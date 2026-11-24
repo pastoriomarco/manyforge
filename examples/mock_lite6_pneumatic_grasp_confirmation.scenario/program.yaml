@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [
       {
@@ -19,13 +19,10 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [
       "lite_gripper"
     ],
@@ -34,7 +31,6 @@
       "pick-and-place"
     ]
   },
-  "description": "Lite6 pneumatic pick and place whose Close relies on the gripper's required grasp confirmation: it fails with grasp_not_confirmed when workpiece_grasped is not true at Close completion, so the object is not attached.",
   "forest": [
     {
       "children": [
@@ -637,7 +633,6 @@
       "parameters": {}
     }
   ],
-  "name": "lite6_pneumatic_grasp_confirmed",
   "parameters": [
     {
       "constraints": {
@@ -688,7 +683,6 @@
     }
   ],
   "positions": {},
-  "program_id": "lite6_pneumatic_grasp_confirmed",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

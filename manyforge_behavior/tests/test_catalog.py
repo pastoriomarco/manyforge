@@ -176,13 +176,18 @@ def test_catalog_exposes_structured_v3_semantics() -> None:
         "automatic_retry_delay_s",
         "base_frame",
         "cache_mode",
-        "clearance_m",
-        "contact_scene_resource_id",
-        "contact_policy_id",
+        "collision_rules",
         "execution_timeout_s",
         "goal",
         "joint_position_tol_rad",
+        "cartesian_timing",
+        "max_angular_acceleration_rad_s2",
+        "max_angular_speed_rad_s",
+        "max_linear_acceleration_mps2",
+        "max_rotation_step_rad",
         "max_tcp_linear_speed_mps",
+        "max_translation_step_m",
+        "motion_type",
         "offset_reference",
         "per_joint_dynamics_limits",
         "planner",
@@ -1078,14 +1083,48 @@ def test_nested_parameter_defaults_are_transitively_read_only(
         default["box_dimensions_m"][0] = 99.0
 
 
-def test_joint_goal_exposes_the_same_explicit_contact_inputs_as_pose_goal() -> None:
+_COLLISION_RULE_NODES = {
+    "motion.move_to_joint_target": "collision_rule",
+    "motion.move_to_pose": "collision_rule",
+    "motion.follow_cartesian_path": "collision_rule",
+    "motion.move_until_signal": "collision_rule",
+    "motion.probe_search": "collision_rule",
+    "planning.plan_pick_sequence": "sequence_collision_rule",
+    "planning.plan_place_sequence": "sequence_collision_rule",
+}
+
+
+def test_motion_and_sequence_nodes_take_optional_collision_rules() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
-    joint = {row.id: row for row in catalog.get('motion.move_to_joint_target').parameters}
-    pose = {row.id: row for row in catalog.get('motion.move_to_pose').parameters}
-    for name in ('contact_policy_id', 'contact_scene_resource_id'):
-        assert joint[name].required is False
-        assert joint[name].has_default is False
-        assert joint[name].schema == pose[name].schema
+    registry = catalog.schema_registry
+    for entry in catalog.entries:
+        parameters = {row.id: row for row in entry.parameters}
+        # The replaced contact and clearance parameters are gone everywhere.
+        assert not {"clearance_m", "contact_policy_id", "contact_scene_resource_id"} & set(
+            parameters
+        )
+        assert ("collision_rules" in parameters) is (entry.id in _COLLISION_RULE_NODES)
+    for node_id, row_type in _COLLISION_RULE_NODES.items():
+        rules = {row.id: row for row in catalog.get(node_id).parameters}["collision_rules"]
+        assert rules.required is False
+        assert rules.has_default is False
+        schema = registry.resolve(rules.schema)
+        assert schema.schema_type == "array"
+        assert schema.max_items == 64
+        assert registry.resolve(schema.items) is registry.types[row_type]
+    selection = registry.types["collision_rule_selection"]
+    assert set(registry.resolve(selection.properties["kind"]).enum_values) == {
+        "component", "collision_body", "link", "attached_object", "scene_objects",
+        "scene_object", "active_tcp_contact_bodies",
+    }
+    assert registry.resolve(selection.properties["scene_resource_id"]).semantic_type == (
+        "scene_resource"
+    )
+    assert registry.resolve(selection.properties["blackboard_key"]).semantic_type == (
+        "blackboard_key"
+    )
+    assert "leg" in registry.types["sequence_collision_rule"].required
+    assert "leg" not in registry.types["collision_rule"].properties
 
 
 def test_every_entry_parameter_and_schema_type_is_documented() -> None:

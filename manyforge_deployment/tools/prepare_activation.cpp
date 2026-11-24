@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -15,6 +16,7 @@
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/initial_scene_projection.hpp>
+#include <manyforge_deployment/model_source.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
 #include <manyforge_deployment/activation_content_collection.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
@@ -36,6 +38,7 @@
 #include "activation_prepared_model_internal.hpp"
 #include "prepared_activation_materialization_internal.hpp"
 #include "prepared_catalog_source_internal.hpp"
+#include "verified_retained_bundle_internal.hpp"
 
 namespace {
 
@@ -69,6 +72,9 @@ struct Options final {
   std::filesystem::path capability_root;
   std::filesystem::path activation_root;
   bool publish_canonical_empty{false};
+  /// Store mode: one runtime-captured scene mesh file to store in the
+  /// activation raw-artifact store (no preparation).
+  std::filesystem::path store_scene_mesh;
 };
 
 [[nodiscard]] Options parse_options(int argc, char **argv) {
@@ -93,17 +99,24 @@ struct Options final {
     } else if (option == "--activation-root" &&
                result.activation_root.empty()) {
       result.activation_root = value;
+    } else if (option == "--store-scene-mesh" &&
+               result.store_scene_mesh.empty()) {
+      result.store_scene_mesh = value;
     } else {
       throw std::invalid_argument("invalid or repeated preparation option");
     }
     index += 2;
   }
-  if (result.input.empty() || result.capability_root.empty() ||
-      result.activation_root.empty()) {
+  const bool store_mode = !result.store_scene_mesh.empty();
+  if (result.activation_root.empty() ||
+      (store_mode && (!result.input.empty() || !result.capability_root.empty() ||
+                      result.publish_canonical_empty)) ||
+      (!store_mode && (result.input.empty() || result.capability_root.empty()))) {
     throw std::invalid_argument(
         "usage: manyforge_prepare_activation --input <request> "
         "--capability-root <root> --activation-root <root> "
-        "[--publish-canonical-empty]");
+        "[--publish-canonical-empty] | manyforge_prepare_activation "
+        "--store-scene-mesh <file> --activation-root <root>");
   }
   return result;
 }
@@ -173,20 +186,22 @@ void materialize_activation(
   }
 }
 
-[[nodiscard]] std::string read_file(const std::filesystem::path &path) {
+[[nodiscard]] std::string read_file(const std::filesystem::path &path,
+                                    const std::uint64_t maximum_bytes,
+                                    const std::string_view label) {
   if (std::filesystem::is_symlink(path) ||
       !std::filesystem::is_regular_file(path)) {
-    throw std::invalid_argument("preparation input is not one plain file");
+    throw std::invalid_argument(std::string(label) + " is not one plain file");
   }
   const auto size = std::filesystem::file_size(path);
-  if (size == 0U || size > deployment::kMaxActivationPreparationRequestBytes) {
-    throw std::invalid_argument("preparation input violates its byte bound");
+  if (size == 0U || size > maximum_bytes) {
+    throw std::invalid_argument(std::string(label) + " violates its byte bound");
   }
   std::ifstream stream(path, std::ios::binary);
   std::string bytes(static_cast<std::size_t>(size), '\0');
   stream.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   if (!stream || stream.peek() != std::char_traits<char>::eof()) {
-    throw std::runtime_error("preparation input changed during capture");
+    throw std::runtime_error(std::string(label) + " changed during capture");
   }
   return bytes;
 }
@@ -291,23 +306,110 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   return deployment::prepared_activation_artifact_rows(artifact_rows(artifacts));
 }
 
+constexpr std::string_view kSceneMeshClosureSchema =
+    "manyforge.activation_scene_mesh_closure.v1";
+constexpr std::size_t kMaximumSceneMeshes = 4096U;
+
+struct CapturedSceneMesh final {
+  std::string resource_uri;
+  core::ContentDigest content_digest;
+  std::string bytes;
+};
+
+/// Decode and verify the scene-mesh closure: rows uniquely sorted by URI,
+/// each decoding to bytes of its declared size and digest, within the
+/// per-mesh and aggregate source-closure bounds.
+[[nodiscard]] std::vector<CapturedSceneMesh>
+parse_scene_mesh_closure(const deployment::CanonicalValue &value) {
+  require_exact_fields(value, {"meshes", "schema_version"},
+                       "scene_mesh_closure");
+  if (text(member(value, "schema_version", "scene_mesh_closure"),
+           "scene_mesh_closure.schema_version") != kSceneMeshClosureSchema) {
+    throw std::invalid_argument(
+        "scene_mesh_closure has an unsupported schema version");
+  }
+  const auto *rows = std::get_if<deployment::CanonicalValue::Array>(
+      &member(value, "meshes", "scene_mesh_closure").storage());
+  if (rows == nullptr || rows->size() > kMaximumSceneMeshes) {
+    throw std::invalid_argument(
+        "scene_mesh_closure.meshes must be an array within its count bound");
+  }
+  std::vector<CapturedSceneMesh> result;
+  result.reserve(rows->size());
+  std::uint64_t total_bytes = 0U;
+  for (const auto &row : *rows) {
+    const auto &uri = text(member(row, "resource_uri", "scene mesh"),
+                           "scene mesh resource_uri");
+    if (uri.size() > 4096U) {
+      throw std::invalid_argument("scene mesh resource_uri exceeds its bound");
+    }
+    if (!result.empty() && uri <= result.back().resource_uri) {
+      throw std::invalid_argument(
+          "scene_mesh_closure.meshes are not uniquely sorted by resource_uri");
+    }
+    deployment::CanonicalValue::Object artifact;
+    for (const auto &[name, field] : object(row, "scene mesh")) {
+      if (name != "resource_uri") artifact.emplace_back(name, field);
+    }
+    auto decoded =
+        deployment::detail::parse_activation_model_source_transfer_artifact(
+            deployment::CanonicalValue(std::move(artifact)), uri,
+            deployment::kMaxModelSourceOpaqueArtifactBytes, "scene mesh " + uri);
+    if (decoded.media_type != "application/octet-stream") {
+      throw std::invalid_argument("scene mesh " + uri +
+                                  " must use application/octet-stream");
+    }
+    total_bytes += decoded.bytes.size();
+    if (total_bytes > deployment::kMaxModelSourceClosureBytes) {
+      throw std::invalid_argument(
+          "scene_mesh_closure exceeds the decoded byte bound");
+    }
+    result.push_back({uri, std::move(decoded.content_digest),
+                      std::move(decoded.bytes)});
+  }
+  return result;
+}
+
+/// Require the closure to capture exactly the Program's scene meshes.
+void require_program_scene_meshes(const std::vector<CapturedSceneMesh> &meshes,
+                                  const deployment::CanonicalValue &program) {
+  const auto wanted = deployment::program_scene_mesh_uris(program);
+  for (const auto &uri : wanted) {
+    if (std::none_of(meshes.begin(), meshes.end(), [&](const auto &mesh) {
+          return mesh.resource_uri == uri;
+        })) {
+      throw std::invalid_argument(
+          "scene_mesh_closure does not capture the Program's scene mesh " + uri);
+    }
+  }
+  for (const auto &mesh : meshes) {
+    if (!std::binary_search(wanted.begin(), wanted.end(), mesh.resource_uri)) {
+      throw std::invalid_argument("scene_mesh_closure captures " +
+                                  mesh.resource_uri +
+                                  ", which the Program does not name");
+    }
+  }
+}
+
 [[nodiscard]] deployment::CanonicalValue prepare(const Options &options) {
   const auto request =
       deployment::parse_strict_json_model_yaml(
-          read_file(options.input),
+          read_file(options.input,
+                    deployment::kMaxActivationPreparationRequestBytes,
+                    "preparation input"),
           deployment::kMaxActivationPreparationRequestBytes);
   const auto &root = request.root();
   if (text(member(root, "schema_version", "request"), "schema_version") !=
-      "manyforge.activation_preparation_request.v4") {
+      "manyforge.activation_preparation_request.v5") {
     throw std::invalid_argument(
-        "unsupported activation preparation request version (only v4)");
+        "unsupported activation preparation request version (only v5)");
   }
   require_exact_fields(root,
                        {"schema_version", "runtime_cell_id",
                         "source_document_digest", "scenario_id", "project_path",
                         "captured_input_digest", "deployment",
                         "model_source_closure", "prepared_model_closure",
-                        "program"},
+                        "program", "scene_mesh_closure"},
                        "activation preparation request");
   const auto &source_digest =
       text(member(root, "source_document_digest", "request"),
@@ -348,6 +450,8 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   const auto &prepared_model_closure =
       member(root, "prepared_model_closure", "request");
   const auto &program_value = member(root, "program", "request");
+  const auto &scene_mesh_closure =
+      member(root, "scene_mesh_closure", "request");
   static_cast<void>(object(deployment_value, "deployment"));
   static_cast<void>(object(model_source_closure, "model_source_closure"));
   static_cast<void>(object(prepared_model_closure, "prepared_model_closure"));
@@ -361,12 +465,14 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       {"program", program_value},
       {"scenario_id", deployment::CanonicalValue(scenario_id)},
       {"project_path", deployment::CanonicalValue(project_path)},
+      {"scene_mesh_closure", scene_mesh_closure},
       {"source_document_digest", deployment::CanonicalValue(source_digest)},
   });
   if (deployment::sha256_digest(deployment::canonical_json(captured)) !=
       captured_digest) {
     throw std::invalid_argument("captured_input_digest does not match request");
   }
+  const auto scene_meshes = parse_scene_mesh_closure(scene_mesh_closure);
   const auto candidate = deployment::detail::build_prepared_activation_candidate(
       options.capability_root, deployment_value, model_source_closure,
       prepared_model_closure, runtime_cell_id, options.publish_canonical_empty);
@@ -390,7 +496,27 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
         *program, *materialized.bundle, materialized.model_map, catalog_store);
   }
   const auto &binding = outcome.binding;
+  require_program_scene_meshes(
+      scene_meshes, program != nullptr ? program->normalized_program_root()
+                                       : deployment::CanonicalValue(nullptr));
   auto raw_artifact_rows = artifact_rows(materialized.raw_artifacts);
+  // Each captured mesh is one raw artifact (once per content), stored by
+  // materialize_activation with the rest of the closure.
+  std::vector<deployment::PreparedSceneMesh> scene_mesh_rows;
+  scene_mesh_rows.reserve(scene_meshes.size());
+  for (const auto &mesh : scene_meshes) {
+    const core::ContentAddressedStoreKey key(
+        deployment::detail::retained_store_key_for_digest(
+            mesh.content_digest.value()));
+    if (std::none_of(raw_artifact_rows.begin(), raw_artifact_rows.end(),
+                     [&](const auto &row) {
+                       return row.content_addressed_store_key == key;
+                     })) {
+      raw_artifact_rows.push_back({key, mesh.content_digest, mesh.bytes});
+    }
+    scene_mesh_rows.push_back({mesh.resource_uri, mesh.content_digest,
+                               static_cast<std::uint64_t>(mesh.bytes.size())});
+  }
   // The complete assembled input is independently verified below, including
   // strict absence of identities for no_program.
   deployment::CanonicalValue program_outcome(nullptr);
@@ -466,8 +592,6 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       {"assistant_mode",
        deployment::CanonicalValue(std::string(assistant_mode_text(mode)))},
       {"captured_input_digest", deployment::CanonicalValue(captured_digest)},
-      {"deployment_artifact_id",
-       deployment::CanonicalValue(materialized.deployment_artifact_id.value())},
       {"deployment_revision",
        deployment::CanonicalValue(materialized.deployment_revision.value())},
       {"graph_revision",
@@ -477,10 +601,6 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
        deployment::CanonicalValue(
            materialized.bundle->value()
                .catalogs.node_environment.environment_digest.value())},
-      {"program_id",
-       program != nullptr
-           ? deployment::CanonicalValue(program->value().program_id.value())
-           : deployment::CanonicalValue(nullptr)},
       {"program_outcome", std::move(program_outcome)},
       {"program_revision", program != nullptr
                                ? deployment::CanonicalValue(
@@ -490,6 +610,8 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
        deployment::CanonicalValue(
            materialized.bundle->retained_bundle_id().value())},
       {"origin", deployment::prepared_activation_origin_value(scenario_origin)},
+      {"scene_meshes",
+       deployment::prepared_scene_meshes_value(std::move(scene_mesh_rows))},
       {"schema_version",
        deployment::CanonicalValue(
            std::string(deployment::kPreparedActivationInputSchemaVersion))},
@@ -557,11 +679,41 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
   return deployment::CanonicalValue(std::move(receipt));
 }
 
+/// Store mode: one runtime-captured scene mesh, stored under the writer lock
+/// so no content collection runs while it is written. Prints its identity.
+[[nodiscard]] deployment::CanonicalValue store_scene_mesh(const Options &options) {
+  const auto bytes =
+      read_file(options.store_scene_mesh,
+                deployment::kMaxModelSourceOpaqueArtifactBytes, "scene mesh");
+  const deployment::ActivationContentWriterLock writing(
+      options.activation_root);
+  deployment::FilesystemRawArtifactStore store(options.activation_root);
+  const auto stored = store.put_if_absent(bytes);
+  if (stored.byte_size != bytes.size() ||
+      stored.content_digest.value() != deployment::sha256_digest(bytes)) {
+    throw std::runtime_error("scene mesh was stored with another identity");
+  }
+  return deployment::CanonicalValue(deployment::CanonicalValue::Object{
+      {"byte_size",
+       deployment::CanonicalValue(static_cast<double>(stored.byte_size))},
+      {"content_digest",
+       deployment::CanonicalValue(stored.content_digest.value())},
+  });
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   try {
     auto options = parse_options(argc, argv);
+    if (!options.store_scene_mesh.empty()) {
+      options.store_scene_mesh =
+          std::filesystem::canonical(options.store_scene_mesh);
+      options.activation_root =
+          std::filesystem::canonical(options.activation_root);
+      std::cout << deployment::canonical_json(store_scene_mesh(options)) << '\n';
+      return 0;
+    }
     options.input = std::filesystem::canonical(options.input);
     options.capability_root =
         std::filesystem::canonical(options.capability_root);

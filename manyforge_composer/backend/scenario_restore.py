@@ -17,6 +17,7 @@ from manyforge_behavior.program import Program
 
 from .authoring_forest import derive_candidate, from_program
 from .authoring_workspace import AuthoringWorkspaceIdentity
+from .deployment_defaults import with_defaults
 from .draft_session import DraftSessionError
 from .state import ComposerState
 
@@ -109,7 +110,8 @@ def saved_deployment_differs(saved: Any, applied: Any) -> bool | None:
     applied_revision = applied.get("deployment_revision")
     if saved_revision is not None and applied_revision is not None:
         return saved_revision != applied_revision
-    return saved != applied
+    # Applied holds the compiled input (required defaults filled at Apply).
+    return with_defaults(saved) != applied
 
 
 __all__ = [

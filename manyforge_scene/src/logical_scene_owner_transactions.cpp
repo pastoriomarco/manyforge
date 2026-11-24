@@ -2,90 +2,6 @@
 #include <manyforge_scene/scene_candidate_preview.hpp>
 
 namespace manyforge::scene::logical_scene_owner_detail {
-namespace {
-
-class CellAdmissionClaimRejected final : public std::runtime_error {
-public:
-  explicit CellAdmissionClaimRejected(core::ErrorDTO error)
-      : std::runtime_error(error.message), error_(std::move(error)) {}
-  const core::ErrorDTO &error() const noexcept { return error_; }
-
-private:
-  core::ErrorDTO error_;
-};
-
-[[nodiscard]] core::CellAdmissionClaimDTO RequireAuthoredSceneClaim(
-    core::IKernelCellAdmissionPort &admission,
-    const core::CellAdmissionClaimIntentDTO &intent) {
-  const auto receipt = admission.GetCellAdmissionRecoveryReceipt(
-      {intent, std::nullopt, std::nullopt});
-  if (!receipt.ok()) {
-    ThrowCellAdmissionFailure("authored scene admission lookup failed",
-                              receipt.error());
-  }
-  if (receipt.value().status ==
-          core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
-      receipt.value().matched_claim.has_value()) {
-    return *receipt.value().matched_claim;
-  }
-  if (receipt.value().status !=
-      core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown) {
-    throw LogicalSceneOwnerConflictError(
-        "authored scene admission identity conflicts or is already settled");
-  }
-  const auto acquired = admission.AcquireCellAdmissionClaim(intent);
-  if (!acquired.ok()) {
-    throw CellAdmissionClaimRejected(acquired.error());
-  }
-  return acquired.value();
-}
-
-// The file bytes one more Scene transaction can take, error texts aside
-// (od212): its intent with `request_bytes` of request and the largest
-// resolved operation and candidate snapshot, its owner event, its outcome,
-// and an attempt and a result for each of `projections`, every identifier
-// and code at the identifier bound.
-std::uint64_t SceneTransactionFileBytesBound(const std::size_t request_bytes,
-                                             const std::size_t projections) {
-  constexpr std::size_t kIdentifier = kMaximumSceneStoreIdentifierBytes;
-  constexpr auto kInteger = std::numeric_limits<std::int64_t>::max();
-  const auto sized = [](const std::size_t integers,
-                        const std::vector<std::size_t> &texts,
-                        const std::size_t nulls) {
-    RecordSize size;
-    for (std::size_t index = 0U; index < integers; ++index) {
-      size.Integer(kInteger);
-    }
-    for (const auto bytes : texts) {
-      size.Text(bytes);
-    }
-    for (std::size_t index = 0U; index < nulls; ++index) {
-      size.Null();
-    }
-    return size.bytes();
-  };
-  std::vector<std::size_t> intent_texts{16U, kIdentifier, request_bytes,
-                                        kMaximumLogicalSceneTransactionBytes,
-                                        kMaximumLogicalSceneTransactionBytes};
-  intent_texts.insert(intent_texts.end(), 11U, kIdentifier);
-  auto bytes = SceneRowFileBytes(sized(4U, intent_texts, 0U),
-                                 SceneTable("logical_scene_transaction_intents"));
-  bytes += SceneRowFileBytes(sized(2U, {kIdentifier}, 0U),
-                             SceneTable("logical_scene_owner_events"));
-  bytes += SceneRowFileBytes(sized(3U, {16U, kIdentifier, kIdentifier}, 3U),
-                             SceneTable("logical_scene_request_outcomes"));
-  const auto per_projection =
-      SceneRowFileBytes(sized(2U, std::vector<std::size_t>(4U, kIdentifier), 0U),
-                        SceneTable("logical_scene_projection_attempts")) +
-      SceneRowFileBytes(sized(4U, std::vector<std::size_t>(6U, kIdentifier), 3U),
-                        SceneTable("logical_scene_projection_results"));
-  return bytes + projections * per_projection;
-}
-
-} // namespace
-} // namespace manyforge::scene::logical_scene_owner_detail
-
-namespace manyforge::scene::logical_scene_owner_detail {
 
 ErrorDTO SceneError(const std::string_view code, const std::string_view message,
                     std::map<std::string, std::string> details) {
@@ -130,6 +46,15 @@ void ValidateBoundedText(const std::string_view value,
   }
 }
 
+// The admission call did not reach the Kernel: refused by the Manager's
+// execution-host channel. The Kernel itself answers none of these codes.
+[[nodiscard]] bool AdmissionOwnerUnreachable(const std::string_view code) {
+  return code == "kernel_owner_unavailable" ||
+         code == "runtime_unit_launch_in_progress" ||
+         code == "execution_host_late" || code == "execution_host_exited" ||
+         code == "application_stopping";
+}
+
 } // namespace
 } // namespace manyforge::scene::logical_scene_owner_detail
 
@@ -161,212 +86,7 @@ ContentDigest CellResolutionEvidence(const ContentDigest &request_digest,
       projection.scene_revision.content_hash.value()));
 }
 
-bool ReleaseFieldsMatchDefaults(const core::SupportContactDTO &contact) {
-  return contact.enforce_max_start_penetration &&
-         contact.max_start_penetration_m == 0.0 &&
-         contact.release_tolerance_m == 1e-5 &&
-         contact.min_release_progress_m == 0.0 &&
-         contact.require_separation_by_end &&
-         contact.require_strictly_decreasing_penetration &&
-         !contact.allow_recontact;
-}
-
-bool ReleaseFieldsAreNeutral(const core::SupportContactDTO &contact) {
-  return !contact.enforce_max_start_penetration &&
-         contact.max_start_penetration_m == 0.0 &&
-         contact.release_tolerance_m == 0.0 &&
-         contact.min_release_progress_m == 0.0 &&
-         !contact.require_separation_by_end &&
-         !contact.require_strictly_decreasing_penetration &&
-         !contact.allow_recontact;
-}
-
-bool BinaryFieldsMatchDefaults(const core::SupportContactDTO &contact) {
-  return contact.enforce_max_start_penetration &&
-         contact.max_start_penetration_m == 0.0 &&
-         contact.release_tolerance_m == 1e-5 &&
-         contact.min_release_progress_m == 0.0 &&
-         contact.require_strictly_decreasing_penetration;
-}
-
-bool BinaryFieldsAreNeutral(const core::SupportContactDTO &contact) {
-  return !contact.enforce_max_start_penetration &&
-         contact.max_start_penetration_m == 0.0 &&
-         contact.release_tolerance_m == 0.0 &&
-         contact.min_release_progress_m == 0.0 &&
-         !contact.require_strictly_decreasing_penetration;
-}
-
-[[noreturn]] void RejectSupportContact(const std::size_t index,
-                                       const std::string_view reason,
-                                       const std::string_view field,
-                                       const std::string_view message) {
-  throw SceneRequestRejectionError(
-      "invalid_contact_policy", std::string(message),
-      {{"support_contact_index", std::to_string(index)},
-       {"reason", std::string(reason)},
-       {"field", std::string(field)}});
-}
-
-void ValidateAndNormalizeSupportContact(core::SupportContactDTO &contact,
-                                        const std::size_t index) {
-  try {
-    ValidateBoundedIdentity(contact.support_object_id, "support_object_id");
-  } catch (const std::invalid_argument &error) {
-    RejectSupportContact(index, "invalid_support_contact_reference",
-                         "support_object_id", error.what());
-  }
-  const auto nonnegative_finite = [](const double value) {
-    return std::isfinite(value) && value >= 0.0;
-  };
-  if (!nonnegative_finite(contact.max_start_penetration_m) ||
-      !nonnegative_finite(contact.release_tolerance_m) ||
-      !nonnegative_finite(contact.min_release_progress_m) ||
-      !nonnegative_finite(contact.max_contact_penetration_m)) {
-    RejectSupportContact(index, "support_contact_metric_invalid", "metrics",
-                         "support-contact metrics must be finite and "
-                         "non-negative");
-  }
-
-  switch (contact.mode) {
-  case core::CollisionContactPolicyMode::kBoundedPenetration:
-    if (contact.release_evidence_mode !=
-        core::ContactReleaseEvidenceMode::kSignedPenetration) {
-      RejectSupportContact(index, "release_evidence_mode_not_applicable",
-                           "release_evidence_mode",
-                           "binary release evidence is not applicable to "
-                           "bounded penetration");
-    }
-    if (!ReleaseFieldsMatchDefaults(contact) &&
-        !ReleaseFieldsAreNeutral(contact)) {
-      RejectSupportContact(index, "release_field_for_bounded_penetration",
-                           "release_fields",
-                           "release-only fields are not applicable to "
-                           "bounded penetration");
-    }
-    break;
-  case core::CollisionContactPolicyMode::kContactProcess:
-    if (contact.max_contact_penetration_m != 0.0) {
-      RejectSupportContact(index, "bounded_penetration_field_not_applicable",
-                           "max_contact_penetration_m",
-                           "max_contact_penetration_m is valid only for "
-                           "bounded penetration");
-    }
-    if (contact.release_evidence_mode !=
-            core::ContactReleaseEvidenceMode::kSignedPenetration ||
-        (!ReleaseFieldsMatchDefaults(contact) &&
-         !ReleaseFieldsAreNeutral(contact))) {
-      RejectSupportContact(index, "release_field_not_applicable",
-                           "release_fields",
-                           "release-only fields are not applicable to "
-                           "contact process");
-    }
-    break;
-  case core::CollisionContactPolicyMode::kContactRelease:
-    if (contact.max_contact_penetration_m != 0.0) {
-      RejectSupportContact(index, "bounded_penetration_field_not_applicable",
-                           "max_contact_penetration_m",
-                           "max_contact_penetration_m is valid only for "
-                           "bounded penetration");
-    }
-    switch (contact.release_evidence_mode) {
-    case core::ContactReleaseEvidenceMode::kSignedPenetration:
-      break;
-    case core::ContactReleaseEvidenceMode::kBinaryContact:
-      if (!BinaryFieldsMatchDefaults(contact) &&
-          !BinaryFieldsAreNeutral(contact)) {
-        RejectSupportContact(index, "metric_field_for_binary_contact",
-                             "metric_fields",
-                             "signed-distance metric fields are not valid "
-                             "for binary contact evidence");
-      }
-      break;
-    default:
-      RejectSupportContact(index, "unknown_release_evidence_mode",
-                           "release_evidence_mode",
-                           "support-contact release evidence is unsupported");
-    }
-    break;
-  default:
-    RejectSupportContact(index, "unknown_contact_policy_mode", "mode",
-                         "support-contact mode is unsupported");
-  }
-
-  if (contact.mode == core::CollisionContactPolicyMode::kContactRelease) {
-    contact.max_contact_penetration_m = 0.0;
-    if (contact.release_evidence_mode ==
-        core::ContactReleaseEvidenceMode::kBinaryContact) {
-      contact.enforce_max_start_penetration = false;
-      contact.max_start_penetration_m = 0.0;
-      contact.release_tolerance_m = 0.0;
-      contact.min_release_progress_m = 0.0;
-      contact.require_strictly_decreasing_penetration = false;
-    }
-    return;
-  }
-
-  contact.release_evidence_mode =
-      core::ContactReleaseEvidenceMode::kSignedPenetration;
-  contact.enforce_max_start_penetration = false;
-  contact.max_start_penetration_m = 0.0;
-  contact.release_tolerance_m = 0.0;
-  contact.min_release_progress_m = 0.0;
-  contact.require_separation_by_end = false;
-  contact.require_strictly_decreasing_penetration = false;
-  contact.allow_recontact = false;
-  if (contact.mode == core::CollisionContactPolicyMode::kContactProcess) {
-    contact.max_contact_penetration_m = 0.0;
-  }
-}
-
 } // namespace
-} // namespace manyforge::scene::logical_scene_owner_detail
-
-namespace manyforge::scene::logical_scene_owner_detail {
-
-std::vector<core::SupportContactDTO>
-NormalizeSupportContacts(const core::SceneResourceId &scene_resource_id,
-                         std::vector<core::SupportContactDTO> support_contacts,
-                         const core::LogicalSceneSnapshotDTO &current) {
-  for (std::size_t index = 0U; index < support_contacts.size(); ++index) {
-    ValidateAndNormalizeSupportContact(support_contacts[index], index);
-  }
-  std::sort(support_contacts.begin(), support_contacts.end(),
-            [](const auto &left, const auto &right) {
-              return left.support_object_id < right.support_object_id;
-            });
-  for (std::size_t index = 0U; index < support_contacts.size(); ++index) {
-    const auto &contact = support_contacts[index];
-    if (index != 0U && support_contacts[index - 1U].support_object_id ==
-                           contact.support_object_id) {
-      RejectSupportContact(index, "duplicate_support_contact_pair",
-                           "support_object_id",
-                           "support object is declared more than once");
-    }
-    if (contact.support_object_id == scene_resource_id.value()) {
-      RejectSupportContact(index, "self_support_contact", "support_object_id",
-                           "scene resource cannot support itself");
-    }
-    const auto support =
-        std::lower_bound(current.objects.begin(), current.objects.end(),
-                         contact.support_object_id,
-                         [](const SceneObjectSnapshotDTO &object,
-                            const std::string &support_id) {
-                           return object.scene_resource_id.value() < support_id;
-                         });
-    if (support == current.objects.end() ||
-        support->scene_resource_id.value() != contact.support_object_id) {
-      throw SceneRequestRejectionError(
-          "missing_reference",
-          "support contact names an unknown scene resource",
-          {{"reference_type", "support_scene_resource"},
-           {"reference_id", contact.support_object_id},
-           {"scene_resource_id", scene_resource_id.value()}});
-    }
-  }
-  return support_contacts;
-}
-
 } // namespace manyforge::scene::logical_scene_owner_detail
 
 namespace manyforge::scene::logical_scene_owner_detail {
@@ -591,6 +311,17 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                       std::is_same_v<T, core::UpsertObjectRequestDTO>) {
           ValidateBoundedIdentity(operation.scene_resource_id.value(),
                                   "scene_resource_id");
+          // The Manager fills the captured mesh content before the owner sees
+          // the request; an empty digest means it did not.
+          if (const auto *mesh =
+                  std::get_if<core::MeshShapeDTO>(&operation.shape);
+              mesh != nullptr && mesh->content_digest.empty()) {
+            throw SceneRequestRejectionError(
+                "scene_mesh_unavailable",
+                "scene mesh " + mesh->resource_uri + " was not captured",
+                {{"resource_uri", mesh->resource_uri},
+                 {"scene_resource_id", operation.scene_resource_id.value()}});
+          }
           const auto normalized =
               NormalizeScenePose(operation.frame_ref, operation.pose, current,
                                  request.expected_projection_revision,
@@ -620,15 +351,12 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                 {{"reason", "scene_object_is_attached"},
                  {"scene_resource_id", operation.scene_resource_id.value()}});
           }
-          auto support_contacts = NormalizeSupportContacts(
-              operation.scene_resource_id, operation.support_contacts, current);
           SceneObjectSnapshotDTO object{
               operation.scene_resource_id,
               {operation.shape},
               core::CellFixedSceneObjectPlacementDTO{current.cell_id,
                                                      normalized.pose_in_cell},
               std::nullopt,
-              std::move(support_contacts),
               operation.mass_kg,
           };
           const bool unchanged = exists && *found == object;
@@ -660,26 +388,6 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
             throw SceneRequestRejectionError(
                 "object_not_found", "scene resource does not exist",
                 {{"scene_resource_id", operation.scene_resource_id.value()}});
-          }
-          for (const auto &object : candidate.snapshot.objects) {
-            if (object.scene_resource_id == operation.scene_resource_id) {
-              continue;
-            }
-            const auto dependent = std::find_if(
-                object.support_contacts.begin(), object.support_contacts.end(),
-                [&](const core::SupportContactDTO &contact) {
-                  return contact.support_object_id ==
-                         operation.scene_resource_id.value();
-                });
-            if (dependent != object.support_contacts.end()) {
-              throw SceneRequestRejectionError(
-                  "scene_object_state_conflict",
-                  "scene resource is still referenced as a support",
-                  {{"reason", "support_contact_reference_exists"},
-                   {"scene_resource_id", operation.scene_resource_id.value()},
-                   {"dependent_scene_resource_id",
-                    object.scene_resource_id.value()}});
-            }
           }
           if (std::holds_alternative<core::CarriedSceneObjectPlacementDTO>(
                   found->placement)) {
@@ -839,7 +547,8 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                   &frame_resolution->resolved_frame);
           if (carrier == nullptr ||
               carrier->controllable_component_id !=
-                  operation.controllable_component_id) {
+                  operation.carrier_component_id.value_or(
+                      operation.controllable_component_id)) {
             throw SceneRequestRejectionError(
                 "missing_reference",
                 "carrier target resolved to another component",
@@ -1101,14 +810,14 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
           // Last arrival wins: expected_configured_policy_revision is
           // ignored and the edit replaces the current configured policy.
           const auto &current_policy = current.configured_collision_policy;
-          if (!operation.configured_policy.allowed_static_static_pairs
-                   .empty() ||
+          if (!operation.configured_policy.static_body_ids.empty() ||
               !operation.configured_policy.allowed_touch_link_pairs.empty() ||
-              !operation.configured_policy.support_contacts.empty()) {
+              !operation.configured_policy.contact_rules.empty()) {
             throw SceneRequestRejectionError(
                 "invalid_request",
                 "configured collision policy cannot contain owner-derived "
-                "static, touch, or support allowances",
+                "static bodies or touch allowances, or collision rules of a "
+                "move",
                 {{"reason", "derived_collision_policy_fields_are_read_only"}});
           }
           auto next_policy = operation.configured_policy;
@@ -1170,87 +879,23 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
   return candidate;
 }
 
+// The intent keeps the delta and, in its proposed revision, the candidate's
+// content hash.
 void InsertSceneIntent(SceneStoreMemory &memory,
-                       persistence::SqliteRecord &statement,
                        const SceneTransactionRequestDTO &request,
                        const ContentDigest &request_digest,
-                       const std::string_view request_json,
+                       std::string request_json,
                        const core::SceneTransactionDTO &transaction,
                        const ResolvedSceneCandidate &candidate,
                        const std::size_t required_projection_count) {
-  const auto resolved_json =
-      logical_scene_codec_internal::EncodeResolvedOperation(
-          transaction.resolved_operation);
-  auto snapshot_json =
-      logical_scene_codec_internal::EncodeSnapshot(candidate.snapshot);
-  if (request_json.size() > kMaximumLogicalSceneTransactionBytes ||
-      resolved_json.size() > kMaximumLogicalSceneTransactionBytes ||
-      snapshot_json.size() > kMaximumLogicalSceneTransactionBytes) {
-    throw LogicalSceneOwnerLimitError(
-        "logical-scene transaction exceeds its durable byte bound");
-  }
-  SizedRow row(
-      statement,
-      "INSERT INTO logical_scene_transaction_intents("
-      "transaction_sequence,request_key,request_digest,"
-      "request_json,prior_retained_bundle_id,prior_graph_revision,"
-      "prior_scene_id,prior_scene_revision_id,prior_scene_content_hash,"
-      "proposed_retained_bundle_id,proposed_graph_revision,"
-      "proposed_scene_id,proposed_scene_revision_id,"
-      "proposed_scene_content_hash,resolved_operation_json,"
-      "resolution_evidence_digest,candidate_snapshot_json,update_status,"
-      "required_projection_count) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  row.Bind(1, CheckedSafeCounter(transaction.transaction_sequence,
-                                       "transaction_sequence"));
-  BindRequestKey(row, 2, request.request_context.request_key);
-  row.Bind(3, request_digest.value());
-  row.Bind(4, request_json);
-  row.Bind(
-      5, transaction.prior_projection_revision.retained_bundle_id.value());
-  row.Bind(6,
-                 transaction.prior_projection_revision.graph_revision.value());
-  row.Bind(
-      7, transaction.prior_projection_revision.scene_revision.scene_id.value());
-  row.Bind(
-      8, CheckedSafeCounter(
-             transaction.prior_projection_revision.scene_revision.revision_id,
-             "prior scene revision"));
-  row.Bind(9, transaction.prior_projection_revision.scene_revision
-                         .content_hash.value());
-  row.Bind(
-      10, transaction.proposed_projection_revision.retained_bundle_id.value());
-  row.Bind(
-      11, transaction.proposed_projection_revision.graph_revision.value());
-  row.Bind(
-      12,
-      transaction.proposed_projection_revision.scene_revision.scene_id.value());
-  row.Bind(
-      13,
-      CheckedSafeCounter(
-          transaction.proposed_projection_revision.scene_revision.revision_id,
-          "proposed scene revision"));
-  row.Bind(14, transaction.proposed_projection_revision.scene_revision
-                         .content_hash.value());
-  row.Bind(15, resolved_json);
-  if (transaction.resolution_evidence_digest.has_value()) {
-    row.Bind(16, transaction.resolution_evidence_digest->value());
-  } else {
-    row.BindNull(16);
-  }
-  row.Bind(17, snapshot_json);
-  row.Bind(18, core::to_string(candidate.update_status));
-  row.Bind(19, static_cast<std::int64_t>(required_projection_count));
-  memory.transaction_file_bytes += SceneRowFileBytes(
-      row.record_bytes(), SceneTable("logical_scene_transaction_intents"));
   memory.transactions.push_back(SceneTransactionRecord{
       transaction.transaction_sequence,
       request.request_context.request_key,
       request_digest,
-      std::string(request_json),
+      std::move(request_json),
       transaction.prior_projection_revision,
       transaction.proposed_projection_revision,
-      std::move(snapshot_json),
+      transaction.resolved_operation,
       candidate.update_status,
       required_projection_count,
       0U,
@@ -1258,31 +903,11 @@ void InsertSceneIntent(SceneStoreMemory &memory,
   });
 }
 
-std::uint64_t NextSceneOwnerEventSequence(const SceneStoreMemory &memory) {
-  const auto &history = memory.history;
-  std::uint64_t maximum = 0U;
-  for (const auto &event : memory.owner_events) {
-    maximum = std::max(maximum, event.owner_event_sequence);
-  }
-  if (memory.owner_events.size() >= kMaximumLogicalSceneOwnerEvents) {
-    throw LogicalSceneOwnerLimitError(
-        "logical-scene owner event ledger is exhausted or invalid");
-  }
-  const auto watermark =
-      std::max(maximum, history.compacted_through_owner_event_sequence);
-  if (watermark >= kMaximumSafeIntegral) {
-    throw LogicalSceneOwnerLimitError(
-        "logical-scene owner event sequence is exhausted");
-  }
-  return watermark + 1U;
-}
-
 } // namespace
 
 // Compaction is transparent to callers: it prunes the resident ledger behind
 // a checkpoint of the active head, so neither the triggering request nor any
-// other caller has to refresh. A commit compacts a non-empty ledger when it
-// is full or the next transaction would not fit the file bytes (od212).
+// other caller has to refresh. A commit compacts the ledger when it is full.
 // A maintenance fold runs the same compaction before the bounded maintenance
 // history evicts a completion the replay would otherwise still consume; it
 // needs only a settled head, not a ledger or an open maintenance window.
@@ -1309,13 +934,6 @@ PreparedSceneHistoryCompaction PrepareSceneHistoryCompaction(
         "logical-scene history compaction generation is exhausted");
   }
   const auto next_compaction_generation = history.compaction_generation + 1U;
-  auto snapshot_json = logical_scene_codec_internal::EncodeSnapshot(
-      transactions.active_snapshot);
-  if (snapshot_json.empty() ||
-      snapshot_json.size() > kMaximumLogicalSceneTransactionBytes) {
-    throw LogicalSceneOwnerLimitError(
-        "logical-scene checkpoint exceeds its canonical byte bound");
-  }
   static_cast<void>(
       CheckedSafeCounter(next_compaction_generation, "compaction generation"));
   static_cast<void>(CheckedSafeCounter(
@@ -1335,58 +953,19 @@ PreparedSceneHistoryCompaction PrepareSceneHistoryCompaction(
             return initialization.publication_receipt.has_value();
           }));
   next.checkpoint_projection = transactions.active_projection;
-  // The checkpoint as the file returns it.
-  next.checkpoint_snapshot =
-      logical_scene_codec_internal::DecodeSnapshot(snapshot_json);
-  return {std::move(next), std::move(snapshot_json)};
+  next.checkpoint_snapshot = transactions.active_snapshot;
+  return {std::move(next)};
 }
 
 void CompactSceneTransactionHistory(
-    SceneStoreMemory &memory, persistence::SqliteRecord &update,
-    PreparedSceneHistoryCompaction compaction,
+    SceneStoreMemory &memory, PreparedSceneHistoryCompaction compaction,
     const DurableState &durable_state,
     const SceneTransactionStoreState &transactions) {
-  const auto &next = compaction.history;
-  update.Statement(
-      "UPDATE logical_scene_history_state SET compaction_generation=?,"
-      "compacted_through_transaction_sequence=?,"
-      "compacted_through_owner_event_sequence=?,"
-      "compacted_maintenance_completion_count=?,"
-      "checkpoint_retained_bundle_id=?,checkpoint_graph_revision=?,"
-      "checkpoint_scene_id=?,checkpoint_scene_revision_id=?,"
-      "checkpoint_scene_content_hash=?,checkpoint_snapshot_json=?,"
-      "compaction_in_progress=1 WHERE singleton=1 AND "
-      "compaction_in_progress=0");
-  update.Bind(1, static_cast<std::int64_t>(next.compaction_generation));
-  update.Bind(2, static_cast<std::int64_t>(
-                     next.compacted_through_transaction_sequence));
-  update.Bind(3, static_cast<std::int64_t>(
-                     next.compacted_through_owner_event_sequence));
-  update.Bind(4, static_cast<std::int64_t>(
-                     next.compacted_maintenance_completion_count));
-  update.Bind(5, next.checkpoint_projection->retained_bundle_id.value());
-  update.Bind(6, next.checkpoint_projection->graph_revision.value());
-  update.Bind(7, next.checkpoint_projection->scene_revision.scene_id.value());
-  update.Bind(8, static_cast<std::int64_t>(
-                     next.checkpoint_projection->scene_revision.revision_id));
-  update.Bind(
-      9, next.checkpoint_projection->scene_revision.content_hash.value());
-  update.Bind(10, compaction.checkpoint_snapshot_json);
-  update.ExpectChanges(1);
-  // The delete guards admit these deletes only while the flag is set.
-  update.Statement("DELETE FROM logical_scene_projection_results");
-  update.Statement("DELETE FROM logical_scene_projection_attempts");
-  update.Statement("DELETE FROM logical_scene_request_outcomes");
-  update.Statement("DELETE FROM logical_scene_owner_events");
-  update.Statement("DELETE FROM logical_scene_transaction_intents");
-  update.Statement("UPDATE logical_scene_history_state SET "
-                   "compaction_in_progress=0 WHERE singleton=1");
-
   memory.history = std::move(compaction.history);
   memory.transactions.clear();
   memory.outcomes.clear();
   memory.owner_events.clear();
-  memory.transaction_file_bytes = 0U;
+  memory.settled_head.reset();
 
   const auto compacted =
       ReadSceneTransactionStoreState(memory, durable_state);
@@ -1405,109 +984,22 @@ void CompactSceneTransactionHistory(
 namespace {
 
 void InsertSceneTransactionOwnerEvent(
-    SceneStoreMemory &memory, persistence::SqliteRecord &statement,
-    const std::uint64_t owner_event_sequence,
+    SceneStoreMemory &memory, const std::uint64_t owner_event_sequence,
     const std::uint64_t transaction_sequence) {
-  SizedRow row(
-      statement,
-      "INSERT INTO logical_scene_owner_events(owner_event_sequence,"
-      "event_kind,transaction_sequence) "
-      "VALUES(?,'scene_transaction_intent',?)");
-  row.Bind(
-      1, CheckedSafeCounter(owner_event_sequence, "owner_event_sequence"));
-  row.Bind(
-      2, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
-  row.Literal("scene_transaction_intent");
-  memory.transaction_file_bytes += SceneRowFileBytes(
-      row.record_bytes(), SceneTable("logical_scene_owner_events"));
   memory.owner_events.push_back(
       SceneOwnerEventRecord{owner_event_sequence, transaction_sequence});
 }
 
 // The attempt and result rows belong to the newest resident transaction:
-// Commit holds `mutex_` from its intent to its outcome.
-void InsertProjectionAttempt(
-    SceneStoreMemory &memory, persistence::SqliteRecord &statement,
-    const std::uint64_t transaction_sequence, const std::size_t ordinal,
-    const core::ProjectionExecutionHostBindingDTO &binding) {
-  SizedRow row(
-      statement,
-      "INSERT INTO logical_scene_projection_attempts("
-      "transaction_sequence,projection_ordinal,provider_binding_id,"
-      "provider_binding_revision,runtime_unit_id,runtime_epoch) "
-      "VALUES(?,?,?,?,?,?)");
-  row.Bind(
-      1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
-  row.Bind(2, static_cast<std::int64_t>(ordinal));
-  row.Bind(3, binding.provider_binding_id.value());
-  row.Bind(4, binding.provider_binding_revision.value());
-  row.Bind(5, binding.runtime_unit_id.value());
-  row.Bind(6, binding.runtime_epoch.value());
-  memory.transaction_file_bytes += SceneRowFileBytes(
-      row.record_bytes(), SceneTable("logical_scene_projection_attempts"));
+// from its intent to its outcome a Commit is the only writer. The Apply-lane
+// writers wait until it ends; every other write is refused by its unresolved
+// intent (OD-376).
+void InsertProjectionAttempt(SceneStoreMemory &memory) {
   ++memory.transactions.back().projection_attempt_count;
 }
 
-std::string_view
-ProjectionResultState(const core::ProjectionCommitResultStateDTO state) {
-  switch (state) {
-  case core::ProjectionCommitResultStateDTO::kAccepted:
-    return "accepted";
-  case core::ProjectionCommitResultStateDTO::kCommitted:
-    return "committed";
-  case core::ProjectionCommitResultStateDTO::kRejectedRollbackProven:
-    return "rejected_rollback_proven";
-  case core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain:
-    return "failed_projection_uncertain";
-  }
-  return {};
-}
-
 void InsertProjectionResult(SceneStoreMemory &memory,
-                            persistence::SqliteRecord &statement,
-                            const std::uint64_t transaction_sequence,
-                            const std::size_t ordinal,
                             const core::ProjectionCommitResultDTO &result) {
-  SizedRow row(
-      statement,
-      "INSERT INTO logical_scene_projection_results("
-      "transaction_sequence,projection_ordinal,result_state,"
-      "acknowledged_retained_bundle_id,acknowledged_graph_revision,"
-      "acknowledged_scene_id,acknowledged_scene_revision_id,"
-      "acknowledged_scene_content_hash,rollback_proven,"
-      "resulting_health_state,error_code,error_message,error_details_json) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  row.Bind(
-      1, CheckedSafeCounter(transaction_sequence, "transaction_sequence"));
-  row.Bind(2, static_cast<std::int64_t>(ordinal));
-  row.Bind(3, ProjectionResultState(result.result));
-  if (result.acknowledged_projection_revision.has_value()) {
-    const auto &ack = *result.acknowledged_projection_revision;
-    row.Bind(4, ack.retained_bundle_id.value());
-    row.Bind(5, ack.graph_revision.value());
-    row.Bind(6, ack.scene_revision.scene_id.value());
-    row.Bind(7, CheckedSafeCounter(ack.scene_revision.revision_id,
-                                         "acknowledged scene revision"));
-    row.Bind(8, ack.scene_revision.content_hash.value());
-  } else {
-    for (int index = 4; index <= 8; ++index) {
-      row.BindNull(index);
-    }
-  }
-  row.Bind(9, std::int64_t{result.rollback_proven ? 1 : 0});
-  row.Bind(10, core::to_string(result.resulting_health.state));
-  if (result.error.has_value()) {
-    row.Bind(11, result.error->code);
-    row.Bind(12, result.error->message);
-    row.Bind(13, logical_scene_codec_internal::EncodeErrorDetails(
-                           result.error->details));
-  } else {
-    row.BindNull(11);
-    row.BindNull(12);
-    row.BindNull(13);
-  }
-  memory.transaction_file_bytes += SceneRowFileBytes(
-      row.record_bytes(), SceneTable("logical_scene_projection_results"));
   memory.transactions.back().projection_results.push_back(result.result);
 }
 
@@ -1531,10 +1023,9 @@ void InsertProjectionResult(SceneStoreMemory &memory,
 
 namespace manyforge::scene::logical_scene_owner_detail {
 
-[[nodiscard]] RequiredSceneProjection ResolveRequiredProjection(
-    const core::ProjectionExecutionHostBindingDTO &binding,
-    const core::IPlannerSceneProjectionResolver *resolver,
-    const ProjectionRevisionDTO &selected_revision) {
+[[nodiscard]] std::shared_ptr<core::IPlannerSceneProjection>
+ResolveProjectionClient(const core::ProjectionExecutionHostBindingDTO &binding,
+                        const core::IPlannerSceneProjectionResolver *resolver) {
   if (resolver == nullptr) {
     throw LogicalSceneOwnerConflictError(
         "native projection requires an installed projection resolver");
@@ -1562,17 +1053,12 @@ namespace manyforge::scene::logical_scene_owner_detail {
     throw LogicalSceneOwnerConflictError(
         "native projection is unavailable: " + detail);
   }
-  auto projection = std::move(resolved.value());
-  const auto health = [&]() {
-    try {
-      return projection->ProjectionHealthForRevision(selected_revision);
-    } catch (const std::bad_alloc &) {
-      throw;
-    } catch (const std::exception &error) {
-      throw LogicalSceneOwnerConflictError(
-          "native projection is unavailable: " + std::string(error.what()));
-    }
-  }();
+  return std::move(resolved.value());
+}
+
+void RequireProjectionHealth(
+    const core::ProjectionHealthDTO &health,
+    const core::ProjectionExecutionHostBindingDTO &binding) {
   if (!health.valid() || health.source_sequence == 0U) {
     throw LogicalSceneOwnerConflictError(
         "native projection returned malformed health");
@@ -1584,7 +1070,25 @@ namespace manyforge::scene::logical_scene_owner_detail {
         "resolved native projection differs from the selected host "
         "incarnation");
   }
-  return {std::move(projection), std::move(health)};
+}
+
+[[nodiscard]] RequiredSceneProjection ResolveRequiredProjection(
+    const core::ProjectionExecutionHostBindingDTO &binding,
+    const core::IPlannerSceneProjectionResolver *resolver,
+    const ProjectionRevisionDTO &selected_revision) {
+  auto projection = ResolveProjectionClient(binding, resolver);
+  auto health = [&]() {
+    try {
+      return projection->ProjectionHealthForRevision(selected_revision);
+    } catch (const std::bad_alloc &) {
+      throw;
+    } catch (const std::exception &error) {
+      throw LogicalSceneOwnerConflictError(
+          "native projection is unavailable: " + std::string(error.what()));
+    }
+  }();
+  RequireProjectionHealth(health, binding);
+  return {std::move(projection), std::move(health), binding};
 }
 
 } // namespace manyforge::scene::logical_scene_owner_detail
@@ -1728,7 +1232,8 @@ FrameSelectorForRequest(const SceneTransactionRequestDTO &request,
           return core::SceneFrameResolutionSelectorDTO{
               core::TargetCarrierSceneFrameRefDTO{
                   operation.controllable_component_id,
-                  operation.command_target_id, operation.frame_role_id}};
+                  operation.command_target_id, operation.frame_role_id,
+                  operation.carrier_component_id}};
         } else if constexpr (
             std::is_same_v<T,
                            core::DetachCarriedObjectAtCurrentPoseRequestDTO>) {
@@ -1831,8 +1336,7 @@ ResolveFrameAcrossProjections(
           {{"reason", "scene_frame_lease_binding_mismatch"}});
     }
     leases.emplace_back(projection.projection, lease_id);
-    const auto &runtime_unit_id =
-        projection.preflight_health.execution_host_binding.runtime_unit_id;
+    const auto &runtime_unit_id = projection.binding.runtime_unit_id;
     if (answered_units.contains(runtime_unit_id)) {
       continue;
     }
@@ -1918,9 +1422,10 @@ ResolveFrameForRequest(
 
 namespace manyforge::scene::logical_scene_owner_detail {
 
-[[nodiscard]] core::CollisionPolicySnapshot ProjectEffectivePolicy(
+[[nodiscard]] core::CollisionPolicySnapshot SelectEffectivePolicy(
     const LogicalSceneSnapshotDTO &candidate,
-    const std::vector<RequiredSceneProjection> &projections) {
+    std::vector<std::optional<core::Result<core::CollisionPolicySnapshot>>>
+        projections) {
   if (projections.empty()) {
     return candidate.configured_collision_policy;
   }
@@ -1930,9 +1435,15 @@ namespace manyforge::scene::logical_scene_owner_detail {
   // used by operation leases when derived pairs change with stable intent.
   const auto effective_policy_revision_id = candidate.revision.revision_id;
   std::optional<core::CollisionPolicySnapshot> selected;
-  for (const auto &projection : projections) {
-    auto projected = projection.projection->ProjectEffectiveCollisionPolicy(
-        candidate, effective_policy_revision_id);
+  for (auto &answer : projections) {
+    if (!answer.has_value()) {
+      throw SceneRequestRejectionError(
+          "live_scene_snapshot_unavailable",
+          "a required native projection answered no effective collision "
+          "policy",
+          {{"reason", "effective_collision_policy_unavailable"}});
+    }
+    auto &projected = *answer;
     if (!projected.ok()) {
       throw SceneRequestRejectionError(projected.error().code,
                                        projected.error().message,
@@ -1942,8 +1453,7 @@ namespace manyforge::scene::logical_scene_owner_detail {
     if (effective.revision.revision_id != effective_policy_revision_id ||
         effective.policy_id !=
             candidate.configured_collision_policy.policy_id ||
-        effective.contact_grasps !=
-            candidate.configured_collision_policy.contact_grasps ||
+        !effective.contact_rules.empty() ||
         effective.require_full_diagnostics !=
             candidate.configured_collision_policy.require_full_diagnostics) {
       throw SceneRequestRejectionError(
@@ -1977,6 +1487,20 @@ namespace manyforge::scene::logical_scene_owner_detail {
     }
   }
   return std::move(*selected);
+}
+
+[[nodiscard]] core::CollisionPolicySnapshot ProjectEffectivePolicy(
+    const LogicalSceneSnapshotDTO &candidate,
+    const std::vector<RequiredSceneProjection> &projections) {
+  std::vector<std::optional<core::Result<core::CollisionPolicySnapshot>>>
+      projected;
+  projected.reserve(projections.size());
+  for (const auto &projection : projections) {
+    projected.emplace_back(
+        projection.projection->ProjectEffectiveCollisionPolicy(
+            candidate, candidate.revision.revision_id));
+  }
+  return SelectEffectivePolicy(candidate, std::move(projected));
 }
 
 } // namespace manyforge::scene::logical_scene_owner_detail
@@ -2050,6 +1574,41 @@ NormalizeProjectionResult(const core::SceneTransactionDTO &transaction,
     return result;
   }
   return contract_error();
+}
+
+} // namespace
+} // namespace manyforge::scene::logical_scene_owner_detail
+
+namespace manyforge::scene::logical_scene_owner_detail {
+namespace {
+
+// A pose-only delta: the upsert of an existing cell-fixed object, without an
+// attachment, that keeps its collision shapes, mass and placement kind; only
+// its pose or provider evidence changes. It changes no topology, policy or
+// attachment, so it cannot change the effective collision policy, and the
+// Commit preflight asks for health only (OD-376 S5).
+[[nodiscard]] bool IsPoseOnlyDelta(
+    const LogicalSceneSnapshotDTO &current,
+    const core::ResolvedSceneOperationDTO &operation) {
+  const auto *upsert =
+      std::get_if<core::ResolvedUpsertSceneObjectDTO>(&operation);
+  if (upsert == nullptr || upsert->attachment.has_value()) {
+    return false;
+  }
+  const auto &next = upsert->object;
+  const auto found = std::lower_bound(
+      current.objects.begin(), current.objects.end(), next.scene_resource_id,
+      [](const SceneObjectSnapshotDTO &object, const SceneResourceId &id) {
+        return object.scene_resource_id < id;
+      });
+  return found != current.objects.end() &&
+         found->scene_resource_id == next.scene_resource_id &&
+         std::holds_alternative<core::CellFixedSceneObjectPlacementDTO>(
+             found->placement) &&
+         std::holds_alternative<core::CellFixedSceneObjectPlacementDTO>(
+             next.placement) &&
+         found->collision_shapes == next.collision_shapes &&
+         found->mass_kg == next.mass_kg;
 }
 
 } // namespace
@@ -2214,7 +1773,7 @@ LogicalSceneOwner::PreviewResolvedSceneCandidate(
       auto projection =
           ResolveRequiredProjection(
             binding, impl_->projection_resolver_, *observed_state.active_projection);
-      if (!projection.preflight_health.healthy_for_target(
+      if (!projection.preflight_health->healthy_for_target(
               *observed_state.active_projection)) {
         return reject(
             "live_scene_snapshot_unavailable",
@@ -2320,12 +1879,6 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   std::optional<core::CellAdmissionClaimIntentDTO> claim_intent;
   try {
     request_json = logical_scene_codec_internal::EncodeRequest(request);
-    if (request_json.empty() ||
-        request_json.size() > kMaximumLogicalSceneTransactionBytes) {
-      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                    "invalid_request",
-                    "scene request exceeds its canonical byte bound");
-    }
     request_digest_input =
         logical_scene_codec_internal::EncodeRequestDigestInput(request);
     request_digest = ContentDigest(
@@ -2340,14 +1893,19 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                   error.what());
   }
 
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
+  // OD-376: the owner lock is held only to read and write owner state, never
+  // across a host or Kernel call. Phase 1 reads and checks the state; the
+  // preflight, resolution and admission run unlocked; phase 2 commits the
+  // intent only when the state generation is unchanged (compare-and-commit),
+  // else the request is refused as stale. From its intent to its outcome
+  // the Commit is in flight: readers see the settled predecessor, every
+  // other write sees the unresolved intent and is refused.
+  std::unique_lock lock(impl_->mutex_);
   auto &memory = impl_->memory_;
   DurableState observed_state;
   std::optional<SceneTransactionStoreState> observed_transactions;
-  std::optional<ResolvedSceneCandidate> candidate;
-
-  {
+  bool recovered_claims_settled = false;
+  for (;;) {
     const auto &cached = impl_->ReadSceneCommitState();
     observed_state = cached.durable_state;
     observed_transactions = cached.transaction_state;
@@ -2369,24 +1927,34 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                       "request_id_conflict",
                       "scene request key was reused with different intent");
       }
+      auto replayed = ResultFromStoredOutcome(
+          memory, *existing, core::RequestReplayStatusDTO::kReplayedExact);
+      const bool success = existing->success;
+      const auto projection_status = existing->projection_status;
+      lock.unlock();
       if (impl_->cell_admission_ != nullptr) {
         try {
-          SettleAuthoredSceneClaimIfHeld(
-              *impl_->cell_admission_, request, request_digest,
-              existing->success, existing->projection_status);
+          SettleAuthoredSceneClaimIfHeld(*impl_->cell_admission_, request,
+                                         request_digest, success,
+                                         projection_status);
         } catch (const CellAdmissionTemporarilyUnavailable &) {
           // Exact replay remains deterministic while the retained Kernel
           // claim, if any, continues to keep authoring fail-closed.
         }
       }
-      return ResultFromStoredOutcome(
-          memory, *existing, core::RequestReplayStatusDTO::kReplayedExact);
+      return replayed;
     }
     if (authored_mutation && impl_->cell_admission_ == nullptr) {
       return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                     "authoring_not_ready",
                     "new authored scene mutation requires owner-local "
                     "admission");
+    }
+    if (impl_->commit_in_flight_.has_value()) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "stale_revision",
+                    "another Scene change is being committed",
+                    {{"reason", "scene_commit_in_progress"}});
     }
     const auto access = AccessStatus(observed_state);
     if (!access.scene_writes_open) {
@@ -2401,76 +1969,168 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
           core::RequestReplayStatusDTO::kAcceptedNew, "stale_revision",
           "expected projection names another Deployment or Scene");
     }
-    // The file bytes the next transaction can take (od212). The resident
-    // transactions are folded first when it would not fit: a fold loses
-    // nothing.
-    const auto transaction_bytes = SceneTransactionFileBytesBound(
-        request_json.size(), ActiveExecutionHostBindings(observed_state).size());
-    const auto fits = [&] {
-      return SceneFileBytes(memory) + transaction_bytes <=
-             kSceneStoreRecordFileBytes;
-    };
     if (observed_transactions->resident_transaction_count >=
-            kMaximumLogicalSceneTransactions ||
-        (observed_transactions->resident_transaction_count != 0U && !fits())) {
-      if (impl_->cell_admission_ != nullptr) {
-        // A durable Scene outcome can precede its admission release. Preserve
-        // that proof until exact settlement succeeds, before pruning it.
+        kMaximumLogicalSceneTransactions) {
+      if (impl_->cell_admission_ != nullptr && !recovered_claims_settled) {
+        // A recorded Scene outcome can precede its admission release. Keep
+        // that proof until exact settlement succeeds, before folding it. The
+        // settlement runs unlocked; the state is then read again.
+        const auto claims = RecoveredAuthoredSceneClaims(memory);
+        lock.unlock();
         try {
-          SettleRecoveredAuthoredSceneClaims(memory, *impl_->cell_admission_);
+          SettleRecoveredAuthoredSceneClaims(claims, *impl_->cell_admission_);
         } catch (const CellAdmissionTemporarilyUnavailable &error) {
           return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                         "kernel_owner_unavailable", error.what());
         }
+        recovered_claims_settled = true;
+        lock.lock();
+        continue;
       }
       impl_->InvalidateSceneCommitState();
       auto compaction = PrepareSceneHistoryCompaction(
           memory, observed_state, *observed_transactions, false);
-      persistence::SqliteRecord record;
-      CompactSceneTransactionHistory(memory, record, std::move(compaction),
+      CompactSceneTransactionHistory(memory, std::move(compaction),
                                      observed_state, *observed_transactions);
-      impl_->Post(std::move(record));
       observed_transactions->resident_transaction_count = 0U;
       impl_->StoreSceneCommitState(observed_state, observed_transactions);
       // The triggering request continues below in the same epoch.
     }
-    // Then the maintenance initializations no reader still needs give way,
-    // oldest first. When nothing can, the transaction goes on; a file write
-    // that does not fit then fails and is counted.
-    if (!fits()) {
-      const auto evictions = MaintenanceEvictions(
-          memory, observed_state,
-          memory.history.compacted_maintenance_completion_count, 0U,
-          transaction_bytes, false);
-      if (!evictions.empty()) {
-        impl_->InvalidateSceneCommitState();
-        persistence::SqliteRecord record;
-        for (const auto *row : evictions) {
-          DeleteMaintenanceInitialization(memory, record, *row);
-        }
-        impl_->Post(std::move(record));
-        observed_state = impl_->ReadStateTransaction();
-        impl_->StoreSceneCommitState(observed_state, observed_transactions);
-      }
-    }
+    break;
   }
+  const auto observed_generation = impl_->state_generation_;
+  lock.unlock();
 
-  std::vector<RequiredSceneProjection> projections;
+  const auto active = *observed_state.active_projection;
   const auto required_bindings = ActiveExecutionHostBindings(observed_state);
+  std::vector<RequiredSceneProjection> projections;
   projections.reserve(required_bindings.size());
   for (const auto &binding : required_bindings) {
     try {
-      auto projection =
-          ResolveRequiredProjection(
-            binding, impl_->projection_resolver_, *observed_state.active_projection);
-      if (!projection.preflight_health.healthy_for_target(
-              *observed_state.active_projection)) {
+      // Its health is the preflight's answer below.
+      projections.push_back(
+          {ResolveProjectionClient(binding, impl_->projection_resolver_),
+           std::nullopt, binding});
+    } catch (const std::exception &error) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "live_scene_snapshot_unavailable", error.what());
+    }
+  }
+
+  // The typed refusal of a failed frame resolution, candidate or policy.
+  const auto refusal = [&]() -> SceneCommitResultDTO {
+    try {
+      throw;
+    } catch (const SceneRequestRejectionError &error) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew, error.code(),
+                    error.what(), error.details());
+    } catch (const LogicalSceneOwnerConflictError &error) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "scene_object_state_conflict", error.what());
+    } catch (const LogicalSceneOwnerLimitError &error) {
+      return reject(core::RequestReplayStatusDTO::kRequestLedgerFull,
+                    "request_ledger_full", error.what());
+    } catch (const std::invalid_argument &error) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "invalid_request", error.what());
+    } catch (const std::exception &error) {
+      return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                    "live_scene_snapshot_unavailable", error.what());
+    }
+  };
+
+  // The candidate is resolved, validated and digested once, here. Its
+  // refusal waits for the preflight: an unhealthy projection is refused
+  // first, as before.
+  std::optional<ResolvedSceneCandidate> candidate;
+  std::optional<core::SceneTransactionDTO> scene_transaction;
+  std::optional<SceneCommitResultDTO> candidate_refusal;
+  try {
+    // A request may name any revision of this Scene;
+    // its frames and candidate always resolve against the active revision.
+    auto active_request = request;
+    active_request.expected_projection_revision = active;
+    const auto frame_resolution = ResolveFrameForRequest(
+        active_request, *observed_state.active_scene_snapshot, projections);
+    candidate = ResolveSceneCandidate(
+        active_request, *observed_state.active_scene_snapshot,
+        observed_transactions->next_transaction_sequence, request_digest,
+        frame_resolution);
+    // A Scene that could not be published in the Manager status stream is
+    // refused here, before any claim or intent.
+    if (candidate->snapshot.revision != active.scene_revision) {
+      const auto bytes =
+          logical_scene_codec_internal::EncodeSnapshot(candidate->snapshot)
+              .size();
+      if (bytes > kMaximumLogicalSceneSnapshotBytes) {
+        throw SceneRequestRejectionError(
+            "scene_too_large",
+            "the changed Scene would exceed its size limit",
+            {{"scene_bytes", std::to_string(bytes)},
+             {"maximum_scene_bytes",
+              std::to_string(kMaximumLogicalSceneSnapshotBytes)}});
+      }
+    }
+    scene_transaction = core::SceneTransactionDTO{
+        request.request_context.request_key,
+        request.attribution,
+        observed_transactions->next_transaction_sequence,
+        active,
+        ProjectionRevisionDTO{
+            active.retained_bundle_id,
+            active.graph_revision,
+            candidate->snapshot.revision,
+        },
+        request_digest,
+        candidate->operation,
+        candidate->resolution_evidence_digest,
+    };
+  } catch (const std::exception &) {
+    candidate_refusal = refusal();
+  }
+
+  // One preflight call per projection: its health at the predecessor and,
+  // unless the delta only moves an object, the effective policy of the
+  // candidate.
+  const bool project_policy =
+      scene_transaction.has_value() &&
+      !IsPoseOnlyDelta(*observed_state.active_scene_snapshot,
+                       scene_transaction->resolved_operation);
+  std::vector<std::optional<core::Result<core::CollisionPolicySnapshot>>>
+      effective_policies;
+  effective_policies.reserve(projections.size());
+  for (auto &projection : projections) {
+    try {
+      auto answer = [&] {
+        try {
+          return projection.projection->CommitPreflight(
+              active, project_policy ? &*scene_transaction : nullptr,
+              project_policy ? &candidate->snapshot : nullptr);
+        } catch (const std::bad_alloc &) {
+          throw;
+        } catch (const std::exception &error) {
+          throw LogicalSceneOwnerConflictError(
+              "native projection is unavailable: " +
+              std::string(error.what()));
+        }
+      }();
+      // A typed refusal of the call itself, e.g. a transaction beyond the
+      // transport bound (native_projection_rpc_bound_exceeded).
+      if (!answer.ok()) {
+        return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                      answer.error().code, answer.error().message,
+                      answer.error().details);
+      }
+      auto &preflight = answer.value();
+      RequireProjectionHealth(preflight.health, projection.binding);
+      if (!preflight.health.healthy_for_target(active)) {
         return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                       "live_scene_snapshot_unavailable",
                       "a required native scene projection is not healthy at "
                       "the exact predecessor revision");
       }
-      projections.push_back(std::move(projection));
+      projection.preflight_health = std::move(preflight.health);
+      effective_policies.push_back(std::move(preflight.effective_policy));
     } catch (const std::exception &error) {
       return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                     "live_scene_snapshot_unavailable", error.what());
@@ -2481,40 +2141,20 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                     "exception");
     }
   }
-
-  try {
-    // A request may name any revision of this Scene;
-    // its frames and candidate always resolve against the active revision.
-    auto active_request = request;
-    active_request.expected_projection_revision =
-        *observed_state.active_projection;
-    const auto frame_resolution = ResolveFrameForRequest(
-        active_request, *observed_state.active_scene_snapshot, projections);
-    candidate = ResolveSceneCandidate(
-        active_request, *observed_state.active_scene_snapshot,
-        observed_transactions->next_transaction_sequence, request_digest,
-        frame_resolution);
-    auto effective_policy =
-        ProjectEffectivePolicy(candidate->snapshot, projections);
-    if (auto *policy = std::get_if<core::ResolvedCollisionPolicyDTO>(
-            &candidate->operation)) {
-      policy->effective_policy = std::move(effective_policy);
+  if (candidate_refusal.has_value()) {
+    return *candidate_refusal;
+  }
+  if (project_policy) {
+    try {
+      auto effective_policy = SelectEffectivePolicy(
+          candidate->snapshot, std::move(effective_policies));
+      if (auto *policy = std::get_if<core::ResolvedCollisionPolicyDTO>(
+              &scene_transaction->resolved_operation)) {
+        policy->effective_policy = std::move(effective_policy);
+      }
+    } catch (const std::exception &) {
+      return refusal();
     }
-  } catch (const SceneRequestRejectionError &error) {
-    return reject(core::RequestReplayStatusDTO::kAcceptedNew, error.code(),
-                  error.what(), error.details());
-  } catch (const LogicalSceneOwnerConflictError &error) {
-    return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                  "scene_object_state_conflict", error.what());
-  } catch (const LogicalSceneOwnerLimitError &error) {
-    return reject(core::RequestReplayStatusDTO::kRequestLedgerFull,
-                  "request_ledger_full", error.what());
-  } catch (const std::invalid_argument &error) {
-    return reject(core::RequestReplayStatusDTO::kAcceptedNew, "invalid_request",
-                  error.what());
-  } catch (const std::exception &error) {
-    return reject(core::RequestReplayStatusDTO::kAcceptedNew,
-                  "live_scene_snapshot_unavailable", error.what());
   }
 
   if (program_reset_mutation) {
@@ -2529,101 +2169,107 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     }
   }
 
-  core::SceneTransactionDTO scene_transaction{
-      request.request_context.request_key,
-      request.attribution,
-      observed_transactions->next_transaction_sequence,
-      *observed_state.active_projection,
-      ProjectionRevisionDTO{
-          observed_state.active_projection->retained_bundle_id,
-          observed_state.active_projection->graph_revision,
-          candidate->snapshot.revision,
-      },
-      request_digest,
-      candidate->operation,
-      candidate->resolution_evidence_digest,
+  lock.lock();
+  if (impl_->state_generation_ != observed_generation) {
+    return reject(core::RequestReplayStatusDTO::kAcceptedNew, "stale_revision",
+                  "the Scene changed while this request was prepared",
+                  {{"reason", "scene_commit_concurrent_change"}});
+  }
+  impl_->InvalidateSceneCommitState();
+  InsertSceneIntent(memory, request, request_digest, std::move(request_json),
+                    *scene_transaction, *candidate, projections.size());
+  InsertSceneTransactionOwnerEvent(
+      memory, observed_transactions->next_owner_event_sequence,
+      scene_transaction->transaction_sequence);
+  // In flight from the intent to the outcome, across the admission claim
+  // and the native apply.
+  impl_->commit_in_flight_.emplace(SceneCommitStateCache{
+      std::move(observed_state), std::move(observed_transactions)});
+  // Ends this Commit's in-flight state if an exception leaves it set: the
+  // unresolved intent is then visible to readers, closed, as before. Once
+  // taken, the state is no longer this Commit's to clear.
+  struct InFlight final {
+    LogicalSceneOwner::Impl &impl;
+    std::unique_lock<std::mutex> &lock;
+    bool owned{true};
+    ~InFlight() {
+      if (!owned) {
+        return;
+      }
+      if (!lock.owns_lock()) {
+        lock.lock();
+      }
+      impl.EndCommitInFlight();
+    }
+  } in_flight{*impl_, lock, true};
+  // Under the lock: the settled predecessor, no longer in flight.
+  const auto take_settled = [&] {
+    auto settled = std::move(*impl_->commit_in_flight_);
+    impl_->EndCommitInFlight();
+    in_flight.owned = false;
+    return settled;
   };
 
-  const auto reconstructed = core::ApplyResolvedSceneTransaction(
-      *observed_state.active_scene_snapshot, scene_transaction);
-  if (!reconstructed.ok()) {
-    throw LogicalSceneOwnerIntegrityError(
-        "owner-normalized scene transaction was rejected by the shared "
-        "projection reducer: " +
-        reconstructed.error().message);
-  }
-  if (reconstructed.value() != candidate->snapshot) {
-    throw LogicalSceneOwnerIntegrityError(
-        "owner-normalized scene transaction does not reproduce its exact "
-        "candidate snapshot");
-  }
-
-  {
-    if (NextSceneOwnerEventSequence(memory) !=
-            observed_transactions->next_owner_event_sequence ||
-        ReadOutcomeForRequest(memory, request.request_context.request_key)
-            .has_value()) {
-      impl_->InvalidateSceneCommitState();
-      throw LogicalSceneOwnerIntegrityError(
-          "logical-scene database changed outside its owner before durable "
-          "acceptance");
-    }
-    impl_->InvalidateSceneCommitState();
-    persistence::SqliteRecord write;
-    InsertSceneIntent(memory, write, request, request_digest, request_json,
-                      scene_transaction, *candidate, projections.size());
-    InsertSceneTransactionOwnerEvent(
-        memory, write, observed_transactions->next_owner_event_sequence,
-        scene_transaction.transaction_sequence);
-    impl_->Post(std::move(write));
-  }
-
+  // The intent is recorded before the claim is acquired, so no claim is
+  // held without one; a refused claim is this request's outcome.
   std::optional<core::CellAdmissionClaimDTO> authored_claim;
   if (authored_mutation && !program_reset_mutation) {
-    try {
-      authored_claim =
-          RequireAuthoredSceneClaim(*impl_->cell_admission_, *claim_intent);
-    } catch (const std::exception &error) {
-      const auto *rejected =
-          dynamic_cast<const CellAdmissionClaimRejected *>(&error);
-      const auto rejection =
-          rejected != nullptr ? rejected->error()
-                              : SceneError("authoring_not_ready", error.what());
-      persistence::SqliteRecord outcome;
+    lock.unlock();
+    // An admission owner that cannot be reached refuses authoring
+    // (authoring_not_ready), as the receipt lookup that preceded the claim
+    // did before OD-376; the Kernel's own refusal is the outcome as it is.
+    auto acquired = [&] {
+      try {
+        auto claim =
+            impl_->cell_admission_->AcquireCellAdmissionClaim(*claim_intent);
+        if (!claim.ok() && AdmissionOwnerUnreachable(claim.error().code)) {
+          return core::Result<core::CellAdmissionClaimDTO>::Err(
+              SceneError("authoring_not_ready",
+                         "authored scene admission is unavailable: " +
+                             claim.error().message));
+        }
+        return claim;
+      } catch (const std::exception &error) {
+        return core::Result<core::CellAdmissionClaimDTO>::Err(
+            SceneError("authoring_not_ready", error.what()));
+      }
+    }();
+    lock.lock();
+    if (!acquired.ok()) {
       InsertSceneOutcome(
-          memory, outcome, request.request_context.request_key,
-          request_digest, scene_transaction.transaction_sequence, false,
-          SceneProjectionCommitStatusDTO::kNotAttempted, 0U, rejection);
-      impl_->Post(std::move(outcome));
+          memory, request.request_context.request_key, request_digest,
+          scene_transaction->transaction_sequence, false,
+          SceneProjectionCommitStatusDTO::kNotAttempted, 0U, acquired.error());
+      // Readers replay the store again: the cache was dropped at the intent.
+      static_cast<void>(take_settled());
       return FailedSceneResult(request.request_context.request_key,
                                core::RequestReplayStatusDTO::kAcceptedNew,
-                               rejection,
+                               acquired.error(),
                                SceneProjectionCommitStatusDTO::kNotAttempted);
     }
+    authored_claim = std::move(acquired.value());
   }
   if (!projections.empty()) {
-    persistence::SqliteRecord attempt;
-    InsertProjectionAttempt(
-        memory, attempt, scene_transaction.transaction_sequence, 0U,
-        projections.front().preflight_health.execution_host_binding);
-    impl_->Post(std::move(attempt));
+    InsertProjectionAttempt(memory);
+    lock.unlock();
   }
 
+  const auto &transaction = *scene_transaction;
   bool every_attempt_rolled_back = true;
   for (std::size_t ordinal = 0U; ordinal < projections.size(); ++ordinal) {
     const auto &projection = projections[ordinal];
     core::ProjectionCommitResultDTO projection_result = [&] {
       try {
         return NormalizeProjectionResult(
-            scene_transaction, projection.preflight_health,
-            projection.projection->ApplyTransaction(scene_transaction));
+            transaction, *projection.preflight_health,
+            projection.projection->ApplyTransaction(transaction));
       } catch (const std::exception &error) {
         return UncertainProjectionResult(
-            scene_transaction, projection.preflight_health,
+            transaction, *projection.preflight_health,
             SceneError("scene_projection_call_failed", error.what()));
       } catch (...) {
         return UncertainProjectionResult(
-            scene_transaction, projection.preflight_health,
+            transaction, *projection.preflight_health,
             SceneError("scene_projection_call_failed",
                        "native scene projection threw a non-standard "
                        "exception"));
@@ -2636,10 +2282,8 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     const bool committed = projection_result.result ==
                            core::ProjectionCommitResultStateDTO::kCommitted;
 
-    persistence::SqliteRecord result_write;
-    InsertProjectionResult(memory, result_write,
-                           scene_transaction.transaction_sequence, ordinal,
-                           projection_result);
+    lock.lock();
+    InsertProjectionResult(memory, projection_result);
     if (!committed) {
       const auto status =
           every_attempt_rolled_back
@@ -2652,10 +2296,9 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                     "scene_projection_commit_uncertain",
                     "at least one invoked native projection cannot prove the "
                     "predecessor state");
-      InsertSceneOutcome(memory, result_write,
-                         request.request_context.request_key, request_digest,
-                         scene_transaction.transaction_sequence, false, status,
-                         ordinal + 1U, error);
+      InsertSceneOutcome(memory, request.request_context.request_key,
+                         request_digest, transaction.transaction_sequence,
+                         false, status, ordinal + 1U, error);
       if (status ==
           SceneProjectionCommitStatusDTO::kFailedProjectionUncertain) {
         const auto failed_state = ReadCompleteDurableState(memory);
@@ -2664,78 +2307,89 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
               "uncertain projection result did not close projection leases");
         }
       }
-      impl_->Post(std::move(result_write));
-      if (status == SceneProjectionCommitStatusDTO::kRejectedRollbackProven) {
-        if (authored_claim.has_value()) {
-          ReleaseAuthoredSceneClaim(
-              *impl_->cell_admission_, *authored_claim, request_digest,
-              core::CellAdmissionSettlementKindDTO::kProvenNoEffect);
-        }
-        ++observed_transactions->next_transaction_sequence;
-        ++observed_transactions->next_owner_event_sequence;
-        ++observed_transactions->resident_transaction_count;
-        impl_->StoreSceneCommitState(observed_state, observed_transactions);
+      // Still in flight while the claim is settled, so no other writer can
+      // settle it first.
+      if (status == SceneProjectionCommitStatusDTO::kRejectedRollbackProven &&
+          authored_claim.has_value()) {
+        lock.unlock();
+        ReleaseAuthoredSceneClaim(
+            *impl_->cell_admission_, *authored_claim, request_digest,
+            core::CellAdmissionSettlementKindDTO::kProvenNoEffect);
+        lock.lock();
       }
+      auto settled = take_settled();
+      if (status == SceneProjectionCommitStatusDTO::kRejectedRollbackProven) {
+        auto &transactions = *settled.transaction_state;
+        ++transactions.next_transaction_sequence;
+        ++transactions.next_owner_event_sequence;
+        ++transactions.resident_transaction_count;
+        impl_->StoreSceneCommitState(std::move(settled.durable_state),
+                                     std::move(settled.transaction_state));
+      }
+      lock.unlock();
       return FailedSceneResult(request.request_context.request_key,
                                core::RequestReplayStatusDTO::kAcceptedNew,
                                std::move(error), status);
     }
     if (ordinal + 1U < projections.size()) {
-      InsertProjectionAttempt(
-          memory, result_write, scene_transaction.transaction_sequence,
-          ordinal + 1U,
-          projections[ordinal + 1U].preflight_health.execution_host_binding);
+      InsertProjectionAttempt(memory);
+      lock.unlock();
     } else {
-      InsertSceneOutcome(memory, result_write,
-                         request.request_context.request_key, request_digest,
-                         scene_transaction.transaction_sequence, true,
-                         SceneProjectionCommitStatusDTO::kCommitted,
+      InsertSceneOutcome(memory, request.request_context.request_key,
+                         request_digest, transaction.transaction_sequence,
+                         true, SceneProjectionCommitStatusDTO::kCommitted,
                          projections.size(), std::nullopt);
     }
-    impl_->Post(std::move(result_write));
   }
 
   if (projections.empty()) {
-    persistence::SqliteRecord outcome;
-    InsertSceneOutcome(memory, outcome, request.request_context.request_key,
-                       request_digest,
-                       scene_transaction.transaction_sequence, true,
+    InsertSceneOutcome(memory, request.request_context.request_key,
+                       request_digest, transaction.transaction_sequence, true,
                        SceneProjectionCommitStatusDTO::kCommitted,
                        projections.size(), std::nullopt);
-    impl_->Post(std::move(outcome));
   }
 
+  // Still in flight while the claim is settled, so no other writer can
+  // settle it first.
   if (authored_claim.has_value()) {
+    lock.unlock();
     ReleaseAuthoredSceneClaim(
         *impl_->cell_admission_, *authored_claim, request_digest,
         core::CellAdmissionSettlementKindDTO::kOwnerCommit);
+    lock.lock();
   }
-
-  observed_state.active_projection =
-      scene_transaction.proposed_projection_revision;
-  observed_state.active_scene_snapshot = candidate->snapshot;
-  observed_state.projection_desynchronized = false;
-  observed_state.unresolved_scene_transaction = false;
-  observed_state.latest_uncertain_transaction_sequence.reset();
-  observed_transactions->active_projection =
-      scene_transaction.proposed_projection_revision;
-  observed_transactions->active_snapshot = candidate->snapshot;
-  ++observed_transactions->next_transaction_sequence;
-  ++observed_transactions->next_owner_event_sequence;
-  ++observed_transactions->resident_transaction_count;
-  observed_transactions->projection_desynchronized = false;
-  observed_transactions->unresolved_native_attempt = false;
-  observed_transactions->unresolved_transaction_sequence.reset();
-  observed_transactions->latest_uncertain_transaction_sequence.reset();
-  impl_->StoreSceneCommitState(observed_state, observed_transactions);
+  auto settled = take_settled();
+  // The settled head: later reads take it instead of replaying the delta.
+  memory.settled_head =
+      SettledSceneHead{transaction.transaction_sequence, candidate->snapshot};
+  auto &settled_state = settled.durable_state;
+  auto &settled_transactions = *settled.transaction_state;
+  settled_state.active_projection = transaction.proposed_projection_revision;
+  settled_state.active_scene_snapshot = candidate->snapshot;
+  settled_state.projection_desynchronized = false;
+  settled_state.unresolved_scene_transaction = false;
+  settled_state.latest_uncertain_transaction_sequence.reset();
+  settled_transactions.active_projection =
+      transaction.proposed_projection_revision;
+  settled_transactions.active_snapshot = std::move(candidate->snapshot);
+  ++settled_transactions.next_transaction_sequence;
+  ++settled_transactions.next_owner_event_sequence;
+  ++settled_transactions.resident_transaction_count;
+  settled_transactions.projection_desynchronized = false;
+  settled_transactions.unresolved_native_attempt = false;
+  settled_transactions.unresolved_transaction_sequence.reset();
+  settled_transactions.latest_uncertain_transaction_sequence.reset();
+  impl_->StoreSceneCommitState(std::move(settled.durable_state),
+                               std::move(settled.transaction_state));
+  lock.unlock();
 
   SceneCommitResultDTO result{
       request.request_context.request_key,
       core::RequestReplayStatusDTO::kAcceptedNew,
       true,
       std::nullopt,
-      scene_transaction.transaction_sequence,
-      scene_transaction.proposed_projection_revision,
+      transaction.transaction_sequence,
+      transaction.proposed_projection_revision,
       SceneProjectionCommitStatusDTO::kCommitted,
       candidate->update_status,
   };

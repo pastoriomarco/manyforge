@@ -1,6 +1,5 @@
 #pragma once
 
-#include <manyforge_core/types/program_contact_envelope.hpp>
 #include <manyforge_core/types/program_reference.hpp>
 
 #include <cstddef>
@@ -16,7 +15,7 @@ namespace manyforge::core {
 
 struct ProgramBindingDTO;
 
-inline constexpr std::string_view kProgramApiVersion = "manyforge.program.v3";
+inline constexpr std::string_view kProgramApiVersion = "manyforge.program.v4";
 inline constexpr std::string_view kComposableCellProgramProfile = "composable-cell-v1";
 inline constexpr std::size_t kMaxProgramContractRoles = 4096U;
 inline constexpr std::size_t kMaxProgramRoleRequirements = 4096U;
@@ -184,7 +183,6 @@ using ProgramRunResolutionContext = std::shared_ptr<const void>;
 struct ProgramRunExecutionCaptureDTO final {
   CellAdmissionClaimGeneration claim_generation;
   ProgramRunNumber program_run_id;
-  ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
   RetainedBundleId retained_bundle_id;
@@ -297,47 +295,27 @@ struct ProgramTargetRequirementDTO final {
 };
 
 /// A component-local body selected directly by the Program.
-struct ProgramContactGraspBodySelectorDTO final {
-  ProgramCollisionBodyReferenceDTO body;
-
-  friend bool operator==(const ProgramContactGraspBodySelectorDTO&,
-                         const ProgramContactGraspBodySelectorDTO&) = default;
-};
-
-/// Binding-relevant projection of the currently qualified geometry-only
-/// `contact_grasp` policy subset. The complete canonical policy remains in the
-/// sealed Program; this value contains only what the binding compiler must
-/// resolve before a selected scene resource is known.
-struct ProgramContactGraspTemplateDTO final {
-  ContactPolicyId contact_policy_id;
-  ContactPolicyRevision contact_policy_revision;
-  RuntimeObjectId runtime_object_id;
-  std::vector<ProgramContactGraspBodySelectorDTO> allowed_body_selectors;
-  ContactZoneEnvelopeDTO envelope{ContactGraspEnvelopeDTO{}};
-
-  /// Resolve bodies from the operation's selected motion endpoint; explicit
-  /// body selectors must be empty in this mode.
-  bool bodies_from_motion_endpoint{};
-
-  friend bool operator==(const ProgramContactGraspTemplateDTO&,
-                         const ProgramContactGraspTemplateDTO&) = default;
-};
-
 /// Binding-relevant projection of one complete, revision-verified Program.
 ///
 /// This DTO remains an untrusted representation. The deployment package's
 /// sealed ProgramBindingContract is the proof that it was extracted from the
 /// exact canonical Program and resolved against one retained node catalog.
 struct ProgramBindingContractDTO final {
-  ProgramId program_id;
   ProgramRevision program_revision;
   RetainedNodeEnvironmentDTO node_environment;
   std::vector<ProgramTargetRequirementDTO> target_requirements;
   std::vector<ProgramFrameReferenceDTO> frame_requirements;
   std::vector<ProgramSignalReferenceDTO> signal_requirements;
   std::vector<ProgramCollisionBodyReferenceDTO> collision_body_requirements;
-  std::vector<ProgramContactGraspTemplateDTO> contact_grasp_templates{};
+  /// The collision bodies that node `collision_rules` select (`collision_body`
+  /// selections), sorted and unique. Every entry is also a collision body
+  /// requirement.
+  std::vector<ProgramCollisionBodyReferenceDTO> collision_rule_bodies{};
   std::vector<ProgramNodePolicyDTO> node_policies{};
+  /// The generated-tool spring sliders that node `collision_rules` switch on
+  /// (`spring_slider` rows, OD-371): {tool, slider element = its collision
+  /// body role}, sorted and unique. Every entry is also a collision-rule body.
+  std::vector<ProgramCollisionBodyReferenceDTO> collision_rule_spring_sliders{};
 
   friend bool operator==(const ProgramBindingContractDTO&,
                          const ProgramBindingContractDTO&) = default;

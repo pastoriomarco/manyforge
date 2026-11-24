@@ -2237,6 +2237,11 @@ void add_expanded_occurrence(
   SrdfSemanticBudget budget;
   const auto parent_joint_by_child =
       build_parent_joint_by_child_index(accumulator.urdf);
+  std::unordered_map<std::string, std::string_view> child_link_by_joint;
+  child_link_by_joint.reserve(accumulator.urdf.joints.size());
+  for (const auto& joint : accumulator.urdf.joints) {
+    child_link_by_joint.emplace(joint.name, joint.child_link_name);
+  }
 
   for (const auto& group_name : accumulator.group_expansion_postorder) {
     const auto& group = *group_by_name.at(group_name);
@@ -2282,6 +2287,11 @@ void add_expanded_occurrence(
                  joint != nullptr) {
         add_direct(joint->joint_name, ExpansionMemberKind::kJoint,
                    SrdfExpansionProvenanceKind::kDirectJoint,
+                   std::nullopt);
+        // As in MoveIt, a listed joint also brings in its child link.
+        add_direct(child_link_by_joint.at(joint->joint_name),
+                   ExpansionMemberKind::kLink,
+                   SrdfExpansionProvenanceKind::kJointChildLink,
                    std::nullopt);
       } else if (const auto* chain =
                      std::get_if<SrdfChainGroupMemberIr>(&member);

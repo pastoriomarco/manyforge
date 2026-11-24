@@ -24,7 +24,7 @@ const viewerReady = new URLSearchParams(location.search).has('viewer') ? (async 
       scene_resource_id: 'fixture-box', collision_shapes: [{ type: 'box', dimensions_m: { x: 0.2, y: 0.2, z: 0.2 } }],
       placement: { kind: 'cell_fixed', cell_id: 'fixture', pose_in_cell: {
         position_m: { x: 0, y: 0, z: 0.1 }, orientation_xyzw: [0, 0, 0, 1],
-      } }, provider_evidence: null, support_contacts: [],
+      } }, provider_evidence: null,
     }]} />));
 })() : Promise.resolve();
 const entry: CatalogEntry = {
@@ -36,7 +36,7 @@ const entry: CatalogEntry = {
 };
 const node = { node_id: entry.id, instance_id: 'edit', parameters: {}, children: [] };
 const program: ProgramAuthoringDocument = {
-  api_version: 'manyforge.program.v2', program_id: 'editor_fixture', name: 'Editor fixture',
+  api_version: 'manyforge.program.v2',
   program_profile: 'composable-cell-v1', catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.4.0' },
   component_roles: {}, target_roles: {}, schema_version: 'manyforge.composer_authoring_forest.v1',
   forest: [node], positions: {},

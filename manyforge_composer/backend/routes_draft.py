@@ -15,7 +15,11 @@ from manyforge_behavior.canonical_artifact import (
     raw_sha256_digest,
     StrictArtifactError,
 )
-from manyforge_behavior.model_source_capture import ModelSourceCaptureError, capture_deployment_model_sources
+from manyforge_behavior.model_source_capture import (
+    ModelSourceCaptureError,
+    SceneMeshPathError,
+    capture_deployment_model_sources,
+)
 from manyforge_behavior.program import (
     Program,
     ProgramValidationError,
@@ -27,10 +31,12 @@ from manyforge_headless_api.program_binding_projection import (
 )
 from pydantic import BaseModel, ConfigDict, Field
 
+from .deployment_defaults import with_defaults
 from .deployment_draft import DeploymentDraftError
 from .draft_session import (
     DraftSessionError,
     OPERATOR_DRAFT_MUTATIONS,
+    PreparedProgramReplacement,
 )
 from .authoring_forest import AuthoringForestError, derive_candidate, from_program
 from .expression_check import ExpressionCheckRefusal, check_draft_expression
@@ -56,8 +62,6 @@ from .reset_apply_log import log_reset_apply_link
 from .program_artifacts import (
     ProgramArtifactError,
     load_program_artifact,
-    normalize_program_save_path,
-    save_program_artifact,
 )
 from .scenario_restore import (
     saved_deployment_differs_from,
@@ -67,22 +71,17 @@ from .scenario_restore import (
 from .state import ComposerState
 from .authoring_admission import (
     AuthoringMutationEnvelope,
-    OperationEffects,
     draft_session_http_exception,
     headless_client_http_exception,
-    raise_save_failure,
     scenario_artifact_http_exception,
 )
 from .authoring_workspace import (
     AuthoringOperationContext,
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
-    scenario_project_facts,
 )
 from .scenario_artifacts import (
-    SCENARIO_PROJECT_MEMBERS,
     ScenarioArtifactError,
-    save_scenario_member,
 )
 from .authoring_workspace_fence import (
     commit_draft_edit,
@@ -97,9 +96,7 @@ _AUTHORING_MUTATIONS = frozenset(
         "blackboard_draft_remove_namespaces",
         "blackboard_draft_upsert_keys",
         "blackboard_draft_upsert_namespaces",
-        "program_draft_remove_contact_policies",
         "program_draft_remove_parameters",
-        "program_draft_upsert_contact_policies",
         "program_draft_upsert_parameters",
         "program_draft_update_motion_defaults",
         "scene_draft_add_object",
@@ -204,15 +201,6 @@ class ExpressionCheckRequest(BaseModel):
     expression: str = Field(max_length=65_536)
     destination_type: Literal["bool", "int64", "float64", "string"]
     exclude_computed_key: str | None = Field(default=None, min_length=1, max_length=256)
-
-
-class SaveDraftRequest(_LocalDraftFence):
-    pass
-
-
-class SaveDraftAsRequest(_LocalDraftFence):
-    path: str = Field(min_length=1, max_length=4096)
-    confirm_overwrite: bool = Field(default=False, alias="confirmOverwrite")
 
 
 class ApplyDraftRequest(_DraftFence):
@@ -353,7 +341,6 @@ def _non_executable_applied_context(
         or not isinstance(status, dict)
         or status.get("executable") is not False
         or not isinstance(program, dict)
-        or program.get("program_id") != status.get("program_id")
         or program_identity != status.get("program_revision")
     ):
         return None, {
@@ -405,7 +392,6 @@ def _applied_context(
     source = applied.get("source")
     program = applied.get("program")
     binding = applied.get("program_binding")
-    program_id = applied.get("program_id")
     program_revision = applied.get("program_revision")
     record_digest = source.get("record_digest") if isinstance(source, dict) else None
     try:
@@ -428,7 +414,6 @@ def _applied_context(
         program_identity = None
     if (
         not isinstance(program, dict)
-        or program.get("program_id") != program_id
         or program_identity != program_revision
     ):
         return None, {
@@ -484,39 +469,6 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
             "message": "the authoring workspace changed while it was being read",
         },
     )
-
-
-def _program_write_roots(state: ComposerState) -> list[str]:
-    """Use the explicit Program-write boundary, or preserve legacy callers."""
-
-    if state.allowed_program_write_roots is not None:
-        return state.allowed_program_write_roots
-    return state.allowed_fs_roots
-
-
-def _published_program_revision(state: ComposerState, target: str) -> str | None:
-    """Return the content identity already published at one exact target.
-
-    Save resolves a lost response by rereading the exact target and comparing
-    this identity with the content captured for that request. A missing,
-    unreadable or divergent target returns ``None``, so the ordinary overwrite
-    rules still apply.
-    """
-
-    try:
-        program, _path = load_program_artifact(
-            target,
-            allowed_roots=_program_write_roots(state),
-            catalog=_active_catalog(state),
-        )
-    except (
-        ProgramArtifactError,
-        ActiveNodeEnvironmentProjectionError,
-        HeadlessClientError,
-        OSError,
-    ):
-        return None
-    return program.program_revision
 
 
 def _draft_node(document: dict[str, Any], instance_id: str) -> dict[str, Any]:
@@ -1203,6 +1155,103 @@ def _source_resolved_mutation(
     return None
 
 
+def read_applied_program(
+    state: ComposerState,
+) -> tuple[Program | dict[str, Any], tuple[str, str, str]]:
+    """The exact Applied Program, or the verified empty authoring of an
+    applied Scenario without one, and its identity."""
+
+    context, reason = _applied_context(state)
+    if reason is not None and reason["code"] == "program_not_selected":
+        empty = _applied_empty_authoring(state)
+        if empty is not None:
+            return empty
+    if reason is not None or context is None:
+        raise DraftSessionError(
+            (
+                reason["code"]
+                if reason
+                else "program_applied_selection_invalid"
+            ),
+            reason["message"] if reason else "Applied Program is absent",
+            status_code=(
+                404
+                if reason
+                and reason["code"]
+                == "program_applied_selection_not_found"
+                else 502
+                if reason
+                and reason["code"]
+                == "program_applied_selection_invalid"
+                else 503
+            ),
+        )
+    try:
+        candidate = Program.from_dict(
+            context.program_document,
+            _active_catalog(state),
+            path="<composer-program-discard>",
+        )
+    except ProgramValidationError as error:
+        raise DraftSessionError(
+            "composer_applied_program_validation_failed",
+            str(error),
+            status_code=409,
+            detail=str(error),
+        ) from error
+    if candidate.program_revision != context.program_revision:
+        raise DraftSessionError(
+            "program_applied_selection_invalid",
+            "headless Applied Program content is divergent",
+            status_code=502,
+        )
+    return candidate, (
+        context.scenario_id,
+        context.program_revision,
+        context.record_digest,
+    )
+
+
+def applied_program_authoring(state: ComposerState) -> dict[str, Any]:
+    """The authoring of the Applied Program: what Discard returns the Draft
+    to, and what Save writes in place of unapplied edits (OD-365)."""
+
+    applied, _identity = read_applied_program(state)
+    return deepcopy(applied) if isinstance(applied, dict) else from_program(applied)
+
+
+def prepare_program_saved_baseline(
+    state: ComposerState,
+    saved_authoring: dict[str, Any],
+    saved_path: str,
+    *,
+    draft_authoring: dict[str, Any] | None = None,
+) -> PreparedProgramReplacement:
+    """The Program Draft with ``saved_authoring``, written at ``saved_path``,
+    as its Saved baseline; the Draft keeps its own content (OD-365: Save
+    writes the Applied Program, never unapplied edits). ``draft_authoring``,
+    when given, is the Draft's new content (a Save into another project
+    folder rebases its scene mesh paths)."""
+
+    catalog = _active_catalog(state)
+    retained = state.draft_session.retained_state()
+    if draft_authoring is not None and draft_authoring != retained["authoring"]:
+        program, diagnostics = derive_candidate(deepcopy(draft_authoring), catalog)
+        retained.update(
+            draft_revision=retained["draft_revision"] + 1,
+            authoring=deepcopy(draft_authoring),
+            program=program.to_dict() if program is not None else None,
+            diagnostics=diagnostics,
+        )
+    saved, _diagnostics = derive_candidate(deepcopy(saved_authoring), catalog)
+    retained.update(
+        saved_path=saved_path,
+        saved_program_revision=saved.program_revision if saved is not None else None,
+        saved_document=saved.to_dict() if saved is not None else deepcopy(saved_authoring),
+    )
+    return state.draft_session.prepare_load_replacement(retained, catalog)
+
+
 def prepare_program_discard(
     state: ComposerState, draft_id: str, expected_revision: int
 ) -> tuple[Callable[[], None], Callable[[], bool]]:
@@ -1212,64 +1261,13 @@ def prepare_program_discard(
     Program Discard and the Scenario Discard commit it the same way.
     """
 
-    def read_applied() -> tuple[Program | dict[str, Any], tuple[str, str, str]]:
-        context, reason = _applied_context(state)
-        if reason is not None and reason["code"] == "program_not_selected":
-            empty = _applied_empty_authoring(state)
-            if empty is not None:
-                return empty
-        if reason is not None or context is None:
-            raise DraftSessionError(
-                (
-                    reason["code"]
-                    if reason
-                    else "program_applied_selection_invalid"
-                ),
-                reason["message"] if reason else "Applied Program is absent",
-                status_code=(
-                    404
-                    if reason
-                    and reason["code"]
-                    == "program_applied_selection_not_found"
-                    else 502
-                    if reason
-                    and reason["code"]
-                    == "program_applied_selection_invalid"
-                    else 503
-                ),
-            )
-        try:
-            candidate = Program.from_dict(
-                context.program_document,
-                _active_catalog(state),
-                path="<composer-program-discard>",
-            )
-        except ProgramValidationError as error:
-            raise DraftSessionError(
-                "composer_applied_program_validation_failed",
-                str(error),
-                status_code=409,
-                detail=str(error),
-            ) from error
-        if candidate.program_revision != context.program_revision:
-            raise DraftSessionError(
-                "program_applied_selection_invalid",
-                "headless Applied Program content is divergent",
-                status_code=502,
-            )
-        return candidate, (
-            context.scenario_id,
-            context.program_revision,
-            context.record_digest,
-        )
-
-    applied_program, applied_identity = read_applied()
+    applied_program, applied_identity = read_applied_program(state)
     prepared = state.draft_session.prepare_discard_replacement(
         applied_program, _active_catalog(state)
     )
 
     def validate_applied_unchanged() -> None:
-        _program, current_identity = read_applied()
+        _program, current_identity = read_applied_program(state)
         if current_identity != applied_identity:
             raise DraftSessionError(
                 "program_applied_changed",
@@ -1313,11 +1311,14 @@ def validate_captured_program_source(
         source_root = state.deployment_source_project_path
         if not isinstance(deployment, dict) or not isinstance(source_root, str):
             raise DraftSessionError("deployment_draft_unavailable", "A complete Deployment Draft and source root are required for reference validation", status_code=409)
+        # Validate what Apply prepares: the Draft with its defaults filled.
+        deployment = with_defaults(deployment)
         if state.headless_client is None:
             raise DraftSessionError("activation_preparer_unavailable", "Reference validation is unavailable", status_code=503)
         authoring = deepcopy(authoring_input)
         program_digest = raw_sha256_digest(canonical_json_bytes(authoring))
-        source_closure = capture_deployment_model_sources(deployment, project_root=Path(source_root))
+        source_closure = capture_deployment_model_sources(
+            deployment, project_root=Path(source_root), paths=state.project_paths)
         if state.authoring_workspace.identity() != identity or state.deployment_source_project_path != source_root:
             raise DraftSessionError("composer_workspace_stale", "Draft changed during reference capture", status_code=409)
         candidate, diagnostics = derive_candidate(authoring, state.node_catalog)
@@ -1361,7 +1362,9 @@ def validate_captured_program_source(
             raise DraftSessionError("activation_preparer_response_invalid", "Reference validation returned a mismatched capture", status_code=502)
         if (state.authoring_workspace.identity() != identity
                 or state.deployment_source_project_path != source_root
-                or capture_deployment_model_sources(deployment, project_root=Path(source_root)) != source_closure):
+                or capture_deployment_model_sources(
+                    deployment, project_root=Path(source_root),
+                    paths=state.project_paths) != source_closure):
             raise DraftSessionError("composer_workspace_stale", "Draft changed during reference validation", status_code=409)
     except AuthoringForestError as error:
         raise HTTPException(status_code=422, detail={
@@ -1369,7 +1372,8 @@ def validate_captured_program_source(
         }) from error
     except ModelSourceCaptureError as error:
         raise HTTPException(status_code=409, detail={
-            "code": "activation_model_source_invalid", "message": str(error),
+            "code": error.code or "activation_model_source_invalid",
+            "message": str(error),
         }) from error
     except Exception as error:
         _raise_workspace_error(error)
@@ -1452,7 +1456,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         if require_deployment is not None:
             require_deployment(deployment)
         source_closure = capture_deployment_model_sources(
-            deployment, project_root=Path(project_path)
+            deployment, project_root=Path(project_path), paths=state.project_paths
         )
         if source_closure != context["model_source_closure"]:
             raise DraftSessionError(
@@ -1460,6 +1464,12 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 "An active Deployment model source changed since Apply",
                 status_code=409,
             )
+        try:
+            scene_mesh_closure = state.capture_scene_mesh_closure(
+                program_document, project_path=scenario_project_path
+            )
+        except SceneMeshPathError as error:
+            raise DraftSessionError(error.code, str(error), status_code=409) from error
         captured_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
@@ -1469,6 +1479,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     "deployment": deployment,
                     "model_source_closure": source_closure,
                     "program": program_document,
+                    "scene_mesh_closure": scene_mesh_closure,
                 }
             )
         )
@@ -1483,6 +1494,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             "captured_input_digest": captured_digest,
             "deployment": deepcopy(deployment),
             "model_source_closure": source_closure,
+            "scene_mesh_closure": scene_mesh_closure,
             "program": deepcopy(program_document),
             "expected_manager_current": {
                 "retained_bundle_id": bundle,
@@ -1684,148 +1696,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             # The Program workspace carries its own Draft-matched identity; the
             # composite snapshot must not replace it (it breaks that contract).
             return _workspace(state)
-        except Exception as error:
-            _raise_workspace_error(error)
-
-    def program_save(
-        body: SaveDraftRequest | SaveDraftAsRequest,
-        *,
-        target_path: str | None,
-        confirm_overwrite: bool,
-    ) -> dict[str, Any]:
-        """Persist one exact Program Draft and adopt it as the Saved baseline.
-
-        The capture, the write and the baseline adoption are three separate
-        steps: the write happens only after admission, under the local
-        authoring claim, so an admission refusal writes nothing; the adoption
-        is one composite commit fenced by the captured workspace identity. A
-        stale adoption keeps the correctly written file and never labels newer
-        in-memory content Saved. One effect record decides both the HTTP
-        outcome and the claim settlement: Not saved, Saved but not adopted
-        (naming the written path), or unverified.
-        """
-
-        effects = OperationEffects()
-        try:
-            _program_save(
-                body,
-                target_path=target_path,
-                confirm_overwrite=confirm_overwrite,
-                effects=effects,
-            )
-        except Exception as error:
-            raise_save_failure(
-                error,
-                effects,
-                _raise_workspace_error,
-                code="program_saved_baseline_not_adopted",
-                document="Program Draft",
-            )
-        # The Program workspace carries its own Draft-matched identity; the
-        # composite snapshot must not replace it (it breaks that contract).
-        return _workspace(state)
-
-    def _program_save(
-        body: SaveDraftRequest | SaveDraftAsRequest,
-        *,
-        target_path: str | None,
-        confirm_overwrite: bool,
-        effects: OperationEffects,
-    ) -> None:
-        prepared = state.draft_session.prepare_save(
-            draft_id=body.draft_id,
-            expected_revision=body.expected_draft_revision,
-            target_path=target_path,
-            confirm_overwrite=confirm_overwrite,
-        )
-        captured_workspace = state.authoring_workspace.snapshot().as_dict()
-        project_path = captured_workspace["project"]["document_path"]
-        scenario_member = (
-            target_path is None and project_path is not None
-            and prepared.resolved_target == str(
-                Path(project_path) / SCENARIO_PROJECT_MEMBERS["program_draft"]
-            )
-        )
-        saved_path = prepared.resolved_target
-
-        def write_artifact_under_claim() -> None:
-            nonlocal saved_path
-            # The adoption's fences, checked before the write: a stale Save is
-            # refused before any effect.
-            body.require_workspace_fence(state.authoring_workspace.identity())
-            state.draft_session.require_current(
-                draft_id=prepared.draft_id, expected_revision=prepared.base_revision
-            )
-            # A prior completed write of this exact revision is resolved
-            # without repeating it.
-            revision = prepared.program.program_revision
-            if _published_program_revision(state, prepared.target_path) == revision:
-                return
-            try:
-                saved_path = save_program_artifact(
-                    prepared.program,
-                    prepared.target_path,
-                    allowed_roots=_program_write_roots(state),
-                    overwrite=prepared.overwrite,
-                )
-            except Exception:
-                # The write is one atomic replacement: the target holds either
-                # its previous content (Not saved) or exactly this revision.
-                if _published_program_revision(
-                    state, prepared.target_path
-                ) == revision:
-                    effects.destination_published(saved_path)
-                raise
-            effects.destination_published(saved_path)
-
-        def prepare_saved_project() -> dict[str, Any]:
-            document, path, digest = save_scenario_member(
-                project_path, "program_draft", captured_workspace["program"]["authoring"],
-                allowed_roots=state.allowed_fs_roots, effects=effects,
-            )
-            return scenario_project_facts(
-                document, document_path=path, source_document_digest=digest
-            )
-
-        # Both forms are written under the claim, after admission: a Scenario
-        # member with its manifest, a standalone artifact as the under-claim
-        # step before the commit.
-        commit_local_authoring(
-            state,
-            body,
-            operation_kind=prepared.tool_id,
-            session="whole-workspace" if scenario_member else "program",
-            validate_under_claim=(
-                None if scenario_member else write_artifact_under_claim
-            ),
-            prepare_project_under_claim=(
-                prepare_saved_project if scenario_member else None
-            ),
-            install=lambda: state.draft_session.install_prepared_save(
-                prepared, saved_path=saved_path
-            ),
-            effects=effects,
-        )
-
-    @router.post("/api/program/save")
-    def save_draft(body: SaveDraftRequest) -> dict[str, Any]:
-        try:
-            return program_save(
-                body,
-                target_path=None,
-                confirm_overwrite=True,
-            )
-        except Exception as error:
-            _raise_workspace_error(error)
-
-    @router.post("/api/program/save-as")
-    def save_draft_as(body: SaveDraftAsRequest) -> dict[str, Any]:
-        try:
-            return program_save(
-                body,
-                target_path=normalize_program_save_path(body.path),
-                confirm_overwrite=body.confirm_overwrite,
-            )
         except Exception as error:
             _raise_workspace_error(error)
 

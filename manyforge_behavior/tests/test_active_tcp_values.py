@@ -28,17 +28,15 @@ def _entry(frame_id: str = "tcp") -> dict:
 def _store() -> ProgramValueStore:
     catalog = NodeCatalog(Path(__file__).parents[1] / "resources/node_catalog.yaml")
     document = {
-        "api_version": "manyforge.program.v3",
-        "program_id": "active_tcp_values",
+        "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "0" * 64,  # TCP migration: placeholder digest shape, recomputed below
         "program_profile": "composable-cell-v1",
-        "name": "Active TCP values",
         "catalog": {"api_version": catalog.api_version, "content_version": catalog.content_version},
         "tree": {"node_id": "timer", "instance_id": "timer", "parameters": {"duration_s": 1.0}, "children": []},
     }
     document["program_revision"] = compute_content_identity(
         deepcopy(document), own_field="program_revision",
-        identity_domain="program-revision", api_version="manyforge.program.v3",
+        identity_domain="program-revision", api_version="manyforge.program.v4",
     )
     program = Program.from_dict(document, catalog).with_active_tcp_binding(
         {"target_bindings": [{"target": _TARGET, "robot_tcps": []}]}

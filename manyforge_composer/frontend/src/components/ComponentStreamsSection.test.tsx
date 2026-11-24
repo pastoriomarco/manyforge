@@ -18,7 +18,7 @@ const partLink = [{ scene_resource_id: 'part', source_id: 'camera', apply_policy
 
 function controllerWith(overrides?: JsonValue[], result: unknown = {}) {
   const document = {
-    api_version: 'manyforge.deployment_intent.v2',
+    api_version: 'manyforge.deployment_intent.v3',
     components: [
       { component_id: 'robot', configuration: { runtime_kind: 'ros2_control',
         runtime_configuration: { component_streams: robotStreams } } },
@@ -128,7 +128,7 @@ describe('ComponentStreamsSection', () => {
       controllable_component_id: component, direction: 'input', signal_name: 'ready',
       provider: { profile, topic: `/${component}/ready` } });
     const controller = {
-      workspace: { draft: { document: { api_version: 'manyforge.deployment_intent.v2', components: [
+      workspace: { draft: { document: { api_version: 'manyforge.deployment_intent.v3', components: [
         { component_id: 'plc', configuration: { runtime_kind: 'io_provider',
           runtime_configuration: { io_signals: [ioSignal('plc', 'ros_bool')] } } },
         { component_id: 'station', configuration: { runtime_kind: 'io_provider',

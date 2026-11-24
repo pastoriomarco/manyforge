@@ -100,7 +100,6 @@ struct RetainedSceneFrameResolverInput final {
   /// G6: what each mounted component is mounted on.
   std::vector<RetainedSceneFrameComponentMountInput> component_mounts;
   std::vector<RetainedSceneFrameStateSourceInput> state_sources;
-  std::int64_t maximum_receiver_time_skew_ns{10'000'000};
 };
 
 /// One "express pose P, given in frame A, in frame B" query. Frames are
@@ -147,6 +146,11 @@ public:
       const core::RuntimeEpoch &local_runtime_epoch,
       std::vector<RetainedSceneFrameStateSourceInput> provided_state_sources,
       std::optional<core::ControllableComponentId> local_component_id =
+          std::nullopt,
+      // With `local_component_id`: the one command target of the component
+      // whose state this owner provides (a gripper view of a tool with
+      // several gripper targets); absent: every target of the component.
+      std::optional<core::CommandTargetId> local_command_target_id =
           std::nullopt) {
     if (!verify_retained_bundle_identity(retained_bundle)) {
       throw std::invalid_argument(
@@ -172,8 +176,7 @@ public:
         {},
         retained_scene_frame_component_mounts(
             retained_bundle.value().cell_graph, model_map.kinematic_index()),
-        {},
-        10'000'000};
+        {}};
 
     for (const auto &attachment :
          retained_bundle.value().cell_graph.component_attachments) {
@@ -340,8 +343,10 @@ public:
             "scene-frame state binding has no exact component/domain");
       }
       const bool component_selected =
-          !local_component_id.has_value() ||
-          graph_binding->controllable_component_id == *local_component_id;
+          (!local_component_id.has_value() ||
+           graph_binding->controllable_component_id == *local_component_id) &&
+          (!local_command_target_id.has_value() ||
+           graph_binding->command_target_id == *local_command_target_id);
       const bool local =
           component_selected &&
           (std::find(component->runtime_unit_ids.begin(),

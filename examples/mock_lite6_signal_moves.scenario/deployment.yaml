@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -51,8 +51,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [
       "lite_gripper"
     ],
@@ -227,12 +232,7 @@
               "mount_frame": "lite_gripper_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "link_tcp",
-              "touch_links": [
-                "lite_gripper_base_link",
-                "lite_gripper_left_finger",
-                "lite_gripper_right_finger"
-              ]
+              "tcp_frame": "link_tcp"
             }
           ]
         },
@@ -437,9 +437,6 @@
       "target_settings": {}
     }
   ],
-  "deployment_artifact_id": "mock_lite6_signal_moves",
-  "description": "One Lite6 on the ROS Mock lane, one Mock I/O device (station_io), one ROS Bool/SetBool I/O device (plc_io) and one global light-curtain interrupt rule.",
-  "name": "mock_lite6_signal_moves",
   "policies": {
     "interrupt_rules": [
       {

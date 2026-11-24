@@ -103,20 +103,31 @@ void SettleAuthoredSceneClaimIfHeld(
               : core::CellAdmissionSettlementKindDTO::kProvenNoEffect);
 }
 
-// Every resident intent with a recorded outcome, in transaction order; an
-// already released or unknown claim is left as it is.
-void SettleRecoveredAuthoredSceneClaims(
-    const SceneStoreMemory &memory, core::IKernelCellAdmissionPort &admission) {
+// Every resident intent with a recorded outcome, in transaction order.
+std::vector<RecoveredAuthoredSceneClaim>
+RecoveredAuthoredSceneClaims(const SceneStoreMemory &memory) {
+  std::vector<RecoveredAuthoredSceneClaim> claims;
   for (const auto &intent : memory.transactions) {
     const auto outcome = memory.outcomes.find(intent.request_key);
     if (outcome == memory.outcomes.end()) {
       continue;
     }
-    const auto request =
-        logical_scene_codec_internal::DecodeRequest(intent.request_json);
-    SettleAuthoredSceneClaimIfHeld(admission, request, intent.request_digest,
-                                   outcome->second.success,
-                                   outcome->second.projection_status);
+    claims.push_back({logical_scene_codec_internal::DecodeRequest(
+                          intent.request_json),
+                      intent.request_digest, outcome->second.success,
+                      outcome->second.projection_status});
+  }
+  return claims;
+}
+
+// An already released or unknown claim is left as it is.
+void SettleRecoveredAuthoredSceneClaims(
+    const std::vector<RecoveredAuthoredSceneClaim> &claims,
+    core::IKernelCellAdmissionPort &admission) {
+  for (const auto &claim : claims) {
+    SettleAuthoredSceneClaimIfHeld(admission, claim.request,
+                                   claim.request_digest, claim.success,
+                                   claim.projection_status);
   }
 }
 
@@ -126,16 +137,19 @@ namespace manyforge::scene {
 
 core::Result<void>
 LogicalSceneOwner::ReconcileAuthoredSceneAdmissionClaims() {
-  std::lock_guard lock(impl_->mutex_);
   if (impl_->cell_admission_ == nullptr) {
     return core::Result<void>::Err(
         {"kernel_owner_unavailable",
          "authored scene admission owner is not configured", {}});
   }
   try {
-    impl_->RequireOpen();
-    SettleRecoveredAuthoredSceneClaims(impl_->memory_,
-                                       *impl_->cell_admission_);
+    // The settlements are copied under the lock and made without it: no
+    // Kernel call runs under the owner lock (OD-376).
+    const auto claims = [&] {
+      std::lock_guard lock(impl_->mutex_);
+      return RecoveredAuthoredSceneClaims(impl_->memory_);
+    }();
+    SettleRecoveredAuthoredSceneClaims(claims, *impl_->cell_admission_);
     return core::Result<void>::Ok();
   } catch (const CellAdmissionTemporarilyUnavailable &error) {
     return core::Result<void>::Err(

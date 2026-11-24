@@ -15,13 +15,15 @@ namespace {
 constexpr char kSceneIdGolden[] =
     "sha256:1702618655fff8c8b8f86181440bc94fb28d0a7853113bb5d162ebbe1d71be17";
 constexpr char kEmptySceneGolden[] =
-    "sha256:8f39833b5d7eb081ce9c0026868a9f8f381eb3c0a3c30f69353f2de0c865abe3";
+    "sha256:5f895143fe92b8b0b1a857fe27a8c59f96c9ae0d46c305546dc58d237d206eeb";
 constexpr char kAttachmentGolden[] =
     "sha256:752cc330ef8133e5797b4c2cc2ea1ef450197978f99f5ddfef40eb20c331f679";
 constexpr char kDigestA[] =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 constexpr char kDigestB[] =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+constexpr char kMeshDigest[] =
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
 CollisionPolicySnapshot EmptyPolicy() {
   CollisionPolicySnapshot policy;
@@ -32,27 +34,31 @@ CollisionPolicySnapshot EmptyPolicy() {
 CollisionPolicySnapshot RichPolicy() {
   CollisionPolicySnapshot policy;
   policy.policy_id = "rich-policy";
-  policy.allowed_static_static_pairs = {
-      {"scene/fixture-a/shape/0", "scene/fixture-b/shape/0"}};
+  policy.static_body_ids = {"scene/fixture-a/shape/0", "scene/fixture-b/shape/0"};
   policy.allowed_touch_link_pairs = {
       {"component/arm-a/model/arm-model/body/finger-a/collision/0",
        "scene/object-a/shape/0"}};
-  SupportContactPolicyEntry support;
-  support.pair = {"scene/object-a/shape/0", "scene/support/shape/0"};
-  support.mode = CollisionContactPolicyMode::kContactRelease;
-  support.release_evidence_mode =
+  CollisionReleaseRule release;
+  release.release_evidence_mode =
       ContactReleaseEvidenceMode::kSignedPenetration;
-  support.enforce_max_start_penetration = true;
-  support.max_start_penetration_m = 0.001;
-  support.release_tolerance_m = 0.00001;
-  support.min_release_progress_m = 0.00002;
-  support.max_contact_penetration_m = 0.0;
-  support.require_separation_by_end = true;
-  support.require_strictly_decreasing_penetration = true;
-  support.allow_recontact = false;
-  policy.support_contacts = {support};
-  policy.contact_grasps = {ContactGraspPolicyEntry{
-      "grasp-a", "object-a", {"finger-a", "finger-b"}, 0.0005, 0.8}};
+  release.enforce_max_start_penetration = true;
+  release.max_start_penetration_m = 0.001;
+  release.release_tolerance_m = 0.00001;
+  release.min_release_progress_m = 0.00002;
+  release.require_separation_by_end = true;
+  release.require_strictly_decreasing_penetration = true;
+  release.allow_recontact = false;
+  policy.contact_rules = {
+      CollisionPairContactRule{
+          {"component/arm-a/model/arm-model/body/finger-a/collision/0",
+           "scene/object-b/shape/0"},
+          "grasp-a",
+          CollisionContactRule{0.0005, 0.8, std::nullopt}},
+      CollisionPairContactRule{
+          {"scene/object-a/shape/0", "scene/support/shape/0"},
+          "lift-a",
+          release},
+  };
   policy.require_full_diagnostics = true;
   return policy;
 }
@@ -86,7 +92,9 @@ LogicalSceneSnapshotDTO RichSnapshot() {
   snapshot.topology_epoch = 3U;
   snapshot.policy_epoch = 2U;
 
+  // A policy retained in the logical scene carries no collision rules.
   auto policy = RichPolicy();
+  policy.contact_rules.clear();
   SealPolicy(policy, 7U);
   snapshot.configured_collision_policy = policy;
 
@@ -110,7 +118,8 @@ LogicalSceneSnapshotDTO RichSnapshot() {
       },
       SceneObjectSnapshotDTO{
           SceneResourceId("object-b"),
-          {MeshShapeDTO{"asset://tool.stl", Vector3DTO{1.0, 1.0, 1.0}}},
+          {MeshShapeDTO{"asset://tool.stl", Vector3DTO{1.0, 1.0, 1.0},
+                        kMeshDigest}},
           CarriedSceneObjectPlacementDTO{attachment_id, attachment_revision},
           std::nullopt,
       },
@@ -178,6 +187,24 @@ TEST(LogicalSceneIdentity, ComputesPublishedCanonicalEmptyPolicyGolden) {
             kCanonicalEmptyCollisionPolicyDigest);
 }
 
+TEST(LogicalSceneIdentity, PolicyDigestOfManyStaticBodiesIsDeterministic) {
+  // 200 cell-fixed objects: the digest covers 200 static bodies, not their
+  // 19900 pairs, and two equal policies hash alike.
+  auto policy = EmptyPolicy();
+  for (int index = 0; index < 200; ++index) {
+    policy.static_body_ids.push_back("scene/fixed-" +
+                                     std::to_string(1000 + index).substr(1U) +
+                                     "/shape/0");
+  }
+  const auto digest = ComputeCollisionPolicyContentDigest(policy);
+  const auto copy = policy;
+  EXPECT_EQ(ComputeCollisionPolicyContentDigest(copy), digest);
+  EXPECT_NE(digest.value(), kCanonicalEmptyCollisionPolicyDigest);
+  auto fewer = policy;
+  fewer.static_body_ids.erase(fewer.static_body_ids.begin() + 57);
+  EXPECT_NE(ComputeCollisionPolicyContentDigest(fewer), digest);
+}
+
 TEST(LogicalSceneIdentity, PolicyDigestCoversEverySemanticSection) {
   const auto baseline = RichPolicy();
   const auto digest = ComputeCollisionPolicyContentDigest(baseline);
@@ -189,16 +216,31 @@ TEST(LogicalSceneIdentity, PolicyDigestCoversEverySemanticSection) {
 
   expect_changed([](auto& value) { value.policy_id = "other-policy"; });
   expect_changed([](auto& value) {
-    value.allowed_static_static_pairs[0].body_b = "scene/fixture-c/shape/0";
+    value.static_body_ids[1] = "scene/fixture-c/shape/0";
   });
+  expect_changed([](auto& value) { value.static_body_ids.pop_back(); });
   expect_changed([](auto& value) {
     value.allowed_touch_link_pairs[0].body_b = "scene/object-b/shape/0";
   });
   expect_changed([](auto& value) {
-    value.support_contacts[0].max_start_penetration_m = 0.002;
+    std::get<CollisionReleaseRule>(value.contact_rules[1].value)
+        .max_start_penetration_m = 0.002;
   });
   expect_changed([](auto& value) {
-    value.contact_grasps[0].terminal_window_start_fraction = 0.9;
+    std::get<CollisionContactRule>(value.contact_rules[0].value)
+        .end_from_fraction = 0.9;
+  });
+  expect_changed([](auto& value) {
+    std::get<CollisionContactRule>(value.contact_rules[0].value)
+        .max_penetration_m.reset();
+  });
+  expect_changed([](auto& value) {
+    std::get<CollisionContactRule>(value.contact_rules[0].value)
+        .end_from_fraction = 0.0;
+  });
+  expect_changed([](auto& value) { value.contact_rules[0].rule_id = "grasp-b"; });
+  expect_changed([](auto& value) {
+    value.contact_rules[0].value = CollisionReleaseRule{};
   });
   expect_changed([](auto& value) { value.require_full_diagnostics = false; });
 
@@ -209,19 +251,34 @@ TEST(LogicalSceneIdentity, PolicyDigestCoversEverySemanticSection) {
 
 TEST(LogicalSceneIdentity, RejectsNoncanonicalPolicyInsteadOfNormalizingIt) {
   auto policy = RichPolicy();
-  policy.allowed_static_static_pairs.push_back(
-      policy.allowed_static_static_pairs.front());
+  policy.static_body_ids.push_back(policy.static_body_ids.front());
+  EXPECT_THROW(ComputeCollisionPolicyContentDigest(policy),
+               LogicalSceneIdentityError);
+  policy = RichPolicy();
+  std::swap(policy.static_body_ids[0], policy.static_body_ids[1]);
+  EXPECT_THROW(ComputeCollisionPolicyContentDigest(policy),
+               LogicalSceneIdentityError);
+
+  // Binary-contact evidence keeps the signed-only release fields neutral.
+  policy = RichPolicy();
+  std::get<CollisionReleaseRule>(policy.contact_rules[1].value)
+      .release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
   EXPECT_THROW(ComputeCollisionPolicyContentDigest(policy),
                LogicalSceneIdentityError);
 
   policy = RichPolicy();
-  policy.support_contacts[0].release_evidence_mode =
-      ContactReleaseEvidenceMode::kBinaryContact;
+  std::swap(policy.contact_rules[0], policy.contact_rules[1]);
   EXPECT_THROW(ComputeCollisionPolicyContentDigest(policy),
                LogicalSceneIdentityError);
 
   policy = RichPolicy();
-  policy.contact_grasps[0].allowed_robot_links = {"finger-b", "finger-a"};
+  policy.contact_rules[0].rule_id.clear();
+  EXPECT_THROW(ComputeCollisionPolicyContentDigest(policy),
+               LogicalSceneIdentityError);
+
+  policy = RichPolicy();
+  std::get<CollisionContactRule>(policy.contact_rules[0].value)
+      .end_from_fraction = 1.5;
   EXPECT_THROW(ComputeCollisionPolicyContentDigest(policy),
                LogicalSceneIdentityError);
 }
@@ -272,10 +329,6 @@ TEST(LogicalSceneIdentity, SceneHashCoversPortableContent) {
     value.objects[0].provider_evidence->provider_source_epoch = "epoch-b";
   });
   expect_changed([](auto& value) {
-    value.objects[1].support_contacts = {
-        SupportContactDTO{.support_object_id = "object-a"}};
-  });
-  expect_changed([](auto& value) {
     value.carried_object_attachments[0].command_target_id =
         CommandTargetId("other-target");
     const auto revision = ComputeCarriedObjectAttachmentRevision(
@@ -288,6 +341,23 @@ TEST(LogicalSceneIdentity, SceneHashCoversPortableContent) {
   expect_changed([](auto& value) {
     value.configured_collision_policy.revision.revision_id += 1U;
   });
+  expect_changed([](auto& value) {
+    std::get<MeshShapeDTO>(value.objects[1].collision_shapes.front())
+        .content_digest = kDigestB;
+  });
+}
+
+TEST(LogicalSceneIdentity, MeshShapeRequiresExactContentDigest) {
+  for (const std::string &invalid :
+       {std::string{}, std::string("sha256:CCCC"),
+        std::string(kMeshDigest).substr(1U)}) {
+    auto snapshot = RichSnapshot();
+    std::get<MeshShapeDTO>(snapshot.objects[1].collision_shapes.front())
+        .content_digest = invalid;
+    EXPECT_FALSE(snapshot.objects[1].locally_valid());
+    EXPECT_THROW(ComputeLogicalSceneContentHash(snapshot),
+                 LogicalSceneIdentityError);
+  }
 }
 
 TEST(LogicalSceneIdentity,
@@ -311,12 +381,6 @@ TEST(LogicalSceneIdentity,
 
   changed = object;
   changed.provider_evidence->provider_source_epoch = "epoch-b";
-  EXPECT_NE(ComputeSceneObjectCollisionIdentity(changed, snapshot.cell_id),
-            identity);
-
-  changed = object;
-  changed.support_contacts = {
-      SupportContactDTO{.support_object_id = "object-b"}};
   EXPECT_NE(ComputeSceneObjectCollisionIdentity(changed, snapshot.cell_id),
             identity);
 }

@@ -12,7 +12,6 @@ using namespace manyforge::core;
 
 [[nodiscard]] RuntimeParticipantBindingDTO valid_binding() {
   return RuntimeParticipantBindingDTO{
-      ProgramId("program.pick"),
       ProgramRevision("program-revision"),
       ProgramBindingId("program-binding"),
       RetainedBundleId("bundle"),
@@ -217,7 +216,6 @@ TEST(RuntimeParticipantBindingTest,
   ASSERT_TRUE(physical.ok()) << physical.error().message;
 
   auto alias_value = physical.value().value();
-  alias_value.program_id = ProgramId("program.place");
   alias_value.program_revision = ProgramRevision("program-place-revision");
   alias_value.program_binding_id = ProgramBindingId("program-place-binding");
   alias_value.resources.pop_back();
@@ -310,16 +308,12 @@ TEST(RuntimeParticipantBindingTest, ResolvesOverlappingSemanticBodyRolesToOnePhy
                                          ModelInstanceId("robot.model"),
                                          ModelRevision("model-revision"),
                                          {"mf2_robot_tool"}}};
-  value.contact_grasp_bindings = {ProgramContactGraspBindingDTO{
-      ContactPolicyId("grasp.tool"),
-      ContactPolicyRevision("grasp-revision"),
-      RuntimeObjectId("selected_object"),
-      {ProgramContactGraspBodyBindingDTO{{value.controllable_component_id, CollisionBodyRoleId("tool_collision")},
-                                         ModelRoleId("body"),
-                                         ModelInstanceId("robot.model"),
-                                         ModelRevision("model-revision"),
-                                         {semantic}}},
-      ContactGraspEnvelopeDTO{0.002, 0.8}}};
+  value.collision_rule_bodies = {ProgramCollisionRuleBodyBindingDTO{
+      {value.controllable_component_id, CollisionBodyRoleId("tool_collision")},
+      ModelRoleId("body"),
+      ModelInstanceId("robot.model"),
+      ModelRevision("model-revision"),
+      {semantic}}};
   auto sealed = verify_runtime_participant_binding(std::move(value));
   ASSERT_TRUE(sealed.ok()) << sealed.error().message;
 
@@ -331,8 +325,7 @@ TEST(RuntimeParticipantBindingTest, ResolvesOverlappingSemanticBodyRolesToOnePhy
       bind_runtime_participant_collision_body_aliases(std::move(sealed.value()), aliases);
 
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-  const auto& body =
-      resolved.value().value().contact_grasp_bindings.front().allowed_body_bindings.front();
+  const auto& body = resolved.value().value().collision_rule_bodies.front();
   EXPECT_EQ(body.body.collision_body_id.value(), "tool_collision");
   EXPECT_EQ(body.collision_body_ids, (std::vector<std::string>{physical}));
 }
@@ -348,6 +341,38 @@ TEST(RuntimeParticipantBindingTest, RejectsCollisionBodyAliasWithoutPhysicalFixe
 
   ASSERT_FALSE(resolved.ok());
   EXPECT_EQ(resolved.error().details.at("reason"), "runtime_collision_body_alias_table_invalid");
+}
+
+TEST(RuntimeParticipantBindingTest, RejectsUnsortedOrIncompleteCollisionRuleBodies) {
+  const auto body = [](const char* role, std::size_t count) {
+    ProgramCollisionRuleBodyBindingDTO binding{
+        {ControllableComponentId("robot.1"), CollisionBodyRoleId(role)},
+        std::nullopt,
+        ModelInstanceId("robot.model"),
+        ModelRevision("model-revision"),
+        {}};
+    for (std::size_t index = 0U; index < count; ++index) {
+      binding.collision_body_ids.push_back(make_component_collision_body_id(
+          binding.body.component_id, binding.model_instance_id, binding.body.collision_body_id,
+          index));
+    }
+    return binding;
+  };
+  auto sorted = valid_binding();
+  sorted.collision_rule_bodies = {body("a_body", 2U), body("b_body", 1U)};
+  EXPECT_TRUE(verify_runtime_participant_binding(std::move(sorted)).ok());
+
+  auto unsorted = valid_binding();
+  unsorted.collision_rule_bodies = {body("b_body", 1U), body("a_body", 2U)};
+  auto refused = verify_runtime_participant_binding(std::move(unsorted));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "runtime_collision_rule_body_invalid");
+
+  auto empty = valid_binding();
+  empty.collision_rule_bodies = {body("a_body", 0U)};
+  refused = verify_runtime_participant_binding(std::move(empty));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "runtime_collision_rule_body_invalid");
 }
 
 TEST(RuntimeParticipantBindingTest, FrameAssociationsMustNameUniqueTargetLocalFrames) {

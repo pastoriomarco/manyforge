@@ -53,13 +53,11 @@ const runtime = {
 } as unknown as ProgramRuntimeController;
 
 const program: ProgramAuthoringDocument = {
-  api_version: 'manyforge.program.v3',
-  program_id: 'role_removal',
+  api_version: 'manyforge.program.v4',
   program_profile: 'composable-cell-v1',
-  name: 'Role removal',
   catalog: {
     api_version: 'manyforge.node_catalog.v3',
-    content_version: '3.0.0',
+    content_version: '4.0.0',
   },
   schema_version: 'manyforge.composer_authoring_forest.v2',
   forest: [],

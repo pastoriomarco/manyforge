@@ -14,9 +14,10 @@ struct RoboPlanCandidateProjectionDTO final {
   core::ProjectionLeaseBindingDTO projection_binding;
   core::CollisionWorldSnapshotPtr world;
   std::shared_ptr<const core::CollisionPolicySnapshot> policy;
-  /// Planning-only allowance for this operation's resolved grasp pairs.
+  /// Planning-only allowance for the pairs of the policy's contact rules
+  /// that have an end window. Set for a plan request, not for IK.
   /// Coordinator and runtime contact constraints remain authoritative.
-  std::optional<std::string> contact_policy_id{};
+  bool end_contact_pairs_allowed{};
   /// The Kernel's clearance margins for this operation. They do not change
   /// the selected worker generation; they are sent with each plan request.
   std::shared_ptr<const core::CollisionClearanceMargins> clearance_margins{};

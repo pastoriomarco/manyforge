@@ -1022,7 +1022,9 @@ class FilesystemVerifiedRetainedPlanningModelSource final
     : public IVerifiedRetainedPlanningModelSource {
  public:
   explicit FilesystemVerifiedRetainedPlanningModelSource(
-      std::filesystem::path trusted_package_root);
+      std::filesystem::path trusted_package_root,
+      std::optional<std::filesystem::path> activation_root =
+          std::nullopt);
   ~FilesystemVerifiedRetainedPlanningModelSource() override = default;
 
   FilesystemVerifiedRetainedPlanningModelSource(
@@ -1039,6 +1041,7 @@ class FilesystemVerifiedRetainedPlanningModelSource final
 
  private:
   std::filesystem::path trusted_package_root_;
+  std::optional<std::filesystem::path> activation_root_;
 };
 
 /// Filesystem-backed exact typed viewer-model reader.

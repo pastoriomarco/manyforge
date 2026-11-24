@@ -627,6 +627,7 @@ function parseProgramViewerMetadata(
       'scene_resource_axes_visibility',
       'object_axes_gizmo_size_m',
       'hidden_execution_groups',
+      'default_view',
     ],
     path,
   );
@@ -681,34 +682,44 @@ function parseProgramViewerMetadata(
       `${path}.object_axes_gizmo_size_m`,
     );
   }
+  if (record.default_view !== undefined) {
+    const viewPath = `${path}.default_view`;
+    const view = objectAt(record.default_view, viewPath);
+    exactKeysAt(view, ['position_m', 'target_m'], viewPath);
+    const point = (value: unknown, pointPath: string): [number, number, number] => {
+      const items = arrayAt(value, pointPath);
+      if (items.length !== 3) return fail(pointPath, 'three numbers');
+      return [numberAt(items[0], `${pointPath}[0]`), numberAt(items[1], `${pointPath}[1]`), numberAt(items[2], `${pointPath}[2]`)];
+    };
+    viewer.default_view = {
+      position_m: point(view.position_m, `${viewPath}.position_m`),
+      target_m: point(view.target_m, `${viewPath}.target_m`),
+    };
+  }
   return viewer;
 }
 
 export function parseProgramDocument(value: unknown, path = 'program'): ProgramDocument {
   const record = objectAt(value, path);
   const apiVersion = stringAt(record.api_version, `${path}.api_version`);
-  if (apiVersion !== 'manyforge.program.v3') {
-    return fail(`${path}.api_version`, 'the literal "manyforge.program.v3"');
+  if (apiVersion !== 'manyforge.program.v4') {
+    return fail(`${path}.api_version`, 'the literal "manyforge.program.v4"');
   }
   allowedKeysAt(
     record,
     [
       'api_version',
-      'program_id',
       'program_revision',
       'program_profile',
-      'name',
       'catalog',
       'tree',
     ],
     [
-      'description',
       'compatibility',
       'viewer',
       'scene',
       'parameters',
       'blackboard',
-      'contact_policies',
       'execution_groups',
     ],
     path,
@@ -728,19 +739,14 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
   }
   const result: ProgramDocument = {
     api_version: apiVersion,
-    program_id: stringAt(record.program_id, `${path}.program_id`),
     program_revision: digestAt(record.program_revision, `${path}.program_revision`),
     program_profile: programProfile,
-    name: stringAt(record.name, `${path}.name`),
     catalog: {
       api_version: catalogApiVersion,
       content_version: stringAt(catalog.content_version, `${path}.catalog.content_version`),
     },
     tree: parseProgramTreeNode(record.tree, `${path}.tree`),
   };
-  if (record.description !== undefined) {
-    result.description = stringAt(record.description, `${path}.description`);
-  }
   if (record.compatibility !== undefined) {
     result.compatibility = jsonRecordAt(record.compatibility, `${path}.compatibility`);
   }
@@ -854,12 +860,6 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
       }),
     };
   }
-  if (record.contact_policies !== undefined) {
-    result.contact_policies = arrayAt(
-      record.contact_policies,
-      `${path}.contact_policies`,
-    ).map((item, index) => jsonValueAt(item, `${path}.contact_policies[${index}]`));
-  }
   if (record.execution_groups !== undefined) {
     const groupPath = `${path}.execution_groups`;
     const definitions = objectAt(record.execution_groups, groupPath);
@@ -912,21 +912,17 @@ export function parseProgramAuthoringDocument(
     [
       'schema_version',
       'api_version',
-      'program_id',
       'program_profile',
-      'name',
       'catalog',
       'forest',
       'positions',
     ],
     [
-      'description',
       'compatibility',
       'viewer',
       'scene',
       'parameters',
       'blackboard',
-      'contact_policies',
       'execution_groups',
     ],
     path,

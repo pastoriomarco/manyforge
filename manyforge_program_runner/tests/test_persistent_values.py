@@ -59,11 +59,9 @@ _RUN = 1
 def _program(*keys: dict[str, Any]) -> dict[str, Any]:
     environment = build_node_environment()
     document = {
-        "api_version": "manyforge.program.v3",
-        "program_id": "persistent_values_fixture",
+        "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "0" * 64,
         "program_profile": "composable-cell-v1",
-        "name": "Persistent values fixture",
         "catalog": {"api_version": "manyforge.node_catalog.v3",
                     "content_version": environment.catalog.content_version},
         "parameters": [],
@@ -82,7 +80,7 @@ def _program(*keys: dict[str, Any]) -> dict[str, Any]:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return document
 
@@ -514,7 +512,6 @@ def test_a_live_run_owns_the_values_and_serializes_operator_edits(tmp_path) -> N
     controls = ProgramRuntimeControls(
         {
             "program_run_id": _RUN,
-            "program_id": _DOCUMENT["program_id"],
             "program_revision": _REVISION,
             "program_binding_id": "sha256:" + "b" * 64,
             "retained_bundle_id": "sha256:" + "a" * 64,
@@ -622,7 +619,6 @@ def _live(runtime: ProgramRuntime) -> _Owner:
     runtime._runtime_controls[_RUN] = ProgramRuntimeControls(  # noqa: SLF001
         {
             "program_run_id": _RUN,
-            "program_id": _DOCUMENT["program_id"],
             "program_revision": _REVISION,
             "program_binding_id": "sha256:" + "b" * 64,
             "retained_bundle_id": "sha256:" + "a" * 64,
@@ -1026,7 +1022,7 @@ def test_persistent_pose_uses_exact_committed_frame_snapshot(tmp_path, monkeypat
     }
     document["program_revision"] = compute_content_identity(
         document, own_field="program_revision", identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     headless.apply(document)
     original = headless.committed_scenario_activation

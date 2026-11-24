@@ -49,11 +49,10 @@ function componentOverview(): ComposerHeadlessState['componentOverview'] {
   };
 }
 
-// The owner labels name the case only; no snapshot member carries them.
+// The runtime label names the case only; no snapshot member carries it.
 function state(
   _runtimeLabel: string,
   runtimeGeneration: number,
-  _alarmLabel = 'alarms.epoch.1',
   alarmGeneration = 3,
   alarmStateRevision = alarmGeneration,
 ): ComposerHeadlessState {
@@ -162,7 +161,6 @@ function scenePose(x: number) {
 interface TestSceneObject {
   scene_resource_id: string;
   collision_shapes: Array<Record<string, unknown>>;
-  support_contacts: unknown[];
   placement: Record<string, unknown>;
   provider_evidence: Record<string, unknown> | null;
 }
@@ -172,17 +170,17 @@ function logicalScenePayload(sample: number) {
   const revision = { scene_id: 'scene-1', revision_id: sample, content_hash: `sha256:${sample}` };
   const objects: TestSceneObject[] = [
     {
-      scene_resource_id: 'cheese', collision_shapes: [{ type: 'box' }], support_contacts: [],
+      scene_resource_id: 'cheese', collision_shapes: [{ type: 'box' }],
       placement: { kind: 'cell_fixed', cell_id: 'cell-1', pose_in_cell: scenePose(sample) },
       provider_evidence: { provider_instance_id: 'camera', provider_source_epoch: 'camera.1' },
     },
     {
-      scene_resource_id: 'table', collision_shapes: [{ type: 'box' }], support_contacts: [],
+      scene_resource_id: 'table', collision_shapes: [{ type: 'box' }],
       placement: { kind: 'cell_fixed', cell_id: 'cell-1', pose_in_cell: scenePose(0) },
       provider_evidence: null,
     },
     {
-      scene_resource_id: 'cup', collision_shapes: [{ type: 'box' }], support_contacts: [],
+      scene_resource_id: 'cup', collision_shapes: [{ type: 'box' }],
       placement: {
         kind: 'carried', carried_object_attachment_id: 'attachment-1',
         carried_object_attachment_revision: `sha256:attachment-${sample}`,
@@ -495,17 +493,17 @@ describe('Headless owner-frame admission', () => {
       state('runtime.epoch.1', 2),
       state('runtime.epoch.1', 3),
     ).accepted).toBe(true);
-    const nextStart = state('runtime.epoch.2', 0, 'alarms.epoch.2', 0);
+    const nextStart = state('runtime.epoch.2', 0, 0);
     nextStart.applicationStartId = NEXT_START_ID;
     expect(admitHeadlessState(
-      state('runtime.epoch.1', 20, 'alarms.epoch.1', 30),
+      state('runtime.epoch.1', 20, 30),
       nextStart,
     ).accepted).toBe(true);
   });
 
   it('does not duplicate nested owner-generation adjudication in the browser', () => {
-    const current = state('receiver.epoch.1', 2, 'alarms.epoch.1', 6, 290);
-    const candidate = state('receiver.epoch.1', 1, 'alarms.epoch.1', 5, 291);
+    const current = state('receiver.epoch.1', 2, 6, 290);
+    const candidate = state('receiver.epoch.1', 1, 5, 291);
     candidate.snapshotSequence = current.snapshotSequence + 1;
     expect(admitHeadlessState(current, candidate)).toEqual({
       accepted: true,
@@ -1535,6 +1533,33 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(() => parseExecutionObservationFrame(measured)).toThrow(/overlap/);
     delete measured.measured_targets;
     expect(() => parseExecutionObservationFrame(measured)).toThrow(/shape/);
+  });
+
+  it('parses compressed spring pairs, absent when none is compressed', () => {
+    expect(parseExecutionObservationFrame(wireObservation(2)).springCompressions).toBeUndefined();
+    const frame = wireObservation(3);
+    const tube = { kind: 'scene_object', scene_resource_id: 'tube' };
+    const rod = { kind: 'component_link', component_id: 'tool', link: 'tool__tool_stylus' };
+    frame.spring_compressions = [
+      { rule_id: 'tube_into_endplate', a: tube, depth_m: 0.002, push_direction: [0, 0, 1] },
+      { rule_id: 'probe', a: rod, depth_m: 0.001, push_direction: [1, 0, 0] },
+    ];
+    expect(parseExecutionObservationFrame(frame).springCompressions).toEqual([
+      { ruleId: 'tube_into_endplate', a: { kind: 'scene_object', sceneResourceId: 'tube' },
+        depthM: 0.002, pushDirection: [0, 0, 1] },
+      { ruleId: 'probe', a: { kind: 'component_link', componentId: 'tool', link: 'tool__tool_stylus' },
+        depthM: 0.001, pushDirection: [1, 0, 0] },
+    ]);
+    for (const bad of [
+      [],
+      [{ rule_id: 'r', a: tube, depth_m: 0, push_direction: [0, 0, 1] }],
+      [{ rule_id: 'r', a: tube, depth_m: 0.001, push_direction: [0, 0, 2] }],
+      [{ rule_id: 'r', a: { kind: 'link', link: 'x' }, depth_m: 0.001, push_direction: [0, 0, 1] }],
+      [{ rule_id: 'r', a: tube, depth_m: 0.001, push_direction: [0, 0, 1], extra: 1 }],
+    ]) {
+      frame.spring_compressions = bad;
+      expect(() => parseExecutionObservationFrame(frame)).toThrow();
+    }
   });
 
   it('uses the same UTF-8 identity byte bounds as the owner and proxy', () => {
@@ -4036,7 +4061,7 @@ describe('The control connection stays open for Stop', () => {
       .map((value) => (value.command as { command_envelope: { command_kind: string } })
         .command_envelope.command_kind);
     const pending: Array<Promise<unknown>> = [];
-    const send = (kind: Parameters<HeadlessStateSource['sendExecutionCommand']>[0], _label: string) => {
+    const send = (kind: Parameters<HeadlessStateSource['sendExecutionCommand']>[0]) => {
       const promise = source.sendExecutionCommand(kind, {});
       pending.push(promise.catch(() => undefined));
       return promise;
@@ -4073,9 +4098,9 @@ describe('The control connection stays open for Stop', () => {
     expect(session.source.getShellSnapshot().commandLatch).toBe(true);
     expect(session.source.getShellSnapshot().transportError)
       .toBe('Control state is invalid; commands other than Stop are disabled. Reconnect when motion has stopped.');
-    await expect(session.send('program_reset', 'reset.invalid')).rejects
+    await expect(session.send('program_reset')).rejects
       .toThrow('Control connection is not synchronized.');
-    session.send('halt', 'halt.invalid');
+    session.send('halt');
     expect(session.commandKinds()).toEqual(['halt']);
     // Owner state is no longer applied; heartbeats are still answered.
     const shell = wireState(2);
@@ -4144,7 +4169,7 @@ describe('The control connection stays open for Stop', () => {
     // A run is active: the stale connection is kept for Stop.
     expect(session.socket.closed).toBeNull();
     expect(session.controls()).toHaveLength(1);
-    session.send('program_motion_stop', 'stop.stale');
+    session.send('program_motion_stop');
     expect(session.commandKinds()).toEqual(['program_motion_stop']);
     const internal = session.source as unknown as {
       latest: { programCycle: { state: string } };
@@ -4195,7 +4220,7 @@ describe('The control connection stays open for Stop', () => {
     vi.stubGlobal('fetch', fetch);
     const session = mountSession('idle_after_reset');
     let settled = false;
-    const receipt = session.send('program_run', 'run.slow');
+    const receipt = session.send('program_run');
     void receipt.then(() => { settled = true; }, () => { settled = true; });
     // The request carries no abort signal and nothing gives up on it.
     expect(fetch.mock.calls[0]![1]).not.toHaveProperty('signal');
@@ -4224,7 +4249,7 @@ describe('The control connection stays open for Stop', () => {
         return { ...reply, json: async () => body };
       }));
       const session = mountSession('idle_after_reset');
-      await expect(session.send('program_run', 'run.invalid')).rejects.toThrow('Command delivery is unconfirmed');
+      await expect(session.send('program_run')).rejects.toThrow('Command delivery is unconfirmed');
       await session.dispose();
     }
   });
@@ -4234,7 +4259,7 @@ describe('The control connection stays open for Stop', () => {
     const lost = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
     vi.stubGlobal('fetch', lost);
     const session = mountSession('idle_after_reset');
-    await expect(session.send('program_run', 'run.lost')).rejects.toThrow('Command delivery is unconfirmed');
+    await expect(session.send('program_run')).rejects.toThrow('Command delivery is unconfirmed');
     const sentKey = (call: unknown[]) => (
       JSON.parse(String((call[1] as RequestInit).body)) as { payload: { request_key: string } }
     ).payload.request_key;
@@ -4251,12 +4276,12 @@ describe('The control connection stays open for Stop', () => {
       return { ...reply, json: async () => body };
     });
     vi.stubGlobal('fetch', answered);
-    await expect(session.send('program_run', 'run.again')).resolves.toMatchObject({
+    await expect(session.send('program_run')).resolves.toMatchObject({
       requestKey: `c0${lostKey.slice(2)}`, command: { step: 'claiming' },
     });
     expect(sentKey(answered.mock.calls[0]!)).toBe(lostKey);
     // Answered: the next command is a new one.
-    await session.send('program_run', 'run.next');
+    await session.send('program_run');
     expect(sentKey(answered.mock.calls[1]!)).not.toBe(lostKey);
     await session.dispose();
   });
@@ -4267,7 +4292,7 @@ describe('The control connection stays open for Stop', () => {
       ok: false, status: 503, json: async () => ({}),
     }));
     const session = mountSession('idle_after_reset');
-    await expect(session.send('program_run', 'run.unknown')).rejects
+    await expect(session.send('program_run')).rejects
       .toThrow('Command delivery is unconfirmed');
     expect(session.socket.closed).toBeNull();
     expect(session.source.getShellSnapshot().transportError)

@@ -337,9 +337,7 @@ TEST(AssistantSettingsCodec,
                                            "deployment_capabilities_read",
                                            "history_read",
                                            "inspect_isaac_scene",
-                                           "program_draft_remove_contact_policies",
                                            "program_draft_remove_parameters",
-                                           "program_draft_upsert_contact_policies",
                                            "program_draft_upsert_parameters",
                                            "program_read",
                                            "program_validate",
@@ -366,7 +364,7 @@ TEST(AssistantSettingsCodec,
           "program_validate", "scene_inspect", "skills_read", "status_read"}));
   // Assistant edits land in the Draft through the tool callback only.
   EXPECT_TRUE(proposals.empty());
-  EXPECT_EQ(draft_mutations.size(), 20U);
+  EXPECT_EQ(draft_mutations.size(), 18U);
 
   // Descriptions and input schemas are built from the node catalog where
   // the mode projection is built; the registry is identity and effect only.

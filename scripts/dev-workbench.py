@@ -41,6 +41,10 @@ from manyforge_operator.application_processes import (
     request_manager_shutdown,
     write_document as write_application_processes,
 )
+from manyforge_operator.filesystem_roots import (
+    filesystem_roots_value,
+    launch_filesystem_roots,
+)
 from scripts.lib.export_retention import create_host_ros_log_session, run_session
 from scripts.lib.workbench_session import Session
 
@@ -172,10 +176,15 @@ def _project_roots(artifact_root: Path) -> list[Path]:
     return [artifact_root, *(Path(root) for root in extra_roots.split(",") if root)]
 
 
-def _composer_filesystem_roots(artifact_root: Path) -> str:
-    """Keep examples available alongside folders mounted by the launcher."""
+def _read_filesystem_roots(artifact_root: Path) -> tuple[Path, ...]:
+    """The folders Composer and Headless read below (MANYFORGE_FS_ROOTS).
 
-    return ",".join(str(root) for root in _project_roots(artifact_root))
+    The examples (Composer's default browse folder), the mounted project
+    folders and the workbench folder, which holds ManyForge's own content:
+    the examples' shipped model sources (OD-335).
+    """
+
+    return launch_filesystem_roots(*_project_roots(artifact_root), WORKSPACE)
 
 
 def _container_project_path(raw_path: str) -> str:
@@ -479,15 +488,26 @@ def _ensure_repository_bootstrap_package() -> Path:
 
 
 def _capture_ros_bootstrap_project(
-    project_path: str, *, allowed_roots: Sequence[Path]
+    project_path: str,
+    *,
+    allowed_roots: Sequence[Path],
+    read_roots: Sequence[Path] | None = None,
 ) -> tuple[dict[str, Any], str]:
-    """Capture the intended first Load through the ordinary authoring owners."""
+    """Capture the intended first Load through the ordinary authoring owners.
+
+    The project must lie in ``allowed_roots`` (the startup project folders);
+    its model sources and scene meshes follow the project path rule over
+    ``read_roots`` (by default the workbench folder and ``allowed_roots``),
+    the folders Composer and Headless read below."""
 
     from manyforge_behavior.model_source_capture import (
         ModelSourceCaptureError,
+        SceneMeshPathError,
         capture_deployment_model_sources,
+        capture_program_scene_meshes,
     )
     from manyforge_behavior.node_environment import build_node_environment
+    from manyforge_behavior.project_paths import ProjectPathRule
     from manyforge_composer.backend.authoring_forest import (
         AuthoringForestError,
         derive_candidate,
@@ -500,9 +520,17 @@ def _capture_ros_bootstrap_project(
     )
     from manyforge_composer.backend.state import canonical_project_path
 
+    readable = (
+        list(launch_filesystem_roots(*allowed_roots, WORKSPACE))
+        if read_roots is None
+        else list(read_roots)
+    )
+    paths = ProjectPathRule(readable)
     try:
         scenario, source_path, source_digest = capture_scenario_artifact(
-            project_path, allowed_roots=[str(root) for root in allowed_roots]
+            project_path,
+            allowed_roots=[str(root) for root in allowed_roots],
+            read_roots=[str(root) for root in readable],
         )
         deployment = scenario["deployment_draft"]
         runtime_kinds = {
@@ -532,17 +560,29 @@ def _capture_ros_bootstrap_project(
             raise WorkbenchError(
                 "intended first ROS Scenario has an incomplete authored Program"
             )
+        project = canonical_project_path(source_path)
+        program_document = program.to_dict() if program is not None else None
         captured = {
             "scenario_id": scenario["scenario_id"],
-            "project_path": canonical_project_path(source_path),
+            "project_path": project,
             "source_document_digest": source_digest,
             "deployment": deployment,
             "model_source_closure": capture_deployment_model_sources(
-                deployment, project_root=Path(source_path)
+                deployment, project_root=Path(source_path), paths=paths
             ),
-            "program": program.to_dict() if program is not None else None,
+            "program": program_document,
+            "scene_mesh_closure": capture_program_scene_meshes(
+                program_document,
+                project_folder=project,
+                paths=paths,
+            ),
         }
-    except (ScenarioArtifactError, AuthoringForestError, ModelSourceCaptureError) as error:
+    except (
+        ScenarioArtifactError,
+        AuthoringForestError,
+        ModelSourceCaptureError,
+        SceneMeshPathError,
+    ) as error:
         raise WorkbenchError(str(error)) from error
     return captured, source_path
 
@@ -988,14 +1028,13 @@ class Workbench:
                 f"http://127.0.0.1:{self.frontend_port}"
             ),
         }
-        composer_roots = _composer_filesystem_roots(self.artifact_root)
-        composer_environment["MANYFORGE_FS_ROOTS"] = composer_roots
-        composer_environment["MANYFORGE_PROGRAM_WRITE_ROOTS"] = composer_roots
-        composer_environment["MANYFORGE_DEPLOYMENT_WRITE_ROOTS"] = composer_roots
+        read_roots = filesystem_roots_value(_read_filesystem_roots(self.artifact_root))
+        composer_environment["MANYFORGE_FS_ROOTS"] = read_roots
         # The Manager starts, watches and stops every application process
         # (spec 3.3, S3); none depends on another being up first. Composer
         # starts after the Manager's first converged baseline, so a --project
-        # Load meets a ready Manager (4.7). Composer owns only process-lifetime
+        # Load meets a ready Manager (4.7), and waits for Headless to listen
+        # before it loads or serves (OD-332). Composer owns only process-lifetime
         # Draft state; its installation settings persist under the inherited
         # MANYFORGE_STATE_DIR (composer/).
         processes = [
@@ -1045,7 +1084,7 @@ class Workbench:
                 str(WORKSPACE),
                 "--activation-preparer-activation-root",
                 str(paths["artifacts"]),
-            )),
+            ), {"MANYFORGE_FS_ROOTS": read_roots}),
             ApplicationProcess("program_runner", (
                 sys.executable,
                 "-m",
@@ -1110,18 +1149,12 @@ class Workbench:
                 str(paths["execution_state"]),
                 "--execution-run-root",
                 str(paths["execution_run"]),
-                "--logical-scene-database",
-                str(self.runtime_root / "logical-scene.sqlite3"),
                 "--canonical-empty-admission-filename",
                 bootstrap_admission,
                 "--program-runner-liveness-socket",
                 str(runner_socket),
                 "--application-processes",
                 str(process_list),
-                # Development value only: relative Program scene meshes such
-                # as examples/<name>/meshes/*.obj resolve below the checkout.
-                "--scene-asset-root",
-                str(WORKSPACE),
             ) + self._site_manager_arguments(),
             # The execution host and its component processes inherit them: a
             # point-cloud source sends its clouds to this Composer; the

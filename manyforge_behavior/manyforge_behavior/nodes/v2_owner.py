@@ -196,6 +196,12 @@ class _OwnerAdapter(InterruptedOutcome, py_trees.behaviour.Behaviour):
     def attempt_identity(self) -> NodeAttemptIdentity | None:
         return self._identity
 
+    @property
+    def attempt_inputs(self) -> Mapping[str, Any] | None:
+        """This attempt's resolved parameters; None while they are unresolved."""
+
+        return self._inputs
+
     def _write_output(
         self,
         output: Any,
@@ -1210,11 +1216,14 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 self._hold_for_simulation(exc)
                 return py_trees.common.Status.RUNNING
             if isinstance(exc, KernelOperationAdmissionRejectedError) and (
-                self._node_id == "motion.set_tcp" or exc.code == "rule_holds"
+                self._node_id == "motion.set_tcp"
+                or exc.code in {"rule_holds", "cartesian_path_moving_takeover_refused"}
             ):
                 # A rule holding its scope refuses the motion: the node fails
                 # at once with `rule_holds` (its `rule_id` in the details) and
-                # the tree handles it.
+                # the tree handles it. A Cartesian path that would take over a
+                # moving robot fails the same way (OD-347); the running motion
+                # continues.
                 self._record_owner_error(exc.code, exc)
             else:
                 self._record_owner_error("owner_request_failed", exc)
@@ -1847,6 +1856,23 @@ class MotionTaskAdapter(OwnerTaskAdapter):
         self._preempted = False
         self._takeover_noted = False
         super()._begin_attempt(restart_series=restart_series)
+        # A new attempt has no result yet: its outcome key is `none` again
+        # until it ends (`_finish`).
+        # Every motion node's key is declared by the Program.
+        identity = self._identity
+        self._input_resolver.value_store.reset_node_outcome(
+            self._node_instance_id,
+            metadata=(
+                {}
+                if identity is None
+                else {
+                    "node_id": self._node_id,
+                    "node_instance_id": self._node_instance_id,
+                    "program_run_id": identity.program_run_id,
+                    "node_attempt_id": identity.node_attempt_id,
+                }
+            ),
+        )
 
     def restart_retry_series(self) -> None:
         """The operator released a hold over this node: full budget again."""

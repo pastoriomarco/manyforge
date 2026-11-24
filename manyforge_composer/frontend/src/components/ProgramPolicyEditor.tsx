@@ -240,8 +240,9 @@ export function ProgramPolicyEditor({
         </label>
         <p className="program-policy-help">
           When this node fails, the run pauses and anyone (operator, assistant or
-          API) may correct it and Retry. Otherwise the failure ends the run. The
-          same rule applies to every caller.
+          API) may correct it and Retry. Otherwise the failure goes to the
+          node&apos;s parent: a Fallback can catch it, and only an uncaught
+          failure ends the run. The same rule applies to every caller.
         </p>
         {form.allow_intervention && (
           <>

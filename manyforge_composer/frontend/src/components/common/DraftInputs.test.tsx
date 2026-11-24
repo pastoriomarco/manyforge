@@ -125,7 +125,7 @@ function TextareaHarness({ scenarioKey, programKey, deploymentKey, value, onInva
       </DraftInputResetProvider>
       <DraftInputResetProvider scope="deployment" resetKey={deploymentKey}>
         <DraftTextarea
-          aria-label="Touch links"
+          aria-label="Auxiliary frames"
           value={value}
           validate={(candidate) => candidate.includes(',') ? null : 'Enter comma-separated names.'}
           onInvalidChange={onInvalidChange}
@@ -197,8 +197,8 @@ describe('DraftTextInput explicit reset identities', () => {
     ));
     try {
       await render('scenario-0', 'program-0', 'deployment-0', 'saved_link');
-      const textarea = host.findElement('Touch links');
-      const props = () => host.findProps('Touch links');
+      const textarea = host.findElement('Auxiliary frames');
+      const props = () => host.findProps('Auxiliary frames');
       (textarea.focus as () => void)();
       await act(() => (props().onFocus as (event: unknown) => void)({ target: { value: 'saved_link' } }));
       await act(() => (props().onChange as (event: unknown) => void)({ target: { value: 'unfinished link' } }));
@@ -218,7 +218,7 @@ describe('DraftTextInput explicit reset identities', () => {
       // A successful deployment reset clears text and its error without
       // replacing the focused textarea.
       await render('scenario-0', 'program-1', 'deployment-1', 'new_saved_link');
-      expect(host.findElement('Touch links')).toBe(textarea);
+      expect(host.findElement('Auxiliary frames')).toBe(textarea);
       expect(host.document.activeElement).toBe(textarea);
       expect(props().value).toBe('new_saved_link');
       expect(props()['aria-invalid']).not.toBe(true);
@@ -229,7 +229,7 @@ describe('DraftTextInput explicit reset identities', () => {
       await act(() => (props().onKeyDown as (event: unknown) => void)({ key: 'Tab', preventDefault: nextPreventDefault }));
       expect(props()['aria-invalid']).toBe(true);
       await render('scenario-1', 'program-1', 'deployment-1', 'scenario_saved_link');
-      expect(host.findElement('Touch links')).toBe(textarea);
+      expect(host.findElement('Auxiliary frames')).toBe(textarea);
       expect(host.document.activeElement).toBe(textarea);
       expect(props().value).toBe('scenario_saved_link');
       expect(props()['aria-invalid']).not.toBe(true);

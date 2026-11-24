@@ -428,7 +428,6 @@ class ExpectedCurrentRequest(StrictRequest):
 
 class ManagerDeploymentCandidateReceipt(StrictRequest):
     schema_version: Literal["manyforge.manager_deployment_candidate_receipt.v3"]
-    deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     candidate_retained_bundle_id: str
@@ -442,7 +441,6 @@ class ManagerDeploymentCandidateReceipt(StrictRequest):
     receipt_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
     @field_validator(
-        "deployment_artifact_id",
         "candidate_retained_bundle_id",
         "candidate_graph_revision",
     )
@@ -456,7 +454,6 @@ class ManagerDeploymentCandidateReceipt(StrictRequest):
 
 
 class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
-    deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     candidate_retained_bundle_id: str
     candidate_graph_revision: str
@@ -467,7 +464,6 @@ class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
     application_start_id: str | None = Field(default=None, exclude=True)
 
     @field_validator(
-        "deployment_artifact_id",
         "candidate_retained_bundle_id",
         "candidate_graph_revision",
     )
@@ -543,6 +539,9 @@ class ActivationPreparationRequest(StartIdentityRequest):
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment: dict[str, Any]
     model_source_closure: dict[str, Any]
+    # The Program's scene meshes captured once (OD-335); the preparer checks
+    # its URI set and bytes.
+    scene_mesh_closure: dict[str, Any]
     program: dict[str, Any] | None
     expected_admission_generation: Annotated[
         int, Field(ge=1, le=9_007_199_254_740_991)
@@ -570,10 +569,12 @@ class ActivationPreparationRequest(StartIdentityRequest):
         if (
             not self.deployment
             or not self.model_source_closure
+            or not self.scene_mesh_closure
             or (self.program is not None and not self.program)
         ):
             raise ValueError(
-                "deployment and model_source_closure must be non-empty objects; "
+                "deployment, model_source_closure and scene_mesh_closure must be "
+                "non-empty objects; "
                 "program must be null or a non-empty object"
             )
         return self
@@ -598,6 +599,21 @@ PreparedActivationOrigin = Annotated[
 ]
 
 
+class PreparedSceneMeshRow(StrictRequest):
+    """One captured Program scene mesh of a prepared activation (OD-335)."""
+
+    byte_size: Annotated[int, Field(ge=1, le=256 * 1024 * 1024)]
+    content_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    resource_uri: str
+
+    @field_validator("resource_uri")
+    @classmethod
+    def validate_uri(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="resource_uri", maximum_bytes=MAX_ACTIVATION_ID_BYTES
+        )
+
+
 class ManagerApplyPreparedActivation(StrictRequest):
     """Exact prepared activation accepted by one named Apply.
 
@@ -610,13 +626,11 @@ class ManagerApplyPreparedActivation(StrictRequest):
     """
 
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    schema_version: Literal["manyforge.prepared_activation_input.v7"]
+    schema_version: Literal["manyforge.prepared_activation_input.v8"]
     origin: PreparedActivationOrigin
-    deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    program_id: str | None
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)] | None
     # Exactly one typed outcome: {"kind": "bound", "program_binding_id"}
     # or {"kind": "non_executable", "outcome"}, or {"kind": "no_program"}.
@@ -625,6 +639,18 @@ class ManagerApplyPreparedActivation(StrictRequest):
     node_environment_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     assistant_mode: Literal["required", "optional", "forbidden"]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    # Sorted by resource_uri, unique; empty when the Program has no mesh.
+    scene_meshes: Annotated[list[PreparedSceneMeshRow], Field(max_length=4096)]
+
+    @field_validator("scene_meshes")
+    @classmethod
+    def validate_scene_meshes(
+        cls, value: list[PreparedSceneMeshRow]
+    ) -> list[PreparedSceneMeshRow]:
+        uris = [row.resource_uri for row in value]
+        if any(left >= right for left, right in zip(uris, uris[1:])):
+            raise ValueError("scene_meshes must be sorted by resource_uri and unique")
+        return value
 
     @field_validator("program_outcome")
     @classmethod
@@ -655,37 +681,22 @@ class ManagerApplyPreparedActivation(StrictRequest):
             raise ValueError("Program outcome kind is unsupported")
         return value
 
-    @field_validator(
-        "deployment_artifact_id",
-        "program_id",
-    )
-    @classmethod
-    def validate_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return value
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
     @model_validator(mode="after")
     def require_program_identity(self) -> "ManagerApplyPreparedActivation":
         if self.program_outcome["kind"] == "no_program":
             if (
-                self.program_id is not None
-                or self.program_revision is not None
+                self.program_revision is not None
                 or self.assistant_mode != "optional"
+                or self.scene_meshes
             ):
                 raise ValueError("no_program requires no Program identity")
-        elif self.program_id is None or self.program_revision is None:
-            raise ValueError("selected Program requires its identity and revision")
+        elif self.program_revision is None:
+            raise ValueError("selected Program requires its revision")
         return self
 
 
 class ManagerApplyRequest(CallerAttributionRequest):
     scene_initialization: Literal["preserve", "initialize"] = "preserve"
-    deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     expected_current: ExpectedCurrentRequest
     reject_if_affected_busy: bool
@@ -701,15 +712,6 @@ class ManagerApplyRequest(CallerAttributionRequest):
     accepted_impact_digest: Annotated[
         str | None, Field(pattern=SHA256_PATTERN)
     ] = None
-
-    @field_validator("deployment_artifact_id")
-    @classmethod
-    def validate_artifact_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="deployment_artifact_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
 
     @model_validator(mode="after")
     def require_busy_rejection(self) -> "ManagerApplyRequest":
@@ -728,15 +730,12 @@ class ManagerApplyRequest(CallerAttributionRequest):
         ):
             raise ValueError("candidate receipt admission generation differs")
         if (
-            self.candidate_receipt.deployment_artifact_id != self.deployment_artifact_id
-            or self.candidate_receipt.deployment_revision != self.deployment_revision
+            self.candidate_receipt.deployment_revision != self.deployment_revision
             or self.candidate_receipt.expected_current != self.expected_current
         ):
             raise ValueError("candidate receipt does not match Apply selection")
         if (
-            self.prepared_activation.deployment_artifact_id
-            != self.deployment_artifact_id
-            or self.prepared_activation.deployment_revision
+            self.prepared_activation.deployment_revision
             != self.deployment_revision
             or self.candidate_receipt.prepared_activation_id
             != self.prepared_activation.prepared_activation_id
@@ -956,14 +955,11 @@ class CycleRecoveryActionRequest(CallerAttributionRequest):
 
     offer_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     offer_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    action_id: Literal[
-        "retry_motion_from_current_state",
-        "acknowledge_and_continue",
-        "retry_after_scene_repair",
-        "replan_from_stopped_state",
-        "retry_runtime_step",
-        "reset_cycle",
-        "continue_with_failure",
+    # One action of the offer: a recovery action, or the option id that
+    # answers an operator question. The Program runner checks it against
+    # the current offer.
+    action_id: Annotated[
+        str, Field(pattern=r"^[a-z][a-z0-9_.-]*$", max_length=128)
     ]
     reason: str | None = None
 
@@ -1329,19 +1325,11 @@ class ManagerApplyStatusPreparedActivation(StrictRequest):
     """The compact immutable activation identity published by Manager status."""
 
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     # Null exactly when the preserved Program is non-executable in the
     # candidate; a succeeded Apply may still report null here.
     program_binding_id: Annotated[str | None, Field(pattern=SHA256_PATTERN)]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-
-    @field_validator("deployment_artifact_id")
-    @classmethod
-    def validate_identity(cls, value: str) -> str:
-        return _bounded_nfc(
-            value, label="deployment_artifact_id", maximum_bytes=MAX_IDENTITY_BYTES
-        )
 
 
 class ManagerApplyStatus(StrictRequest):
@@ -1648,168 +1636,13 @@ class CollisionPolicyRevisionRequest(StrictRequest):
     content_hash: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
 
-class SupportContactPolicyRequest(StrictRequest):
-    pair: CollisionPairRequest
-    mode: Literal["contact_release", "bounded_penetration", "contact_process"]
-    release_evidence_mode: Literal["signed_penetration", "binary_contact"]
-    enforce_max_start_penetration: bool
-    max_start_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
-    release_tolerance_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
-    min_release_progress_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
-    max_contact_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
-    require_separation_by_end: bool
-    require_strictly_decreasing_penetration: bool
-    allow_recontact: bool
-
-
-class SceneSupportContactRequest(StrictRequest):
-    """Portable object-to-object support intent, never a native body pair."""
-
-    support_object_id: str
-    mode: Literal["contact_release", "bounded_penetration", "contact_process"] = (
-        "contact_release"
-    )
-    release_evidence_mode: Literal["signed_penetration", "binary_contact"] = (
-        "signed_penetration"
-    )
-    enforce_max_start_penetration: bool = True
-    max_start_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
-    release_tolerance_m: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 1e-5
-    min_release_progress_m: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
-    max_contact_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)] = 0.0
-    require_separation_by_end: bool = True
-    require_strictly_decreasing_penetration: bool = True
-    allow_recontact: bool = False
-
-    @model_validator(mode="before")
-    @classmethod
-    def fill_mode_scoped_neutral_defaults(cls, value):
-        if not isinstance(value, dict):
-            return value
-        normalized = dict(value)
-        mode = normalized.get("mode", "contact_release")
-        if mode in {"bounded_penetration", "contact_process"}:
-            normalized.setdefault("release_evidence_mode", "signed_penetration")
-            normalized.setdefault("enforce_max_start_penetration", False)
-            normalized.setdefault("max_start_penetration_m", 0.0)
-            normalized.setdefault("release_tolerance_m", 0.0)
-            normalized.setdefault("min_release_progress_m", 0.0)
-            normalized.setdefault("require_separation_by_end", False)
-            normalized.setdefault("require_strictly_decreasing_penetration", False)
-            normalized.setdefault("allow_recontact", False)
-        elif (
-            normalized.get("release_evidence_mode", "signed_penetration")
-            == "binary_contact"
-        ):
-            normalized.setdefault("enforce_max_start_penetration", False)
-            normalized.setdefault("max_start_penetration_m", 0.0)
-            normalized.setdefault("release_tolerance_m", 0.0)
-            normalized.setdefault("min_release_progress_m", 0.0)
-            normalized.setdefault("require_strictly_decreasing_penetration", False)
-        return normalized
-
-    @field_validator("support_object_id")
-    @classmethod
-    def validate_support_object_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="support_object_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-    @model_validator(mode="after")
-    def validate_mode_scoped_fields(self) -> "SceneSupportContactRequest":
-        if self.mode == "contact_release":
-            if self.max_contact_penetration_m != 0.0:
-                raise ValueError(
-                    "max_contact_penetration_m is valid only for " "bounded_penetration"
-                )
-            if self.release_evidence_mode == "binary_contact" and (
-                self.enforce_max_start_penetration
-                or self.max_start_penetration_m != 0.0
-                or self.release_tolerance_m != 0.0
-                or self.min_release_progress_m != 0.0
-                or self.require_strictly_decreasing_penetration
-            ):
-                raise ValueError(
-                    "signed-distance metric fields must be neutral for "
-                    "binary_contact"
-                )
-            return self
-
-        if self.release_evidence_mode != "signed_penetration":
-            raise ValueError(
-                "release_evidence_mode is not applicable outside " "contact_release"
-            )
-        if (
-            self.enforce_max_start_penetration
-            or self.max_start_penetration_m != 0.0
-            or self.release_tolerance_m != 0.0
-            or self.min_release_progress_m != 0.0
-            or self.require_separation_by_end
-            or self.require_strictly_decreasing_penetration
-            or self.allow_recontact
-        ):
-            raise ValueError(
-                "release-only fields must be neutral outside contact_release"
-            )
-        if self.mode == "contact_process" and self.max_contact_penetration_m != 0.0:
-            raise ValueError(
-                "max_contact_penetration_m is valid only for " "bounded_penetration"
-            )
-        return self
-
-
-class ContactGraspPolicyRequest(StrictRequest):
-    policy_id: str
-    selected_object_id: str
-    allowed_robot_links: Annotated[list[str], Field(max_length=4096)]
-    max_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
-    terminal_window_start_fraction: Annotated[
-        float, Field(ge=0, le=1, allow_inf_nan=False)
-    ]
-
-    @field_validator(
-        "policy_id",
-        "selected_object_id",
-    )
-    @classmethod
-    def validate_grasp_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-    @field_validator("allowed_robot_links")
-    @classmethod
-    def validate_allowed_links(cls, values: list[str]) -> list[str]:
-        normalized = [
-            _bounded_nfc(
-                value,
-                label="allowed_robot_link",
-                maximum_bytes=MAX_IDENTITY_BYTES,
-            )
-            for value in values
-        ]
-        if normalized != sorted(set(normalized)):
-            raise ValueError("allowed_robot_links must be sorted and unique")
-        return normalized
-
-
 class CollisionPolicyRequest(StrictRequest):
     policy_id: str
     revision: CollisionPolicyRevisionRequest
-    allowed_static_static_pairs: Annotated[
-        list[CollisionPairRequest], Field(max_length=4096)
-    ]
+    static_body_ids: Annotated[list[str], Field(max_length=4096)]
     allowed_touch_link_pairs: Annotated[
         list[CollisionPairRequest], Field(max_length=4096)
     ]
-    support_contacts: Annotated[
-        list[SupportContactPolicyRequest], Field(max_length=4096)
-    ]
-    contact_grasps: Annotated[list[ContactGraspPolicyRequest], Field(max_length=4096)]
     require_full_diagnostics: bool
 
     @field_validator("policy_id")
@@ -1821,23 +1654,26 @@ class CollisionPolicyRequest(StrictRequest):
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
 
+    @field_validator("static_body_ids")
+    @classmethod
+    def validate_static_body_ids(cls, values: list[str]) -> list[str]:
+        values = [
+            _bounded_nfc(
+                value,
+                label="static_body_ids",
+                maximum_bytes=MAX_IDENTITY_BYTES,
+            )
+            for value in values
+        ]
+        if values != sorted(set(values)):
+            raise ValueError("static_body_ids must be sorted and unique")
+        return values
+
     @model_validator(mode="after")
     def require_canonical_collections(self) -> "CollisionPolicyRequest":
-        for label, values in (
-            ("allowed_static_static_pairs", self.allowed_static_static_pairs),
-            ("allowed_touch_link_pairs", self.allowed_touch_link_pairs),
-        ):
-            keys = [(item.body_a, item.body_b) for item in values]
-            if keys != sorted(set(keys)):
-                raise ValueError(f"{label} must be sorted and unique")
-        support_keys = [
-            (item.pair.body_a, item.pair.body_b) for item in self.support_contacts
-        ]
-        if support_keys != sorted(set(support_keys)):
-            raise ValueError("support_contacts must be sorted and unique by pair")
-        grasp_keys = [item.policy_id for item in self.contact_grasps]
-        if grasp_keys != sorted(set(grasp_keys)):
-            raise ValueError("contact_grasps must be sorted and unique by policy_id")
+        keys = [(item.body_a, item.body_b) for item in self.allowed_touch_link_pairs]
+        if keys != sorted(set(keys)):
+            raise ValueError("allowed_touch_link_pairs must be sorted and unique")
         return self
 
 
@@ -1847,9 +1683,6 @@ class AddSceneObjectRequest(StrictRequest):
     shape: CollisionShapeRequest
     pose: Pose3Request
     frame_ref: SceneTransactionFrameRequest
-    support_contacts: Annotated[
-        list[SceneSupportContactRequest], Field(max_length=4096)
-    ] = Field(default_factory=list)
     # Object mass (kg); absent means 0, so a present mass is positive.
     mass_kg: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
 
@@ -1861,26 +1694,6 @@ class AddSceneObjectRequest(StrictRequest):
             label="scene_resource_id",
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
-
-    @field_validator("support_contacts")
-    @classmethod
-    def canonicalize_support_contacts(
-        cls, values: list[SceneSupportContactRequest]
-    ) -> list[SceneSupportContactRequest]:
-        ordered = sorted(values, key=lambda value: value.support_object_id)
-        ids = [value.support_object_id for value in ordered]
-        if len(ids) != len(set(ids)):
-            raise ValueError("support_contacts contains a duplicate support")
-        return ordered
-
-    @model_validator(mode="after")
-    def reject_self_support(self) -> "AddSceneObjectRequest":
-        if any(
-            contact.support_object_id == self.scene_resource_id
-            for contact in self.support_contacts
-        ):
-            raise ValueError("scene resource cannot support itself")
-        return self
 
 
 class UpsertSceneObjectRequest(AddSceneObjectRequest):
@@ -1955,6 +1768,9 @@ class AttachCarriedObjectRequest(StrictRequest):
     ]
     grasp_lost_bound: CarriedObjectGraspLostBound | None = None
     on_grasp_lost: CarriedObjectGraspLostResponse | None = None
+    # OD-372: the component mounted on the target's robot that owns the
+    # carrier frame and touch bodies; absent means the target's own.
+    carrier_component_id: str | None = None
 
     @field_validator(
         "carried_object_attachment_id",
@@ -1962,9 +1778,12 @@ class AttachCarriedObjectRequest(StrictRequest):
         "controllable_component_id",
         "command_target_id",
         "frame_role_id",
+        "carrier_component_id",
     )
     @classmethod
-    def validate_attachment_identity(cls, value: str, info) -> str:
+    def validate_attachment_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return _bounded_nfc(
             value,
             label=info.field_name,
@@ -2259,9 +2078,50 @@ class JointGoalRequest(StrictRequest):
         return self
 
 
+_LINEAR_POSE_FIELDS = (
+    "max_translation_step_m",
+    "max_rotation_step_rad",
+    "max_angular_speed_rad_s",
+    "max_linear_acceleration_mps2",
+    "max_angular_acceleration_rad_s2",
+)
+
+
 class PoseGoalRequest(StrictRequest):
     kind: Literal["pose_goal"]
     goal: Pose3Request
+    # Absent: a joint move. linear: the TCP moves on the straight line from
+    # the planning start state's TCP pose to the goal (OD-341), with the line
+    # settings below (the Cartesian path's) and optional speed_mode.
+    motion_type: Literal["linear"] | None = None
+    max_translation_step_m: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
+    max_rotation_step_rad: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
+    max_angular_speed_rad_s: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
+    max_linear_acceleration_mps2: Annotated[
+        float, Field(gt=0, allow_inf_nan=False)
+    ] | None = None
+    max_angular_acceleration_rad_s2: Annotated[
+        float, Field(gt=0, allow_inf_nan=False)
+    ] | None = None
+    # Absent means the Deployment's cartesian_timing.
+    speed_mode: Literal["constant_speed", "time_optimal"] | None = None
+
+    @model_validator(mode="after")
+    def validate_motion_type(self) -> "PoseGoalRequest":
+        given = [getattr(self, name) is not None for name in _LINEAR_POSE_FIELDS]
+        if self.motion_type is None and (any(given) or self.speed_mode is not None):
+            raise ValueError("line settings require motion_type linear")
+        if self.motion_type == "linear" and not all(given):
+            raise ValueError("a linear pose goal requires every line setting")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_pose_goal(self, handler) -> dict[str, Any]:
+        result = handler(self)
+        for name in ("motion_type", *_LINEAR_POSE_FIELDS, "speed_mode"):
+            if result.get(name) is None:
+                result.pop(name, None)
+        return result
 
 
 class CartesianPathRequest(StrictRequest):
@@ -2785,6 +2645,232 @@ class SetTcpParticipantRequest(StrictRequest):
     tcp: TcpSelectorRequest
 
 
+class CollisionRuleComponentSelectionRequest(StrictRequest):
+    kind: Literal["component"]
+    component_id: str
+
+    @field_validator("component_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class CollisionRuleCollisionBodySelectionRequest(StrictRequest):
+    kind: Literal["collision_body"]
+    component_id: str
+    collision_body_id: str
+
+    @field_validator("component_id", "collision_body_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class CollisionRuleLinkSelectionRequest(StrictRequest):
+    kind: Literal["link"]
+    component_id: str
+    link: str
+
+    @field_validator("component_id", "link")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class CollisionRuleAttachedObjectSelectionRequest(StrictRequest):
+    """The Scene objects a component carries; with `collision_body_role_id`
+    only those carried by that collision body (OD-371)."""
+
+    kind: Literal["attached_object"]
+    component_id: str
+    collision_body_role_id: str | None = None
+
+    @field_validator("component_id", "collision_body_role_id")
+    @classmethod
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+    @model_serializer(mode="wrap")
+    def serialize_selection(self, handler) -> dict[str, Any]:
+        result = handler(self)
+        if result.get("collision_body_role_id") is None:
+            result.pop("collision_body_role_id", None)
+        return result
+
+
+class CollisionRuleSceneObjectsSelectionRequest(StrictRequest):
+    kind: Literal["scene_objects"]
+
+
+class CollisionRuleSceneObjectSelectionRequest(StrictRequest):
+    """One Scene object; a blackboard key is resolved before the motion is sent."""
+
+    kind: Literal["scene_object"]
+    scene_resource_id: str
+
+    @field_validator("scene_resource_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class CollisionRuleActiveTcpContactBodiesSelectionRequest(StrictRequest):
+    kind: Literal["active_tcp_contact_bodies"]
+
+
+CollisionRuleSelectionRequest = Annotated[
+    CollisionRuleComponentSelectionRequest
+    | CollisionRuleCollisionBodySelectionRequest
+    | CollisionRuleLinkSelectionRequest
+    | CollisionRuleAttachedObjectSelectionRequest
+    | CollisionRuleSceneObjectsSelectionRequest
+    | CollisionRuleSceneObjectSelectionRequest
+    | CollisionRuleActiveTcpContactBodiesSelectionRequest,
+    Field(discriminator="kind"),
+]
+
+
+class CollisionSpringGroupRequest(StrictRequest):
+    """The spring slider a contact rule switches on (OD-371): the rule's pairs
+    are one spring, compressed along `axis` (slider link frame)."""
+
+    component_id: str
+    element_id: str
+    axis: Annotated[list[Annotated[float, Field(allow_inf_nan=False)]],
+                    Field(min_length=3, max_length=3)]
+
+    @field_validator("component_id", "element_id")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
+
+
+class CollisionRuleContactRequest(StrictRequest):
+    """The pair may touch. Without a depth limit the depth is not checked.
+    Without `end_from_fraction` the pair may touch from 0.8 of the move on;
+    0 means during the whole move, from its first sample."""
+
+    max_penetration_m: Annotated[
+        float | None, Field(ge=0, allow_inf_nan=False)
+    ] = None
+    end_from_fraction: Annotated[
+        float | None, Field(ge=0, le=1, allow_inf_nan=False)
+    ] = None
+    # A spring (OD-356): the deepest penetration increase between two
+    # samples; needs max_penetration_m (the stroke).
+    max_compression_step_m: Annotated[
+        float | None, Field(gt=0, allow_inf_nan=False)
+    ] = None
+    # Set when the rule switches a spring slider on: its pairs are one spring.
+    spring_group: CollisionSpringGroupRequest | None = None
+
+    @model_validator(mode="after")
+    def spring_needs_stroke(self) -> "CollisionRuleContactRequest":
+        if self.max_compression_step_m is not None and self.max_penetration_m is None:
+            raise ValueError("max_compression_step_m needs max_penetration_m")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_contact(self, handler) -> dict[str, Any]:
+        result = handler(self)
+        for key in ("max_penetration_m", "end_from_fraction", "max_compression_step_m",
+                    "spring_group"):
+            if result.get(key) is None:
+                result.pop(key, None)
+        return result
+
+
+class CollisionRuleReleaseRequest(StrictRequest):
+    """A pair in contact at the start of the move must separate. Every key is
+    sent with the motion."""
+
+    release_evidence_mode: Literal["signed_penetration", "binary_contact"]
+    enforce_max_start_penetration: bool
+    max_start_penetration_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    release_tolerance_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    min_release_progress_m: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    require_separation_by_end: bool
+    require_strictly_decreasing_penetration: bool
+    allow_recontact: bool
+
+    @model_validator(mode="after")
+    def validate_evidence_scoped_fields(self) -> "CollisionRuleReleaseRequest":
+        if self.release_evidence_mode == "binary_contact" and (
+            self.enforce_max_start_penetration
+            or self.max_start_penetration_m != 0.0
+            or self.release_tolerance_m != 0.0
+            or self.min_release_progress_m != 0.0
+            or self.require_strictly_decreasing_penetration
+        ):
+            raise ValueError(
+                "signed-distance metric fields must be neutral for "
+                "binary_contact"
+            )
+        return self
+
+
+MAX_COLLISION_RULES = 64
+MAX_COLLISION_RULE_SELECTIONS = 16
+MAX_COLLISION_RULE_ID_BYTES = 128
+
+
+class CollisionRuleRequest(StrictRequest):
+    """One collision rule of a motion: every pair of one member of `a` and one
+    member of `b` gets the value. The row without `a` and `b` carries a
+    clearance for the pairs of the Deployment's first rule."""
+
+    rule_id: str
+    a: Annotated[
+        list[CollisionRuleSelectionRequest] | None,
+        Field(min_length=1, max_length=MAX_COLLISION_RULE_SELECTIONS),
+    ] = None
+    b: Annotated[
+        list[CollisionRuleSelectionRequest] | None,
+        Field(min_length=1, max_length=MAX_COLLISION_RULE_SELECTIONS),
+    ] = None
+    clearance_m: Annotated[
+        float | None, Field(ge=0, le=0.05, allow_inf_nan=False)
+    ] = None
+    contact: CollisionRuleContactRequest | None = None
+    release: CollisionRuleReleaseRequest | None = None
+
+    @field_validator("rule_id")
+    @classmethod
+    def validate_rule_id(cls, value: str) -> str:
+        return _bounded_nfc(
+            value, label="rule_id", maximum_bytes=MAX_COLLISION_RULE_ID_BYTES
+        )
+
+    @model_validator(mode="after")
+    def validate_row(self) -> "CollisionRuleRequest":
+        if (self.a is None) != (self.b is None):
+            raise ValueError("a collision rule gives both a and b or neither")
+        values = [
+            value
+            for value in (self.clearance_m, self.contact, self.release)
+            if value is not None
+        ]
+        if len(values) != 1:
+            raise ValueError(
+                "a collision rule has exactly one of clearance_m, contact, release"
+            )
+        if self.a is None and self.clearance_m is None:
+            raise ValueError(
+                "the collision rule without selections carries a clearance only"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_rule(self, handler) -> dict[str, Any]:
+        result = handler(self)
+        for key in ("a", "b", "clearance_m", "contact", "release"):
+            if result.get(key) is None:
+                result.pop(key, None)
+        return result
+
+
 class MotionParticipantRequest(StrictRequest):
     kind: Literal["motion"]
     move_id: str
@@ -2798,7 +2884,11 @@ class MotionParticipantRequest(StrictRequest):
     target_reference: MotionReferenceRequest | None = None
     offset_reference: MotionReferenceRequest | None = None
     motion: MotionSpecRequest
-    contact_policy_id: str | None = None
+    # Collision rules of this move. The row without selections replaces the
+    # clearance of the Deployment's first rule for the move.
+    collision_rules: Annotated[
+        list[CollisionRuleRequest], Field(max_length=MAX_COLLISION_RULES)
+    ]
     per_joint_dynamics_limits: dict[str, JointDynamicsLimitRequest]
     motion_interrupt_scopes: Annotated[list[None], Field(max_length=0)]
     runtime_object_bindings: list[RuntimeObjectReferenceBindingRequest] = Field(
@@ -2806,11 +2896,6 @@ class MotionParticipantRequest(StrictRequest):
     )
     # Frame of an absolute pose/Cartesian goal; absent means the base frame.
     goal_frame_reference: FrameReferenceRequest | None = None
-    # Collision clearance for this move (m); absent means the Deployment's
-    # collision_clearance_m, 0 turns it off for this move.
-    clearance_m: Annotated[
-        float | None, Field(ge=0, le=0.05, allow_inf_nan=False)
-    ] = None
     # Planner override for this move; absent means the Deployment planner.
     planner: MotionPlannerRequest | None = None
 
@@ -2819,18 +2904,11 @@ class MotionParticipantRequest(StrictRequest):
         result = handler(self)
         if self.goal_frame_reference is None:
             result.pop("goal_frame_reference", None)
-        if self.clearance_m is None:
-            result.pop("clearance_m", None)
         return result
 
-    @field_validator(
-        "move_id",
-        "contact_policy_id",
-    )
+    @field_validator("move_id")
     @classmethod
-    def validate_motion_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
+    def validate_motion_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
             value,
             label=info.field_name,
@@ -2867,12 +2945,18 @@ class MotionParticipantRequest(StrictRequest):
             if isinstance(reference, RuntimeObjectReferenceRequest)
         }
         bound_runtime_objects = set(runtime_objects)
-        if not referenced_runtime_objects.issubset(bound_runtime_objects) or (
-            self.contact_policy_id is None
-            and bound_runtime_objects != referenced_runtime_objects
-        ):
+        # A pick's descend leg also binds the selected object for its planner,
+        # without a motion reference to it (PickSequencePlanningRequest).
+        if not referenced_runtime_objects.issubset(bound_runtime_objects):
             raise ValueError(
-                "runtime_object_bindings must exactly cover motion references"
+                "runtime_object_bindings must cover motion references"
+            )
+        rule_ids = [rule.rule_id for rule in self.collision_rules]
+        if len(rule_ids) != len(set(rule_ids)):
+            raise ValueError("collision_rules must have unique rule_id values")
+        if sum(1 for rule in self.collision_rules if rule.a is None) > 1:
+            raise ValueError(
+                "collision_rules has at most one row without selections"
             )
         is_joint = isinstance(self.motion, JointGoalRequest)
         if is_joint and (
@@ -2964,7 +3048,6 @@ class ManualProgramHandover(StrictRequest):
 
 class OperationIntentRequest(StartIdentityRequest):
     request_context: RequestContext
-    program_id: str
     program_revision: str
     program_binding_id: str
     # Present for Program work; None for manual work, including a manual
@@ -2988,7 +3071,6 @@ class OperationIntentRequest(StartIdentityRequest):
         return result
 
     @field_validator(
-        "program_id",
         "program_revision",
         "program_binding_id",
         "expected_graph_revision",
@@ -3074,7 +3156,6 @@ class ProgramNodeCorrectionPreviewRequest(StrictRequest):
     # Checked once at the Headless edge and never serialized downstream.
     application_start_id: str | None = Field(default=None, exclude=True)
     program_run_id: ProgramRunNumber
-    program_id: str
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     node_instance_id: str
@@ -3083,10 +3164,7 @@ class ProgramNodeCorrectionPreviewRequest(StrictRequest):
         list[ProposedNodeInputRequest], Field(max_length=MAX_PROPOSED_NODE_INPUTS)
     ] = Field(default_factory=list)
 
-    @field_validator(
-        "program_id",
-        "node_instance_id",
-    )
+    @field_validator("node_instance_id")
     @classmethod
     def validate_preview_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -3192,7 +3270,6 @@ def _validate_pick_place_operations(
         raise ValueError("pick/place phase request_key values must be distinct")
     contexts = {
         (
-            operation.program_id,
             operation.program_revision,
             operation.program_binding_id,
             operation.program_run_id,
@@ -3235,7 +3312,9 @@ def _validate_pick_place_operations(
 class PickSequencePlanningRequest(StrictRequest):
     sequence_id: str
     selected_object_id: str
-    selected_runtime_object_id: str
+    # Blackboard key of the selected object; present only when a synthesis
+    # offset reference names the object by that key.
+    selected_runtime_object_id: str | None = None
     carrier_frame: ProgramFrameReferenceRequest
     synthesis: PickCandidateSynthesisRequest = Field(
         default_factory=PickCandidateSynthesisRequest
@@ -3255,12 +3334,21 @@ class PickSequencePlanningRequest(StrictRequest):
         "selected_runtime_object_id",
     )
     @classmethod
-    def validate_pick_identity(cls, value: str, info) -> str:
+    def validate_pick_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return _bounded_nfc(
             value,
             label=info.field_name,
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
+
+    @model_serializer(mode="wrap")
+    def serialize_pick(self, handler) -> dict[str, Any]:
+        result = handler(self)
+        if self.selected_runtime_object_id is None:
+            result.pop("selected_runtime_object_id", None)
+        return result
 
     @model_validator(mode="after")
     def validate_pick_phases(self) -> "PickSequencePlanningRequest":
@@ -3278,21 +3366,23 @@ class PickSequencePlanningRequest(StrictRequest):
             for value in (approach, descend, retreat)
         ):
             return self
-        if approach.contact_policy_id is not None or approach.runtime_object_bindings:
-            raise ValueError("pick approach cannot carry contact-policy state")
-        if (
-            descend.contact_policy_id is None
-            or len(descend.runtime_object_bindings) != 1
-            or descend.runtime_object_bindings[0].runtime_object_id
-            != self.selected_runtime_object_id
-            or descend.runtime_object_bindings[0].scene_resource_id
-            != self.selected_object_id
-        ):
+        if approach.runtime_object_bindings:
+            raise ValueError("pick approach cannot carry runtime-object bindings")
+        expected = (
+            []
+            if self.selected_runtime_object_id is None
+            else [(self.selected_runtime_object_id, self.selected_object_id)]
+        )
+        if [
+            (binding.runtime_object_id, binding.scene_resource_id)
+            for binding in descend.runtime_object_bindings
+        ] != expected:
             raise ValueError(
-                "pick descend requires one exact selected-object contact binding"
+                "pick descend binds exactly the selected object when the "
+                "request names its runtime object, and nothing otherwise"
             )
-        if retreat.contact_policy_id is not None or retreat.runtime_object_bindings:
-            raise ValueError("pick retreat cannot carry contact-policy state")
+        if retreat.runtime_object_bindings:
+            raise ValueError("pick retreat cannot carry runtime-object bindings")
         return self
 
 
@@ -3334,11 +3424,12 @@ class PlaceSequencePlanningRequest(StrictRequest):
         )
         if any(
             not isinstance(value, MotionParticipantRequest)
-            or value.contact_policy_id is not None
             or bool(value.runtime_object_bindings)
             for value in motions
         ):
-            raise ValueError("place motion phases cannot carry contact-policy state")
+            raise ValueError(
+                "place motion phases cannot carry runtime-object bindings"
+            )
         return self
 
 
@@ -3772,6 +3863,94 @@ class ProgramResetOutcomeRequest(StrictRequest):
     outcome: Literal["succeeded", "refused", "failed", "unknown"]
     error: ActivityErrorRequest | None = None
     reset: ProgramResetFactsRequest
+
+
+# The wall-clock form History reads (RFC 3339 with an explicit offset).
+_WALL_TIME_PATTERN = (
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(\.[0-9]{1,9})?([Zz]|[+-][0-9]{2}:[0-9]{2})$"
+)
+
+
+class ProgramNodeAttemptErrorRequest(StrictRequest):
+    """The typed error of a failed or interrupted node attempt."""
+
+    code: str
+    message: _ActivityText | None = None
+    # The node's bounded failure details (`failure_details`), as in run records.
+    details: dict[str, Any] | None = None
+
+    @field_validator("code")
+    @classmethod
+    def bounded_code(cls, value: str) -> str:
+        return _bounded_nfc(value, label="code", maximum_bytes=MAX_IDENTITY_BYTES)
+
+    @field_validator("details")
+    @classmethod
+    def bounded_details(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is not None:
+            require_failure_details(value)
+            if len(rfc8785.dumps(value)) > MAX_FAILURE_DETAILS_BYTES:
+                raise ValueError("failure details exceed their byte bound")
+        return value
+
+
+class ProgramNodeAttemptFacts(StrictRequest):
+    """One finished Program node attempt (OD-375): its run, node instance,
+    node type, attempt, start, duration and result; for a scene node also the
+    scene operation and the scene object it named."""
+
+    program_run_id: ProgramRunNumber
+    node_instance_id: str
+    node_id: str
+    node_attempt_id: NodeAttemptNumber
+    started_at_wall: Annotated[str, Field(pattern=_WALL_TIME_PATTERN)]
+    # Stamped by the Runner at the attempt's end (its CLOCK_MONOTONIC and UTC).
+    finished_at_ns: Annotated[str, Field(pattern=r"^(0|[1-9][0-9]{0,18})$")]
+    finished_at_wall: Annotated[str, Field(pattern=_WALL_TIME_PATTERN)]
+    duration_ms: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    outcome: Literal["succeeded", "failed", "interrupted", "stopped", "preempted"]
+    error: ProgramNodeAttemptErrorRequest | None = None
+    scene_operation: str | None = None
+    scene_resource_id: str | None = None
+
+    @field_validator(
+        "node_instance_id", "node_id", "scene_operation", "scene_resource_id"
+    )
+    @classmethod
+    def bounded_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
+        )
+
+    @field_validator("finished_at_ns")
+    @classmethod
+    def exact_clock(cls, value: str) -> str:
+        nonnegative_int64(value)
+        return value
+
+    @model_validator(mode="after")
+    def error_matches_outcome(self) -> "ProgramNodeAttemptFacts":
+        if (self.error is not None) != (self.outcome in {"failed", "interrupted"}):
+            raise ValueError(
+                "a node attempt carries its error exactly when it failed or "
+                "was interrupted"
+            )
+        return self
+
+
+class ProgramNodeAttemptBatchRequest(StrictRequest):
+    """`POST /api/program/node-attempts`: finished node attempts, recorded
+    once each in History by the Program Runner that ran them (OD-375)."""
+
+    schema_version: Literal["manyforge.program_node_attempt_batch.v1"]
+    # Checked once at the route (contract 1.6).
+    application_start_id: str | None = Field(default=None, exclude=True)
+    attempts: Annotated[
+        list[ProgramNodeAttemptFacts], Field(min_length=1, max_length=64)
+    ]
 
 
 class SetOutputRequest(StrictRequest):

@@ -733,9 +733,6 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
   }
   ValidateDigest(intent.prepared_activation.captured_input_digest.value(),
                  "captured_input_digest");
-  ValidateBoundedIdentity(
-      intent.prepared_activation.deployment_artifact_id.value(),
-      "deployment_artifact_id");
   ValidateDigest(intent.prepared_activation.deployment_revision.value(),
                  "deployment_revision");
   if (intent.prepared_activation.program_binding_id.has_value()) {
@@ -794,8 +791,6 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
               intent.candidate_graph_revision.value());
   AppendField(record, "captured_input_digest",
               intent.prepared_activation.captured_input_digest.value());
-  AppendField(record, "deployment_artifact_id",
-              intent.prepared_activation.deployment_artifact_id.value());
   AppendField(record, "deployment_revision",
               intent.prepared_activation.deployment_revision.value());
   // Empty only for a non-executable Program; a bound id is a digest.
@@ -2713,7 +2708,6 @@ ContentDigest ComputeManagerApplyPrivateMaterializationDigest(
 
 bool ManagerApplyPreparedActivationDTO::valid() const noexcept {
   return core::IsExactLowercaseSha256Digest(captured_input_digest.value()) &&
-         !deployment_artifact_id.empty() &&
          core::IsExactLowercaseSha256Digest(deployment_revision.value()) &&
          (!program_binding_id.has_value() ||
           core::IsExactLowercaseSha256Digest(program_binding_id->value())) &&
@@ -3446,12 +3440,12 @@ public:
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
         "candidate_retained_bundle_id,candidate_graph_revision,"
-        "captured_input_digest,deployment_artifact_id,deployment_revision,"
+        "captured_input_digest,deployment_revision,"
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,"
         "intent_digest,scene_initialization,accepted_sequence"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         {
             SqlInteger(intent.apply_id),
             SqlInteger(encoded.apply_generation),
@@ -3465,7 +3459,6 @@ public:
             SqlText(intent.candidate_retained_bundle_id.value()),
             SqlText(intent.candidate_graph_revision.value()),
             SqlText(prepared.captured_input_digest.value()),
-            SqlText(prepared.deployment_artifact_id.value()),
             SqlText(prepared.deployment_revision.value()),
             prepared.program_binding_id.has_value()
                 ? SqlText(prepared.program_binding_id->value())
@@ -3650,7 +3643,7 @@ public:
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
         "candidate_retained_bundle_id,candidate_graph_revision,"
-        "captured_input_digest,deployment_artifact_id,deployment_revision,"
+        "captured_input_digest,deployment_revision,"
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,"
@@ -3674,14 +3667,13 @@ public:
     const auto candidate_retained_bundle_id = row.Text(9);
     const auto candidate_graph_revision = row.Text(10);
     const auto captured_input_digest = row.Text(11);
-    const auto deployment_artifact_id = row.Text(12);
-    const auto deployment_revision = row.Text(13);
-    const auto program_binding_id = row.OptionalText(14);
-    const auto prepared_activation_id = row.Text(15);
-    const auto prepared_activation_receipt_json = row.Text(16);
+    const auto deployment_revision = row.Text(12);
+    const auto program_binding_id = row.OptionalText(13);
+    const auto prepared_activation_id = row.Text(14);
+    const auto prepared_activation_receipt_json = row.Text(15);
     std::optional<core::AdmissionGeneration> expected_admission_generation;
-    if (!row.IsNull(17)) {
-      const auto stored_admission_generation = row.Integer(17);
+    if (!row.IsNull(16)) {
+      const auto stored_admission_generation = row.Integer(16);
       if (stored_admission_generation <= 0) {
         throw ManagerApplyJournalIntegrityError(
             "stored Apply admission generation is invalid");
@@ -3689,9 +3681,9 @@ public:
       expected_admission_generation.emplace(
           static_cast<std::uint64_t>(stored_admission_generation));
     }
-    const auto parent_authoring_claim = row.OptionalBlob(18);
-    const auto stored_digest = row.Text(19);
-    const auto scene_initialization = row.Text(20);
+    const auto parent_authoring_claim = row.OptionalBlob(17);
+    const auto stored_digest = row.Text(18);
+    const auto scene_initialization = row.Text(19);
     if (scene_initialization != "preserve" &&
         scene_initialization != "initialize") {
       throw ManagerApplyJournalIntegrityError(
@@ -3724,7 +3716,6 @@ public:
         GraphRevision(candidate_graph_revision),
         ManagerApplyPreparedActivationDTO{
             ContentDigest(captured_input_digest),
-            core::DeploymentArtifactId(deployment_artifact_id),
             core::DeploymentRevision(deployment_revision),
             program_binding_id.has_value()
                 ? std::optional(core::ProgramBindingId(*program_binding_id))

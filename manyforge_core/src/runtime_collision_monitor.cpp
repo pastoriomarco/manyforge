@@ -162,22 +162,6 @@ Result<void> RuntimeCollisionMonitor::detach() {
   return Result<void>::Ok();
 }
 
-void RuntimeCollisionMonitor::set_active_contact_policy_id(
-    std::string contact_policy_id) {
-  std::lock_guard<std::mutex> lock(contact_policy_mutex_);
-  active_contact_policy_id_ = std::move(contact_policy_id);
-}
-
-void RuntimeCollisionMonitor::clear_active_contact_policy_id() {
-  std::lock_guard<std::mutex> lock(contact_policy_mutex_);
-  active_contact_policy_id_.clear();
-}
-
-std::string RuntimeCollisionMonitor::active_contact_policy_id() const {
-  std::lock_guard<std::mutex> lock(contact_policy_mutex_);
-  return active_contact_policy_id_;
-}
-
 RuntimeCollisionMonitorTimingMetrics RuntimeCollisionMonitor::timing_metrics()
     const noexcept {
   return RuntimeCollisionMonitorTimingMetrics{

@@ -1,18 +1,10 @@
-api_version: manyforge.program.v3
-program_id: vision_guided_pose_pick
-program_revision: sha256:116d55f473a2e261127685ade85e9417a28935800a2d4b96ed829434ff190bfc
+api_version: manyforge.program.v4
+program_revision: sha256:e8c6eb81324182533e84a34e3f4a4b86ebebacfdad68a508e74e9c662c5f9a6b
 program_profile: composable-cell-v1
-name: vision_guided_pose_pick
-description: Preview Program for the typed vision-guided pose dataflow. A model response supplies bounded
-  approach and grasp poses in the target base frame; motion nodes consume those fields directly. It remains
-  intentionally fail-closed when a single-image model invents unreachable metric coordinates rather than
-  grounding them in an authoritative pose source.
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
-  lanes:
-  - manyforge-only
   assistant: required
   requires:
   - vision_pose_inference

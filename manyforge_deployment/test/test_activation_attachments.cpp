@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <manyforge_core/types/typed_error.hpp>
+#include <manyforge_deployment/artifact_codec.hpp>
 
 #include "activation_deployment_compiler_internal.hpp"
 #include "activation_deployment_intent_internal.hpp"
@@ -54,11 +55,12 @@ Value Mount(std::optional<Value> pose = std::nullopt) {
 }
 
 Value Intent(Array components, Array attachments) {
-  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v2")},
+  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v3")},
+      {"collision_rules",
+       Value(Array{Value(Object{{"clearance_m", Value(0.001)},
+                   {"rule_id", Value("everything")}})})},
                       {"attachments", Value(std::move(attachments))},
                       {"components", Value(std::move(components))},
-                      {"deployment_artifact_id", Value("tool_split")},
-                      {"name", Value("tool_split")},
                       {"policies", Value(Object{})}});
 }
 
@@ -77,6 +79,44 @@ std::vector<detail::CapturedComponentModelSource> Captured() {
 detail::ActivationDeploymentIntent Parse(Array components, Array attachments) {
   return detail::parse_activation_deployment_intent(
       Intent(std::move(components), std::move(attachments)), Captured());
+}
+
+// OD-352, OD-357: a row's `model_source.parameters` (a parameter file, or
+// the parameters inline) replaces urdf, srdf and package_roots; its captured
+// model always has an SRDF.
+TEST(ActivationParameterFile, ParsesAParameterFileRowAlone) {
+  const auto row = [](Object source) {
+    auto value = Physical("lite_gripper", false).as_object();
+    for (auto &[name, field] : value)
+      if (name == "model_source") field = Value(std::move(source));
+    return Value(std::move(value));
+  };
+  const auto parameters =
+      Value(Object{{"project_path", Value("tool/probe.tool.yaml")}});
+  const auto inline_parameters = Value(Object{
+      {"api_version", Value("manyforge.parametric_tool.v1")},
+      {"kind", Value("tool")}});
+  auto captured = Captured();
+  captured[1].srdf = detail::CapturedModelSourceArtifact{
+      "asset://model.srdf", "application/xml",
+      c::ContentDigest("sha256:" + std::string(64U, '1')), ""};
+  const auto parse = [&](Object source, auto sources) {
+    return detail::parse_activation_deployment_intent(
+        Intent(Array{Physical("lite6_robot", true), row(std::move(source))},
+               Array{Mount()}),
+        std::move(sources));
+  };
+  EXPECT_EQ(parse(Object{{"parameters", parameters}}, captured).components.size(), 2U);
+  EXPECT_EQ(parse(Object{{"parameters", inline_parameters}}, captured).components.size(), 2U);
+  EXPECT_THROW((void)parse(Object{{"parameters", parameters}}, Captured()),
+               std::invalid_argument);
+  EXPECT_THROW((void)parse(Object{{"package_roots", Value(Object{})},
+                                  {"parameters", parameters}},
+                           captured),
+               std::invalid_argument);
+  EXPECT_THROW((void)parse(Object{{"parameters", Value(Object{{"path", Value("x")}})}},
+                           captured),
+               std::invalid_argument);
 }
 
 TEST(ActivationAttachments, MountedChildOmitsItsRootPose) {
@@ -185,6 +225,106 @@ TEST(ActivationCustomTcps, RefusesUnsortedDuplicateOrMalformedRows) {
   auto extra = CustomTcp("pen", "flange", Rpy()).as_object();
   extra.emplace_back("fine_tuning", Value(Object{}));
   EXPECT_THROW((void)parse(Array{Value(std::move(extra))}), std::invalid_argument);
+}
+
+// A custom TCP's `contact_bodies`: absent keeps the component's default, a
+// list (also an empty one) is taken as written, sorted.
+TEST(ActivationCustomTcps, ContactBodiesAreOptionalAndSorted) {
+  const auto with_bodies = [](Value bodies) {
+    auto row = CustomTcp("pen", "flange", Rpy()).as_object();
+    row.emplace_back("contact_bodies", std::move(bodies));
+    return Value(std::move(row));
+  };
+  const auto parse = [](Value row) {
+    return Parse(Array{RobotWithCustomTcps(Array{std::move(row)}),
+                       Physical("lite_gripper", false)},
+                 Array{Mount()})
+        .components[0]
+        .custom_tcps[0]
+        .contact_bodies;
+  };
+  EXPECT_FALSE(parse(CustomTcp("pen", "flange", Rpy())).has_value());
+  EXPECT_EQ(parse(with_bodies(Value(Array{}))),
+            std::optional<std::vector<std::string>>(std::vector<std::string>{}));
+  EXPECT_EQ(parse(with_bodies(Value(Array{Value("tip"), Value("gripper_fingers")}))),
+            std::optional<std::vector<std::string>>(
+                std::vector<std::string>{"gripper_fingers", "tip"}));
+  EXPECT_THROW((void)parse(with_bodies(Value(Array{Value("tip"), Value("tip")}))),
+               std::invalid_argument);
+  EXPECT_THROW((void)parse(with_bodies(Value(Array{Value(1.0)}))), std::invalid_argument);
+  EXPECT_THROW((void)parse(with_bodies(Value("tip"))), std::invalid_argument);
+}
+
+}  // namespace
+
+// The Deployment's `collision_rules`: required, the first rule without
+// selections, cell selections only; kept in the authored shape with release
+// rules spelled out.
+namespace {
+
+Value IntentWithRules(Value rules) {
+  auto root = Intent(Array{Physical("lite6_robot", true), Physical("lite_gripper", false)},
+                     Array{Mount()})
+                  .as_object();
+  std::erase_if(root, [](const auto &field) { return field.first == "collision_rules"; });
+  if (!rules.is_null()) root.emplace_back("collision_rules", std::move(rules));
+  return Value(std::move(root));
+}
+
+Value Rule(std::string_view json) {
+  return manyforge::deployment::parse_strict_json_model_yaml(json).root();
+}
+
+TEST(ActivationCollisionRules, KeepsTheAuthoredRulesWithReleaseSpelledOut) {
+  const auto intent = detail::parse_activation_deployment_intent(
+      IntentWithRules(Rule(R"([
+          {"rule_id":"everything","clearance_m":0.002},
+          {"rule_id":"gripper_on_parts",
+           "a":[{"kind":"collision_body","component_id":"lite_gripper",
+                 "collision_body_id":"gripper_fingers"}],
+           "b":[{"kind":"scene_objects"}],"contact":{"max_penetration_m":0.001}},
+          {"rule_id":"parts_leave",
+           "a":[{"kind":"attached_object","component_id":"lite_gripper"}],
+           "b":[{"kind":"scene_objects"}],"release":{}}])")),
+      Captured());
+  const auto &rules = intent.collision_rules.as_array();
+  ASSERT_EQ(rules.size(), 3U);
+  EXPECT_EQ(rules[0].find_object_member("clearance_m")->as_number(), 0.002);
+  EXPECT_EQ(rules[1].find_object_member("rule_id")->as_string(), "gripper_on_parts");
+  const auto *release = rules[2].find_object_member("release");
+  ASSERT_NE(release, nullptr);
+  EXPECT_EQ(release->as_object().size(), 8U);
+  EXPECT_EQ(release->find_object_member("release_evidence_mode")->as_string(),
+            "signed_penetration");
+}
+
+TEST(ActivationCollisionRules, RefusesAMissingOrMisshapenList) {
+  const auto refused = [](Value rules, std::string_view code) {
+    try {
+      (void)detail::parse_activation_deployment_intent(IntentWithRules(std::move(rules)),
+                                                       Captured());
+      FAIL() << "accepted";
+    } catch (const manyforge::core::TypedError &error) {
+      EXPECT_EQ(error.code(), code) << error.what();
+    } catch (const std::invalid_argument &error) {
+      EXPECT_TRUE(code.empty()) << error.what();
+    }
+  };
+  refused(Value(nullptr), "");  // the key is required
+  refused(Rule(R"([])"), "collision_rule_selection_invalid");
+  refused(Rule(R"([{"rule_id":"r","a":[{"kind":"scene_objects"}],
+                    "b":[{"kind":"scene_objects"}],"contact":{}}])"),
+          "collision_rule_selection_invalid");
+  refused(Rule(R"([{"rule_id":"everything","clearance_m":0.06}])"),
+          "collision_rule_value_invalid");
+  refused(Rule(R"([{"rule_id":"everything","clearance_m":0.001},
+                   {"rule_id":"tip","a":[{"kind":"active_tcp_contact_bodies"}],
+                    "b":[{"kind":"scene_objects"}],"contact":{}}])"),
+          "collision_rule_selection_invalid");
+  refused(Rule(R"([{"rule_id":"everything","clearance_m":0.001},
+                   {"rule_id":"everything","a":[{"kind":"scene_objects"}],
+                    "b":[{"kind":"scene_objects"}],"contact":{}}])"),
+          "collision_rule_id_duplicate");
 }
 
 }  // namespace

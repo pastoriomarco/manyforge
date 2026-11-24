@@ -528,7 +528,7 @@ def build_component_overview(
             (
                 applied_detail
                 if applied_detail is not None
-                else f"{applied_program.get('program_id')} · {applied_program.get('scenario_id')}"
+                else str(applied_program.get('scenario_id'))
                 if applied_status == _HEALTHY
                 else "no exact Applied Program matches the active composition"
             ),

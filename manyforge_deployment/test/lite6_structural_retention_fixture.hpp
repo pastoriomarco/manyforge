@@ -509,13 +509,10 @@ qualify_lite6_passive_deployment(
   });
   const CanonicalValue deployment_value(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
-      {"deployment_artifact_id",
-       CanonicalValue("lite6_passive_fixture")},
       {"deployment_revision",
        CanonicalValue(
            "sha256:0000000000000000000000000000000000000000000000000000000000000000")},
       {"cell_id", CanonicalValue("lite6_passive_cell")},
-      {"name", CanonicalValue("Lite6 passive fixture")},
       {"catalogs", catalogs},
       {"graph", graph},
       {"desired_control_configurations",

@@ -6,6 +6,7 @@ Run through the CLI shim from the repository root, in the workbench container:
     scripts/manyforge component new <robot|tool|io_device|machine> <vendor>.<name> [--into <folder>]
     scripts/manyforge component register <folder>
     scripts/manyforge component list [--json]
+    scripts/manyforge component export <parameters.yaml> <out_dir> [--format urdf|srdf|usda ...]
 
 Problems print as `error: <where>: <what> [<code>]`, one per line, with exit
 status 1. Guide: docs/authoring/ADDING_A_COMPONENT.md.
@@ -19,6 +20,7 @@ import os
 import sys
 from pathlib import Path
 
+from manyforge_behavior import parametric_tool
 from scripts.components import descriptor
 
 
@@ -74,6 +76,38 @@ def _list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export(args: argparse.Namespace) -> int:
+    """Write the model a parameter file generates (OD-352), as the
+    Composer's Export does: meshes stay where they are, and the exported URDF
+    names each by its path relative to the output folder (OD-364)."""
+
+    try:
+        formats = args.format or ["urdf", "srdf"]
+        source = Path(args.parameters)
+        out = Path(args.out_dir)
+        parameters = parametric_tool.load_parameters(source.read_bytes(), source=str(source))
+        mesh_files: dict[str, str] = {}
+        for relative in parametric_tool.mesh_paths(parameters):
+            mesh = Path(os.path.normpath(source.resolve().parent / relative))
+            if not mesh.is_file():
+                raise parametric_tool.ParametricToolError(
+                    "parametric_tool_mesh_unavailable",
+                    f"{source}: mesh {relative!r} ({mesh}) is not a file",
+                )
+            mesh_files[relative] = Path(os.path.relpath(mesh, out.resolve())).as_posix()
+        files = parametric_tool.export_files(
+            parametric_tool.generate(parameters, mesh_files), formats)
+    except parametric_tool.ParametricToolError as error:
+        print(f"error: {error} [{error.code}]")
+        return 1
+    out.mkdir(parents=True, exist_ok=True)
+    for name, content in files.items():
+        target = out / name
+        target.write_bytes(content)
+        print(f"wrote: {target}")
+    return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manyforge component",
@@ -107,6 +141,17 @@ def _parser() -> argparse.ArgumentParser:
     listing = commands.add_parser("list", help="list the curated components, each checked")
     listing.add_argument("--json", action="store_true")
     listing.set_defaults(handler=_list)
+    export = commands.add_parser(
+        "export",
+        help="write the URDF and SRDF a tool parameter file generates",
+    )
+    export.add_argument("parameters", help="a manyforge.parametric_tool.v1 file")
+    export.add_argument("out_dir", help="folder to write tool.urdf and tool.srdf into")
+    export.add_argument(
+        "--format", action="append", choices=parametric_tool.EXPORT_FORMATS,
+        help="a format to write (repeatable; default urdf and srdf; usda not yet)",
+    )
+    export.set_defaults(handler=_export)
     return parser
 
 

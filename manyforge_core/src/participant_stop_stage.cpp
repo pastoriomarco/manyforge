@@ -402,7 +402,7 @@ template <typename ProviderPath>
            .ok()) {
     return invalid("participant_stop_plan_unverified");
   }
-  if (plan.program_id != binding.program_id || plan.program_revision != binding.program_revision ||
+  if (plan.program_revision != binding.program_revision ||
       plan.program_binding_id != binding.program_binding_id ||
       plan.resolved_stop_base_plan_id != verified_base_plan.resolved_stop_base_plan_id ||
       binding.retained_bundle_id != verified_base_plan.retained_bundle_id ||

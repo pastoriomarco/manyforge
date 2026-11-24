@@ -21,7 +21,6 @@ enum class CatalogRecordKind : std::uint8_t {
   kProviderManifest,
   kCommandSchema,
   kCapabilityDefinition,
-  kContactPolicy,
   kStopEvidencePolicy,
 };
 
@@ -66,9 +65,6 @@ using CommandSchemaCatalogRecordRefDTO =
 using CapabilityDefinitionCatalogRecordRefDTO =
     TypedCatalogRecordRefDTO<CatalogRecordKind::kCapabilityDefinition, CapabilityId,
                              CapabilityDefinitionRevision>;
-using ContactPolicyCatalogRecordRefDTO =
-    TypedCatalogRecordRefDTO<CatalogRecordKind::kContactPolicy, ContactPolicyId,
-                             ContactPolicyRevision>;
 using StopEvidencePolicyCatalogRecordRefDTO =
     TypedCatalogRecordRefDTO<CatalogRecordKind::kStopEvidencePolicy, StopEvidencePolicyId,
                              StopEvidencePolicyRevision>;
@@ -81,7 +77,7 @@ using CatalogRecordRefDTO =
                  ComponentTypeCatalogRecordRefDTO, ControlInterfaceContractCatalogRecordRefDTO,
                  ControllerTopologyCatalogRecordRefDTO, ProviderManifestCatalogRecordRefDTO,
                  CommandSchemaCatalogRecordRefDTO, CapabilityDefinitionCatalogRecordRefDTO,
-                 ContactPolicyCatalogRecordRefDTO, StopEvidencePolicyCatalogRecordRefDTO>;
+                 StopEvidencePolicyCatalogRecordRefDTO>;
 
 struct CatalogRecordTypeDescriptor {
   CatalogRecordKind record_kind;
@@ -94,7 +90,7 @@ struct CatalogRecordTypeDescriptor {
                          const CatalogRecordTypeDescriptor&) = default;
 };
 
-inline constexpr std::array<CatalogRecordTypeDescriptor, 10> kCatalogRecordTypeRegistry{{
+inline constexpr std::array<CatalogRecordTypeDescriptor, 9> kCatalogRecordTypeRegistry{{
     {CatalogRecordKind::kModelAsset, "model_asset", "model_asset_id", "model_revision",
      "manyforge.model_asset.v1"},
     {CatalogRecordKind::kRuntimeProfile, "runtime_profile", "runtime_profile_id",
@@ -112,8 +108,6 @@ inline constexpr std::array<CatalogRecordTypeDescriptor, 10> kCatalogRecordTypeR
      "command_schema_revision", "manyforge.command_schema.v1"},
     {CatalogRecordKind::kCapabilityDefinition, "capability_definition", "capability_id",
      "capability_definition_revision", "manyforge.capability_definition.v1"},
-    {CatalogRecordKind::kContactPolicy, "contact_policy", "policy_id", "version",
-     "manyforge.contact_policy.v1"},
     {CatalogRecordKind::kStopEvidencePolicy, "stop_evidence_policy", "stop_evidence_policy_id",
      "stop_evidence_policy_revision", "manyforge.stop_evidence_policy.v2"},
 }};

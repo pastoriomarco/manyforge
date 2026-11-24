@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_roboplan VERSION 0.3.1 LANGUAGES CXX)
+project(manyforge_roboplan VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -141,7 +141,8 @@ target_include_directories(manyforge_roboplan_scene_factory PUBLIC
 target_compile_definitions(manyforge_roboplan_scene_factory PRIVATE
   COAL_DISABLE_HPP_FCL_WARNINGS)
 target_link_libraries(manyforge_roboplan_scene_factory PUBLIC
-  roboplan::roboplan)
+  roboplan::roboplan
+  PRIVATE manyforge_collision)
 
 add_library(manyforge_roboplan_collision_projection
   src/retained_collision_world_projector.cpp
@@ -493,6 +494,28 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   manyforge_register_component_adapter_family(
     manyforge_pointcloud_adapter_family pointcloud)
 
+  # The vendor-neutral I/O bank (an owner-less model-form I/O device on its
+  # `manyforge_io_interfaces` topics, OD-327). The interface package is built
+  # first into the ROS overlay (scripts/ros/build-ros2-control-runtime.sh); a
+  # configure without it builds no `ros_io_bank` family.
+  find_package(manyforge_io_interfaces QUIET)
+  if(manyforge_io_interfaces_FOUND)
+    add_library(manyforge_io_bank_adapter_family SHARED
+      src/io_bank_adapter_family.cpp
+      src/io_bank_component.cpp
+      src/ros_io_bank_link.cpp)
+    target_include_directories(manyforge_io_bank_adapter_family PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(manyforge_io_bank_adapter_family PRIVATE
+      manyforge_roboplan_ros2_control_runtime
+      rclcpp::rclcpp
+      ${manyforge_io_interfaces_TARGETS})
+    manyforge_register_component_adapter_family(
+      manyforge_io_bank_adapter_family ros_io_bank)
+  else()
+    message(STATUS "manyforge_io_interfaces not found: no ros_io_bank adapter family")
+  endif()
+
   # The assistant (a `kind: assistant` model); its host runs as the
   # component's own process and owns the chat bridge.
   add_library(manyforge_assistant_adapter_family SHARED
@@ -524,6 +547,9 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     manyforge_assistant_adapter_family
     manyforge_xarm_adapter_family
     manyforge_isaac_adapter_family)
+  if(TARGET manyforge_io_bank_adapter_family)
+    list(APPEND MANYFORGE_COMPONENT_ADAPTER_FAMILIES manyforge_io_bank_adapter_family)
+  endif()
 endif()
 
 add_library(manyforge_roboplan_worker_protocol STATIC
@@ -1176,6 +1202,19 @@ if(BUILD_TESTING)
       gtest_discover_tests(test_pointcloud_source_adapter
         PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+      # The shared I/O bank tracker and the `ros_io_bank` component (ROS-free,
+      # with a fake link).
+      add_executable(test_io_bank_component
+        test/test_io_bank_tracker.cpp
+        test/test_io_bank_component.cpp
+        src/io_bank_component.cpp)
+      target_include_directories(test_io_bank_component PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include")
+      target_link_libraries(test_io_bank_component PRIVATE
+        manyforge_core manyforge::content_identity GTest::gtest_main)
+      gtest_discover_tests(test_io_bank_component
+        PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
       add_executable(test_assistant_component_adapter
         test/test_assistant_component_adapter.cpp
         src/assistant_component_adapter.cpp)
@@ -1187,18 +1226,21 @@ if(BUILD_TESTING)
         PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
       # The registry loads the real Mock and simulation_interfaces family
-      # libraries from a test index.
+      # libraries from a test index, and every family of this build tree's
+      # index as the execution host does (discovered below, in the host
+      # tests' environment).
+      list(LENGTH MANYFORGE_COMPONENT_ADAPTER_FAMILIES _MANYFORGE_ADAPTER_FAMILY_COUNT)
       add_executable(test_component_adapter_registry
         test/test_component_adapter_registry.cpp)
       target_compile_definitions(test_component_adapter_registry PRIVATE
         MANYFORGE_MOCK_ADAPTER_FAMILY_LIBRARY="$<TARGET_FILE:manyforge_mock_adapter_family>"
-        MANYFORGE_SIMULATION_ADAPTER_FAMILY_LIBRARY="$<TARGET_FILE:manyforge_simulation_adapter_family>")
+        MANYFORGE_SIMULATION_ADAPTER_FAMILY_LIBRARY="$<TARGET_FILE:manyforge_simulation_adapter_family>"
+        MANYFORGE_COMPONENT_ADAPTER_PREFIX="${MANYFORGE_COMPONENT_ADAPTER_PREFIX}"
+        MANYFORGE_COMPONENT_ADAPTER_FAMILY_COUNT=${_MANYFORGE_ADAPTER_FAMILY_COUNT})
       add_dependencies(test_component_adapter_registry
-        manyforge_mock_adapter_family manyforge_simulation_adapter_family)
+        ${MANYFORGE_COMPONENT_ADAPTER_FAMILIES})
       target_link_libraries(test_component_adapter_registry PRIVATE
         manyforge_roboplan_ros2_control_runtime GTest::gtest_main)
-      gtest_discover_tests(test_component_adapter_registry
-        PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     endif()
 
     add_executable(test_ros2_control_component_state
@@ -1947,6 +1989,14 @@ if(BUILD_TESTING)
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    if(TARGET test_component_adapter_registry)
+      # The host tests' library environment: a family the host couldn't
+      # load fails here by name.
+      gtest_discover_tests(test_component_adapter_registry
+        PROPERTIES
+          ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+          TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    endif()
     if(TARGET test_retained_execution_host_unit_adapter)
     # The execution host loads its adapter families from the build tree's
     # ament prefix, as scripts/test-all.sh does.

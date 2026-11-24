@@ -151,7 +151,11 @@ HistorianEvent PreviousSessionReportEvent(const CanonicalValue &report) {
             code, "previous-session report text must be bounded NFC UTF-8");
     return value;
   };
-  Require(text("schema_version") == "manyforge.workbench_previous_session.v2",
+  // v3 is current. A v2 report was written while the Scene still had a
+  // journal; one left pending is filed as recorded, its "scene" family kept.
+  const auto version = text("schema_version");
+  const bool version2 = version == "manyforge.workbench_previous_session.v2";
+  Require(version == "manyforge.workbench_previous_session.v3" || version2,
           code, "previous-session report version is unsupported");
   const auto session_id = text("session_id");
   Require(session_id.size() == 32U &&
@@ -168,10 +172,12 @@ HistorianEvent PreviousSessionReportEvent(const CanonicalValue &report) {
           "previous-session report classification is invalid");
   static_cast<void>(text("message"));
   const auto &families = RequiredMember(report, "journal_families");
-  const std::array<std::string_view, 4U> expected{
-      "program_cycle", "scene", "manager", "kernel_operation"};
+  std::vector<std::string_view> expected{"program_cycle", "manager", "kernel_operation"};
+  if (version2) {
+    expected.insert(expected.begin() + 1, "scene");
+  }
   Require(families.is_array() && families.as_array().size() == expected.size(),
-          code, "previous-session report must name all four journal families");
+          code, "previous-session report must name its version's journal families");
   for (std::size_t i = 0U; i < expected.size(); ++i) {
     const auto *family = std::get_if<std::string>(&families.as_array()[i].storage());
     Require(family != nullptr && *family == expected[i], code,
@@ -1829,12 +1835,11 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
   Require(bundle != nullptr, "program_applied_selection_invalid",
           "active retained bundle is unavailable");
   auto model_map = LoadActiveProgramModelMap(*bundle, retained_model_map_source_);
-  const auto program_id = core::ProgramId(RequiredString(prepared, "program_id"));
   const auto program_revision =
       core::ProgramRevision(RequiredString(prepared, "program_revision"));
   const auto binding_id = *outcome.program_binding_id;
   const auto program =
-      program_repository_.get_verified(program_id, program_revision, *bundle);
+      program_repository_.get_verified(program_revision, *bundle);
   std::shared_ptr<const deployment::ProgramBinding> binding;
   try {
     const deployment::FilesystemVerifiedCatalogArtifactSource catalog(config_.artifact_root);
@@ -1846,8 +1851,7 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
           "active Program is unavailable");
   Require(binding != nullptr, "program_applied_selection_invalid",
           "active Program binding is unavailable");
-  Require(binding->value().program_id == program_id &&
-              binding->value().program_revision == program_revision,
+  Require(binding->value().program_revision == program_revision,
           "program_applied_selection_invalid",
           "active Program and binding are divergent");
 
@@ -1913,8 +1917,6 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
       {"assistant_mode", RequiredMember(prepared, "assistant_mode")},
       {"assistant_projection", std::move(assistant_projection)},
       {"baseline_program_binding_id", CanonicalValue(binding_id.value())},
-      {"deployment_artifact_id",
-       RequiredMember(prepared, "deployment_artifact_id")},
       {"deployment_revision", RequiredMember(prepared, "deployment_revision")},
       {"graph_revision", CanonicalValue(active_graph_revision)},
       {"node_environment_digest",
@@ -1932,7 +1934,6 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
       {"program_binding", binding->normalized_root()},
       {"program_frame_facts", program_frame_facts},
       {"program_binding_id", CanonicalValue(binding_id.value())},
-      {"program_id", CanonicalValue(program_id.value())},
       {"program_revision", CanonicalValue(program_revision.value())},
       {"retained_bundle_id", CanonicalValue(active_bundle_id)},
       {"source_document_digest",
@@ -2044,7 +2045,6 @@ CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
     Require(bundle != nullptr, "program_applied_selection_invalid",
             "active retained bundle is unavailable");
     const auto authored = program_repository_.get_verified(
-        core::ProgramId(RequiredString(prepared, "program_id")),
         core::ProgramRevision(RequiredString(prepared, "program_revision")),
         *bundle);
     Require(authored != nullptr, "program_applied_selection_invalid",
@@ -2054,8 +2054,6 @@ CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
         deployment::EncodeProgramNonExecutableOutcome(*outcome.non_executable));
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"deployment_artifact_id",
-       RequiredMember(prepared, "deployment_artifact_id")},
       {"deployment_revision", RequiredMember(prepared, "deployment_revision")},
       {"executable", CanonicalValue(outcome.program_binding_id.has_value())},
       {"graph_revision", RequiredMember(prepared, "graph_revision")},
@@ -2070,7 +2068,6 @@ CanonicalValue HeadlessApiCore::AppliedProgramStatus() {
        outcome.program_binding_id.has_value()
            ? CanonicalValue(outcome.program_binding_id->value())
            : CanonicalValue(nullptr)},
-      {"program_id", RequiredMember(prepared, "program_id")},
       {"program_revision", RequiredMember(prepared, "program_revision")},
       {"record_digest", RequiredMember(record, "intent_digest")},
       {"retained_bundle_id", RequiredMember(prepared, "retained_bundle_id")},
@@ -2109,7 +2106,6 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
     Require(bundle != nullptr, "program_applied_selection_invalid",
             "active retained bundle is unavailable");
     authored = program_repository_.get_verified(
-        core::ProgramId(RequiredString(prepared, "program_id")),
         core::ProgramRevision(RequiredString(prepared, "program_revision")), *bundle);
     Require(authored != nullptr, "program_applied_selection_invalid",
             "active Program is unavailable");
@@ -2134,7 +2130,6 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
         const deployment::FilesystemVerifiedCatalogArtifactSource catalog(config_.artifact_root);
         const auto binding = binding_repository_.get_verified(*outcome.program_binding_id, *bundle, model_map, catalog);
         if (binding != nullptr &&
-            binding->value().program_id == core::ProgramId(RequiredString(prepared, "program_id")) &&
             binding->value().program_revision == core::ProgramRevision(revision) &&
             binding->value().retained_bundle_id == core::RetainedBundleId(bundle_id) &&
             binding->value().graph_revision == core::GraphRevision(graph_revision)) {
@@ -2267,6 +2262,11 @@ bool HeadlessApiCore::MarkManagerStatusDisconnected() {
 std::optional<std::pair<std::string, std::string>>
 HeadlessApiCore::ViewerPoseSources() const {
   return manager_status_.ViewerPoseSources();
+}
+
+std::optional<std::string>
+HeadlessApiCore::LogicalSceneActiveProjection() const {
+  return manager_status_.LogicalSceneActiveProjection();
 }
 
 CanonicalValue HeadlessApiCore::RefreshAlarmSources() {
@@ -2456,7 +2456,6 @@ CanonicalValue HeadlessApiCore::RecordClientIncident(
                                              "reset_phase",
                                              "execution_control_revision",
                                              "run_revision",
-                                             "program_id",
                                              "program_revision",
                                              "graph_revision",
                                              "retained_bundle_id",
@@ -2664,16 +2663,23 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
 CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   const std::string code = "activity_record_invalid";
   Require(record.is_object(), code, "activity record fields are invalid");
-  // A Program Reset record (OD-305) also carries its `reset` facts.
+  // A Program Reset record (OD-305) also carries its `reset` facts, a
+  // Program node attempt its `attempt` facts and a scene change its
+  // `scene_change` facts (OD-375).
   const auto *kind_member = record.find_object_member("kind");
   const auto *kind_text = kind_member == nullptr
                               ? nullptr
                               : std::get_if<std::string>(&kind_member->storage());
   const bool program_reset = kind_text != nullptr && *kind_text == "program_reset";
+  const bool node_attempt =
+      kind_text != nullptr && *kind_text == "program_node_attempt";
+  const bool scene_change = kind_text != nullptr && *kind_text == "scene_change";
   std::set<std::string> fields{"schema_version", "kind",   "subject",
                                "action",         "outcome", "error",
                                "components",     "message"};
   if (program_reset) fields.insert("reset");
+  if (node_attempt) fields.insert("attempt");
+  if (scene_change) fields.insert("scene_change");
   Require(record.as_object().size() == fields.size(), code,
           "activity record fields are invalid");
   for (const auto &[name, value] : record.as_object()) {
@@ -2694,10 +2700,15 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   // A typed error: code and message, optionally the vendor's code and text.
   const auto error_value = [&](const CanonicalValue &error) {
     if (std::holds_alternative<std::nullptr_t>(error.storage())) return false;
-    Require(error.is_object() && error.as_object().size() <= 4U, code,
+    Require(error.is_object() && error.as_object().size() <= 5U, code,
             "activity record error is invalid");
     bool has_code = false;
     for (const auto &[name, value] : error.as_object()) {
+      if (name == "details") {
+        // Structured details (bounded by the producer and the record bound).
+        Require(value.is_object(), code, "activity record error details are invalid");
+        continue;
+      }
       const auto *member = std::get_if<std::string>(&value.storage());
       Require(member != nullptr &&
                   (name == "code" || name == "message" ||
@@ -2716,14 +2727,18 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   const auto outcome = text("outcome");
   text("message", 4096U);
   const bool component_action = kind == "component_action";
-  Require(component_action || kind == "apply" || program_reset, code,
-          "activity record kind is unsupported");
+  Require(component_action || kind == "apply" || program_reset ||
+              node_attempt || scene_change,
+          code, "activity record kind is unsupported");
   const std::set<std::string> outcomes =
       component_action
           ? std::set<std::string>{"succeeded", "failed", "unknown", "refused",
                                   "interrupted"}
-      : program_reset
+      : program_reset || scene_change
           ? std::set<std::string>{"succeeded", "failed", "unknown", "refused"}
+      : node_attempt
+          ? std::set<std::string>{"succeeded", "failed", "interrupted",
+                                  "stopped", "preempted"}
           : std::set<std::string>{"succeeded", "accepted", "failed", "refused"};
   Require(outcomes.contains(outcome), code,
           "activity record outcome is unsupported");
@@ -2731,10 +2746,109 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   const auto &components = RequiredMember(record, "components");
   Require(components.is_array() && components.as_array().size() <= 256U, code,
           "activity record components are invalid");
+  // The exact fields of a kind's facts object.
+  const auto facts_object = [&](const std::string_view name,
+                                const std::set<std::string> &names)
+      -> const CanonicalValue & {
+    const auto &facts = RequiredMember(record, name);
+    Require(facts.is_object() && facts.as_object().size() == names.size(),
+            code, "activity record facts are invalid");
+    for (const auto &[member, value] : facts.as_object()) {
+      Require(names.contains(member), code,
+              "activity record facts field is unknown");
+    }
+    return facts;
+  };
+  const auto optional_fact_text = [&](const CanonicalValue &facts,
+                                      const std::string_view name) {
+    const auto &value = RequiredMember(facts, name);
+    if (std::holds_alternative<std::nullptr_t>(value.storage())) return false;
+    const auto *member = std::get_if<std::string>(&value.storage());
+    Require(member != nullptr, code, "activity record facts text is invalid");
+    bounded(*member, 256U);
+    return true;
+  };
+  const auto fact_number = [&](const CanonicalValue &facts,
+                               const std::string_view name, bool optional) {
+    const auto &value = RequiredMember(facts, name);
+    if (optional && std::holds_alternative<std::nullptr_t>(value.storage())) {
+      return;
+    }
+    const auto *member = std::get_if<double>(&value.storage());
+    Require(member != nullptr && std::isfinite(*member) && *member >= 1.0 &&
+                std::floor(*member) == *member &&
+                *member <= static_cast<double>(kMaximumSafeInteger),
+            code, "activity record facts number is invalid");
+  };
+  const auto fact_duration = [&](const CanonicalValue &facts) {
+    const auto *member =
+        std::get_if<double>(&RequiredMember(facts, "duration_ms").storage());
+    Require(member != nullptr && std::isfinite(*member) && *member >= 0.0,
+            code, "activity record duration is invalid");
+  };
+  // A node attempt's end (Runner monotonic ns, UTC text): its event time.
+  std::optional<std::pair<std::int64_t, std::string>> attempt_end;
   if (component_action) {
     text("action", 64U);
     Require(components.as_array().empty(), code,
             "a component action record carries no component rows");
+  } else if (node_attempt || scene_change) {
+    Require(std::holds_alternative<std::nullptr_t>(action.storage()) &&
+                components.as_array().empty(),
+            code, "a node attempt or scene change record carries no action "
+                  "or component rows");
+    if (node_attempt) {
+      // The subject is the node type; the facts name the run, the node
+      // instance, the attempt, its start and duration and, for a scene
+      // node, the scene operation and object.
+      const auto &attempt = facts_object(
+          "attempt", {"program_run_id", "node_instance_id", "node_attempt_id",
+                      "started_at_wall", "finished_at_ns", "finished_at_wall",
+                      "duration_ms", "scene_operation", "scene_resource_id"});
+      fact_number(attempt, "program_run_id", false);
+      fact_number(attempt, "node_attempt_id", false);
+      Require(optional_fact_text(attempt, "node_instance_id"), code,
+              "activity record node instance is missing");
+      const auto *started = std::get_if<std::string>(
+          &RequiredMember(attempt, "started_at_wall").storage());
+      Require(started != nullptr && started->size() <= 64U &&
+                  HistorianRecordedUtcNs(*started).has_value(),
+              code, "activity record node attempt start is invalid");
+      // The event is stamped at the attempt's end on the Runner's clocks.
+      const auto *finished_wall = std::get_if<std::string>(
+          &RequiredMember(attempt, "finished_at_wall").storage());
+      Require(finished_wall != nullptr && finished_wall->size() <= 64U &&
+                  HistorianRecordedUtcNs(*finished_wall).has_value(),
+              code, "activity record node attempt end is invalid");
+      attempt_end = std::pair{
+          content_identity::parse_nonnegative_int64(
+              RequiredMember(attempt, "finished_at_ns")),
+          *finished_wall};
+      fact_duration(attempt);
+      optional_fact_text(attempt, "scene_operation");
+      optional_fact_text(attempt, "scene_resource_id");
+    } else {
+      const std::set<std::string> operations{
+          "add_object",
+          "upsert_object",
+          "remove_object",
+          "update_object_pose",
+          "attach_carried_object",
+          "detach_carried_object",
+          "detach_carried_object_at_current_pose",
+          "set_collision_policy"};
+      Require(operations.contains(subject), code,
+              "activity record scene operation is unsupported");
+      // The object, the caller, the time it took and the committed revision.
+      const auto &change = facts_object(
+          "scene_change", {"scene_resource_id", "source_label", "principal_id",
+                           "duration_ms", "scene_revision_id"});
+      optional_fact_text(change, "scene_resource_id");
+      optional_fact_text(change, "source_label");
+      optional_fact_text(change, "principal_id");
+      fact_duration(change);
+      fact_number(change, "scene_revision_id", true);
+    }
   } else if (program_reset) {
     Require(subject == "program_reset", code,
             "activity record Program Reset subject is unsupported");
@@ -2814,28 +2928,41 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
     }
   }
   const bool has_error = error_value(RequiredMember(record, "error"));
-  Require(has_error == (outcome != "succeeded" && outcome != "accepted"),
+  // A node attempt carries its error only when it failed or was interrupted
+  // (a Stop or a preemption is no error).
+  Require(has_error == (node_attempt
+                            ? outcome == "failed" || outcome == "interrupted"
+                            : outcome != "succeeded" && outcome != "accepted"),
           code, "activity record error does not match its outcome");
   Require(content_identity::canonical_json(record).size() <= 64U * 1024U, code,
           "activity record exceeds its byte bound");
-  const auto severity = outcome == "succeeded" || outcome == "accepted" ? "INFO"
-                        : outcome == "refused" || outcome == "interrupted"
-                            ? "WARN"
-                            : "ERROR";
+  // A failed node attempt is WARN, never ERROR: a failed condition node is
+  // ordinary control flow, and ERROR would start a failure capture.
+  const auto severity =
+      node_attempt ? (outcome == "failed" ? "WARN" : "INFO")
+      : outcome == "succeeded" || outcome == "accepted" ? "INFO"
+      : outcome == "refused" || outcome == "interrupted" ? "WARN"
+                                                         : "ERROR";
   auto payload = record.as_object();
   payload.emplace_back("clock_owner",
-                       CanonicalValue("headless:" + config_.application_start_id));
+                       CanonicalValue((attempt_end ? "program_runner:" : "headless:") +
+                                      config_.application_start_id));
 
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   auto event = MakeHistorianEvent(
       component_action ? subject
-      : program_reset  ? std::string("manyforge.program_runner")
-                       : std::string("manyforge.composer"),
+      : program_reset || node_attempt ? std::string("manyforge.program_runner")
+      : scene_change                  ? std::string("manyforge.scene")
+                                      : std::string("manyforge.composer"),
       component_action ? "component_action_finished"
       : program_reset  ? "program_reset_finished"
+      : node_attempt   ? "program_node_attempt_finished"
+      : scene_change   ? "scene_change_finished"
                        : "apply_finished",
-      severity, clocks_.monotonic_time_ns(), clocks_.wall_time_text(),
+      severity,
+      attempt_end ? attempt_end->first : clocks_.monotonic_time_ns(),
+      attempt_end ? attempt_end->second : clocks_.wall_time_text(),
       CanonicalValue(std::move(payload)));
   const auto event_id = event.event_id;
   const bool recorded = historian_.TryEnqueue(std::move(event));

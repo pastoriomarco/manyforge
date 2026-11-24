@@ -53,12 +53,10 @@ struct ParallelValidationTelemetry {
   /// trajectory order (worker 0 first).
   std::vector<int> per_worker_waypoint_counts;
 
-  /// True when the active policy snapshot declared one or more
-  /// `support_contacts` entries, regardless of whether that caused a
-  /// serial fallback. Useful for distinguishing "support_contact present
-  /// but pool ran parallel because the refusal flag is off" from "no
-  /// support_contact at all" in dashboards.
-  bool support_contact_active = false;
+  /// True when the active policy snapshot holds one or more tracked
+  /// contact-rule pairs (release rules, whole-move contact rules with a
+  /// depth limit), regardless of whether that caused a serial fallback.
+  bool tracked_contact_active = false;
 
   bool contact_release_active = false;
   bool ordered_contact_summary_used = false;
@@ -96,7 +94,7 @@ struct FallbackLogEvent {
   int worker_count_requested = 0;
   int worker_count_available = 0;
   int waypoint_count = 0;
-  bool support_contact_active = false;
+  bool tracked_contact_active = false;
 };
 
 /// Lock-free diagnostic snapshot for the persistent validation worker pool.
@@ -160,11 +158,11 @@ class ParallelCollisionValidationWorkerPool {
     /// avoid sub-millisecond contention overheads.
     int min_waypoints_for_parallel = 8;
 
-    /// Enable the qualified two-phase ordered-summary path for support-contact
-    /// and contact-release validation. Every collision query remains
+    /// Enable the qualified two-phase ordered-summary path for tracked
+    /// contact-rule pairs. Every collision query remains
     /// sequential inside one worker chunk; only bounded summaries cross back
     /// to the coordinator. Disable only for qualification/debug comparison.
-    bool enable_ordered_support_contact_summaries = true;
+    bool enable_ordered_contact_summaries = true;
 
     /// Optional sink for structured fallback-log events. When set, the
     /// pool calls the sink at most once per cause per `fallback_log_window`.

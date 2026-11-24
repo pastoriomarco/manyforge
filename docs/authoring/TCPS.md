@@ -25,6 +25,16 @@ Control) show:
 - the TCPs of the tools mounted on it;
 - the TCPs of tools mounted on no robot.
 
+A Tool made from its parameters and the generic passive tool have their
+TCPs on their frame-only `tool` target (for example `holder · tool · tcp`).
+A Tool's TCPs are those of its parameters, the first its default, each
+belonging to a tool end or the body
+([A Tool from its parameters](ADDING_A_COMPONENT.md#a-tool-from-its-parameters));
+a passive tool's default TCP is the link `passive_tool_tcp` of its URDF,
+placed by its fixed joint's origin
+([A project's own passive tool](ADDING_A_COMPONENT.md#a-projects-own-passive-tool)).
+More TCPs are custom TCPs on the component page.
+
 TCPs of tools mounted on another robot are hidden. The **Show TCPs of tools
 mounted on other robots** checkbox (off by default) shows them too; its
 tooltip reads "Useful only once tool change is implemented: today a TCP whose
@@ -56,6 +66,33 @@ or a TCP of a tool it carries; a robot without an Active TCP is described
 [below](#the-active-tcp). A key's value is checked like a specific TCP at
 that moment. The picker checkbox changes visibility only; it does not change
 these rules.
+
+## Contact bodies
+
+A TCP has **contact bodies**: the collision bodies of its component that are
+meant to touch the work, for example a gripper's pads or a probe's tip. A
+collision rule selects them with **Contact bodies of the move's TCP**
+(`active_tcp_contact_bodies`), so that a move may touch an object with these
+bodies only ([Collision rules](COLLISION_RULES.md)). The geometric-contact
+inputs use the same bodies
+([Geometric-contact inputs](ADDING_A_COMPONENT.md#geometric-contact-inputs)).
+
+Each TCP row can list them as `contact_bodies`, a list of the component's
+collision body names:
+
+| TCP | Where `contact_bodies` is written |
+| --- | --- |
+| A TCP of the component's model | The `tcps` row of its descriptor (`component.yaml`) |
+| A custom TCP | **Contact bodies** of the custom TCP on the component page (`custom_tcps` row in the Deployment) |
+
+A row without `contact_bodies` takes the default: on a gripper the
+`gripper_pads` collision body when the component has one, else
+`gripper_fingers`, else none; on a passive tool none. An empty list means
+none. The curated passive tool lists its probe tip (`tip`) on its `tcp` row.
+A Tool's TCP has the contact bodies its parameters name, by default its tool
+end's (a jaw pair's pads, else its fingers; a tip or a spring slider itself;
+none on the body).
+The component page shows each TCP's contact bodies.
 
 ## The Active TCP
 
@@ -228,11 +265,19 @@ dialog for a change that occurred before Hold.
 
 An **Attach object** node names the holder (for example the gripper) and the
 frame the part is attached to: one of the holder's frames, or **Active TCP**.
-The Active TCP is resolved when Attach runs and is accepted only when it is
-one of the holder's own TCPs; otherwise the attach is refused with "Active
-TCP is not on the holder" (`attach_active_tcp_not_holder`). A later Active TCP
-change does not retarget an existing attachment. Detach and grasp-lost
-handling do not change.
+When the holder is a robot (its arm target), the frame may also belong to a
+component mounted on the robot, directly or through a tool changer: the
+robot's kinematics places that frame, as for **Get frame pose** and moves to
+a tool TCP. A frame on a moving part of the tool, such as a gripper jaw, is
+not placed by the robot: attach it with the tool's own target. The touch
+bodies belong to the carrier frame's component.
+
+The Active TCP is resolved when Attach runs and is accepted when it is one of
+the holder's own TCPs, or, on a robot holder, a TCP of a tool mounted on the
+robot that the robot's kinematics places; otherwise the attach is refused
+with "Active TCP is not on the holder" (`attach_active_tcp_not_holder`). A
+later Active TCP change does not retarget an existing attachment. Detach and
+grasp-lost handling do not change.
 
 On a Real xArm, the host follows its current Scene projection for total
 payload and sends it through the xArm adapter's tool-context hook

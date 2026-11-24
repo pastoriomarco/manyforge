@@ -4,13 +4,14 @@ answers once the Manager status mirror shows it."""
 from __future__ import annotations
 
 import copy
+import json
 from threading import Event, Thread
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from manyforge_headless_api.native import HeadlessApiError
+from manyforge_headless_api.native import HeadlessApiError, NativeHeadlessCore
 from manyforge_headless_api.service import (
     RUNTIME_SNAPSHOT_VERSION,
     HeadlessService,
@@ -31,13 +32,21 @@ def _projection(revision_id: int, *, bundle: str = "bundle") -> dict[str, Any]:
 
 
 class Mirror:
-    """The native core's runtime snapshot over a settable logical scene."""
+    """The native core's mirror over a settable logical scene."""
 
     def __init__(self) -> None:
-        self.shown = _projection(1)
+        self.shown: dict[str, Any] | None = _projection(1)
         self.freshness = "fresh"
+        self.snapshots = 0
+        self.reads = 0
+
+    def logical_scene_active_projection(self) -> dict[str, Any] | None:
+        # The last valid value, whatever its freshness (OD-378).
+        self.reads += 1
+        return copy.deepcopy(self.shown)
 
     def runtime_snapshot(self) -> dict[str, Any]:
+        self.snapshots += 1
         section = {
             "available": True,
             "freshness": self.freshness,
@@ -57,7 +66,7 @@ class Manager:
     def __init__(self) -> None:
         self.committed = Event()
 
-    def commit_scene_transaction(self, request, *, trusted_principal_id):
+    def commit_scene_transaction(self, request, *, trusted_principal_id, mesh_content_digest):
         self.committed.set()
         return {
             "ok": True,
@@ -69,6 +78,7 @@ class Manager:
 def _request() -> SimpleNamespace:
     return SimpleNamespace(
         operation=SimpleNamespace(kind="remove_object"),
+        request_context=SimpleNamespace(source_label="composer_ui"),
         program_node_evidence=None,
         expected_admission_generation=1,
         program_reset_scene_authorization=None,
@@ -108,6 +118,8 @@ def test_reply_waits_until_the_mirror_shows_the_commit() -> None:
     thread.join(5.0)
     assert not thread.is_alive()
     assert replies[0]["ok"] is True
+    # The wait reads the mirror alone, never a full runtime snapshot.
+    assert mirror.snapshots == 0
     shown = service.scene()["logical_scene"]["payload"]["access"]["active_projection"]
     assert shown == replies[0]["committed_projection_revision"]
 
@@ -118,6 +130,53 @@ def test_newer_revision_or_other_lineage_answers_at_once(shown: dict[str, Any]) 
     mirror.shown = shown
     service = HeadlessService(mirror, Manager(), application_start_id="3f9a0000000000a1")
     assert service.scene_commit(_request(), TrustedAttribution())["ok"] is True
+
+
+def test_no_projection_yet_keeps_waiting() -> None:
+    # Before the Manager's bootstrap publication the mirror shows none.
+    mirror, manager = Mirror(), Manager()
+    mirror.shown = None
+    service = HeadlessService(mirror, manager, application_start_id="3f9a0000000000a1")
+    thread, replies = _commit_in_thread(service)
+    _waiting(manager, thread)
+    service.manager_status_changed()
+    thread.join(0.1)
+    assert thread.is_alive()
+
+    mirror.shown = _projection(2)
+    service.manager_status_changed()
+    thread.join(5.0)
+    assert not thread.is_alive()
+    assert replies[0]["ok"] is True
+
+
+def test_change_during_the_mirror_read_is_not_lost() -> None:
+    """The change counter is read before the mirror: a publication landing
+    between the mirror read and the wait still wakes it (no lost wake-up)."""
+
+    class RacingMirror(Mirror):
+        def __init__(self) -> None:
+            super().__init__()
+            self.service: HeadlessService | None = None
+
+        def logical_scene_active_projection(self) -> dict[str, Any] | None:
+            shown = super().logical_scene_active_projection()
+            if self.reads == 1:
+                # The follower applies the commit's frame right after this
+                # read and signals once; no later change ever comes.
+                self.shown = _projection(2)
+                assert self.service is not None
+                self.service.manager_status_changed()
+            return shown
+
+    mirror, manager = RacingMirror(), Manager()
+    service = HeadlessService(mirror, manager, application_start_id="3f9a0000000000a1")
+    mirror.service = service
+    thread, replies = _commit_in_thread(service)
+    thread.join(5.0)
+    assert not thread.is_alive()
+    assert replies[0]["ok"] is True
+    assert mirror.reads == 2
 
 
 def test_tick_silence_keeps_waiting_and_disconnect_ends_the_wait() -> None:
@@ -199,3 +258,14 @@ def test_latch_that_committed_nothing_answers_at_once() -> None:
     thread.join(5.0)
     assert not thread.is_alive()
     assert replies[0]["ok"] is True
+
+
+@pytest.mark.parametrize("shown", [None, _projection(4)])
+def test_native_accessor_parses_the_mirror_text(shown: dict[str, Any] | None) -> None:
+    core = object.__new__(NativeHeadlessCore)
+    core._native = SimpleNamespace(
+        logical_scene_active_projection=lambda: (
+            None if shown is None else json.dumps(shown, sort_keys=True, separators=(",", ":"))
+        )
+    )
+    assert core.logical_scene_active_projection() == shown

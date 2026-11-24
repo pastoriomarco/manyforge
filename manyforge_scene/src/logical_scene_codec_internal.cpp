@@ -7,6 +7,7 @@
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
@@ -97,15 +98,6 @@ const CanonicalValue::Array &Array(const CanonicalValue &value,
   return *array;
 }
 
-CanonicalValue StringArray(const std::vector<std::string> &values) {
-  CanonicalValue::Array result;
-  result.reserve(values.size());
-  for (const auto &value : values) {
-    result.emplace_back(value);
-  }
-  return CanonicalValue(std::move(result));
-}
-
 template <typename Strong>
 CanonicalValue StrongArray(const std::vector<Strong> &values) {
   CanonicalValue::Array result;
@@ -172,9 +164,16 @@ core::Pose3DTO DecodePose(const CanonicalValue &value) {
   return result;
 }
 
-CanonicalValue Shape(const core::CollisionShapeDTO &value) {
+/// How a mesh shape carries `mesh_content_digest`: required in persisted and
+/// resolved scene content, optional in a transaction request (the Manager
+/// fills it before the owner sees the request), and absent from the request
+/// digest input (resolved content, not request intent).
+enum class MeshDigestField { kRequired, kOptional, kOmitted };
+
+CanonicalValue Shape(const core::CollisionShapeDTO &value,
+                     const MeshDigestField digest = MeshDigestField::kRequired) {
   return std::visit(
-      [](const auto &shape) -> CanonicalValue {
+      [digest](const auto &shape) -> CanonicalValue {
         using T = std::decay_t<decltype(shape)>;
         if constexpr (std::is_same_v<T, core::BoxShapeDTO>) {
           return CanonicalValue(CanonicalValue::Object{
@@ -193,17 +192,26 @@ CanonicalValue Shape(const core::CollisionShapeDTO &value) {
               {"type", CanonicalValue("cylinder")},
           });
         } else {
-          return CanonicalValue(CanonicalValue::Object{
-              {"mesh_resource_uri", CanonicalValue(shape.resource_uri)},
-              {"mesh_scale", Vector(shape.scale)},
-              {"type", CanonicalValue("mesh")},
-          });
+          CanonicalValue::Object object;
+          if (digest == MeshDigestField::kRequired ||
+              (digest == MeshDigestField::kOptional &&
+               !shape.content_digest.empty())) {
+            object.emplace_back("mesh_content_digest",
+                                CanonicalValue(shape.content_digest));
+          }
+          object.emplace_back("mesh_resource_uri",
+                              CanonicalValue(shape.resource_uri));
+          object.emplace_back("mesh_scale", Vector(shape.scale));
+          object.emplace_back("type", CanonicalValue("mesh"));
+          return CanonicalValue(std::move(object));
         }
       },
       value);
 }
 
-core::CollisionShapeDTO DecodeShape(const CanonicalValue &value) {
+core::CollisionShapeDTO
+DecodeShape(const CanonicalValue &value,
+            const MeshDigestField digest = MeshDigestField::kRequired) {
   const auto type = String(Member(value, "type"), "shape.type");
   if (type == "box") {
     ExactObject(value, 2U, "box shape");
@@ -222,10 +230,25 @@ core::CollisionShapeDTO DecodeShape(const CanonicalValue &value) {
     };
   }
   if (type == "mesh") {
-    ExactObject(value, 3U, "mesh shape");
+    const bool has_digest =
+        value.is_object() &&
+        value.find_object_member("mesh_content_digest") != nullptr;
+    if (!has_digest && digest == MeshDigestField::kRequired) {
+      Fail("mesh shape requires mesh_content_digest");
+    }
+    ExactObject(value, has_digest ? 4U : 3U, "mesh shape");
+    std::string content_digest;
+    if (has_digest) {
+      content_digest =
+          String(Member(value, "mesh_content_digest"), "mesh_content_digest");
+      if (!core::IsExactLowercaseSha256Digest(content_digest)) {
+        Fail("mesh_content_digest must be an exact sha256 digest");
+      }
+    }
     return core::MeshShapeDTO{
         String(Member(value, "mesh_resource_uri"), "mesh_resource_uri"),
         DecodeVector(Member(value, "mesh_scale")),
+        std::move(content_digest),
     };
   }
   Fail("shape.type is unsupported");
@@ -265,160 +288,33 @@ std::vector<core::CollisionPairId> DecodePairs(const CanonicalValue &value) {
   return result;
 }
 
-std::string_view ContactMode(const core::CollisionContactPolicyMode mode) {
-  switch (mode) {
-  case core::CollisionContactPolicyMode::kContactRelease:
-    return "contact_release";
-  case core::CollisionContactPolicyMode::kBoundedPenetration:
-    return "bounded_penetration";
-  case core::CollisionContactPolicyMode::kContactProcess:
-    return "contact_process";
-  }
-  return {};
-}
-
-core::CollisionContactPolicyMode DecodeContactMode(std::string_view mode) {
-  if (mode == "contact_release") {
-    return core::CollisionContactPolicyMode::kContactRelease;
-  }
-  if (mode == "bounded_penetration") {
-    return core::CollisionContactPolicyMode::kBoundedPenetration;
-  }
-  if (mode == "contact_process") {
-    return core::CollisionContactPolicyMode::kContactProcess;
-  }
-  Fail("collision contact mode is unsupported");
-}
-
-std::string_view ReleaseMode(const core::ContactReleaseEvidenceMode mode) {
-  switch (mode) {
-  case core::ContactReleaseEvidenceMode::kSignedPenetration:
-    return "signed_penetration";
-  case core::ContactReleaseEvidenceMode::kBinaryContact:
-    return "binary_contact";
-  }
-  return {};
-}
-
-core::ContactReleaseEvidenceMode DecodeReleaseMode(std::string_view mode) {
-  if (mode == "signed_penetration") {
-    return core::ContactReleaseEvidenceMode::kSignedPenetration;
-  }
-  if (mode == "binary_contact") {
-    return core::ContactReleaseEvidenceMode::kBinaryContact;
-  }
-  Fail("contact release evidence mode is unsupported");
-}
-
-CanonicalValue SupportDeclaration(const core::SupportContactDTO &contact) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"allow_recontact", CanonicalValue(contact.allow_recontact)},
-      {"enforce_max_start_penetration",
-       CanonicalValue(contact.enforce_max_start_penetration)},
-      {"max_contact_penetration_m",
-       CanonicalValue(contact.max_contact_penetration_m)},
-      {"max_start_penetration_m",
-       CanonicalValue(contact.max_start_penetration_m)},
-      {"min_release_progress_m",
-       CanonicalValue(contact.min_release_progress_m)},
-      {"mode", CanonicalValue(std::string(ContactMode(contact.mode)))},
-      {"release_evidence_mode",
-       CanonicalValue(std::string(ReleaseMode(contact.release_evidence_mode)))},
-      {"release_tolerance_m", CanonicalValue(contact.release_tolerance_m)},
-      {"require_separation_by_end",
-       CanonicalValue(contact.require_separation_by_end)},
-      {"require_strictly_decreasing_penetration",
-       CanonicalValue(contact.require_strictly_decreasing_penetration)},
-      {"support_object_id", CanonicalValue(contact.support_object_id)},
-  });
-}
-
-CanonicalValue
-SupportDeclarations(const std::vector<core::SupportContactDTO> &contacts) {
+CanonicalValue Bodies(const std::vector<core::CollisionBodyId> &values) {
   CanonicalValue::Array result;
-  result.reserve(contacts.size());
-  for (const auto &contact : contacts) {
-    result.emplace_back(SupportDeclaration(contact));
+  result.reserve(values.size());
+  for (const auto &value : values) {
+    result.emplace_back(value);
   }
   return CanonicalValue(std::move(result));
 }
 
-core::SupportContactDTO DecodeSupportDeclaration(const CanonicalValue &value) {
-  ExactObject(value, 11U, "support declaration");
-  return {
-      String(Member(value, "support_object_id"), "support_object_id"),
-      DecodeContactMode(String(Member(value, "mode"), "support mode")),
-      DecodeReleaseMode(String(Member(value, "release_evidence_mode"),
-                               "support release evidence mode")),
-      Boolean(Member(value, "enforce_max_start_penetration"),
-              "enforce_max_start_penetration"),
-      Number(Member(value, "max_start_penetration_m"),
-             "max_start_penetration_m"),
-      Number(Member(value, "release_tolerance_m"), "release_tolerance_m"),
-      Number(Member(value, "min_release_progress_m"), "min_release_progress_m"),
-      Number(Member(value, "max_contact_penetration_m"),
-             "max_contact_penetration_m"),
-      Boolean(Member(value, "require_separation_by_end"),
-              "require_separation_by_end"),
-      Boolean(Member(value, "require_strictly_decreasing_penetration"),
-              "require_strictly_decreasing_penetration"),
-      Boolean(Member(value, "allow_recontact"), "allow_recontact"),
-  };
-}
-
-std::vector<core::SupportContactDTO>
-DecodeSupportDeclarations(const CanonicalValue &value) {
-  std::vector<core::SupportContactDTO> result;
-  const auto &contacts = Array(value, "support_contacts");
-  result.reserve(contacts.size());
-  for (const auto &contact : contacts) {
-    result.emplace_back(DecodeSupportDeclaration(contact));
+std::vector<core::CollisionBodyId> DecodeBodies(const CanonicalValue &value) {
+  std::vector<core::CollisionBodyId> result;
+  const auto &values = Array(value, "collision bodies");
+  result.reserve(values.size());
+  for (const auto &entry : values) {
+    result.emplace_back(String(entry, "collision body"));
   }
   return result;
 }
 
+// A policy held by the logical scene has no collision rules: rules belong to
+// one move and the kernel installs them at admission.
 CanonicalValue Policy(const core::CollisionPolicySnapshot &policy) {
-  CanonicalValue::Array contacts;
-  contacts.reserve(policy.support_contacts.size());
-  for (const auto &contact : policy.support_contacts) {
-    contacts.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"allow_recontact", CanonicalValue(contact.allow_recontact)},
-        {"enforce_max_start_penetration",
-         CanonicalValue(contact.enforce_max_start_penetration)},
-        {"max_contact_penetration_m",
-         CanonicalValue(contact.max_contact_penetration_m)},
-        {"max_start_penetration_m",
-         CanonicalValue(contact.max_start_penetration_m)},
-        {"min_release_progress_m",
-         CanonicalValue(contact.min_release_progress_m)},
-        {"mode", CanonicalValue(std::string(ContactMode(contact.mode)))},
-        {"pair", Pair(contact.pair)},
-        {"release_evidence_mode", CanonicalValue(std::string(ReleaseMode(
-                                      contact.release_evidence_mode)))},
-        {"release_tolerance_m", CanonicalValue(contact.release_tolerance_m)},
-        {"require_separation_by_end",
-         CanonicalValue(contact.require_separation_by_end)},
-        {"require_strictly_decreasing_penetration",
-         CanonicalValue(contact.require_strictly_decreasing_penetration)},
-    }));
-  }
-  CanonicalValue::Array grasps;
-  grasps.reserve(policy.contact_grasps.size());
-  for (const auto &grasp : policy.contact_grasps) {
-    grasps.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"allowed_robot_links", StringArray(grasp.allowed_robot_links)},
-        {"max_penetration_m", CanonicalValue(grasp.max_penetration_m)},
-        {"policy_id", CanonicalValue(grasp.policy_id)},
-        {"selected_object_id", CanonicalValue(grasp.selected_object_id)},
-        {"terminal_window_start_fraction",
-         CanonicalValue(grasp.terminal_window_start_fraction)},
-    }));
+  if (!policy.contact_rules.empty()) {
+    Fail("a scene collision policy cannot carry collision rules");
   }
   return CanonicalValue(CanonicalValue::Object{
-      {"allowed_static_static_pairs",
-       Pairs(policy.allowed_static_static_pairs)},
       {"allowed_touch_link_pairs", Pairs(policy.allowed_touch_link_pairs)},
-      {"contact_grasps", CanonicalValue(std::move(grasps))},
       {"policy_id", CanonicalValue(policy.policy_id)},
       {"require_full_diagnostics",
        CanonicalValue(policy.require_full_diagnostics)},
@@ -428,12 +324,12 @@ CanonicalValue Policy(const core::CollisionPolicySnapshot &policy) {
            {"revision_id",
             Unsigned(policy.revision.revision_id, "policy revision")},
        })},
-      {"support_contacts", CanonicalValue(std::move(contacts))},
+      {"static_body_ids", Bodies(policy.static_body_ids)},
   });
 }
 
 core::CollisionPolicySnapshot DecodePolicy(const CanonicalValue &value) {
-  ExactObject(value, 7U, "collision policy");
+  ExactObject(value, 5U, "collision policy");
   core::CollisionPolicySnapshot policy;
   policy.policy_id = String(Member(value, "policy_id"), "policy_id");
   const auto &revision = Member(value, "revision");
@@ -442,59 +338,9 @@ core::CollisionPolicySnapshot DecodePolicy(const CanonicalValue &value) {
       DecodeUnsigned(Member(revision, "revision_id"), "policy revision_id"),
       String(Member(revision, "content_hash"), "policy content_hash"),
   };
-  policy.allowed_static_static_pairs =
-      DecodePairs(Member(value, "allowed_static_static_pairs"));
+  policy.static_body_ids = DecodeBodies(Member(value, "static_body_ids"));
   policy.allowed_touch_link_pairs =
       DecodePairs(Member(value, "allowed_touch_link_pairs"));
-  for (const auto &entry :
-       Array(Member(value, "support_contacts"), "support_contacts")) {
-    ExactObject(entry, 11U, "support contact");
-    core::SupportContactPolicyEntry contact;
-    contact.pair = DecodePair(Member(entry, "pair"));
-    contact.mode = DecodeContactMode(
-        String(Member(entry, "mode"), "support contact mode"));
-    contact.release_evidence_mode = DecodeReleaseMode(String(
-        Member(entry, "release_evidence_mode"), "release evidence mode"));
-    contact.enforce_max_start_penetration =
-        Boolean(Member(entry, "enforce_max_start_penetration"),
-                "enforce_max_start_penetration");
-    contact.max_start_penetration_m = Number(
-        Member(entry, "max_start_penetration_m"), "max_start_penetration_m");
-    contact.release_tolerance_m =
-        Number(Member(entry, "release_tolerance_m"), "release_tolerance_m");
-    contact.min_release_progress_m = Number(
-        Member(entry, "min_release_progress_m"), "min_release_progress_m");
-    contact.max_contact_penetration_m =
-        Number(Member(entry, "max_contact_penetration_m"),
-               "max_contact_penetration_m");
-    contact.require_separation_by_end =
-        Boolean(Member(entry, "require_separation_by_end"),
-                "require_separation_by_end");
-    contact.require_strictly_decreasing_penetration =
-        Boolean(Member(entry, "require_strictly_decreasing_penetration"),
-                "require_strictly_decreasing_penetration");
-    contact.allow_recontact =
-        Boolean(Member(entry, "allow_recontact"), "allow_recontact");
-    policy.support_contacts.emplace_back(std::move(contact));
-  }
-  for (const auto &entry :
-       Array(Member(value, "contact_grasps"), "contact_grasps")) {
-    ExactObject(entry, 5U, "contact grasp");
-    core::ContactGraspPolicyEntry grasp;
-    grasp.policy_id = String(Member(entry, "policy_id"), "grasp policy_id");
-    grasp.selected_object_id =
-        String(Member(entry, "selected_object_id"), "selected_object_id");
-    for (const auto &link :
-         Array(Member(entry, "allowed_robot_links"), "allowed_robot_links")) {
-      grasp.allowed_robot_links.emplace_back(String(link, "robot link"));
-    }
-    grasp.max_penetration_m =
-        Number(Member(entry, "max_penetration_m"), "max_penetration_m");
-    grasp.terminal_window_start_fraction =
-        Number(Member(entry, "terminal_window_start_fraction"),
-               "terminal_window_start_fraction");
-    policy.contact_grasps.emplace_back(std::move(grasp));
-  }
   policy.require_full_diagnostics = Boolean(
       Member(value, "require_full_diagnostics"), "require_full_diagnostics");
   return policy;
@@ -704,7 +550,6 @@ CanonicalValue Object(const core::SceneObjectSnapshotDTO &object) {
       {"collision_shapes", CanonicalValue(std::move(shapes))},
       {"placement", Placement(object.placement)},
       {"scene_resource_id", CanonicalValue(object.scene_resource_id.value())},
-      {"support_contacts", SupportDeclarations(object.support_contacts)},
   };
   if (object.provider_evidence.has_value()) {
     value.emplace_back("provider_evidence",
@@ -717,7 +562,7 @@ CanonicalValue Object(const core::SceneObjectSnapshotDTO &object) {
 core::SceneObjectSnapshotDTO DecodeObject(const CanonicalValue &value) {
   if (!value.is_object() ||
       value.as_object().size() !=
-          4U + MassFieldCount(value) +
+          3U + MassFieldCount(value) +
               (value.find_object_member("provider_evidence") != nullptr
                    ? 1U
                    : 0U)) {
@@ -729,7 +574,6 @@ core::SceneObjectSnapshotDTO DecodeObject(const CanonicalValue &value) {
       {},
       DecodePlacement(Member(value, "placement")),
       std::nullopt,
-      DecodeSupportDeclarations(Member(value, "support_contacts")),
       DecodeMass(value),
   };
   for (const auto &shape :
@@ -997,9 +841,10 @@ core::RequestAttributionDTO DecodeAttribution(const CanonicalValue &value) {
   return result;
 }
 
-CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
+CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value,
+                                const MeshDigestField mesh_digest) {
   return std::visit(
-      [](const auto &request) -> CanonicalValue {
+      [mesh_digest](const auto &request) -> CanonicalValue {
         using T = std::decay_t<decltype(request)>;
         if constexpr (std::is_same_v<T, core::AddObjectRequestDTO>) {
           CanonicalValue::Object object{
@@ -1008,9 +853,7 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
               {"pose", Pose(request.pose)},
               {"scene_resource_id",
                CanonicalValue(request.scene_resource_id.value())},
-              {"shape", Shape(request.shape)},
-              {"support_contacts",
-               SupportDeclarations(request.support_contacts)},
+              {"shape", Shape(request.shape, mesh_digest)},
           };
           AppendMass(object, request.mass_kg);
           return CanonicalValue(std::move(object));
@@ -1021,9 +864,7 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
               {"pose", Pose(request.pose)},
               {"scene_resource_id",
                CanonicalValue(request.scene_resource_id.value())},
-              {"shape", Shape(request.shape)},
-              {"support_contacts",
-               SupportDeclarations(request.support_contacts)},
+              {"shape", Shape(request.shape, mesh_digest)},
           };
           AppendMass(object, request.mass_kg);
           return CanonicalValue(std::move(object));
@@ -1073,6 +914,11 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
                                 GraspLostBound(*request.grasp_lost_bound));
           }
           EmplaceGraspLostResponse(object, request.on_grasp_lost);
+          if (request.carrier_component_id) {
+            object.emplace_back(
+                "carrier_component_id",
+                CanonicalValue(request.carrier_component_id->value()));
+          }
           return CanonicalValue(std::move(object));
         } else if constexpr (std::is_same_v<
                                  T, core::DetachCarriedObjectRequestDTO>) {
@@ -1133,26 +979,24 @@ DecodeRequestOperation(const CanonicalValue &value) {
   }
   const auto kind = String(Member(value, "kind"), "operation kind");
   if (kind == "add_object") {
-    ExactObject(value, 6U + MassFieldCount(value), "add-object request");
+    ExactObject(value, 5U + MassFieldCount(value), "add-object request");
     return core::AddObjectRequestDTO{
         core::SceneResourceId(
             String(Member(value, "scene_resource_id"), "scene_resource_id")),
-        DecodeShape(Member(value, "shape")),
+        DecodeShape(Member(value, "shape"), MeshDigestField::kOptional),
         DecodePose(Member(value, "pose")),
         DecodeRequestFrame(Member(value, "frame_ref")),
-        DecodeSupportDeclarations(Member(value, "support_contacts")),
         DecodeMass(value),
     };
   }
   if (kind == "upsert_object") {
-    ExactObject(value, 6U + MassFieldCount(value), "upsert-object request");
+    ExactObject(value, 5U + MassFieldCount(value), "upsert-object request");
     return core::UpsertObjectRequestDTO{
         core::SceneResourceId(
             String(Member(value, "scene_resource_id"), "scene_resource_id")),
-        DecodeShape(Member(value, "shape")),
+        DecodeShape(Member(value, "shape"), MeshDigestField::kOptional),
         DecodePose(Member(value, "pose")),
         DecodeRequestFrame(Member(value, "frame_ref")),
-        DecodeSupportDeclarations(Member(value, "support_contacts")),
         DecodeMass(value),
     };
   }
@@ -1187,7 +1031,10 @@ DecodeRequestOperation(const CanonicalValue &value) {
   if (kind == "attach_carried_object") {
     const auto *bound = value.find_object_member("grasp_lost_bound");
     const auto *response = value.find_object_member("on_grasp_lost");
-    ExactObject(value, 8U + (bound ? 1U : 0U) + (response ? 1U : 0U),
+    const auto *carrier = value.find_object_member("carrier_component_id");
+    ExactObject(value,
+                8U + (bound ? 1U : 0U) + (response ? 1U : 0U) +
+                    (carrier ? 1U : 0U),
                 "attach-carried-object request");
     return core::AttachCarriedObjectRequestDTO{
         core::CarriedObjectAttachmentId(
@@ -1210,6 +1057,9 @@ DecodeRequestOperation(const CanonicalValue &value) {
         bound ? std::optional(DecodeGraspLostBound(*bound)) : std::nullopt,
         response ? std::optional(DecodeGraspLostResponse(*response))
                  : std::nullopt,
+        carrier ? std::optional(core::ControllableComponentId(
+                      String(*carrier, "carrier_component_id")))
+                : std::nullopt,
     };
   }
   if (kind == "detach_carried_object") {
@@ -1732,7 +1582,8 @@ std::string EncodeRequest(const core::SceneTransactionRequestDTO &request) {
            : CanonicalValue(nullptr)},
       {"expected_projection_revision",
        Projection(request.expected_projection_revision)},
-      {"operation", RequestOperation(request.operation)},
+      {"operation",
+       RequestOperation(request.operation, MeshDigestField::kOptional)},
       {"program_reset_scene_authorization",
        request.program_reset_scene_authorization.has_value()
            ? ProgramResetSceneAuthorization(
@@ -1751,7 +1602,8 @@ EncodeRequestDigestInput(const core::SceneTransactionRequestDTO &request) {
   CanonicalValue::Object fields{
       {"expected_projection_revision",
        Projection(request.expected_projection_revision)},
-      {"operation", RequestOperation(request.operation)},
+      {"operation",
+       RequestOperation(request.operation, MeshDigestField::kOmitted)},
       {"program_reset_scene_authorization",
        request.program_reset_scene_authorization.has_value()
            ? ProgramResetSceneAuthorization(
@@ -1866,30 +1718,6 @@ core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes) {
     }
   }
   return snapshot;
-}
-
-std::string
-EncodeErrorDetails(const std::map<std::string, std::string> &details) {
-  CanonicalValue::Object object;
-  object.reserve(details.size());
-  for (const auto &[key, value] : details) {
-    object.emplace_back(key, CanonicalValue(value));
-  }
-  return ci::canonical_json(CanonicalValue(std::move(object)));
-}
-
-std::map<std::string, std::string>
-DecodeErrorDetails(const std::string_view bytes) {
-  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
-  const auto &root = parsed.root();
-  if (!root.is_object() || ci::canonical_json(root) != bytes) {
-    Fail("stored error details are not a canonical object");
-  }
-  std::map<std::string, std::string> result;
-  for (const auto &[key, value] : root.as_object()) {
-    result.emplace(key, String(value, "error detail"));
-  }
-  return result;
 }
 
 } // namespace manyforge::scene::logical_scene_codec_internal

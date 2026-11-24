@@ -42,49 +42,42 @@ bool CanonicalEmptySceneAccessStatus::valid() const noexcept {
 }
 
 LogicalSceneOwner::LogicalSceneOwner(
-    std::filesystem::path database_path,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const core::IActiveBundlePublicationReader &publication_reader)
-    : impl_(std::make_unique<Impl>(std::move(database_path), admission,
-                                   publication_reader)) {}
+    : impl_(std::make_unique<Impl>(admission, publication_reader)) {}
 
 LogicalSceneOwner::LogicalSceneOwner(
-    std::filesystem::path database_path,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const core::IActiveBundlePublicationReader &publication_reader,
     core::IKernelCellAdmissionPort &cell_admission)
-    : impl_(std::make_unique<Impl>(std::move(database_path), admission,
-                                   publication_reader, cell_admission)) {}
+    : impl_(std::make_unique<Impl>(admission, publication_reader,
+                                   cell_admission)) {}
 
 LogicalSceneOwner::LogicalSceneOwner(
-    std::filesystem::path database_path,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const core::IActiveBundlePublicationReader &publication_reader,
     const deployment::IVerifiedRetainedBundleSource &retained_bundle_source)
-    : impl_(std::make_unique<Impl>(std::move(database_path), admission,
-                                   publication_reader,
+    : impl_(std::make_unique<Impl>(admission, publication_reader,
                                    retained_bundle_source)) {}
 
 LogicalSceneOwner::LogicalSceneOwner(
-    std::filesystem::path database_path,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const core::IActiveBundlePublicationReader &publication_reader,
     const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
     const core::IPlannerSceneProjectionResolver &projection_resolver)
-    : impl_(std::make_unique<Impl>(std::move(database_path), admission,
-                                   publication_reader, retained_bundle_source,
+    : impl_(std::make_unique<Impl>(admission, publication_reader,
+                                   retained_bundle_source,
                                    projection_resolver)) {}
 
 LogicalSceneOwner::LogicalSceneOwner(
-    std::filesystem::path database_path,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const core::IActiveBundlePublicationReader &publication_reader,
     const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
     const core::IPlannerSceneProjectionResolver &projection_resolver,
     core::IKernelCellAdmissionPort &cell_admission)
-    : impl_(std::make_unique<Impl>(
-          std::move(database_path), admission, publication_reader,
-          retained_bundle_source, projection_resolver, cell_admission)) {}
+    : impl_(std::make_unique<Impl>(admission, publication_reader,
+                                   retained_bundle_source, projection_resolver,
+                                   cell_admission)) {}
 
 LogicalSceneOwner::~LogicalSceneOwner() = default;
 
@@ -94,16 +87,9 @@ LogicalSceneOwner::LogicalSceneOwner(
 LogicalSceneOwner &LogicalSceneOwner::operator=(
     LogicalSceneOwner &&) noexcept = default;
 
-const std::filesystem::path &
-LogicalSceneOwner::database_path() const noexcept {
-  return impl_->database_path_;
-}
-
 const ProjectionBootstrapPrerequisiteQueryDTO &
 LogicalSceneOwner::fixed_query() const noexcept {
   return impl_->fixed_query_;
 }
-
-void LogicalSceneOwner::Close() { impl_->Close(); }
 
 } // namespace manyforge::scene

@@ -156,9 +156,13 @@ def test_native_commands_start_only_the_manager_with_the_ordered_process_list(
     every_argv = (manager.argv, headless, runner, composer)
     assert not any("manyforge_assistant_bridge" in part for argv in every_argv for part in argv)
     assert all("--apply" not in argv and "--run" not in argv for argv in every_argv)
-    # Children inherit the Manager's environment; only Composer adds its own.
+    # Children inherit the Manager's environment; Headless and Composer read
+    # below the same allowed folders (OD-335).
     assert manager.environment["MANYFORGE_FS_ROOTS"] == str(config.install_root)
-    assert processes[0].environment == {} and processes[1].environment == {}
+    assert processes[0].environment == {
+        "MANYFORGE_FS_ROOTS": processes[2].environment["MANYFORGE_FS_ROOTS"]
+    }
+    assert processes[1].environment == {}
     # The Manager's execution host and its component processes (a point-cloud
     # source, the assistant's host and bridge) inherit both URLs.
     assert manager.environment["MANYFORGE_COMPOSER_URL"] == "http://127.0.0.1:9000"
@@ -166,10 +170,9 @@ def test_native_commands_start_only_the_manager_with_the_ordered_process_list(
     assert processes[2].environment == {
         "MANYFORGE_FS_ROOTS": (
             f"{config.source_root / 'examples'},"
+            f"{config.source_root / 'manyforge_example_models'},"
             f"{config.install_root},{config.program_workspace}"
         ),
-        "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
-        "MANYFORGE_DEPLOYMENT_WRITE_ROOTS": str(config.program_workspace),
         # Composer settings are saved under data/composer/ (finding F1).
         "MANYFORGE_STATE_DIR": str(config.instance_root / "data"),
     }

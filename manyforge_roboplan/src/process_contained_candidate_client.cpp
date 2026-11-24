@@ -27,6 +27,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -34,6 +35,7 @@
 #include <utility>
 
 #include <manyforge_collision/scene_asset_root.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 
 #include "roboplan_worker_protocol.hpp"
 
@@ -73,13 +75,6 @@ native_geometry_name(const std::string_view body_id,
   return result;
 }
 
-/// A relative scene mesh whose bytes differ from the collision model's
-/// pinned digest; reported with reason `scene_mesh_content_changed`.
-class SceneMeshContentChangedError final : public std::invalid_argument {
-public:
-  using std::invalid_argument::invalid_argument;
-};
-
 struct ProjectedMesh final {
   std::optional<std::filesystem::path> resolved_mesh_path;
   std::optional<std::string> scene_mesh_content_digest;
@@ -88,35 +83,23 @@ struct ProjectedMesh final {
 [[nodiscard]] ProjectedMesh
 project_mesh(const RoboPlanWorkerModelDTO &model,
              const ProcessContainedCandidateClientConfig &config,
-             const std::string &uri) {
+             const std::string &uri,
+             const std::optional<std::string> &content_digest) {
   constexpr std::string_view kAssetPrefix = "asset://";
   if (!uri.starts_with(kAssetPrefix)) {
-    // Program scene mesh: resolved only inside the worker, below its own
-    // scene-asset root descriptor. Here only its syntax and the collision
-    // model's pinned digest are bound into the projection.
-    if (!config.scene_asset_root_fd.has_value() ||
-        uri.find("://") != uri.npos) {
+    // Program scene mesh, captured at activation: the worker reads it from
+    // its scene content root by this digest and verifies the bytes. The URI
+    // is never opened.
+    if (!config.scene_content_root_fd.has_value()) {
       throw std::invalid_argument(
-          "retained worker mesh has no exact staged asset path");
+          "retained worker scene mesh has no scene content root: " + uri);
     }
-    if (!collision::is_plain_relative_resource_path(uri)) {
-      throw std::invalid_argument("retained worker mesh asset path is invalid");
-    }
-    if (!config.scene_mesh_content_digest) {
+    if (!content_digest.has_value() ||
+        !core::IsExactLowercaseSha256Digest(*content_digest)) {
       throw std::invalid_argument(
-          "retained worker scene mesh has no content digest source");
+          "retained worker scene mesh has no captured content digest: " + uri);
     }
-    auto digest = config.scene_mesh_content_digest(uri);
-    if (!digest.ok()) {
-      const auto reason = digest.error().details.find("reason");
-      if (reason != digest.error().details.end() &&
-          reason->second == collision::kSceneMeshContentChangedReason) {
-        throw SceneMeshContentChangedError(digest.error().message);
-      }
-      throw std::invalid_argument("retained worker scene mesh is unavailable: " +
-                                  digest.error().message);
-    }
-    return ProjectedMesh{std::nullopt, std::move(digest.value())};
+    return ProjectedMesh{std::nullopt, *content_digest};
   }
   const auto relative_text = uri.substr(kAssetPrefix.size());
   if (model.package_paths.size() != 1U) {
@@ -174,9 +157,11 @@ projected_shape(const core::CollisionGeometryDescriptor &geometry) {
     if (!geometry.source_uri.has_value()) {
       break;
     }
+    // A scene mesh's captured content digest is set by project_mesh.
     return core::MeshShapeDTO{
         *geometry.source_uri,
-        geometry.mesh_scale.value_or(core::Vector3DTO{1.0, 1.0, 1.0})};
+        geometry.mesh_scale.value_or(core::Vector3DTO{1.0, 1.0, 1.0}),
+        std::string{}};
   case core::CollisionGeometryKind::kCapsule:
   case core::CollisionGeometryKind::kCompound:
     break;
@@ -212,6 +197,13 @@ void add_native_pairs(const NativeBodies &native_bodies,
   }
 }
 
+/// A contact rule that allows its pair to touch only from a fraction of the
+/// move on. Every other contact or release rule holds for the whole move.
+[[nodiscard]] bool has_end_window(const core::CollisionPairContactRule &rule) noexcept {
+  const auto *contact = rule.contact();
+  return contact != nullptr && !contact->whole_move();
+}
+
 [[nodiscard]] RoboPlanWorkerModelDTO
 project_worker_model(const RoboPlanWorkerModelDTO &base,
                      const ProcessContainedCandidateClientConfig &config,
@@ -239,16 +231,19 @@ project_worker_model(const RoboPlanWorkerModelDTO &base,
       const auto &geometry = body.geometries[index];
       auto shape = projected_shape(geometry);
       ProjectedMesh mesh_source;
-      if (const auto *mesh = std::get_if<core::MeshShapeDTO>(&shape)) {
-        mesh_source = project_mesh(model, config, mesh->resource_uri);
+      if (auto *mesh = std::get_if<core::MeshShapeDTO>(&shape)) {
+        mesh_source = project_mesh(model, config, mesh->resource_uri,
+                                   geometry.source_hash);
+        // The shape is the one carrier of the captured content digest.
+        mesh->content_digest =
+            mesh_source.scene_mesh_content_digest.value_or(std::string{});
       }
       const auto name = native_geometry_name(body.body_id, index);
       names.push_back(name);
       model.geometries.push_back(RoboPlanWorkerGeometryDTO{
           name, body.frame_id, std::move(shape),
           core::multiply_poses(body.pose, geometry.local_pose),
-          std::move(mesh_source.resolved_mesh_path),
-          std::move(mesh_source.scene_mesh_content_digest)});
+          std::move(mesh_source.resolved_mesh_path)});
       if (model.geometries.size() > kMaximumProjectedWorkerGeometries) {
         throw std::invalid_argument(
             "retained worker projection exceeds the geometry bound");
@@ -256,45 +251,38 @@ project_worker_model(const RoboPlanWorkerModelDTO &base,
     }
   }
 
-  // The selected contact policy's pairs are not part of the worker scene:
-  // they travel with each request (native_contact_pairs).
+  // Pairs of a contact rule with an end window are not part of the worker
+  // scene: they travel with each plan request (native_contact_pairs). Two
+  // static bodies need no entry: the worker skips every pair without a body
+  // of the planned group (ignore_pairs_without_group_bodies), and a static
+  // body is never one.
   NativePairs allowed;
-  for (const auto &pair : projection.policy->allowed_static_static_pairs) {
-    add_native_pairs(native_bodies, pair, allowed);
-  }
   for (const auto &pair : projection.policy->allowed_touch_link_pairs) {
     add_native_pairs(native_bodies, pair, allowed);
   }
-  for (const auto &contact : projection.policy->support_contacts) {
-    add_native_pairs(native_bodies, contact.pair, allowed);
+  for (const auto &rule : projection.policy->contact_rules) {
+    if (!has_end_window(rule)) {
+      add_native_pairs(native_bodies, rule.pair, allowed);
+    }
   }
   model.allowed_collision_pairs.assign(allowed.begin(), allowed.end());
   native_bodies_out = std::move(native_bodies);
   return model;
 }
 
-/// The selected contact policy's allowed pairs as native worker-scene pairs.
-/// Only the bound operation's exact body/object pairs are relaxed for
-/// candidate generation; the final coordinator still checks window/depth.
+/// The pairs of the move's contact rules with an end window as native
+/// worker-scene pairs. They are relaxed for candidate generation of a plan
+/// request only; the final coordinator still checks window and depth.
 [[nodiscard]] std::vector<std::pair<std::string, std::string>>
 native_contact_pairs(const NativeBodies &native_bodies,
                      const RoboPlanCandidateProjectionDTO &projection) {
-  if (!projection.contact_policy_id) {
-    return {};
-  }
-  const auto active = std::find_if(
-      projection.policy->contact_grasps.begin(),
-      projection.policy->contact_grasps.end(), [&](const auto &entry) {
-        return entry.policy_id == *projection.contact_policy_id;
-      });
-  if (active == projection.policy->contact_grasps.end()) {
+  if (!projection.end_contact_pairs_allowed) {
     return {};
   }
   NativePairs allowed;
-  for (const auto &pair : core::build_selected_collision_distance_pairs(
-           *projection.policy, *projection.world, *projection.contact_policy_id)) {
-    if (core::contact_grasp_pair_matches(pair, *active)) {
-      add_native_pairs(native_bodies, pair, allowed);
+  for (const auto &rule : projection.policy->contact_rules) {
+    if (has_end_window(rule)) {
+      add_native_pairs(native_bodies, rule.pair, allowed);
     }
   }
   return {allowed.begin(), allowed.end()};
@@ -378,7 +366,7 @@ enum class RequestFailureKind {
   kTimeout,
   kTransport,
   kProtocol,
-  kSceneMeshContentChanged,
+  kSceneMeshUnavailable,
 };
 
 class RequestFailure final : public std::runtime_error {
@@ -698,12 +686,12 @@ request_failure_error(const RequestFailure &failure, bool ik) {
                  "RoboPlan worker became unavailable",
                  ik ? "native_ik_worker_unavailable"
                     : "native_planner_worker_unavailable");
-  case RequestFailureKind::kSceneMeshContentChanged:
+  case RequestFailureKind::kSceneMeshUnavailable:
     return error(ik ? core::ErrorCode::kIkFailed
                     : core::ErrorCode::kPlanningFailed,
-                 "Scene mesh bytes differ from the bytes the collision model "
-                 "loaded",
-                 std::string(collision::kSceneMeshContentChangedReason));
+                 "A scene mesh's captured content is unavailable to the "
+                 "planner",
+                 "scene_mesh_unavailable", {{"detail", failure.what()}});
   }
   return error(core::ErrorCode::kInternalError, "RoboPlan worker failed",
                "native_worker_failure");
@@ -711,13 +699,37 @@ request_failure_error(const RequestFailure &failure, bool ik) {
 
 } // namespace
 
+namespace {
+
+// The joints of the planner's model by what a request may pose: scalar
+// joints (one bounded position), and the others (continuous). Sorted.
+struct PlannerModelJoints final {
+  std::vector<std::string> scalar;
+  std::vector<std::string> other;
+};
+
+[[nodiscard]] std::shared_ptr<const PlannerModelJoints>
+planner_model_joints(const RoboPlanWorkerModelDTO &model) {
+  auto joints = std::make_shared<PlannerModelJoints>();
+  for (const auto &row : model.joint_limits) {
+    const bool scalar = row.minimum_position.has_value() &&
+                        row.minimum_position->size() == 1U;
+    (scalar ? joints->scalar : joints->other).push_back(row.joint_name);
+  }
+  std::sort(joints->scalar.begin(), joints->scalar.end());
+  std::sort(joints->other.begin(), joints->other.end());
+  return joints;
+}
+
+}  // namespace
+
 struct ProcessContainedRoboPlanCandidateClient::Impl final {
   struct ProjectionSelection final {
     core::ProjectionRevisionDTO projection_revision;
     core::CollisionWorldRevision world_revision;
     core::CollisionPolicyRevision policy_revision;
-    /// Not part of the worker identity: the margins and the selected contact
-    /// policy's pairs travel with each request.
+    /// Not part of the worker identity: the margins and the end-window
+    /// contact pairs travel with each request.
     NativeBodies native_bodies;
     std::vector<RoboPlanPairMarginDTO> pair_margins;
     std::vector<std::pair<std::string, std::string>> contact_pairs;
@@ -743,6 +755,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
         binding(std::move(binding_value)),
         candidate_config(std::move(candidate_config_value)),
         config(std::move(config_value)) {
+    model_joints.store(planner_model_joints(model), std::memory_order_release);
     validate_config();
     if (!config.require_retained_projection) {
       start_worker(nullptr, Clock::now() + config.startup_timeout);
@@ -794,11 +807,11 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
             "RoboPlan retained package descriptor is not inherited");
       }
     }
-    if (config.scene_asset_root_fd.has_value()) {
+    if (config.scene_content_root_fd.has_value()) {
       // The descriptor is duplicated (close-on-exec) at each spawn and mapped
       // to the worker's reserved FD, so it must not alias a descriptor that
       // spawn itself rewrites or the separate retained package root.
-      const int scene_root_fd = *config.scene_asset_root_fd;
+      const int scene_root_fd = *config.scene_content_root_fd;
       struct stat status {};
       if (scene_root_fd <= worker_protocol::kProtocolDescriptor ||
           (config.retained_package_root_fd.has_value() &&
@@ -806,7 +819,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
             scene_root_fd == 6)) ||
           ::fstat(scene_root_fd, &status) != 0 || !S_ISDIR(status.st_mode)) {
         throw std::invalid_argument(
-            "RoboPlan scene-asset root descriptor is invalid");
+            "RoboPlan scene content root descriptor is invalid");
       }
     }
   }
@@ -862,12 +875,6 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
       pair_margins =
           native_pair_margins(native_bodies, projection.clearance_margins.get());
       contact_pairs = native_contact_pairs(native_bodies, projection);
-    } catch (const SceneMeshContentChangedError &exception) {
-      return core::Result<void>::Err(
-          error(core::ErrorCode::kInvalidRequest,
-                "Retained RoboPlan worker projection failed: " +
-                    std::string(exception.what()),
-                std::string(collision::kSceneMeshContentChangedReason)));
     } catch (const std::exception &exception) {
       return margin_failure(exception);
     }
@@ -909,17 +916,12 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
   }
 
   /// Compares the initialization the worker loads, so equal bytes mean an
-  /// identical worker scene. A relative scene mesh is re-hashed by each new
-  /// worker generation, so such a projection always restarts the worker.
-  /// Guarded by request_mutex.
+  /// identical worker scene. A Program scene mesh is part of it by its
+  /// captured content digest: an equal digest names the same immutable bytes
+  /// the worker already loaded, a changed digest restarts it. Guarded by
+  /// request_mutex.
   [[nodiscard]] bool
   loads_same_scene(const RoboPlanWorkerModelDTO &projected) const {
-    if (std::any_of(projected.geometries.begin(), projected.geometries.end(),
-                    [](const auto &geometry) {
-                      return geometry.scene_mesh_content_digest.has_value();
-                    })) {
-      return false;
-    }
     try {
       return worker_protocol::encode_initialization(
                  worker_protocol::WorkerInitializationDTO{
@@ -964,6 +966,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     base_model = replacement;
     ++base_model_generation;
     model = replacement;
+    model_joints.store(planner_model_joints(model), std::memory_order_release);
     selection.store(nullptr, std::memory_order_release);
     return core::Result<void>::Ok();
   }
@@ -1081,12 +1084,12 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
             "could not preserve the retained package descriptor for worker");
       }
     }
-    // The scene-asset root is mapped last from a close-on-exec copy above
+    // The scene content root is mapped last from a close-on-exec copy above
     // every rewritten descriptor, so no earlier action can clobber it.
     UniqueFd scene_root_copy;
-    if (config.scene_asset_root_fd.has_value()) {
-      const int source_scene_fd = *config.scene_asset_root_fd;
-      const int scene_target = worker_protocol::kSceneAssetRootDescriptor;
+    if (config.scene_content_root_fd.has_value()) {
+      const int source_scene_fd = *config.scene_content_root_fd;
+      const int scene_target = worker_protocol::kSceneContentRootDescriptor;
       scene_root_copy.reset(
           ::fcntl(source_scene_fd, F_DUPFD_CLOEXEC, scene_target + 1));
       if (!scene_root_copy ||
@@ -1096,7 +1099,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
           ::posix_spawn_file_actions_adddup2(&actions, scene_root_copy.get(),
                                              scene_target) != 0) {
         throw std::runtime_error(
-            "could not preserve the scene-asset root descriptor for worker");
+            "could not preserve the scene content root descriptor for worker");
       }
     }
 
@@ -1134,10 +1137,13 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
           receive_frame(worker->socket.get(), config.maximum_response_bytes,
                         request, deadline);
       if (ready.type == MessageType::kProtocolError) {
-        if (worker_protocol::decode_protocol_error(ready.payload) ==
-            worker_protocol::kSceneMeshContentChangedDetail) {
-          throw RequestFailure(RequestFailureKind::kSceneMeshContentChanged,
-                               "worker scene mesh content changed");
+        auto detail = worker_protocol::decode_protocol_error(ready.payload);
+        if (detail.starts_with(
+                worker_protocol::kSceneMeshUnavailableDetailPrefix)) {
+          throw RequestFailure(
+              RequestFailureKind::kSceneMeshUnavailable,
+              detail.substr(
+                  worker_protocol::kSceneMeshUnavailableDetailPrefix.size()));
         }
         throw RequestFailure(RequestFailureKind::kProtocol,
                              "worker rejected initialization");
@@ -1342,6 +1348,8 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
   std::optional<WorkerProcess> worker;
   std::atomic<std::shared_ptr<const ProjectionSelection>> selection;
   std::atomic<std::shared_ptr<ActiveRequest>> active_request;
+  // What the current model can pose; read by requests without request_mutex.
+  std::atomic<std::shared_ptr<const PlannerModelJoints>> model_joints;
 };
 
 ProcessContainedRoboPlanCandidateClient::
@@ -1367,19 +1375,80 @@ ProcessContainedRoboPlanCandidateClient::compute(
   return compute_with_target(selected_request, nullptr);
 }
 
+namespace {
+
+// Where the other components of the cell are observed at this moment: the
+// cell model's coordinates outside the planned group. `code` is the refusing
+// request's own code (planning or IK).
+[[nodiscard]] core::Result<RoboPlanOtherCoordinatesDTO> observe_other_coordinates(
+    const ProcessContainedCandidateClientConfig &config,
+    const RoboPlanCandidateBindingDTO &binding, const PlannerModelJoints &model_joints,
+    const char *code) {
+  using Result = core::Result<RoboPlanOtherCoordinatesDTO>;
+  RoboPlanOtherCoordinatesDTO other;
+  const auto sources =
+      config.cell_model_state && config.clock ? config.cell_model_state->Get() : nullptr;
+  if (!sources) return Result::Ok(std::move(other));
+  for (const auto &source : *sources) {
+    if (!source.publication) continue;
+    const auto names = source.publication->canonical_joint_names();
+    other.joint_names.insert(other.joint_names.end(), names.begin(), names.end());
+  }
+  // Bound by name to the list just built; this planner's own source drops out.
+  const auto bound = core::bind_cell_model_state(*sources, other.joint_names,
+                                                 binding.compiled_joint_names);
+  other.positions.assign(other.joint_names.size(), 0.0);
+  if (const auto unavailable = core::overlay_cell_model_state(
+          bound, config.clock->now(), std::span<double>(other.positions))) {
+    return Result::Err(core::peer_state_unavailable_error(unavailable, code));
+  }
+  // Only what the planner's model can pose is sent: its scalar joints. A
+  // source coordinate that is not one of them is refused here, not dropped
+  // and not left for the worker to fail on.
+  RoboPlanOtherCoordinatesDTO written;
+  for (const auto &source : bound) {
+    for (const auto index : source.target_indices) {
+      if (index == core::BoundCellModelStateSource::kNotBound) continue;
+      auto &name = other.joint_names[index];
+      if (!std::binary_search(model_joints.scalar.begin(), model_joints.scalar.end(), name)) {
+        const bool known = std::binary_search(model_joints.other.begin(),
+                                              model_joints.other.end(), name);
+        return Result::Err(core::ErrorDTO{
+            code,
+            "Component " + source.component_id.value() + " coordinate '" + name +
+                "' cannot be posed in the planning model",
+            {{"reason", known ? "robot_state_joint_not_scalar" : "kinematic_coordinate_missing"},
+             {"peer_component_id", source.component_id.value()},
+             {"joint", name}}});
+      }
+      written.joint_names.push_back(name);
+      written.positions.push_back(other.positions[index]);
+    }
+  }
+  return Result::Ok(std::move(written));
+}
+
+}  // namespace
+
 core::Result<core::TrajectoryDTO>
 ProcessContainedRoboPlanCandidateClient::compute_with_target(
     const RoboPlanCandidateRequestDTO &selected_request,
     std::optional<core::ControlledStateDTO> *target) {
   const auto request_started = Clock::now();
   if (target) target->reset();
-  // The selected projection's clearance margins and contact-policy pairs
-  // travel with this plan.
+  // The selected projection's clearance margins and end-window contact
+  // pairs travel with this plan.
   auto request = selected_request;
   if (const auto selected = impl_->selection.load(std::memory_order_acquire)) {
     request.collision_pair_margins = selected->pair_margins;
     request.contact_allowed_pairs = selected->contact_pairs;
   }
+  auto other_coordinates = observe_other_coordinates(
+      impl_->config, impl_->binding,
+      *impl_->model_joints.load(std::memory_order_acquire), core::kErrorPlanningFailed);
+  if (!other_coordinates.ok())
+    return core::Result<core::TrajectoryDTO>::Err(other_coordinates.error());
+  request.other_coordinates = std::move(other_coordinates.value());
   if (request.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled) {
     request.planning_timeout_s -= std::chrono::duration<double>(Clock::now() - request_started).count();
     if (request.planning_timeout_s <= 0.0)
@@ -1441,19 +1510,26 @@ ProcessContainedRoboPlanCandidateClient::solve_ik(
     const core::Pose3DTO &goal, const core::ResolvedFrameDTO &base_frame,
     const core::ResolvedFrameDTO &tcp_frame,
     const core::ControlledStateDTO &seed_state, double timeout_s) {
-  // The selected contact policy's pairs travel with this solve.
+  // The selected projection's contact pairs travel with this solve; a
+  // projection selected for IK has none.
   std::vector<std::pair<std::string, std::string>> contact_pairs;
   if (const auto selected = impl_->selection.load(std::memory_order_acquire)) {
     contact_pairs = selected->contact_pairs;
   }
+  const auto other_coordinates = observe_other_coordinates(
+      impl_->config, impl_->binding,
+      *impl_->model_joints.load(std::memory_order_acquire), core::kErrorIkFailed);
+  if (!other_coordinates.ok())
+    return core::Result<std::vector<double>>::Err(other_coordinates.error());
   return impl_->transact<std::vector<double>>(
       MessageType::kIk, MessageType::kIkResult, timeout_s, true,
-      [&goal, &base_frame, &tcp_frame, &seed_state, timeout_s,
-       &contact_pairs](Clock::time_point) {
-        return worker_protocol::encode_ik_request(
-            worker_protocol::WorkerIkRequestDTO{goal, base_frame, tcp_frame,
-                                                seed_state, timeout_s,
-                                                contact_pairs});
+      [&goal, &base_frame, &tcp_frame, &seed_state, timeout_s, &contact_pairs,
+       &other_coordinates](Clock::time_point) {
+        worker_protocol::WorkerIkRequestDTO request{goal, base_frame, tcp_frame,
+                                                    seed_state, timeout_s,
+                                                    contact_pairs};
+        request.other_coordinates = other_coordinates.value();
+        return worker_protocol::encode_ik_request(request);
       },
       [](std::string_view bytes) {
         return worker_protocol::decode_ik_result(bytes);
@@ -1466,15 +1542,22 @@ ProcessContainedRoboPlanCandidateClient::solve_ik_diagnostic(
     const core::ResolvedFrameDTO &tcp_frame,
     const core::ControlledStateDTO &seed_state, double timeout_s,
     const std::optional<core::TolerancesDTO> &tolerances) {
+  const auto other_coordinates = observe_other_coordinates(
+      impl_->config, impl_->binding,
+      *impl_->model_joints.load(std::memory_order_acquire), core::kErrorIkFailed);
+  if (!other_coordinates.ok())
+    return core::Result<std::vector<double>>::Err(other_coordinates.error());
   return impl_->transact<std::vector<double>>(
       MessageType::kIk, MessageType::kIkResult, timeout_s, true,
-      [&goal, &base_frame, &tcp_frame, &seed_state, &tolerances](Clock::time_point deadline) {
+      [&goal, &base_frame, &tcp_frame, &seed_state, &tolerances,
+       &other_coordinates](Clock::time_point deadline) {
         worker_protocol::WorkerIkRequestDTO request{goal, base_frame, tcp_frame,
                                                     seed_state, std::chrono::duration<double>(deadline - Clock::now()).count()};
         request.collision_mode = core::PlannerCollisionMode::kDiagnosticDisabled;
         request.diagnostic_deadline_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             deadline.time_since_epoch()).count();
         request.diagnostic_tolerances = tolerances;
+        request.other_coordinates = other_coordinates.value();
         return worker_protocol::encode_ik_request(request);
       },
       [](std::string_view bytes) { return worker_protocol::decode_ik_result(bytes); },

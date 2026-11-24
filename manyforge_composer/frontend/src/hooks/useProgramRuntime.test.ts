@@ -577,6 +577,29 @@ describe('Program command settlement', () => {
     expect(controlPendingAfterProjection(pending, focused(2), focused(3), run)).toBeNull();
     expect(controlPendingAfterProjection(pending, focused(2), focused(null), run)).toBeNull();
   });
+
+  it('keeps an operator-question answer pending until that question changes or is retired', () => {
+    const run = {
+      state: 'running',
+      capture: { programRunId: 1 },
+    } as unknown as ProgramRunStatus;
+    const questionId = `sha256:${'4'.repeat(64)}`;
+    const otherId = `sha256:${'5'.repeat(64)}`;
+    const asking = (revision: number | null, other = 1) => ({
+      programRunId: 1,
+      recoveryOffer: null,
+      recoveryHolds: [],
+      operatorQuestions: [
+        ...(revision === null ? [] : [{ offerId: questionId, offerRevision: revision }]),
+        { offerId: otherId, offerRevision: other },
+      ],
+    } as unknown as NonNullable<Parameters<typeof controlPendingAfterProjection>[1]>);
+    const pending = `recovery:${questionId}:continue`;
+    expect(controlPendingAfterProjection(pending, asking(3), asking(3), run)).toBe(pending);
+    expect(controlPendingAfterProjection(pending, asking(3), asking(3, 2), run)).toBe(pending);
+    expect(controlPendingAfterProjection(pending, asking(3), asking(4), run)).toBeNull();
+    expect(controlPendingAfterProjection(pending, asking(3), asking(null), run)).toBeNull();
+  });
 });
 
 describe('Program runtime authority requests', () => {

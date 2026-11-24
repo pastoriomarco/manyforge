@@ -43,7 +43,7 @@ constexpr std::string_view kZeroDigest =
 constexpr std::string_view kCapabilitySchemaRevision =
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0";
 constexpr std::string_view kComponentTypeSchemaRevision =
-    "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde";
+    "sha256:4c1a934edc63d9da5eac2d1aef76d86142fcb797950a12306009e028d551c3fa";
 constexpr std::string_view kControlInterfaceSchemaRevision =
     "sha256:4abdf2c402d8e6e818bc26df59ce1c9cdc911d1e807144bdf525d2f69d0a449d";
 constexpr std::string_view kControllerTopologySchemaRevision =

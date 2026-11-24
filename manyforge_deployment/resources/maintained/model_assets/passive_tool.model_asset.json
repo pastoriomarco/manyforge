@@ -1,0 +1,51 @@
+{
+  "api_version": "manyforge.model_asset.v1",
+  "collision_body_role_bindings": [
+    {
+      "collision_body_role_id": "default_collision",
+      "source_link_names": [
+        "passive_tool_body"
+      ]
+    },
+    {
+      "collision_body_role_id": "tip",
+      "source_link_names": [
+        "passive_tool_tip"
+      ]
+    }
+  ],
+  "expanded_source": {
+    "artifacts": [
+      {
+        "byte_size": 169,
+        "content_digest": "sha256:22fedc9b6dc82d2eaf010aee811c05c5daf0098e7abc09831b10b36ecfad4376",
+        "logical_uri": "asset://passive_tool/model.srdf",
+        "media_type": "application/xml"
+      },
+      {
+        "byte_size": 1276,
+        "content_digest": "sha256:6b210607867da2319deaf7d6de2347780a3a8dbf2dc143c6ae236a352e4842ff",
+        "logical_uri": "asset://passive_tool/model.urdf",
+        "media_type": "application/xml"
+      }
+    ],
+    "srdf_logical_uri": "asset://passive_tool/model.srdf",
+    "urdf_logical_uri": "asset://passive_tool/model.urdf"
+  },
+  "frame_role_bindings": [
+    {
+      "frame_role_id": "mount",
+      "source_link_name": "passive_tool_mount"
+    },
+    {
+      "frame_role_id": "tcp",
+      "source_link_name": "passive_tool_tcp"
+    }
+  ],
+  "instance_cardinality": "multiple_per_cell",
+  "model_asset_id": "passive_tool",
+  "model_group_role_bindings": [],
+  "model_revision": "sha256:c82d588a23eda14ded083e57b4f30866a1fdb41fbc509091ee92a9193ef095fd",
+  "resource_role_bindings": [],
+  "root_frame_role_id": "mount"
+}

@@ -329,8 +329,21 @@ parse_activation_model_source_closure(const CanonicalValue &value) {
   std::size_t resource_count = 0U;
   std::string previous_component;
   for (const auto &component : components) {
-    require_fields(component, {"component_id", "entrypoints", "resources"},
-                   "component");
+    // A Tool generated from its parameters (`manyforge.tool`) also carries what
+    // its component declares.
+    const auto *generated_component =
+        object(component, "component").size() == 4U
+            ? component.find_object_member("generated_component")
+            : nullptr;
+    if (generated_component != nullptr) {
+      require_fields(component,
+                     {"component_id", "entrypoints", "generated_component",
+                      "resources"},
+                     "component");
+      static_cast<void>(object(*generated_component, "generated_component"));
+    } else
+      require_fields(component, {"component_id", "entrypoints", "resources"},
+                     "component");
     const auto &component_id = text(member(component, "component_id", "component"),
                                     "component.component_id");
     if (!portable_id(component_id) || !component_ids.insert(component_id).second ||
@@ -379,7 +392,10 @@ parse_activation_model_source_closure(const CanonicalValue &value) {
       fail("exceeds the decoded byte bound");
     }
     result.push_back({component_id, std::move(urdf), std::move(srdf),
-                      std::move(resources)});
+                      std::move(resources),
+                      generated_component != nullptr
+                          ? std::optional<CanonicalValue>(*generated_component)
+                          : std::nullopt});
   }
   return result;
 }

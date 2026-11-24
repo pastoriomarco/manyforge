@@ -13,6 +13,7 @@
 #include <variant>
 
 #include <manyforge_core/types/typed_error.hpp>
+#include <manyforge_deployment/collision_rule_codec.hpp>
 
 namespace manyforge::deployment::detail {
 namespace {
@@ -20,7 +21,7 @@ namespace {
 using Array = CanonicalValue::Array;
 using Object = CanonicalValue::Object;
 
-constexpr std::string_view kApiVersion = "manyforge.deployment_intent.v2";
+constexpr std::string_view kApiVersion = "manyforge.deployment_intent.v3";
 constexpr std::size_t kMaximumComponents = 128U;
 constexpr std::size_t kMaximumAttachments = 256U;
 constexpr std::size_t kMaximumPackageRoots = 128U;
@@ -135,6 +136,19 @@ void require_source_reference(const CanonicalValue &value,
 
 void require_model_source(const CanonicalValue &value, bool captured_has_srdf,
                           std::string_view label) {
+  // OD-352, OD-357: a tool's parameters in place of urdf, srdf and
+  // package_roots, inline (a mapping with `api_version`, which capture
+  // validated) or a parameter file; the capture generated the URDF and SRDF
+  // from them.
+  if (value.is_object() && value.find_object_member("parameters") != nullptr) {
+    require_fields(value, {"parameters"}, {}, label);
+    const auto &parameters = member(value, "parameters", label);
+    if (!parameters.is_object() || parameters.find_object_member("api_version") == nullptr)
+      require_source_reference(parameters, std::string(label) + ".parameters");
+    if (!captured_has_srdf)
+      fail(std::string(label) + " differs from the captured SRDF presence");
+    return;
+  }
   require_fields(value, {"package_roots", "urdf"}, {"srdf"}, label);
   require_source_reference(member(value, "urdf", label),
                            std::string(label) + ".urdf");
@@ -188,8 +202,9 @@ void require_pose(const CanonicalValue &value, std::string_view label) {
   }
 }
 
-// `custom_tcps`: `{tcp_id, parent_frame, pose}` rows, uniquely sorted by
-// tcp_id, each pose with a unit quaternion. The compiler resolves parents.
+// `custom_tcps`: `{tcp_id, parent_frame, pose, contact_bodies?}` rows,
+// uniquely sorted by tcp_id, each pose with a unit quaternion. The compiler
+// resolves parents and contact bodies.
 [[nodiscard]] std::vector<ActivationCustomTcp>
 custom_tcps(const CanonicalValue *value, std::string_view label) {
   std::vector<ActivationCustomTcp> result;
@@ -201,8 +216,8 @@ custom_tcps(const CanonicalValue *value, std::string_view label) {
   for (std::size_t index = 0U; index < rows.size(); ++index) {
     const std::string row_label =
         std::string(label) + "[" + std::to_string(index) + "]";
-    require_fields(rows[index], {"parent_frame", "pose", "tcp_id"}, {},
-                   row_label);
+    require_fields(rows[index], {"parent_frame", "pose", "tcp_id"},
+                   {"contact_bodies"}, row_label);
     const auto &tcp_id = portable_identifier(
         member(rows[index], "tcp_id", row_label), row_label + ".tcp_id");
     const auto &parent = text(member(rows[index], "parent_frame", row_label),
@@ -245,7 +260,18 @@ custom_tcps(const CanonicalValue *value, std::string_view label) {
       fail("custom_tcp_duplicate: " + std::string(label) +
            " must be uniquely sorted by tcp_id");
     }
-    result.push_back({tcp_id, parent, pose});
+    std::optional<std::vector<std::string>> contact_bodies;
+    if (const auto *bodies = rows[index].find_object_member("contact_bodies")) {
+      const std::string bodies_label = row_label + ".contact_bodies";
+      contact_bodies.emplace();
+      for (const auto &body : array(*bodies, bodies_label))
+        contact_bodies->push_back(portable_identifier(body, bodies_label));
+      std::sort(contact_bodies->begin(), contact_bodies->end());
+      if (std::adjacent_find(contact_bodies->begin(), contact_bodies->end()) !=
+          contact_bodies->end())
+        fail("custom_tcp_invalid: " + bodies_label + " names a body twice");
+    }
+    result.push_back({tcp_id, parent, pose, std::move(contact_bodies)});
   }
   return result;
 }
@@ -279,20 +305,6 @@ void require_target_settings(const CanonicalValue &value,
   }
 }
 
-[[nodiscard]] std::optional<std::string> optional_text(
-    const CanonicalValue *value, std::string_view label,
-    std::size_t maximum_bytes) {
-  if (value == nullptr || value->is_null()) return std::nullopt;
-  const auto *result = std::get_if<std::string>(&value->storage());
-  if (result == nullptr) {
-    fail(std::string(label) + " must be text");
-  }
-  if (result->size() > maximum_bytes) {
-    fail(std::string(label) + " exceeds its byte bound");
-  }
-  return *result;
-}
-
 [[nodiscard]] std::optional<std::string> optional_portable_identifier(
     const CanonicalValue *value, std::string_view label) {
   if (value == nullptr || value->is_null()) return std::nullopt;
@@ -320,14 +332,15 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     std::vector<CapturedComponentModelSource> captured_sources) {
   require_fields(
       value,
-      {"api_version", "attachments", "components", "deployment_artifact_id",
-       "name", "policies"},
-      {"assistant_model_components", "assistant_profile_id", "compatibility",
-       "description"},
+      {"api_version", "attachments", "collision_rules", "components",
+       "policies"},
+      {"assistant_model_components", "assistant_profile_id", "compatibility"},
       "root");
   if (text(member(value, "api_version", "root"), "api_version") !=
       kApiVersion) {
-    fail("has an unsupported api_version");
+    fail("has an unsupported api_version: expected " + std::string(kApiVersion) +
+         " (an older Deployment is rewritten with "
+         "scripts/convert_scenario_od46.py)");
   }
 
   const auto &components = array(member(value, "components", "root"),
@@ -516,7 +529,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     else if (io_member)
       require_fields(component,
                      {"component_id", "component_profile_id", "owner", "role"},
-                     {"active"}, label);
+                     {"active", "mock_inputs"}, label);
     else if (member_row && mounted)
       require_fields(component,
                      {"component_id", "component_profile_id", "configuration",
@@ -580,8 +593,13 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     }
     if (owner_row || io_member) {
       // An owner's configuration holds only its site address reference; an
-      // I/O member has none (its signals come from its model).
+      // I/O member's signals come from its model, and its `mock_inputs`
+      // (OD-356) are checked against them when its signals are expanded.
       CanonicalValue configuration(Object{});
+      if (io_member) {
+        if (const auto *mock_inputs = component.find_object_member("mock_inputs"))
+          configuration = CanonicalValue(Object{{"mock_inputs", *mock_inputs}});
+      }
       if (owner_row) {
         configuration = member(component, "configuration", label);
         require_fields(configuration, {}, {"device_address_ref"},
@@ -703,11 +721,6 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
 
   if (captured_index != captured_sources.size())
     fail("captured source closure contains an unowned model row");
-  const auto &deployment_id = portable_identifier(
-      member(value, "deployment_artifact_id", "root"),
-      "deployment_artifact_id");
-  const auto &name = text(member(value, "name", "root"), "name");
-  if (name.size() > 256U) fail("name exceeds its byte bound");
 
   const auto assistant_profile_id = optional_portable_identifier(
       value.find_object_member("assistant_profile_id"), "assistant_profile_id");
@@ -725,11 +738,15 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
                                      "assistant_model_components." + alias));
     }
   }
+  CanonicalValue collision_rules{Array{}};
+  try {
+    collision_rules = encode_collision_rules(decode_cell_collision_rules(
+        member(value, "collision_rules", "root"), "collision_rules"));
+  } catch (const CollisionRuleCodecError &error) {
+    throw core::TypedError(error.reason(),
+                           std::string("Deployment intent ") + error.what());
+  }
   return ActivationDeploymentIntent{
-      deployment_id,
-      name,
-      optional_text(value.find_object_member("description"), "description",
-                    4096U),
       assistant_profile_id,
       member(value, "attachments", "root"),
       member(value, "policies", "root"),
@@ -741,6 +758,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       value,
       std::move(assistant_model_components),
       std::move(inactive_members),
+      std::move(collision_rules),
   };
 }
 

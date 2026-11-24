@@ -24,10 +24,11 @@ namespace manyforge::roboplan_backend {
 /// What a robot's tool context is made of in its retained
 /// Deployment, in compiled frame names of the composed cell URDF.
 struct RetainedToolContextFrames final {
-  /// (component, command target, frame role) of an attachment's carrier.
+  /// (component, frame role) of an attachment's carrier. The carrier frame
+  /// may belong to a component mounted below the holder (OD-372), so the
+  /// holder's command target does not select it.
   using CarrierKey =
-      std::tuple<core::ControllableComponentId, core::CommandTargetId,
-                 core::FrameRoleId>;
+      std::tuple<core::ControllableComponentId, core::FrameRoleId>;
 
   /// The robot's `flange`.
   std::string flange_link;
@@ -37,7 +38,7 @@ struct RetainedToolContextFrames final {
   /// The robot and every component mounted on it, directly or by a chain.
   std::set<core::ControllableComponentId> carriers;
   /// Every frame of those components an object may be attached to, each
-  /// under its own target's frame role.
+  /// under its targets' frame role.
   std::map<CarrierKey, std::string> carrier_frames;
   /// Each mounted tool's root link (the mount) and its model payload, in that
   /// link; tools without a payload are absent.

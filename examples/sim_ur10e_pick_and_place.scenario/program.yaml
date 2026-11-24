@@ -1,14 +1,11 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "optional",
-    "lanes": [
-      "isaac-sim"
-    ],
     "requires": [
       "robotiq_2f_140_gripper",
       "ros2_control"
@@ -20,7 +17,6 @@
       "ur10e"
     ]
   },
-  "description": "Isaac Sim light-scene pick-and-place Program for the UR10e and Robotiq 2F-140: authored meshes and poses, simulator play/reset/pause, observed-scene planning, gripper commands, carried-object transitions and a rest pose.",
   "forest": [
     {
       "children": [
@@ -71,6 +67,7 @@
           "node_id": "gripper.command_position",
           "parameters": {
             "command_duration_s": 1.0,
+            "completion_timeout_s": 15.0,
             "max_effort": {
               "kind": "angular_newton_meter",
               "value_nm": 40.0
@@ -82,8 +79,7 @@
             "target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_140"
-            },
-            "completion_timeout_s": 15.0
+            }
           }
         },
         {
@@ -200,6 +196,7 @@
               "node_id": "gripper.command_position",
               "parameters": {
                 "command_duration_s": 1,
+                "completion_timeout_s": 15.0,
                 "max_effort": {
                   "kind": "angular_newton_meter",
                   "value_nm": 40
@@ -211,8 +208,7 @@
                 "target": {
                   "command_target_id": "gripper",
                   "component_id": "robotiq_2f_140"
-                },
-                "completion_timeout_s": 15.0
+                }
               }
             },
             {
@@ -260,6 +256,33 @@
               "component_id": "isaac_ur10e_light_robot",
               "frame_id": "base"
             },
+            "collision_rules": [
+              {
+                "a": [
+                  {
+                    "component_id": "robotiq_2f_140",
+                    "kind": "attached_object"
+                  }
+                ],
+                "b": [
+                  {
+                    "kind": "scene_object",
+                    "scene_resource_id": "isaac_table_low_327"
+                  }
+                ],
+                "release": {
+                  "allow_recontact": false,
+                  "enforce_max_start_penetration": false,
+                  "max_start_penetration_m": 0.0,
+                  "min_release_progress_m": 0.0,
+                  "release_evidence_mode": "binary_contact",
+                  "release_tolerance_m": 0.0,
+                  "require_separation_by_end": true,
+                  "require_strictly_decreasing_penetration": false
+                },
+                "rule_id": "lift_from_isaac_table_low_327"
+              }
+            ],
             "execution_timeout_s": 30.0,
             "goal": {
               "orientation": {
@@ -362,6 +385,26 @@
               "component_id": "isaac_ur10e_light_robot",
               "frame_id": "base"
             },
+            "collision_rules": [
+              {
+                "a": [
+                  {
+                    "component_id": "robotiq_2f_140",
+                    "kind": "attached_object"
+                  }
+                ],
+                "b": [
+                  {
+                    "kind": "scene_object",
+                    "scene_resource_id": "isaac_table_low_327"
+                  }
+                ],
+                "contact": {
+                  "end_from_fraction": 0.8
+                },
+                "rule_id": "place_on_isaac_table_low_327"
+              }
+            ],
             "execution_timeout_s": 30.0,
             "goal": {
               "orientation": {
@@ -434,6 +477,7 @@
               "node_id": "gripper.command_position",
               "parameters": {
                 "command_duration_s": 1.0,
+                "completion_timeout_s": 15.0,
                 "max_effort": {
                   "kind": "angular_newton_meter",
                   "value_nm": 40.0
@@ -445,8 +489,7 @@
                 "target": {
                   "command_target_id": "gripper",
                   "component_id": "robotiq_2f_140"
-                },
-                "completion_timeout_s": 15.0
+                }
               }
             }
           ],
@@ -588,7 +631,6 @@
       "parameters": {}
     }
   ],
-  "name": "isaac_manipulator_scene_light",
   "parameters": [
     {
       "constraints": {
@@ -602,26 +644,9 @@
     }
   ],
   "positions": {},
-  "program_id": "isaac_manipulator_scene_light",
   "program_profile": "composable-cell-v1",
   "scene": [
     {
-      "metadata": {
-        "support_contacts": [
-          {
-            "allow_recontact": false,
-            "enforce_max_start_penetration": false,
-            "max_start_penetration_m": 0.0,
-            "min_release_progress_m": 0.0,
-            "mode": "contact_release",
-            "release_evidence_mode": "binary_contact",
-            "release_tolerance_m": 0.0,
-            "require_separation_by_end": true,
-            "require_strictly_decreasing_penetration": false,
-            "support_object_id": "isaac_table_low_327"
-          }
-        ]
-      },
       "pose": {
         "frame_ref": {
           "kind": "cell_frame"
@@ -644,7 +669,7 @@
       ],
       "scene_resource_id": "isaac_cheese_box",
       "shape": {
-        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj",
+        "mesh_resource_uri": "../isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj",
         "mesh_scale": [
           1.0,
           1.0,
@@ -673,7 +698,7 @@
       },
       "scene_resource_id": "isaac_small_klt",
       "shape": {
-        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj",
+        "mesh_resource_uri": "../isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj",
         "mesh_scale": [
           1.0,
           1.0,
@@ -702,7 +727,7 @@
       },
       "scene_resource_id": "isaac_small_klt_01",
       "shape": {
-        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj",
+        "mesh_resource_uri": "../isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj",
         "mesh_scale": [
           1.0,
           1.0,
@@ -731,7 +756,7 @@
       },
       "scene_resource_id": "isaac_soup_can",
       "shape": {
-        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj",
+        "mesh_resource_uri": "../isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj",
         "mesh_scale": [
           1.0,
           1.0,
@@ -760,7 +785,7 @@
       },
       "scene_resource_id": "isaac_table_low_327",
       "shape": {
-        "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj",
+        "mesh_resource_uri": "../isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj",
         "mesh_scale": [
           1.0,
           1.5,

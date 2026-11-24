@@ -39,9 +39,11 @@ import {
   parseApiErrorDto,
   parseExpressionCheckResult,
   parsePersistentKeyValues,
+  parseProgramRunKeyValues,
   parseCapabilityCommandPreviewResponse,
   parseDraftMutationResponse,
   parseDeploymentWorkspaceResponse,
+  parseToolReplacementResponse,
   parseFileBrowserResponse,
   parseHealthResponse,
   parseHistorianPage,
@@ -96,6 +98,7 @@ import type {
   AppliedProgramSelection,
   AppliedProgramStatus,
   PersistentKeyValues,
+  ProgramRunKeyValues,
   ApplyCommandRow,
   CommandRow,
   RunnerCommandRowKind,
@@ -108,6 +111,7 @@ import type {
   DraftMutationResponse,
   DeploymentControlledStopUpdate,
   DeploymentWorkspaceResponse,
+  ToolReplacementResponse,
   FileBrowserResponse,
   HealthResponse,
   JsonValue,
@@ -153,6 +157,8 @@ import type {
 } from '../types/robotControl';
 import type { ComponentCatalog } from '../types/componentCatalog';
 import { parseComponentCatalog } from './componentCatalogParser';
+import type { ToolExportResponse, ToolPreviewResponse } from '../types/toolParameters';
+import { parseToolExportResponse, parseToolPreviewResponse } from './toolParametersParser';
 import type {
   AssistantModeDetail,
   AssistantModeIndex,
@@ -179,7 +185,8 @@ export interface HistorianListQuery {
   actionSpanId?: string;
   nodeInstanceId?: string;
   interventionSessionId?: string;
-  contactPolicyId?: string;
+  /** Id of the collision rule the events name (`collision_rule_id`). */
+  collisionRuleId?: string;
   incidentId?: string;
   conditionId?: string;
   channel?: string;
@@ -222,7 +229,7 @@ export function historianListPath(query: HistorianListQuery = {}): string {
     ['recent_seconds', query.recentSeconds], ['clock_owner', query.clockOwner],
     ['program_run_id', query.programRunId], ['operation_id', query.operationId],
     ['action_span_id', query.actionSpanId], ['node_instance_id', query.nodeInstanceId],
-    ['intervention_session_id', query.interventionSessionId], ['contact_policy_id', query.contactPolicyId],
+    ['intervention_session_id', query.interventionSessionId], ['collision_rule_id', query.collisionRuleId],
     ['incident_id', query.incidentId], ['condition_id', query.conditionId],
     ['channel', query.channel],
     ['alarm_phase', query.alarmPhase], ['search', query.search],
@@ -484,8 +491,6 @@ export function incompleteScenarioText(error: unknown): string | null {
 // Saved (for example a newer workspace revision): a definite outcome, so the
 // client shows it, refreshes and adopts the current identity, never retries.
 const SAVED_NOT_ADOPTED_CODES = new Set([
-  'program_saved_baseline_not_adopted',
-  'deployment_saved_baseline_not_adopted',
   'scenario_saved_baseline_not_adopted',
 ]);
 
@@ -831,14 +836,18 @@ export const api = {
      * Applies exactly what `scope` previewed; a changed Draft is refused.
      * Answered at acceptance: the row's end is read from `apply_commands`.
      */
-    apply: (scope: ApplyPreview['scope']): Promise<ApplyCommandRow> =>
-      sendKeyedCommand('/api/deployment/apply', { scope }, parseApplyCommandReply),
+    apply: (scope: ApplyPreview['scope'], confirmedCollisionRuleIds: string[] = []): Promise<ApplyCommandRow> =>
+      sendKeyedCommand('/api/deployment/apply', {
+        scope, confirmed_collision_rule_ids: confirmedCollisionRuleIds,
+      }, parseApplyCommandReply),
     /** The impact of reverting to the Saved Scenario; effect-free. */
     revertPreview: (): Promise<ApplyPreview> =>
       requestJson('/api/deployment/revert/preview', parseApplyPreview, undefined, { method: 'POST', body: '{}' }),
     /** Apply of the Saved Scenario the Revert preview showed; both Drafts return to Saved. */
-    revert: (scope: ApplyPreview['scope']): Promise<ApplyCommandRow> =>
-      sendKeyedCommand('/api/deployment/revert', { scope }, parseApplyCommandReply),
+    revert: (scope: ApplyPreview['scope'], confirmedCollisionRuleIds: string[] = []): Promise<ApplyCommandRow> =>
+      sendKeyedCommand('/api/deployment/revert', {
+        scope, confirmed_collision_rule_ids: confirmedCollisionRuleIds,
+      }, parseApplyCommandReply),
     effective: (signal?: AbortSignal): Promise<EffectiveValues> =>
       requestJson('/api/deployment/effective', parseEffectiveValues, signal),
     /** The GUI asks before discarding unsaved Drafts, then confirms here. */
@@ -932,29 +941,6 @@ export const api = {
       {
         method: 'POST',
         body: JSON.stringify({ ...fence, path, confirmDiscard }),
-      },
-    ),
-    save: (
-      fence: LocalWorkspaceFenceRequest,
-      signal?: AbortSignal,
-    ): Promise<ProgramWorkspaceResponse> => requestJson(
-      '/api/program/save',
-      parseProgramWorkspaceResponse,
-      signal,
-      { method: 'POST', body: JSON.stringify(fence) },
-    ),
-    saveAs: (
-      fence: LocalWorkspaceFenceRequest,
-      path: string,
-      confirmOverwrite: boolean,
-      signal?: AbortSignal,
-    ): Promise<ProgramWorkspaceResponse> => requestJson(
-      '/api/program/save-as',
-      parseProgramWorkspaceResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({ ...fence, path, confirmOverwrite }),
       },
     ),
     apply: (
@@ -1059,6 +1045,22 @@ export const api = {
     /** Components Add component can compose into the Draft (read-only). */
     componentCatalog: (signal?: AbortSignal): Promise<ComponentCatalog> =>
       requestJson('/api/deployment/component-catalog', parseComponentCatalog, signal),
+    /** Check and preview a Tool's parameters (no Draft change); a refusal names its field. */
+    toolPreview: (componentId: string, parameters: JsonValue, signal?: AbortSignal): Promise<ToolPreviewResponse> =>
+      requestJson('/api/deployment/tool-parameters/preview', parseToolPreviewResponse, signal, {
+        method: 'POST', body: JSON.stringify({ componentId, parameters }),
+      }),
+    /**
+     * Write the model a Tool's parameters generate into `<project>/<component id>/`;
+     * with `copyMeshes` it references copies of the meshes written there, else
+     * the meshes where they are.
+     */
+    toolExport: (
+      componentId: string, parameters: JsonValue, copyMeshes: boolean, signal?: AbortSignal,
+    ): Promise<ToolExportResponse> =>
+      requestJson('/api/deployment/tool-parameters/export', parseToolExportResponse, signal, {
+        method: 'POST', body: JSON.stringify({ componentId, parameters, copyMeshes }),
+      }),
     openDraft: (
       fence: LocalWorkspaceFenceRequest,
       path: string,
@@ -1103,6 +1105,39 @@ export const api = {
         body: JSON.stringify({ ...fence, components, attachments }),
       },
     ),
+    removeComponent: (
+      fence: LocalWorkspaceFenceRequest,
+      componentId: string,
+      signal?: AbortSignal,
+    ): Promise<DeploymentWorkspaceResponse> => requestJson(
+      '/api/deployment/draft/components/remove',
+      parseDeploymentWorkspaceResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...fence, component_id: componentId }),
+      },
+    ),
+    /**
+     * Replace tool (OD-367): the replacement takes over the mounted tool's
+     * mount and every Deployment and Program reference to it; one Draft edit.
+     */
+    replaceTool: (
+      fence: LocalWorkspaceFenceRequest,
+      componentId: string,
+      replacementComponentId: string,
+      signal?: AbortSignal,
+    ): Promise<ToolReplacementResponse> => requestJson(
+      '/api/deployment/draft/components/replace-tool',
+      parseToolReplacementResponse,
+      signal,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...fence, component_id: componentId, replacement_component_id: replacementComponentId,
+        }),
+      },
+    ),
     updateControlledStop: (
       fence: LocalWorkspaceFenceRequest,
       update: DeploymentControlledStopUpdate,
@@ -1136,29 +1171,6 @@ export const api = {
         }),
       },
     ),
-    save: (
-      fence: LocalWorkspaceFenceRequest,
-      signal?: AbortSignal,
-    ): Promise<DeploymentWorkspaceResponse> => requestJson(
-      '/api/deployment/save',
-      parseDeploymentWorkspaceResponse,
-      signal,
-      { method: 'POST', body: JSON.stringify(fence) },
-    ),
-    saveAs: (
-      fence: LocalWorkspaceFenceRequest,
-      path: string,
-      confirmOverwrite: boolean,
-      signal?: AbortSignal,
-    ): Promise<DeploymentWorkspaceResponse> => requestJson(
-      '/api/deployment/save-as',
-      parseDeploymentWorkspaceResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({ ...fence, path, confirmOverwrite }),
-      },
-    ),
     discard: (
       fence: LocalWorkspaceFenceRequest,
       signal?: AbortSignal,
@@ -1185,6 +1197,18 @@ export const api = {
       (value) => parseProgramNodeCorrectionPreview(value, request),
       signal,
       { method: 'POST', body: JSON.stringify(request) },
+    ),
+    /** Read-only: the run's declared keys with their current values. */
+    runKeyValues: (
+      programRunId: number,
+      applicationStartId: ApplicationStartId,
+      signal?: AbortSignal,
+    ): Promise<ProgramRunKeyValues> => requestJson(
+      `/api/program/runs/${programRunId}/blackboard-values?${new URLSearchParams({
+        application_start_id: applicationStartId,
+      })}`,
+      parseProgramRunKeyValues,
+      signal,
     ),
     persistentValues: (
       signal?: AbortSignal,
@@ -1504,7 +1528,6 @@ export const api = {
         }
         if (
           !sameClientRequestKey(receipt.requestKey, intent.request_context.request_key)
-          || receipt.programId !== intent.program_id
           || receipt.programRevision !== intent.program_revision
           || receipt.programBindingId !== intent.program_binding_id
           || receipt.graphRevision !== intent.expected_graph_revision
@@ -1543,7 +1566,6 @@ export const api = {
         }
         if (
           !sameClientRequestKey(receipt.requestKey, intent.request_context.request_key)
-          || receipt.programId !== intent.program_id
           || receipt.programRevision !== intent.program_revision
           || receipt.programBindingId !== intent.program_binding_id
           || receipt.graphRevision !== intent.expected_graph_revision

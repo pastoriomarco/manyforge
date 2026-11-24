@@ -4,7 +4,7 @@ import type { JsonValue, ProgramTreeNode } from '../types/api';
 import { deploymentArmControlledStop, precisionContactStopWarnings } from './precisionContactStopWarnings';
 
 const intent = (stop: Record<string, JsonValue>): Record<string, JsonValue> => ({
-  api_version: 'manyforge.deployment_intent.v2',
+  api_version: 'manyforge.deployment_intent.v3',
   components: [{ component_id: 'robot', target_settings: { arm: { controlled_stop: stop } } }],
 });
 const compiled = (parameters: Record<string, JsonValue>): Record<string, JsonValue> => ({

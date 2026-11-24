@@ -270,7 +270,7 @@ def _request(projection: dict[str, Any]) -> dict[str, Any]:
             "candidateAvailable": True,
             "programRevision": "sha256:" + "8" * 64,
             "program": {
-                "api_version": "manyforge.program.v3",
+                "api_version": "manyforge.program.v4",
                 "program_revision": "sha256:" + "8" * 64,
             },
             "diagnostics": [],
@@ -2060,12 +2060,6 @@ def test_change_summary_names_what_each_committed_edit_touched() -> None:
          "arguments": {"scene_resource_ids": ["box_a", "box_b"]}},
         {"toolId": "program_draft_upsert_parameters", "draftMutated": True,
          "arguments": {"parameters": [{"parameter_id": "speed", "type": "number"}]}},
-        {"toolId": "program_draft_upsert_contact_policies", "draftMutated": True,
-         "arguments": {"contact_policies": [{"policy_id": "grasp_contact", "zones": [
-             {"zone_id": "fingertips", "body_pairs": [{"body_b": {
-                 "kind": "runtime_object", "runtime_object_id": "pick_target"}}]}]}]}},
-        {"toolId": "program_draft_remove_contact_policies", "draftMutated": True,
-         "arguments": {"contact_policy_ids": ["old_grasp"]}},
         {"toolId": "tree_draft_delete_node", "draftMutated": False,
          "arguments": {"instance_id": "failed"}},
     ]
@@ -2074,9 +2068,7 @@ def test_change_summary_names_what_each_committed_edit_touched() -> None:
         "- added main, wait (tree_draft_insert_node)\n"
         "- updated wait (tree_draft_update_node_params)\n"
         "- removed box_a, box_b (scene_draft_remove_objects)\n"
-        "- added or updated speed (program_draft_upsert_parameters)\n"
-        "- added or updated grasp_contact (program_draft_upsert_contact_policies)\n"
-        "- removed old_grasp (program_draft_remove_contact_policies)"
+        "- added or updated speed (program_draft_upsert_parameters)"
     )
 
 
@@ -2142,41 +2134,6 @@ def test_prompt_scene_lines_give_size_pose_and_roles() -> None:
               "pose": {"frame_ref": {"kind": "cell_frame"}, "position_m": [0, 0, 0.00004],
                        "orientation": {"rpy_deg": [0, -0.0001, 90]}}}
     assert _scene_line(sphere) == "- ball: sphere radius_m=0.04 at (0, 0, 0) rpy (0, 0, 90) in cell"
-
-
-def test_prompt_outline_lists_contact_policies_compactly() -> None:
-    from manyforge_assistant_bridge.prompt import MAXIMUM_SECTION_LINES, _outline
-
-    grasp = {
-        "policy_id": "grasp_part", "mode": "contact_grasp", "version": "sha256:" + "0" * 64,
-        "zones": [{"zone_id": "tool_contact", "max_penetration_m": 0.002,
-                   "terminal_window_start_fraction": 0.8, "violation_response": "hard_stop",
-                   "body_pairs": [{"body_a": {"kind": "component_model_body",
-                                              "body": {"component_id": "gripper",
-                                                       "collision_body_id": "fingers"}},
-                                   "body_b": {"kind": "runtime_object",
-                                              "runtime_object_id": "held_part"}}]}],
-    }
-    release = {
-        "policy_id": "release_part", "mode": "contact_release",
-        "zones": [{"zone_id": "tip", "release_evidence_mode": "binary_contact",
-                   "body_pairs": [{"body_a": {"kind": "motion_endpoint"},
-                                   "body_b": {"kind": "runtime_object",
-                                              "runtime_object_id": "held_part"}}]}],
-    }
-    out = _outline({"forest": [], "contact_policies": [grasp, release]}, [])
-    start = out.index("Contact policies:")
-    assert out[start + 1:start + 3] == [
-        "- grasp_part: contact_grasp; zone tool_contact: gripper/fingers~held_part, "
-        "max penetration 0.002 m",
-        "- release_part: contact_release; zone tip: motion endpoint~held_part, "
-        "evidence binary_contact",
-    ]
-    assert "Contact policies:" not in _outline({"forest": []}, [])
-    many = _outline({"forest": [], "contact_policies": [
-        {**grasp, "policy_id": f"p{i}"} for i in range(MAXIMUM_SECTION_LINES + 5)]}, [])
-    assert sum(line.startswith("- p") for line in many) == MAXIMUM_SECTION_LINES
-
 
 
 @pytest.mark.parametrize(("arguments", "message"), [
@@ -2403,6 +2360,16 @@ def test_prompt_rules_scope_diagnostic_fixes_and_name_the_wrap_for_a_new_top() -
         "Never delete or rewrite the operator's nodes to clear diagnostics unless asked.")
         for rule in RULES)
     assert "To make a node the new top of the Program, wrap @root with tree_draft_wrap_node." in RULES
+
+
+def test_prompt_rules_explain_orientation_forms_and_keep_turns_silent() -> None:
+    from manyforge_assistant_bridge.prompt import RULES
+
+    orientation = next(rule for rule in RULES if rule.startswith("Orientation:"))
+    for field in ("orientation.rpy_deg", "rotate_local_rpy_deg", "rotate_world_rpy_deg",
+                  "rpy_delta_deg", "orientation_from", "current_pose", "scene_resource"):
+        assert field in orientation
+    assert RULES[-1].startswith("Write no text between tool calls.")
 
 
 def _selector_facts() -> dict[str, Any]:

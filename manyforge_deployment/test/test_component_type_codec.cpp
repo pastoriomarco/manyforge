@@ -23,7 +23,7 @@ namespace {
 constexpr std::string_view kCapabilitySchemaRevision =
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0";
 constexpr std::string_view kComponentTypeSchemaRevision =
-    "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde";
+    "sha256:4c1a934edc63d9da5eac2d1aef76d86142fcb797950a12306009e028d551c3fa";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -54,6 +54,10 @@ struct TargetSpec final {
   // target's default TCP.
   std::vector<std::string> tcp_frames{};
   std::optional<std::string> default_tcp{};
+  // The target's grip body: one of its collision bodies.
+  std::optional<std::string> grip_body{};
+  // OD-371: `arm_collision` is a spring slider with this travel row.
+  std::optional<CanonicalValue> spring_slider{};
 };
 
 struct TypeSpec final {
@@ -195,7 +199,7 @@ struct TypeSpec final {
       });
     }
     frames.emplace_back(std::move(frame));
-    bodies.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object body{
         {"collision_body_role_id", CanonicalValue("arm_collision")},
         {"model_role_id",
          CanonicalValue(spec.collision_body_model_role.empty()
@@ -203,7 +207,11 @@ struct TypeSpec final {
                             : spec.collision_body_model_role)},
         {"asset_collision_body_role_id",
          CanonicalValue("arm_collision")},
-    });
+    };
+    if (spec.spring_slider.has_value()) {
+      body.emplace_back("spring_slider", *spec.spring_slider);
+    }
+    bodies.emplace_back(std::move(body));
     if (!spec.sibling_contact_body_role_ids.empty()) {
       bodies.emplace_back(CanonicalValue::Object{
           {"collision_body_role_id", CanonicalValue("sibling_collision")},
@@ -256,6 +264,9 @@ struct TypeSpec final {
   if (spec.default_tcp.has_value()) {
     target.emplace_back("default_tcp_frame_role_id",
                         CanonicalValue(*spec.default_tcp));
+  }
+  if (spec.grip_body.has_value()) {
+    target.emplace_back("grip_body_role_id", CanonicalValue(*spec.grip_body));
   }
   return CanonicalValue(std::move(target));
 }
@@ -602,6 +613,64 @@ TEST(ComponentTypeCodecTest, TcpTagsNeedOneTaggedDefaultAndAMotionFlange) {
   motion.targets.front().tcp_frames = {"flange", "tcp"};
   const auto robot = qualify(motion, motion_dependencies);
   EXPECT_EQ(robot.value().command_targets.front().frame_roles.size(), 2U);
+}
+
+// A target's grip body is one of its own collision bodies; absent means none.
+TEST(ComponentTypeCodecTest, GripBodyNamesACollisionBodyOfItsTarget) {
+  TypeSpec spec;
+  EXPECT_FALSE(qualify(spec, rich_dependencies())
+                   .value()
+                   .command_targets.front()
+                   .grip_body_role_id.has_value());
+
+  spec.targets.front().grip_body = "arm_collision";
+  const auto qualified = qualify(spec, rich_dependencies());
+  EXPECT_EQ(qualified.value().command_targets.front().grip_body_role_id,
+            std::optional<core::CollisionBodyRoleId>(
+                core::CollisionBodyRoleId("arm_collision")));
+
+  auto unknown = spec;
+  unknown.targets.front().grip_body = "no_such_body";
+  expect_rejection(unknown, rich_dependencies(), "grip_body_unknown");
+}
+
+// OD-371: a spring slider's body carries its travel; the release is optional
+// and every depth is positive.
+TEST(ComponentTypeCodecTest, CollisionBodyCarriesItsSpringSliderTravel) {
+  const auto travel = [](std::optional<double> release, double stroke) {
+    CanonicalValue::Object row{
+        {"axis", CanonicalValue(CanonicalValue::Array{
+                     CanonicalValue(0.0), CanonicalValue(0.0), CanonicalValue(1.0)})},
+        {"stroke_m", CanonicalValue(stroke)},
+        {"trip_depth_m", CanonicalValue(0.0095)},
+        {"max_compression_step_m", CanonicalValue(0.002)},
+    };
+    if (release.has_value()) row.emplace_back("release_depth_m", CanonicalValue(*release));
+    return CanonicalValue(std::move(row));
+  };
+  TypeSpec spec;
+  EXPECT_FALSE(qualify(spec, rich_dependencies())
+                   .value().command_targets.front().collision_body_roles.front()
+                   .spring_slider.has_value());
+  spec.targets.front().spring_slider = travel(0.009, 0.02);
+  const auto qualified = qualify(spec, rich_dependencies());
+  const auto &bodies = qualified.value().command_targets.front().collision_body_roles;
+  const auto body = std::find_if(bodies.begin(), bodies.end(), [](const auto &row) {
+    return row.collision_body_role_id.value() == "arm_collision";
+  });
+  ASSERT_NE(body, bodies.end());
+  EXPECT_EQ(body->spring_slider,
+            std::optional<core::ComponentTypeSpringSliderDTO>(
+                core::ComponentTypeSpringSliderDTO{{0.0, 0.0, 1.0}, 0.02, 0.0095, 0.009, 0.002}));
+  spec.targets.front().spring_slider = travel(std::nullopt, 0.02);
+  const auto without_release = qualify(spec, rich_dependencies());
+  for (const auto &row : without_release.value().command_targets.front().collision_body_roles) {
+    if (row.spring_slider.has_value()) {
+      EXPECT_FALSE(row.spring_slider->release_depth_m.has_value());
+    }
+  }
+  spec.targets.front().spring_slider = travel(std::nullopt, 0.0);
+  expect_closed_schema_rejection(spec, rich_dependencies());
 }
 
 // O5: a passive tool's frame-only target selects no capability.

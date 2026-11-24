@@ -26,35 +26,35 @@ Mutation = Callable[[dict[str, Any]], None]
 
 def _native_fixture() -> dict[str, Any]:
     document = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    if document.get("api_version") != "manyforge.program_binding.v3":
-        pytest.skip("held: genuine native v3 Binding fixture required")
+    if document.get("api_version") != "manyforge.program_binding.v4":
+        pytest.skip("held: genuine native v4 Binding fixture required")
     return document
 
 
 def test_old_program_binding_is_refused_without_repair() -> None:
     document = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    document["api_version"] = "manyforge.program_binding.v2"
+    document["api_version"] = "manyforge.program_binding.v3"
     before = copy.deepcopy(document)
     with pytest.raises(ProgramBindingTransportError):
         validate_program_binding(document)
     assert document == before
 
 
-def test_native_v3_binding_fixture_is_required_for_cumulative_gate() -> None:
+def test_native_v4_binding_fixture_is_required_for_cumulative_gate() -> None:
     document = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    assert document.get("api_version") == "manyforge.program_binding.v3", (
-        "native v3 Binding fixture is required"
+    assert document.get("api_version") == "manyforge.program_binding.v4", (
+        "native v4 Binding fixture is required"
     )
 
 
 def _rehash(value: dict[str, Any]) -> None:
-    if value.get("api_version") != "manyforge.program_binding.v3":
-        raise ValueError("only native v3 Binding mutations may be rehashed")
+    if value.get("api_version") != "manyforge.program_binding.v4":
+        raise ValueError("only native v4 Binding mutations may be rehashed")
     value["program_binding_id"] = compute_content_identity(
         value,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v3",
+        api_version="manyforge.program_binding.v4",
     )
 
 
@@ -69,30 +69,22 @@ def _fixture() -> dict[str, Any]:
         for row in component["model_bindings"]
         if row["model_instance_id"] == collision["model_instance_id"]
     )
-    value["contact_grasp_bindings"] = [
+    # One collision body a node's collision rule selects.
+    value["collision_rule_bodies"] = [
         {
-            "contact_policy_id": "fixture_contact",
-            "contact_policy_revision": "sha256:" + "c" * 64,
-            "runtime_object_id": "fixture_object",
-            "allowed_body_bindings": [
-                {
-                    "body": copy.deepcopy(collision["reference"]),
-                    "model_role_id": model["model_role_id"],
-                    "model_instance_id": collision["model_instance_id"],
-                    "model_revision": collision["model_revision"],
-                    "collision_body_ids": [
-                        "component/"
-                        f"{collision['reference']['component_id']}/model/"
-                        f"{collision['model_instance_id']}/body/"
-                        f"{collision['reference']['collision_body_id']}/collision/{index}"
-                        for index, _ in enumerate(
-                            collision["compiled_collision_body_names"]
-                        )
-                    ],
-                }
+            "body": copy.deepcopy(collision["reference"]),
+            "model_role_id": model["model_role_id"],
+            "model_instance_id": collision["model_instance_id"],
+            "model_revision": collision["model_revision"],
+            "collision_body_ids": [
+                "component/"
+                f"{collision['reference']['component_id']}/model/"
+                f"{collision['model_instance_id']}/body/"
+                f"{collision['reference']['collision_body_id']}/collision/{index}"
+                for index, _ in enumerate(
+                    collision["compiled_collision_body_names"]
+                )
             ],
-            "max_penetration_m": 0.001,
-            "terminal_window_start_fraction": 0.8,
         }
     ]
     value["node_policies"] = [_node_policy()]
@@ -140,8 +132,8 @@ def _node_policy(*, instance_id: str = "root") -> dict[str, Any]:
 def _rows(value: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     component = value["component_bindings"][0]
     target = value["target_bindings"][0]
-    contact = value["contact_grasp_bindings"][0]
-    return component, target, contact
+    rule_body = value["collision_rule_bodies"][0]
+    return component, target, rule_body
 
 
 def _unknown(record: Callable[[dict[str, Any]], dict[str, Any]]) -> Mutation:
@@ -176,8 +168,8 @@ SHAPE_MUTATIONS: tuple[tuple[str, Mutation], ...] = (
     (".node_policies[0]: expected closed record", lambda value: value["node_policies"][0].pop("recovery_policy")),
     (".node_policies[0]: expected closed record", lambda value: value["node_policies"][0].__setitem__("modification_policy", {"runtime_override": "forbidden", "persistent_edit": "forbidden", "intervention_delegate": "forbidden"})),
     (".node_policies[0].recovery_policy: expected closed record", _unknown(lambda value: value["node_policies"][0]["recovery_policy"])),
-    (".contact_grasp_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[2])),
-    (".allowed_body_bindings[0]: expected closed record", _unknown(lambda value: _rows(value)[2]["allowed_body_bindings"][0])),
+    (".collision_rule_bodies[0]: expected closed record", _unknown(lambda value: _rows(value)[2])),
+    (".collision_rule_bodies[0]: expected closed record", lambda value: _rows(value)[2].pop("model_role_id")),
     (".provenance: expected closed record", _unknown(lambda value: value["provenance"])),
     (".source_records[0]: expected closed record", _unknown(lambda value: value["provenance"]["source_records"][0])),
 )
@@ -185,22 +177,15 @@ SHAPE_MUTATIONS: tuple[tuple[str, Mutation], ...] = (
 
 def _case(name: str) -> Mutation:
     def mutate(value: dict[str, Any]) -> None:
-        component, target, contact = _rows(value)
+        component, target, body = _rows(value)
         resource = target["resource_role_bindings"][0]
         collision = value["collision_body_bindings"][0]
         capability = target["capability_bindings"][0]
-        body = contact["allowed_body_bindings"][0]
         provenance = value["provenance"]["source_records"]
         policy = value["node_policies"][0]
         recovery = policy["recovery_policy"]
-        if name == "null":
-            value["program_id"] = None
-        elif name == "wrong_type":
+        if name == "wrong_type":
             value["target_bindings"] = {}
-        elif name == "identity_pattern":
-            value["program_id"] = "not portable"
-        elif name == "identity_bytes":
-            value["program_id"] = "a" * 129
         elif name == "text_bytes":
             value["frame_bindings"][0]["compiled_frame_name"] = "é" * 2049
         elif name == "invalid_utf8":
@@ -225,8 +210,8 @@ def _case(name: str) -> Mutation:
             value["collision_body_bindings"].append(copy.deepcopy(collision))
         elif name == "capability_order":
             target["capability_bindings"].append(copy.deepcopy(capability))
-        elif name == "contact_order":
-            value["contact_grasp_bindings"].append(copy.deepcopy(contact))
+        elif name == "rule_body_order":
+            value["collision_rule_bodies"].append(copy.deepcopy(body))
         elif name == "resource_vector_size":
             resource["compiled_resource_names"].append("extra")
         elif name == "resource_id_duplicate":
@@ -242,18 +227,8 @@ def _case(name: str) -> Mutation:
             capability["capability_provider_binding"] = None
         elif name == "target_component":
             target["target"]["component_id"] = "mismatch"
-        elif name == "contact_penetration":
-            contact["max_penetration_m"] = 0
-        elif name == "contact_fraction":
-            contact["terminal_window_start_fraction"] = 1.01
-        elif name == "contact_bool":
-            contact["max_penetration_m"] = True
-        elif name == "contact_nonfinite":
-            contact["max_penetration_m"] = float("nan")
-        elif name == "body_minimum":
-            contact["allowed_body_bindings"] = []
-        elif name == "body_order":
-            contact["allowed_body_bindings"].append(copy.deepcopy(body))
+        elif name == "body_ids_minimum":
+            body["collision_body_ids"] = []
         elif name == "generated_body_id":
             body["collision_body_ids"][0] = "wrong"
         elif name == "body_target":
@@ -322,10 +297,7 @@ def _case(name: str) -> Mutation:
 
 
 CASES = (
-    ("null", "bounded non-empty string"),
     ("wrong_type", "bounded array"),
-    ("identity_pattern", "portable identity"),
-    ("identity_bytes", "bounded non-empty string"),
     ("text_bytes", "bounded non-empty string"),
     ("invalid_utf8", "valid UTF-8"),
     ("root_maximum", "bounded array"),
@@ -338,19 +310,14 @@ CASES = (
     ("resource_order", "canonical sorted unique"),
     ("collision_order", "canonical sorted unique"),
     ("capability_order", "canonical sorted unique"),
-    ("contact_order", "canonical sorted unique"),
+    ("rule_body_order", "canonical sorted unique"),
     ("resource_vector_size", "equal length"),
     ("resource_id_duplicate", "duplicate-free"),
     ("resource_name_duplicate", "duplicate-free"),
     ("collision_name_duplicate", "duplicate-free"),
     ("all_null_capability", "control or provider"),
     ("target_component", "target has no component binding"),
-    ("contact_penetration", "numeric ranges"),
-    ("contact_fraction", "numeric ranges"),
-    ("contact_bool", "finite number"),
-    ("contact_nonfinite", "finite number"),
-    ("body_minimum", "bounded array"),
-    ("body_order", "canonical sorted unique"),
+    ("body_ids_minimum", "bounded array"),
     ("generated_body_id", "generated scope"),
     ("body_target", "references must be sorted unique and resolve"),
     ("body_collision", "collision binding"),
@@ -547,7 +514,7 @@ def test_logic_only_binding_accepts_empty_component_and_target_tables() -> None:
     document["frame_bindings"] = []
     document["collision_body_bindings"] = []
     document["signal_bindings"] = []
-    document["contact_grasp_bindings"] = []
+    document["collision_rule_bodies"] = []
     _rehash(document)
     assert validate_program_binding(document) is document
 
@@ -695,9 +662,6 @@ def _endpoint_fixture() -> dict[str, Any]:
                  and frame["reference"] in target["frame_references"])
     association = next(row for row in target["frame_associations"] if row["frame"] == frame["reference"])
     association["contact_body_role_ids"] = [body["reference"]["collision_body_id"]]
-    policy = value["contact_grasp_bindings"][0]
-    policy["bodies_from_motion_endpoint"] = True
-    policy["allowed_body_bindings"] = []
     _rehash(value)
     return value
 
@@ -707,7 +671,7 @@ def test_endpoint_binding_transport_preserves_exact_association() -> None:
     assert validate_program_binding(value) == value
 
 
-@pytest.mark.parametrize("fault", ["missing_body", "wrong_model", "duplicate_body", "false_selector", "mixed_bodies"])
+@pytest.mark.parametrize("fault", ["missing_body", "wrong_model", "duplicate_body"])
 def test_endpoint_binding_transport_rejects_invalid_association(fault: str) -> None:
     value = _endpoint_fixture()
     association = next(row for target in value["target_bindings"]
@@ -717,83 +681,20 @@ def test_endpoint_binding_transport_rejects_invalid_association(fault: str) -> N
         association["contact_body_role_ids"] = ["absent"]
     elif fault == "wrong_model":
         frame["model_revision"] = "sha256:" + "f" * 64
-    elif fault == "duplicate_body":
-        association["contact_body_role_ids"] *= 2
-    elif fault == "false_selector":
-        value["contact_grasp_bindings"][0]["bodies_from_motion_endpoint"] = False
     else:
-        value["contact_grasp_bindings"][0]["allowed_body_bindings"] = _fixture()["contact_grasp_bindings"][0]["allowed_body_bindings"]
+        association["contact_body_role_ids"] *= 2
     _rehash(value)
     with pytest.raises(ProgramBindingTransportError):
         validate_program_binding(value)
 
 
-def _release_fixture(*, binary=False, endpoint=False):
+@pytest.mark.parametrize("key", ["contact_grasp_bindings", "contact_rules"])
+def test_binding_carries_collision_rule_bodies_and_no_contact_table(key: str) -> None:
+    # A node's rules travel with its motion; the Binding only resolves the
+    # collision bodies they select.
     value = _fixture()
-    policy = value["contact_grasp_bindings"][0]
-    policy.pop("max_penetration_m")
-    policy.pop("terminal_window_start_fraction")
-    policy.update(
-        mode="contact_release",
-        release_evidence_mode="binary_contact" if binary else "signed_penetration",
-        enforce_max_start_penetration=not binary,
-        max_start_penetration_m=0.0 if binary else 0.002,
-        min_release_progress_m=0.0,
-        release_tolerance_m=0.0 if binary else 1e-5,
-        require_strictly_decreasing_penetration=not binary,
-        require_separation_by_end=True,
-        allow_recontact=False,
-    )
-    if endpoint:
-        policy["bodies_from_motion_endpoint"] = True
-        policy["allowed_body_bindings"] = []
-    _rehash(value)
-    return value
-
-
-@pytest.mark.parametrize("binary", [False, True])
-@pytest.mark.parametrize("endpoint", [False, True])
-def test_contact_release_binding_uses_one_closed_mode_specific_envelope(binary, endpoint):
-    value = _release_fixture(binary=binary, endpoint=endpoint)
     assert validate_program_binding(value) == value
-
-
-@pytest.mark.parametrize("field,value", [
-    ("mode", "contact_grasp"), ("mode", None),
-    ("release_evidence_mode", "distance"), ("enforce_max_start_penetration", 1),
-    ("require_separation_by_end", None), ("max_start_penetration_m", -0.001),
-    ("min_release_progress_m", 1000.001), ("release_tolerance_m", True),
-    ("max_penetration_m", 0.002), ("terminal_window_start_fraction", 0.5),
-])
-def test_contact_release_binding_rejects_crossed_or_invalid_fields(field, value):
-    binding = _release_fixture(endpoint=True)
-    binding["contact_grasp_bindings"][0][field] = value
-    _rehash(binding)
-    with pytest.raises(ProgramBindingTransportError):
-        validate_program_binding(binding)
-
-
-@pytest.mark.parametrize("field", [
-    "mode", "release_evidence_mode", "enforce_max_start_penetration",
-    "max_start_penetration_m", "min_release_progress_m", "release_tolerance_m",
-    "require_strictly_decreasing_penetration", "require_separation_by_end", "allow_recontact",
-])
-def test_contact_release_binding_requires_every_normalized_release_field(field):
-    binding = _release_fixture()
-    binding["contact_grasp_bindings"][0].pop(field)
-    _rehash(binding)
-    with pytest.raises(ProgramBindingTransportError):
-        validate_program_binding(binding)
-
-
-@pytest.mark.parametrize("field,value", [
-    ("enforce_max_start_penetration", True), ("require_strictly_decreasing_penetration", True),
-    ("max_start_penetration_m", 0.002), ("min_release_progress_m", 0.001),
-    ("release_tolerance_m", 1e-5),
-])
-def test_binary_release_binding_requires_neutral_metric_fields(field, value):
-    binding = _release_fixture(binary=True)
-    binding["contact_grasp_bindings"][0][field] = value
-    _rehash(binding)
-    with pytest.raises(ProgramBindingTransportError):
-        validate_program_binding(binding)
+    value[key] = []
+    _rehash(value)
+    with pytest.raises(ProgramBindingTransportError, match="expected closed record"):
+        validate_program_binding(value)

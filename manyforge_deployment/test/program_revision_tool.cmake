@@ -6,20 +6,10 @@ endif()
 file(REMOVE_RECURSE "${MANYFORGE_TEST_BINARY_DIR}")
 file(MAKE_DIRECTORY "${MANYFORGE_TEST_BINARY_DIR}")
 set(program "${MANYFORGE_TEST_BINARY_DIR}/program.yaml")
-file(WRITE "${program}" [=[api_version: manyforge.program.v3
-program_id: revision_tool_test
+file(WRITE "${program}" [=[api_version: manyforge.program.v4
 program_revision: sha256:0000000000000000000000000000000000000000000000000000000000000000
 program_profile: composable-cell-v1
-name: Revision tool test
 catalog: {api_version: manyforge.node_catalog.v3, content_version: 2.4.0}
-contact_policies:
-  - api_version: manyforge.contact_policy.v1
-    policy_id: revision_tool_policy
-    version: sha256:0000000000000000000000000000000000000000000000000000000000000000
-    mode: contact_grasp
-    sensing_mode: geometry_only
-    default_unmatched_response: hard_stop
-    zones: []
 tree: {node_id: sequence, instance_id: root, parameters: {}, children: []}
 ]=])
 
@@ -65,10 +55,4 @@ string(REGEX MATCHALL "program_revision:" revision_rows "${updated_program}")
 list(LENGTH revision_rows revision_row_count)
 if(NOT revision_row_count EQUAL 1)
   message(FATAL_ERROR "revision update did not preserve one authored field")
-endif()
-string(REGEX MATCHALL "    version: sha256:[0-9a-f]+" policy_revision_rows
-       "${updated_program}")
-list(LENGTH policy_revision_rows policy_revision_row_count)
-if(NOT policy_revision_row_count EQUAL 1)
-  message(FATAL_ERROR "revision update did not preserve one contact-policy field")
 endif()

@@ -9,7 +9,7 @@ One command family creates, checks and lists component folders:
 | --- | --- |
 | `scripts/manyforge component new <robot\|tool\|io_device\|machine> <vendor>.<name> [--into <folder>]` | Creates the folder from a template |
 | `scripts/manyforge component check <folder> [--scenario <scenario>]` | Checks the descriptor, its model files, its lane rows and the rows Apply reads |
-| `scripts/manyforge component register <folder>` | Writes a robot's or tool's model family row; lists a machine, a machine's I/O bank, a sensor or an assistant in `component_models` |
+| `scripts/manyforge component register <folder>` | Writes a robot's or tool's model family row; lists a machine, a model-form I/O device, a sensor or an assistant in `component_models` |
 | `scripts/manyforge component list [--json]` | Lists the curated components, each checked |
 
 Run them in the workbench container from the repository root; ROS is never
@@ -23,11 +23,18 @@ The kinds:
   row per lane it runs on (`lanes.mock`, `lanes.isaac`, `lanes.real`).
 - **Tool** (a gripper or a passive tool): its own component, mounted on a
   robot's `flange`. A gripper runs on a lane's controller (`lanes.<lane>`), or,
-  when pneumatic, without a lane, driven by I/O signals.
+  when pneumatic, without a lane, driven by I/O signals. A passive tool (no
+  `gripper` section) has nothing to drive and never names a lane. A project
+  makes its own tool from parameters with the shipped Tool model
+  ([A Tool from its parameters](#a-tool-from-its-parameters)), or brings its
+  own URDF with the generic passive tool
+  ([A project's own passive tool](#a-projects-own-passive-tool)).
 - **I/O device** (`io_device`): signals. In provider form each signal names
   its provider (a separately connected device, Deployment profile
-  `io_device_v0`); in model form it is a machine's own I/O bank (signals plus
-  `lanes.real: {adapter, bank, input_maximum_age_ms}`).
+  `io_device_v0`); in model form it is an I/O bank (signals, each with an
+  optional `index`, plus `lanes.real: {adapter, input_maximum_age_ms, ...}`):
+  a machine's own bank, or a device of its own such as a PLC's bank
+  ([I/O banks](IO_BANKS.md)).
 - **Machine** (`machine`): one physical machine as an **owner** (connection,
   driver process, controller state, power) with **members** (its arm, its I/O
   banks). See [Add a machine](#add-a-machine).
@@ -49,7 +56,7 @@ itself (its lane rows); a Deployment component selects a model by its `id`
 `list --json` prints each curated component with its descriptor, its errors
 (`{code, message, details}`), `addable` and `runtime`: `componentProfileId`,
 and for a robot or tool `modelFamilyId` and `lanes` (`lane_free` for a
-pneumatic tool), for a machine `lanes` (its arm's) and `members`. Addable are:
+pneumatic or passive tool), for a machine `lanes` (its arm's) and `members`. Addable are:
 a robot with a Mock lane that is no machine's member, a tool with a Mock lane
 or lane-free, a machine whose arm has a Mock lane, a provider-form I/O device,
 a sensor, an assistant and a simulator. A machine's member models are added only with their
@@ -264,13 +271,18 @@ controller is the owner's stop, not a fault.
      `geometric_contact`, `mock`, `ros2_control_gpio`, `ros_bool`; outputs
      `mock_output`, `ros2_control_gpio`, `ros_set_bool`. The fields beside
      `profile` are the profile's own, as in a Deployment's `io_signals`.
-   - **Model form** (a machine's own I/O bank): signals without a provider and
-     `lanes: {real: {adapter, bank, input_maximum_age_ms}}` (`bank`:
-     `controller` or `tool`; `input_maximum_age_ms`: the inputs' freshness
-     budget, the oldest sample still fresh). On the real lane the vendor family
-     reads and writes the bank through its owner's connection, its inputs
-     sampled periodically; on Mock and Isaac the host's Mock I/O provides it
-     (outputs read back). Register it (`component register <folder>`).
+   - **Model form** (an I/O bank): signals without a provider, each with an
+     optional `index` (its bit in the device's bank, unique per direction),
+     and `lanes: {real: {adapter, input_maximum_age_ms, ...}}`
+     (`input_maximum_age_ms`: the inputs' freshness budget, the oldest sample
+     still fresh). The row's other keys belong to the adapter family, which
+     checks them when the Deployment is applied: the xArm family's `bank`
+     (`controller` or `tool`), the `ros_io_bank` family's `rate_hz` and its
+     required `index` per signal ([I/O banks](IO_BANKS.md)). A machine's bank
+     is read and written by its vendor family through its owner's connection;
+     a bank of its own (no owner) by its own family. On Mock and Isaac the
+     host's Mock I/O provides it (outputs read back). Register it
+     (`component register <folder>`).
 3. `scripts/manyforge component check components/io_device/<vendor>.<name>` until it
    prints `ok:`.
 
@@ -325,9 +337,85 @@ A live unavailable sample uses `io_source_unavailable`; its `reason` says why:
 - `collision_query_inconclusive`: the geometry query cannot confirm contact or no contact.
 - `contact_bodies_static`: at least one contact body is static relative to the robot's motion
   group, so it does not move with the robot.
+- `mesh_not_closed`: a trip depth between two meshes, and one of them is not a closed surface.
+- `mesh_depth_vertex_cap_reached`: a trip depth between two meshes, with more than 256 vertices of
+  one mesh inside the other.
 
 Before the first sample, the signal has no value. A valid sample becomes stale when it is older than the configured **Maximum sample age**. Setting that age below normal sample-production time can make the sample stale. This input is read-only; manual
 and timed Mock writes do not apply.
+
+In place of `target_scene_resource_id`, the provider may name two selections
+`a` and `b` with the selection kinds of a collision rule
+([Selections](COLLISION_RULES.md#selections)): `component`, `link`,
+`attached_object`, `scene_objects` and `scene_object` (by
+`scene_resource_id`). The input is then true while a pair of one part of `a`
+and one of `b` touches, and with `trip_depth_m` only while a pair overlaps
+deeper than that. With `release_depth_m` as well (above 0 and below
+`trip_depth_m`) the input has hysteresis like a real sensor: it turns true
+when a pair overlaps deeper than `trip_depth_m` and turns false again only
+when no pair overlaps deeper than `release_depth_m`. Without it the input
+turns false as soon as the overlap is no longer deeper than `trip_depth_m`. A
+`release_depth_m` that is not below `trip_depth_m`, or one without
+`trip_depth_m`, is refused.
+`robot_component_id` still names the robot whose positions are sampled. An `attached_object` selection while nothing is carried holds no
+pair: the input is false. A selection that names nothing in the cell is
+`collision_geometry_unresolved`, and a touching pair whose depth the query
+does not give is `collision_query_inconclusive`.
+
+### Mock inputs from geometry
+
+On Mock and Isaac a machine's I/O inputs are the host's Mock inputs. An I/O
+member row may instead let an input follow the cell's geometry with
+`mock_inputs`, for example a holder whose sensor trips when the tube the robot
+carries is pressed into it:
+
+```yaml
+- component_id: uf850_tool_io
+  component_profile_id: ufactory.uf850_tool_io
+  owner: uf850
+  role: tool_io
+  mock_inputs:
+    - signal_name: TI0
+      geometric_contact:
+        robot_component_id: uf850_robot
+        a: [{kind: attached_object, component_id: tube_gripper}]
+        b: [{kind: scene_object, scene_resource_id: endplate}]
+        trip_depth_m: 0.004           # true once pressed in deeper than 4 mm
+        release_depth_m: 0.003        # optional: false again only below 3 mm
+        maximum_sample_age_ms: 1000   # optional, default 1000
+```
+
+On Mock and Isaac the input is then a geometric-contact input with these
+fields (see above); on Real the row is not used and the physical input is
+read. The Program reads the same signal on every lane. A row naming a signal
+that is not an input of the member's model, a signal listed twice or a
+missing field fails Apply with `io_mock_input_invalid`.
+
+A holder modelled as a generated tool's spring slider
+([Parameters](#parameters)) names the slider in place of
+`geometric_contact`:
+
+```yaml
+  mock_inputs:
+    - signal_name: TI0
+      spring_slider: {component_id: tube_holder, element_id: holder_rod}
+      b: [{kind: scene_object, scene_resource_id: endplate}]
+      maximum_sample_age_ms: 1000   # optional, default 1000
+```
+
+- `a` is the slider's body and every object the slider carries.
+- The robot is the arm the tool is mounted on.
+- `trip_depth_m` and `release_depth_m` are the slider's (without its
+  `release_depth_m` the input has no hysteresis).
+- A row has exactly one of `geometric_contact` and `spring_slider`; `b` is
+  required.
+- A component that is not a generated tool, an element that is not a
+  spring slider or a tool not mounted on a robot fails Apply with
+  `io_mock_input_invalid`.
+
+A trip depth between two meshes needs both to be closed surfaces, and its
+precision follows their triangulation
+([Depth between two meshes](COLLISION_RULES.md#depth-between-two-meshes)).
 
 ## Add a tool
 
@@ -396,7 +484,12 @@ mesh `package://` URIs that share one folder before `meshes/`.
 6. **Generate the catalog files** as in robot step 6 (`--family <name>`). A
    family without `arm_joints` gets a tool component type: root and
    interface `mount`, one `gripper` target with a frame role per TCP, the
-   first the default.
+   first the default. A passive tool's (no `gripper` group) has one
+   frame-only `tool` target instead: its TCPs and no capability. A collision
+   body listed in `roles.optional_collision_bodies` (the passive tool's
+   `tip`) is optional: a model without its links leaves it unbound, and it
+   then contributes nothing; a body naming a link without `<collision>`
+   geometry still fails.
 
 7. **Scenario.** Add the tool component next to its robot in
    `deployment.yaml`:
@@ -448,6 +541,341 @@ mesh `package://` URIs that share one folder before `meshes/`.
 **Done when** `component check <folder> --scenario <scenario>` prints only
 `ok:` lines and the Program's gripper steps run.
 
+### Unmounted tools and Replace tool
+
+A tool can be added before it has a robot: in **Add component → Tool**,
+choose **Not mounted yet** under **Mount on** (it is also what is offered
+when no robot has a free flange). The Draft then holds the tool row without
+an attachment row and without `root_pose_in_cell`; only a tool may stay
+unmounted, any other model component still needs one of the two. Its page
+and its tool editor work as for a mounted tool. **Mounted on** on its page
+mounts it later (one Draft edit adds its attachment row) and, set to
+**Not mounted**, unmounts a mounted tool again.
+
+Preview and Apply refuse while any tool is unmounted
+(`deployment_tool_unmounted`, naming the tool), so the cell never holds a
+floating tool: mount it or remove it first.
+
+**Replace with…** on a mounted tool's page swaps it for another tool of the
+Draft, typically one added unmounted. One Draft edit:
+
+- the new tool takes over the old tool's attachment row: parent, interfaces,
+  `pose`, `primary` and `collision_exclusions` (its own mount, if it had one,
+  is dropped);
+- every reference to the old tool's component id in the Deployment Draft
+  (collision rule selections, I/O and wiring rows of other components,
+  attachments where it is the parent, policies) and in the Program Draft
+  (node targets, TCP frames, collision bodies, collision rule selections,
+  stored-pose target frames, Active TCP keys, frame visibility) names the new
+  tool;
+- the old tool leaves the Draft with its own settings (its custom TCPs, its
+  gripper wiring).
+
+Afterwards the Components page lists what the rewritten references name that
+the new tool does not declare: command targets, frames (TCPs) and collision
+bodies, from its parameters or its model. Change those references, or the
+new tool, before Apply; Program reference validation reports the ones left.
+Collision exclusions name the old tool's links: adjust them when the new
+tool's links differ (Apply refuses unknown links).
+
+### A Tool from its parameters
+
+A tool without a controller of its own (a probe, a tool body, a part holder,
+a pneumatic gripper with one or more jaw pairs, a spring-loaded probe) needs
+no component folder: the Tool model, `manyforge.tool`
+(`manyforge_example_models/models/tool/`), makes it from its parameters.
+
+- A **Tool** is one component, mounted as a whole on a robot's `flange`.
+- Its **tool ends** are where it meets the work: a jaw pair, a spring slider
+  or a probe tip. Each has its TCPs and its grip or contact bodies; a jaw
+  pair is actuated and is a gripper command target under its id.
+- Its **mount** is fixed.
+
+Its components name no `lane` and run on Mock and Real with any robot lane,
+on the host's generic adapter; they have no streams. Jaw positions are the
+commanded ones. Isaac is not supported for a Tool with jaw pairs
+(`pneumatic_io_unsupported_on_isaac`).
+
+1. **Add it.** Add component, kind Tool, group **ManyForge**, **Tool from parameters**, and
+   pick the robot to mount it on. The new row holds the starter parameters
+   (`new_tool.tool.yaml`: a cylinder body and its default TCP) inline in
+   `model_source.parameters`, and its `attachments` row.
+2. **Edit it** on its component page. The Tool card shows a 3D preview of the
+   generated tool (mount frame at the origin, jaws open, TCPs as small axes;
+   `.stl` meshes drawn like the other parts; a mesh it cannot draw, such as
+   a `.dae` file, is a small red box named below the preview), and its
+   sections edit the parameters:
+   **Body** (its parts), **Chains**, **TCPs**, **Wiring** and **Mass**. Each
+   change is a Draft edit; Apply loads it. When the parameters do not fit,
+   the refusal shows on its field. A part with **Mesh file** geometry has
+   **Browse approved meshes**: it lists the `.stl` and `.dae` files in the
+   allowed folders and writes the picked file's path relative to the
+   Scenario folder.
+3. **Wire each jaw pair** in **Wiring**: one valve output (single-acting) or
+   two (open and close), with their Open and Close values, picked from the
+   cell's declared output signals; its opened and closed sensors (and the
+   other gripper inputs) are optional, picked from the declared inputs.
+4. **Export** (Tool card) writes the generated `tool.urdf` and `tool.srdf`
+   into `<project folder>/<component id>/`. The exported URDF names each mesh
+   where it is, by its path relative to that folder; with **Copy meshes into
+   the export folder** it writes a copy of each mesh into its `meshes/`
+   folder (`<digest>-<file name>`) and names the copies instead.
+
+The row, as saved (the Deployment holds the parameters and, per jaw pair,
+its wiring only; states, motion time, frames and the grip body come from the
+parameters):
+
+```yaml
+- component_id: gripper
+  component_profile_id: manyforge.tool
+  frame_prefix: ''
+  model_source:
+    parameters:                     # inline; or {project_path: tool/gripper.tool.yaml}
+      api_version: manyforge.parametric_tool.v1
+      kind: tool
+      body: [...]
+      chains: [...]
+      tcps: [...]
+  target_settings: {}
+  configuration:
+    runtime_kind: ros2_control
+    runtime_configuration:
+      component_streams: []
+      gripper_target_configurations:  # one wiring row per jaw pair
+        - controllable_component_id: gripper
+          command_target_id: outer      # the jaw pair's id
+          pneumatic_io:
+            inputs: {}
+            outputs:
+              - signal: {controllable_component_id: gripper_io, signal_name: outer_valve}
+                close_value: true
+                open_value: false
+```
+
+A wiring row may add `grasp_confirmation`
+([Grasp confirmation](GRIPPERS.md#grasp-confirmation)); any other field fails
+Load with `generated_tool_wiring_invalid`, as does a row without
+`pneumatic_io`. A jaw pair without its row fails with
+`generated_tool_wiring_missing`, a row naming no jaw pair (or one twice) with
+`generated_tool_wiring_unknown`. A `manyforge.tool` row without parameters
+fails with `generated_tool_parameters_required`; parameters on any other
+model with `parametric_tool_kind_unsupported`.
+
+`model_source.parameters` may instead name a parameter file in the project
+(`{project_path: ...}`, relative to the Scenario project folder, or
+`{external_path: ...}`), for example to share a tool between projects; the
+file holds the same parameters, and its component page then edits its
+wiring only. Load reads the parameters (and the file) and their meshes once
+and generates the URDF and SRDF from them. The meshes stay where they are:
+Load keeps their content with the loaded model, which names each mesh by its
+content, so the same parameters and the same mesh content always give the
+same model, and nothing is written into the project folders.
+
+#### Parameters
+
+```yaml
+api_version: manyforge.parametric_tool.v1
+kind: tool
+body:                          # one or more parts, at least one with collision
+  - name: housing
+    pose: {position_m: [0, 0, 0.03]}
+    collision: {box: {size_m: [0.08, 0.08, 0.06]}}
+chains:
+  - attach_to: body            # the default; or an element of an earlier chain
+    pose: {position_m: [0, 0, 0.06]}
+    elements:
+      - jaw_pair:
+          id: outer
+          positive_jaw:
+            - name: outer_finger
+              pose: {position_m: [0, 0.006, 0.03]}
+              collision: {box: {size_m: [0.02, 0.008, 0.06]}}
+          min_aperture_m: 0.0
+          max_aperture_m: 0.04
+tcps:
+  - id: tcp                    # the first is the default TCP; its id is tcp
+    attach_to: outer           # a tool end, or body (the default)
+    pose: {position_m: [0, 0, 0.05]}
+mass_kg: 0.6                   # or mass_kg (and center_of_mass_m) per part
+center_of_mass_m: [0, 0, 0.04]
+```
+
+- Poses: `position_m` in metres and `orientation` as `rpy_deg` (fixed-axis
+  roll, pitch, yaw, as URDF) or a quaternion `xyzw`; each optional (zero,
+  identity). Body parts are in the mount frame (the robot flange plane).
+- A part has a `name` (lower-case, unique in the parameters), a `pose`, and
+  `collision` and `visual` geometry: exactly one of `box: {size_m: [x, y,
+  z]}`, `cylinder: {radius_m, length_m}` (along its z axis, centred),
+  `sphere: {radius_m}` or `mesh: {path, scale}`. The visual is the
+  collision geometry unless given (`visual: none` shows nothing);
+  `collision_pose` and `visual_pose` offset them from the part's pose.
+- A mesh `path` is an `.stl` or `.dae` file under the project path rule, as
+  for Scene meshes and model sources: relative to the parameter file's
+  folder (inline parameters: the Scenario folder) or absolute. `..` may
+  leave that folder, but the file must lie inside an allowed folder;
+  otherwise Load refuses with `parametric_tool_mesh_unavailable`, naming the
+  path and the allowed folders.
+- Each chain hangs from the body or from an element of an earlier chain
+  (`attach_to: <element id>`, with `jaw: positive|negative` for a jaw of a
+  jaw pair), at its `pose`; its elements lead to its tool ends. Each element
+  has an `id` (unique; `body` and `tool` are reserved) and a `pose` in the
+  chain frame:
+  - `fixed`: rigid `parts`, the link `tool_<id>`.
+  - `jaw_pair` (tool end, actuated): two jaws on the pair frame's y axis.
+    `positive_jaw` is the +y jaw's parts at the closed position; the -y jaw
+    is the same parts turned 180 degrees about the pair's z, unless
+    `negative_jaw` gives its own parts (in the pair frame). Optional
+    `pads: {positive, negative}` (the same rule). `min_aperture_m` and
+    `max_aperture_m` are the apertures at full closure and full opening;
+    `open_aperture_m` (default the maximum) and `closed_aperture_m`
+    (default the minimum, required with pads: the assumed grasp) are its
+    `open` and `closed` states; `command_duration_s` (default 0.8 s) is its
+    motion time. Each jaw travels `(aperture - min_aperture_m) / 2` on one
+    commanded prismatic joint `tool_<id>_joint` and its mimic follower.
+  - `spring_slider` (tool end): a spring-loaded rod, a fixed collision body
+    `<id>` (link `tool_<id>`) with its `axis` (element frame, default z),
+    `stroke_m`, `trip_depth_m` (at most the stroke), optional
+    `release_depth_m` (above 0 and below `trip_depth_m`: the sensor's
+    hysteresis) and `max_compression_step_m` (default 0.002) declared beside
+    it. Load carries the values with the component. The rod does not move in
+    the model: its compression is the modelled overlap. The `axis` points out
+    of the tool along the rod; a push moves the rod back against it.
+    - The slider is a frame of the tool, `<id>`, at the slider link. An
+      object attached to it (carrier frame `{component_id: <tool>,
+      frame_id: <id>}`) is carried by the slider: it presses the spring with
+      the rod, as a tube in a holder. The attach node's target is the robot
+      the tool is mounted on (its arm target), whose kinematics places the
+      slider; the touch bodies are the tool's, for example
+      `{component_id: <tool>, collision_body_id: <id>}`.
+    - A move that presses the slider in names it in a `spring_slider` rule
+      ([Springs](COLLISION_RULES.md#springs)): the limits are the slider's
+      `stroke_m` and `max_compression_step_m`.
+    - An input that follows the slider's trip uses the `spring_slider` form
+      ([Mock inputs from geometry](#mock-inputs-from-geometry)): the trip
+      and release depths are the slider's.
+    `swept_space: true` (default false) adds a fixed collision body
+    `<id>_swept` (link `tool_<id>_swept`, no visual) covering every
+    position the parts reach over the stroke: a box, or a cylinder whose
+    own axis is the slider axis, is lengthened by the stroke and moved
+    back by half of it; a sphere becomes a cylinder between its end
+    positions with a sphere at each end. Any other part (a mesh, or a box
+    or cylinder at an angle to the axis) fails Load with
+    `parametric_tool_swept_space_unsupported`. The swept body is an
+    ordinary collision body of the tool, not one of its TCPs' contact
+    bodies, and is not checked against the slider or what the slider is
+    attached to.
+  - `tip` (tool end): a probe tip, rigid `parts`, the link `tool_<id>`.
+- `tcps`: the first is the default TCP, id `tcp` (link `tool_tcp`), later
+  ones `tool_tcp_<id>`. A TCP belongs to a tool end (`attach_to`, its pose in
+  the tool end's frame) or to the body. `contact_bodies` names collision
+  bodies ([TCPs](TCPS.md#contact-bodies)); without it a TCP takes its tool
+  end's: a jaw pair's pads (else its fingers), a tip's or a spring slider's
+  own body; a TCP on the body has none.
+- The mass is either the tool's `mass_kg` (with an optional
+  `center_of_mass_m`, default the mount origin) or per-part `mass_kg`, never
+  both. The robot's payload adds it while the tool is mounted. Without a
+  mass the tool is 0 kg.
+
+Parameters that do not fit fail Load with `parametric_tool_invalid` (the
+message names the field), an unknown `kind` with
+`parametric_tool_kind_unsupported`, and a missing mesh or one outside the
+allowed folders with `parametric_tool_mesh_unavailable` (a swept space that cannot be built:
+`parametric_tool_swept_space_unsupported`). Examples in
+`manyforge_example_models/models/tool/`: `dual_jaw_gripper.tool.yaml` (two
+jaw pairs), `spring_probe.tool.yaml` and `probe.tool.yaml` (a tip).
+
+At Load, the component's type is derived from the parameters:
+
+- `tool`: the body with every collision body and every TCP under its id,
+  each with its contact bodies, and one frame per spring slider. The default TCP is `<component> · tool · tcp`,
+  the robot's End-effector TCP while the tool is on its flange
+  ([TCPs](TCPS.md)).
+- one gripper target per jaw pair, under the pair's id, with the pair's
+  group, commanded joint and collision bodies (`<id>_fingers`, and
+  `<id>_pads` with pads). Its grip body (what may touch what it holds) is
+  `<id>_pads` with pads, otherwise `<id>_fingers`. A Program's Close and
+  Open nodes, the manual gripper control and a carried object's attachment
+  address one pair as `<component> · <pair id>`; each pair has its own
+  state, valve and Stop.
+
+The collision bodies are `body`, each fixed element, tip and spring slider
+by its id, and `<id>_fingers` and `<id>_pads` per jaw pair. The SRDF has one
+group per jaw pair (with `open` and `closed` states) and disables the
+adjacent link pairs only. As for every tool, Apply disables collisions
+between the two rigid link groups that meet at the mount; list other tool
+and arm link pairs that touch by design on the attachment row
+(`collision_exclusions`), as in [Add a tool](#add-a-tool) step 7. An Apply
+that leaves the Tool unchanged keeps it running, like any unchanged
+component.
+
+Outside the Composer, `scripts/manyforge component export <parameter file>
+<folder>` writes the same `tool.urdf` and `tool.srdf` as Export (each mesh
+named where it is, by its path relative to `<folder>`);
+`--format urdf` or `--format srdf` writes one of them, `--format usda` is
+refused (`parametric_tool_export_format_unsupported`).
+
+A gripper with its own controller stays a component package
+([Add a tool](#add-a-tool)), with its one target `gripper`.
+
+### A project's own passive tool
+
+A project that has its own URDF of a tool with nothing to drive uses the
+generic passive tool, `manyforge.passive_tool`
+(`manyforge_example_models/models/passive_tool/`): a mount frame, a TCP frame
+and an optional tip, no joints, groups, gripper section or controller
+(`lanes: {}`). Its components name no `lane` and run on every lane, Mock,
+Isaac and Real, with any robot lane, on the host's generic adapter
+([Lanes and adapters](#lanes-and-adapters)); it has no streams, and its
+Components page shows its lane as **Every lane**. Its folder holds a neutral
+placeholder model. Add it with Add component, kind Tool, group ManyForge,
+**Tool from your URDF (passive)** (`manyforge.passive_tool`), and point its row at the project's files. The tool
+folder (for example `tool/`) is then the package `passive_tool`:
+
+- the URDF (any file name), with the root link `passive_tool_mount` (the
+  robot flange plane) and a link `passive_tool_tcp` at the TCP, placed by its
+  fixed joint's `origin`; the other links and their names are the project's.
+  Use fixed joints only: nothing moves them. A link `passive_tool_tip` with
+  `<collision>` geometry is the tool's `tip` (the default TCP's contact body);
+  without such a link the tool has no tip;
+- its meshes, `.stl`, `.dae`, `.png` or `.jpg`, anywhere in the folder.
+  Every mesh URI is `package://passive_tool/<path in the folder>`, for
+  example `package://passive_tool/meshes/body.stl` for
+  `tool/meshes/body.stl`. A URI of another package fails Load
+  (`activation_model_preparation_failed`);
+- the tool's mass and centre of mass: `<inertial>` elements on its links.
+  Load sums their masses and places the centre of mass in
+  `passive_tool_mount`. A URDF without `<inertial>` is 0 kg;
+- no SRDF: the passive tool has no groups, so a URDF alone is a complete
+  model. Add one only for `disable_collisions` between the tool's own links;
+  its `<robot name>` must then equal the URDF's.
+
+```yaml
+- component_id: holder
+  component_profile_id: manyforge.passive_tool
+  frame_prefix: ''
+  model_source:
+    urdf: {project_path: tool/holder.urdf}
+    package_roots:
+      passive_tool: {project_path: tool}
+  target_settings: {}
+  configuration:
+    runtime_kind: ros2_control
+    runtime_configuration: {component_streams: []}
+```
+
+The package root names this component's files only; the robot's row keeps
+its own. Every link with `<collision>` geometry is checked; the links other
+than the tip form the tool's `default_collision` body. Without an SRDF nothing
+excludes parts that touch by design: pairs of the tool's own links go in an
+SRDF's `disable_collisions`. Add more TCPs as custom TCPs on the component
+page.
+
+`scripts/manyforge component check manyforge_example_models/models/passive_tool
+--scenario <scenario>` checks the rows: one attachment row from a free
+`flange`, no `root_pose_in_cell`, no `lane`, no streams, and a
+`model_source` naming a URDF with its SRDF and package roots (parameters are
+for the Tool model, [A Tool from its parameters](#a-tool-from-its-parameters)).
+
 ## Set up a component's TCPs
 
 The TCPs of a new robot or tool are set up in this order (the terms are in
@@ -459,7 +887,9 @@ The TCPs of a new robot or tool are set up in this order (the terms are in
 2. **Targets and frame roles**: name the frames the component uses
    (`roles.frames`, a tool's `mount.frame`). Every frame has one name.
 3. **Mark the TCPs**: list each TCP in `tcps`. Only the listed frames are TCPs.
-   Custom TCPs can be added later on the component page.
+   Custom TCPs can be added later on the component page. A TCP's
+   `contact_bodies` name the collision bodies meant to touch the work
+   ([TCPs](TCPS.md#contact-bodies)).
 4. **Choose a default if there are several**: the first `tcps` entry is the
    component's default. A component type with TCPs across multiple targets
    and no single type-declared default needs `default_tcp` on its Deployment
@@ -560,10 +990,10 @@ what it supports: `reset_position`, `power_off`, `reboot`, `io_manual_write`,
 are offered. Declaring `sim_reset` identifies the component as a simulator;
 its state never latches the cell or blocks Execute.
 
-**Components without a lane** (a pneumatic tool driven by I/O) run on the
-host's generic adapter: Prepare, Enable, Disable and Recover succeed at once;
-its activity follows its own commands (busy during an open or close); it has
-no streams.
+**Components without a lane** (a pneumatic tool driven by I/O, a passive
+tool) run on the host's generic adapter: Prepare, Enable, Disable and Recover
+succeed at once; its activity follows its own commands (busy during an open
+or close; a passive tool is always idle); it has no streams.
 
 **The AI assistant** has no lane either; its adapter runs a component process
 (the ROS node `assistant_host`) next to the execution host:
@@ -676,7 +1106,7 @@ Common to every kind:
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `api_version` | yes | `manyforge.component_package.v1` |
+| `api_version` | yes | `manyforge.component_package.v2` (`v1` is still read; v2 added the optional I/O signal `index` and leaves a model-form I/O device's lane keys to its family) |
 | `kind` | yes | `robot`, `tool`, `io_device`, `machine`, `sensor`, `assistant` or `simulator` |
 | `id` | yes | `<vendor>.<name>`, each a lower-case portable id (`[a-z][a-z0-9_]*`). A Deployment component selects the model by it (`component_profile_id`); for a robot or tool `<name>` is the model family id |
 | `version` | yes | `MAJOR.MINOR.PATCH`. Bump the minor version for compatible data changes, the major version when roles or joints change |
@@ -694,37 +1124,51 @@ Robot:
 | `roles.frames` | yes | Frame roles to URDF links; robot arms require `base` and `flange` |
 | `roles.groups` | yes | Group roles to SRDF groups; robot arms require `arm` |
 | `roles.joints` | yes | `arm_joints`: the commanded arm joints, base to tip |
-| `roles.collision_bodies` | no | Collision roles to URDF links (`arm_collision`) |
+| `roles.collision_bodies` | no | Collision roles to URDF links (`arm_collision`); see [Collision bodies](#collision-bodies) |
 | `roles.instance_cardinality` | no | `multiple_per_cell` (default) or `one_per_cell` |
 | `tcps` | yes | `[{id, frame}]`, one or more TCPs, each a frame role named by its `id`; the first is the default TCP. An `id` that is also a frame role (`roles.frames`, or `root`) must be on that role's link, else it is refused (`component_manifest_invalid`). Only the listed frames are TCPs: a frame merely named `tcp` is an ordinary frame. `tcp` is an ordinary name, allowed for any TCP. The descriptor checker verifies each frame exists |
 | `limits.max_tcp_linear_speed_mps` | yes | The vendor TCP speed limit. Take it from the component's datasheet: checking the value is your responsibility, and ManyForge enforces whatever value is entered. `check` refuses a default or a Scenario TCP ceiling above it (`component_limit_exceeded`); Apply does not read it |
 | `lanes.<lane>` | yes | One row per lane (`mock`, `isaac`, `real`): `adapter`, `controller`, `arrival_tolerance_rad`, `runtime_scale`, optional `goal_time_s`, `vendor` or `controllers_file` (a Mock row needs one of them), and the adapter's own keys ([Lanes and adapters](#lanes-and-adapters)) |
-| `defaults` | no | Values for a new Deployment component: `initial_joint_positions_rad` (one per arm joint), `maximum_tcp_linear_speed_mps` (at or below the limit) |
+| `defaults` | yes | Values for a new Deployment component: `controlled_stop_max_deceleration_rad_s2` (required: the per-joint deceleration of the arm's controlled Stop, for example the `max_acceleration` in the vendor's MoveIt `joint_limits.yaml`), `initial_joint_positions_rad` (one per arm joint), `maximum_tcp_linear_speed_mps` (at or below the limit) |
 
 Tool:
 
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `model.urdf`, `model.srdf` | yes | Files in the folder |
-| `model.package_name` | no | The package of the mesh URIs; read from the URIs when absent |
+| `model.package_name` | no | The package of the mesh URIs; read from the URIs when absent. When it is the folder's own name, the folder is the package (`package://<name>/...`, as the passive tool) |
 | `mount.frame` | yes | The URDF root link, the one on the robot flange (frame role `mount`) |
-| `tcps` | yes | `[{id, frame}]`, each a frame role named by its `id`; the first is the default TCP. An `id` of `mount` (or a `roles.frames` role) must be on that role's link, else it is refused. `tcp` is an ordinary name, allowed for any TCP |
-| `roles.groups.gripper` | with a gripper | The SRDF group with the `open`/`closed` states |
-| `roles.joints.fingers` | with a gripper | The commanded finger joint, not a mimic follower |
-| `roles.collision_bodies` | no | `gripper_collision` and other collision roles to URDF links |
+| `tcps` | yes | `[{id, frame}]`, each a frame role named by its `id`; the first is the default TCP. An `id` of `mount` (or a `roles.frames` role) must be on that role's link, else it is refused. `tcp` is an ordinary name, allowed for any TCP. A row may add `contact_bodies`, a list of `roles.collision_bodies` names ([TCPs](TCPS.md#contact-bodies)); without it a gripper's TCP takes `gripper_pads`, else `gripper_fingers`, and a passive tool's TCP none |
+| `roles.groups.gripper` | with a gripper | The SRDF group with the `open`/`closed` states; a passive tool (no `gripper` section) has no groups |
+| `roles.joints.fingers` | with a gripper | The commanded finger joint, not a mimic follower; a passive tool has no joints |
+| `roles.collision_bodies` | no | `gripper_collision` and other collision roles to URDF links; see [Collision bodies](#collision-bodies) |
 | `gripper.actuation` | with a gripper | `position_commanded` or `pneumatic` |
 | `gripper.states` | with a gripper | `{open, closed}`: group_states of the gripper group |
-| `gripper.attach_frame`, `gripper.touch_links` | with a gripper | The link a grasped object attaches to; the links that may touch it |
+| `gripper.attach_frame`, `gripper.grip_body` | with a gripper | The link a grasped object attaches to; the collision body (a `roles.collision_bodies` name, `gripper_collision` in the curated grippers) whose links hold it |
 | `gripper.command_duration_s` | pneumatic | The valve dwell in seconds |
-| `lanes.<lane>` | no | One row per lane: `adapter`, `controller` (the gripper controller), `controllers_file` on Mock, timeouts and the adapter's keys; no `arrival_tolerance_rad` or `runtime_scale`. A pneumatic tool may have none |
+| `lanes.<lane>` | no | One row per lane: `adapter`, `controller` (the gripper controller), `controllers_file` on Mock, timeouts and the adapter's keys; no `arrival_tolerance_rad` or `runtime_scale`. A pneumatic tool may have none; a passive tool declares `lanes: {}` |
 | `lanes.<lane>.gripper_stop_finish_tolerance` | Mock and `ros_gripper_command` Isaac rows | Finger distance to the target (the gripper's position unit, about 5% of the stroke) within which a Stop lets the command finish instead of cancelling it; see [Grippers](GRIPPERS.md#stop-near-the-target) |
+
+### Collision bodies
+
+Every URDF link with `<collision>` geometry is collision-checked, whether or
+not a collision body names it. Collision bodies (`roles.collision_bodies`)
+are names for groups of links, so that Programs and Deployments can refer to
+parts of the model (for example the gripper's fingers as a TCP's contact
+bodies, or a single body in a [collision rule](COLLISION_RULES.md)).
+Links that no collision body names go to the component's `default_collision`
+body. A collision body that names a link without `<collision>` geometry is
+refused at Load. A curated robot or tool names every collision link in its
+collision bodies.
 
 I/O device: `signals` (required), each with `signal_name` (unique),
 `direction` (`input` or `output`) and `value_type` (`bool`). Provider form:
 `signal_name` is a portable id, and each signal has `provider` (`profile`
 plus its fields) and, for an input, `freshness`, `transition_capability` and
 `update_mode`. Model form: `signal_name` is the device's own name (e.g. `CI0`,
-`TO1`), no provider, and `lanes: {real: {adapter, bank, input_maximum_age_ms}}`.
+`TO1`), no provider, an optional `index` (a whole number, unique per
+direction), and `lanes: {real: {adapter, input_maximum_age_ms, ...}}` whose
+other keys are the adapter family's.
 
 Machine: `default_owner_id` (portable id), `members` (`[{role, model}]`, each
 role once, each model a curated robot or model-form I/O device) and `lanes`
@@ -741,12 +1185,12 @@ Simulator: `lanes` (rows with at least `adapter`).
 | --- | --- |
 | `component_manifest_invalid` | A descriptor field is missing, unknown or malformed, the YAML is invalid, or a machine member names no curated robot or model-form I/O device (the line names the field) |
 | `component_model_unreadable` | The URDF or SRDF cannot be read |
-| `component_role_unknown_link` | A frame, collision, TCP, mount, attach or touch link is not in the URDF |
+| `component_role_unknown_link` | A frame, collision, TCP, mount or attach link is not in the URDF |
 | `component_group_unknown` | A group role names no SRDF group |
 | `component_joint_invalid` | A joint role names a missing, fixed or mimic joint |
 | `component_state_unknown` | The gripper group lacks an `open`/`closed` state, or `gripper.states` names a missing one |
 | `component_mesh_unresolved` | A mesh URI does not resolve in the package or maintained model source root |
-| `component_lane_invalid` | A robot row without `arrival_tolerance_rad` or `runtime_scale` (`supported` or `unsupported`), a tool row with either, a Mock row with neither `vendor` nor `controllers_file`, a missing `controllers_file`, or a Scenario lane the model lacks |
+| `component_lane_invalid` | A robot row without `arrival_tolerance_rad` or `runtime_scale` (`supported` or `unsupported`), a tool row with either, a Mock row with neither `vendor` nor `controllers_file`, a missing `controllers_file`, a passive tool without `lanes: {}`, or a Scenario lane the model lacks |
 | `component_joint_count_mismatch` | Initial joint positions do not match the arm joints |
 | `component_limit_exceeded` | A default or Scenario TCP ceiling is above `limits.max_tcp_linear_speed_mps` |
 | `component_not_registered` | A robot's or tool's family row is missing, or a machine, model-form I/O device or sensor isn't in `component_models`; run `register` |

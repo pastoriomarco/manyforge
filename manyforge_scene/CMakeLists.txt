@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_scene VERSION 0.3.1 LANGUAGES CXX)
+project(manyforge_scene VERSION 0.4.0 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -10,8 +10,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-Wall -Wextra -Werror -pedantic)
 
 option(BUILD_TESTING "Build unit tests" ON)
-
-find_package(SQLite3 3.37 REQUIRED)
 
 set(
   MANYFORGE_CORE_SOURCE_DIR
@@ -43,24 +41,6 @@ if(NOT TARGET manyforge_core)
 endif()
 if(NOT TARGET manyforge_core)
   message(FATAL_ERROR "manyforge_scene could not resolve manyforge_core")
-endif()
-
-set(
-  MANYFORGE_PERSISTENCE_SOURCE_DIR
-  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_persistence"
-  CACHE PATH
-  "Path to the manyforge_persistence source tree")
-if(NOT TARGET manyforge::persistence)
-  if(NOT EXISTS
-     "${MANYFORGE_PERSISTENCE_SOURCE_DIR}/include/manyforge_persistence/sqlite_read_only_preflight.hpp")
-    message(FATAL_ERROR
-      "manyforge_scene requires the manyforge_persistence mechanical "
-      "SQLite preflight")
-  endif()
-  add_subdirectory(
-    "${MANYFORGE_PERSISTENCE_SOURCE_DIR}"
-    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_persistence"
-    EXCLUDE_FROM_ALL)
 endif()
 
 set(
@@ -105,114 +85,6 @@ if(NOT TARGET manyforge::deployment_admission)
     "manyforge_scene could not resolve the focused deployment admission "
     "target")
 endif()
-if(NOT TARGET manyforge::persistence)
-  message(FATAL_ERROR
-    "manyforge_scene could not resolve manyforge_persistence")
-endif()
-
-set(
-  MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/001_canonical_empty_scene_store.sql")
-set(
-  MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/002_logical_scene_transactions.sql")
-set(
-  MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/003_native_projection_handoff.sql")
-set(
-  MANYFORGE_BOUNDED_HISTORY_MIGRATION
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/004_bounded_history.sql")
-set(
-  MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/005_maintenance_initialization.sql")
-set(
-  MANYFORGE_INITIAL_SCENE_BASELINE_MIGRATION
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/006_initial_scene_baseline.sql")
-set_property(
-  DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-  "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA}"
-  "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION}"
-  "${MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION}"
-  "${MANYFORGE_BOUNDED_HISTORY_MIGRATION}"
-  "${MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION}"
-  "${MANYFORGE_INITIAL_SCENE_BASELINE_MIGRATION}")
-file(READ
-  "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA}"
-  MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL)
-file(READ
-  "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION}"
-  MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_SQL)
-file(READ
-  "${MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION}"
-  MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_SQL)
-file(READ
-  "${MANYFORGE_BOUNDED_HISTORY_MIGRATION}"
-  MANYFORGE_BOUNDED_HISTORY_MIGRATION_SQL)
-file(READ
-  "${MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION}"
-  MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_SQL)
-file(READ
-  "${MANYFORGE_INITIAL_SCENE_BASELINE_MIGRATION}"
-  MANYFORGE_INITIAL_SCENE_BASELINE_MIGRATION_SQL)
-string(
-  FIND
-  "${MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_SQL}"
-  ")mf_sces\""
-  MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_DELIMITER_COLLISION)
-if(NOT MANYFORGE_CANONICAL_EMPTY_SCENE_SCHEMA_DELIMITER_COLLISION EQUAL -1)
-  message(FATAL_ERROR
-    "canonical-empty scene schema collides with its generated-header "
-    "raw-string delimiter")
-endif()
-string(
-  FIND
-  "${MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_SQL}"
-  ")mf_sctm\""
-  MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_DELIMITER_COLLISION)
-if(NOT MANYFORGE_LOGICAL_SCENE_TRANSACTION_MIGRATION_DELIMITER_COLLISION EQUAL -1)
-  message(FATAL_ERROR
-    "logical-scene transaction migration collides with its generated-header "
-    "raw-string delimiter")
-endif()
-string(
-  FIND
-  "${MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_SQL}"
-  ")mf_nphm\""
-  MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_DELIMITER_COLLISION)
-if(NOT MANYFORGE_NATIVE_PROJECTION_HANDOFF_MIGRATION_DELIMITER_COLLISION EQUAL -1)
-  message(FATAL_ERROR
-    "native-projection handoff migration collides with its generated-header "
-    "raw-string delimiter")
-endif()
-string(
-  FIND
-  "${MANYFORGE_BOUNDED_HISTORY_MIGRATION_SQL}"
-  ")mf_bhm\""
-  MANYFORGE_BOUNDED_HISTORY_MIGRATION_DELIMITER_COLLISION)
-if(NOT MANYFORGE_BOUNDED_HISTORY_MIGRATION_DELIMITER_COLLISION EQUAL -1)
-  message(FATAL_ERROR
-    "bounded-history migration collides with its generated-header "
-    "raw-string delimiter")
-endif()
-string(
-  FIND
-  "${MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_SQL}"
-  ")mf_mim\""
-  MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_DELIMITER_COLLISION)
-if(NOT MANYFORGE_MAINTENANCE_INITIALIZATION_MIGRATION_DELIMITER_COLLISION EQUAL -1)
-  message(FATAL_ERROR
-    "maintenance-initialization migration collides with its generated-header "
-    "raw-string delimiter")
-endif()
-string(FIND "${MANYFORGE_INITIAL_SCENE_BASELINE_MIGRATION_SQL}"
-  ")mf_isbm\"" MANYFORGE_INITIAL_SCENE_BASELINE_DELIMITER_COLLISION)
-if(NOT MANYFORGE_INITIAL_SCENE_BASELINE_DELIMITER_COLLISION EQUAL -1)
-  message(FATAL_ERROR "initial-scene baseline migration collides with its raw-string delimiter")
-endif()
-configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_scene_schema.hpp.in"
-  "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_canonical_empty_scene_schema.hpp"
-  @ONLY)
 
 add_library(manyforge_scene_value_codec
   src/logical_scene_codec_internal.cpp)
@@ -233,21 +105,16 @@ add_library(manyforge_scene
   src/logical_scene_owner_transactions.cpp
   src/logical_scene_owner_adoption.cpp
   src/logical_scene_owner_claims.cpp
-  src/logical_scene_owner_health.cpp
-  src/sqlite_scene_lifecycle_internal.cpp)
+  src/logical_scene_owner_health.cpp)
 add_library(manyforge::scene ALIAS manyforge_scene)
 target_include_directories(manyforge_scene PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-target_include_directories(manyforge_scene PRIVATE
-  "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(manyforge_scene PUBLIC manyforge_core)
 target_link_libraries(manyforge_scene PRIVATE
-  SQLite::SQLite3
   manyforge::content_identity
   manyforge::deployment_admission
-  manyforge::scene_value_codec
-  manyforge::persistence)
+  manyforge::scene_value_codec)
 set_target_properties(manyforge_scene PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # The full host graph normally embeds Scene without its tests. This opt-in
@@ -338,21 +205,17 @@ if(BUILD_TESTING OR MANYFORGE_SCENE_BUILD_TESTS_IN_CONSUMER)
     manyforge_scene_test_canonical_empty_package)
   target_compile_definitions(test_canonical_empty_scene_owner PRIVATE
     MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_SCENE_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}"
-    MANYFORGE_SCENE_TEST_RESOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/resources"
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_SCENE_LITE6_FIXTURE_ROOT}"
     MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_SCENE_LITE6_SOURCE_ROOT}")
   target_include_directories(test_canonical_empty_scene_owner PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${CMAKE_CURRENT_BINARY_DIR}/generated"
     "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
     "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
   target_link_libraries(test_canonical_empty_scene_owner PRIVATE
     manyforge_scene
     manyforge::scene_value_codec
-    manyforge::persistence
     manyforge_deployment
     manyforge::deployment_admission
-    SQLite::SQLite3
     GTest::gtest_main)
   # The maintenance-history bound test runs 256 + 8 full maintenance cycles.
   gtest_discover_tests(test_canonical_empty_scene_owner

@@ -53,7 +53,9 @@ This input is true while the selected robot's contact bodies touch the selected 
 At every sample, ManyForge reads the current Active TCP and collision geometry. A Program may read this signal,
 but it does not store those live values or the contact result. Manual and timed Mock writes do not apply. See
 [Adding a component](ADDING_A_COMPONENT.md#geometric-contact-inputs) for every unavailable reason and the
-sample-age rule.
+sample-age rule. The same input may instead watch two selections (for example a carried object against a Scene
+object) and turn true only beyond a trip depth; a machine's input can follow such a check on Mock and Isaac
+while Real reads the device ([Mock inputs from geometry](ADDING_A_COMPONENT.md#mock-inputs-from-geometry)).
 
 **Changed outside.** For every output with read-back that isn't
 controller-owned, ManyForge holds the boolean signal
@@ -219,7 +221,11 @@ configured as interrupt rules and do not appear in `interrupt_state.*`:
   that goes silent ([Add an I/O device](ADDING_A_COMPONENT.md#add-an-io-device)). A fault while anything executes,
   or an unhealthy component after a Stop, latches the cell; the latch blocks
   Program runs, nodes, interrupt evaluation, manual motion and manual I/O
-  until every component is healthy and idle again, and clears by itself.
+  until every component is healthy and idle again, and clears by itself. A
+  fault while motion runs also stops every moving robot with its fault Stop
+  profile (**A component fault stopped motion**, `component_fault`), so a
+  move whose interrupt reads a failing I/O device stops even when the fault
+  pauses interrupt evaluation before its rule sees the lost input.
 
 ### Grasp lost as a Program event
 
@@ -279,9 +285,8 @@ to exercise the key-triggered global rule and recovery. Its Deployment rule
 `part_lost_guard` reads the writable key `part_lost`, with `on_trip: stop`,
 `after_stop: fail_node` and scope `{execution_groups: [carry]}`. Mock does not
 measure grasp loss, so start a Run, wait until `pick_retreat` is running,
-then in the **Program run** panel open **Advanced: runtime blackboard, stored
-values and audit**, choose `part_lost`, enter `true`, and click **Write
-current-run value**. This simulates the key value; it does not publish a
+then open the viewer's **Keys** panel, choose `part_lost`, enter `true`, and
+click **Write current-run value**. This simulates the key value; it does not publish a
 grasp-loss event, change the read-only `carried_object_lost.<target>` signal,
 or qualify the measured-loss detector.
 
@@ -307,6 +312,9 @@ boolean `value: true`, the application start identity the run belongs to
 and a `source_label`. The reply comes when the write is accepted
 (`manyforge.program_command_reply.v1`, the command's row); whether it was
 applied is the row's `end` in `runner_commands` of `GET /api/cycle/status`.
+`GET /api/program/runs/{program_run_id}/blackboard-values?application_start_id=<id>`
+reads the run's current key values, as the viewer's **Keys** panel shows
+them.
 
 **Isaac measured-loss example:**
 [`examples/sim_ur10e_grasp_lost_recovery.scenario`](../../examples/sim_ur10e_grasp_lost_recovery.scenario)
@@ -344,7 +352,7 @@ during the current Run.
 | (a) Keep moving; only raise a signal or key for the tree or another rule to catch | `on_grasp_lost: {stop_motion: false, raise_alarm: false, set_key: <key>}`, or a global rule with `on_trip: notify` |
 | (b) Stop, then the node succeeds | Move until signal / Probe search with `on_signal: success` |
 | (c) Stop, then the node fails and the tree's Fallback runs at once | `on_signal: failure`, a global rule with `on_trip: stop` and `after_stop: fail_node`, or `on_grasp_lost: {stop_motion: true}`, each with the node's default `recovery_policy` |
-| (d) Stop and hold the node for the operator | As (c), plus the node's `recovery_policy: {allow_intervention: true, max_retries: N}`: the Run holds with Retry from the stopped state (at most `N` times; `0` is unlimited), Continue (the node fails, then the Fallback runs) and Reset |
+| (d) Stop and hold the node for the operator | As (c), plus the node's `recovery_policy: {allow_intervention: true, max_retries: N}`: the Run holds with Retry from the stopped state (at most `N` times; `0` is unlimited), Continue (the node fails, then the Fallback runs) and the Program's Reset, which ends the run. See [Holding a failed node for the operator](#holding-a-failed-node-for-the-operator) |
 | (e) Stop and hold the run until the condition clears | A global rule with `on_trip: stop` and `after_stop: hold` (the default); the operator Resumes once the rule no longer holds |
 | (f) Stop the whole cell | A global `stop` rule with scope `everything`: every operation in the cell stops, like Stop all |
 
@@ -352,6 +360,145 @@ during the current Run.
 Stop, a lost source, or an operator Stop, Stop all, Halt or Cell Stop that
 also covers the robot keeps the operation held for the operator. A Stop requested through the public Stop API is always an
 operator Stop.
+
+### Holding a failed node for the operator
+
+A node's `recovery_policy` decides what its failure does. It is authored on
+the node in the Program tree, next to `params`:
+
+| Field | Meaning | When omitted |
+| --- | --- | --- |
+| `allow_intervention` | `true`: a failure of the node is held for the operator. `false`: the failure goes to the node's parent; a Fallback can catch it, and only a failure that no node catches ends the run | `false` |
+| `max_retries` | How many times the operator can Retry the node, 0 to 255; `0` is unlimited | `0` |
+| `intervention_stop_scope` | Which motion groups the held failure stops: `all` or `own_groups` (below) | `all` |
+
+When a failure is held, the whole Program tree pauses, and Program motion
+stops:
+
+- `all`: motion stops in every motion group.
+- `own_groups`: motion stops only in the held node's own motion groups. This
+  applies only while every active hold uses `own_groups`; as soon as one
+  active hold uses `all`, every group stops. A node that is in no named motion
+  group always stops every group.
+
+The operator then chooses one of:
+
+- **Retry**: the node runs again from the stopped state (at most
+  `max_retries` times).
+- **Continue**: the node fails, and its parent handles the failure (for
+  example, the Fallback runs).
+- **Reset**: the Program's general Reset. It ends the run; it is not an
+  action on the held node.
+
+Retry and Continue release the hold's motion groups: its own groups always;
+with `all`, also every group that no other active hold owns.
+
+```yaml
+recovery_policy:
+  allow_intervention: true
+  max_retries: 3
+  intervention_stop_scope: own_groups
+```
+
+### Asking the operator from the Program
+
+Two nodes let the Program itself involve the operator or stop motion groups.
+Both are in the **Recovery** category.
+
+**Ask operator** (`operator.request_choice`) shows a question and waits for
+the operator's answer.
+
+| Parameter | Meaning | When omitted |
+| --- | --- | --- |
+| `message` | The question shown to the operator | required |
+| `severity` | `info`, `warning` or `fault` | `info` |
+| `options` | 2 to 8 answers, each `{option_id, label, result}`. `option_id`: a lower-case letter, then lower-case letters, digits, `_`, `.`, `-`; at most 128 bytes; unique in the node. `label`: the text shown, not empty, at most 256 bytes. `result`: `success` or `failure`, the node's result for that answer | required |
+| `output_key` | A `string` blackboard key that receives the chosen `option_id` | no key written |
+| `hold_motion` | Motion groups to stop while the question is open: `[]` (none), `["all"]` (every group) or a list of the Program's execution group ids, without duplicates; `all` cannot be combined with other ids | `[]` |
+
+All parameters are fixed values; they cannot come from a key.
+
+What happens:
+
+- Only the node's own branch waits. The rest of the tree keeps running, and
+  several questions can be open at once.
+- With `hold_motion`, the groups stop when the node starts, exactly like the
+  operator's Stop of those groups. They stay stopped after the answer, until
+  the operator's **Run**.
+- The question has no time limit. It appears in the **Program run** panel
+  with the recovery offers and is answered there. Over the API, open
+  questions are listed in `operator_questions` of
+  `GET /api/program/runs/{program_run_id}/runtime-controls`; answer one with
+  `POST /api/cycle/recovery-actions`, giving the question's `offer_id` and
+  `offer_revision`, the chosen `option_id` as `action_id`, a fresh
+  `request_key` and a `source_label`. An answer to a question that is no
+  longer open is refused with `cycle_recovery_offer_stale`. Answering does
+  not move anything.
+- With an answer whose `result` is `success`, the node succeeds. With one
+  whose `result` is `failure`, the node fails with `operator_choice_failed`
+  ("The operator chose <label>"), and its parent handles the failure like any
+  other.
+- Reset or Stop all ends the question. Halt pauses the node like any other
+  node.
+- The question and the answer are recorded in the runtime-control events
+  (History).
+
+When `hold_motion` is `["all"]`, or names a group that contains the node
+itself, the Stop holds the node too: it completes only after the operator's
+Run, unless its `operator_stop_policy` is `continue` (see below).
+
+#### How a node behaves under a Stop: `operator_stop_policy`
+
+Every tree node can set `operator_stop_policy`:
+
+| Value | Meaning |
+| --- | --- |
+| `hold` | While a Stop holds the node's motion group (the operator's group Stop, Stop all, or a Program node's Stop), the node is not ticked: it waits where it is until the operator's Run or Resume of that group. For a composite or decorator, its whole subtree waits. |
+| `continue` | The node keeps being ticked under such a Stop. Its own motion is still held by the Stop; only the tree logic goes on. |
+| `inherit` (default) | A leaf uses `hold`. A composite or decorator uses its parent's policy; the root uses `continue`. |
+
+The motion itself stops in every case: the policy decides only whether the
+tree keeps working around it.
+
+The difference from [holding a failed node](#holding-a-failed-node-for-the-operator):
+that hold pauses the whole tree; Ask operator waits only in its own branch.
+
+Example: if the place move fails, ask the operator before going on.
+
+```yaml
+- node_id: fallback
+  instance_id: place_or_ask
+  parameters: {}
+  children:
+  - node_id: motion.move_to_pose
+    instance_id: place
+    parameters:
+      # ... the move's parameters
+  - node_id: operator.request_choice
+    instance_id: ask_place_failed
+    parameters:
+      message: Place failed. Clear the bin, then choose.
+      severity: warning
+      options:
+      - {option_id: continue, label: "Bin cleared, continue", result: success}
+      - {option_id: abort, label: Abort this cycle, result: failure}
+      output_key: cell.place_answer
+      hold_motion: [left_arm]
+```
+
+The operator sees the question while `left_arm` is stopped. With **Bin
+cleared, continue** the Fallback succeeds and `cell.place_answer` is
+`continue`; `left_arm` moves again after the operator's Run. With **Abort
+this cycle** the node fails with `operator_choice_failed`, so the Fallback
+fails and its parent handles that.
+
+**Stop motion groups** (`motion.stop_groups`) stops motion groups the same
+way as the operator's Stop. Its one parameter, `groups` (required, a fixed
+value), is `["all"]` or a list of at least one of the Program's execution
+group ids. The node succeeds once the Stop has completed. It fails with
+`motion_group_stop_failed` when the Stop of a node in those groups ended
+uncontained; Recover or Reset the cell. The groups stay stopped until the
+operator's **Run**.
 
 ### Interrupts are operational
 
@@ -443,6 +590,12 @@ values (they cannot come from a key):
 | `stop_mode` | This node's Stop mode: `spring_back_hold`, `soft_on_path`, `hard_deceleration` or `spring_back_fast`, using the robot's configured limits | required |
 | `activation_mode` | `require_inactive_at_arm` (the signal must be off when the move starts), `fresh_edge_after_arm` (only a new change after the start counts) or `trip_if_already_active` | `require_inactive_at_arm` (Probe search allows only this one) |
 
+The move itself follows the node's `motion_type`: `joint` (the default) or
+`linear`, where the tool moves on the straight line from where the move
+starts to the goal (see [Linear pose
+moves](../reference/ROBOPLAN_ADAPTER_NOTES.md#cartesian-paths)). The rule's
+parameters and results are the same for both.
+
 What happens:
 
 - The node's `stop_mode` selects its primary mode; it does not change the
@@ -473,7 +626,10 @@ What happens:
 search can take over a robot that is still running an earlier Program move,
 and can itself be taken over, like any other move. The robot keeps the
 earlier move until it switches to the new one, and each rule watches its own
-part:
+part. A `linear` move joins the moving robot only when its connection is
+proven to stay within the robot's joint limits and within the move's own
+`translation_tol_m` and `rotation_tol_rad` of its line; otherwise the robot
+stops first and the line starts from rest:
 
 - The earlier move's rule keeps watching until the robot switches, although
   its node has already ended as `preempted`. If it trips before the switch,
@@ -504,7 +660,10 @@ one Draft edit:
   intervention not allowed in the node's `recovery_policy`.
 - **Stop and ask the operator (Retry / Continue / Reset)**:
   `on_signal: failure`, with `recovery_policy.allow_intervention: true`. The
-  retry limit shown with it is `recovery_policy.max_retries`.
+  retry limit shown with it is `recovery_policy.max_retries`. Reset here is
+  the Program's general Reset, which ends the run; it is not an action on
+  the node. See
+  [Holding a failed node for the operator](#holding-a-failed-node-for-the-operator).
 
 Values that match none of these show as **Custom**. On the **Attach object**
 node the same dropdown sets `on_grasp_lost`:
@@ -672,7 +831,7 @@ name in the tree.
 
 | Value | Meaning |
 | --- | --- |
-| `none` | The node has no result yet in this Run |
+| `none` | The node has no result yet in this Run, or it is running a new attempt |
 | `completed` | The move finished |
 | `failed` | The move failed |
 | `preempted` | Another motion took over the robot during this move |
@@ -681,9 +840,21 @@ name in the tree.
 | `signal_trip` | Move until signal / Probe search only: the condition tripped |
 | `no_signal_trip` | Move until signal / Probe search only: the move ended without a trip |
 
+A Follow Cartesian path cannot take over a robot that is still moving (it
+starts at its first waypoint). Such a take-over is refused before anything is
+planned, stopped or sent: the running move continues, and the path's node
+fails with `cartesian_path_moving_takeover_refused` (key `failed`; its
+`preempted_result` does not apply, and there is no automatic retry). A
+lower-priority path is refused by priority first. Take over a moving robot
+with a pose move (`joint` or `linear`), or start the path once the robot is
+at rest.
+
 - The key is `none` when a Run starts and after Reset.
-- It changes only when the node ends. It keeps that value until the node
-  ends again; it is not cleared when the node starts again.
+- It is `none` again whenever the node starts a new attempt: when the tree
+  enters the node, at the operator's Retry, when a hold on the node is
+  released, and at an automatic retry.
+- It changes to the node's outcome when the node ends, and keeps that value
+  until the node starts again.
 
 ### `interrupt_state.<rule_id>`
 
@@ -714,12 +885,23 @@ One per global rule.
   `active_at_start`, which can change the key between `inactive` and the
   rule's current state.
 
+### `motion_group_state.<group>`
+
+One per motion group of the Program (every execution group a node names, and
+`all`). Values: `ready`, `running`, `stopping`, `held`, `mixed`, `faulted`,
+`unavailable`; they are the group's state in the Motion panel and are listed
+in [Blackboard keys](BLACKBOARD_KEYS.md#motion-group-state). The key is
+`unavailable` between Runs. Groups stopped by a failure pause or a Halt are
+`held`. A group that an **Ask operator** (`hold_motion`) or **Stop motion
+groups** node stops shows `stopping` and then `held`, like a group the
+operator stopped, until the operator's Run.
+
 ### Writing "not completed" correctly
 
-Before a node runs, its outcome is `none`. So
-`node_outcome.pick != completed` is already **true** before `pick` has run.
-If "not completed" should only count after the node ran, also exclude
-`none`:
+Before a node runs, and while it runs a new attempt, its outcome is `none`.
+So `node_outcome.pick != completed` is already **true** before `pick` has
+run, and again while `pick` runs once more. If "not completed" should only
+count after the node ended, also exclude `none`:
 
 ```yaml
 all:
@@ -727,7 +909,8 @@ all:
   - compare: {operand: {key: node_outcome.pick}, op: "!=", value: none}
 ```
 
-- Before `pick` runs: `none`, so the condition is false.
+- Before `pick` runs, and while it runs again: `none`, so the condition is
+  false.
 - After `pick` completes: `completed`, so the condition is false.
 - After `pick` fails, is preempted, and so on: the condition is true.
 
@@ -737,9 +920,10 @@ written.
 
 ### Reserved names
 
-`node_outcome` and `interrupt_state` belong to the system. A blackboard key,
-a key namespace or a Program parameter cannot be named `node_outcome` or
-`interrupt_state`, or start with `node_outcome.` or `interrupt_state.`. The
+`node_outcome`, `interrupt_state` and `motion_group_state` belong to the
+system. A blackboard key, a key namespace or a Program parameter cannot be
+named `node_outcome`, `interrupt_state` or `motion_group_state`, or start with
+`node_outcome.`, `interrupt_state.` or `motion_group_state.`. The
 editor refuses such a name when you create or rename it, and Program
 validation refuses it too.
 

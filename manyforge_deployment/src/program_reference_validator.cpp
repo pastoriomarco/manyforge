@@ -15,6 +15,7 @@
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 
+#include "activation_generated_tool_internal.hpp"
 #include "program_io_condition_compiler_internal.hpp"
 #include "program_reference_probe_internal.hpp"
 
@@ -73,8 +74,8 @@ public:
 
   std::vector<ProgramReferenceDiagnostic> run(const CanonicalValue &program) {
     if (!program.is_object() || !member(program, "api_version").is_string() ||
-        member(program, "api_version").as_string() != "manyforge.program.v3")
-      invalid("expected a structurally validated v3 Program");
+        member(program, "api_version").as_string() != "manyforge.program.v4")
+      invalid("expected a structurally validated v4 Program");
     program_ = &program;
     if (const auto *scene = program.find_object_member("scene")) {
       if (!scene->is_array())
@@ -291,6 +292,26 @@ private:
                   std::move(qualified_candidates));
   }
 
+  // A `spring_slider` row names a generated tool's spring slider (OD-371).
+  void spring_slider(const CanonicalValue &value,
+                     const ProgramReferenceLocation &location) {
+    const auto *component = value.is_object() ? value.find_object_member("component_id") : nullptr;
+    const auto *element = value.is_object() ? value.find_object_member("element_id") : nullptr;
+    if (!component || !element || !component->is_string() || !element->is_string()) {
+      if (!draft_) invalid("spring_slider must name component_id and element_id");
+      return;
+    }
+    if (has_component(component->as_string()) &&
+        detail::generated_spring_slider(
+            qualified_program_component_type(
+                core::ControllableComponentId(component->as_string()), bundle_, source_),
+            element->as_string()))
+      return;
+    emit("collision_rule_spring_slider_unresolved", location,
+         {{"component_id", text(component->as_string())},
+          {"element_id", text(element->as_string())}});
+  }
+
   void condition(const CanonicalValue &value,
                  const ProgramReferenceLocation &location, std::size_t depth) {
     if (depth > 8U || !value.is_object() || value.as_object().size() != 1U)
@@ -418,45 +439,13 @@ private:
         }
       }
     }
-    if (const auto *policies = program.find_object_member("contact_policies")) {
-      if (!policies->is_array())
-        invalid("contact policies must be an array");
-      for (std::size_t i = 0; i < policies->as_array().size(); ++i) {
-        const auto *zones = policies->as_array()[i].find_object_member("zones");
-        if (!zones || !zones->is_array())
-          continue;
-        for (std::size_t j = 0; j < zones->as_array().size(); ++j) {
-          const auto *pairs =
-              zones->as_array()[j].find_object_member("body_pairs");
-          if (!pairs || !pairs->is_array())
-            continue;
-          for (std::size_t k = 0; k < pairs->as_array().size(); ++k) {
-            const auto &pair = pairs->as_array()[k];
-            for (const auto side : {"body_a", "body_b"}) {
-              const auto *selector = pair.find_object_member(side);
-              if (!selector || !selector->is_object())
-                continue;
-              const auto *kind = selector->find_object_member("kind");
-              if (!kind || !kind->is_string() ||
-                  kind->as_string() != "component_model_body")
-                continue;
-              reference(selector->find_object_member("body"),
-                        "collision_body_reference",
-                        {"/contact_policies/" + std::to_string(i) + "/zones/" +
-                             std::to_string(j) + "/body_pairs/" +
-                             std::to_string(k) + "/" + side + "/body",
-                         {},
-                         {}});
-            }
-          }
-        }
-      }
-    }
   }
 
+  // `mounted_component`: OD-372, the frame may also be a target frame of a
+  // component mounted on the target's robot that its kinematics places.
   void mounted_frame(const CanonicalValue &value,
                      const ProgramReferenceLocation &location,
-                     bool nested_frame = true) {
+                     bool nested_frame = true, bool mounted_component = false) {
     if (!map_ || !value.is_object())
       return;
     const auto *target = value.find_object_member("target");
@@ -484,22 +473,34 @@ private:
                           core::CommandTargetId(ti->as_string()));
     if (!target_resolution)
       invalid("missing exact retained target model map");
-    const bool selected_by_target = std::any_of(
-        target_resolution->frames.begin(), target_resolution->frames.end(),
-        [&](const auto &entry) {
-          const auto *resolved =
-              std::get_if<CompositionComponentModelFrame>(&entry.frame);
-          return resolved &&
-                 resolved->controllable_component_id.value() ==
-                     fc->as_string() &&
-                 resolved->model_instance_id == physical.model_instance_id &&
-                 resolved->model_revision == physical.model_revision &&
-                 resolved->compiled_frame_name == physical.compiled_frame_name;
-        });
-    if (!selected_by_target ||
-        !map_->kinematic_index().carries(
-            core::ControllableComponentId(tc->as_string()),
-            core::ControllableComponentId(fc->as_string()))) {
+    const auto lists_frame = [&](const CompositionTargetResolution &target) {
+      return std::any_of(
+          target.frames.begin(), target.frames.end(), [&](const auto &entry) {
+            const auto *resolved =
+                std::get_if<CompositionComponentModelFrame>(&entry.frame);
+            return resolved &&
+                   resolved->controllable_component_id.value() ==
+                       fc->as_string() &&
+                   resolved->model_instance_id == physical.model_instance_id &&
+                   resolved->model_revision == physical.model_revision &&
+                   resolved->compiled_frame_name == physical.compiled_frame_name;
+          });
+    };
+    const core::ControllableComponentId robot(tc->as_string());
+    const bool own = lists_frame(*target_resolution) &&
+                     map_->kinematic_index().carries(
+                         robot, core::ControllableComponentId(fc->as_string()));
+    const bool mounted =
+        mounted_component && fc->as_string() != tc->as_string() &&
+        map_->kinematic_index().places_mounted_frame(
+            robot, physical.compiled_frame_name) &&
+        std::any_of(map_->targets().begin(), map_->targets().end(),
+                    [&](const auto &target) {
+                      return target.controllable_component_id.value() ==
+                                 fc->as_string() &&
+                             lists_frame(target);
+                    });
+    if (!own && !mounted) {
       auto nested = location;
       if (nested_frame) nested.path += "/frame";
       emit("frame_not_mounted", nested,
@@ -510,8 +511,11 @@ private:
     }
   }
 
+  // `mounted_component`: OD-372, the body may also be a body of a component
+  // mounted on the target's robot.
   void target_body(const CanonicalValue &target, const CanonicalValue &body,
-                   const ProgramReferenceLocation &location) {
+                   const ProgramReferenceLocation &location,
+                   bool mounted_component = false) {
     if (!map_ || !target.is_object() || !body.is_object()) return;
     const auto *tc = target.find_object_member("component_id");
     const auto *ti = target.find_object_member("command_target_id");
@@ -528,16 +532,24 @@ private:
                                              core::CommandTargetId(ti->as_string()));
     if (!selected) invalid("missing exact retained target model map");
     const auto &physical = matches.front();
-    const bool provided = !physical.compiled_collision_body_names.empty() &&
-        std::any_of(selected->collision_bodies.begin(), selected->collision_bodies.end(),
-                    [&](const auto &candidate) {
-          return candidate.model_instance_id == physical.model_instance_id &&
-              std::all_of(physical.compiled_collision_body_names.begin(),
-                          physical.compiled_collision_body_names.end(), [&](const auto &name) {
-                return std::find(candidate.compiled_link_names.begin(), candidate.compiled_link_names.end(), name) !=
-                       candidate.compiled_link_names.end();
-              });
-        });
+    const auto provides = [&](const CompositionTargetResolution &target) {
+      return !physical.compiled_collision_body_names.empty() &&
+          std::any_of(target.collision_bodies.begin(), target.collision_bodies.end(),
+                      [&](const auto &candidate) {
+            return candidate.model_instance_id == physical.model_instance_id &&
+                std::all_of(physical.compiled_collision_body_names.begin(),
+                            physical.compiled_collision_body_names.end(), [&](const auto &name) {
+                  return std::find(candidate.compiled_link_names.begin(), candidate.compiled_link_names.end(), name) !=
+                         candidate.compiled_link_names.end();
+                });
+          });
+    };
+    const bool provided =
+        provides(*selected) ||
+        (mounted_component && bc->as_string() != tc->as_string() &&
+         std::any_of(map_->targets().begin(), map_->targets().end(), [&](const auto &target) {
+           return target.controllable_component_id.value() == bc->as_string() && provides(target);
+         }));
     if (!provided || !map_->kinematic_index().carries(
                          core::ControllableComponentId(tc->as_string()),
                          core::ControllableComponentId(bc->as_string())))
@@ -992,13 +1004,16 @@ private:
                              std::string("base_frame")}, false);
       }
     }
+    // OD-372: the attach node's carrier frame and touch bodies may belong to
+    // a component mounted on the target's robot.
+    const bool attach = node_id.as_string() == "scene.attach_carried_object";
     if (const auto *carrier = parameters.find_object_member("carrier_frame_ref")) {
       const auto *target = parameters.find_object_member("tool_target");
       if (!target) target = parameters.find_object_member("target");
       if (target) {
         const CanonicalValue pair(CanonicalValue::Object{{"target", *target}, {"frame", *carrier}});
         mounted_frame(pair, {path + "/parameters/carrier_frame_ref", instance.as_string(),
-                             std::string("carrier_frame_ref")}, false);
+                             std::string("carrier_frame_ref")}, false, attach);
       }
     }
     if (const auto *bodies = parameters.find_object_member("touch_bodies"); bodies && bodies->is_array()) {
@@ -1008,7 +1023,45 @@ private:
         for (std::size_t i = 0; i < bodies->as_array().size(); ++i)
           target_body(*target, bodies->as_array()[i],
                       {path + "/parameters/touch_bodies/" + std::to_string(i),
-                       instance.as_string(), std::string("touch_bodies")});
+                       instance.as_string(), std::string("touch_bodies")}, attach);
+    }
+    // The collision bodies that the node's collision rules select (a
+    // collision_body, the body role of an attached_object) and the spring
+    // sliders they switch on.
+    if (const auto *rules = parameters.find_object_member("collision_rules");
+        rules && rules->is_array()) {
+      for (std::size_t i = 0; i < rules->as_array().size(); ++i) {
+        const auto &row = rules->as_array()[i];
+        if (!row.is_object()) continue;
+        const std::string row_path =
+            path + "/parameters/collision_rules/" + std::to_string(i);
+        if (const auto *slider = row.find_object_member("spring_slider"))
+          spring_slider(*slider, {row_path + "/spring_slider", instance.as_string(),
+                                  std::string("collision_rules")});
+        for (const std::string_view side : {"a", "b"}) {
+          const auto *selections = row.find_object_member(side);
+          if (!selections || !selections->is_array()) continue;
+          for (std::size_t k = 0; k < selections->as_array().size(); ++k) {
+            const auto &selection = selections->as_array()[k];
+            const auto *kind =
+                selection.is_object() ? selection.find_object_member("kind") : nullptr;
+            if (!kind || !kind->is_string()) continue;
+            const ProgramReferenceLocation location{
+                row_path + "/" + std::string(side) + "/" + std::to_string(k),
+                instance.as_string(), std::string("collision_rules")};
+            if (kind->as_string() == "collision_body") {
+              reference(&selection, "collision_body_reference", location);
+            } else if (kind->as_string() == "attached_object") {
+              const auto *component = selection.find_object_member("component_id");
+              const auto *role = selection.find_object_member("collision_body_role_id");
+              if (!component || !role) continue;
+              const CanonicalValue body(CanonicalValue::Object{
+                  {"component_id", *component}, {"collision_body_id", *role}});
+              reference(&body, "collision_body_reference", location);
+            }
+          }
+        }
+      }
     }
     node_capabilities(found->second, parameters, path, instance.as_string());
     tcp_selectors(definitions, parameters, path, instance.as_string());

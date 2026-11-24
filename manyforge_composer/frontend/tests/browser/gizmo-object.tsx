@@ -13,7 +13,7 @@ function App() {
     scene_resource_id: 'test-box', collision_shapes: [{ type: 'box', dimensions_m: { x: 0.2, y: 0.2, z: 0.2 } }],
     placement: { kind: 'cell_fixed', cell_id: 'fixture', pose_in_cell: {
       position_m: { x: 0.123, y: 0.237, z: 0.344 }, orientation_xyzw: [0, 0, 0, 1],
-    } }, provider_evidence: null, support_contacts: [],
+    } }, provider_evidence: null,
   });
   return <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', height: '100vh' }}>
     <div ref={setInspector} />

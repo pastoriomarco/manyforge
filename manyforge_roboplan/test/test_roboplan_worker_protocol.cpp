@@ -117,27 +117,25 @@ TEST(RoboPlanWorkerProtocolTest,
               std::vector<double>{3.0}}},
           {RoboPlanWorkerGeometryDTO{
                "box-a", "cell-frame", BoxShapeDTO{{1.0, 2.0, 3.0}},
-               {{0.1, 0.2, 0.3}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt, std::nullopt},
+               {{0.1, 0.2, 0.3}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt},
            RoboPlanWorkerGeometryDTO{
                "sphere-a", "cell-frame", SphereShapeDTO{0.25},
-               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt,
-               std::nullopt},
+               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt},
            RoboPlanWorkerGeometryDTO{
                "cylinder-a", "cell-frame", CylinderShapeDTO{0.2, 0.7},
-               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt,
-               std::nullopt},
+               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt},
            RoboPlanWorkerGeometryDTO{
                "mesh-a", "cell-frame",
-               MeshShapeDTO{"asset://mesh-a", {1.0, 1.5, 2.0}},
+               MeshShapeDTO{"asset://mesh-a", {1.0, 1.5, 2.0}, std::string{}},
                {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}},
-               "/resources/mesh-a.stl", std::nullopt},
+               "/resources/mesh-a.stl"},
            RoboPlanWorkerGeometryDTO{
                "scene-mesh-a", "cell-frame",
-               MeshShapeDTO{"examples/x/meshes/a.obj", {1.0, 1.5, 1.15}},
-               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt,
-               std::string("sha256:"
-                           "2222222222222222222222222222222222222222222222222"
-                           "222222222222222")}},
+               MeshShapeDTO{"examples/x/meshes/a.obj", {1.0, 1.5, 1.15},
+                            std::string("sha256:"
+                                        "222222222222222222222222222222222"
+                                        "2222222222222222222222222222222")},
+               {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}, std::nullopt}},
           {{"body-a", "body-b"}, {"body-c", "body-d"}}},
       binding(), RoboPlanCandidateComputerConfig{
                      0x1234U, 4096U, 0.02, 0.0075, PlannerSearchDTO::kRrt,
@@ -169,10 +167,15 @@ TEST(RoboPlanWorkerProtocolTest,
             "asset://mesh-a");
   EXPECT_EQ(decoded.model.geometries[3].resolved_mesh_path,
             std::filesystem::path("/resources/mesh-a.stl"));
-  EXPECT_FALSE(decoded.model.geometries[3].scene_mesh_content_digest);
+  // The mesh shape round-trips with its captured content digest, the one
+  // carrier: empty for a model-local mesh, the digest for a scene mesh.
+  EXPECT_EQ(decoded.model.geometries[3].shape, input.model.geometries[3].shape);
+  EXPECT_TRUE(std::get<MeshShapeDTO>(decoded.model.geometries[3].shape)
+                  .content_digest.empty());
   EXPECT_FALSE(decoded.model.geometries[4].resolved_mesh_path);
-  EXPECT_EQ(decoded.model.geometries[4].scene_mesh_content_digest,
-            input.model.geometries[4].scene_mesh_content_digest);
+  EXPECT_EQ(decoded.model.geometries[4].shape, input.model.geometries[4].shape);
+  EXPECT_EQ(std::get<MeshShapeDTO>(decoded.model.geometries[4].shape)
+                .content_digest.size(), 71U);
   EXPECT_EQ(decoded.binding, input.binding);
   EXPECT_EQ(decoded.candidate_config.rng_seed,
             input.candidate_config.rng_seed);
@@ -240,6 +243,33 @@ TEST(RoboPlanWorkerProtocolTest,
   EXPECT_DOUBLE_EQ(decoded_ik.timeout_s, ik.timeout_s);
 }
 
+TEST(RoboPlanWorkerProtocolTest, PlanAndIkRequestsCarryTheOtherComponentsCoordinates) {
+  const RoboPlanOtherCoordinatesDTO other{{"peer_joint1", "peer_joint2", "finger"},
+                                          {-1.75, 0.61, 0.004}};
+  auto input = candidate_request();
+  EXPECT_EQ(decode_candidate_request(encode_candidate_request(input)).other_coordinates,
+            RoboPlanOtherCoordinatesDTO{});
+  input.other_coordinates = other;
+  EXPECT_EQ(decode_candidate_request(encode_candidate_request(input)).other_coordinates,
+            other);
+
+  WorkerIkRequestDTO ik{{{0.4, 0.5, 0.6}, {0.1, 0.2, 0.3, 0.9}},
+                        binding().permitted_frames[0],
+                        binding().permitted_frames[1],
+                        state(),
+                        2.75};
+  EXPECT_EQ(decode_ik_request(encode_ik_request(ik)).other_coordinates,
+            RoboPlanOtherCoordinatesDTO{});
+  ik.other_coordinates = other;
+  EXPECT_EQ(decode_ik_request(encode_ik_request(ik)).other_coordinates, other);
+
+  // Names and positions are one list.
+  input.other_coordinates.positions.pop_back();
+  EXPECT_ANY_THROW(static_cast<void>(encode_candidate_request(input)));
+  ik.other_coordinates.joint_names.pop_back();
+  EXPECT_ANY_THROW(static_cast<void>(encode_ik_request(ik)));
+}
+
 TEST(RoboPlanWorkerProtocolTest, CandidateRequestCarriesPerPairClearanceMargins) {
   auto input = candidate_request();
   input.collision_pair_margins = {
@@ -303,7 +333,7 @@ TEST(RoboPlanWorkerProtocolTest, PlanAndIkRequestsCarryContactAllowedPairs) {
 }
 
 TEST(RoboPlanWorkerProtocolTest, DiagnosticV13RoundTripsQualifiedTargetAndDeadline) {
-  EXPECT_EQ(kProtocolVersion, 14U);
+  EXPECT_EQ(kProtocolVersion, 17U);
   auto input = candidate_request();
   input.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
   input.diagnostic_qualified_target = state();
@@ -349,6 +379,37 @@ TEST(RoboPlanWorkerProtocolTest, CartesianDiagnosticNeedsDeadlineButNoJointTarge
   request.motion = ResolvedJointGoalDTO{request.resources, {"joint_a", "joint_b"}, {0.1, 0.2}};
   EXPECT_ANY_THROW(encode_candidate_request(request));
   request.diagnostic_deadline_ns.reset();
+  EXPECT_ANY_THROW(encode_candidate_request(request));
+}
+
+TEST(RoboPlanWorkerProtocolTest, PoseGoalRoundTripsItsMotionTypeAndLineSettings) {
+  auto request = candidate_request();
+  const Pose3DTO goal{{0.2, 0.3, 0.4}, {0.0, 0.0, 0.5, 0.5}};
+  request.motion = PoseGoalDTO{goal};
+  EXPECT_EQ(decode_candidate_request(encode_candidate_request(request)).motion,
+            request.motion);
+  LinearPoseMotionDTO linear;
+  linear.max_translation_step_m = 0.004;
+  linear.max_rotation_step_rad = 0.03;
+  linear.max_angular_speed_rad_s = 0.4;
+  linear.max_linear_acceleration_mps2 = 0.3;
+  linear.max_angular_acceleration_rad_s2 = 1.5;
+  for (const auto mode : {std::optional<CartesianSpeedModeDTO>{},
+                          std::optional{CartesianSpeedModeDTO::kTimeOptimal}}) {
+    linear.speed_mode = mode;
+    request.motion = PoseGoalDTO{goal, linear};
+    const auto decoded = decode_candidate_request(encode_candidate_request(request));
+    EXPECT_EQ(decoded.motion, request.motion);
+    ASSERT_TRUE(std::get<PoseGoalDTO>(decoded.motion).linear.has_value());
+  }
+  // A linear pose goal is planned as a Cartesian path: its diagnostic plan
+  // needs no qualified joint target.
+  request.collision_mode = PlannerCollisionMode::kDiagnosticDisabled;
+  request.diagnostic_deadline_ns = 123456789;
+  request.diagnostic_qualified_target.reset();
+  EXPECT_EQ(decode_candidate_request(encode_candidate_request(request)).motion,
+            request.motion);
+  request.motion = PoseGoalDTO{goal};
   EXPECT_ANY_THROW(encode_candidate_request(request));
 }
 

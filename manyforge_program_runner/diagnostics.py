@@ -131,3 +131,118 @@ class ProgramDiagnosticPublisher:
             # The one in-flight delivery ends by Headless's answer or by its
             # connection failing; no time limit decides it (OD-309).
             thread.join()
+
+
+class ProgramNodeAttemptPublisher:
+    """Deliver finished node-attempt facts to the Historian in batches (OD-375).
+
+    ``submit`` runs on a run's tick: it never waits. A full or closed queue
+    drops the newest facts and counts them; so does a failed delivery.
+    """
+
+    def __init__(self, send, application_start_id: str, *, capacity: int = 512, batch: int = 64) -> None:
+        self._send = send
+        self._application_start_id = application_start_id
+        self._capacity = capacity
+        self._batch = batch
+        self._pending = deque()
+        self._condition = Condition()
+        self._thread = None
+        self._closed = False
+        self._lost = 0
+        self._sent = 0
+        self._failed = False
+        self._notice_pending = False
+
+    def submit(self, facts) -> None:
+        with self._condition:
+            if self._closed or len(self._pending) >= self._capacity:
+                self._loss_locked(1)
+                return
+            self._pending.append(facts)
+            if self._thread is None:
+                thread = Thread(target=self._run, name="program-node-attempts", daemon=True)
+                try:
+                    thread.start()
+                except RuntimeError:
+                    self._pending.pop()
+                    self._loss_locked(1)
+                    return
+                self._thread = thread
+            self._condition.notify()
+
+    def _loss_locked(self, count: int) -> None:
+        self._lost = min(_MAX_COUNT, self._lost + count)
+        if not self._failed:
+            self._notice_pending = True
+        self._failed = True
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(lambda: self._pending or self._closed)
+                if not self._pending:
+                    return
+                attempts = [
+                    self._pending.popleft()
+                    for _ in range(min(self._batch, len(self._pending)))
+                ]
+                lost = self._lost
+            try:
+                result = self._send({
+                    "schema_version": "manyforge.program_node_attempt_batch.v1",
+                    "application_start_id": self._application_start_id,
+                    "attempts": attempts,
+                })
+                recorded = result.get("recorded")
+                if type(recorded) is not int or not 0 <= recorded <= len(attempts):
+                    raise RuntimeError("Historian rejected Program node attempts")
+            except Exception:
+                with self._condition:
+                    self._loss_locked(len(attempts))
+                    notice, self._notice_pending = self._notice_pending, False
+                if notice:
+                    _LOGGER.exception(
+                        "Program node-attempt delivery unavailable; history may be incomplete"
+                    )
+            else:
+                with self._condition:
+                    self._sent = min(_MAX_COUNT, self._sent + recorded)
+                    if recorded < len(attempts):
+                        self._loss_locked(len(attempts) - recorded)
+                    notice, self._notice_pending = self._notice_pending, False
+                    recovered = self._failed and lost == self._lost
+                    if recovered:
+                        self._failed = False
+                if notice:
+                    _LOGGER.error(
+                        "Program node-attempt delivery unavailable; history may be incomplete"
+                    )
+                if recovered:
+                    _LOGGER.info("Program node-attempt delivery recovered; prior gaps remain recorded")
+
+    def health(self) -> dict:
+        with self._condition:
+            return {
+                "schema_version": "manyforge.program_node_attempt_health.v1",
+                "delivery_failed": self._failed,
+                "lost_count": str(self._lost),
+                "enqueued_count": len(self._pending),
+                "sent_count": str(self._sent),
+                "capacity": self._capacity,
+                "closed": self._closed,
+            }
+
+    def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            # Do not let delivery extend execution-owner shutdown.
+            if self._pending:
+                self._loss_locked(len(self._pending))
+            self._pending.clear()
+            self._condition.notify_all()
+            thread = self._thread
+        if thread is not None:
+            # The one in-flight delivery ends by Headless's answer or by its
+            # connection failing; no time limit decides it (OD-309).
+            thread.join()

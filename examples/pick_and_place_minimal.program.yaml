@@ -1,16 +1,10 @@
-api_version: manyforge.program.v3
-program_id: pick_and_place_minimal
-program_revision: sha256:a0ef88c70239e2fd5263f4321ef5830c1e2960324917455164ae10765ac88b0e
+api_version: manyforge.program.v4
+program_revision: sha256:388e6f1a7f8845eda7fd8d6355a8811fcff560f904b7bedfe79190a76b5cf482
 program_profile: composable-cell-v1
-name: pick_and_place_minimal
-description: 'Minimal smoke Program for the ur5-simple-pick-place scenario: one target-scoped source-joint
-  move followed by removal of one declared scene resource.'
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
-  lanes:
-  - manyforge-only
   assistant: forbidden
   requires: []
   tags:

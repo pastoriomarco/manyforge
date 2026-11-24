@@ -81,6 +81,9 @@ template <typename Frame>
 [[nodiscard]] ReferenceIdentity frame_identity(const Frame &frame) {
   if constexpr (requires { frame.cell_id; })
     return {"cell_frame", frame.cell_id.value(), {}};
+  else if constexpr (requires { frame.frame_component_id; })
+    return {"component_frame", frame.frame_role_id.value(),
+            frame.frame_component_id.value_or(frame.controllable_component_id).value()};
   else if constexpr (requires { frame.controllable_component_id; })
     return {"component_frame", frame.frame_role_id.value(), frame.controllable_component_id.value()};
   else
@@ -536,12 +539,8 @@ public:
       }
     }
 
-    core::KinematicStatePathQueryDTO query{input_.retained_bundle_id,
-                                           input_.graph_revision,
-                                           path,
-                                           {},
-                                           input_.maximum_receiver_time_skew_ns,
-                                           {}};
+    core::KinematicStatePathQueryDTO query{
+        input_.retained_bundle_id, input_.graph_revision, path, {}, {}};
     for (const auto &[unused, expected] : configurations) {
       static_cast<void>(unused);
       query.expected_active_control_configurations.push_back(expected);
@@ -570,9 +569,9 @@ public:
 /// Each control binding is read at most once; every frame-path query and
 /// view built from this capture sees that same publication, so two frames of
 /// one robot (or a carrier and its robot) can never mix samples. Freshness is
-/// still validated per publication at the capture time by the view provider,
-/// and the retained receiver-time skew budget holds across every contributor
-/// of the capture, so independently fresh robots must also agree in time.
+/// validated per publication at the capture time by the view provider; the
+/// capture reads the current state of each source as it is, with no budget on
+/// how far apart in time different sources were received (OD-377).
 class RetainedSceneFrameResolver::StateCapture final
     : public core::IObservedStateProvider {
 public:
@@ -599,44 +598,10 @@ public:
 
   [[nodiscard]] std::int64_t at_ns() const noexcept { return at_ns_; }
 
-  /// Admits one reading received over [earliest_ns, latest_ns] into this
-  /// capture; refused when the capture would exceed the retained skew budget.
-  [[nodiscard]] core::Result<void>
-  AdmitReceived(const std::int64_t earliest_ns,
-                const std::int64_t latest_ns) const {
-    const std::int64_t earliest =
-        received_.has_value() ? std::min(received_->first, earliest_ns)
-                              : earliest_ns;
-    const std::int64_t latest =
-        received_.has_value() ? std::max(received_->second, latest_ns)
-                              : latest_ns;
-    if (latest - earliest > impl_->input_.maximum_receiver_time_skew_ns) {
-      return core::Result<void>::Err(core::ErrorDTO{
-          core::kErrorInvalidRequest,
-          "Observed-state sources of one coherent capture exceed the "
-          "retained coherence budget",
-          {{"reason", "kinematic_receiver_time_skew_exceeded"}}});
-    }
-    received_.emplace(earliest, latest);
-    return core::Result<void>::Ok();
-  }
-
-  /// Builds one frame-path view from this capture and admits its readings.
+  /// Builds one frame-path view from this capture.
   [[nodiscard]] core::Result<core::KinematicStatePathViewDTO>
   View(const core::KinematicStatePathQueryDTO &query) const {
-    auto view = views_->current_kinematic_state_path(query, at_ns_);
-    if (!view.ok() || !view.value().earliest_received_timestamp_ns.has_value() ||
-        !view.value().latest_received_timestamp_ns.has_value()) {
-      return view;
-    }
-    if (auto admitted =
-            AdmitReceived(*view.value().earliest_received_timestamp_ns,
-                          *view.value().latest_received_timestamp_ns);
-        !admitted.ok()) {
-      return core::Result<core::KinematicStatePathViewDTO>::Err(
-          admitted.error());
-    }
-    return view;
+    return views_->current_kinematic_state_path(query, at_ns_);
   }
 
   [[nodiscard]] core::Result<core::ObservedStateSnapshotDTO>
@@ -696,7 +661,6 @@ private:
   std::unique_ptr<core::ImmutableKinematicStateViewProvider> views_;
   mutable std::map<SourceKey, core::Result<core::ObservedStatePublicationDTO>>
       publications_;
-  mutable std::optional<std::pair<std::int64_t, std::int64_t>> received_;
 };
 
 std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
@@ -704,8 +668,7 @@ std::shared_ptr<RetainedSceneFrameResolver> RetainedSceneFrameResolver::create(
     RetainedSceneFrameResolverInput input) {
   if (!shared_model || input.retained_bundle_id.empty() ||
       input.graph_revision.empty() || input.cell_id.empty() ||
-      input.compiled_cell_frame_name.empty() || input.frame_paths.empty() ||
-      input.maximum_receiver_time_skew_ns < 0) {
+      input.compiled_cell_frame_name.empty() || input.frame_paths.empty()) {
     throw std::invalid_argument(
         "retained scene-frame resolver input is incomplete");
   }
@@ -899,16 +862,8 @@ RetainedSceneFrameResolver::capture_program_frame_resolution_context(
     core::KinematicStatePathViewDTO view;
   };
   std::vector<CapturedPath> captured_paths;
-  // Every requested frame path is read from one coherent capture, which also
-  // holds the selected start publication.
+  // Every requested frame path is read from one coherent capture.
   const auto state = StateCapture::Create(impl_, capture.captured_at_ns);
-  if (auto admitted = state->AdmitReceived(
-          capture.observed_start_publication.received_timestamp_ns,
-          capture.observed_start_publication.received_timestamp_ns);
-      !admitted.ok()) {
-    return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
-        admitted.error());
-  }
   // Finding a frame's retained path is about `owner`, the reference the
   // frame belongs to; reading its state is about the capture and names none.
   const auto capture_resolved_frame =
@@ -1826,12 +1781,21 @@ RetainedSceneFrameResolver::ResolveWithCandidateState(
         if constexpr (std::is_same_v<Selector, core::SceneFrameRefDTO>) {
           return core::Result<core::SceneFrameRefDTO>::Ok(selector);
         } else {
+          // OD-372: a frame of a component mounted on the target's robot is
+          // a target frame of that component (any of its targets naming one
+          // physical frame); the robot's kinematics must place it (below).
+          const auto &component = selector.frame_component_id.value_or(
+              selector.controllable_component_id);
+          const bool mounted = component != selector.controllable_component_id;
           const RetainedTargetSceneFrameInput *selected = nullptr;
           for (const auto &candidate : impl_->input_.target_frames) {
-            if (candidate.controllable_component_id !=
-                    selector.controllable_component_id ||
-                candidate.command_target_id != selector.command_target_id ||
+            if (candidate.controllable_component_id != component ||
+                (!mounted &&
+                 candidate.command_target_id != selector.command_target_id) ||
                 candidate.target_frame_role_id != selector.frame_role_id) {
+              continue;
+            }
+            if (selected != nullptr && selected->frame == candidate.frame) {
               continue;
             }
             if (selected != nullptr) {
@@ -1878,6 +1842,18 @@ RetainedSceneFrameResolver::ResolveWithCandidateState(
     return resolution_error<core::ResolvedSceneFramePoseDTO>(
         "scene_frame_reference_missing",
         "scene-frame reference has no retained compiler path", about());
+  }
+  if (const auto *carrier =
+          std::get_if<core::TargetCarrierSceneFrameRefDTO>(&selector);
+      carrier != nullptr && carrier->frame_component_id &&
+      *carrier->frame_component_id != carrier->controllable_component_id &&
+      !core::mounted_frame_placed_by(*path, carrier->controllable_component_id)) {
+    return resolution_error<core::ResolvedSceneFramePoseDTO>(
+        "frame_not_mounted",
+        "carrier frame is not placed by the target robot's kinematics: its "
+        "component is not mounted on the robot, or the frame is on a moving "
+        "part of it",
+        about());
   }
   std::vector<core::ComponentAttachmentRevision> attachment_revisions;
   for (const auto &segment : path->segments) {

@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -13,8 +13,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [
       "robotiq_2f_140_gripper",
       "scene_authoring_tools"
@@ -233,20 +238,7 @@
               "mount_frame": "robotiq_2f_140_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "grasp_frame",
-              "touch_links": [
-                "left_inner_finger",
-                "left_inner_finger_pad",
-                "left_inner_knuckle",
-                "left_outer_finger",
-                "left_outer_knuckle",
-                "right_inner_finger",
-                "right_inner_finger_pad",
-                "right_inner_knuckle",
-                "right_outer_finger",
-                "right_outer_knuckle",
-                "robotiq_base_link"
-              ]
+              "tcp_frame": "grasp_frame"
             }
           ]
         },
@@ -381,9 +373,6 @@
       }
     }
   ],
-  "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack, set up as a Mock pick-and-place workcell. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to composer-assistant requests. The Mock cell_io device carries the cell signals: inputs part_present (pick-table part sensor, starts true), clamp_pressure_ok (drop-fixture clamp pressure switch, follows clamp_valve after 300 ms), touch_probe (fixture touch probe), start_button (operator start) and zone_occupied (area scanner); outputs clamp_valve, alarm_light and ready_light. The global rule zone_intrusion stops all motion while the area scanner reports the zone occupied.",
-  "name": "ur10e_robotiq_assistant_modes_scene_authoring",
   "policies": {
     "interrupt_rules": [
       {

@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_model_components": {
     "vision_model": "vision_model"
   },
@@ -16,8 +16,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [
       "vision_pose_inference"
     ],
@@ -60,18 +65,7 @@
               "mount_frame": "robotiq_2f_85_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "robotiq_85_base_link",
-              "touch_links": [
-                "robotiq_85_base_link",
-                "robotiq_85_left_finger_link",
-                "robotiq_85_left_finger_tip_link",
-                "robotiq_85_left_inner_knuckle_link",
-                "robotiq_85_left_knuckle_link",
-                "robotiq_85_right_finger_link",
-                "robotiq_85_right_finger_tip_link",
-                "robotiq_85_right_inner_knuckle_link",
-                "robotiq_85_right_knuckle_link"
-              ]
+              "tcp_frame": "robotiq_85_base_link"
             }
           ]
         },
@@ -220,8 +214,5 @@
       "target_settings": {}
     }
   ],
-  "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
-  "description": "Mock deployment for the vision-guided bin-pick example. It requires one connected viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
-  "name": "ur5_roboplan_local_vision_guided_pick",
   "policies": {}
 }

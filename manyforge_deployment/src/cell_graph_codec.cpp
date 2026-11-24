@@ -379,16 +379,31 @@ template <typename StrongType>
   for (std::size_t index = 0; index < array.size(); ++index) {
     const std::string item_path = index_path(path, index);
     const auto& object = require_object(array[index], item_path);
-    require_exact_fields(object, {"frame_role_id", "parent_link_name", "pose_in_parent_link"},
-                         item_path);
+    require_fields(object, {"frame_role_id", "parent_link_name", "pose_in_parent_link"},
+                   {"contact_body_role_ids"}, item_path);
     ModelCustomTcpDTO row{
         parse_identity<FrameRoleId>(require_member(object, "frame_role_id", item_path),
                                     child_path(item_path, "frame_role_id")),
         require_string(require_member(object, "parent_link_name", item_path),
                        child_path(item_path, "parent_link_name")),
         parse_placement_pose(require_member(object, "pose_in_parent_link", item_path),
-                             child_path(item_path, "pose_in_parent_link"))};
+                             child_path(item_path, "pose_in_parent_link")),
+        {}};
     if (row.parent_link_name.empty()) fail(item_path, "parent_link_name must be non-empty");
+    // The TCP's contact bodies: sorted, unique; an empty list is omitted.
+    if (const auto* bodies = find_member(object, "contact_body_role_ids")) {
+      const std::string bodies_path = child_path(item_path, "contact_body_role_ids");
+      const auto& roles = require_array(*bodies, bodies_path);
+      if (roles.empty()) fail(bodies_path, "an empty contact_body_role_ids list is omitted");
+      for (std::size_t body = 0; body < roles.size(); ++body) {
+        auto role = parse_identity<core::CollisionBodyRoleId>(roles[body],
+                                                              index_path(bodies_path, body));
+        if (!row.contact_body_role_ids.empty() && !(row.contact_body_role_ids.back() < role)) {
+          fail(bodies_path, "contact bodies must be uniquely sorted");
+        }
+        row.contact_body_role_ids.push_back(std::move(role));
+      }
+    }
     if (!result.empty() && !(result.back().frame_role_id < row.frame_role_id)) {
       fail(path, "custom TCPs must be uniquely sorted by frame_role_id");
     }
@@ -1055,10 +1070,19 @@ template <typename StrongType>
     CanonicalValue::Array rows;
     rows.reserve(record.custom_tcps.size());
     for (const auto& custom : record.custom_tcps) {
-      rows.emplace_back(CanonicalValue::Object{
+      CanonicalValue::Object row{
           {"frame_role_id", identity_value(custom.frame_role_id)},
           {"parent_link_name", CanonicalValue(custom.parent_link_name)},
-          {"pose_in_parent_link", placement_pose_value(custom.pose_in_parent_link)}});
+          {"pose_in_parent_link", placement_pose_value(custom.pose_in_parent_link)}};
+      if (!custom.contact_body_role_ids.empty()) {
+        CanonicalValue::Array bodies;
+        bodies.reserve(custom.contact_body_role_ids.size());
+        for (const auto& role : custom.contact_body_role_ids) {
+          bodies.push_back(identity_value(role));
+        }
+        row.emplace_back("contact_body_role_ids", CanonicalValue(std::move(bodies)));
+      }
+      rows.emplace_back(std::move(row));
     }
     object.emplace_back("custom_tcps", CanonicalValue(std::move(rows)));
   }

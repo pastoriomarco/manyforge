@@ -115,3 +115,12 @@ states and clears by itself once every component is healthy and idle; Recover
 the faulted components to get there. While latched, runs, nodes, manual
 motion and manual I/O are blocked; component actions, Apply, New and Load are
 not. A global rule trip is an operational stop: never a fault, never a latch.
+
+When a component faults while motion runs (a robot, a tool or an I/O
+device, e.g. an I/O bank whose stream stops), every moving robot stops with
+its fault Stop profile, as for a runtime collision, and the cell latches. The
+stopped move ends with **A component fault stopped motion**
+(`component_fault`, naming the component) and is handled like a runtime
+monitor Stop: its node fails, or holds for the operator when its recovery
+policy allows intervention; it never continues by itself. Recover the
+component first.

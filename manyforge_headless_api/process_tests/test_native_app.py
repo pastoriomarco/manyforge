@@ -114,8 +114,6 @@ def _start_manager(root: Path) -> subprocess.Popen[bytes]:
             str(execution_state_root),
             "--execution-run-root",
             str(execution_run_root),
-            "--logical-scene-database",
-            str(root / "logical-scene.sqlite3"),
             "--application-processes",
             str(application_processes),
             "--reconciliation-period-ms",

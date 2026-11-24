@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [
       {
@@ -39,20 +39,16 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "lite6",
       "r5-live-trial"
     ]
   },
-  "description": "Mock Lite6 automatic motion retry after a planning (IK) failure. The goal key starts unreachable; after 1.5 s a parallel branch writes a reachable goal, and a later automatic attempt (automatic_retries 3, delay 1.0 s) re-reads it and succeeds.",
   "forest": [
     {
       "children": [
@@ -247,10 +243,8 @@
       "parameters": {}
     }
   ],
-  "name": "mock_lite6_motion_retry",
   "parameters": [],
   "positions": {},
-  "program_id": "mock_lite6_motion_retry",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

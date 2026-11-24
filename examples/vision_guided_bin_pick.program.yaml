@@ -1,4 +1,4 @@
-api_version: manyforge.program.v3
+api_version: manyforge.program.v4
 blackboard:
   keys:
   - access: read_write
@@ -90,11 +90,6 @@ blackboard:
     key: pick_place.place_right_part
     persistence: run
     type: pick_planning_result
-  - access: read_write
-    description: Operation-scoped selected-object binding for contact policy resolution.
-    key: selected_object
-    persistence: run
-    type: scene_resource
   namespaces:
   - namespace_id: perception
     owner: program
@@ -102,45 +97,17 @@ blackboard:
     owner: program
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
   assistant: required
-  lanes:
-  - manyforge-only
   requires:
   - vision_pose_inference
   tags:
   - bin-pick
   - ur5
   - vision-pick
-contact_policies:
-- api_version: manyforge.contact_policy.v1
-  default_unmatched_response: hard_stop
-  mode: contact_grasp
-  policy_id: selected_object_grasp
-  sensing_mode: geometry_only
-  version: sha256:cdd5cd17bdd43f72582cbc09806d1ebbe2e658b8ad896b3ce040e5a842a79977
-  zones:
-  - body_pairs:
-    - body_a:
-        kind: component_model_body
-        body:
-          component_id: robotiq_2f_85
-          collision_body_id: gripper_collision
-      body_b:
-        kind: runtime_object
-        runtime_object_id: selected_object
-    max_penetration_m: 0.002
-    terminal_window_start_fraction: 0.8
-    violation_response: hard_stop
-    zone_id: tool_contact
-description: Vision-guided pick-and-place Program. A bounded model request selects one of two declared
-  scene resources, an ordered fallback chooses the matching branch, and visible ordinary Pick/Place subtrees
-  plan and execute the selected operation through the same motion, gripper, and Scene nodes used elsewhere.
-name: vision_guided_bin_pick
-program_id: vision_guided_bin_pick
 program_profile: composable-cell-v1
-program_revision: sha256:2d99d16828a772ce31d46a8108999c4f5f19d7945781b1622c55f5c901bf9e92
+program_revision: sha256:064a5c3d85b0357178549d301b7d233384245239cb04ccb0ff4904573f732dae
 scene:
 - pose:
     frame_ref:
@@ -262,7 +229,19 @@ tree:
             carrier_frame_ref:
               component_id: robotiq_2f_85
               frame_id: tcp
-            contact_policy_id: selected_object_grasp
+            collision_rules:
+            - a:
+              - collision_body_id: gripper_collision
+                component_id: robotiq_2f_85
+                kind: collision_body
+              b:
+              - kind: scene_object
+                scene_resource_id: left_part
+              contact:
+                end_from_fraction: 0.8
+                max_penetration_m: 0.002
+              leg: descend
+              rule_id: selected_object_grasp
             motion_options:
               approach_velocity_scale: 0.4
               descend_velocity_scale: 0.4
@@ -346,7 +325,19 @@ tree:
             base_frame:
               component_id: ur5_robot
               frame_id: base
-            contact_policy_id: selected_object_grasp
+            collision_rules:
+            - a:
+              - collision_body_id: gripper_collision
+                component_id: robotiq_2f_85
+                kind: collision_body
+              b:
+              - blackboard_key: pick_place.pick_left_part
+                field: selected_object_id
+                kind: scene_object
+              contact:
+                end_from_fraction: 0.8
+                max_penetration_m: 0.002
+              rule_id: selected_object_grasp
             target:
               component_id: ur5_robot
               command_target_id: arm
@@ -355,10 +346,6 @@ tree:
             velocity_scale: 0.4
           children: []
           value_sources:
-            contact_scene_resource_id:
-              field: selected_object_id
-              kind: blackboard_field
-              reference: pick_place.pick_left_part
             path:
               field: descend_path
               kind: blackboard_field
@@ -568,7 +555,19 @@ tree:
             carrier_frame_ref:
               component_id: robotiq_2f_85
               frame_id: tcp
-            contact_policy_id: selected_object_grasp
+            collision_rules:
+            - a:
+              - collision_body_id: gripper_collision
+                component_id: robotiq_2f_85
+                kind: collision_body
+              b:
+              - kind: scene_object
+                scene_resource_id: right_part
+              contact:
+                end_from_fraction: 0.8
+                max_penetration_m: 0.002
+              leg: descend
+              rule_id: selected_object_grasp
             motion_options:
               approach_velocity_scale: 0.4
               descend_velocity_scale: 0.4
@@ -652,7 +651,19 @@ tree:
             base_frame:
               component_id: ur5_robot
               frame_id: base
-            contact_policy_id: selected_object_grasp
+            collision_rules:
+            - a:
+              - collision_body_id: gripper_collision
+                component_id: robotiq_2f_85
+                kind: collision_body
+              b:
+              - blackboard_key: pick_place.pick_right_part
+                field: selected_object_id
+                kind: scene_object
+              contact:
+                end_from_fraction: 0.8
+                max_penetration_m: 0.002
+              rule_id: selected_object_grasp
             target:
               component_id: ur5_robot
               command_target_id: arm
@@ -661,10 +672,6 @@ tree:
             velocity_scale: 0.4
           children: []
           value_sources:
-            contact_scene_resource_id:
-              field: selected_object_id
-              kind: blackboard_field
-              reference: pick_place.pick_right_part
             path:
               field: descend_path
               kind: blackboard_field

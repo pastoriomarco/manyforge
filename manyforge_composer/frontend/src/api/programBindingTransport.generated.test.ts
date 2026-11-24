@@ -3,30 +3,30 @@ import nativeFixture from '../../../../manyforge_deployment/resources/program_bi
 import { parseProgramBindingTransport, ProgramBindingTransportError } from './programBindingTransport.generated';
 
 it('refuses an old Program Binding without repairing it', () => {
-  const document = { ...structuredClone(nativeFixture), api_version: 'manyforge.program_binding.v2' };
+  const document = { ...structuredClone(nativeFixture), api_version: 'manyforge.program_binding.v3' };
   const before = structuredClone(document);
   expect(() => parseProgramBindingTransport(document, 'binding')).toThrow(ProgramBindingTransportError);
   expect(document).toEqual(before);
 });
 
-it('requires the genuine native v3 Binding fixture for the cumulative gate', () => {
-  expect(nativeFixture.api_version, 'native v3 Binding fixture and legacy corpus migration are required')
-    .toBe('manyforge.program_binding.v3');
+it('requires the genuine native v4 Binding fixture for the cumulative gate', () => {
+  expect(nativeFixture.api_version, 'native v4 Binding fixture and legacy corpus migration are required')
+    .toBe('manyforge.program_binding.v4');
 });
 
 type Row = Record<string, unknown>;
 const row = (value: unknown): Row => value as Row;
 const rows = (value: unknown): Row[] => value as Row[];
 // Synthetic schema-only input. It is not a native artifact or a substitute
-// for the separately required genuine v3 native fixture above.
+// for the separately required genuine v4 native fixture above.
 const fixture = (): Row => {
   const digest = `sha256:${'a'.repeat(64)}`;
   const target = { component_id: 'robot', command_target_id: 'arm' };
   const frame = { component_id: 'robot', frame_id: 'tcp' };
   const body = { component_id: 'robot', collision_body_id: 'finger' };
   return {
-    api_version: 'manyforge.program_binding.v3', program_binding_id: digest,
-    program_id: 'program', program_revision: digest, retained_bundle_id: digest,
+    api_version: 'manyforge.program_binding.v4', program_binding_id: digest,
+    program_revision: digest, retained_bundle_id: digest,
     graph_revision: digest,
     node_environment: { catalog_id: 'catalog', content_version: '1', catalog_digest: digest, environment_digest: digest },
     component_bindings: [{ component_id: 'robot', component_type_id: 'type', component_type_revision: digest,
@@ -42,10 +42,10 @@ const fixture = (): Row => {
     collision_body_bindings: [{ reference: structuredClone(body), model_instance_id: 'instance', model_revision: digest,
       compiled_collision_body_names: ['finger_collision'] }],
     signal_bindings: [], node_policies: [nodePolicy()],
-    contact_grasp_bindings: [{ contact_policy_id: 'fixture_contact', contact_policy_revision: digest,
-      runtime_object_id: 'fixture_object', allowed_body_bindings: [{ body: structuredClone(body), model_role_id: 'model',
-        model_instance_id: 'instance', model_revision: digest, collision_body_ids: ['component/robot/model/instance/body/finger/collision/0'] }],
-      max_penetration_m: 0.001, terminal_window_start_fraction: 0.8 }],
+    // The collision bodies that node collision rules select, with their generated body ids.
+    collision_rule_bodies: [{ body: structuredClone(body), model_role_id: 'model',
+      model_instance_id: 'instance', model_revision: digest,
+      collision_body_ids: ['component/robot/model/instance/body/finger/collision/0'] }],
     provenance: { binding_compiler_contract_digest: digest,
       source_records: [{ record_kind: 'model_asset', record_id: 'model', revision: digest }], resolved_output_records: [] },
   };
@@ -62,20 +62,19 @@ function nodePolicy(instance_id = 'root'): Row {
 function context(value: Row) {
   const component = rows(value.component_bindings)[0];
   const target = rows(value.target_bindings)[0];
-  const contact = rows(value.contact_grasp_bindings)[0];
   const resource = rows(target.resource_role_bindings)[0];
   const collision = rows(value.collision_body_bindings)[0];
   const capability = rows(target.capability_bindings)[0];
-  const body = rows(contact.allowed_body_bindings)[0];
+  const body = rows(value.collision_rule_bodies)[0];
   const provenance = rows(row(value.provenance).source_records);
   return {
-    component, target, contact, resource, collision, capability, body, provenance,
+    component, target, resource, collision, capability, body, provenance,
   };
 }
 
 function mutate(name: string, value: Row): void {
   const {
-    component, target, contact, resource, collision, capability, body, provenance,
+    component, target, resource, collision, capability, body, provenance,
   } = context(value);
   const policy = rows(value.node_policies)[0];
   const recovery = row(policy.recovery_policy);
@@ -84,10 +83,10 @@ function mutate(name: string, value: Row): void {
     owner[field] = [...values, structuredClone(values[0])];
   };
   switch (name) {
-    case 'null': value.program_id = null; break;
+    case 'null': component.component_type_id = null; break;
     case 'wrong-type': value.target_bindings = {}; break;
-    case 'identity': value.program_id = 'not portable'; break;
-    case 'identity-bytes': value.program_id = 'a'.repeat(129); break;
+    case 'identity': component.component_type_id = 'not portable'; break;
+    case 'identity-bytes': component.component_type_id = 'a'.repeat(129); break;
     case 'text-bytes': rows(value.frame_bindings)[0].compiled_frame_name = 'é'.repeat(2049); break;
     case 'invalid-unicode': rows(value.frame_bindings)[0].compiled_frame_name = '\ud800'; break;
     case 'root-minimum': value.component_bindings = []; break;
@@ -101,7 +100,6 @@ function mutate(name: string, value: Row): void {
     case 'resource-order': duplicate(target, 'resource_role_bindings'); break;
     case 'collision-order': duplicate(value, 'collision_body_bindings'); break;
     case 'capability-order': duplicate(target, 'capability_bindings'); break;
-    case 'contact-order': duplicate(value, 'contact_grasp_bindings'); break;
     case 'resource-size':
       resource.compiled_resource_names = [...resource.compiled_resource_names as string[], 'extra'];
       break;
@@ -122,11 +120,9 @@ function mutate(name: string, value: Row): void {
     case 'all-null-capability':
       capability.control_binding = null; capability.capability_provider_binding = null; break;
     case 'target-component': row(target.target).component_id = 'mismatch'; break;
-    case 'contact-penetration': contact.max_penetration_m = 0; break;
-    case 'contact-fraction': contact.terminal_window_start_fraction = 1.01; break;
-    case 'contact-nonfinite': contact.max_penetration_m = Number.NaN; break;
-    case 'body-minimum': contact.allowed_body_bindings = []; break;
-    case 'body-order': duplicate(contact, 'allowed_body_bindings'); break;
+    case 'body-minimum': body.collision_body_ids = []; break;
+    case 'body-order': duplicate(value, 'collision_rule_bodies'); break;
+    case 'removed-contact-bindings': value.contact_grasp_bindings = []; break;
     case 'generated-body-id': (body.collision_body_ids as string[])[0] = 'wrong'; break;
     case 'body-target': row(body.body).component_id = 'mismatch'; break;
     case 'body-collision': body.model_revision = `sha256:${'f'.repeat(64)}`; break;
@@ -179,11 +175,10 @@ const cases = [
   'invalid-unicode',
   'root-minimum', 'root-maximum', 'nested-maximum', 'provenance-maximum',
   'component-order', 'model-order', 'target-order', 'frame-order',
-  'resource-order', 'collision-order', 'capability-order', 'contact-order',
+  'resource-order', 'collision-order', 'capability-order',
   'resource-size', 'resource-id-duplicate', 'resource-name-duplicate',
   'collision-name-duplicate', 'all-null-capability', 'target-component',
-  'contact-penetration', 'contact-fraction', 'contact-nonfinite',
-  'body-minimum', 'body-order', 'generated-body-id', 'body-target',
+  'body-minimum', 'body-order', 'removed-contact-bindings', 'generated-body-id', 'body-target',
   'body-collision', 'body-model', 'provenance-kind', 'provenance-order',
   'node-policies-missing', 'node-policies-wrong-type', 'node-policy-null',
   'removed-modification-policy', 'removed-recovery-actions', 'removed-skills',
@@ -197,8 +192,8 @@ const cases = [
   'table-unsorted', 'table-bound', 'default-row',
 ];
 
-describe('generated Program Binding transport parser (synthetic v3 schema cases)', () => {
-  it.skipIf(nativeFixture.api_version !== 'manyforge.program_binding.v3')('returns the exact native fixture reference with concrete nested rows', () => {
+describe('generated Program Binding transport parser (synthetic v4 schema cases)', () => {
+  it.skipIf(nativeFixture.api_version !== 'manyforge.program_binding.v4')('returns the exact native fixture reference with concrete nested rows', () => {
     const document = structuredClone(nativeFixture) as Row;
     const parsed = parseProgramBindingTransport(document, 'binding');
     expect(parsed).toBe(document);
@@ -341,7 +336,6 @@ describe('generated Program Binding transport parser (synthetic v3 schema cases)
         unknown: true,
       };
     },
-    (value: Row) => { context(value).contact.unknown = true; },
     (value: Row) => { context(value).body.unknown = true; },
     (value: Row) => { row(value.provenance).unknown = true; },
     (value: Row) => { context(value).provenance[0].unknown = true; },
@@ -352,91 +346,53 @@ describe('generated Program Binding transport parser (synthetic v3 schema cases)
   });
 });
 
-describe('logical endpoint transport (synthetic v3 schema cases)', () => {
+describe('TCP contact bodies of a frame association (synthetic v4 schema cases)', () => {
   function endpointFixture(): Row {
     const value = fixture();
     const target = rows(value.target_bindings)[0];
     const association = rows(target.frame_associations)[0];
     association.contact_body_role_ids = ['finger'];
-    const policy = rows(value.contact_grasp_bindings)[0];
-    policy.bodies_from_motion_endpoint = true;
-    policy.allowed_body_bindings = [];
     return value;
   }
 
-  it('preserves the selected frame association and endpoint policy', () => {
+  it('preserves the contact bodies of the selected frame association', () => {
     const value = endpointFixture();
     expect(parseProgramBindingTransport(value, 'binding')).toBe(value);
   });
 
-  it.each(['missing_body', 'wrong_model', 'duplicate_body', 'false_selector', 'mixed_bodies'])('rejects %s', (fault) => {
+  it.each(['missing_body', 'wrong_model', 'duplicate_body'])('rejects %s', (fault) => {
     const value = endpointFixture();
     const target = rows(value.target_bindings)[0];
     const frame = rows(target.frame_associations)[0];
-    const policy = rows(value.contact_grasp_bindings)[0];
     if (fault === 'missing_body') frame.contact_body_role_ids = ['absent'];
     else if (fault === 'wrong_model') rows(value.frame_bindings)[0].model_revision = `sha256:${'f'.repeat(64)}`;
-    else if (fault === 'duplicate_body') {
+    else {
       const roles = frame.contact_body_role_ids as string[];
       frame.contact_body_role_ids = [...roles, ...roles];
-    } else if (fault === 'false_selector') policy.bodies_from_motion_endpoint = false;
-    else policy.allowed_body_bindings = rows(fixture().contact_grasp_bindings)[0].allowed_body_bindings;
+    }
     expect(() => parseProgramBindingTransport(value, 'binding')).toThrow();
   });
 });
 
-describe('contact release transport (synthetic v3 schema cases)', () => {
-  function releaseFixture(binary: boolean, endpoint = true): Row {
-    const value = fixture();
-    const policy = rows(value.contact_grasp_bindings)[0];
-    delete policy.max_penetration_m;
-    delete policy.terminal_window_start_fraction;
-    Object.assign(policy, {
-      mode: 'contact_release',
-      release_evidence_mode: binary ? 'binary_contact' : 'signed_penetration',
-      enforce_max_start_penetration: !binary,
-      max_start_penetration_m: binary ? 0 : 0.002,
-      min_release_progress_m: 0,
-      release_tolerance_m: binary ? 0 : 1e-5,
-      require_strictly_decreasing_penetration: !binary,
-      require_separation_by_end: true,
-      allow_recontact: false,
-    });
-    if (endpoint) {
-      policy.bodies_from_motion_endpoint = true;
-      policy.allowed_body_bindings = [];
-    }
-    return value;
-  }
-
-  it.each([
-    [false, false], [false, true], [true, false], [true, true],
-  ])('accepts normalized binary=%s endpoint=%s release without rewriting it', (binary, endpoint) => {
-    const value = releaseFixture(binary, endpoint);
-    expect(parseProgramBindingTransport(value, 'binding')).toBe(value);
+describe('collision rule bodies (synthetic v4 schema cases)', () => {
+  it('accepts an empty table and a body without a model role', () => {
+    const empty = fixture();
+    empty.collision_rule_bodies = [];
+    expect(parseProgramBindingTransport(empty, 'binding')).toBe(empty);
+    const roleless = fixture();
+    rows(roleless.collision_rule_bodies)[0].model_role_id = null;
+    expect(parseProgramBindingTransport(roleless, 'binding')).toBe(roleless);
   });
 
-  it.each([
-    'wrong_mode', 'missing_mode', 'unknown', 'grasp_field', 'missing_release_field',
-    'wrong_evidence', 'number_boolean', 'negative_metric', 'oversized_metric',
-    'nonfinite_metric', 'binary_enforce', 'binary_strict', 'binary_metric',
-  ])('rejects %s in a release binding', (fault) => {
-    const binary = fault.startsWith('binary_');
-    const value = releaseFixture(binary);
-    const policy = rows(value.contact_grasp_bindings)[0];
-    if (fault === 'wrong_mode') policy.mode = 'contact_grasp';
-    else if (fault === 'missing_mode') delete policy.mode;
-    else if (fault === 'unknown') policy.extra = true;
-    else if (fault === 'grasp_field') policy.max_penetration_m = 0.002;
-    else if (fault === 'missing_release_field') delete policy.require_separation_by_end;
-    else if (fault === 'wrong_evidence') policy.release_evidence_mode = 'distance';
-    else if (fault === 'number_boolean') policy.allow_recontact = 1;
-    else if (fault === 'negative_metric') policy.max_start_penetration_m = -0.001;
-    else if (fault === 'oversized_metric') policy.min_release_progress_m = 1000.001;
-    else if (fault === 'nonfinite_metric') policy.release_tolerance_m = Number.POSITIVE_INFINITY;
-    else if (fault === 'binary_enforce') policy.enforce_max_start_penetration = true;
-    else if (fault === 'binary_strict') policy.require_strictly_decreasing_penetration = true;
-    else policy.release_tolerance_m = 1e-5;
-    expect(() => parseProgramBindingTransport(value, 'binding')).toThrow();
+  it('requires the table', () => {
+    const value = fixture();
+    delete value.collision_rule_bodies;
+    expect(() => parseProgramBindingTransport(value, 'binding')).toThrow(/closed record/);
+  });
+
+  it.each(['wrong_type', 'null_row'])('rejects %s at its path', (fault) => {
+    const value = fixture();
+    value.collision_rule_bodies = fault === 'wrong_type' ? {} : [null];
+    expect(() => parseProgramBindingTransport(value, 'binding')).toThrow(/collision_rule_bodies/);
   });
 });

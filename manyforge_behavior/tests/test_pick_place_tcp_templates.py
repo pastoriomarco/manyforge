@@ -19,9 +19,7 @@ def _parameters(kind):
         "selected_object_id": "part",
         "tool_position": {"kind": "named_preset", "name": "closed"},
     }
-    if kind == "pick":
-        values["contact_policy_id"] = "pick.contact"
-    else:
+    if kind == "place":
         values["place_pose"] = {"position_m": [0, 0, 0], "orientation": {"xyzw": [0, 0, 0, 1]}}
     return values
 
@@ -90,3 +88,71 @@ def test_pick_attachment_forwards_selected_tool_frame_and_bodies():
     assert attach["parameters"]["target"] == parameters["tool_target"]
     assert attach["parameters"]["carrier_frame_ref"] == parameters["carrier_frame_ref"]
     assert attach["parameters"]["touch_bodies"] == [body]
+
+
+def _leg_rules():
+    return [
+        {"rule_id": "grasp", "leg": "descend",
+         "a": [{"kind": "active_tcp_contact_bodies"}],
+         "b": [{"kind": "scene_object", "scene_resource_id": "part"}],
+         "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8}},
+        {"rule_id": "lift", "leg": "retreat",
+         "a": [{"kind": "attached_object", "component_id": "tool"}],
+         "b": [{"kind": "scene_object", "scene_resource_id": "table"}],
+         "release": {"release_evidence_mode": "binary_contact"}},
+    ]
+
+
+@pytest.mark.parametrize("kind", ["pick", "place"])
+def test_template_puts_each_leg_rule_on_the_plan_and_on_its_move(kind):
+    parameters = _parameters(kind)
+    parameters["collision_rules"] = _leg_rules()
+    subtree = build_pick_place_subtree(
+        kind, instance_id=kind, parameters=parameters, value_sources={},
+        result_key="trial.result",
+        touch_bodies=[{"component_id": "tool", "collision_body_id": "fingers"}] if kind == "pick" else (),
+    )
+    children = {child["instance_id"].rsplit(".", 1)[-1]: child for child in subtree["children"]}
+    assert children["plan"]["parameters"]["collision_rules"] == _leg_rules()
+    assert "collision_rules" not in children["approach"]["parameters"]
+    without_leg = [
+        {name: value for name, value in row.items() if name != "leg"} for row in _leg_rules()
+    ]
+    assert children["descend"]["parameters"]["collision_rules"] == [without_leg[0]]
+    assert children["retreat"]["parameters"]["collision_rules"] == [without_leg[1]]
+    assert set(children["descend"]["value_sources"]) == {"path"}
+
+
+def test_pick_template_needs_no_collision_rule():
+    subtree = build_pick_place_subtree(
+        "pick", instance_id="pick", parameters=_parameters("pick"), value_sources={},
+        result_key="trial.result",
+        touch_bodies=[{"component_id": "tool", "collision_body_id": "fingers"}],
+    )
+    assert all("collision_rules" not in child["parameters"] for child in subtree["children"])
+
+
+@pytest.mark.parametrize("rules", [
+    [{"rule_id": "no_leg", "a": [{"kind": "scene_objects"}],
+      "b": [{"kind": "component", "component_id": "robot"}], "clearance_m": 0.01}],
+    [{"rule_id": "two_values", "leg": "descend", "clearance_m": 0.01, "contact": {}}],
+])
+def test_template_rejects_malformed_collision_rules(rules):
+    parameters = _parameters("pick")
+    parameters["collision_rules"] = rules
+    with pytest.raises(PickPlaceTemplateError, match="collision_rules"):
+        build_pick_place_subtree(
+            "pick", instance_id="pick", parameters=parameters, value_sources={},
+            result_key="trial.result",
+            touch_bodies=[{"component_id": "tool", "collision_body_id": "fingers"}],
+        )
+
+
+def test_template_rejects_dynamic_collision_rules():
+    with pytest.raises(PickPlaceTemplateError, match="selectors cannot be dynamic"):
+        build_pick_place_subtree(
+            "pick", instance_id="pick", parameters=_parameters("pick"),
+            value_sources={"collision_rules": {"kind": "blackboard_key", "reference": "rules"}},
+            result_key="trial.result",
+            touch_bodies=[{"component_id": "tool", "collision_body_id": "fingers"}],
+        )

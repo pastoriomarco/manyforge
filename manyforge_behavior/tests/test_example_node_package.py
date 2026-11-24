@@ -55,7 +55,7 @@ def _adapter(port, *, minimum=0.0, maximum=1.0):
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     program = Program.from_dict(document, environment.catalog)
     context = NodeAdapterBuildContext(

@@ -236,9 +236,9 @@ describe('Program parameter binding continuity', () => {
     };
     const selected = tree({ parameters: { target: { component_id: 'robot', command_target_id: 'arm' } } });
     const program: ProgramAuthoringDocument = {
-      api_version: 'manyforge.program.v3', program_id: 'semantic_test',
-      program_profile: 'composable-cell-v1', name: 'Semantic test',
-      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+      api_version: 'manyforge.program.v4',
+      program_profile: 'composable-cell-v1',
+      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
       blackboard: { namespaces: [], keys: [
         { key: 'selection', type: 'scene_selection_result', access: 'write', persistence: 'run' },
         { key: 'wrong_type', type: 'bool', access: 'write', persistence: 'run' },
@@ -262,11 +262,9 @@ describe('Program parameter binding continuity', () => {
       parameters: { on_grasp_lost: { raise_alarm: false, stop_motion: false, set_key: null, detach: true } },
     });
     const program: ProgramAuthoringDocument = {
-      api_version: 'manyforge.program.v3',
-      program_id: 'grasp_lost_test',
+      api_version: 'manyforge.program.v4',
       program_profile: 'composable-cell-v1',
-      name: 'Grasp lost test',
-      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
       blackboard: {
         namespaces: [],
         keys: [
@@ -303,10 +301,8 @@ describe('Program parameter binding continuity', () => {
       ],
     };
     const program = {
-      api_version: 'manyforge.program.v3',
-      program_id: 'bound_motion',
+      api_version: 'manyforge.program.v4',
       program_profile: 'composable-cell-v1',
-      name: 'Bound motion',
       catalog: {
         api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',
@@ -366,10 +362,8 @@ describe('Program parameter binding continuity', () => {
       parameters: [parameter('velocity_scale', 'number')],
     };
     const program = {
-      api_version: 'manyforge.program.v3',
-      program_id: 'renamed_motion',
+      api_version: 'manyforge.program.v4',
       program_profile: 'composable-cell-v1',
-      name: 'Renamed motion',
       catalog: {
         api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',
@@ -409,10 +403,8 @@ describe('Program parameter binding continuity', () => {
       translation_tol_m: 0.005,
     };
     const program = {
-      api_version: 'manyforge.program.v3',
-      program_id: 'joint_only_motion',
+      api_version: 'manyforge.program.v4',
       program_profile: 'composable-cell-v1',
-      name: 'Joint-only motion',
       catalog: {
         api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',

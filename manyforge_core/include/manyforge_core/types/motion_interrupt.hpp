@@ -705,7 +705,8 @@ struct MotionExecutionOutcomeDTO {
   std::uint64_t execution_id = 0;
   std::string move_id;
   std::optional<ActionSpanDTO> action_span;
-  std::string contact_policy_id;
+  /// The id of the move's contact or release rule when it has exactly one.
+  std::string collision_rule_id;
   MotionExecutionTerminalCause terminal_cause = MotionExecutionTerminalCause::kCompletedNormally;
   /// Present iff `terminal_cause == kSignalTrip`.
   std::optional<MotionTripOutcomeDTO> trip;

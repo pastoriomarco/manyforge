@@ -1,0 +1,54 @@
+{
+  "api_version": "manyforge.component_type.v1",
+  "attachment_interfaces": [
+    {
+      "accepts_tags": [
+        "articulated-arm"
+      ],
+      "attachment_interface_id": "mount",
+      "frame_role_id": "mount",
+      "max_attachments": 1,
+      "model_role_id": "tool_model"
+    }
+  ],
+  "command_targets": [
+    {
+      "capabilities": [],
+      "collision_body_roles": [
+        {
+          "asset_collision_body_role_id": "default_collision",
+          "collision_body_role_id": "default_collision",
+          "model_role_id": "tool_model"
+        }
+      ],
+      "command_target_id": "tool",
+      "default_tcp_frame_role_id": "tcp",
+      "frame_roles": [
+        {
+          "asset_frame_role_id": "tcp",
+          "frame_role_id": "tcp",
+          "model_role_id": "tool_model",
+          "tcp": true
+        }
+      ],
+      "model_group_roles": [],
+      "resource_roles": []
+    }
+  ],
+  "component_root": {
+    "frame_role_id": "mount",
+    "model_role_id": "tool_model"
+  },
+  "component_type_id": "tool.component",
+  "component_type_revision": "sha256:e7d1e8a8b287b0c4b2c43d9582ddca6ba0c4ef0723b24dba0f9d9dece9695ca0",
+  "model_mounts": [],
+  "model_roles": [
+    {
+      "cardinality": "exactly_one",
+      "model_role_id": "tool_model"
+    }
+  ],
+  "tags": [
+    "tool"
+  ]
+}

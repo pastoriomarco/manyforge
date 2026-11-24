@@ -16,10 +16,9 @@ COMMITTED = {"ok": True, "projection_status": "committed",
 class Core:
     """A mirror already showing the commit (OD-293)."""
 
-    def runtime_snapshot(self):
-        return {"sections": {"logical_scene": {
-            "available": True, "freshness": "fresh",
-            "payload": {"access": {"active_projection": PROJECTION}}}}}
+    def logical_scene_active_projection(self):
+        return PROJECTION
+
 
 
 class Manager:
@@ -27,7 +26,7 @@ class Manager:
         self.inside = False
         self.result = COMMITTED
 
-    def commit_scene_transaction(self, request, *, trusted_principal_id):
+    def commit_scene_transaction(self, request, *, trusted_principal_id, mesh_content_digest):
         self.inside = True
         try:
             return self.result
@@ -58,6 +57,7 @@ class Execution:
 def request(kind):
     operation = SimpleNamespace(kind=kind)
     return SimpleNamespace(operation=operation, program_node_evidence=None,
+                           request_context=SimpleNamespace(source_label="mcp"),
                            expected_admission_generation=None,
                            program_reset_scene_authorization=None)
 

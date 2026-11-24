@@ -24,11 +24,11 @@ ErrorCode error_code_from_dto(const ErrorDTO& error) {
   if (error.code == kErrorValidationCollision) {
     return ErrorCode::kValidationCollision;
   }
-  if (error.code == kErrorInvalidContactPolicy) {
-    return ErrorCode::kInvalidContactPolicy;
+  if (error.code == kErrorInvalidCollisionRule) {
+    return ErrorCode::kInvalidCollisionRule;
   }
-  if (error.code == kErrorContactPolicyViolation) {
-    return ErrorCode::kContactPolicyViolation;
+  if (error.code == kErrorContactRuleViolation) {
+    return ErrorCode::kContactRuleViolation;
   }
   if (error.code == kErrorValidationDeferred) {
     return ErrorCode::kValidationDeferred;

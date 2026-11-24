@@ -6,13 +6,16 @@
 
 namespace manyforge::core {
 
-/// Reconstruct one scene-owner-normalized immutable snapshot delta.
+/// Apply one scene-owner-resolved delta to its exact predecessor snapshot.
 ///
 /// This function is deliberately narrower than logical-scene authority. It
 /// accepts no public request, resolves no frame, mints no identity, and
-/// performs no native effect. Projection adapters use it to verify that the
-/// complete resolved operation and proposed revision received from the sole
-/// scene owner produce exactly one deterministic successor snapshot.
+/// performs no native effect. The owner validated and digested the successor
+/// once; this applies the owner's resolved delta and trusts its proposed
+/// revision and digest. It refuses only a delta that does not apply: a wrong
+/// predecessor, a non-advancing sequence, a changed bundle, graph or Scene, a
+/// missing object or attachment, a duplicate attachment, or inconsistent
+/// revision counters. It never validates or digests the whole snapshot.
 [[nodiscard]] Result<LogicalSceneSnapshotDTO> ApplyResolvedSceneTransaction(
     const LogicalSceneSnapshotDTO& current, const SceneTransactionDTO& transaction);
 

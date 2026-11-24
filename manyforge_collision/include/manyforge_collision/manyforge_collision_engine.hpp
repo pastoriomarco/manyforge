@@ -93,6 +93,16 @@ struct SelectedCollidingDistanceEvidence {
 
 }  // namespace detail
 
+/// True when frame `link_name` of `model` moves with none of
+/// `group_joint_names` (physical ancestry and mimic sources). A robot's own
+/// bodies are those that move with its group: its links, its tools and the
+/// objects attached to them. A robot considers only collision pairs with at
+/// least one own body (OD-359); this engine and the planner scene use this one
+/// test. An empty group or an absent frame counts as moving.
+[[nodiscard]] bool link_is_static_wrt_group(
+    const pinocchio::Model& model, const std::string& link_name,
+    const std::vector<std::string>& group_joint_names);
+
 /// ManyForge-owned scene-aware collision engine.
 ///
 /// The engine consumes immutable CollisionWorldSnapshot values through the
@@ -148,36 +158,27 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
 
   /// Parse URDF/SRDF and load immutable Pinocchio model assets once.
   ///
-  /// `scene_asset_root_fd` is the approved scene-asset root directory
-  /// descriptor. The model keeps its own duplicate for its lifetime. Relative
-  /// scene mesh URIs resolve only below it; without it they fail closed.
+  /// `scene_content_root_fd` is the activation root directory descriptor.
+  /// The model keeps its own duplicate for its lifetime. Scene triangle
+  /// meshes are read only from its raw-artifact store by their content digest
+  /// (geometry `source_hash`); without it they fail closed.
   static SharedModelPtr load_shared_model(
       const std::string& model_name,
       const std::filesystem::path& urdf_path,
       const std::filesystem::path& srdf_path,
       const std::vector<std::filesystem::path>& package_paths,
       std::string group_name,
-      std::optional<int> scene_asset_root_fd = std::nullopt);
+      std::optional<int> scene_content_root_fd = std::nullopt);
 
   /// The model `load_shared_model` returns for `group_name` over the same
   /// URDF/SRDF, without loading again: `loaded`'s kinematic and collision
-  /// models are copied (collision shapes stay shared), its scene-asset root
+  /// models are copied (collision shapes stay shared), its scene content root
   /// descriptor is duplicated, and the group's joints are resolved from the
-  /// exact URDF/SRDF text it was loaded from. Scene-mesh digests are pinned
-  /// per returned model, as for a fresh load.
+  /// exact URDF/SRDF text it was loaded from.
   static SharedModelPtr bind_shared_model_group(const SharedModelPtr& loaded,
                                                 const std::string& urdf_xml,
                                                 const std::string& srdf_xml,
                                                 std::string group_name);
-
-  /// Content digest (`sha256:<hex>`) of the bytes this model's collision
-  /// contexts use for one relative scene mesh URI. The first read of a URI
-  /// below the approved root, by a collision load or by this query, pins its
-  /// digest for the model's lifetime; every later collision load of that URI
-  /// must read identical bytes or fails with reason
-  /// `scene_mesh_content_changed`. Errors carry details["reason"].
-  [[nodiscard]] static core::Result<std::string> scene_mesh_content_digest(
-      const SharedModelPtr& shared_model, const std::string& relative_uri);
 
   /// Create an independently-owned revision cache over a shared model.
   static SharedSceneCachePtr make_shared_scene_cache(

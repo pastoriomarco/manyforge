@@ -12,7 +12,6 @@ namespace manyforge::roboplan_backend::detail {
 /// stated that the Apply succeeded. It grants no installation by itself.
 struct AppliedProgramOwnerSnapshot final {
   core::ActiveBundlePublicationGeneration publication_generation;
-  core::ProgramId program_id;
   core::ProgramRevision program_revision;
   core::ProgramBindingId program_binding_id;
 };

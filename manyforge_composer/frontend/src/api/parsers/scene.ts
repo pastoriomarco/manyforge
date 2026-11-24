@@ -592,7 +592,7 @@ function parseLogicalSceneObject(value: unknown, path: string): LogicalSceneObje
   const record = objectAt(value, path);
   allowedKeysAt(
     record,
-    ['collision_shapes', 'placement', 'provider_evidence', 'scene_resource_id', 'support_contacts'],
+    ['collision_shapes', 'placement', 'provider_evidence', 'scene_resource_id'],
     ['mass_kg'],
     path,
   );
@@ -637,8 +637,6 @@ function parseLogicalSceneObject(value: unknown, path: string): LogicalSceneObje
     provider_evidence: record.provider_evidence === null
       ? null
       : jsonRecordAt(record.provider_evidence, `${path}.provider_evidence`),
-    support_contacts: boundedArrayAt(record.support_contacts, `${path}.support_contacts`, 4096)
-      .map((item, index) => jsonRecordAt(item, `${path}.support_contacts[${index}]`)),
     ...(record.mass_kg === undefined
       ? {}
       : { mass_kg: positiveNumberAt(record.mass_kg, `${path}.mass_kg`) }),

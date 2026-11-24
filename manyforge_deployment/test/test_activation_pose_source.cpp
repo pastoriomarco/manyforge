@@ -113,11 +113,11 @@ Value Intent(Array components, Array links = {}, Array streams = {}) {
     policies.emplace_back("scene_pose_sources", Value(std::move(links)));
   if (!streams.empty())
     policies.emplace_back("component_streams", Value(std::move(streams)));
-  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v2")},
-                      {"deployment_artifact_id", Value("authored_pose")},
-                      {"name", Value("authored_pose")},
+  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v3")},
+      {"collision_rules",
+       Value(Array{Value(Object{{"clearance_m", Value(0.001)},
+                   {"rule_id", Value("everything")}})})},
                       {"compatibility", Value(Object{
-                          {"lane", Value("manyforge-only")},
                           {"provides", Value(Array{})},
                           {"tags", Value(Array{})}})},
                       {"attachments", Value(Array{})},

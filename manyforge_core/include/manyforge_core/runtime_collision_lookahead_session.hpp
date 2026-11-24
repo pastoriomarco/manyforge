@@ -217,21 +217,26 @@ class RuntimeCollisionLookaheadSession final {
     std::uint64_t execution_id{};
     std::uint64_t execution_generation{};
     std::shared_ptr<const TrajectoryDTO> trajectory;
-    std::string contact_policy_id;
     std::string active_cancel_reason;
     std::string pending_cancel_reason;
+    std::shared_ptr<const std::vector<BoundCellModelStateSource>> live_sources;
   };
 
+  /// `live_sources`: the other components of the cell, bound to the
+  /// trajectory's joint names. Every cycle places them where they are
+  /// observed at that moment in each checked sample.
   [[nodiscard]] static PreparedArm prepare_arm(
       std::uint64_t execution_id, std::uint64_t execution_generation,
-      std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id);
+      std::shared_ptr<const TrajectoryDTO> trajectory,
+      std::vector<BoundCellModelStateSource> live_sources = {});
   /// Only accepts the product of prepare_arm. The owning Kernel rechecks its
   /// source/Stop/scene fence before its CAS and publishes while holding the
   /// existing protection mutex, after backend adoption exposes new progress.
   void publish_prepared_arm(PreparedArm prepared) noexcept;
 
   void arm(std::uint64_t execution_id, std::uint64_t execution_generation,
-           std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id);
+           std::shared_ptr<const TrajectoryDTO> trajectory,
+           std::vector<BoundCellModelStateSource> live_sources = {});
   void disarm() noexcept;
 
   /// True only when this generation has no arm, queued/in-flight job, or
@@ -265,7 +270,7 @@ class RuntimeCollisionLookaheadSession final {
     std::uint64_t execution_generation = 0;
     std::uint64_t arm_generation = 0;
     std::shared_ptr<const TrajectoryDTO> trajectory;
-    std::string contact_policy_id;
+    std::shared_ptr<const std::vector<BoundCellModelStateSource>> live_sources;
   };
 
   struct Job {

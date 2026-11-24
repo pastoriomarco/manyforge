@@ -202,14 +202,10 @@ derive_cell_scoped_canonical_empty_deployment_impl(
   }
   const CanonicalValue empty_runtime_unit(std::move(empty_runtime_fields));
 
-  const std::string deployment_id =
-      first_deployment.deployment_artifact_id().value() + ".canonical_empty";
   CanonicalValue::Object root{
       {"api_version", CanonicalValue(std::string("manyforge.deployment.v1"))},
-      {"deployment_artifact_id", CanonicalValue(deployment_id)},
       {"deployment_revision", CanonicalValue(std::string(kPlaceholderDigest))},
       {"cell_id", CanonicalValue(first_deployment.cell_id().value())},
-      {"name", CanonicalValue(deployment_id)},
       {"catalogs",
        CanonicalValue(CanonicalValue::Object{
            {"records", CanonicalValue(std::move(selected_catalog_records))},
@@ -425,8 +421,7 @@ CanonicalEmptyRetainedBundleAdmission generate_ros_empty_package_impl(
   // An incompatible infrastructure change remains a pre-effect Apply refusal.
   const auto authored_deployment =
       ros2_control_execution_runtime_contract::empty_host_deployment(
-          cell_id, catalog_reference, "ros_workbench_bootstrap",
-          "ROS workbench infrastructure");
+          cell_id, catalog_reference);
   const auto deployment = compute_deployment_artifact_revision(
       parse_strict_json_model_yaml(canonical_json(authored_deployment)), profiles);
   const auto qualified = compile_fixed_deployment(deployment, profiles);

@@ -1944,7 +1944,7 @@ TEST(EventHistorian, TheSameNumberUnderTwoStartIdentitiesIsToldApart) {
 
 TEST(EventHistorian, AFormatSixFileIsListedAndNeverOpened) {
   TemporaryDirectory directory;
-  ASSERT_EQ(SqliteEventHistoryStore::DatabasePath(directory.path()).filename().string(), "history.v8.sqlite3");
+  ASSERT_EQ(SqliteEventHistoryStore::DatabasePath(directory.path()).filename().string(), "history.v9.sqlite3");
   const auto v6 = directory.path() / "history.v6.sqlite3";
   sqlite3 *database = nullptr;
   ASSERT_EQ(sqlite3_open(v6.c_str(), &database), SQLITE_OK);
@@ -1968,7 +1968,7 @@ TEST(EventHistorian, AFormatSixFileIsListedAndNeverOpened) {
   EXPECT_EQ(read(), before);
   EXPECT_FALSE(std::filesystem::exists(directory.path() / "history.v6.sqlite3-wal"));
   EXPECT_FALSE(std::filesystem::exists(directory.path() / "history.v6.sqlite3-shm"));
-  EXPECT_EQ(UserVersion(SqliteEventHistoryStore::DatabasePath(directory.path())), 8);
+  EXPECT_EQ(UserVersion(SqliteEventHistoryStore::DatabasePath(directory.path())), 9);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,24 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/tool`.
+# The generated tool family (OD-357): a Tool is one component, mounted as a
+# whole, made from its parameters (manyforge.parametric_tool.v1, kind: tool):
+# inline in the Deployment row's `model_source.parameters`, or a parameter
+# file the row references. Load generates its model and derives its
+# component type from the parameters: its tool ends (jaw pairs, spring
+# sliders, probe tips), TCPs, collision and contact bodies, and one gripper
+# target per jaw pair. This folder's model is a neutral placeholder.
+api_version: manyforge.component_package.v2
+kind: tool
+id: manyforge.tool
+version: 1.0.0
+title: Tool from parameters
+license: Apache-2.0
+model:
+  urdf: tool.urdf
+  srdf: tool.srdf
+  package_name: tool               # Load names each mesh by its content: package://tool/meshes/<digest>
+mount:
+  frame: tool_mount                # the root link, on the robot flange
+tcps:                              # the default TCP; Load takes the parameters' TCPs
+  - {id: tcp, frame: tool_tcp}
+lanes: {}                          # no controller on any lane: its components name no lane

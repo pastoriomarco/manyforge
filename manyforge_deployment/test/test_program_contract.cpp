@@ -37,7 +37,6 @@ namespace {
 using manyforge::core::CapabilityId;
 using manyforge::core::FrameRoleId;
 using manyforge::core::ProgramCapabilityDisposition;
-using manyforge::core::ProgramId;
 using manyforge::core::ProgramRevision;
 using manyforge::deployment::canonical_json;
 using manyforge::deployment::CanonicalValue;
@@ -55,17 +54,17 @@ using manyforge::deployment::test::materialize_lite6_retained_consumer_fixture;
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-TEST(ProgramContractFormatTest, RejectsV2BeforeNormalizationWithTypedVersions) {
-  const CanonicalValue v2(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.program.v2")}});
+TEST(ProgramContractFormatTest, RejectsV3BeforeNormalizationWithTypedVersions) {
+  const CanonicalValue v3(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.program.v3")}});
   try {
-    static_cast<void>(manyforge::deployment::normalize_program_authoring(v2));
-    FAIL() << "v2 format was accepted";
+    static_cast<void>(manyforge::deployment::normalize_program_authoring(v3));
+    FAIL() << "v3 format was accepted";
   } catch (const ProgramContractError &error) {
     EXPECT_EQ(error.code(), "program_format_unsupported");
     ASSERT_TRUE(error.unsupported_format().has_value());
-    EXPECT_EQ(error.unsupported_format()->actual_api_version, "manyforge.program.v2");
-    EXPECT_EQ(error.unsupported_format()->supported_api_version, "manyforge.program.v3");
+    EXPECT_EQ(error.unsupported_format()->actual_api_version, "manyforge.program.v3");
+    EXPECT_EQ(error.unsupported_format()->supported_api_version, "manyforge.program.v4");
   }
 }
 
@@ -128,8 +127,7 @@ make_bundle(const std::filesystem::path &root) {
     const auto bundle = source.get_verified(manyforge::core::RetainedBundleId(
         "sha256:" + entry.path().stem().string()));
     if (bundle != nullptr && bundle->value().cell_graph.cell_id == cell_id &&
-        bundle->value().deployment_artifact_id.value() ==
-            "lite6_lite_gripper_pick_and_place") {
+        !bundle->value().cell_graph.controllable_components.empty()) {
       if (selected != nullptr) {
         throw std::logic_error("maintained capture package has duplicate Lite6 motion bundles");
       }
@@ -256,7 +254,6 @@ TEST(ProgramContractTest,
   ASSERT_NE(contract, nullptr);
   EXPECT_EQ(contract->canonical_program_bytes(), bytes);
   EXPECT_EQ(contract->normalized_program_root(), program);
-  EXPECT_EQ(contract->value().program_id, ProgramId("contract_program"));
   EXPECT_EQ(contract->value().node_environment,
             bundle->value().catalogs.node_environment);
   EXPECT_TRUE(contract->value().target_requirements.empty());
@@ -307,13 +304,11 @@ TEST(ProgramContractTest,
 
   FilesystemProgramRepository reopened(root.path());
   const auto read =
-      reopened.get_verified(contract->value().program_id,
-                            contract->value().program_revision, *bundle);
+      reopened.get_verified(contract->value().program_revision, *bundle);
   ASSERT_NE(read, nullptr);
   EXPECT_EQ(read->value(), contract->value());
   EXPECT_EQ(read->canonical_program_bytes(), bytes);
-  EXPECT_EQ(reopened.get_verified(contract->value().program_id,
-                                  ProgramRevision(std::string(kZeroDigest)),
+  EXPECT_EQ(reopened.get_verified(ProgramRevision(std::string(kZeroDigest)),
                                   *bundle),
             nullptr);
 }
@@ -337,12 +332,10 @@ TEST(ProgramContractTest,
   const FilesystemVerifiedProgramSource source(procfd.path());
   manyforge::deployment::test::ScopedPathReplacement replacement(root.path());
   const auto read =
-      source.get_verified(contract->value().program_id,
-                          contract->value().program_revision, *bundle);
+      source.get_verified(contract->value().program_revision, *bundle);
   ASSERT_NE(read, nullptr);
   EXPECT_EQ(read->canonical_program_bytes(), bytes);
-  EXPECT_EQ(source.get_verified(contract->value().program_id,
-                                ProgramRevision(std::string(kZeroDigest)),
+  EXPECT_EQ(source.get_verified(ProgramRevision(std::string(kZeroDigest)),
                                 *bundle),
             nullptr);
   EXPECT_EQ(static_cast<std::size_t>(std::distance(
@@ -358,8 +351,7 @@ TEST(ProgramContractTest,
   ScopedTrustedRoot empty_root;
   manyforge::deployment::test::ScopedProcfdRoot empty_procfd(empty_root.path());
   const FilesystemVerifiedProgramSource empty_source(empty_procfd.path());
-  EXPECT_EQ(empty_source.get_verified(contract->value().program_id,
-                                      contract->value().program_revision,
+  EXPECT_EQ(empty_source.get_verified(contract->value().program_revision,
                                       *bundle),
             nullptr);
   EXPECT_FALSE(std::filesystem::exists(empty_root.path() / "programs"));
@@ -369,104 +361,8 @@ TEST(ProgramContractTest,
   manyforge::deployment::test::ScopedProcfdRoot unsafe_procfd(
       unsafe_root.path());
   const FilesystemVerifiedProgramSource unsafe_source(unsafe_procfd.path());
-  EXPECT_THROW(static_cast<void>(unsafe_source.get_verified(
-                   contract->value().program_id,
-                   contract->value().program_revision, *bundle)),
+  EXPECT_THROW(static_cast<void>(unsafe_source.get_verified(contract->value().program_revision, *bundle)),
                manyforge::deployment::RetainedBundleError);
-}
-
-TEST(ProgramContractTest,
-     ExtractsRevisionVerifiedPortableContactGraspTemplate) {
-  ScopedTrustedRoot root;
-  const auto bundle = make_bundle(root.path());
-  ProgramOptions options = valid_options(*bundle);
-  options.include_contact_grasp = true;
-  const auto contract = verify_fixture_program(
-      canonical_json(with_program_revision(make_program_root(options))),
-      *bundle, root.path());
-
-  ASSERT_EQ(contract->value().contact_grasp_templates.size(), 1U);
-  const auto &policy = contract->value().contact_grasp_templates.front();
-  EXPECT_FALSE(policy.bodies_from_motion_endpoint);
-  EXPECT_EQ(policy.contact_policy_id.value(), "selected_object_grasp");
-  EXPECT_EQ(policy.runtime_object_id.value(), "selected_object");
-  ASSERT_EQ(policy.allowed_body_selectors.size(), 1U);
-  EXPECT_EQ(policy.allowed_body_selectors.front().body.component_id.value(),
-            "lite6_arm");
-  EXPECT_EQ(
-      policy.allowed_body_selectors.front().body.collision_body_id.value(),
-      "arm_collision");
-  const auto &envelope = std::get<manyforge::core::ContactGraspEnvelopeDTO>(policy.envelope);
-  EXPECT_DOUBLE_EQ(envelope.max_penetration_m, 0.002);
-  EXPECT_DOUBLE_EQ(envelope.terminal_window_start_fraction, 0.8);
-}
-
-TEST(ProgramContractTest, MotionEndpointContactSelectorIsExclusiveAndHasNoIds) {
-  ScopedTrustedRoot root;
-  const auto bundle = make_bundle(root.path());
-  auto options = valid_options(*bundle);
-  options.include_contact_grasp = true;
-  const auto document = [&](CanonicalValue::Array pairs) {
-    auto policy =
-        manyforge::deployment::test::make_contact_grasp_policy().as_object();
-    for (auto &[name, value] : policy) {
-      if (name != "zones")
-        continue;
-      auto zones = value.as_array();
-      auto zone = zones.front().as_object();
-      replace_member(zone, "body_pairs", CanonicalValue(std::move(pairs)));
-      zones.front() = CanonicalValue(std::move(zone));
-      value = CanonicalValue(std::move(zones));
-    }
-    const auto revision = compute_content_identity(
-        CanonicalValue(policy),
-        ContentIdentitySpec{.identity_domain =
-                                "catalog-record-revision/contact_policy",
-                            .api_version = "manyforge.contact_policy.v1",
-                            .own_field = "version"});
-    replace_member(policy, "version", CanonicalValue(revision));
-    auto program = make_program_root(options).as_object();
-    replace_member(program, "contact_policies",
-                   CanonicalValue(CanonicalValue::Array{
-                       CanonicalValue(std::move(policy))}));
-    return canonical_json(
-        with_program_revision(CanonicalValue(std::move(program))));
-  };
-  const auto pair = [](CanonicalValue::Object robot) {
-    return CanonicalValue(CanonicalValue::Object{
-        {"body_a", CanonicalValue(std::move(robot))},
-        {"body_b",
-         CanonicalValue(CanonicalValue::Object{
-             {"kind", CanonicalValue("runtime_object")},
-             {"runtime_object_id", CanonicalValue("selected_object")}})}});
-  };
-  const auto endpoint = pair({{"kind", CanonicalValue("motion_endpoint")}});
-  const auto contract =
-      verify_fixture_program(document({endpoint}), *bundle, root.path());
-  ASSERT_EQ(contract->value().contact_grasp_templates.size(), 1U);
-  EXPECT_TRUE(contract->value()
-                  .contact_grasp_templates.front()
-                  .bodies_from_motion_endpoint);
-  EXPECT_TRUE(contract->value()
-                  .contact_grasp_templates.front()
-                  .allowed_body_selectors.empty());
-  EXPECT_THROW(
-      static_cast<void>(verify_fixture_program(
-          document(
-              {endpoint, pair({{"kind", CanonicalValue("component_model_body")},
-                               {"body", CanonicalValue(CanonicalValue::Object{
-                                   {"component_id", CanonicalValue("lite6_arm")},
-                                   {"collision_body_id", CanonicalValue("arm_collision")}})}})}),
-          *bundle, root.path())),
-      ProgramContractError);
-  EXPECT_THROW(
-      static_cast<void>(verify_fixture_program(
-          document({pair({{"kind", CanonicalValue("motion_endpoint")},
-                          {"body", CanonicalValue(CanonicalValue::Object{
-                              {"component_id", CanonicalValue("lite6_arm")},
-                              {"collision_body_id", CanonicalValue("arm_collision")}})}})}),
-          *bundle, root.path())),
-      ProgramContractError);
 }
 
 TEST(ProgramContractTest, ExtractsSparseCompleteNodePolicies) {
@@ -694,8 +590,13 @@ TEST(ProgramContractTest, RejectsStaleCompleteProgramRevision) {
       with_program_revision(make_program_root(valid_options(*bundle)))
           .as_object();
   for (auto &[name, value] : members) {
-    if (name == "name") {
-      value = CanonicalValue("Changed without a new revision");
+    if (name == "tree") {
+      value = CanonicalValue(CanonicalValue::Object{
+          {"node_id", CanonicalValue("sequence")},
+          {"instance_id", CanonicalValue("changed_without_new_revision")},
+          {"parameters", CanonicalValue(CanonicalValue::Object{})},
+          {"children", CanonicalValue(CanonicalValue::Array{})},
+      });
     }
   }
 
@@ -895,6 +796,157 @@ automatic_retry_program(const RetainedBundle &bundle,
   return with_tree(options, CanonicalValue(std::move(node)));
 }
 
+// A move with collision rules; `selected_object` is a declared scene_resource
+// key and `plan` a declared structured key.
+[[nodiscard]] std::string collision_rule_program(const RetainedBundle &bundle,
+                                                 const std::string &node_id,
+                                                 std::string_view rules_json,
+                                                 CanonicalValue::Object value_sources = {}) {
+  auto members = automatic_retry_program(
+                     bundle, node_id,
+                     {{"collision_rules", parse_strict_json_model_yaml(rules_json).root()}},
+                     std::move(value_sources))
+                     .as_object();
+  members.emplace_back(
+      "blackboard",
+      parse_strict_json_model_yaml(R"({"namespaces":[],"keys":[
+          {"key":"plan","type":"pick_planning_result","access":"read_write","persistence":"run",
+           "fields":[{"field":"selected_object_id","type":"string"}]},
+          {"key":"selected_object","type":"scene_resource","access":"read_write",
+           "persistence":"run"}]})").root());
+  return canonical_json(with_program_revision(CanonicalValue(std::move(members))));
+}
+
+TEST(ProgramContractTest, NodeCollisionRulesGiveTheirCollisionBodies) {
+  const auto bundle = maintained_motion_bundle();
+  const auto contract = verify_maintained_program(
+      collision_rule_program(*bundle, "motion.move_to_pose", R"([
+          {"rule_id":"everything_else","clearance_m":0.002},
+          {"rule_id":"arm_on_object",
+           "a":[{"kind":"collision_body","component_id":"lite6_robot",
+                 "collision_body_id":"arm_collision"}],
+           "b":[{"kind":"scene_object","blackboard_key":"selected_object"}],
+           "contact":{"max_penetration_m":0.002,"end_from_fraction":0.8}},
+          {"rule_id":"tip_off_planned_object",
+           "a":[{"kind":"active_tcp_contact_bodies"}],
+           "b":[{"kind":"scene_object","blackboard_key":"plan","field":"selected_object_id"}],
+           "release":{"release_evidence_mode":"binary_contact"}},
+          {"rule_id":"arm_near_everything",
+           "a":[{"kind":"component","component_id":"lite6_robot"},
+                {"kind":"attached_object","component_id":"lite6_robot"}],
+           "b":[{"kind":"scene_objects"},
+                {"kind":"link","component_id":"lite6_robot","link":"link5"}],
+           "clearance_m":0.01}])"),
+      *bundle);
+  const manyforge::core::ProgramCollisionBodyReferenceDTO arm_collision{
+      manyforge::core::ControllableComponentId("lite6_robot"),
+      manyforge::core::CollisionBodyRoleId("arm_collision")};
+  EXPECT_EQ(contract->value().collision_rule_bodies,
+            std::vector<manyforge::core::ProgramCollisionBodyReferenceDTO>{arm_collision});
+  const auto &required = contract->value().collision_body_requirements;
+  EXPECT_NE(std::find(required.begin(), required.end(), arm_collision), required.end());
+
+  // A Program without rules names no rule body.
+  const auto plain = verify_maintained_program(
+      canonical_json(automatic_retry_program(*bundle, "motion.move_to_pose")), *bundle);
+  EXPECT_TRUE(plain->value().collision_rule_bodies.empty());
+}
+
+// OD-371: the body role of an attached_object is a rule body; a
+// spring_slider row names a generated tool's slider, else Apply refuses it.
+TEST(ProgramContractTest, NodeCollisionRulesGiveCarryingBodiesAndCheckSpringSliders) {
+  const auto bundle = maintained_motion_bundle();
+  const auto contract = verify_maintained_program(
+      collision_rule_program(*bundle, "motion.move_to_pose", R"([
+          {"rule_id":"carried_apart",
+           "a":[{"kind":"attached_object","component_id":"lite6_robot",
+                 "collision_body_role_id":"arm_collision"}],
+           "b":[{"kind":"scene_objects"}],"clearance_m":0.002}])"),
+      *bundle);
+  const manyforge::core::ProgramCollisionBodyReferenceDTO arm_collision{
+      manyforge::core::ControllableComponentId("lite6_robot"),
+      manyforge::core::CollisionBodyRoleId("arm_collision")};
+  EXPECT_EQ(contract->value().collision_rule_bodies,
+            std::vector<manyforge::core::ProgramCollisionBodyReferenceDTO>{arm_collision});
+  EXPECT_TRUE(contract->value().collision_rule_spring_sliders.empty());
+
+  // The robot is no generated tool: it has no spring slider.
+  try {
+    static_cast<void>(verify_maintained_program(
+        collision_rule_program(*bundle, "motion.move_to_pose", R"([
+            {"rule_id":"press",
+             "spring_slider":{"component_id":"lite6_robot","element_id":"arm_collision"},
+             "b":[{"kind":"scene_objects"}],"contact":{"end_from_fraction":0}}])"),
+        *bundle));
+    FAIL() << "a spring slider of no generated tool was accepted";
+  } catch (const manyforge::deployment::ProgramReferenceValidationRefusal &error) {
+    ASSERT_EQ(error.diagnostics().size(), 1U);
+    const auto &row = error.diagnostics().front();
+    EXPECT_EQ(row.code, "collision_rule_spring_slider_unresolved");
+    EXPECT_EQ(row.location.path, "/tree/parameters/collision_rules/0/spring_slider");
+    EXPECT_EQ(canonical_json(row.payload),
+              R"({"component_id":"lite6_robot","element_id":"arm_collision"})");
+  }
+}
+
+TEST(ProgramContractTest, RefusesMisshapenNodeCollisionRules) {
+  const auto bundle = maintained_motion_bundle();
+  const auto refused = [&](std::string_view rules_json) {
+    EXPECT_THROW(static_cast<void>(verify_maintained_program(
+                     collision_rule_program(*bundle, "motion.move_to_pose", rules_json),
+                     *bundle)),
+                 ProgramContractError)
+        << rules_json;
+  };
+  constexpr std::string_view body =
+      R"({"kind":"collision_body","component_id":"lite6_robot","collision_body_id":"arm_collision"})";
+  const auto row = [&](std::string_view rest) {
+    return std::string(R"([{"rule_id":"r","a":[)") + std::string(body) +
+           R"(],"b":[{"kind":"scene_objects"}],)" + std::string(rest) + "}]";
+  };
+  // Two values, no value, a value out of range.
+  refused(row(R"("clearance_m":0.001,"contact":{})"));
+  refused(R"([{"rule_id":"r","a":[{"kind":"scene_objects"}],"b":[{"kind":"scene_objects"}]}])");
+  refused(row(R"("clearance_m":0.06)"));
+  refused(row(R"("contact":{"end_from_fraction":1.5})"));
+  refused(row(R"("contact":{"max_penetration_m":-0.001})"));
+  // Binary release evidence carries no signed limit.
+  refused(row(R"("release":{"release_evidence_mode":"binary_contact","max_start_penetration_m":0.01})"));
+  // One side only, a row without selections that is no clearance, two such rows.
+  refused(R"([{"rule_id":"r","a":[{"kind":"scene_objects"}],"clearance_m":0.001}])");
+  refused(R"([{"rule_id":"r","contact":{}}])");
+  refused(R"([{"rule_id":"r","clearance_m":0.001},{"rule_id":"s","clearance_m":0.002}])");
+  // Duplicate ids, an unknown selection, a leg on a motion node.
+  refused(R"([{"rule_id":"r","clearance_m":0.001},{"rule_id":"r","a":[{"kind":"scene_objects"}],
+              "b":[{"kind":"scene_objects"}],"contact":{}}])");
+  refused(R"([{"rule_id":"r","a":[{"kind":"model_group","component_id":"lite6_robot","group":"arm"}],
+              "b":[{"kind":"scene_objects"}],"contact":{}}])");
+  refused(row(R"("leg":"descend","contact":{})"));
+  // A blackboard key that is not a declared scene_resource key, both spellings.
+  refused(R"([{"rule_id":"r","a":[{"kind":"active_tcp_contact_bodies"}],
+              "b":[{"kind":"scene_object","blackboard_key":"missing"}],"contact":{}}])");
+  refused(R"([{"rule_id":"r","a":[{"kind":"active_tcp_contact_bodies"}],
+              "b":[{"kind":"scene_object","blackboard_key":"selected_object",
+                    "scene_resource_id":"table"}],"contact":{}}])");
+  // A collision body the component does not have.
+  EXPECT_ANY_THROW(static_cast<void>(verify_maintained_program(
+      collision_rule_program(*bundle, "motion.move_to_pose", R"([
+          {"rule_id":"r","a":[{"kind":"collision_body","component_id":"lite6_robot",
+                               "collision_body_id":"no_such_body"}],
+           "b":[{"kind":"scene_objects"}],"contact":{}}])"),
+      *bundle)));
+  // Rules never come from a value source.
+  EXPECT_THROW(static_cast<void>(verify_maintained_program(
+                   collision_rule_program(
+                       *bundle, "motion.move_to_pose", R"([{"rule_id":"r","clearance_m":0.001}])",
+                       {{"collision_rules[0].clearance_m",
+                         CanonicalValue(CanonicalValue::Object{
+                             {"kind", CanonicalValue("blackboard_key")},
+                             {"reference", CanonicalValue("selected_object")}})}}),
+                   *bundle)),
+               ProgramContractError);
+}
+
 TEST(ProgramContractTest,
      AcceptsLiteralAutomaticRetryPolicyWithoutKernelBudgetCapture) {
   const auto bundle = maintained_motion_bundle();
@@ -973,8 +1025,7 @@ TEST(ProgramContractTest, SealsLiteralMotionPriorityFromQualifiedCatalog) {
   FilesystemProgramRepository repository(root.path());
   ASSERT_TRUE(repository.put_if_absent(captured, *bundle));
   const auto reopened =
-      repository.get_verified(captured->value().program_id,
-                              captured->value().program_revision, *bundle);
+      repository.get_verified(captured->value().program_revision, *bundle);
   ASSERT_NE(reopened, nullptr);
   EXPECT_EQ(reopened->execution_table(), captured->execution_table());
 }
@@ -1069,8 +1120,7 @@ TEST(ProgramContractTest,
   }
   FilesystemProgramRepository reopened(root.path());
   const auto read =
-      reopened.get_verified(contract->value().program_id,
-                            contract->value().program_revision, *bundle);
+      reopened.get_verified(contract->value().program_revision, *bundle);
   ASSERT_NE(read, nullptr);
   EXPECT_EQ(read->execution_table(), contract->execution_table());
   EXPECT_EQ(read->canonical_program_bytes(),
@@ -2360,6 +2410,8 @@ TEST(ProgramContractTest,
                 {"flag", "bool"},
                 {"label", "string"},
                 {"limit", "int64"},
+                // Every Program's `all` group state (OD-339).
+                {"motion_group_state.all", "string"},
                 {"place", "stored_pose"},
                 {"ratio", "float64"}}));
   EXPECT_EQ(verified->normalized_program_root(), program);
@@ -2405,7 +2457,10 @@ TEST(ProgramContractTest,
       EXPECT_EQ(
           contract->blackboard_key_declarations(),
           (std::vector<manyforge::core::ProgramBlackboardKeyDeclarationDTO>{
-              {active_tcp, "tcp_entry"}, {"finished", "bool"}, {outcome, "string"}}));
+              {active_tcp, "tcp_entry"},
+              {"finished", "bool"},
+              {"motion_group_state.all", "string"},
+              {outcome, "string"}}));
       // The computed read and literal key read use the same implicit
       // declaration.
       auto sourced = reader;
@@ -2493,6 +2548,47 @@ TEST(ProgramContractTest, RefusesAuthoredOutcomeDeclarationsAndCatalogWrites) {
   rejects(std::move(absent), "names no declared blackboard key");
 }
 
+TEST(ProgramContractTest, MotionGroupStateKeysAreImplicitAndReadOnly) {
+  const auto bundle = maintained_motion_bundle();
+  const auto base =
+      automatic_retry_program(*bundle, "motion.move_to_joint_target");
+  const auto with_node = [&](std::string node_id, std::string key) {
+    auto members = base.as_object();
+    replace_member(
+        members, "tree",
+        selection_node("root", CanonicalValue("inherit"),
+                       {conformance_member(base.as_object(), "tree"),
+                        CanonicalValue(key_typed_node(
+                            std::move(node_id),
+                            {{"key", CanonicalValue(std::move(key))},
+                             {"value", CanonicalValue("held")}}))}));
+    return canonical_json(
+        with_program_revision(CanonicalValue(std::move(members))));
+  };
+  const auto contract = verify_maintained_program(
+      with_node("logic.check_value", "motion_group_state.all"), *bundle);
+  const auto &keys = contract->blackboard_key_declarations();
+  const auto all = std::find_if(keys.begin(), keys.end(), [](const auto &key) {
+    return key.name == "motion_group_state.all";
+  });
+  ASSERT_NE(all, keys.end());
+  EXPECT_EQ(all->declared_type, "string");
+  EXPECT_FALSE(all->has_declared_initial);
+  const auto rejects = [&](std::string bytes, std::string_view reason) {
+    try {
+      static_cast<void>(verify_maintained_program(bytes, *bundle));
+      ADD_FAILURE() << "accepted a motion group state key use";
+    } catch (const ProgramContractError &error) {
+      EXPECT_NE(std::string(error.what()).find(reason), std::string::npos)
+          << error.what();
+    }
+  };
+  rejects(with_node("logic.set_value", "motion_group_state.all"),
+          "cannot be written by catalog bindings");
+  rejects(with_node("logic.check_value", "motion_group_state.arm"),
+          "names no declared blackboard key");
+}
+
 TEST(ProgramContractTest,
      SignalMotionOutcomesHaveImplicitReadOnlyDeclarations) {
   const auto bundle = maintained_motion_bundle();
@@ -2512,9 +2608,6 @@ TEST(ProgramContractTest,
       parameters.emplace_back("interrupt_condition", parse_strict_json_model_yaml(
           R"({"compare":{"operand":{"key":"node_outcome.move"},"op":"==","value":"none"}})").root());
       parameters.emplace_back("stop_mode", CanonicalValue("spring_back_hold"));
-      if (node_id == "motion.probe_search")
-        parameters.emplace_back("contact_policy_id",
-                                CanonicalValue("contact_policy"));
     });
     auto reader = key_typed_node("logic.check_value",
                                  {{"key", CanonicalValue("node_outcome.move")},
@@ -2559,7 +2652,8 @@ TEST(ProgramContractTest,
   const auto base =
       automatic_retry_program(*bundle, "motion.move_to_joint_target");
   for (const auto *name : {"node_outcome", "node_outcome.move",
-                           "interrupt_state", "interrupt_state.guard"}) {
+                           "interrupt_state", "interrupt_state.guard",
+                           "motion_group_state", "motion_group_state.all"}) {
     for (const auto *kind : {"parameter", "key", "namespace"}) {
       SCOPED_TRACE(name);
       SCOPED_TRACE(kind);

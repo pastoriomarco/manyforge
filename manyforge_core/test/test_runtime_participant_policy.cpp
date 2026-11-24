@@ -12,7 +12,6 @@ using namespace manyforge::core;
 
 [[nodiscard]] RuntimeParticipantBinding binding() {
   auto result = verify_runtime_participant_binding(RuntimeParticipantBindingDTO{
-      ProgramId("program"),
       ProgramRevision("program.revision"),
       ProgramBindingId("program.binding"),
       RetainedBundleId("bundle"),

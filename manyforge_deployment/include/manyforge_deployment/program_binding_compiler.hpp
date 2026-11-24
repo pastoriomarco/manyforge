@@ -27,12 +27,6 @@ public:
   using std::invalid_argument::invalid_argument;
 };
 
-inline constexpr std::string_view kDirectControlMotionProgramId =
-    "manyforge.direct_control.motion";
-inline constexpr std::string_view kDirectControlGripperProgramId =
-    "manyforge.direct_control.gripper";
-inline constexpr std::string_view kDirectControlIoProgramId =
-    "manyforge.direct_control.io";
 inline constexpr std::string_view kDirectControlBaseFrameRoleId = "base";
 
 /// A compiled robot TCP row projected into the Robot Control descriptor.

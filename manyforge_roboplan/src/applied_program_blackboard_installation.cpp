@@ -131,8 +131,7 @@ core::Result<void> EnsureAppliedProgramBlackboardContext(
   if (!activated.ok())
     return activated;
   auto context = detail::CompileAppliedProgramBlackboardContext(
-      {selected.publication, selected.program->value().program_id,
-       selected.program->value().program_revision,
+      {selected.publication, selected.program->value().program_revision,
        selected.binding->program_binding_id()},
       selected.program, selected.binding, *selected.bundle);
   if (!context.ok())

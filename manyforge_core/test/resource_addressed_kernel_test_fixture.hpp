@@ -1953,7 +1953,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     PlanRequestDTO plan_request{
         request.binding.operation_id,
         request.binding.participant_id,
-        request.binding.program_id,
         request.binding.program_revision,
         request.binding.program_binding_id,
         request.binding.program_run_id,
@@ -1993,8 +1992,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         request.tolerances,
         request.speed_profile,
         request.planner,
-        request.contact_policy_id.empty() ? std::nullopt
-                                          : std::optional<std::string>{request.contact_policy_id},
         request.per_resource_dynamics_limits,
         request.timeouts.planning_timeout_s,
         0U,
@@ -2046,7 +2043,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
           request.binding.operation_id,
           authority.operation_revision,
           request.binding.participant_id,
-          request.binding.program_id,
           request.binding.program_revision,
           request.binding.program_binding_id,
           request.binding.program_run_id,
@@ -2077,12 +2073,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     std::sort(scopes.begin(), scopes.end(),
               [](const auto& left, const auto& right) { return left.scope_id < right.scope_id; });
 
-    std::optional<PreparedContactPolicyRefDTO> contact_policy;
-    if (request.resolved_contact_grasp) {
-      contact_policy =
-          PreparedContactPolicyRefDTO{request.resolved_contact_grasp->contact_policy_id,
-                                      request.resolved_contact_grasp->contact_policy_revision};
-    }
     PreparedMotionExecutionDTO payload{
         MoveId(request.move_id),
         plan_request,
@@ -2096,7 +2086,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                                  std::vector<double>(trajectory.joint_names.size(), 0.5),
                                  std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
          world, CollisionPolicyRevision{1U, Digest('d')}, decision},
-        std::move(contact_policy),
+        request.collision_rules,
         authority.requested_tcp_linear_speed_mps,
         authority.deployment_maximum_tcp_linear_speed_mps,
         std::move(scopes),
@@ -2119,7 +2109,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         request.binding.operation_id,
         authority.operation_revision,
         request.binding.participant_id,
-        binding.program_id,
         binding.program_revision,
         binding.program_binding_id,
         request.binding.program_run_id,
@@ -3021,7 +3010,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
     bool include_second_angular_resource = false,
     std::string planner_capability_revision =
         "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
-    bool include_contact_grasp = false) {
+    bool include_collision_rule_body = false) {
   std::vector<std::string> compiled_group_joint_names{
       kind == CoordinateKind::kAngular ? "mf2_joint_1" : "mf2_finger_joint"};
   std::vector<RuntimeResourceBindingDTO> resources{RuntimeResourceBindingDTO{
@@ -3046,24 +3035,19 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
         ProviderManifestRevision(test_digest('e')), RuntimeUnitId("runtime.native"),
         RuntimeEpoch("runtime-epoch.1")});
   }
-  std::vector<ProgramContactGraspBindingDTO> contact_grasps;
-  if (include_contact_grasp) {
+  // The one collision body a test's collision rules may select.
+  std::vector<ProgramCollisionRuleBodyBindingDTO> collision_rule_bodies;
+  if (include_collision_rule_body) {
     const CollisionBodyRoleId body_role("gripper_collision");
-    contact_grasps.push_back(ProgramContactGraspBindingDTO{
-        ContactPolicyId("selected_object_grasp"),
-        ContactPolicyRevision("contact-policy-revision"),
-        RuntimeObjectId("selected_object"),
-        {ProgramContactGraspBodyBindingDTO{
-            {ControllableComponentId("robot.1"), body_role},
-            ModelRoleId("body"),
-            ModelInstanceId("robot.model"),
-            ModelRevision("model-revision"),
-            {make_component_collision_body_id(ControllableComponentId("robot.1"),
-                                              ModelInstanceId("robot.model"), body_role, 0U)}}},
-        ContactGraspEnvelopeDTO{0.002, 0.8}});
+    collision_rule_bodies.push_back(ProgramCollisionRuleBodyBindingDTO{
+        {ControllableComponentId("robot.1"), body_role},
+        ModelRoleId("body"),
+        ModelInstanceId("robot.model"),
+        ModelRevision("model-revision"),
+        {make_component_collision_body_id(ControllableComponentId("robot.1"),
+                                          ModelInstanceId("robot.model"), body_role, 0U)}});
   }
   RuntimeParticipantBindingDTO value{
-      ProgramId("program.pick"),
       ProgramRevision(test_digest('0')),
       ProgramBindingId(test_digest('1')),
       RetainedBundleId(test_digest('6')),
@@ -3120,7 +3104,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
       std::move(supporting_paths),
       {RuntimeUnitEpochBindingDTO{RuntimeUnitId("runtime.native"),
                                   RuntimeEpoch("runtime-epoch.1")}},
-      std::move(contact_grasps)};
+      std::move(collision_rule_bodies)};
   if (kind == CoordinateKind::kAngular) {
     value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
         {value.controllable_component_id, value.command_target_id}, value.frame_bindings.back(), {}};
@@ -3149,7 +3133,6 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
 [[nodiscard]] RuntimeParticipantBinding same_control_scope_program_alias(
     const RuntimeParticipantBinding& source) {
   auto value = source.value();
-  value.program_id = ProgramId("program.direct-control");
   value.program_revision = ProgramRevision(test_digest('2'));
   value.program_binding_id = ProgramBindingId(test_digest('3'));
   if (value.motion_endpoint) {
@@ -3476,7 +3459,6 @@ inline void rescope_default_program_intent(OperationIntentDTO& intent) {
   OperationIntentDTO intent{
       PublicRequestContextDTO{TestRequestKey(std::move(request_id)),
                               "test"},
-      ProgramId("program.pick"),
       ProgramRevision(test_digest('0')),
       ProgramBindingId(test_digest('1')),
       ProgramRunNumber(1U),
@@ -3498,7 +3480,6 @@ inline void rescope_default_program_intent(OperationIntentDTO& intent) {
                                      std::nullopt,
                                      std::nullopt,
                                      JointGoalDTO{{"joint_1"}, {0.2}},
-                                     std::nullopt,
                                      {{"joint_1", JointDynamicsLimitDTO{1.0, 2.0, std::nullopt}}},
                                      {}}}},
       OperationCoordinationPolicy::kIndependent};
@@ -3673,7 +3654,6 @@ void retarget(OperationParticipantIntentDTO& participant, const ControllableComp
   auto binding = std::make_shared<ProgramBindingDTO>(ProgramBindingDTO{
       std::string(kProgramBindingApiVersion),
       intent.program_binding_id,
-      intent.program_id,
       intent.program_revision,
       intent.expected_retained_bundle_id,
       intent.expected_graph_revision,
@@ -3695,7 +3675,6 @@ void retarget(OperationParticipantIntentDTO& participant, const ControllableComp
   table->named_selections = {{"arm", {0U}}, {"supervision", {1U}}};
   return {CellAdmissionClaimGeneration(1U),
           *intent.program_run_id,
-          intent.program_id,
           intent.program_revision,
           intent.program_binding_id,
           intent.expected_retained_bundle_id,
@@ -3868,7 +3847,6 @@ inline void start_default_program(ResourceAddressedExecutionKernel& kernel,
 /// Binding (run equality: Program work names the claimed, captured run).
 /// Call on an unclaimed Kernel.
 inline void establish_program_as(ResourceAddressedExecutionKernel& kernel,
-                                 const ProgramId& program_id,
                                  const ProgramRevision& program_revision,
                                  const ProgramBindingId& program_binding_id,
                                  const std::optional<RetainedBundleId>& retained_bundle_id = {},
@@ -3878,16 +3856,14 @@ inline void establish_program_as(ResourceAddressedExecutionKernel& kernel,
   const auto claim = kernel.AcquireCellAdmissionClaim(CellAdmissionClaimIntentDTO{
       CellAdmissionClaimKindDTO::kProgramCycle, ApplicationRole::kProgramRunner,
       CellAdmissionOwnerTransactionId(ProgramRunNumber(1U)),
-      TestRequestKey("request.program-cycle.claim." + program_id.value()),
+      TestRequestKey("request.program-cycle.claim." + program_revision.value()),
       kernel.GetAuthoringAdmission().admission_generation, {},
       ProgramCycleAdmissionEvidenceDTO{program_revision, program_revision}, std::nullopt});
   ASSERT_TRUE(claim.ok()) << claim.error().message;
   auto capture = default_program_capture();
   auto binding = std::make_shared<ProgramBindingDTO>(*capture.binding);
-  binding->program_id = program_id;
   binding->program_revision = program_revision;
   binding->program_binding_id = program_binding_id;
-  capture.program_id = program_id;
   capture.program_revision = program_revision;
   capture.program_binding_id = program_binding_id;
   if (retained_bundle_id) {
@@ -3907,7 +3883,7 @@ inline void establish_program_as(ResourceAddressedExecutionKernel& kernel,
   ASSERT_TRUE(scope.ok()) << scope.error().message;
   const auto started = kernel.start_program_selection(
       ProgramExecutionSelectionRequestDTO{
-          PublicRequestContextDTO{TestRequestKey("request.program.run." + program_id.value()),
+          PublicRequestContextDTO{TestRequestKey("request.program.run." + program_revision.value()),
                                   "test"},
           ProgramRunNumber(1U),
           {"all"},

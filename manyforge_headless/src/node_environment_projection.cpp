@@ -195,11 +195,18 @@ struct CatalogIdentity final {
   std::set<std::string> owner_neutral_node_ids;
 };
 
+/// Owner APIs with no separate semantic owner: the Program runner executes
+/// them itself, so their owner health is the runner's. The pure ones, and
+/// the Program run owner's own operator question and motion-group Stop
+/// (OD-342). The same set as the Python resolver's adapters without an owner
+/// port (`executable_node_resolver.py`; test_owner_portless_apis.py checks it).
 bool IsOwnerNeutralOwnerApi(const std::string_view owner_api) noexcept {
   return owner_api == "geometry.compare" ||
          owner_api == "orchestration.blackboard" ||
          owner_api == "orchestration.clock" ||
-         owner_api == "orchestration.control_flow";
+         owner_api == "orchestration.control_flow" ||
+         owner_api == "orchestration.operator" ||
+         owner_api == "orchestration.selection_stop";
 }
 
 CatalogIdentity VerifyCatalog(const CanonicalValue &catalog) {

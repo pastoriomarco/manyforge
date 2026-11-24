@@ -123,9 +123,10 @@ void RewriteProviderManifest(
 detail::PreparedActivationMaterialization
 MaterializeEmptyCell(const fs::path &root) {
   const CanonicalValue intent_value(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.deployment_intent.v2")},
-      {"deployment_artifact_id", CanonicalValue("catalog_presence_activation")},
-      {"name", CanonicalValue("catalog_presence_activation")},
+      {"api_version", CanonicalValue("manyforge.deployment_intent.v3")},
+      {"collision_rules",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{{"clearance_m", CanonicalValue(0.001)},
+                   {"rule_id", CanonicalValue("everything")}})})},
       {"attachments", CanonicalValue(CanonicalValue::Array{})},
       {"components", CanonicalValue(CanonicalValue::Array{})},
       {"policies", CanonicalValue(CanonicalValue::Object{})},
@@ -149,7 +150,7 @@ TEST(ActivationCatalogPresence, CellsWithComponentsHaveQualifiedExecutionInterru
   ASSERT_NE(materialized.bundle, nullptr);
   const detail::PreparedCatalogSource catalog(materialized.catalog_artifacts);
   for (const std::string_view id : {"execution.interrupt.resource_scoped",
-                                    "execution.interrupt.contact_policy"}) {
+                                    "execution.interrupt.contact_rule"}) {
     const auto *definition = core::find_builtin_capability_definition(id);
     ASSERT_NE(definition, nullptr);
     const core::ProgramCapabilityRequirementDTO requirement{

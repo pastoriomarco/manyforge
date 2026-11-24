@@ -5,7 +5,7 @@ from manyforge_behavior.production_ports import HeadlessSceneProgramPort
 def test_scene_binding_keeps_component_observations_and_target_authority_distinct():
     digest = "sha256:" + "0" * 64
     binding = {
-        "program_id": "program", "program_revision": digest, "program_binding_id": digest,
+        "program_revision": digest, "program_binding_id": digest,
         "retained_bundle_id": digest, "graph_revision": digest,
         "component_bindings": [{"component_id": "tool", "model_bindings": [
             {"model_role_id": "tool_model", "model_instance_id": "model", "model_revision": "revision"}]}],
@@ -19,7 +19,7 @@ def test_scene_binding_keeps_component_observations_and_target_authority_distinc
                              "frame_references": [{"component_id": "tool", "frame_id": "tcp"}],
                              "collision_body_references": [{"component_id": "tool", "collision_body_id": "jaw"}]}],
     }
-    capture = ProgramRunPortContext(1, digest, "scenario", digest, "program", digest,
+    capture = ProgramRunPortContext(1, digest, "scenario", digest, digest,
                                     digest, digest, digest, digest, binding)
     context = HeadlessSceneProgramPort._parse_context(capture)
     target = context.targets[("tool", "grip")]
@@ -93,11 +93,11 @@ def test_runtime_context_uses_exact_direct_target_and_derived_signal_rows():
     def row(ref, direction):
         return {"reference": ref, "target": target, "runtime_unit_id": "unit", "value_type": "bool",
                 "direction": direction, "transition_capability": "sampled_only", "signal_descriptor_digest": digest}
-    binding = {"program_id": "program", "program_revision": digest, "program_binding_id": digest,
+    binding = {"program_revision": digest, "program_binding_id": digest,
                "retained_bundle_id": digest, "graph_revision": digest,
                "target_bindings": [{"target": target, "capability_bindings": []}],
                "signal_bindings": [row(output, "output"), row(derived, "input")]}
-    capture = ProgramRunPortContext(1, digest, "scenario", digest, "program", digest,
+    capture = ProgramRunPortContext(1, digest, "scenario", digest, digest,
                                     digest, digest, digest, digest, binding)
     context = NativeKernelProgramPort._parse_context(capture)
     assert context.targets[("io", "bank")].reference() == target
@@ -154,7 +154,7 @@ def test_motion_participant_uses_direct_target_base_frame_and_tcp():
               "velocity_scale": 0.5, "acceleration_scale": 0.5,
               "planning_timeout_s": 1, "execution_timeout_s": 2, "cache_mode": "off"}
     result = program_motion_participant("motion.move_to_joint_target", params,
-        targets={("robot", "arm"): bound}, contact_grasps={}, move_id="move",
+        targets={("robot", "arm"): bound}, move_id="move",
         binding={"frame_bindings": [{"reference": base}]})
     assert result.target.reference() == target
     assert result.payload["base_frame"] == base

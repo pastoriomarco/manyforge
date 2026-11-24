@@ -75,6 +75,8 @@ void hash_text(std::uint64_t& hash, const std::string_view text) noexcept {
     if (request.attribution->principal_id) hash_text(hash, *request.attribution->principal_id);
   }
   hash_u64(hash, request.mode ? static_cast<std::uint64_t>(*request.mode) + 1U : 0U);
+  if (request.held_by_program_node != nullptr)
+    hash_text(hash, request.held_by_program_node->value());
   return hash;
 }
 
@@ -897,7 +899,11 @@ std::uint32_t ResourceAddressedExecutionKernel::request_stop_locked(const StopRe
   const bool carried_object_lost = request.kind == StopKind::kOperation &&
                                    request.source_label == "manager.carried_object_lost" &&
                                    request.reason == "carried_object_lost";
-  const bool runtime_collision = applied == StopKind::kRuntimeCollision;
+  // The runtime monitor's containment and (OD-379) a component fault's Stop
+  // stop each robot with its fault Stop profile and leave the typed cause
+  // their producer stored on the participants they start.
+  const bool fault_containment =
+      applied == StopKind::kRuntimeCollision || applied == StopKind::kComponentFault;
   const bool internal_control = applied == StopKind::kOperationReset ||
                                 applied == StopKind::kHoldTimeout;
   const bool failure_halt = applied == StopKind::kStopFailedHalt;
@@ -1005,7 +1011,7 @@ std::uint32_t ResourceAddressedExecutionKernel::request_stop_locked(const StopRe
         if (selection != nullptr && selection->plan != nullptr) {
           mode = StopMode::kInterrupt;
           plan = selection->plan;
-        } else if (runtime_collision) {
+        } else if (fault_containment) {
           mode = StopMode::kFault;
           if (participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
               participant.fault_stop_plan != nullptr)
@@ -1037,7 +1043,7 @@ std::uint32_t ResourceAddressedExecutionKernel::request_stop_locked(const StopRe
         work.prepared_execution_id = participant.preparation_id;
         work.prepared_motion_engine = participant.prepared_motion_engine;
         work.execution_engine = participant.engine;
-        work.runtime_collision_containment = runtime_collision;
+        work.runtime_collision_containment = fault_containment;
         work.carried_object_lost = carried_object_lost;
         work.internal_control_stop = internal_control;
         work.started_by_failure_halt = failure_halt;
@@ -1046,7 +1052,7 @@ std::uint32_t ResourceAddressedExecutionKernel::request_stop_locked(const StopRe
         if (selection != nullptr) {
           work.current_stage_index = selection->stop_entry;
           work.selected_interrupt_suffix = true;
-        } else if (runtime_collision &&
+        } else if (fault_containment &&
                    participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
                    participant.fault_stop_plan == nullptr) {
           // Admission required this exact prepared cancel row; no profile is
@@ -1971,7 +1977,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           settlement_waits = !item.participant_settlement_complete;
         }
         if (!settlement_waits) {
-          // Terminal projection of the participant (unchanged mapping).
+          // Terminal projection of the participant.
           const auto rules_retired = retire_participant_io_rules_locked(participant);
           if (!rules_retired.ok()) item.participant_settlement_error = rules_retired.error();
           const bool io_source_failed = std::any_of(
@@ -1983,9 +1989,23 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                (item.participant_settlement_complete && !item.participant_settlement_error.has_value()));
           const bool runtime_collision_participant =
               item.runtime_collision_containment && participant.runtime_collision_error.has_value();
+          // OD-373 (A): a collision Stop that contained the participant
+          // cleanly (contained and settled, not escalated, the same test as
+          // its Stop record's `escalated`, and no I/O source lost) ends it
+          // Stopped like an ordinary Stop, keeping its typed collision cause.
+          // Any other containment, and the monitor's own lost-observation or
+          // checks-stopped Stops (their own codes), stay intervention-required.
+          const bool clean_collision_stop =
+              runtime_collision_participant &&
+              participant.runtime_collision_error->code ==
+                  to_string(ErrorCode::kExecutionAborted) &&
+              participant_settled && !io_source_failed &&
+              !(item.escalation_cause.has_value() && !item.lane_hard_stop_requested);
+          const bool stopped_cleanly =
+              participant_settled && (!runtime_collision_participant || clean_collision_stop);
           participant_state.state =
               item.participant_failure_preserved ? OperationStateKind::kFailed
-              : participant_settled && !runtime_collision_participant
+              : stopped_cleanly
                   ? (io_source_failed ? OperationStateKind::kFailed : OperationStateKind::kStopped)
                   : OperationStateKind::kInterventionRequired;
           if (item.stop_path_collision.has_value()) {
@@ -2075,8 +2095,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                 participant_state.terminal_fact = ParticipantExecutionFact{
                     ParticipantExecutionFactKind::kLocalFailure,
                     ParticipantEffectKnowledge::kNoEffect, participant_state.terminal_error};
-            } else if (participant_settled && !runtime_collision_participant &&
-                       !item.participant_failure_preserved) {
+            } else if (stopped_cleanly && !item.participant_failure_preserved) {
               participant_state.terminal_fact = ParticipantExecutionFact{
                   item.cancelled_pre_dispatch
                       ? ParticipantExecutionFactKind::kCancelledBeforeDispatch

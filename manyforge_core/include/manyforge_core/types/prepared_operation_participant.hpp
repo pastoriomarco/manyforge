@@ -70,12 +70,6 @@ struct PreparedMotionValidationEvidenceDTO final {
   CollisionPolicyRevision collision_policy_revision;
   CollisionDecision collision_decision;
 };
-struct PreparedContactPolicyRefDTO final {
-  ContactPolicyId contact_policy_id;
-  ContactPolicyRevision contact_policy_revision;
-  friend bool operator==(const PreparedContactPolicyRefDTO&,
-                         const PreparedContactPolicyRefDTO&) = default;
-};
 struct PreparedMotionInterruptScopeDTO final {
   MotionInterruptScopeId scope_id;
   InterruptPolicyId interrupt_policy_id;
@@ -102,7 +96,8 @@ struct PreparedMotionExecutionDTO final {
   ControlledStateDTO start_state;
   PreparedMotionPlanningEvidenceDTO planning_evidence;
   PreparedMotionValidationEvidenceDTO validation_evidence;
-  std::optional<PreparedContactPolicyRefDTO> contact_policy;
+  /// The admitted collision rules the motion was validated under.
+  std::vector<CollisionRule> collision_rules;
   std::optional<double> requested_tcp_linear_speed_mps;
   double deployment_maximum_tcp_linear_speed_mps{};
   std::vector<PreparedMotionInterruptScopeDTO> interrupt_scopes;
@@ -164,7 +159,6 @@ struct PreparedOperationParticipantDTO final {
   OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
-  ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
   std::optional<ProgramRunNumber> program_run_id;
@@ -189,7 +183,7 @@ struct PreparedOperationParticipantDTO final {
   PreparedOperationParticipantDTO(
       ContentDigest prepared_contract_digest, OperationNumber operation_id,
       OperationRevision operation_revision, OperationParticipantId participant_id,
-      ProgramId program_id, ProgramRevision program_revision, ProgramBindingId program_binding_id,
+      ProgramRevision program_revision, ProgramBindingId program_binding_id,
       std::optional<ProgramRunNumber> program_run_id, RetainedBundleId retained_bundle_id,
       GraphRevision graph_revision, ControllableComponentId controllable_component_id,
       ComponentLifecycleGeneration component_lifecycle_generation,
@@ -220,7 +214,6 @@ struct PreparedOperationParticipantDTO final {
         operation_id(std::move(operation_id)),
         operation_revision(std::move(operation_revision)),
         participant_id(std::move(participant_id)),
-        program_id(std::move(program_id)),
         program_revision(std::move(program_revision)),
         program_binding_id(std::move(program_binding_id)),
         program_run_id(std::move(program_run_id)),

@@ -31,7 +31,6 @@ namespace {
 [[nodiscard]] RuntimeParticipantBinding Binding(const ResolvedStopBasePlanDTO& base) {
   const auto& target = base.escalation_stages.front().command_target;
   RuntimeParticipantBindingDTO value{
-      ProgramId("program.1"),
       ProgramRevision("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
       ProgramBindingId("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
       base.retained_bundle_id,

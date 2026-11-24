@@ -221,7 +221,7 @@ TEST(StopStateCoreTest, StopAcceptanceAllocatesNothing) {
   auto& handoff = StopControlExecutorTestAccess::ThreadHandoff(harness.kernel);  // sized first
   std::uint64_t sequence = 1U;
   for (const auto kind : {StopKind::kOperation, StopKind::kStopAll, StopKind::kHalt,
-                          StopKind::kCellStop, StopKind::kGroups}) {
+                          StopKind::kCellStop, StopKind::kGroups, StopKind::kComponentFault}) {
     auto request = cell_request_of(kind, TestRequestKey(("alloc." + std::to_string(sequence++)).c_str()));
     if (kind == StopKind::kOperation) {
       request.selector = StopSelectorKind::kOperations;

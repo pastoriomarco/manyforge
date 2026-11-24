@@ -247,6 +247,14 @@ Composition::~Composition() {
     return runtime != nullptr ? runtime->cell_addressed_kernel : nullptr;
   }
 
+[[nodiscard]] std::pair<core::ControllableComponentId, std::string>
+Composition::owner_key() const {
+  return {controllable_component_id,
+          direct_control_gripper_binding.has_value()
+              ? direct_control_gripper_binding->value().command_target_id.value()
+              : std::string()};
+}
+
 [[nodiscard]] const void *Composition::component_runtime_identity() const noexcept {
   if (component_runtime_pins)
     return component_runtime_pins.get();
@@ -431,6 +439,24 @@ std::vector<core::CoordinatedComponent> CoordinatedComponentsOf(const Compositio
   return components;
 }
 
+std::shared_ptr<const core::CellModelStateSources> CellModelStateSourcesOf(
+    const std::span<const CellFrameStateSource> sources,
+    const std::function<std::shared_ptr<const core::ComponentStreamStaleFlag>(
+        const core::ControllableComponentId &)> &stream_stale) {
+  auto result = std::make_shared<core::CellModelStateSources>();
+  result->reserve(sources.size());
+  for (const auto &source : sources) {
+    if (source.frame_source.coordinate_authority !=
+            RetainedSceneFrameCoordinateAuthority::kRequiredPublication ||
+        source.numeric_publication == nullptr)
+      continue;
+    const auto &component = source.frame_source.context.controllable_component_id;
+    result->push_back({component, source.numeric_publication,
+                       stream_stale ? stream_stale(component) : nullptr});
+  }
+  return result;
+}
+
 std::vector<std::jthread> ExecutionCompositionAccess::replace_current(
     Composition *replacement) {
     HostRobotTcpReaders readers;
@@ -481,6 +507,11 @@ std::vector<std::jthread> ExecutionCompositionAccess::replace_current(
       for (const auto &participant : current->participant_compositions)
         wake_if_retired(*participant);
     }
+    // The new cell's sources first: the composition is never selected while
+    // its robots would still read the previous cell's components.
+    cell_model_state->Replace(replacement != nullptr
+                                  ? replacement->cell_model_state_sources
+                                  : nullptr);
     SelectHostRobotTcps(std::move(readers), [&] { current = replacement; });
     logical_product.reset();
     if (publish_transport_membership) publish_transport_membership(replacement);

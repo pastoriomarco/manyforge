@@ -13,7 +13,7 @@ bool validation_cancelled_by_interrupt(const ErrorDTO& error) {
 
 bool authoritative_collision_replan_candidate(const ErrorDTO& error) {
   if ((error.code != kErrorValidationCollision &&
-       error.code != kErrorContactPolicyViolation) ||
+       error.code != kErrorContactRuleViolation) ||
       validation_cancelled_by_interrupt(error)) {
     return false;
   }

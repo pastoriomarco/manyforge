@@ -58,14 +58,12 @@ def _context(
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="isaac-cell",
         source_document_digest=_DIGEST_A,
-        program_id="simulation_program",
         program_revision=_DIGEST_B,
         program_binding_id=_DIGEST_C,
         retained_bundle_id=_DIGEST_A,
         graph_revision=_DIGEST_B,
         node_environment_digest=_DIGEST_C,
         program={
-            "program_id": "simulation_program",
             "program_revision": _DIGEST_B,
             "scene": [
                 {"scene_resource_id": resource_id}
@@ -75,7 +73,6 @@ def _context(
         simulation_scene=simulation_scene,
         program_binding={
             "program_binding_id": _DIGEST_C,
-            "program_id": "simulation_program",
             "program_revision": _DIGEST_B,
             "retained_bundle_id": _DIGEST_A,
             "graph_revision": _DIGEST_B,

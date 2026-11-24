@@ -188,6 +188,8 @@ export function appliedExecutionSelectionRows(
         runtimeScaleUnavailableReason: scale.reason,
         // No run reserves anything yet; release is unavailable regardless.
         resourceIds: [],
+        stoppedBy: null,
+        stoppedByNodeInstanceId: null,
       } satisfies ProgramExecutionSelectionRow;
     });
 }

@@ -46,10 +46,12 @@ TEST(SourceModelProjection, EmptyScenarioWithRetainedMapProjectsEmpty) {
   using deployment::CanonicalValue;
   namespace detail = deployment::detail;
   const CanonicalValue intent_value(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.deployment_intent.v2")},
-      {"deployment_artifact_id", CanonicalValue("empty_projection")},
-      {"name", CanonicalValue("empty_projection")},
+      {"api_version", CanonicalValue("manyforge.deployment_intent.v3")},
       {"attachments", CanonicalValue(CanonicalValue::Array{})},
+      {"collision_rules",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+           {"rule_id", CanonicalValue("everything")},
+           {"clearance_m", CanonicalValue(0.001)}})})},
       {"components", CanonicalValue(CanonicalValue::Array{})},
       {"policies", CanonicalValue(CanonicalValue::Object{})},
   });

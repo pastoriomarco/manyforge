@@ -423,8 +423,11 @@ RequiredMember(const content_identity::CanonicalValue &value,
                const std::string_view name) {
   const auto *member = value.find_object_member(name);
   if (member == nullptr) {
+    // Name the value searched, so a failing process run shows which
+    // response lacked the member.
     throw std::runtime_error("Manager source fixture lacks " +
-                             std::string(name));
+                             std::string(name) + " in " +
+                             content_identity::canonical_json(value));
   }
   return *member;
 }
@@ -504,11 +507,9 @@ ReadRuntimeOfferProjection(const content_identity::CanonicalValue &payload) {
 struct ManagerApplyFixtureMetadata final {
   std::string admission_filename;
   std::string cell_id;
-  std::string close_deployment_artifact_id;
   std::string close_deployment_revision;
   std::string close_retained_bundle_id;
   std::string physical_candidate_retained_bundle_id;
-  std::string physical_deployment_artifact_id;
   std::string physical_deployment_revision;
   std::string predecessor_graph_revision;
   std::string predecessor_retained_bundle_id;
@@ -516,7 +517,6 @@ struct ManagerApplyFixtureMetadata final {
   /// `program_apply_fixture` Scenario.
   std::string prepared_activation_id;
   std::string program_binding_id;
-  std::string program_id;
   std::string program_revision;
 };
 
@@ -530,7 +530,7 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
   const std::string bytes{std::istreambuf_iterator<char>(stream),
                           std::istreambuf_iterator<char>()};
   const auto root = deployment::parse_strict_json_model_yaml(bytes).root();
-  if (!root.is_object() || root.as_object().size() != 15U ||
+  if (!root.is_object() || root.as_object().size() != 12U ||
       content_identity::canonical_json(root) != bytes) {
     throw std::runtime_error("Manager Apply fixture metadata is invalid");
   }
@@ -539,18 +539,15 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
   return {
       RequiredText(root, "admission_filename"),
       RequiredText(root, "cell_id"),
-      RequiredText(root, "close_deployment_artifact_id"),
       RequiredText(root, "close_deployment_revision"),
       RequiredText(root, "close_retained_bundle_id"),
       RequiredText(root, "physical_candidate_retained_bundle_id"),
-      RequiredText(root, "physical_deployment_artifact_id"),
       RequiredText(root, "physical_deployment_revision"),
       RequiredText(root, "predecessor_graph_revision"),
       RequiredText(root, "predecessor_retained_bundle_id"),
       RequiredText(RequiredMember(prepared, "program_apply_fixture"),
                    "prepared_activation_id"),
       RequiredText(root, "program_binding_id"),
-      RequiredText(root, "program_id"),
       RequiredText(root, "program_revision"),
   };
 }
@@ -605,9 +602,6 @@ public:
   }
   [[nodiscard]] std::filesystem::path manager_run_root() const {
     return root_ / "manager-run";
-  }
-  [[nodiscard]] std::filesystem::path scene_database() const {
-    return root_ / "logical-scene.sqlite3";
   }
   [[nodiscard]] std::filesystem::path program_cycle_journal() const {
     return root_ / "program-cycle.sqlite3";
@@ -890,9 +884,7 @@ public:
         "--execution-state-root",
         directory.execution_state_root().string(),
         "--execution-run-root",
-        directory.execution_run_root().string(),
-        "--logical-scene-database",
-        directory.scene_database().string()};
+        directory.execution_run_root().string()};
     if (!program_runner_liveness_socket.empty()) {
       arguments.emplace_back("--program-runner-liveness-socket");
       arguments.push_back(program_runner_liveness_socket);
@@ -1506,8 +1498,7 @@ content_identity::CanonicalValue PublishTestPreparedActivation(
     throw std::runtime_error("Manager Apply fixture lost its physical bundle");
   }
   const auto authored = deployment::FilesystemVerifiedProgramSource(package_root)
-                            .get_verified(core::ProgramId(fixture.program_id),
-                                          core::ProgramRevision(fixture.program_revision),
+                            .get_verified(core::ProgramRevision(fixture.program_revision),
                                           *physical);
   if (authored == nullptr) {
     throw std::runtime_error("Manager Apply fixture Program is unavailable");
@@ -1598,7 +1589,6 @@ std::string PublishTestCloseWithoutProgram(
 std::string ApplyRequest(
     const DaemonDirectory &directory,
     const std::uint64_t expected_admission_generation,
-    const std::string_view deployment_artifact_id = "candidate",
     const std::string_view deployment_revision = kDeploymentRevision,
     const std::string_view expected_graph_revision = "current-graph",
     const std::string_view expected_retained_bundle_id = "current-bundle",
@@ -1649,15 +1639,31 @@ std::string ApplyRequest(
         directory.apply_package_root());
     const auto retained_root =
         directory.apply_package_root() / "retained-bundles" / "sha256";
+    // Close and the canonical-empty admission share the empty intent's
+    // deployment revision: an explicit prepared activation selects its own
+    // bundle, never whichever one the directory happens to list first.
+    std::string override_bundle;
+    if (!prepared_activation_id_override.empty()) {
+      const auto prepared =
+          deployment::FilesystemPreparedActivationRepository(
+              directory.activation_root())
+              .get_verified(core::ContentDigest(
+                  std::string(prepared_activation_id_override)));
+      if (prepared == nullptr) {
+        throw std::runtime_error(
+            "Manager Apply fixture prepared activation is unavailable");
+      }
+      override_bundle = prepared->retained_bundle_id().value();
+    }
     for (const auto &entry : std::filesystem::directory_iterator(retained_root)) {
       if (!entry.is_regular_file() || entry.path().extension() != ".json")
         continue;
       const auto bundle = bundles.get_verified(core::RetainedBundleId(
           "sha256:" + entry.path().stem().string()));
       if (bundle != nullptr &&
-          bundle->value().deployment_artifact_id.value() ==
-              deployment_artifact_id &&
-          bundle->value().deployment_revision.value() == deployment_revision) {
+          bundle->value().deployment_revision.value() == deployment_revision &&
+          (override_bundle.empty() ||
+           bundle->retained_bundle_id().value() == override_bundle)) {
         candidate_bundle = bundle->retained_bundle_id().value();
         candidate_graph = bundle->value().cell_graph.graph_revision.value();
         if (prepared_activation_id_override.empty()) {
@@ -1705,8 +1711,6 @@ std::string ApplyRequest(
           {"command", CanonicalValue("deployment_candidate_preview")},
           {"candidate_graph_revision", CanonicalValue(candidate_graph)},
           {"candidate_retained_bundle_id", CanonicalValue(candidate_bundle)},
-          {"deployment_artifact_id",
-           CanonicalValue(std::string(deployment_artifact_id))},
           {"deployment_revision",
            CanonicalValue(std::string(deployment_revision))},
           {"expected_admission_generation",
@@ -1743,8 +1747,6 @@ std::string ApplyRequest(
       {"api_version", CanonicalValue("manyforge.manager_command.v2")},
       {"candidate_receipt", RequiredMember(preview, "candidate_receipt")},
       {"command", CanonicalValue("apply")},
-      {"deployment_artifact_id",
-       CanonicalValue(std::string(deployment_artifact_id))},
       {"deployment_revision", CanonicalValue(std::string(deployment_revision))},
       {"expected_current", expected},
       {"prepared_activation", prepared_summary},
@@ -1784,7 +1786,8 @@ ApplyStatusRequest(const std::string_view submission_response) {
 std::string SceneAddRequest(
     const StatusSection &scene_source, const std::string_view request_name,
     const std::uint64_t expected_admission_generation, const double box_x = 0.1,
-    const std::string_view scene_resource_id = "scene-process-box") {
+    const std::string_view scene_resource_id = "scene-process-box",
+    const content_identity::CanonicalValue *shape = nullptr) {
   using content_identity::CanonicalValue;
   const auto &projection = RequiredMember(
       RequiredMember(scene_source.payload, "access"), "active_projection");
@@ -1827,15 +1830,17 @@ std::string SceneAddRequest(
                 {"scene_resource_id",
                  CanonicalValue(std::string(scene_resource_id))},
                 {"shape",
-                 CanonicalValue(CanonicalValue::Object{
-                     {"box_dimensions_m", CanonicalValue(CanonicalValue::Object{
-                                              {"x_m", CanonicalValue(box_x)},
-                                              {"y_m", CanonicalValue(0.2)},
-                                              {"z_m", CanonicalValue(0.3)},
-                                          })},
-                     {"type", CanonicalValue("box")},
-                 })},
-                {"support_contacts", CanonicalValue(CanonicalValue::Array{})},
+                 shape != nullptr
+                     ? *shape
+                     : CanonicalValue(CanonicalValue::Object{
+                           {"box_dimensions_m",
+                            CanonicalValue(CanonicalValue::Object{
+                                {"x_m", CanonicalValue(box_x)},
+                                {"y_m", CanonicalValue(0.2)},
+                                {"z_m", CanonicalValue(0.3)},
+                            })},
+                           {"type", CanonicalValue("box")},
+                       })},
             })},
            {"program_reset_scene_authorization", CanonicalValue(nullptr)},
            {"request_context",
@@ -2144,9 +2149,7 @@ TEST(ManagerDaemonProcess, OneStoreWriterDrainsBeforeTheStoresClose) {
   const auto apply_path =
       directory.manager_root() /
       std::string(component_manager::kManagerApplyJournalFilename);
-  for (const auto &database :
-       {bootstrap_path, publication_path, apply_path,
-        directory.scene_database()}) {
+  for (const auto &database : {bootstrap_path, publication_path, apply_path}) {
     ASSERT_TRUE(std::filesystem::exists(database)) << database;
     const std::filesystem::path wal(database.string() + "-wal");
     std::error_code error;
@@ -2166,6 +2169,64 @@ TEST(ManagerDaemonProcess, OneStoreWriterDrainsBeforeTheStoresClose) {
   component_manager::SqliteActiveBundlePublicationStore publication(
       publication_path, admission.cell_id());
   EXPECT_EQ(publication.VerifyIntegrity().current_generation.value(), 1U);
+}
+
+// The run-folder check (OD-242, OD-378) reads the Manager's stores: a folder
+// whose bootstrap journal holds a phase is refused although no publication
+// was made yet (a bootstrap that a previous start left half-finished).
+TEST(ManagerDaemonProcess, AHalfFinishedBootstrapIsRefusedAsAPreviousRun) {
+  DaemonDirectory directory;
+  const auto admission =
+      deployment::FilesystemCanonicalEmptyRetainedBundleSource(
+          MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT)
+          .load_verified();
+  {
+    component_manager::ExternallyProvisionedManagerStores stores(
+        directory.manager_root(), admission);
+    ASSERT_TRUE(stores.bootstrap_journal()
+                    .EnsureIntent({
+                        core::BootstrapId(
+                            "bootstrap-0123456789abcdef0123456789abcdef"),
+                        core::BootstrapGeneration(1U),
+                        admission.cell_id(),
+                        admission.retained_bundle_id(),
+                        admission.graph_revision(),
+                        {},
+                    })
+                    .inserted);
+    const auto inventory = stores.StartupInventory();
+    ASSERT_EQ(inventory.active_bundle_publication.receipt_count, 0);
+    ASSERT_TRUE(stores.apply_journal().ReadStatusInventory().empty());
+  }
+  ManagerProcess manager(directory);
+  ExpectPreviousRunRefused(manager, directory);
+}
+
+// A folder that a cleanly stopped run left behind holds its publication; a
+// new start on it is refused before any process is started.
+TEST(ManagerDaemonProcess, AFolderWhosePublicationStoreHoldsARunIsRefused) {
+  DaemonDirectory directory;
+  {
+    ManagerProcess manager(directory);
+    manager.WaitReady(directory);
+    const auto stopped = manager.Stop(SIGTERM);
+    ASSERT_TRUE(WIFEXITED(stopped));
+    ASSERT_EQ(WEXITSTATUS(stopped), 0);
+  }
+  {
+    const auto admission =
+        deployment::FilesystemCanonicalEmptyRetainedBundleSource(
+            MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT)
+            .load_verified();
+    component_manager::SqliteActiveBundlePublicationStore publication(
+        directory.manager_root() /
+            std::string(
+                component_manager::kActiveBundlePublicationStoreFilename),
+        admission.cell_id());
+    ASSERT_EQ(publication.VerifyIntegrity().current_generation.value(), 1U);
+  }
+  ManagerProcess replacement(directory);
+  ExpectPreviousRunRefused(replacement, directory);
 }
 
 // OD-187: the Manager's stop has no time limit. A listed process that ignores
@@ -2497,9 +2558,9 @@ TEST(ManagerDaemonProcess,
     first_scene_runtime_generation = scene_runtime_snapshot->source_generation;
 
     unavailable_response = ApplyRequest(
-        directory, 1U, "candidate", kDeploymentRevision,
+        directory, 1U, kDeploymentRevision,
         "current-graph", "current-bundle", "request-1", true);
-    EXPECT_EQ(ApplyRequest(directory, 1U, "candidate",
+    EXPECT_EQ(ApplyRequest(directory, 1U,
                            kDeploymentRevision, "current-graph",
                            "current-bundle", "request-1", true),
               unavailable_response);
@@ -2991,7 +3052,7 @@ TEST(ManagerDaemonProcess,
   ASSERT_TRUE(std::filesystem::create_directory(selected_root));
 
   const auto apply =
-      ApplyRequest(directory, 1U, "candidate",
+      ApplyRequest(directory, 1U,
                    kDeploymentRevision, "current-graph", "current-bundle",
                    "request-1", true);
   EXPECT_EQ(ReadDirectChildren(manager.pid()), children_before_replacement);
@@ -3140,6 +3201,90 @@ TEST(ManagerDaemonProcess,
 
   ManagerProcess replacement(directory);
   ExpectPreviousRunRefused(replacement, directory);
+}
+
+// A mesh scene object carries captured content (OD-335). Without a digest
+// the Manager takes the active Apply's capture of the URI; a supplied digest
+// must name a blob in the activation raw-artifact store. A refusal is typed
+// and reaches no scene owner.
+TEST(ManagerDaemonProcess, SceneMeshObjectsRequireCapturedContent) {
+  using content_identity::CanonicalValue;
+  DaemonDirectory directory;
+  ManagerProcess manager(directory);
+  manager.WaitReady(directory);
+  StatusSectionReader scene_source(directory, "logical_scene");
+  const auto initial = scene_source.Read();
+  ASSERT_TRUE(initial.has_value());
+  const auto mesh = [](const std::optional<std::string> &digest) {
+    CanonicalValue::Object shape;
+    if (digest.has_value())
+      shape.emplace_back("mesh_content_digest", CanonicalValue(*digest));
+    shape.emplace_back("mesh_resource_uri", CanonicalValue("meshes/part.obj"));
+    shape.emplace_back("mesh_scale", CanonicalValue(CanonicalValue::Object{
+                                         {"x_m", CanonicalValue(1.0)},
+                                         {"y_m", CanonicalValue(1.0)},
+                                         {"z_m", CanonicalValue(1.0)},
+                                     }));
+    shape.emplace_back("type", CanonicalValue("mesh"));
+    return CanonicalValue(std::move(shape));
+  };
+
+  // No Apply captured the URI (the cell runs its bootstrap configuration).
+  const auto uncaptured_shape = mesh(std::nullopt);
+  const auto uncaptured = SendCommand(
+      directory.socket_path(),
+      SceneAddRequest(*initial, "scene-mesh.uncaptured", 1U, 0.1, "scene-mesh",
+                      &uncaptured_shape));
+  EXPECT_NE(uncaptured.find("\"code\":\"scene_mesh_unavailable\""),
+            std::string::npos)
+      << uncaptured;
+  EXPECT_NE(uncaptured.find("meshes/part.obj was not captured"), std::string::npos)
+      << uncaptured;
+
+  // A supplied digest whose blob is not stored.
+  const std::string bytes = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+  const auto digest = content_identity::sha256_digest(bytes);
+  const auto unstored_shape = mesh(digest);
+  const auto unstored = SendCommand(
+      directory.socket_path(),
+      SceneAddRequest(*initial, "scene-mesh.unstored", 1U, 0.1, "scene-mesh",
+                      &unstored_shape));
+  EXPECT_NE(unstored.find("\"code\":\"scene_mesh_unavailable\""),
+            std::string::npos)
+      << unstored;
+  EXPECT_NE(unstored.find("is not stored in the activation"), std::string::npos)
+      << unstored;
+  const auto published = scene_source.Read();
+  ASSERT_TRUE(published.has_value());
+  EXPECT_EQ(published->source_generation, initial->source_generation);
+
+  // Stored (after the start-up content collection ran, which would remove an
+  // unreferenced blob): the request passes to the scene owner.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  const auto collected = [&] {
+    std::ifstream input(directory.startup_stderr(), std::ios::binary);
+    const std::string log{std::istreambuf_iterator<char>(input),
+                          std::istreambuf_iterator<char>()};
+    return log.find("Manager activation content collection") != std::string::npos;
+  };
+  while (!collected() && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  ASSERT_TRUE(collected());
+  const auto blob = directory.activation_root() / "raw-artifacts" / "sha256" /
+                    (digest.substr(7U) + ".blob");
+  std::filesystem::create_directories(blob.parent_path());
+  {
+    std::ofstream output(blob, std::ios::binary);
+    output << bytes;
+  }
+  const auto stored = SendCommand(
+      directory.socket_path(),
+      SceneAddRequest(*initial, "scene-mesh.stored", 1U, 0.1, "scene-mesh",
+                      &unstored_shape));
+  EXPECT_EQ(stored.find("scene_mesh_unavailable"), std::string::npos) << stored;
+  // The owner's own commit result (no Manager refusal).
+  EXPECT_NE(stored.find("\"replay_status\":\"accepted_new\""), std::string::npos)
+      << stored;
 }
 
 #if defined(MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST)
@@ -3471,7 +3616,6 @@ TEST(ManagerDaemonProcess,
   const auto request = ApplyRequest(
       directory,
       WaitForAuthoringAdmission(directory).admission_generation,
-      fixture.physical_deployment_artifact_id,
       fixture.physical_deployment_revision,
       fixture.predecessor_graph_revision,
       fixture.predecessor_retained_bundle_id,
@@ -3587,7 +3731,6 @@ TEST(
   const auto request = ApplyRequest(
       directory,
       WaitForAuthoringAdmission(directory).admission_generation,
-      fixture.physical_deployment_artifact_id,
       fixture.physical_deployment_revision, fixture.predecessor_graph_revision,
       fixture.predecessor_retained_bundle_id,
       "manager-pneumatic-commanded-feedback-apply.1", false, "receipt",
@@ -3657,7 +3800,6 @@ TEST(ManagerDaemonProcess,
       directory.socket_path(),
       ApplyRequest(directory,
                    WaitForAuthoringAdmission(directory).admission_generation,
-                   fixture.physical_deployment_artifact_id,
                    fixture.physical_deployment_revision,
                    fixture.predecessor_graph_revision,
                    fixture.predecessor_retained_bundle_id,
@@ -3693,7 +3835,6 @@ TEST(ManagerDaemonProcess,
                           const std::string_view accepted) {
     last_request =
         ApplyRequest(directory, admission,
-                     fixture.close_deployment_artifact_id,
                      fixture.close_deployment_revision,
                      physical_graph_revision,
                      fixture.physical_candidate_retained_bundle_id, request_name,
@@ -3824,7 +3965,6 @@ TEST(ManagerDaemonProcess,
     request = ApplyRequest(
         directory,
         WaitForAuthoringAdmission(directory).admission_generation,
-        fixture.physical_deployment_artifact_id,
         fixture.physical_deployment_revision,
         fixture.predecessor_graph_revision,
         fixture.predecessor_retained_bundle_id, "manager-program-apply.1");
@@ -3952,7 +4092,7 @@ TEST(ManagerDaemonProcess,
       ASSERT_TRUE(map.has_value());
       deployment::FilesystemCatalogArtifactStore catalogs(package);
       const auto program = deployment::FilesystemVerifiedProgramSource(package).get_verified(
-          core::ProgramId(fixture.program_id), core::ProgramRevision(fixture.program_revision), *bundle);
+          core::ProgramRevision(fixture.program_revision), *bundle);
       ASSERT_NE(program, nullptr);
       const auto contract = deployment::verify_program_binding_contract(
           program->canonical_program_bytes(), *bundle, map, catalogs);
@@ -4053,7 +4193,6 @@ TEST(ManagerDaemonProcess,
     apply_request =
         ApplyRequest(directory,
                      WaitForAuthoringAdmission(directory).admission_generation,
-                     fixture.physical_deployment_artifact_id,
                      fixture.physical_deployment_revision,
                      fixture.predecessor_graph_revision,
                      fixture.predecessor_retained_bundle_id,
@@ -4186,7 +4325,7 @@ TEST(ManagerDaemonProcess,
   const auto metadata =
       deployment::parse_strict_json_model_yaml(metadata_bytes).root();
   ASSERT_TRUE(metadata.is_object());
-  ASSERT_EQ(metadata.as_object().size(), 9U);
+  ASSERT_EQ(metadata.as_object().size(), 8U);
   ASSERT_EQ(content_identity::canonical_json(metadata), metadata_bytes);
   const auto cell = RequiredText(metadata, "cell_id");
   const auto component = RequiredText(metadata, "component_id");
@@ -4301,7 +4440,6 @@ TEST(ManagerDaemonProcess,
   const auto request =
       ApplyRequest(directory,
                    WaitForAuthoringAdmission(directory).admission_generation,
-                   RequiredText(metadata, "deployment_artifact_id"),
                    RequiredText(metadata, "deployment_revision"),
                    RequiredText(metadata, "predecessor_graph_revision"),
                    predecessor_id, "empty-ros-one-mock.1", false, "receipt",
@@ -4625,7 +4763,7 @@ TEST(ManagerDaemonProcess,
         {"motion", CanonicalValue(CanonicalValue::Object{
             {"kind", CanonicalValue("joint_goal")}, {"joint_names", CanonicalValue(std::move(joint_names))},
             {"positions_rad", RequiredMember(observed, "positions_rad")}})},
-        {"contact_policy_id", CanonicalValue(nullptr)},
+        {"collision_rules", CanonicalValue(CanonicalValue::Array{})},
         {"per_joint_dynamics_limits", CanonicalValue(CanonicalValue::Object{})},
         {"motion_interrupt_scopes", CanonicalValue(CanonicalValue::Array{})},
         {"runtime_object_bindings", CanonicalValue(CanonicalValue::Array{})}});
@@ -4645,7 +4783,6 @@ TEST(ManagerDaemonProcess,
          CanonicalValue(CanonicalValue::Object{
              {"request_key", CanonicalValue(TestRequestKeyText(request_id))},
              {"source_label", CanonicalValue("manager_ros_apply_fixture")}})},
-        {"program_id", RequiredMember(manual, "program_id")},
         {"program_revision", RequiredMember(manual, "program_revision")},
         {"program_binding_id", RequiredMember(manual, "program_binding_id")},
         {"program_run_id", CanonicalValue(nullptr)},
@@ -5038,7 +5175,6 @@ TEST(ManagerDaemonProcess,
                  {"request_key",
                   CanonicalValue(TestRequestKeyText("io-write-wire"))},
                  {"source_label", CanonicalValue("io-write-wire")}})},
-            {"program_id", CanonicalValue("program.io-write-wire")},
             {"program_revision", CanonicalValue("revision.io-write-wire")},
             {"program_binding_id", CanonicalValue("binding.io-write-wire")},
             {"program_run_id", CanonicalValue(156.0)},

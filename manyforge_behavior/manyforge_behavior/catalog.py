@@ -32,10 +32,10 @@ from manyforge_behavior.catalog_schema import (
 
 
 EXPECTED_API_VERSION = "manyforge.node_catalog.v3"
-EXPECTED_CONTENT_VERSION = "3.0.0"
+EXPECTED_CONTENT_VERSION = "4.0.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:cc7d43f05623ebbb3b1012ca7c0557eceb47bbab38bd6eec3345e1261c032318"
+    "sha256:8ea501e0503f9dc6ebfe06ee0ad72e647d5afdb38a06608f98bfecba38480fbb"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -76,6 +76,10 @@ _OWNER_APIS = {
     "orchestration.blackboard",
     "orchestration.clock",
     "orchestration.control_flow",
+    # The Program run owner itself: an operator question and the
+    # Program's own motion-group Stop (Kernel selection Stop).
+    "orchestration.operator",
+    "orchestration.selection_stop",
     "planning.pick_sequence",
     "planning.place_sequence",
     "scene.carried_attachment",
@@ -119,7 +123,7 @@ _CELL_CAPABILITIES = {
     "collision.query.detailed",
     "collision.query.pre_execution",
     "collision.query.runtime",
-    "execution.interrupt.contact_policy",
+    "execution.interrupt.contact_rule",
     "execution.interrupt.resource_scoped",
     "observability.logging.operational",
     "observability.trace.kernel",
@@ -206,7 +210,6 @@ _FORBIDDEN_PORTABLE_NAMES = {
     "tcp_frame",
     "topic",
     "topic_name",
-    "touch_links",
     "trusted_evidence",
     "validation_evidence",
 }

@@ -42,7 +42,6 @@ def _fixture_deployment_compiler(source: str) -> CompiledDeploymentDocument:
     return CompiledDeploymentDocument(
         document=document,
         canonical_json=canonical,
-        deployment_artifact_id=document["deployment_artifact_id"],
         deployment_revision=document["deployment_revision"],
         graph_revision=graph_revision,
     )
@@ -54,13 +53,11 @@ def _selection(program: dict[str, Any]) -> dict[str, Any]:
         "source_document_digest": "sha256:" + "2" * 64,
         "assistant_mode": "forbidden",
         "assistant_projection": None,
-        "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
         "deployment_revision": "sha256:" + "3" * 64,
         "retained_bundle_id": "sha256:" + "4" * 64,
         "graph_revision": "sha256:" + "5" * 64,
         "node_environment_digest": "sha256:" + "8" * 64,
         "owner_identities": [],
-        "program_id": program["program_id"],
         "program_revision": program["program_revision"],
         "program_binding_id": "sha256:" + "6" * 64,
         "program": deepcopy(program),
@@ -89,7 +86,6 @@ def _non_executable_outcome(
         "affected_nodes": ["close_gripper"],
         "api_version": "manyforge.program-binding-outcome.v2",
         "graph_revision": selection["graph_revision"],
-        "program_id": selection["program_id"],
         "program_revision": selection["program_revision"],
         "retained_bundle_id": selection["retained_bundle_id"],
         "unresolved_targets": [
@@ -106,7 +102,6 @@ def _non_executable_status(
     selection: dict[str, Any], *, command_target_id: str = "jaw"
 ) -> dict[str, Any]:
     return {
-        "deployment_artifact_id": selection["deployment_artifact_id"],
         "deployment_revision": selection["deployment_revision"],
         "executable": False,
         "graph_revision": selection["graph_revision"],
@@ -116,7 +111,6 @@ def _non_executable_status(
         ),
         "program": deepcopy(selection["program"]),
         "program_binding_id": None,
-        "program_id": selection["program_id"],
         "program_revision": selection["program_revision"],
         "record_digest": "sha256:" + "b" * 64,
         "retained_bundle_id": selection["retained_bundle_id"],
@@ -135,6 +129,7 @@ def _captured_activation(
     intent = {
         "deployment": deepcopy(selection["deployment"]),
         "model_source_closure": {},
+        "scene_mesh_closure": {},
         "source_document_digest": selection["source_document_digest"],
         "scenario_id": selection["scenario_id"],
         "project_path": "/projects/" + selection["scenario_id"] + ".scenario",
@@ -142,7 +137,6 @@ def _captured_activation(
     prepared = {
         "deployment_revision": selection["deployment_revision"],
         "graph_revision": selection["graph_revision"],
-        "program_id": selection["program_id"],
         "program_revision": selection["program_revision"],
         "program_outcome": deepcopy(program_outcome),
         "retained_bundle_id": selection["retained_bundle_id"],
@@ -182,7 +176,6 @@ class _Headless:
         applied = self.applied
         executable = applied.get("program_binding_id") is not None
         return {
-            "deployment_artifact_id": applied["deployment_artifact_id"],
             "deployment_revision": applied["deployment_revision"],
             "executable": executable,
             "graph_revision": applied["graph_revision"],
@@ -190,7 +183,6 @@ class _Headless:
             "non_executable": None,
             "program": None,
             "program_binding_id": applied.get("program_binding_id"),
-            "program_id": applied["program_id"],
             "program_revision": applied["program_revision"],
             "record_digest": applied["source"]["record_digest"],
             "retained_bundle_id": applied["retained_bundle_id"],
@@ -261,7 +253,6 @@ class _Headless:
             "ok": True,
             "candidate_receipt": {
                 "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
-                "deployment_artifact_id": body["deployment_artifact_id"],
                 "deployment_revision": body["deployment_revision"],
                 "source_document_digest": self.selection[
                     "source_document_digest"
@@ -324,7 +315,6 @@ def _state(
     state.application_start_id = 0x3F9A0000000000A1
     state.node_environment = build_node_environment()
     state.allowed_fs_roots = [str(_ROOT / "examples")]
-    state.allowed_program_write_roots = [str(_ROOT / "examples")]
     state.headless_client = headless
     state.authoring_admission = coordinator
     state.draft_session = ComposerDraftSession(
@@ -458,12 +448,12 @@ def test_no_program_publication_promotes_capture_without_becoming_executable() -
     headless = _Headless(selection)
     headless.applied_status = _non_executable_status(selection)
     headless.applied_status.update(
-        program_id=None, program_revision=None, program=None, non_executable=None,
+        program_revision=None, program=None, non_executable=None,
         message="No Program is selected",
     )
     headless.manager_target = True
     state = _state(headless, _Coordinator(), program=None)
-    selection.update(program_id=None, program_revision=None)
+    selection.update(program_revision=None)
     state._retain_submitted_deployment(_captured_activation(state, selection, {"kind": "no_program"}))
     published = state.published_scenario()
     assert published["ready"] is True

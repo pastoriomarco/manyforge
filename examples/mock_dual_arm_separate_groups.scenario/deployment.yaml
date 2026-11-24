@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -61,8 +61,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [],
     "tags": [
       "dual-robot"
@@ -234,12 +239,7 @@
               "mount_frame": "lite_gripper_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "link_tcp",
-              "touch_links": [
-                "lite_gripper_base_link",
-                "lite_gripper_left_finger",
-                "lite_gripper_right_finger"
-              ]
+              "tcp_frame": "link_tcp"
             }
           ]
         },
@@ -294,18 +294,7 @@
               "mount_frame": "robotiq_2f_85_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "robotiq_85_base_link",
-              "touch_links": [
-                "robotiq_85_base_link",
-                "robotiq_85_left_finger_link",
-                "robotiq_85_left_finger_tip_link",
-                "robotiq_85_left_inner_knuckle_link",
-                "robotiq_85_left_knuckle_link",
-                "robotiq_85_right_finger_link",
-                "robotiq_85_right_finger_tip_link",
-                "robotiq_85_right_inner_knuckle_link",
-                "robotiq_85_right_knuckle_link"
-              ]
+              "tcp_frame": "robotiq_85_base_link"
             }
           ]
         },
@@ -441,8 +430,5 @@
       }
     }
   ],
-  "deployment_artifact_id": "ur5e_lite6_wall",
-  "description": "Mock dual-robot wall example (UR5e and Lite 6).",
-  "name": "ur5e_lite6_wall",
   "policies": {}
 }

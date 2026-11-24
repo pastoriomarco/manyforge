@@ -323,7 +323,6 @@ def test_capture_registration_sends_identities_and_checks_the_returned_claim(
         "schema_version": "manyforge.program_run_execution_capture.v2",
         "claim_generation": 4,
         "program_run_id": 1,
-        "program_id": "pick",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "b" * 64,
         "retained_bundle_id": "sha256:" + "c" * 64,
@@ -400,7 +399,6 @@ def test_program_origin_is_required_privately_and_forbidden_publicly(
 ) -> None:
     operation = {
         "request_context": _stop_body()["request_context"],
-        "program_id": "pick",
         "program_revision": "revision",
         "program_binding_id": "binding",
         "program_run_id": 1,

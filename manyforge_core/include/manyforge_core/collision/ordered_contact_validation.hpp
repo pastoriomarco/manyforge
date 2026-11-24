@@ -35,6 +35,9 @@ struct ContactReleaseSampleSummary {
   double signed_clearance_m = 0.0;
   double penetration_depth_m = 0.0;
   bool separated = false;
+  /// Path steps since the previous sample (see
+  /// CollisionValidationPassConfig::sample_path_steps); absent: unknown.
+  std::optional<double> path_steps;
 };
 
 struct ContactReleaseSegmentSummary {
@@ -52,6 +55,9 @@ struct ContactReleaseSegmentSummary {
   std::optional<ContactReleaseSampleSummary>
       first_active_contact_exceeding_contact_bound;
   std::optional<ContactReleaseSampleSummary> first_internal_depth_increase;
+  /// A spring (OD-356): the first sample after the segment's first whose
+  /// depth grew by more than the step limit.
+  std::optional<ContactReleaseSampleSummary> first_compression_step_exceeded;
   std::optional<double> minimum_effective_depth_m;
   double last_effective_depth_m = 0.0;
   bool saw_separation = false;
@@ -77,6 +83,7 @@ struct OrderedContactChunkSummary {
 };
 
 struct ContactReleaseViolation {
+  /// Index into `CollisionPolicySnapshot::contact_rules`.
   std::size_t policy_entry_index = 0;
   std::int64_t waypoint_index = -1;
   std::optional<std::int64_t> time_from_start_ns;
@@ -86,24 +93,61 @@ struct ContactReleaseViolation {
   std::optional<double> current_depth_m;
 };
 
+/// One step-limit violation of a grouped spring rule (OD-371).
+struct SpringGroupStepViolation {
+  /// Index into the records given.
+  std::size_t record_index = 0;
+  /// Index into `CollisionPolicySnapshot::contact_rules` of the rule's
+  /// deepest pair at that record.
+  std::size_t policy_entry_index = 0;
+  double previous_depth_m = 0.0;
+  double depth_m = 0.0;
+  double step_limit_m = 0.0;
+};
+
+/// The step limit of the grouped spring rules (`CollisionContactRule::
+/// spring_group`) of kind `kind` over one whole trajectory's records, in
+/// order (OD-371). A grouped rule is one spring: its depth at a record is the
+/// deepest penetration over its pairs that collide there with a signed
+/// clearance (0 when none does), and its step limit applies to that depth
+/// against the previous record's; the first record has no predecessor. At
+/// most one violation per rule, the first, on the rule's deepest pair. The
+/// depth limit and a missing clearance stay per pair. O(records x pairs).
+[[nodiscard]] std::vector<SpringGroupStepViolation> spring_group_step_violations(
+    const CollisionPolicySnapshot& policy,
+    const std::vector<CollisionValidationWaypointRecord>& records,
+    const CollisionValidationPassConfig& pass_config, ContactRuleKind kind);
+
+/// The violations of `spring_group_step_violations` for the tracked kind
+/// (whole-move contact with a depth limit), as contact-release violations
+/// for `apply_contact_release_violations`. `records` are one whole
+/// trajectory's, indexed as the pass is.
+[[nodiscard]] std::vector<ContactReleaseViolation> spring_group_release_violations(
+    const CollisionPolicySnapshot& policy,
+    const std::vector<CollisionValidationWaypointRecord>& records,
+    const CollisionValidationPassConfig& pass_config);
+
 /// Build one bounded chunk summary from worker-local records. `global_offset`
 /// maps local record indices to the trajectory's original index space.
+/// `pass_config` gives the samples' path steps for a spring's step limit
+/// (null: none checked).
 OrderedContactChunkSummary summarize_ordered_contact_chunk(
     const CollisionPolicySnapshot& policy,
     const std::vector<CollisionValidationWaypointRecord>& records, std::size_t global_offset,
-    std::size_t range_end);
+    std::size_t range_end, const CollisionValidationPassConfig* pass_config = nullptr);
 
 SupportContactEvaluationStateMap initial_support_contact_state(
     const CollisionPolicySnapshot& policy);
 
-/// Compose one support-contact transition summary into an exact prefix state.
+/// Compose one tracked-contact transition summary into an exact prefix state.
 /// Returns false on a policy/summary identity mismatch.
 bool advance_support_contact_state(const OrderedContactChunkSummary& summary,
                                    SupportContactEvaluationStateMap& state,
                                    std::string* error_reason = nullptr);
 
 /// Merge contact-release summaries in original chunk order. The function
-/// returns at most one earliest violation per policy identity; it never reads
+/// returns at most one earliest violation per tracked contact-rule pair
+/// (release rules and whole-move contact rules with a depth limit); it never reads
 /// waypoint records or calls a collision engine.
 std::vector<ContactReleaseViolation> merge_contact_release_summaries(
     const CollisionPolicySnapshot& policy, const std::vector<OrderedContactChunkSummary>& summaries,

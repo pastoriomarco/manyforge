@@ -1,11 +1,13 @@
 // Unit tests for CollisionValidationCoordinator: trajectory-wide
-// validation, support-contact state across waypoints, fail-closed
+// validation, release-rule state across waypoints, fail-closed
 // preservation, and pose-source borrow/retry behavior.
 
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/execution_collision_support.hpp>
 
 #include <gtest/gtest.h>
+
+#include "collision_rule_test_helpers.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -175,17 +177,15 @@ CollisionPolicySnapshot make_contact_release_snapshot(
     bool require_separation_by_end,
     bool require_strictly_decreasing_penetration) {
   CollisionPolicySnapshot s = make_freespace_snapshot();
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.mode = CollisionContactPolicyMode::kContactRelease;
-  entry.max_start_penetration_m = max_start_penetration_m;
-  entry.release_tolerance_m = 1e-5;
-  entry.min_release_progress_m = 0.0;
-  entry.require_separation_by_end = require_separation_by_end;
-  entry.require_strictly_decreasing_penetration =
+  auto entry = testing::release_rule(pair);
+  testing::release_of(entry).max_start_penetration_m = max_start_penetration_m;
+  testing::release_of(entry).release_tolerance_m = 1e-5;
+  testing::release_of(entry).min_release_progress_m = 0.0;
+  testing::release_of(entry).require_separation_by_end = require_separation_by_end;
+  testing::release_of(entry).require_strictly_decreasing_penetration =
       require_strictly_decreasing_penetration;
-  entry.allow_recontact = false;
-  s.support_contacts.push_back(entry);
+  testing::release_of(entry).allow_recontact = false;
+  testing::add_contact_rule(s, entry);
   return s;
 }
 
@@ -195,53 +195,40 @@ CollisionPolicySnapshot make_binary_contact_release_snapshot(
   auto snapshot = make_contact_release_snapshot(
       pair, /*max_start_penetration_m=*/0.0, require_separation_by_end,
       /*require_strictly_decreasing_penetration=*/false);
-  auto& entry = snapshot.support_contacts.front();
-  entry.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
-  entry.enforce_max_start_penetration = false;
-  entry.max_start_penetration_m = 0.0;
-  entry.release_tolerance_m = 0.0;
-  entry.min_release_progress_m = 0.0;
-  entry.require_strictly_decreasing_penetration = false;
-  entry.allow_recontact = allow_recontact;
+  auto& entry = snapshot.contact_rules.front();
+  testing::release_of(entry).release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  testing::release_of(entry).enforce_max_start_penetration = false;
+  testing::release_of(entry).max_start_penetration_m = 0.0;
+  testing::release_of(entry).release_tolerance_m = 0.0;
+  testing::release_of(entry).min_release_progress_m = 0.0;
+  testing::release_of(entry).require_strictly_decreasing_penetration = false;
+  testing::release_of(entry).allow_recontact = allow_recontact;
   return snapshot;
 }
 
+/// One pair under a whole-move contact rule with a depth limit: the pair may
+/// appear, disappear and touch at the final sample as long as every colliding
+/// depth stays within the limit.
 CollisionPolicySnapshot make_bounded_penetration_snapshot(
-    const CollisionPairId& pair, double max_contact_penetration_m) {
-  auto snapshot = make_contact_release_snapshot(
-      pair, /*max_start_penetration_m=*/0.0,
-      /*require_separation_by_end=*/true,
-      /*require_strictly_decreasing_penetration=*/true);
-  auto& entry = snapshot.support_contacts.front();
-  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  entry.max_contact_penetration_m = max_contact_penetration_m;
-  // These release-only values are deliberately restrictive. Bounded
-  // penetration ignores them and permits appearance, recontact, and contact
-  // at the final sample as long as every colliding depth stays within the cap.
-  entry.allow_recontact = false;
-  return snapshot;
-}
-
-CollisionPolicySnapshot make_contact_process_snapshot(
-    const CollisionPairId& pair) {
+    const CollisionPairId& pair, double max_penetration_m) {
   CollisionPolicySnapshot s = make_freespace_snapshot();
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.mode = CollisionContactPolicyMode::kContactProcess;
-  s.support_contacts.push_back(entry);
+  testing::add_contact_rule(s, testing::contact_rule(pair, max_penetration_m, std::nullopt, "bounded_contact"));
   return s;
 }
 
-CollisionPolicySnapshot make_contact_grasp_snapshot() {
+const char kFingerLeft[] = "component/arm/model/arm_model/body/finger_left/collision/0";
+const char kFingerRight[] = "component/arm/model/arm_model/body/finger_right/collision/0";
+const char kPartShape[] = "scene/part/shape/0";
+
+/// Both fingers may touch the part in the last quarter of the move, at most
+/// 3 mm deep (rule `fingers_on_part`).
+CollisionPolicySnapshot make_windowed_contact_snapshot(
+    std::optional<double> max_penetration_m = 0.003) {
   CollisionPolicySnapshot s = make_freespace_snapshot();
   s.require_full_diagnostics = true;
-  ContactGraspPolicyEntry entry;
-  entry.policy_id = "contact_grasp/part";
-  entry.selected_object_id = "part";
-  entry.allowed_robot_links = {"finger_left", "finger_right"};
-  entry.max_penetration_m = 0.003;
-  entry.terminal_window_start_fraction = 0.75;
-  s.contact_grasps.push_back(entry);
+  testing::add_contact_rule(s, testing::contact_rule({kFingerLeft, kPartShape}, max_penetration_m, 0.75, "fingers_on_part"));
+  testing::add_contact_rule(s, testing::contact_rule({kFingerRight, kPartShape}, max_penetration_m,
+                                                  0.75, "fingers_on_part"));
   return s;
 }
 
@@ -645,8 +632,7 @@ TEST(CollisionValidationCoordinatorTest,
       /*require_strictly_decreasing_penetration=*/false);
   const auto binary_snapshot = make_binary_contact_release_snapshot(
       binary_pair, /*require_separation_by_end=*/false);
-  cfg.policy_snapshot.support_contacts.push_back(
-      binary_snapshot.support_contacts.front());
+  testing::add_contact_rule(cfg.policy_snapshot, binary_snapshot.contact_rules.front());
   CollisionValidationCoordinator coord(cfg);
 
   const auto bundle = coord.validate_trajectory(
@@ -676,10 +662,8 @@ TEST(CollisionValidationCoordinatorTest,
       binary_pair, /*require_separation_by_end=*/true);
   const auto bounded =
       make_bounded_penetration_snapshot(bounded_pair, 0.005);
-  cfg.policy_snapshot.support_contacts.push_back(
-      binary.support_contacts.front());
-  cfg.policy_snapshot.support_contacts.push_back(
-      bounded.support_contacts.front());
+  testing::add_contact_rule(cfg.policy_snapshot, binary.contact_rules.front());
+  testing::add_contact_rule(cfg.policy_snapshot, bounded.contact_rules.front());
 
   auto sample = [](std::vector<CollisionPairId> colliding,
                    std::vector<CollisionPairClearance> clearances) {
@@ -756,18 +740,16 @@ TEST(CollisionValidationCoordinatorTest,
 }
 
 TEST(CollisionValidationCoordinatorTest,
-     ContactGraspRequestsOnlyConcreteSelectedPairEvidence) {
+     WindowedContactRequestsOnlyItsPairsThatNeedADepth) {
   MockCollisionQueryEngine engine;
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   const auto binary = make_binary_contact_release_snapshot(
       {"scene/table/shape/0", "scene/binary_part/shape/0"},
       /*require_separation_by_end=*/false);
-  cfg.policy_snapshot.support_contacts.push_back(
-      binary.support_contacts.front());
-  cfg.contact_policy_id = "contact_grasp/part";
+  testing::add_contact_rule(cfg.policy_snapshot, binary.contact_rules.front());
   CollisionValidationCoordinator coord(cfg);
 
   const auto bundle = coord.validate_trajectory(
@@ -891,20 +873,23 @@ TEST(CollisionValidationCoordinatorTest,
   const auto& diagnostics =
       bundle.waypoint_records[2].result.raw_diagnostics;
   EXPECT_EQ(diagnostics.at("contact_release_violation"),
-            "contact_penetration_exceeds_policy");
-  EXPECT_EQ(diagnostics.at("contact_release_mode"),
-            "bounded_penetration");
-  EXPECT_EQ(diagnostics.at("contact_release_max_contact_penetration_m"),
+            "contact_penetration_exceeded");
+  EXPECT_EQ(diagnostics.at("contact_release_mode"), "contact");
+  EXPECT_EQ(diagnostics.at("contact_release_rule_id"), "bounded_contact");
+  EXPECT_EQ(diagnostics.at("contact_release_max_penetration_m"),
             "0.005000");
   EXPECT_EQ(diagnostics.at("contact_release_current_penetration_m"),
             "0.006000");
-  const auto violation = contact_policy_violation_details(
+  const auto violation = contact_rule_violation_details(
       bundle, cfg.policy_snapshot, "block_dispatch");
   ASSERT_TRUE(violation.has_value());
-  EXPECT_EQ(violation->at("policy_mode"), "bounded_penetration");
-  EXPECT_EQ(violation->at("zone_id"),
-            "support_pair:component/arm/model/arm_model/body/grasp/"
-            "collision/0<->scene/box/shape/0");
+  EXPECT_EQ(violation->at("contact_rule_violation"), "contact_penetration_exceeded");
+  EXPECT_EQ(violation->at("policy_mode"), "contact");
+  EXPECT_EQ(violation->at("collision_rule_id"), "bounded_contact");
+  EXPECT_EQ(violation->at("contact_body_a"),
+            "component/arm/model/arm_model/body/grasp/collision/0");
+  EXPECT_EQ(violation->at("contact_body_b"), "scene/box/shape/0");
+  EXPECT_EQ(violation->find("zone_id"), violation->end());
   EXPECT_EQ(violation->at("contact_present"), "true");
   EXPECT_EQ(violation->at("initial_contact_pair_count"), "0");
   EXPECT_EQ(violation->at("current_contact_pair_count"), "1");
@@ -912,13 +897,11 @@ TEST(CollisionValidationCoordinatorTest,
             "selected_colliding_pairs");
   EXPECT_EQ(violation->at("evaluated_distance_pair_count"), "1");
   EXPECT_DOUBLE_EQ(std::stod(violation->at("penetration_depth_m")), 0.006);
-  EXPECT_DOUBLE_EQ(
-      std::stod(violation->at("max_contact_penetration_m")), 0.005);
+  EXPECT_DOUBLE_EQ(std::stod(violation->at("max_penetration_m")), 0.005);
   EXPECT_EQ(violation->at("within_penetration_bound"), "false");
   EXPECT_EQ(violation->at("response"), "block_dispatch");
   EXPECT_EQ(violation->at("classification"), "blocking_collision");
   EXPECT_EQ(violation->find("release_evidence_mode"), violation->end());
-  EXPECT_EQ(violation->find("max_penetration_m"), violation->end());
 }
 
 TEST(CollisionValidationCoordinatorTest,
@@ -1044,16 +1027,16 @@ TEST(CollisionValidationCoordinatorTest,
             "binary_contact");
   EXPECT_EQ(diagnostics.find("contact_release_current_penetration_m"),
             diagnostics.end());
-  const auto violation = contact_policy_violation_details(
+  const auto violation = contact_rule_violation_details(
       bundle, cfg.policy_snapshot, "block_dispatch");
   ASSERT_TRUE(violation.has_value());
   EXPECT_EQ(violation->at("release_evidence_mode"), "binary_contact");
   EXPECT_EQ(violation->at("distance_request_mode"), "none");
   EXPECT_EQ(violation->at("evaluated_distance_pair_count"), "0");
   EXPECT_EQ(violation->find("penetration_depth_m"), violation->end());
+  EXPECT_EQ(violation->at("policy_mode"), "release");
+  EXPECT_EQ(violation->at("collision_rule_id"), "release_rule");
   EXPECT_EQ(violation->find("max_penetration_m"), violation->end());
-  EXPECT_EQ(violation->find("max_contact_penetration_m"),
-            violation->end());
 }
 
 TEST(CollisionValidationCoordinatorTest,
@@ -1142,8 +1125,8 @@ TEST(CollisionValidationCoordinatorTest,
   append_collision_failure_diagnostics(details, bundle);
   EXPECT_EQ(pre_dispatch_collision_validation_message(
                 details, bundle.decision.action),
-            "Support-contact initial penetration exceeds the permitted "
-            "envelope: component/arm/model/arm_model/body/grasp/collision/0 "
+            "Release pair starts deeper than its rule allows: "
+            "component/arm/model/arm_model/body/grasp/collision/0 "
             "<-> scene/box/shape/0");
 }
 
@@ -1161,7 +1144,7 @@ TEST(CollisionValidationCoordinatorTest,
       pair, /*max_start=*/0.005,
       /*require_separation_by_end=*/true,
       /*require_strictly_decreasing_penetration=*/true);
-  cfg.policy_snapshot.support_contacts.front()
+  testing::release_of(cfg.policy_snapshot.contact_rules.front())
       .enforce_max_start_penetration = false;
   CollisionValidationCoordinator coord(cfg);
 
@@ -1242,41 +1225,13 @@ TEST(CollisionValidationCoordinatorTest,
             "scene/box/shape/0");
   EXPECT_EQ(pre_dispatch_collision_validation_message(
                 details, bundle.decision.action),
-            "Support-contact pair did not separate by final waypoint: "
+            "Release pair did not separate by the final waypoint: "
             "component/arm/model/arm_model/body/grasp/collision/0 <-> "
             "scene/box/shape/0");
 }
 
 TEST(CollisionValidationCoordinatorTest,
-     ContactProcessModeFailsClosed) {
-  // kContactProcess is reserved fail-closed until force/controller sensing
-  // contracts qualify. Validation must reject with
-  // "contact_process_policy_not_implemented".
-  CollisionPairId pair{"component/arm/model/arm_model/body/tcp/collision/0", "scene/part/shape/0"};
-  MockCollisionQueryEngine engine;
-  engine.default_result = make_pass_result_with_clearance(pair, -0.001);
-  CollisionCancellationToken cancel;
-
-  CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_process_snapshot(pair);
-  CollisionValidationCoordinator coord(cfg);
-
-  auto bundle = coord.validate_trajectory(
-      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
-
-  EXPECT_FALSE(bundle.decision.accepted);
-  EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
-  ASSERT_FALSE(bundle.waypoint_records.empty());
-  EXPECT_EQ(bundle.waypoint_records.front()
-                .result.raw_diagnostics.at("contact_release_violation"),
-            "contact_process_policy_not_implemented");
-  EXPECT_EQ(bundle.waypoint_records.front()
-                .result.raw_diagnostics.at("contact_release_mode"),
-            "contact_process");
-}
-
-TEST(CollisionValidationCoordinatorTest,
-     ContactGraspAllowsSelectedObjectContactInTerminalWindow) {
+     WindowedContactAllowsContactInItsWindow) {
   CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[3] =
@@ -1284,8 +1239,7 @@ TEST(CollisionValidationCoordinatorTest,
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   CollisionValidationCoordinator coord(cfg);
 
   auto bundle = coord.validate_trajectory(
@@ -1297,11 +1251,11 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(bundle.waypoint_records[3]
                 .result.normalized_pairs_classified.front()
                 .classification,
-            CollisionPairClassification::kAllowedContactGrasp);
+            CollisionPairClassification::kAllowedContactRule);
 }
 
 TEST(CollisionValidationCoordinatorTest,
-     ContactGraspRejectsCollidingPairWithPositiveClearance) {
+     WindowedContactRejectsCollidingPairWithPositiveClearance) {
   const CollisionPairId pair{
       "component/arm/model/arm_model/body/finger_left/collision/0",
       "scene/part/shape/0"};
@@ -1311,8 +1265,7 @@ TEST(CollisionValidationCoordinatorTest,
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   CollisionValidationCoordinator coord(cfg);
 
   const auto bundle = coord.validate_trajectory(
@@ -1323,20 +1276,19 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(bundle.waypoint_records[3].result.engine_status,
             CollisionEngineStatus::kDiagnosticIncomplete);
   EXPECT_EQ(bundle.waypoint_records[3]
-                .result.raw_diagnostics.at("contact_grasp_violation"),
+                .result.raw_diagnostics.at("contact_rule_violation"),
             "missing_signed_clearance");
 }
 
 TEST(CollisionValidationCoordinatorTest,
-     ContactGraspFailsDiagnosticIncompleteWhenCollidingClearanceIsAbsent) {
+     WindowedContactFailsDiagnosticIncompleteWhenCollidingClearanceIsAbsent) {
   const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[3] = make_colliding_result(pair);
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   CollisionValidationCoordinator coord(cfg);
 
   const auto bundle = coord.validate_trajectory(
@@ -1351,12 +1303,12 @@ TEST(CollisionValidationCoordinatorTest,
             CollisionEngineStatus::kDiagnosticIncomplete);
   EXPECT_EQ(record.result.decision,
             CollisionDecisionResult::kInconclusiveFail);
-  EXPECT_EQ(record.result.raw_diagnostics.at("contact_grasp_violation"),
+  EXPECT_EQ(record.result.raw_diagnostics.at("contact_rule_violation"),
             "missing_signed_clearance");
 }
 
 TEST(CollisionValidationCoordinatorTest,
-     ContactGraspEnrichesEngineDiagnosticIncompleteForMatchedMissingMetric) {
+     WindowedContactEnrichesEngineDiagnosticIncompleteForMatchedMissingMetric) {
   const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   auto incomplete = make_colliding_result(pair);
@@ -1369,8 +1321,7 @@ TEST(CollisionValidationCoordinatorTest,
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   CollisionValidationCoordinator coord(cfg);
 
   const auto bundle = coord.validate_trajectory(
@@ -1384,24 +1335,20 @@ TEST(CollisionValidationCoordinatorTest,
   ASSERT_EQ(record.result.normalized_pairs_classified.size(), 1u);
   EXPECT_EQ(record.result.normalized_pairs_classified.front().classification,
             CollisionPairClassification::kDiagnosticIncomplete);
-  EXPECT_EQ(record.result.raw_diagnostics.at("contact_grasp_violation"),
+  EXPECT_EQ(record.result.raw_diagnostics.at("contact_rule_violation"),
             "missing_signed_clearance");
 
-  const auto violation = contact_policy_violation_details(
+  const auto violation = contact_rule_violation_details(
       bundle, cfg.policy_snapshot, "block_dispatch");
   ASSERT_TRUE(violation.has_value());
-  EXPECT_EQ(violation->at("contact_policy_violation"),
+  EXPECT_EQ(violation->at("contact_rule_violation"),
             "missing_grasp_contact_clearance");
-  EXPECT_EQ(violation->at("contact_policy_id"), "contact_grasp/part");
-  EXPECT_EQ(violation->at("policy_mode"), "contact_grasp");
-  EXPECT_EQ(violation->at("zone_id"),
-            "contact_grasp_pair:component/arm/model/arm_model/body/"
-            "finger_left/collision/0<->scene/part/shape/0");
+  EXPECT_EQ(violation->at("collision_rule_id"), "fingers_on_part");
+  EXPECT_EQ(violation->at("policy_mode"), "contact");
   EXPECT_EQ(violation->at("contact_body_a"),
             "component/arm/model/arm_model/body/finger_left/collision/0");
   EXPECT_EQ(violation->at("contact_body_b"), "scene/part/shape/0");
   EXPECT_EQ(violation->at("contact_present"), "true");
-  EXPECT_EQ(violation->at("selected_object_id"), "part");
   EXPECT_EQ(violation->at("distance_request_mode"),
             "selected_colliding_pairs");
   EXPECT_EQ(violation->at("evaluated_distance_pair_count"), "0");
@@ -1414,8 +1361,130 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_EQ(violation->find("release_evidence_mode"), violation->end());
 }
 
+TEST(CollisionValidationCoordinatorTest, SpringContactRefusesACompressionJump) {
+  // OD-356: whole-move spring (stroke 10 mm, 2 mm per sample) and the same
+  // spring under an end window.
+  const CollisionPairId pair{"component/arm/model/arm_model/body/grasp/collision/0",
+                             "scene/box/shape/0"};
+  for (const bool windowed : {false, true}) {
+    SCOPED_TRACE(windowed);
+    MockCollisionQueryEngine engine;
+    for (int i = 0; i < 6; ++i) engine.result_by_waypoint[i] = make_pass_result_without_clearance();
+    engine.result_by_waypoint[6] = make_colliding_result_with_clearance(pair, -0.001);
+    engine.result_by_waypoint[7] = make_colliding_result_with_clearance(pair, -0.0035);
+    engine.result_by_waypoint[8] = make_colliding_result_with_clearance(pair, -0.004);
+    CollisionCancellationToken cancel;
+
+    CollisionValidationPassConfig cfg;
+    cfg.policy_snapshot = make_freespace_snapshot();
+    cfg.policy_snapshot.require_full_diagnostics = true;
+    auto rule = testing::contact_rule(pair, 0.010, windowed ? std::optional<double>(0.75)
+                                                            : std::nullopt,
+                                      "holder_spring");
+    testing::contact_of(rule).max_compression_step_m = 0.002;
+    testing::add_contact_rule(cfg.policy_snapshot, rule);
+    CollisionValidationCoordinator coord(cfg);
+
+    const auto bundle =
+        coord.validate_trajectory(make_snapshot(), engine, make_trivial_trajectory(9), cancel);
+    ASSERT_FALSE(bundle.decision.accepted);
+    ASSERT_TRUE(bundle.decision.first_failing_waypoint);
+    EXPECT_EQ(*bundle.decision.first_failing_waypoint, 7);
+    const auto violation =
+        contact_rule_violation_details(bundle, cfg.policy_snapshot, "block_dispatch");
+    ASSERT_TRUE(violation.has_value());
+    EXPECT_EQ(violation->at("contact_rule_violation"), "contact_compression_step_exceeded");
+    EXPECT_EQ(violation->at("collision_rule_id"), "holder_spring");
+    EXPECT_DOUBLE_EQ(std::stod(violation->at("max_compression_step_m")), 0.002);
+
+    // The same press, 1.5 mm per sample, is accepted.
+    engine.result_by_waypoint[7] = make_colliding_result_with_clearance(pair, -0.0025);
+    const auto smooth =
+        coord.validate_trajectory(make_snapshot(), engine, make_trivial_trajectory(9), cancel);
+    EXPECT_TRUE(smooth.decision.accepted);
+  }
+}
+
+TEST(CollisionValidationCoordinatorTest, GroupedSpringIsCheckedAsOneSpring) {
+  // OD-371: a spring slider and the tube it carries against an endplate,
+  // one rule (stroke 10 mm, 2 mm per sample), whole move and end window.
+  const CollisionPairId slider{"component/holder/model/holder_model/body/holder_rod/collision/0",
+                               "scene/endplate/shape/0"};
+  const CollisionPairId tube{"scene/endplate/shape/0", "scene/tube/shape/0"};
+  const auto sample = [&](double slider_depth, double tube_depth) {
+    auto result = make_pass_result_without_clearance();
+    for (const auto& [pair, depth] : {std::pair{slider, slider_depth}, std::pair{tube, tube_depth}}) {
+      if (depth > 0.0) {
+        result.in_collision = true;
+        result.decision = CollisionDecisionResult::kFail;
+        result.normalized_pairs.push_back(pair);
+        result.pair_clearances.push_back(CollisionPairClearance{pair, -depth});
+      }
+    }
+    return result;
+  };
+  for (const bool windowed : {false, true}) {
+    for (const bool grouped : {true, false}) {
+      SCOPED_TRACE(std::string(windowed ? "windowed" : "whole move") +
+                   (grouped ? " grouped" : " per pair"));
+      CollisionValidationPassConfig cfg;
+      cfg.policy_snapshot = make_freespace_snapshot();
+      cfg.policy_snapshot.require_full_diagnostics = true;
+      for (const auto& pair : {slider, tube}) {
+        auto rule = testing::contact_rule(pair, 0.010,
+                                          windowed ? std::optional<double>(0.75) : std::nullopt,
+                                          "tube_into_endplate");
+        testing::contact_of(rule).max_compression_step_m = 0.002;
+        if (grouped) {
+          testing::contact_of(rule).spring_group = CollisionSpringGroup{
+              ControllableComponentId("holder"), "holder_rod", {0.0, 0.0, 1.0}};
+        }
+        testing::add_contact_rule(cfg.policy_snapshot, rule);
+      }
+      CollisionValidationCoordinator coord(cfg);
+      CollisionCancellationToken cancel;
+      MockCollisionQueryEngine engine;
+      for (int i = 0; i < 6; ++i) engine.result_by_waypoint[i] = make_pass_result_without_clearance();
+      // The contact moves from the tube to the slider: the rule's depth goes
+      // 1 mm -> 2.6 mm -> 4 mm, the slider's alone 0 -> 2.6 mm.
+      engine.result_by_waypoint[6] = sample(0.0, 0.001);
+      engine.result_by_waypoint[7] = sample(0.0026, 0.0025);
+      engine.result_by_waypoint[8] = sample(0.004, 0.0);
+
+      const auto handover =
+          coord.validate_trajectory(make_snapshot(), engine, make_trivial_trajectory(9), cancel);
+      if (grouped) {
+        EXPECT_TRUE(handover.decision.accepted);
+      } else {
+        ASSERT_FALSE(handover.decision.accepted);
+        ASSERT_TRUE(handover.decision.first_failing_waypoint);
+        EXPECT_EQ(*handover.decision.first_failing_waypoint, 7);
+        const auto violation =
+            contact_rule_violation_details(handover, cfg.policy_snapshot, "block_dispatch");
+        ASSERT_TRUE(violation.has_value());
+        EXPECT_EQ(violation->at("contact_rule_violation"), "contact_compression_step_exceeded");
+        continue;
+      }
+
+      // The rule's depth jumps 2.6 mm -> 5.5 mm: refused on the deepest pair.
+      engine.result_by_waypoint[8] = sample(0.0055, 0.003);
+      const auto jump =
+          coord.validate_trajectory(make_snapshot(), engine, make_trivial_trajectory(9), cancel);
+      ASSERT_FALSE(jump.decision.accepted);
+      ASSERT_TRUE(jump.decision.first_failing_waypoint);
+      EXPECT_EQ(*jump.decision.first_failing_waypoint, 8);
+      const auto violation =
+          contact_rule_violation_details(jump, cfg.policy_snapshot, "block_dispatch");
+      ASSERT_TRUE(violation.has_value());
+      EXPECT_EQ(violation->at("contact_rule_violation"), "contact_compression_step_exceeded");
+      EXPECT_EQ(violation->at("collision_rule_id"), "tube_into_endplate");
+      EXPECT_EQ(violation->at("contact_body_a"), slider.body_a);
+    }
+  }
+}
+
 TEST(CollisionValidationCoordinatorTest,
-     ContactGraspOverCapProducesNativeViolationMetricEvidence) {
+     WindowedContactOverLimitProducesViolationMetricEvidence) {
   const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[3] =
@@ -1423,8 +1492,7 @@ TEST(CollisionValidationCoordinatorTest,
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   CollisionValidationCoordinator coord(cfg);
 
   const auto bundle = coord.validate_trajectory(
@@ -1433,25 +1501,28 @@ TEST(CollisionValidationCoordinatorTest,
   ASSERT_FALSE(bundle.decision.accepted);
   EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
   EXPECT_EQ(bundle.waypoint_records[3]
-                .result.raw_diagnostics.at("contact_grasp_violation"),
-            "penetration_exceeds_policy");
-  const auto violation = contact_policy_violation_details(
+                .result.raw_diagnostics.at("contact_rule_violation"),
+            "contact_penetration_exceeded");
+  const auto violation = contact_rule_violation_details(
       bundle, cfg.policy_snapshot, "block_dispatch");
   ASSERT_TRUE(violation.has_value());
-  EXPECT_EQ(violation->at("contact_policy_violation"),
-            "grasp_contact_penetration_exceeded");
-  EXPECT_EQ(violation->at("policy_mode"), "contact_grasp");
+  EXPECT_EQ(violation->at("contact_rule_violation"),
+            "contact_penetration_exceeded");
+  EXPECT_EQ(violation->at("collision_rule_id"), "fingers_on_part");
+  EXPECT_EQ(violation->at("policy_mode"), "contact");
+  EXPECT_EQ(violation->at("within_penetration_bound"), "false");
+  EXPECT_DOUBLE_EQ(std::stod(violation->at("end_from_fraction")), 0.75);
   EXPECT_DOUBLE_EQ(std::stod(violation->at("penetration_depth_m")), 0.004);
   EXPECT_DOUBLE_EQ(std::stod(violation->at("current_penetration_m")), 0.004);
   EXPECT_DOUBLE_EQ(std::stod(violation->at("max_penetration_m")), 0.003);
-  EXPECT_EQ(violation->at("inside_terminal_window"), "true");
-  EXPECT_EQ(violation->at("allowed_contact_grasp"), "false");
+  EXPECT_EQ(violation->at("inside_window"), "true");
+  EXPECT_EQ(violation->find("zone_id"), violation->end());
   EXPECT_EQ(violation->find("initial_contact_pair_count"), violation->end());
   EXPECT_EQ(violation->find("release_evidence_mode"), violation->end());
 }
 
 TEST(CollisionValidationCoordinatorTest,
-     ContactGraspInitialContactKeepsExplicitNativeReason) {
+     WindowedContactAtTheFirstSampleKeepsItsReason) {
   const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] =
@@ -1459,8 +1530,7 @@ TEST(CollisionValidationCoordinatorTest,
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   CollisionValidationCoordinator coord(cfg);
 
   const auto bundle = coord.validate_trajectory(
@@ -1468,19 +1538,19 @@ TEST(CollisionValidationCoordinatorTest,
 
   ASSERT_FALSE(bundle.decision.accepted);
   EXPECT_EQ(bundle.waypoint_records[0]
-                .result.raw_diagnostics.at("contact_grasp_violation"),
+                .result.raw_diagnostics.at("contact_rule_violation"),
             "initial_sample_in_contact");
-  const auto violation = contact_policy_violation_details(
+  const auto violation = contact_rule_violation_details(
       bundle, cfg.policy_snapshot, "block_dispatch");
   ASSERT_TRUE(violation.has_value());
-  EXPECT_EQ(violation->at("contact_policy_violation"),
+  EXPECT_EQ(violation->at("contact_rule_violation"),
             "initial_sample_in_contact");
-  EXPECT_EQ(violation->at("inside_terminal_window"), "false");
+  EXPECT_EQ(violation->at("inside_window"), "false");
   EXPECT_DOUBLE_EQ(std::stod(violation->at("penetration_depth_m")), 0.001);
 }
 
 TEST(CollisionValidationCoordinatorTest,
-     ContactGraspRejectsSelectedObjectContactBeforeTerminalWindow) {
+     WindowedContactRejectsContactBeforeItsWindow) {
   CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[1] =
@@ -1488,8 +1558,7 @@ TEST(CollisionValidationCoordinatorTest,
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   CollisionValidationCoordinator coord(cfg);
 
   auto bundle = coord.validate_trajectory(
@@ -1500,28 +1569,27 @@ TEST(CollisionValidationCoordinatorTest,
   ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
   EXPECT_EQ(*bundle.decision.first_failing_waypoint, 1);
   EXPECT_EQ(bundle.waypoint_records[1]
-                .result.raw_diagnostics.at("contact_grasp_violation"),
+                .result.raw_diagnostics.at("contact_rule_violation"),
             "contact_before_terminal_window");
-  const auto violation = contact_policy_violation_details(
+  const auto violation = contact_rule_violation_details(
       bundle, cfg.policy_snapshot, "block_dispatch");
   ASSERT_TRUE(violation.has_value());
-  EXPECT_EQ(violation->at("contact_policy_violation"),
+  EXPECT_EQ(violation->at("contact_rule_violation"),
             "grasp_contact_before_terminal_window");
-  EXPECT_EQ(violation->at("policy_mode"), "contact_grasp");
-  EXPECT_EQ(violation->at("inside_terminal_window"), "false");
+  EXPECT_EQ(violation->at("policy_mode"), "contact");
+  EXPECT_EQ(violation->at("inside_window"), "false");
   EXPECT_DOUBLE_EQ(std::stod(violation->at("penetration_depth_m")), 0.001);
   EXPECT_DOUBLE_EQ(std::stod(violation->at("max_penetration_m")), 0.003);
 }
 
-TEST(CollisionValidationCoordinatorTest, ContactGraspRuntimePrefixUsesOriginalTrajectoryFraction) {
+TEST(CollisionValidationCoordinatorTest, WindowedContactRuntimePrefixUsesOriginalTrajectoryFraction) {
   const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[2] = make_colliding_result_with_clearance(pair, -0.001);
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   cfg.original_trajectory_sample_fractions = {0.25, 0.5, 0.74};
   CollisionValidationCoordinator coord(cfg);
 
@@ -1532,20 +1600,19 @@ TEST(CollisionValidationCoordinatorTest, ContactGraspRuntimePrefixUsesOriginalTr
   EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kReject);
   ASSERT_TRUE(bundle.decision.first_failing_waypoint.has_value());
   EXPECT_EQ(*bundle.decision.first_failing_waypoint, 2);
-  EXPECT_EQ(bundle.waypoint_records[2].result.raw_diagnostics.at("contact_grasp_violation"),
+  EXPECT_EQ(bundle.waypoint_records[2].result.raw_diagnostics.at("contact_rule_violation"),
             "contact_before_terminal_window");
 }
 
 TEST(CollisionValidationCoordinatorTest,
-     ContactGraspRuntimeTerminalPrefixDoesNotBecomeInitialSample) {
+     WindowedContactRuntimeTerminalPrefixDoesNotBecomeInitialSample) {
   const CollisionPairId pair{"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"};
   MockCollisionQueryEngine engine;
   engine.result_by_waypoint[0] = make_colliding_result_with_clearance(pair, -0.001);
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   cfg.original_trajectory_sample_fractions = {0.9};
   CollisionValidationCoordinator coord(cfg);
 
@@ -1555,16 +1622,15 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_TRUE(bundle.decision.accepted);
   ASSERT_EQ(bundle.waypoint_records[0].result.normalized_pairs_classified.size(), 1u);
   EXPECT_EQ(bundle.waypoint_records[0].result.normalized_pairs_classified.front().classification,
-            CollisionPairClassification::kAllowedContactGrasp);
+            CollisionPairClassification::kAllowedContactRule);
 }
 
-TEST(CollisionValidationCoordinatorTest, InvalidRuntimeContactGraspFractionsFailClosed) {
+TEST(CollisionValidationCoordinatorTest, InvalidRuntimeWindowedContactFractionsFailClosed) {
   MockCollisionQueryEngine engine;
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/part";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
   cfg.original_trajectory_sample_fractions = {0.5, 0.4};
   CollisionValidationCoordinator coord(cfg);
 
@@ -1573,18 +1639,18 @@ TEST(CollisionValidationCoordinatorTest, InvalidRuntimeContactGraspFractionsFail
 
   EXPECT_FALSE(bundle.decision.accepted);
   EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
-  EXPECT_EQ(bundle.waypoint_records.front().result.raw_diagnostics.at("contact_grasp_violation"),
-            "invalid_contact_grasp_sample_fractions");
+  EXPECT_EQ(bundle.waypoint_records.front().result.raw_diagnostics.at("contact_rule_violation"),
+            "invalid_contact_rule_sample_fractions");
 }
 
 TEST(CollisionValidationCoordinatorTest,
-     ContactGraspUnknownPolicyFailsClosed) {
+     WindowedContactInvalidRuleFailsClosed) {
   MockCollisionQueryEngine engine;
   CollisionCancellationToken cancel;
 
   CollisionValidationPassConfig cfg;
-  cfg.policy_snapshot = make_contact_grasp_snapshot();
-  cfg.contact_policy_id = "contact_grasp/missing";
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
+  testing::contact_of(cfg.policy_snapshot.contact_rules.front()).end_from_fraction = 1.5;
   CollisionValidationCoordinator coord(cfg);
 
   auto bundle = coord.validate_trajectory(
@@ -1593,10 +1659,159 @@ TEST(CollisionValidationCoordinatorTest,
   EXPECT_FALSE(bundle.decision.accepted);
   EXPECT_EQ(bundle.decision.action, CollisionDecisionAction::kInconclusive);
   EXPECT_EQ(bundle.waypoint_records.front()
-                .result.raw_diagnostics.at("contact_grasp_violation"),
-            "unknown_contact_policy_id");
+                .result.raw_diagnostics.at("contact_rule_violation"),
+            "invalid_collision_rule");
+  EXPECT_EQ(bundle.waypoint_records.front().result.raw_diagnostics.at("contact_rule_id"),
+            "fingers_on_part");
 }
 
+TEST(CollisionValidationCoordinatorTest,
+     WindowedContactWithoutLimitNeedsNoDepthEvidence) {
+  // No max_penetration_m: the depth is not checked and no signed distance is
+  // requested; the window and the first-sample refusal still apply.
+  const CollisionPairId pair{kFingerLeft, kPartShape};
+  MockCollisionQueryEngine engine;
+  engine.result_by_waypoint[3] = make_colliding_result(pair);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_windowed_contact_snapshot(std::nullopt);
+  CollisionValidationCoordinator coord(cfg);
+
+  const auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(4), cancel);
+
+  EXPECT_TRUE(bundle.decision.accepted);
+  ASSERT_FALSE(engine.observed_queries.empty());
+  EXPECT_EQ(engine.observed_queries.front().distance_request_mode,
+            CollisionDistanceRequestMode::kNone);
+  EXPECT_TRUE(engine.observed_queries.front().selected_distance_pairs.empty());
+  EXPECT_EQ(bundle.waypoint_records[3]
+                .result.normalized_pairs_classified.front()
+                .classification,
+            CollisionPairClassification::kAllowedContactRule);
+
+  MockCollisionQueryEngine early_engine;
+  early_engine.result_by_waypoint[1] = make_colliding_result(pair);
+  CollisionValidationCoordinator early_coord(cfg);
+  const auto early = early_coord.validate_trajectory(
+      make_snapshot(), early_engine, make_trivial_trajectory(4), cancel);
+  ASSERT_FALSE(early.decision.accepted);
+  EXPECT_EQ(early.waypoint_records[1].result.raw_diagnostics.at("contact_rule_violation"),
+            "contact_before_terminal_window");
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     SeveralWindowedContactPairsAreActiveInOneMove) {
+  // Both finger pairs touch in the window; a third body is no rule pair.
+  const CollisionPairId left{kFingerLeft, kPartShape};
+  const CollisionPairId right{kFingerRight, kPartShape};
+  MockCollisionQueryEngine engine;
+  auto both = make_colliding_result_with_clearance(left, -0.001);
+  both.normalized_pairs = {left, right};
+  both.pair_clearances.push_back(CollisionPairClearance{right, -0.002});
+  engine.result_by_waypoint[3] = both;
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_windowed_contact_snapshot();
+  CollisionValidationCoordinator coord(cfg);
+
+  const auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(4), cancel);
+
+  EXPECT_TRUE(bundle.decision.accepted);
+  ASSERT_EQ(bundle.waypoint_records[3].result.normalized_pairs_classified.size(), 2u);
+  for (const auto& classified : bundle.waypoint_records[3].result.normalized_pairs_classified) {
+    EXPECT_EQ(classified.classification, CollisionPairClassification::kAllowedContactRule);
+  }
+
+  const CollisionPairId palm{"component/arm/model/arm_model/body/palm/collision/0", kPartShape};
+  MockCollisionQueryEngine palm_engine;
+  palm_engine.result_by_waypoint[3] = make_colliding_result_with_clearance(palm, -0.001);
+  CollisionValidationCoordinator palm_coord(cfg);
+  const auto refused = palm_coord.validate_trajectory(
+      make_snapshot(), palm_engine, make_trivial_trajectory(4), cancel);
+  EXPECT_FALSE(refused.decision.accepted);
+  EXPECT_EQ(refused.decision.action, CollisionDecisionAction::kReject);
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     WholeMoveContactWithoutLimitIsAllowedFromTheFirstSample) {
+  const CollisionPairId pair{kFingerLeft, kPartShape};
+  MockCollisionQueryEngine engine;
+  engine.default_result = make_colliding_result(pair);
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_freespace_snapshot();
+  testing::add_contact_rule(cfg.policy_snapshot, testing::contact_rule(pair));
+  CollisionValidationCoordinator coord(cfg);
+
+  const auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(3), cancel);
+
+  EXPECT_TRUE(bundle.decision.accepted);
+  ASSERT_EQ(bundle.waypoint_records.size(), 3u);
+  for (const auto& record : bundle.waypoint_records) {
+    ASSERT_EQ(record.result.normalized_pairs_classified.size(), 1u);
+    EXPECT_EQ(record.result.normalized_pairs_classified.front().classification,
+              CollisionPairClassification::kAllowedContactRule);
+  }
+  EXPECT_EQ(engine.observed_queries.front().distance_request_mode,
+            CollisionDistanceRequestMode::kNone);
+}
+
+TEST(CollisionValidationCoordinatorTest,
+     ClearanceRefusalNamesTheRuleThatHoldsThePair) {
+  // The engine reports the pair as colliding because it is closer than its
+  // clearance; the refusal details name the clearance rule and its value.
+  const CollisionPairId pair{"component/arm/model/arm_model/body/wrist/collision/0",
+                             "scene/wall/shape/0"};
+  auto margins = std::make_shared<CollisionClearanceMargins>();
+  margins->rule_ids = {"everything", "wrist_near_wall"};
+  margins->pairs = {CollisionPairMargin{pair, 0.005, 1U}};
+
+  MockCollisionQueryEngine engine;
+  auto near = make_colliding_result(pair);
+  near.clearance_violations = {CollisionPairClearance{pair, 0.002}};
+  engine.result_by_waypoint[1] = near;
+  CollisionCancellationToken cancel;
+
+  CollisionValidationPassConfig cfg;
+  cfg.policy_snapshot = make_freespace_snapshot();
+  cfg.clearance_margins = margins;
+  CollisionValidationCoordinator coord(cfg);
+
+  const auto bundle = coord.validate_trajectory(
+      make_snapshot(), engine, make_trivial_trajectory(2), cancel);
+  ASSERT_FALSE(bundle.decision.accepted);
+  ASSERT_FALSE(engine.observed_queries.empty());
+  EXPECT_EQ(engine.observed_queries.front().clearance_margins, margins);
+
+  std::map<std::string, std::string> details;
+  append_collision_failure_diagnostics(details, bundle, margins.get());
+  EXPECT_EQ(details.at("classification"), "clearance");
+  EXPECT_EQ(details.at("collision_rule_id"), "wrist_near_wall");
+  EXPECT_DOUBLE_EQ(std::stod(details.at("clearance_m")), 0.005);
+  EXPECT_DOUBLE_EQ(std::stod(details.at("signed_clearance_m")), 0.002);
+
+  // Without the margins the refusal keeps its classification only.
+  std::map<std::string, std::string> plain;
+  append_collision_failure_diagnostics(plain, bundle);
+  EXPECT_EQ(plain.at("classification"), "clearance");
+  EXPECT_EQ(plain.find("collision_rule_id"), plain.end());
+}
+
+TEST(CollisionValidationCoordinatorTest, RejectionMessageNamesTheCollidingPair) {
+  const std::map<std::string, std::string> details{
+      {"collision_result_first_failure_pair", "component/arm/body/link6 <-> scene/endplate/shape/0"}};
+  EXPECT_EQ(pre_dispatch_collision_validation_message(details, CollisionDecisionAction::kReject),
+            "Collision validation rejected trajectory: component/arm/body/link6 <-> "
+            "scene/endplate/shape/0");
+  EXPECT_EQ(pre_dispatch_collision_validation_message({}, CollisionDecisionAction::kReject),
+            "Collision validation rejected trajectory");
+}
 
 }  // namespace
 }  // namespace manyforge::core

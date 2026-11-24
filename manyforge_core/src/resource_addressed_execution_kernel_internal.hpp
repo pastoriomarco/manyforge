@@ -395,12 +395,11 @@ derive_route_readiness_projection(
   // Program inputs consumed by later admitted operations, not controller state.
   // The moving-takeover budgets are cell context: a retained controller takes
   // the candidate's, so they are not compared.
-  candidate_controller_binding.program_id = a.program_id;
   candidate_controller_binding.program_revision = a.program_revision;
   candidate_controller_binding.program_binding_id = a.program_binding_id;
   candidate_controller_binding.retained_bundle_id = a.retained_bundle_id;
   candidate_controller_binding.graph_revision = a.graph_revision;
-  candidate_controller_binding.contact_grasp_bindings = a.contact_grasp_bindings;
+  candidate_controller_binding.collision_rule_bodies = a.collision_rule_bodies;
   candidate_controller_binding.program_frame_bindings = a.program_frame_bindings;
   candidate_controller_binding.program_collision_body_bindings = a.program_collision_body_bindings;
   candidate_controller_binding.frame_associations = a.frame_associations;
@@ -605,7 +604,9 @@ struct StopStaticFacts final {
         if constexpr (std::is_same_v<Value, JointGoalDTO>) {
           return CapabilityId("planning.motion.joint_goal");
         } else if constexpr (std::is_same_v<Value, PoseGoalDTO>) {
-          return CapabilityId("planning.motion.pose_goal");
+          // A linear pose goal is planned as a Cartesian path (OD-341).
+          return CapabilityId(value.linear ? "planning.motion.cartesian_path"
+                                           : "planning.motion.pose_goal");
         } else if constexpr (std::is_same_v<Value, NamedTargetDTO>) {
           return CapabilityId("planning.motion.named_target");
         } else {
@@ -628,64 +629,115 @@ struct StopStaticFacts final {
   return left_stable_identity == right_stable_identity;
 }
 
-[[nodiscard]] inline Result<std::optional<ResolvedContactGraspBindingDTO>>
-resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
-                              const RuntimeParticipantBindingDTO& binding) {
-  if (!motion.contact_policy_id.has_value()) {
-    return Result<std::optional<ResolvedContactGraspBindingDTO>>::Ok(std::nullopt);
+/// Turn a motion's collision rules into their admitted form: a collision body
+/// becomes the ids the Program Binding holds for it, the objects carried by a
+/// collision body (an attached object selection with a role) the objects
+/// carried by those ids, the TCP's contact bodies become the ids of the
+/// resolved motion endpoint. The other selections are resolved against the
+/// move's collision world at validation.
+[[nodiscard]] inline Result<std::vector<CollisionRule>> admit_collision_rules(
+    const MotionParticipantIntentDTO& motion, const RuntimeParticipantBindingDTO& binding) {
+  using Admitted = Result<std::vector<CollisionRule>>;
+  const auto unresolved = [](const CollisionRuleDTO& rule, std::string message,
+                             std::string selection_kind, std::string reference_id) {
+    auto error = reject<std::vector<CollisionRule>>(std::move(message),
+                                                    "collision_rule_selection_unresolved",
+                                                    ErrorCode::kMissingReference)
+                     .error();
+    error.details.emplace("collision_rule_id", rule.rule_id);
+    error.details.emplace("selection_kind", std::move(selection_kind));
+    error.details.emplace("reference_id", std::move(reference_id));
+    return Admitted::Err(std::move(error));
+  };
+  const auto body_ids_of = [](const auto& bodies) {
+    std::vector<CollisionBodyId> ids;
+    for (const auto& body : bodies) {
+      ids.insert(ids.end(), body.collision_body_ids.begin(), body.collision_body_ids.end());
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+  };
+  // The binding of one collision body, null when the Program Binding holds
+  // none.
+  const auto bound_body = [&](const ProgramCollisionBodyReferenceDTO& body)
+      -> const ProgramCollisionRuleBodyBindingDTO* {
+    const auto bound = std::lower_bound(
+        binding.collision_rule_bodies.begin(), binding.collision_rule_bodies.end(), body,
+        [](const ProgramCollisionRuleBodyBindingDTO& candidate,
+           const ProgramCollisionBodyReferenceDTO& selected) { return candidate.body < selected; });
+    return bound != binding.collision_rule_bodies.end() && bound->body == body ? &*bound : nullptr;
+  };
+  std::vector<CollisionRule> admitted;
+  admitted.reserve(motion.collision_rules.size());
+  for (const auto& rule : motion.collision_rules) {
+    CollisionRule resolved{rule.rule_id, {}, {}, rule.value};
+    for (const auto& [authored, selections] :
+         {std::pair{&rule.a, &resolved.a}, std::pair{&rule.b, &resolved.b}}) {
+      selections->reserve(authored->size());
+      for (const auto& selection : *authored) {
+        if (const auto* body = std::get_if<CollisionRuleCollisionBodySelection>(&selection)) {
+          const auto* bound = bound_body(body->body);
+          if (bound == nullptr) {
+            return unresolved(rule, "collision rule selects a collision body the Program "
+                                    "Binding does not hold",
+                              "collision_body",
+                              body->body.component_id.value() + "/" +
+                                  body->body.collision_body_id.value());
+          }
+          selections->push_back(CollisionRuleResolvedBodiesSelection{
+              body_ids_of(std::vector<ProgramCollisionRuleBodyBindingDTO>{*bound})});
+        } else if (const auto* attached =
+                       std::get_if<CollisionRuleAttachedObjectSelection>(&selection);
+                   attached != nullptr && attached->collision_body_role_id) {
+          // The objects carried by one collision body (OD-371).
+          const auto* bound = bound_body(ProgramCollisionBodyReferenceDTO{
+              attached->component_id, CollisionBodyRoleId(*attached->collision_body_role_id)});
+          if (bound == nullptr) {
+            return unresolved(rule, "collision rule selects the objects carried by a collision "
+                                    "body the Program Binding does not hold",
+                              "attached_object",
+                              attached->component_id.value() + "/" +
+                                  *attached->collision_body_role_id);
+          }
+          selections->push_back(CollisionRuleResolvedAttachedObjectSelection{
+              body_ids_of(std::vector<ProgramCollisionRuleBodyBindingDTO>{*bound})});
+        } else if (std::holds_alternative<CollisionRuleActiveTcpContactBodiesSelection>(
+                       selection)) {
+          if (!binding.motion_endpoint ||
+              binding.motion_endpoint->contact_body_bindings.empty()) {
+            return unresolved(rule, "collision rule selects the TCP's contact bodies and the "
+                                    "move's TCP has none",
+                              "active_tcp_contact_bodies", {});
+          }
+          selections->push_back(CollisionRuleResolvedBodiesSelection{
+              body_ids_of(binding.motion_endpoint->contact_body_bindings)});
+        } else if (const auto* group =
+                       std::get_if<CollisionRuleModelGroupSelection>(&selection)) {
+          // Model groups are resolved by the execution host for cell rules;
+          // a move's rules cannot name one.
+          return unresolved(rule, "collision rule on a move selects a model group; model "
+                                  "groups are available on the Deployment's rules only",
+                            "model_group",
+                            group->component_id.value() + "/" + group->group);
+        } else if (const auto* component =
+                       std::get_if<CollisionRuleComponentSelection>(&selection)) {
+          selections->push_back(*component);
+        } else if (const auto* link = std::get_if<CollisionRuleLinkSelection>(&selection)) {
+          selections->push_back(*link);
+        } else if (const auto* attached =
+                       std::get_if<CollisionRuleAttachedObjectSelection>(&selection)) {
+          selections->push_back(*attached);
+        } else if (std::holds_alternative<CollisionRuleSceneObjectsSelection>(selection)) {
+          selections->push_back(CollisionRuleSceneObjectsSelection{});
+        } else {
+          selections->push_back(std::get<CollisionRuleSceneObjectSelection>(selection));
+        }
+      }
+    }
+    admitted.push_back(std::move(resolved));
   }
-  const auto policy = std::lower_bound(
-      binding.contact_grasp_bindings.begin(), binding.contact_grasp_bindings.end(),
-      *motion.contact_policy_id, [](const auto& candidate, const ContactPolicyId& id) {
-        return candidate.contact_policy_id < id;
-      });
-  if (policy == binding.contact_grasp_bindings.end() ||
-      policy->contact_policy_id != *motion.contact_policy_id) {
-    // Not a Program-owned contact_grasp: no late runtime-object binding is
-    // needed here; collision validation resolves the id against the retained
-    // scene policy. Every Program-owned contact_grasp requires this binding.
-    return Result<std::optional<ResolvedContactGraspBindingDTO>>::Ok(std::nullopt);
-  }
-  const auto object = std::lower_bound(
-      motion.runtime_object_bindings.begin(), motion.runtime_object_bindings.end(),
-      policy->runtime_object_id, [](const auto& candidate, const RuntimeObjectId& id) {
-        return candidate.runtime_object_id < id;
-      });
-  if (object == motion.runtime_object_bindings.end() ||
-      object->runtime_object_id != policy->runtime_object_id) {
-    // Name the one runtime object the policy requires and the motion does not
-    // select.
-    auto unresolved = reject<std::optional<ResolvedContactGraspBindingDTO>>(
-                          "contact-grasp policy has no selected runtime object",
-                          "contact_grasp_runtime_object_unresolved", ErrorCode::kMissingReference)
-                          .error();
-    unresolved.details.emplace("reference_type", "runtime_object");
-    unresolved.details.emplace("reference_id", policy->runtime_object_id.value());
-    return Result<std::optional<ResolvedContactGraspBindingDTO>>::Err(std::move(unresolved));
-  }
-  std::vector<CollisionBodyId> body_ids;
-  if (policy->bodies_from_motion_endpoint && !binding.motion_endpoint) {
-    return reject<std::optional<ResolvedContactGraspBindingDTO>>(
-        "contact-grasp policy requires a resolved motion endpoint",
-        "contact_grasp_motion_endpoint_unresolved", ErrorCode::kMissingReference);
-  }
-  const auto& bodies = policy->bodies_from_motion_endpoint
-                           ? binding.motion_endpoint->contact_body_bindings
-                           : policy->allowed_body_bindings;
-  for (const auto& body : bodies) {
-    body_ids.insert(body_ids.end(), body.collision_body_ids.begin(), body.collision_body_ids.end());
-  }
-  std::sort(body_ids.begin(), body_ids.end());
-  body_ids.erase(std::unique(body_ids.begin(), body_ids.end()), body_ids.end());
-  if (body_ids.empty()) {
-    return reject<std::optional<ResolvedContactGraspBindingDTO>>(
-        "contact-grasp policy resolved no robot collision bodies",
-        "contact_grasp_body_binding_empty", ErrorCode::kInvariantViolation);
-  }
-  return Result<std::optional<ResolvedContactGraspBindingDTO>>::Ok(
-      std::optional<ResolvedContactGraspBindingDTO>{ResolvedContactGraspBindingDTO{
-          policy->contact_policy_id, policy->contact_policy_revision, policy->runtime_object_id,
-          object->scene_resource_id, std::move(body_ids), policy->envelope}});
+  return Admitted::Ok(std::move(admitted));
 }
 
 // A frame's component is always its owner, never the moving arm.
@@ -784,7 +836,6 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
       operation_id,
       participant_id,
       controller_goal_id,
-      binding.program_id,
       binding.program_revision,
       binding.program_binding_id,
       operation.program_run_id,
@@ -876,15 +927,12 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
   request.goal_frame_reference = motion.goal_frame_reference;
   request.motion_interrupt_scopes = std::move(effective_interrupt_scopes);
   request.action_span = participant.action_span;
-  request.contact_policy_id =
-      motion.contact_policy_id.has_value() ? motion.contact_policy_id->value() : std::string{};
-  request.clearance_m = motion.clearance_m;
   request.runtime_object_bindings = motion.runtime_object_bindings;
-  auto contact_grasp = resolve_contact_grasp_binding(motion, binding);
-  if (!contact_grasp.ok()) {
-    return Result<ExecuteRequestDTO>::Err(contact_grasp.error());
+  auto collision_rules = admit_collision_rules(motion, binding);
+  if (!collision_rules.ok()) {
+    return Result<ExecuteRequestDTO>::Err(collision_rules.error());
   }
-  request.resolved_contact_grasp = std::move(contact_grasp.value());
+  request.collision_rules = std::move(collision_rules.value());
   // A lane that cannot scale is treated as an unqualified route: the motion
   // runs without a runtime-scale contract.
   if (control.runtime_scale_qualification.has_value() &&
@@ -1102,17 +1150,16 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
     std::span<const HardStopResourceLimitDTO> retained_default_stop_limits,
     const MotionInterruptNodeCategory node_category, const OperationNumber& operation_id,
     const OperationRevision operation_revision, const OperationParticipantId& participant_id,
-    const ProgramId& program_id, const ProgramRevision& program_revision,
-    const ProgramBindingId& program_binding_id,
+    const ProgramRevision& program_revision, const ProgramBindingId& program_binding_id,
     const std::optional<ProgramRunNumber>& program_run_id) {
   if (!profile.has_value()) {
     return Result<std::optional<PreparedParticipantStopPlanDTO>>::Ok(std::nullopt);
   }
   PreparedParticipantStopPlanContextDTO context{
-      operation_id,   operation_revision, participant_id,
-      program_id,     program_revision,   program_binding_id,
-      program_run_id, *profile,           ParticipantStopProfilePurposeDTO::kFault,
-      std::nullopt,   node_category};
+      operation_id,     operation_revision, participant_id,
+      program_revision, program_binding_id, program_run_id,
+      *profile,         ParticipantStopProfilePurposeDTO::kFault,
+      std::nullopt,     node_category};
   auto prepared = MakePreparedParticipantStopPlan(readiness.value().resolved_stop_base_plan,
                                                   std::move(context),
                                                   binding.resources, retained_default_stop_limits);
@@ -1212,7 +1259,6 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
       operation_id,
       operation_revision,
       participant_id,
-      intent.program_id,
       intent.program_revision,
       intent.program_binding_id,
       intent.program_run_id,
@@ -1602,14 +1648,16 @@ struct ResourceAddressedExecutionKernel::ProgramCycleClaimRun::MotionContinuatio
   return matches("in_collision", "true") &&
       (matches("runtime_collision_reason", "runtime_collision_detected") ||
        matches("runtime_collision_reason", "runtime_lookahead_collision")) &&
-      !details.contains("contact_policy_violation") &&
-      !details.contains("collision_result_raw_contact_grasp_violation") &&
+      !details.contains("contact_rule_violation") &&
+      !details.contains("collision_result_raw_contact_rule_violation") &&
       (!details.contains("runtime_query_engine_status") || matches("runtime_query_engine_status", "ok")) &&
       !details.contains("runtime_query_failure_reason");
 }
 
 /// The runtime monitor stopped motion because the measured robot state it
-/// checks was missing, stale or incomplete, not because of contact.
+/// checks was missing, stale or incomplete, not because of contact: the
+/// moving robot's own, or that of another component of the cell (its stream
+/// condition, with `peer_component_id`).
 [[nodiscard]] inline bool runtime_monitor_observation_lost(
     const std::map<std::string, std::string>& details) {
   const auto contact = details.find("in_collision");
@@ -1617,7 +1665,9 @@ struct ResourceAddressedExecutionKernel::ProgramCycleClaimRun::MotionContinuatio
   return (contact == details.end() || contact->second != "true") && reason != details.end() &&
          (reason->second == "stale_observed_robot_state" ||
           reason->second == "observed_state_unavailable" ||
-          reason->second == "observed_state_incomplete");
+          reason->second == "observed_state_incomplete" ||
+          reason->second == error_codes::kComponentStreamStale ||
+          reason->second == error_codes::kComponentStreamAbsent);
 }
 
 [[nodiscard]] inline std::optional<std::int64_t> motion_takeover_budget_ns(
@@ -1701,7 +1751,8 @@ struct StopParticipantWork final {
   std::uint64_t prepared_execution_id{};
   IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
   IResolvedParticipantExecutionEngine* execution_engine{};
-  /// What today's transaction held for this participant, fixed at G4.
+  /// What today's transaction held for this participant, fixed at G4: a
+  /// runtime-collision or (OD-379) component-fault Stop started it.
   bool runtime_collision_containment{};
   bool carried_object_lost{};
   /// Operation Reset or hold timeout: neither is a degraded Stop.
@@ -1906,8 +1957,10 @@ struct ActiveOperationParticipant final {
   std::uint64_t handover_source_execution_id{};
   std::shared_ptr<const detail::MotionResumeIntent> continuation{};
   std::size_t continuation_node_index{};
-  /// Runtime collision observed outside an active Stop; its containment Stop
-  /// ends this participant InterventionRequired with this cause.
+  /// Runtime collision observed outside an active Stop, or (OD-379) the
+  /// component fault whose Stop started this participant's attempt; that
+  /// containment Stop ends it with this cause (InterventionRequired unless a
+  /// clean collision Stop) and its recovery class is `runtime_collision`.
   std::optional<ErrorDTO> runtime_collision_error{};
   /// A Stop that did not wait for this command's still-returning dispatch
   /// leaves its exact local settlement here; the dispatch return performs it.

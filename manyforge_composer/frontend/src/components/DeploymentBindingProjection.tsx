@@ -25,7 +25,6 @@ export function DeploymentBindingProjection({
         ) : (
           <>
             <dl className="deployment-binding-identities">
-              <div><dt>Program</dt><dd>{binding.program_id}</dd></div>
               <div><dt>Program revision</dt><dd>{shortIdentity(binding.program_revision)}</dd></div>
               <div><dt>Binding</dt><dd>{shortIdentity(binding.program_binding_id)}</dd></div>
               <div><dt>Retained bundle</dt><dd>{shortIdentity(binding.retained_bundle_id)}</dd></div>
@@ -65,7 +64,7 @@ export function DeploymentBindingProjection({
               <strong>{candidate.scenarioId}</strong>
               <span>{candidate.description ?? 'No description'}</span>
               <small>
-                Program {candidate.programId} · {shortIdentity(candidate.programRevision)}
+                Program {shortIdentity(candidate.programRevision)}
                 {' · '}Binding {shortIdentity(candidate.programBindingId)}
               </small>
             </div>

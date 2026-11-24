@@ -247,7 +247,7 @@ export function InterruptConditionEditor({ value, choices, disabled, label, onCo
       )}
       {unguarded.length > 0 && (
         <p className="program-form-hint" role="note" aria-label={`${label} none hint`}>
-          <code>none</code> means the node has no result yet in this Run; add <code>!= none</code> if
+          <code>none</code> means the node has no result yet for the current attempt; add <code>!= none</code> if
           {' '}‘not completed’ should only count after the node ran ({unguarded.join(', ')}).
         </p>
       )}

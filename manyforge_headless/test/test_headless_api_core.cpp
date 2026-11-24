@@ -936,7 +936,7 @@ TEST(HeadlessApiCore, ComponentFrameLookupUsesVerifiedRetainedPaths) {
           {"kind", CanonicalValue("named_apply")}, {"apply_id", CanonicalValue(1.0)},
           {"apply_generation", CanonicalValue(1.0)}})}}));
   const CanonicalValue prepared(CanonicalValue::Object{
-      {"schema_version", CanonicalValue("manyforge.prepared_activation_input.v7")},
+      {"schema_version", CanonicalValue("manyforge.prepared_activation_input.v8")},
       {"retained_bundle_id", Member(active, "retained_bundle_id")},
       {"graph_revision", Member(active, "graph_revision")}});
   payload = JournalField(payload, "active", active);
@@ -1031,7 +1031,6 @@ TEST(HeadlessApiCore,
   const auto no_program = CanonicalValue(CanonicalValue::Object{
       {"program_outcome", CanonicalValue(CanonicalValue::Object{
                               {"kind", CanonicalValue("no_program")}})},
-      {"program_id", CanonicalValue(nullptr)},
       {"program_revision", CanonicalValue(nullptr)}});
   const auto absent =
       deployment::parse_prepared_activation_program_outcome(no_program);
@@ -1055,7 +1054,7 @@ TEST(HeadlessApiCore,
             "headless source is missing field program_outcome");
   const auto inconsistent =
       deployment::parse_prepared_activation_program_outcome(
-          JournalField(no_program, "program_id", CanonicalValue("unexpected")));
+          JournalField(no_program, "program_revision", CanonicalValue("unexpected")));
   ASSERT_FALSE(inconsistent.ok());
   EXPECT_EQ(inconsistent.error().code, "program_applied_selection_invalid");
   EXPECT_EQ(inconsistent.error().message, "inconsistent no_program outcome");
@@ -1084,7 +1083,7 @@ TEST(HeadlessApiCore,
             {"incomplete", CanonicalValue(false)},
             {"prepared_activation", CanonicalValue(CanonicalValue::Object{
                 {"schema_version",
-                 CanonicalValue("manyforge.prepared_activation_input.v7")},
+                 CanonicalValue("manyforge.prepared_activation_input.v8")},
                 {"retained_bundle_id", CanonicalValue(Digest('f'))},
                 {"graph_revision", Member(active, "graph_revision")},
                 {"program_outcome", CanonicalValue(CanonicalValue::Object{
@@ -1125,7 +1124,7 @@ TEST(HeadlessApiCore, NoProgramIsPublishedNormallyButHasNoExecutableSelection) {
   }));
   const CanonicalValue prepared(CanonicalValue::Object{
       {"schema_version",
-       CanonicalValue("manyforge.prepared_activation_input.v7")},
+       CanonicalValue("manyforge.prepared_activation_input.v8")},
       {"prepared_activation_id", CanonicalValue(Digest('a'))},
       {"retained_bundle_id", Member(active, "retained_bundle_id")},
       {"graph_revision", Member(active, "graph_revision")},
@@ -1136,9 +1135,7 @@ TEST(HeadlessApiCore, NoProgramIsPublishedNormallyButHasNoExecutableSelection) {
            {"project_path", CanonicalValue("/fixtures/new_scenario.scenario")},
            {"source_document_digest", CanonicalValue(Digest('b'))},
        })},
-      {"deployment_artifact_id", CanonicalValue("new_deployment")},
       {"deployment_revision", CanonicalValue(Digest('c'))},
-      {"program_id", CanonicalValue(nullptr)},
       {"program_revision", CanonicalValue(nullptr)},
       {"program_outcome", CanonicalValue(CanonicalValue::Object{
                               {"kind", CanonicalValue("no_program")},
@@ -1179,7 +1176,7 @@ TEST(HeadlessApiCore, NoProgramIsPublishedNormallyButHasNoExecutableSelection) {
     EXPECT_EQ(error.code(), "component_frame_lookup_invalid");
   }
   const auto status = core.AppliedProgramStatus();
-  EXPECT_TRUE(Member(status, "program_id").is_null());
+  EXPECT_TRUE(Member(status, "program_revision").is_null());
   EXPECT_TRUE(Member(status, "program_binding_id").is_null());
   EXPECT_TRUE(Member(status, "non_executable").is_null());
   EXPECT_FALSE(std::get<bool>(Member(status, "executable").storage()));
@@ -1207,7 +1204,6 @@ TEST(HeadlessApiCore, ActiveApplyFromTheRemovedOverrideVersionIsRefused) {
       {"schema_version", CanonicalValue("manyforge.prepared_activation_input.v4")},
       {"retained_bundle_id", Member(active, "retained_bundle_id")},
       {"graph_revision", Member(active, "graph_revision")},
-      {"program_id", CanonicalValue(nullptr)},
       {"program_revision", CanonicalValue(nullptr)},
       {"program_outcome", CanonicalValue(CanonicalValue::Object{
           {"kind", CanonicalValue("no_program")},
@@ -1264,7 +1260,7 @@ CanonicalValue CommittedApplyRecord(const double apply_id,
       record, "prepared_activation",
       CanonicalValue(CanonicalValue::Object{
           {"schema_version",
-           CanonicalValue("manyforge.prepared_activation_input.v7")},
+           CanonicalValue("manyforge.prepared_activation_input.v8")},
           {"retained_bundle_id", Member(active, "retained_bundle_id")},
           {"graph_revision", Member(active, "graph_revision")},
           {"origin",
@@ -1275,7 +1271,6 @@ CanonicalValue CommittedApplyRecord(const double apply_id,
                 CanonicalValue("/fixtures/" + scenario_id + ".scenario")},
                {"source_document_digest", CanonicalValue(Digest('b'))},
            })},
-          {"program_id", CanonicalValue(nullptr)},
           {"program_revision", CanonicalValue(nullptr)},
           {"program_outcome", CanonicalValue(CanonicalValue::Object{
                                   {"kind", CanonicalValue("no_program")},
@@ -2647,6 +2642,13 @@ TEST(HeadlessApiCore, ComponentActionAndApplyOutcomesAreRecordedOnce) {
   std::map<std::string, std::string> severities;
   for (const auto &stored : Array(page, "events")) {
     const auto &event = Member(stored, "event");
+    if (Text(event, "event_type") == "program_node_attempt_finished") {
+      // Stamped at the attempt's end on the Runner's clocks.
+      EXPECT_EQ(Text(event, "occurred_at_ns"), "5000000000");
+      EXPECT_EQ(Text(event, "occurred_at_wall"), "2026-11-24T10:00:01.365+00:00");
+      EXPECT_EQ(Text(Member(event, "payload"), "clock_owner"),
+                "program_runner:api.epoch.1");
+    }
     severities[Text(event, "component") + "/" +
                Text(Member(event, "payload"), "outcome")] =
         Text(event, "severity");
@@ -2737,12 +2739,152 @@ TEST(HeadlessApiCore, ProgramResetOutcomesAreRecordedWithTheirFacts) {
   std::map<std::string, std::string> severities;
   for (const auto &stored : Array(page, "events")) {
     const auto &event = Member(stored, "event");
+    if (Text(event, "event_type") == "program_node_attempt_finished") {
+      // Stamped at the attempt's end on the Runner's clocks.
+      EXPECT_EQ(Text(event, "occurred_at_ns"), "5000000000");
+      EXPECT_EQ(Text(event, "occurred_at_wall"), "2026-11-24T10:00:01.365+00:00");
+      EXPECT_EQ(Text(Member(event, "payload"), "clock_owner"),
+                "program_runner:api.epoch.1");
+    }
     EXPECT_EQ(Text(event, "component"), "manyforge.program_runner");
     severities[Text(Member(event, "payload"), "outcome")] =
         Text(event, "severity");
   }
   EXPECT_EQ(severities, (std::map<std::string, std::string>{
                             {"refused", "WARN"}, {"succeeded", "INFO"}}));
+}
+
+TEST(HeadlessApiCore, NodeAttemptsAndSceneChangesAreRecordedWithTheirFacts) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const auto error = CanonicalValue(CanonicalValue::Object{
+      {"code", CanonicalValue("motion_plan_failed")},
+      {"message", CanonicalValue("No path")},
+      {"details", CanonicalValue(CanonicalValue::Object{
+                      {"input_problem", CanonicalValue("invalid")}})}});
+  const auto attempt_facts = [](CanonicalValue started_at_wall,
+                                CanonicalValue duration_ms) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"program_run_id", CanonicalValue(3.0)},
+        {"node_instance_id", CanonicalValue("add_box")},
+        {"node_attempt_id", CanonicalValue(12.0)},
+        {"started_at_wall", std::move(started_at_wall)},
+        {"finished_at_ns", CanonicalValue("5000000000")},
+        {"finished_at_wall", CanonicalValue("2026-11-24T10:00:01.365+00:00")},
+        {"duration_ms", std::move(duration_ms)},
+        {"scene_operation", CanonicalValue("add_object")},
+        {"scene_resource_id", CanonicalValue("box_1")}});
+  };
+  const auto attempt = [](const std::string &outcome, CanonicalValue failure,
+                          CanonicalValue facts) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"kind", CanonicalValue("program_node_attempt")},
+        {"subject", CanonicalValue("scene.add_object")},
+        {"action", CanonicalValue(nullptr)},
+        {"outcome", CanonicalValue(outcome)},
+        {"error", std::move(failure)},
+        {"components", CanonicalValue(CanonicalValue::Array{})},
+        {"message", CanonicalValue("Node add_box (scene.add_object) " + outcome)},
+        {"attempt", std::move(facts)}});
+  };
+  const auto change_facts = [](CanonicalValue scene_revision_id) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"scene_resource_id", CanonicalValue("box_1")},
+        {"source_label", CanonicalValue("composer_ui")},
+        {"principal_id", CanonicalValue(nullptr)},
+        {"duration_ms", CanonicalValue(12.5)},
+        {"scene_revision_id", std::move(scene_revision_id)}});
+  };
+  const auto change = [](const std::string &subject, const std::string &outcome,
+                         CanonicalValue failure, CanonicalValue facts) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"kind", CanonicalValue("scene_change")},
+        {"subject", CanonicalValue(subject)},
+        {"action", CanonicalValue(nullptr)},
+        {"outcome", CanonicalValue(outcome)},
+        {"error", std::move(failure)},
+        {"components", CanonicalValue(CanonicalValue::Array{})},
+        {"message", CanonicalValue("Scene add object box_1 " + outcome)},
+        {"scene_change", std::move(facts)}});
+  };
+  const auto wall = CanonicalValue("2026-11-24T10:00:00.125+00:00");
+  for (auto valid :
+       {attempt("failed", error, attempt_facts(wall, CanonicalValue(1240.0))),
+        attempt("stopped", CanonicalValue(nullptr),
+                attempt_facts(wall, CanonicalValue(0.0))),
+        change("add_object", "succeeded", CanonicalValue(nullptr),
+               change_facts(CanonicalValue(4.0))),
+        change("add_object", "refused", error,
+               change_facts(CanonicalValue(nullptr)))}) {
+    EXPECT_TRUE(std::get<bool>(
+        Member(core.RecordActivity(std::move(valid)), "recorded").storage()));
+  }
+  // Exact facts, a parseable start, a non-negative duration, the error only
+  // on a failed or interrupted attempt, and only known scene operations.
+  auto missing = attempt("succeeded", CanonicalValue(nullptr),
+                         attempt_facts(wall, CanonicalValue(1.0)))
+                     .as_object();
+  std::erase_if(missing,
+                [](const auto &member) { return member.first == "attempt"; });
+  for (auto invalid :
+       {CanonicalValue(std::move(missing)),
+        attempt("succeeded", CanonicalValue(nullptr),
+                attempt_facts(CanonicalValue("yesterday"), CanonicalValue(1.0))),
+        attempt("succeeded", CanonicalValue(nullptr),
+                attempt_facts(wall, CanonicalValue(-1.0))),
+        attempt("failed", CanonicalValue(nullptr),
+                attempt_facts(wall, CanonicalValue(1.0))),
+        attempt("stopped", error, attempt_facts(wall, CanonicalValue(1.0))),
+        attempt("refused", error, attempt_facts(wall, CanonicalValue(1.0))),
+        change("rename_object", "succeeded", CanonicalValue(nullptr),
+               change_facts(CanonicalValue(4.0))),
+        change("add_object", "succeeded", CanonicalValue(nullptr),
+               change_facts(CanonicalValue(0.0))),
+        change("add_object", "unknown", CanonicalValue(nullptr),
+               change_facts(CanonicalValue(nullptr)))}) {
+    try {
+      static_cast<void>(core.RecordActivity(std::move(invalid)));
+      FAIL() << "an invalid node attempt or scene change record was accepted";
+    } catch (const OperatorAlarmError &failure) {
+      EXPECT_EQ(failure.code(), "activity_record_invalid");
+    }
+  }
+
+  HistorianQuery query;
+  query.event_types = {"program_node_attempt_finished", "scene_change_finished"};
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == 4U) break;
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 4U);
+  std::map<std::string, std::string> severities;
+  for (const auto &stored : Array(page, "events")) {
+    const auto &event = Member(stored, "event");
+    if (Text(event, "event_type") == "program_node_attempt_finished") {
+      // Stamped at the attempt's end on the Runner's clocks.
+      EXPECT_EQ(Text(event, "occurred_at_ns"), "5000000000");
+      EXPECT_EQ(Text(event, "occurred_at_wall"), "2026-11-24T10:00:01.365+00:00");
+      EXPECT_EQ(Text(Member(event, "payload"), "clock_owner"),
+                "program_runner:api.epoch.1");
+    }
+    severities[Text(event, "component") + "/" + Text(event, "event_type") +
+               "/" + Text(Member(event, "payload"), "outcome")] =
+        Text(event, "severity");
+  }
+  // A failed node attempt is WARN, never ERROR (ordinary control flow).
+  EXPECT_EQ(severities,
+            (std::map<std::string, std::string>{
+                {"manyforge.program_runner/program_node_attempt_finished/failed",
+                 "WARN"},
+                {"manyforge.program_runner/program_node_attempt_finished/stopped",
+                 "INFO"},
+                {"manyforge.scene/scene_change_finished/refused", "WARN"},
+                {"manyforge.scene/scene_change_finished/succeeded", "INFO"}}));
 }
 
 TEST(HeadlessApiCore,
@@ -4273,15 +4415,15 @@ const std::string kPreviousStart = "00000000000000aa";
 CanonicalValue PreviousSessionReport(const std::string &message =
     "Previous session journals retained; old events are not imported into History.") {
   return CanonicalValue(CanonicalValue::Object{
-      {"schema_version", CanonicalValue("manyforge.workbench_previous_session.v2")},
+      {"schema_version", CanonicalValue("manyforge.workbench_previous_session.v3")},
       {"session_id", CanonicalValue(std::string(32U, 'a'))},
       {"archive_relative_path", CanonicalValue("previous-runs/" + std::string(32U, 'a'))},
       {"shutdown", CanonicalValue("clean")},
       {"effects", CanonicalValue("closed")},
       {"history_coverage", CanonicalValue("not_imported")},
       {"journal_families", CanonicalValue(CanonicalValue::Array{
-          CanonicalValue("program_cycle"), CanonicalValue("scene"),
-          CanonicalValue("manager"), CanonicalValue("kernel_operation")})},
+          CanonicalValue("program_cycle"), CanonicalValue("manager"),
+          CanonicalValue("kernel_operation")})},
       {"message", CanonicalValue(message)},
       {"unfinished_operations", CanonicalValue(CanonicalValue::Array{
           CanonicalValue(CanonicalValue::Object{
@@ -4331,6 +4473,60 @@ TEST(HeadlessApiCore, PreviousSessionReportCommitsBeforeReceiptAndDeduplicatesAc
     FAIL() << "same archived session accepted conflicting report content";
   } catch (const EventHistorianError &error) {
     EXPECT_EQ(error.code(), "historian_event_identity_conflict");
+  }
+}
+
+// A report of the previous version (v2) names the scene's journal family too.
+CanonicalValue Version2PreviousSessionReport(const CanonicalValue::Array &families) {
+  auto fields = PreviousSessionReport().as_object();
+  for (auto &[name, value] : fields) {
+    if (name == "schema_version") value = CanonicalValue("manyforge.workbench_previous_session.v2");
+    if (name == "journal_families") value = CanonicalValue(families);
+  }
+  return CanonicalValue(std::move(fields));
+}
+
+const CanonicalValue::Array kVersion2Families{
+    CanonicalValue("program_cycle"), CanonicalValue("scene"),
+    CanonicalValue("manager"), CanonicalValue("kernel_operation")};
+
+TEST(HeadlessApiCore, PreviousSessionReportOfTheEarlierVersionIsFiledAsRecorded) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const auto report = Version2PreviousSessionReport(kVersion2Families);
+  EXPECT_EQ(Text(core.AppendWorkbenchPreviousSessionReport(report), "status"), "stored");
+  HistorianQuery query;
+  query.components.insert("manyforge.workbench");
+  query.event_types.insert("previous_session_report");
+  const auto page = core.HistoryPage(query);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  EXPECT_EQ(content_identity::canonical_json(Member(Member(Array(page, "events").front(), "event"), "payload")),
+            content_identity::canonical_json(report));
+}
+
+TEST(HeadlessApiCore, PreviousSessionReportFamiliesFollowItsVersion) {
+  TemporaryDirectory directory;
+  const auto version3 = PreviousSessionReport().as_object();
+  auto version3_with_scene = version3;
+  for (auto &[name, value] : version3_with_scene) {
+    if (name == "journal_families") value = CanonicalValue(kVersion2Families);
+  }
+  auto unknown_version = version3;
+  for (auto &[name, value] : unknown_version) {
+    if (name == "schema_version") value = CanonicalValue("manyforge.workbench_previous_session.v1");
+  }
+  const std::array refused{
+      CanonicalValue(std::move(version3_with_scene)),
+      Version2PreviousSessionReport(Member(PreviousSessionReport(), "journal_families").as_array()),
+      CanonicalValue(std::move(unknown_version))};
+  for (const auto &report : refused) {
+    HeadlessApiCore core(Config(directory, "api.epoch.invalid"), Clocks());
+    try {
+      static_cast<void>(core.AppendWorkbenchPreviousSessionReport(report));
+      FAIL() << content_identity::canonical_json(report);
+    } catch (const OperatorAlarmError &error) {
+      EXPECT_EQ(error.code(), "headless_previous_session_report_invalid");
+    }
   }
 }
 

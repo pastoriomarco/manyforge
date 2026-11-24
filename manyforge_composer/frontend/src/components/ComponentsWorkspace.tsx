@@ -40,6 +40,8 @@ import {
   DeploymentFocusedEditor,
   geometricContactRobotOptions,
 } from './DeploymentFocusedEditor';
+import { GeneratedToolEditor } from './GeneratedToolEditor';
+import { GENERATED_TOOL_PROFILE_ID } from '../utils/generatedToolAuthoring';
 
 /**
  * The Components section: the cell's components on the left (kind, mount,
@@ -127,6 +129,7 @@ export function ComponentsWorkspace({
     onOpenRobotControl,
     onOpenDeployment,
     onRemoved: () => setSelected(null),
+    onReplaced: setSelected,
   });
 
   return (
@@ -199,7 +202,7 @@ export function ComponentsWorkspace({
 function ComponentPage({
   row, enabled, applicationStartId, controller, state, states, statesKnown, sourceModel, profileFacts, profiles, motionDescriptors,
   gripperDescriptors, programSceneIds, sceneResourceIds, robotControl, onOpenRobotControl, onOpenDeployment, onRemoved,
-  member = false,
+  onReplaced, member = false,
 }: {
   row: ComponentManagerRow;
   enabled: boolean;
@@ -225,11 +228,20 @@ function ComponentPage({
   onOpenRobotControl: (componentId: string) => void;
   onOpenDeployment: (tab: ComponentManagerTab) => void;
   onRemoved: () => void;
+  /** Shows the replacement's page after Replace tool. */
+  onReplaced: (componentId: string) => void;
 }) {
   const id = row.componentId;
   const document = controller.workspace?.draft.document ?? null;
   const mountedTool = toolOnFlange(document, id);
   const frames = componentFrameTargets(sourceModel.status === 'ready' ? sourceModel.data.targets : null, document, id);
+  // A custom TCP's contact-body choices: the component type's bodies (Draft) and the Applied model's.
+  const collisionBodies = [...new Set([
+    ...(profileFacts?.collisionBodyTargets ?? []).flatMap((target) => target.collisionBodyRoleIds),
+    ...(sourceModel.status === 'ready' ? sourceModel.data.targets : [])
+      .filter((target) => target.component_id === id)
+      .flatMap((target) => target.collision_bodies.map((body) => body.collision_body_role_id)),
+  ])].sort();
   const gripperFrames = draftGripperFrames(document, id);
   const signals = componentSignals(document, id);
   // B-run-1: a robot without an end-effector TCP, on its page and its tool's.
@@ -277,25 +289,36 @@ function ComponentPage({
         </>
       )}
       {row.change !== 'removed' && (
-        <ComponentPlacementEditor row={row} controller={controller} profiles={profiles} onRemoved={onRemoved} />
+        <ComponentPlacementEditor row={row} controller={controller} profiles={profiles} onRemoved={onRemoved}
+          onReplaced={onReplaced} />
       )}
 
       <ComponentTcpsCard componentId={id} controller={controller} frames={frames}
-        gripperFrames={gripperFrames} motionDescriptors={motionDescriptors} />
+        collisionBodies={collisionBodies} gripperFrames={gripperFrames} motionDescriptors={motionDescriptors} />
       <ComponentTcpChoices componentId={id} controller={controller} profiles={profiles} />
 
-      {row.kind === 'tool' && profileFacts !== undefined && (
+      {row.profileId === GENERATED_TOOL_PROFILE_ID && row.change !== 'removed' && !controller.loading && (
+        <GeneratedToolEditor controller={controller} componentId={id} />
+      )}
+
+      {row.kind === 'tool' && profileFacts !== undefined && row.profileId !== GENERATED_TOOL_PROFILE_ID && (
         <section className="dcard" aria-labelledby="component-payload-title">
           <h4 id="component-payload-title">Payload</h4>
           <dl aria-label={`${id} payload`}>
-            <div><dt>Mass</dt><dd>{profileFacts.payload === undefined
-              ? '0 kg (the model defines none)'
-              : `${profileFacts.payload.massKg} kg`}</dd></div>
-            {profileFacts.payload !== undefined && (
+            {profileFacts.lanes?.length === 0 ? (
+              <div><dt>Mass</dt><dd>From the inertials of this component&apos;s URDF (0 kg without one)</dd></div>
+            ) : (
+              <div><dt>Mass</dt><dd>{profileFacts.payload === undefined
+                ? '0 kg (the model defines none)'
+                : `${profileFacts.payload.massKg} kg`}</dd></div>
+            )}
+            {profileFacts.lanes?.length !== 0 && profileFacts.payload !== undefined && (
               <div><dt>Centre of mass</dt><dd>{profileFacts.payload.centerOfMassM.join(', ')} m (in the tool's mount)</dd></div>
             )}
           </dl>
-          <p className="field-help">Defined by the component's model. It is package data, not editable here; the robot's payload adds it, and the mass of an attached object, while this tool is mounted.</p>
+          <p className="field-help">{profileFacts.lanes?.length === 0
+            ? "A passive tool's mass and centre of mass are read at Load from the <inertial> elements of the URDF its model source names; the robot's payload adds them, and the mass of an attached object, while this tool is mounted."
+            : "Defined by the component's model. It is package data, not editable here; the robot's payload adds it, and the mass of an attached object, while this tool is mounted."}</p>
         </section>
       )}
 
@@ -357,7 +380,7 @@ function CustomComponentAdd({ controller, geometricContactRobots, sceneResourceI
   const document = controller.workspace?.draft.document ?? null;
   if (document === null) return null;
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
-  const intent = document.api_version === 'manyforge.deployment_intent.v2';
+  const intent = document.api_version === 'manyforge.deployment_intent.v3';
   return (
     <details className="dcard" open={form !== null}>
       <summary>Custom I/O device or AI model</summary>

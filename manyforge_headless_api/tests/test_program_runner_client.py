@@ -246,11 +246,16 @@ def test_program_runner_commands_wait_for_acceptance_without_a_read_limit() -> N
             client.persistent_value_action(action, key)
         client.cycle_status()
         client.read_run(1)
+        client.runtime_blackboard_values(1)
     finally:
         raw.close()
 
-    reads = {"GET /api/cycle/status", "GET /api/program/runs/1"}
-    assert len(timeouts) == 14
+    reads = {
+        "GET /api/cycle/status",
+        "GET /api/program/runs/1",
+        "GET /api/program/runs/1/blackboard-values",
+    }
+    assert len(timeouts) == 15
     for request, timeout in timeouts.items():
         if request in reads:
             assert timeout == {"connect": 7.0, "read": 7.0, "write": 7.0, "pool": 7.0}

@@ -238,11 +238,9 @@ static_assert(!std::is_default_constructible_v<
 [[nodiscard]] RetentionQualifiedDeployment qualify_empty() {
   const std::string document =
       "{\"api_version\":\"manyforge.deployment.v1\","
-      "\"deployment_artifact_id\":\"c1_build_authority\","
       "\"deployment_revision\":\"" +
       std::string(kZeroDigest) +
       "\",\"cell_id\":\"c1_build_authority_cell\","
-      "\"name\":\"C1 build authority\","
       "\"catalogs\":{\"records\":[]},"
       "\"graph\":" +
       empty_graph() +
@@ -1609,8 +1607,8 @@ TEST(BuildManifestAuthority, RejectsPreviousCatalogContentVersion) {
   const auto current = detail::BuildManifestTestAccess::current_candidate(
       BuildManifestKind::kNodeEnvironment);
   const CanonicalValue catalog = member(current, "catalog");
-  // The maintained node catalog is at 3.0.0; 2.8.0 below is a previous version.
-  EXPECT_EQ(text_member(catalog, "content_version"), "3.0.0");
+  // The maintained node catalog is at 4.0.0; 2.8.0 below is a previous version.
+  EXPECT_EQ(text_member(catalog, "content_version"), "4.0.0");
   const CanonicalValue candidate = reidentify(
       replace_member(current, "catalog",
                      replace_member(catalog, "content_version",

@@ -92,8 +92,7 @@ RetainedToolContextFrames retained_tool_context_frames(
       if (const auto *name = compiled_frame(frame))
         result.carrier_frames.emplace(
             RetainedToolContextFrames::CarrierKey{
-                candidate.controllable_component_id, candidate.command_target_id,
-                frame.frame_role_id},
+                candidate.controllable_component_id, frame.frame_role_id},
             *name);
     }
   }
@@ -208,8 +207,7 @@ core::Result<core::ToolContextDTO> RetainedToolContextSource::ComposeSnapshot(
           object->mass_kg <= 0.0)
         continue;
       const auto carrier = frames_.carrier_frames.find(RetainedToolContextFrames::CarrierKey{
-          ref->controllable_component_id, attachment.command_target_id,
-          ref->frame_role_id});
+          ref->controllable_component_id, ref->frame_role_id});
       if (carrier == frames_.carrier_frames.end())
         return refused("tool_context_frame_unknown",
                        "an attached object's carrier frame is unknown",

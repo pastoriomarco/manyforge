@@ -480,7 +480,7 @@ describe('pneumatic manual availability observation', () => {
   it('retains the Move To label only for the operation id in the accepted receipt', async () => {
     const status = statusFixture();
     const snapshot = { applicationStartId: TEST_START, executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 } } as unknown as ComposerHeadlessState;
-    const send = vi.fn(async (_kind: string, _payload: unknown) => ({
+    const send = vi.fn<(kind: string, payload: unknown) => Promise<unknown>>(async () => ({
       result: { ok: true, command: 'submit', accepted: { request_key: TEST_KEY, operation_id: 41 } },
     }));
     const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
@@ -592,7 +592,7 @@ describe('pneumatic manual availability observation', () => {
       programCycle: { state: 'idle_after_reset' } } as unknown as ComposerHeadlessState;
     let finish!: () => void;
     const sent = new Promise<void>((resolve) => { finish = resolve; });
-    const send = vi.fn(async (_kind: string, _payload: unknown) => {
+    const send = vi.fn<(kind: string, payload: unknown) => Promise<unknown>>(async () => {
       await sent;
       return { result: { ok: true, command: 'submit', accepted: { request_key: TEST_KEY, operation_id: 1 },
         active_tcp: [{ component_id: 'robot-a', entry: {
@@ -993,7 +993,7 @@ describe('pneumatic manual availability observation', () => {
       let releaseFirst!: () => void;
       const started = new Promise<void>((resolve) => { firstStarted = resolve; });
       const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-      const send = vi.fn(async (_kind: string, _payload: unknown) => (
+      const send = vi.fn<(kind: string, payload: unknown) => Promise<unknown>>(async () => (
         { result: { accepted: { request_key: TEST_KEY, operation_id: 51 } } }));
       let writes = 0;
       // The one output write path; the first valve write waits.

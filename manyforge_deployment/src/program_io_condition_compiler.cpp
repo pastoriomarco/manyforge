@@ -209,7 +209,9 @@ private:
                        [&](const auto &row) { return row.name == name; });
       if (found == keys_.end()) {
         if (allow_waiting_program_keys_ && name != "node_outcome" &&
-            !name.starts_with("node_outcome.")) {
+            !name.starts_with("node_outcome.") &&
+            name != "motion_group_state" &&
+            !name.starts_with("motion_group_state.")) {
           if (name.empty() ||
               name.size() > condition_limits().maximum_identity_bytes ||
               name.find('\0') != std::string::npos)
@@ -223,13 +225,15 @@ private:
              "Key is not declared by Program", name);
       }
       // Qualified Program declarations supply these system-owned keys only
-      // for actual motion instances / retained rule IDs. Their initial values
-      // belong to Runner/rule state, never to an authored declaration (105).
+      // for actual motion instances / retained rule IDs / the Program's motion
+      // groups. Their initial values belong to Runner/rule state, never to an
+      // authored declaration (105).
       const auto in_system_namespace = [&](std::string_view prefix) {
         return name.starts_with(prefix) && name.size() > prefix.size();
       };
       const bool system_initial = in_system_namespace("node_outcome.") ||
-                                  in_system_namespace("interrupt_state.");
+                                  in_system_namespace("interrupt_state.") ||
+                                  in_system_namespace("motion_group_state.");
       if (!found->has_declared_initial && !system_initial)
         fail("interrupt_key_initial_required",
              "Interrupt condition key requires a declared initial value");
@@ -524,8 +528,7 @@ compile_program_io_conditions(const ProgramBindingContract &program,
                               const RetainedBundle &retained_bundle) {
   try {
     const auto &bound = binding.value();
-    if (bound.program_id != program.value().program_id ||
-        bound.program_revision != program.value().program_revision ||
+    if (bound.program_revision != program.value().program_revision ||
         bound.node_environment != program.value().node_environment ||
         bound.retained_bundle_id != retained_bundle.retained_bundle_id() ||
         bound.graph_revision !=
@@ -558,8 +561,6 @@ compile_program_io_conditions(const ProgramBindingContract &program,
         const auto digest = content_identity::framed_sha256(
             "program-node-io-rule", "manyforge.program_node_io_rule.v1",
             CanonicalValue(CanonicalValue::Object{
-                {"program_id",
-                 CanonicalValue(program.value().program_id.value())},
                 {"program_revision",
                  CanonicalValue(program.value().program_revision.value())},
                 {"node_instance_id", CanonicalValue(id)}}));

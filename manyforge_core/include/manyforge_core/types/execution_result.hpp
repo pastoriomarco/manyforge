@@ -30,7 +30,8 @@ struct ExecutionSnapshot {
   int64_t source_age_ns = 0;
   std::optional<ErrorDTO> error;
   std::optional<ActionSpanDTO> action_span;
-  std::string contact_policy_id;
+  /// The id of the move's contact or release rule when it has exactly one.
+  std::string collision_rule_id;
 };
 
 /// Execution handle for tracking trajectory execution

@@ -160,8 +160,6 @@ const PROGRAM_ACTION_COMMANDS: Record<Exclude<ProgramWorkspaceActionName, 'refre
   load_scenario_document: 'load',
   new_scenario_document: 'new',
   export_scenario_document: 'export',
-  save: 'save',
-  save_as: 'save_as',
   save_scenario_document: 'save',
 };
 
@@ -521,35 +519,6 @@ export function useProgramWorkspace(
     );
   }, [localFence, run]);
 
-  const save = useCallback(() => {
-    const requestFence = localFence('document');
-    if (!requestFence) return;
-    void run(
-      'save',
-      () => api.programWorkspace.save(requestFence).then((next) =>
-        workspaceResult(
-          next,
-          'Draft saved; runtime Applied state was not changed.',
-        )),
-    );
-  }, [localFence, run]);
-
-  const saveAs = useCallback((path: string, confirmOverwrite: boolean) => {
-    const requestFence = localFence('document');
-    if (!requestFence) return;
-    void run(
-      'save_as',
-      () => api.programWorkspace.saveAs(
-        requestFence,
-        path,
-        confirmOverwrite,
-      ).then((next) => workspaceResult(
-        next,
-        'Draft saved to the selected path; runtime Applied state was not changed.',
-      )),
-    );
-  }, [localFence, run]);
-
   /**
    * The ordinary Apply of the current Draft (Idle only; with a run, the
    * Apply-after-Reset chain calls this once the run has ended). Resolves to
@@ -756,8 +725,6 @@ export function useProgramWorkspace(
     mutate,
     newScenarioDocument,
     openDraft,
-    save,
-    saveAs,
     apply,
     discard,
     discardScenario,
@@ -802,8 +769,6 @@ export function useProgramWorkspace(
     refresh,
     refreshApplied,
     revert,
-    save,
-    saveAs,
     saveScenarioDocument,
     state,
     updateNodePolicies,

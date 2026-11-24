@@ -589,7 +589,7 @@ struct AssistantToolRow final {
 constexpr auto kReadOnly = core::AssistantToolEffect::kReadOnly;
 constexpr auto kDraftMutating = core::AssistantToolEffect::kComposerDraftMutating;
 
-constexpr std::array<AssistantToolRow, 30U> kAssistantTools{{
+constexpr std::array<AssistantToolRow, 28U> kAssistantTools{{
     {"alarms_read", kReadOnly},
     {"blackboard_draft_remove_keys", kDraftMutating},
     {"blackboard_draft_remove_namespaces", kDraftMutating},
@@ -599,9 +599,7 @@ constexpr std::array<AssistantToolRow, 30U> kAssistantTools{{
     {"deployment_capabilities_read", kReadOnly},
     {"history_read", kReadOnly},
     {"inspect_isaac_scene", kReadOnly},
-    {"program_draft_remove_contact_policies", kDraftMutating},
     {"program_draft_remove_parameters", kDraftMutating},
-    {"program_draft_upsert_contact_policies", kDraftMutating},
     {"program_draft_upsert_parameters", kDraftMutating},
     {"program_read", kReadOnly},
     {"program_validate", kReadOnly},

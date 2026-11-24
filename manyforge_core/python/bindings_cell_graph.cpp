@@ -370,15 +370,19 @@ void register_cell_graph_bindings(py::module_& module) {
 
   py::class_<ModelCustomTcpDTO>(module, "ModelCustomTcpDTO", py::is_final())
       .def(py::init([](FrameRoleId frame_role_id, std::string parent_link_name,
-                       PlacementPoseDTO pose_in_parent_link) {
+                       PlacementPoseDTO pose_in_parent_link,
+                       std::vector<CollisionBodyRoleId> contact_body_role_ids) {
              return ModelCustomTcpDTO{std::move(frame_role_id), std::move(parent_link_name),
-                                      std::move(pose_in_parent_link)};
+                                      std::move(pose_in_parent_link),
+                                      std::move(contact_body_role_ids)};
            }),
            py::arg("frame_role_id"), py::arg("parent_link_name"),
-           py::arg("pose_in_parent_link"))
+           py::arg("pose_in_parent_link"),
+           py::arg("contact_body_role_ids") = std::vector<CollisionBodyRoleId>{})
       .def_readonly("frame_role_id", &ModelCustomTcpDTO::frame_role_id)
       .def_readonly("parent_link_name", &ModelCustomTcpDTO::parent_link_name)
       .def_readonly("pose_in_parent_link", &ModelCustomTcpDTO::pose_in_parent_link)
+      .def_readonly("contact_body_role_ids", &ModelCustomTcpDTO::contact_body_role_ids)
       .def(
           "__eq__",
           [](const ModelCustomTcpDTO& lhs, const ModelCustomTcpDTO& rhs) { return lhs == rhs; },

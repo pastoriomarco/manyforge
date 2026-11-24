@@ -18,10 +18,15 @@ struct TargetCarrierSceneFrameRefDTO final {
   /// Portable command-target frame role. The retained target map may resolve
   /// this to a differently named model-asset frame role.
   FrameRoleId frame_role_id;
+  /// OD-372: a component mounted on the target's robot whose target frame
+  /// `frame_role_id` is; absent means the target's own frame. The robot's
+  /// kinematics must place it.
+  std::optional<ControllableComponentId> frame_component_id{};
 
   [[nodiscard]] bool valid() const noexcept {
     return !controllable_component_id.empty() && !command_target_id.empty() &&
-           !frame_role_id.empty();
+           !frame_role_id.empty() &&
+           (!frame_component_id || !frame_component_id->empty());
   }
 
   friend bool operator==(const TargetCarrierSceneFrameRefDTO&,

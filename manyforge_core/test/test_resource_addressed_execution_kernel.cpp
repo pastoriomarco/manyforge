@@ -1,6 +1,8 @@
 #include <manyforge_core/testing/request_key_fixture.hpp>
 #include "resource_addressed_kernel_test_fixture.hpp"
 #include <manyforge_core/execution_event_change_signal.hpp>
+#include <sstream>
+#include <string>
 
 namespace {
 
@@ -1181,8 +1183,15 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto output = ::testing::internal::GetCapturedStderr();
   ASSERT_EQ(stopped.covered.size(), 1U);
   // Nothing is printed under the Kernel lock; the journal writer logs the
-  // degraded fence later. It latches nothing.
-  EXPECT_EQ(output.find("manyforge_fault"), std::string::npos) << output;
+  // degraded fence later, on its own thread, so under load that one line may
+  // already be in the capture. No other fault is printed. It latches nothing.
+  {
+    std::istringstream lines(output);
+    for (std::string line; std::getline(lines, line);) {
+      if (line.find("manyforge_fault") == std::string::npos) continue;
+      EXPECT_NE(line.find("code=stop_fence_degraded"), std::string::npos) << output;
+    }
+  }
   EXPECT_FALSE(kernel.get_cell_latch().latched);
   stage.Release();
 
@@ -2059,6 +2068,56 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto next = kernel.execute(motion_operation("request.after-monitor-prepare-reset"));
   ASSERT_TRUE(next.ok()) << next.error().message;
   EXPECT_TRUE(wait_until([&] { return engine.execute_calls.load() == 2; }));
+}
+
+// OD-370 (A): a motion whose preparation failed before dispatch (here the
+// pre-dispatch collision validation) is held without physical effect. Reset
+// retires its prepared inner execution with the no-motion certified reset, so
+// the participant's Kernel returns to Idle; no Stop and no motion are sent.
+TEST(ResourceAddressedExecutionKernelTest,
+     ResetRetiresMotionPreparationThatFailedBeforeDispatchWithoutMotion) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.prepare_failure = ErrorDTO{std::string(to_string(ErrorCode::kValidationCollision)),
+                                    "pre-dispatch collision validation failed",
+                                    {{"reason", "validation_failed"}}};
+  auto kernel_heap_test_owner = make_claimed_kernel(
+      {registration(
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{kTestApplicationStartId,
+                                             CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
+
+  const auto accepted = kernel.execute(motion_operation("request.od370.failed-prepare"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+  }));
+  const auto failed = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(failed.ok()) << failed.error().message;
+  EXPECT_FALSE(failed.value().stop_event_id.has_value());
+
+  const auto reset = kernel.reset(control_request("request.od370.failed-prepare.reset",
+                                                  accepted.value(),
+                                                  failed.value().operation_revision.value()));
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto current = kernel.get_operation_projection(accepted.value().operation_id);
+    return engine.certified_reset_calls.load() == 1 && current.ok() &&
+           !current.value().resident &&
+           kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+  }));
+  EXPECT_EQ(engine.get_status().state, ExecutionState::kIdle);
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 0);
+  EXPECT_EQ(engine.execute_calls.load(), 0);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+  EXPECT_FALSE(kernel.get_operation_state(accepted.value().operation_id)
+                   .value()
+                   .stop_event_id.has_value());
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -4209,6 +4268,23 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_NE(engine.last_stop_stage->participant_stop_plan.stage_commands.at(strongest)
                   .resolved_stage.containment_command.command_kind,
               StopContainmentCommandKind::kControllerGoalCancel);
+    if (collision) {
+      // OD-373 (A): an escalated collision Stop is not clean; the move stays
+      // intervention-required and the operation cannot be closed.
+      const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+      ASSERT_TRUE(operation.ok()) << operation.error().message;
+      EXPECT_EQ(operation.value().state, OperationStateKind::kInterventionRequired);
+      EXPECT_EQ(operation.value().participants.front().state,
+                OperationStateKind::kInterventionRequired);
+      engine.recovery_assessment.eligible_close = true;
+      const auto assessed =
+          kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+      ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+      EXPECT_FALSE(assessed.value().assessment.eligible_close);
+      EXPECT_EQ(assessed.value().assessment.allowed_actions,
+                std::vector<RecoveryAction>{RecoveryAction::kResetCycle});
+      EXPECT_EQ(assessed.value().assessment.status, RecoveryAssessmentStatus::kResetRequired);
+    }
   }
 }
 
@@ -4299,12 +4375,12 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   const auto operation = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(operation.ok()) << operation.error().message;
-  // A runtime collision outside an operator Stop ends
-  // InterventionRequired through the ordinary outcome path once contained.
-  EXPECT_EQ(operation.value().state, OperationStateKind::kInterventionRequired);
+  // OD-373 (A): a runtime collision outside an operator Stop, contained
+  // cleanly, ends Stopped through the ordinary outcome path, keeping its
+  // typed collision cause.
+  EXPECT_EQ(operation.value().state, OperationStateKind::kStopped);
   ASSERT_EQ(operation.value().participants.size(), 1U);
-  EXPECT_EQ(operation.value().participants.front().state,
-            OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(operation.value().participants.front().state, OperationStateKind::kStopped);
   ASSERT_TRUE(operation.value().participants.front().terminal_error.has_value());
   const auto& terminal_error = *operation.value().participants.front().terminal_error;
   EXPECT_EQ(terminal_error.code, std::string(to_string(ErrorCode::kExecutionAborted)));
@@ -4327,7 +4403,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     const auto retained = std::find_if(default_journal.states.rbegin(), default_journal.states.rend(),
         [&](const auto& state) {
           return state.operation_id == accepted.value().operation_id &&
-                 state.state == OperationStateKind::kInterventionRequired;
+                 state.state == OperationStateKind::kStopped;
         });
     ASSERT_NE(retained, default_journal.states.rend());
     ASSERT_EQ(retained->participants.size(), 1U);
@@ -4335,6 +4411,66 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(*retained->participants.front().terminal_error, terminal_error);
   }
   // The contained collision is no Stop fault: no cell-wide latch.
+  EXPECT_FALSE(kernel.get_cell_latch().latched);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CleanRuntimeCollisionStopEndsStoppedCloseEligibleWithReplanOffer) {
+  // OD-373 (A): a collision Stop contained cleanly (stopped, not escalated)
+  // ends the move Stopped like an ordinary Stop: the operation can be closed
+  // (Continue) and the participant's replan from the stopped state is offered
+  // (Retry), under the runtime-collision recovery class.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  auto kernel_heap_test_owner = make_claimed_kernel(
+      {registration(
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {kTestApplicationStartId, CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
+  const auto accepted = kernel.execute(motion_operation("request.collision.clean-stop"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  engine.translate_stop_stage_hook = [&] {
+    engine.emit_transition(ExecutionState::kStopping, ExecutionState::kStopped);
+  };
+  engine.emit_collision();
+  std::optional<StopEventId> stop_id;
+  ASSERT_TRUE(wait_until([&] {
+    const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+    if (!operation.ok() || !operation.value().stop_event_id) return false;
+    stop_id = operation.value().stop_event_id;
+    const auto status = kernel.read_stop(*stop_id);
+    return status.ok() && status.value().complete &&
+           status.value().result == StopEventResult::kStopped;
+  }));
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  EXPECT_EQ(operation.value().state, OperationStateKind::kStopped);
+  ASSERT_EQ(operation.value().participants.size(), 1U);
+  const auto& participant = operation.value().participants.front();
+  EXPECT_EQ(participant.state, OperationStateKind::kStopped);
+  ASSERT_TRUE(participant.terminal_error.has_value());
+  EXPECT_EQ(participant.terminal_error->code, std::string(to_string(ErrorCode::kExecutionAborted)));
+  EXPECT_EQ(participant.terminal_error->details.at("reason"), "runtime_collision_fault");
+  ASSERT_TRUE(participant.terminal_fact.has_value());
+  EXPECT_EQ(participant.terminal_fact->kind,
+            ParticipantExecutionFactKind::kPreemptedByAddressedStop);
+  EXPECT_EQ(participant.terminal_fact->effect, ParticipantEffectKnowledge::kEffectSettled);
+
+  // The participant's own close permission (the real engine grants it for a
+  // certified Stopped execution whose terminal cleanup ended).
+  engine.recovery_assessment.eligible_close = true;
+  const auto assessed = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  const auto& assessment = assessed.value().assessment;
+  EXPECT_EQ(assessment.recovery_class, RecoveryClass::kRuntimeCollision);
+  EXPECT_TRUE(assessment.eligible_close);
+  EXPECT_EQ(assessment.allowed_actions,
+            (std::vector<RecoveryAction>{RecoveryAction::kReplanFromStoppedState,
+                                         RecoveryAction::kResetCycle}));
   EXPECT_FALSE(kernel.get_cell_latch().latched);
 }
 
@@ -4405,6 +4541,73 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     AnotherComponentsLostStateStopsTheMoveAsItsOwnLostObservation) {
+  // The moving robot's collision checks could not place another component of
+  // the cell: that component is stream-stale. The Stop is the existing
+  // observation-lost one, with the component's stream condition and its name.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  auto kernel_heap_test_owner = make_claimed_kernel(
+      {registration(
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal,
+      {kTestApplicationStartId, CellId("cell.test"), 16U});
+  auto& kernel = *kernel_heap_test_owner;
+  const auto accepted = kernel.execute(motion_operation("request.motion.peer-observation-lost"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  engine.translate_stop_stage_hook = [&] {
+    engine.emit_transition(ExecutionState::kStopping, ExecutionState::kStopped);
+  };
+
+  engine.emit_collision({{"reason", std::string(error_codes::kComponentStreamStale)},
+                         {"reason_code", "runtime_collision_monitor"},
+                         {"in_collision", "false"},
+                         {"surface", "observed_runtime_monitor"},
+                         {"peer_component_id", "peer_robot"}});
+  ASSERT_TRUE(wait_until([&] {
+    const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+    if (!operation.ok() || !operation.value().stop_event_id) return false;
+    const auto status = kernel.read_stop(*operation.value().stop_event_id);
+    return status.ok() && status.value().result == StopEventResult::kStopped &&
+           operation.value().state == OperationStateKind::kInterventionRequired;
+  }));
+  // The event's acceptance row is written behind by the journal writer;
+  // the Stop can already be complete before the journal has recorded it.
+  ASSERT_TRUE(wait_until([&] { return journal.stop_acceptance_calls.load() == 1; }));
+
+  {
+    std::lock_guard lock(journal.mutex);
+    ASSERT_TRUE(journal.last_stop_event_accepted.has_value());
+    const auto& record = *journal.last_stop_event_accepted;
+    EXPECT_EQ(record.requested, StopKind::kRuntimeCollision);
+    EXPECT_EQ(record.source_label.view(), "kernel.runtime_collision");
+    EXPECT_EQ(record.reason.view(), "runtime_monitor_observation_lost");
+  }
+  const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  ASSERT_EQ(operation.value().participants.size(), 1U);
+  // Same containment outcome as a runtime collision; only the cause differs.
+  EXPECT_EQ(operation.value().participants.front().state,
+            OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(operation.value().participants.front().terminal_error.has_value());
+  const auto& terminal_error = *operation.value().participants.front().terminal_error;
+  EXPECT_EQ(terminal_error.code, error_codes::kRuntimeMonitorObservationLost);
+  EXPECT_EQ(terminal_error.message,
+            "Runtime monitor stopped the operation: measured robot state was lost");
+  EXPECT_EQ(terminal_error.details.at("reason"), "runtime_monitor_observation_lost");
+  EXPECT_EQ(terminal_error.details.at("runtime_collision_reason"),
+            error_codes::kComponentStreamStale);
+  EXPECT_EQ(terminal_error.details.at("in_collision"), "false");
+  EXPECT_EQ(terminal_error.details.at("peer_component_id"), "peer_robot");
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);
+  EXPECT_FALSE(kernel.get_cell_latch().latched);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      ProgramResetAfterRuntimeCollisionContainmentKeepsMotionAdmissible) {
   // Live incident 2026-10-26: Program Reset's run Stop re-captured an
   // operation its own runtime-collision Stop had already contained; the
@@ -4434,7 +4637,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     const auto status = kernel.read_stop(*collision_stop);
     return status.ok() && status.value().complete &&
            status.value().result == StopEventResult::kStopped &&
-           operation.value().state == OperationStateKind::kInterventionRequired;
+           operation.value().state == OperationStateKind::kStopped;
   }));
   ASSERT_EQ(engine.participant_stop_settlement_calls.load(), 1);
   // The real ExecutionKernel refuses a second Stop settling the same execution.
@@ -4447,7 +4650,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(wait_stop_complete(kernel, run_stop.event_id));
   const auto held = kernel.get_operation_state(accepted.value().operation_id);
   ASSERT_TRUE(held.ok()) << held.error().message;
-  EXPECT_EQ(held.value().state, OperationStateKind::kInterventionRequired);
+  EXPECT_EQ(held.value().state, OperationStateKind::kStopped);
   EXPECT_FALSE(kernel.get_cell_latch().latched);
 
   const auto reset = kernel.reset(control_request("request.collision.reset", accepted.value(),
@@ -4493,7 +4696,7 @@ TEST(ResourceAddressedExecutionKernelTest,
     const auto status = kernel.read_stop(*collision_stop);
     return status.ok() && status.value().complete &&
            status.value().result == StopEventResult::kStopped &&
-           operation.value().state == OperationStateKind::kInterventionRequired;
+           operation.value().state == OperationStateKind::kStopped;
   }));
   ASSERT_EQ(engine.participant_stop_settlement_calls.load(), 1);
   const auto contained = kernel.get_operation_state(accepted.value().operation_id).value();
@@ -6455,6 +6658,68 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionIdleOverlapHasOneHold
   EXPECT_EQ(engine.stop_calls.load(), 0);
 }
 
+// OD-342: a Program node's own group Stop names the node on the holds it
+// raises (stopped_by: program), the way a rule's `hold` names the rule. The
+// attribution lasts as long as the hold and ends with its release; an
+// operator Stop names no Program node.
+TEST(ResourceAddressedExecutionKernelTest, AProgramNodeStopAttributesTheHoldsItRaisesUntilRelease) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{kTestApplicationStartId,
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  auto kernel_heap_test_owner = make_uncaptured_kernel(
+      {registration(
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  auto& kernel = *kernel_heap_test_owner;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(kernel);
+  using Hold = ProgramNodeProgramHoldDTO;
+
+  // `timer` (node 1) stops group arm: node 0 `move` is held by it.
+  auto by_timer = program_selection_request("program.stop.arm", "arm");
+  by_timer.stopped_by_node_instance_id = ProgramNodeInstanceId("timer");
+  const auto stopped = kernel.stop_program_selection(by_timer);
+  ASSERT_TRUE(stopped.state.has_value());
+  EXPECT_EQ(stopped.state->program_held_nodes, (std::vector<Hold>{{0U, 1U}}));
+  EXPECT_FALSE(stopped.state->stopped_by_rule_id.has_value());
+
+  // The operator's Stop all holds node 1 too, attributed to no Program node,
+  // and leaves the Program's attribution of node 0 as it is.
+  const auto all = kernel.stop_program_selection(program_selection_request("stop.all", "all"));
+  ASSERT_TRUE(all.state.has_value());
+  EXPECT_EQ(all.state->held_nodes.size(), 2U);
+  EXPECT_EQ(all.state->program_held_nodes, (std::vector<Hold>{{0U, 1U}}));
+  const auto read = kernel.get_program_execution_scope(ProgramRunNumber(1U));
+  ASSERT_TRUE(read.ok());
+  EXPECT_EQ(read.value().program_held_nodes, (std::vector<Hold>{{0U, 1U}}));
+
+  // Run/Resume of arm releases node 0 and its attribution with it.
+  const auto released = kernel.release_program_selection(
+      program_selection_request("resume.arm", "arm"), all.state->hold_revision);
+  ASSERT_TRUE(released.ok()) << released.error().message;
+  EXPECT_TRUE(released.value().program_held_nodes.empty());
+  EXPECT_EQ(released.value().held_nodes.size(), 1U);
+
+  // An operator Stop of arm now names no Program node.
+  const auto operator_stop =
+      kernel.stop_program_selection(program_selection_request("operator.stop.arm", "arm"));
+  ASSERT_TRUE(operator_stop.state.has_value());
+  EXPECT_EQ(operator_stop.state->held_nodes.size(), 2U);
+  EXPECT_TRUE(operator_stop.state->program_held_nodes.empty());
+
+  // A Program Stop of groups already held does not take over their holds.
+  auto again = program_selection_request("program.stop.arm.again", "arm");
+  again.stopped_by_node_instance_id = ProgramNodeInstanceId("timer");
+  const auto held_already = kernel.stop_program_selection(again);
+  ASSERT_TRUE(held_already.state.has_value());
+  EXPECT_TRUE(held_already.state->program_held_nodes.empty());
+}
+
 TEST(ResourceAddressedExecutionKernelTest, ProgramSelectionUnknownContainsThroughExistingFullStop) {
   FakeClock clock;
   ManualScheduler scheduler;
@@ -6901,7 +7166,6 @@ TEST(ResourceAddressedExecutionKernelTest, ManualAvailabilityDistinguishesSettle
   auto& kernel = *kernel_heap_test_owner;
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   auto manual = manual_motion_operation("manual.availability");
-  manual.program_id = alias.value().program_id;
   manual.program_revision = alias.value().program_revision;
   manual.program_binding_id = alias.value().program_binding_id;
   retarget(manual.participants.front(), alias.value().controllable_component_id, alias.value().command_target_id);
@@ -7349,7 +7613,7 @@ TEST(
     if (fault == "inconclusive")
       details = {{"runtime_query_engine_status", "diagnostic_incomplete"}};
     if (fault == "contact")
-      details = {{"contact_policy_violation", "penetration_exceeded"}};
+      details = {{"contact_rule_violation", "penetration_exceeded"}};
     engine.emit_collision(std::move(details));
     std::optional<StopEventId> stop_id;
     ASSERT_TRUE(wait_until([&] {
@@ -7391,8 +7655,12 @@ TEST(
               (fault == "nominal" || fault == "later_stop"));
     EXPECT_EQ(assessed.value().assessment.recovery_class,
               RecoveryClass::kRuntimeCollision);
-    EXPECT_EQ(assessed.value().assessment.allowed_actions,
-              engine.recovery_assessment.allowed_actions);
+    // OD-373 (A): the monitor's lost-observation Stop leaves the move
+    // intervention-required, so it is not replanned from its stopped state.
+    auto expected_actions = engine.recovery_assessment.allowed_actions;
+    if (fault == "stale")
+      std::erase(expected_actions, RecoveryAction::kReplanFromStoppedState);
+    EXPECT_EQ(assessed.value().assessment.allowed_actions, expected_actions);
     const auto polled =
         kernel.get_operation_recovery_assessment(accepted.value().operation_id);
     ASSERT_TRUE(polled.ok());
@@ -8787,14 +9055,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto physical =
       make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto dynamic_value = physical.value();
-  dynamic_value.program_id = ProgramId("program.dynamic");
   dynamic_value.program_revision = ProgramRevision(test_digest('4'));
   dynamic_value.program_binding_id = ProgramBindingId(test_digest('5'));
   auto dynamic = verify_runtime_participant_binding(std::move(dynamic_value));
   ASSERT_TRUE(dynamic.ok()) << dynamic.error().message;
 
   auto intent = motion_operation("request.dynamic.1");
-  intent.program_id = ProgramId("program.dynamic");
   intent.program_revision = ProgramRevision(test_digest('4'));
   intent.program_binding_id = ProgramBindingId(test_digest('5'));
   std::size_t resolver_calls = 0U;
@@ -8812,7 +9078,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   // Run equality: the dynamic Program's work names the run the Kernel holds,
   // so the run is claimed and captured for that Program (base: an unclaimed
   // Kernel admitted it).
-  establish_program_as(kernel, intent.program_id, intent.program_revision,
+  establish_program_as(kernel, intent.program_revision,
                        intent.program_binding_id);
 
   const auto result = kernel.execute(intent);
@@ -8820,7 +9086,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(resolver_calls, 1U);
   EXPECT_EQ(engine.execute_calls, 1);
   ASSERT_TRUE(engine.last_execute.has_value());
-  EXPECT_EQ(engine.last_execute->binding.program_id, intent.program_id);
+  EXPECT_EQ(engine.last_execute->binding.program_revision, intent.program_revision);
   EXPECT_EQ(engine.last_execute->binding.program_binding_id, intent.program_binding_id);
 }
 
@@ -8835,14 +9101,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto physical =
       make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   auto dynamic_value = physical.value();
-  dynamic_value.program_id = ProgramId("program.dynamic");
   dynamic_value.program_revision = ProgramRevision(test_digest('4'));
   dynamic_value.program_binding_id = ProgramBindingId(test_digest('5'));
   auto dynamic = verify_runtime_participant_binding(std::move(dynamic_value));
   ASSERT_TRUE(dynamic.ok()) << dynamic.error().message;
 
   auto intent = motion_operation("request.context.1");
-  intent.program_id = ProgramId("program.dynamic");
   intent.program_revision = ProgramRevision(test_digest('4'));
   intent.program_binding_id = ProgramBindingId(test_digest('5'));
   std::vector<ProgramRunResolutionContext> received;
@@ -8859,7 +9123,7 @@ TEST(ResourceAddressedExecutionKernelTest,
           }});
   auto& kernel = *kernel_heap_test_owner;
   const ProgramRunResolutionContext context = std::make_shared<const int>(234);
-  establish_program_as(kernel, intent.program_id, intent.program_revision,
+  establish_program_as(kernel, intent.program_revision,
                        intent.program_binding_id, std::nullopt, std::nullopt, context);
   EXPECT_EQ(kernel.program_run_resolution_context(ProgramRunNumber(1U)), context);
   EXPECT_FALSE(kernel.program_run_resolution_context(ProgramRunNumber(2U)));
@@ -8898,7 +9162,7 @@ void ExpectHandedStopPlansExact(const ResolvedPreparedMotionExecutionRequestDTO&
         registered.stop_readiness->value().resolved_stop_base_plan,
         PreparedParticipantStopPlanContextDTO{
             participant_id.operation_id, OperationRevision(1U), participant_id,
-            intent.program_id, intent.program_revision, intent.program_binding_id,
+            intent.program_revision, intent.program_binding_id,
             intent.program_run_id, profile, purpose, std::nullopt,
             registered.stop_node_category},
         registered.binding.value().resources, registered.retained_default_stop_limits);
@@ -8966,7 +9230,7 @@ TEST(ResourceAddressedExecutionKernelTest, HandedStopPlansAreExactlyTheRegistrat
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     ResolvesProgramContactGraspAndSelectedRuntimeObjectBeforeSubordinateCall) {
+     AdmitsCollisionRuleBodiesBeforeSubordinateCall) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
@@ -8982,20 +9246,35 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto& kernel = *kernel_heap_test_owner;
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
-  motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
-  motion.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
-      RuntimeObjectId("selected_object"), SceneResourceId("part.7")}};
+  const CollisionRuleDTO grasp{
+      "selected_object_grasp",
+      {CollisionRuleCollisionBodySelection{
+          {ControllableComponentId("robot.1"), CollisionBodyRoleId("gripper_collision")}}},
+      {CollisionRuleSceneObjectSelection{SceneResourceId("part.7")}},
+      CollisionContactRule{0.002, 0.8, std::nullopt}};
+  motion.collision_rules = {CollisionRuleDTO{"this_move", {}, {}, CollisionClearanceRule{0.003}},
+                            grasp};
 
   const auto result = kernel.execute(intent);
   ASSERT_TRUE(result.ok()) << result.error().message;
   ASSERT_TRUE(engine.last_execute.has_value());
-  ASSERT_TRUE(engine.last_execute->resolved_contact_grasp.has_value());
-  const auto& resolved = *engine.last_execute->resolved_contact_grasp;
-  EXPECT_EQ(resolved.contact_policy_id.value(), "selected_object_grasp");
-  EXPECT_EQ(resolved.runtime_object_id.value(), "selected_object");
-  EXPECT_EQ(resolved.selected_object_id.value(), "part.7");
-  EXPECT_EQ(resolved.allowed_robot_body_ids.size(), 1U);
-  EXPECT_EQ(engine.last_execute->runtime_object_bindings, motion.runtime_object_bindings);
+  // The collision body became the ids the binding holds; the rest is unchanged.
+  const auto& admitted = engine.last_execute->collision_rules;
+  ASSERT_EQ(admitted.size(), 2U);
+  EXPECT_EQ(admitted[0],
+            (CollisionRule{"this_move", {}, {}, CollisionClearanceRule{0.003}}));
+  EXPECT_EQ(admitted[1].rule_id, "selected_object_grasp");
+  EXPECT_EQ(admitted[1].value, grasp.value);
+  ASSERT_EQ(admitted[1].a.size(), 1U);
+  EXPECT_EQ(std::get<CollisionRuleResolvedBodiesSelection>(admitted[1].a.front())
+                .collision_body_ids,
+            std::vector<CollisionBodyId>{make_component_collision_body_id(
+                ControllableComponentId("robot.1"), ModelInstanceId("robot.model"),
+                CollisionBodyRoleId("gripper_collision"), 0U)});
+  ASSERT_EQ(admitted[1].b.size(), 1U);
+  EXPECT_EQ(std::get<CollisionRuleSceneObjectSelection>(admitted[1].b.front())
+                .scene_resource_id.value(),
+            "part.7");
 }
 
 TEST(ResourceAddressedExecutionKernelTest, MotionRequiresTheExactCapturedEndpointOwnerAndFrame) {
@@ -9031,9 +9310,9 @@ TEST(ResourceAddressedExecutionKernelTest, MotionRequiresTheExactCapturedEndpoin
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
-     MotionEndpointContactUsesOnlyItsSelectedProjectedBodiesAndRequiresPermission) {
+     TcpContactBodiesRuleUsesOnlyTheEndpointsProjectedBodies) {
   for (const int scenario : {0, 1, 2, 3}) {
-    SCOPED_TRACE(scenario);  // selected bodies, no permission, empty, absent
+    SCOPED_TRACE(scenario);  // selected bodies, no rule, no contact bodies, no endpoint
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
@@ -9041,10 +9320,8 @@ TEST(ResourceAddressedExecutionKernelTest,
         make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular, std::nullopt,
             false, "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce", true)
             .value();
-    auto& policy = value.contact_grasp_bindings.front();
-    auto body = policy.allowed_body_bindings.front();
-    policy.allowed_body_bindings.clear();
-    policy.bodies_from_motion_endpoint = true;
+    auto body = value.collision_rule_bodies.front();
+    value.collision_rule_bodies.clear();
     auto frame = value.frame_bindings.back();
     frame.reference = {ControllableComponentId("gripper.1"), FrameRoleId("finger_center")};
     // Direct references: an endpoint body is owned by the endpoint's frame
@@ -9056,8 +9333,8 @@ TEST(ResourceAddressedExecutionKernelTest,
     frame.compiled_frame_name = "mf2_finger_center";
     value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
         {ControllableComponentId("gripper.1"), CommandTargetId("gripper")}, std::move(frame),
-        scenario == 2 ? std::vector<ProgramContactGraspBodyBindingDTO>{}
-                      : std::vector<ProgramContactGraspBodyBindingDTO>{body},
+        scenario == 2 ? std::vector<ProgramCollisionRuleBodyBindingDTO>{}
+                      : std::vector<ProgramCollisionRuleBodyBindingDTO>{body},
         scenario == 2 ? std::vector<CollisionBodyRoleId>{}
                       : std::vector<CollisionBodyRoleId>{body.body.collision_body_id}};
     if (scenario == 3) value.motion_endpoint.reset();
@@ -9087,15 +9364,17 @@ TEST(ResourceAddressedExecutionKernelTest,
                                                {ControllableComponentId("gripper.1"), FrameRoleId("finger_center")}};
     }
     if (scenario != 1) {
-      motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
-      motion.runtime_object_bindings = {
-          {RuntimeObjectId("selected_object"), SceneResourceId("part.7")}};
+      motion.collision_rules = {
+          CollisionRuleDTO{"selected_object_grasp",
+                           {CollisionRuleActiveTcpContactBodiesSelection{}},
+                           {CollisionRuleSceneObjectSelection{SceneResourceId("part.7")}},
+                           CollisionContactRule{0.002, 0.8, std::nullopt}}};
     }
     const auto result = kernel.execute(intent);
     if (scenario >= 2) {
       ASSERT_FALSE(result.ok());
       EXPECT_EQ(result.error().details.at("reason"),
-                scenario == 2 ? "contact_grasp_body_binding_empty"
+                scenario == 2 ? "collision_rule_selection_unresolved"
                               : "runtime_motion_mapping_incomplete");
       EXPECT_EQ(engine.execute_calls, 0);
     } else {
@@ -9108,12 +9387,17 @@ TEST(ResourceAddressedExecutionKernelTest,
       EXPECT_EQ(engine.last_execute->speed_profile.max_tcp_linear_speed_mps,
                 scenario == 1 ? 0.1 : 0.15);
       if (scenario == 1) {
-        EXPECT_FALSE(engine.last_execute->resolved_contact_grasp);
+        EXPECT_TRUE(engine.last_execute->collision_rules.empty());
       } else {
-        ASSERT_TRUE(engine.last_execute->resolved_contact_grasp);
-        EXPECT_EQ(engine.last_execute->resolved_contact_grasp->allowed_robot_body_ids,
+        ASSERT_EQ(engine.last_execute->collision_rules.size(), 1U);
+        const auto& rule = engine.last_execute->collision_rules.front();
+        ASSERT_EQ(rule.a.size(), 1U);
+        EXPECT_EQ(std::get<CollisionRuleResolvedBodiesSelection>(rule.a.front())
+                      .collision_body_ids,
                   std::vector<CollisionBodyId>{physical_body});
-        EXPECT_EQ(engine.last_execute->resolved_contact_grasp->selected_object_id.value(),
+        ASSERT_EQ(rule.b.size(), 1U);
+        EXPECT_EQ(std::get<CollisionRuleSceneObjectSelection>(rule.b.front())
+                      .scene_resource_id.value(),
                   "part.7");
       }
     }
@@ -9138,9 +9422,12 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto& kernel = *kernel_heap_test_owner;
   auto intent = motion_operation("request.preview.1");
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
-  motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
-  motion.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
-      RuntimeObjectId("selected_object"), SceneResourceId("part.7")}};
+  motion.collision_rules = {CollisionRuleDTO{
+      "selected_object_grasp",
+      {CollisionRuleCollisionBodySelection{
+          {ControllableComponentId("robot.1"), CollisionBodyRoleId("gripper_collision")}}},
+      {CollisionRuleSceneObjectSelection{SceneResourceId("part.7")}},
+      CollisionContactRule{0.002, 0.8, std::nullopt}}};
   // The Program claim's row is written behind; the preview adds none.
   ASSERT_TRUE(drain_journal(kernel));
   const auto calls_before = journal.calls;
@@ -9149,8 +9436,11 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(session.ok()) << session.error().message;
   auto prepared = session.value()->prepare_motion(intent);
   ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  ASSERT_TRUE(prepared.value().resolved_contact_grasp.has_value());
-  EXPECT_EQ(prepared.value().resolved_contact_grasp->selected_object_id.value(), "part.7");
+  ASSERT_EQ(prepared.value().collision_rules.size(), 1U);
+  EXPECT_EQ(std::get<CollisionRuleSceneObjectSelection>(
+                prepared.value().collision_rules.front().b.front())
+                .scene_resource_id.value(),
+            "part.7");
   EXPECT_EQ(prepared.value().binding.controllable_component_id.value(), "robot.1");
   auto state = session.value()->current_state();
   ASSERT_TRUE(state.ok()) << state.error().message;
@@ -9515,8 +9805,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 
-TEST(ResourceAddressedExecutionKernelTest,
-     RejectsProgramContactGraspWithoutItsRuntimeObjectBeforeEffect) {
+TEST(ResourceAddressedExecutionKernelTest, RejectsAModelGroupOnAMoveRuleBeforeEffect) {
   FakeClock clock;
   ManualScheduler scheduler;
   FakeParticipantEngine engine;
@@ -9530,33 +9819,66 @@ TEST(ResourceAddressedExecutionKernelTest,
       clock, scheduler, default_journal,
       {kTestApplicationStartId, CellId("cell.test"), 8U});
   auto& kernel = *kernel_heap_test_owner;
-  const auto expect_policy_object_named = [](const ErrorDTO& error) {
-    EXPECT_EQ(error.code, "missing_reference");
-    EXPECT_EQ(error.details.at("reason"), "contact_grasp_runtime_object_unresolved");
-    // The one reference is the runtime object the contact policy requires.
-    EXPECT_EQ(error.details.at("reference_type"), "runtime_object");
-    EXPECT_EQ(error.details.at("reference_id"), "selected_object");
-    EXPECT_FALSE(error.details.contains("target_role_id"));
-  };
   auto intent = motion_operation();
   auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
-  motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
+  // Model groups are Deployment selections; the execution host resolves them.
+  motion.collision_rules = {CollisionRuleDTO{
+      "arm_on_part",
+      {CollisionRuleModelGroupSelection{ControllableComponentId("robot.1"), "manipulator"}},
+      {CollisionRuleSceneObjectSelection{SceneResourceId("part.7")}},
+      CollisionContactRule{std::nullopt, 0.0, std::nullopt}}};
 
   const auto result = kernel.execute(intent);
   ASSERT_FALSE(result.ok());
-  expect_policy_object_named(result.error());
+  EXPECT_EQ(result.error().details.at("reason"), "collision_rule_selection_unresolved");
+  EXPECT_EQ(result.error().details.at("selection_kind"), "model_group");
+  EXPECT_EQ(result.error().details.at("reference_id"), "robot.1/manipulator");
+  EXPECT_EQ(engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RejectsCollisionRuleBodyTheBindingDoesNotHoldBeforeEffect) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  auto kernel_heap_test_owner = make_claimed_kernel(
+      {registration(
+          make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular,
+                       std::nullopt, false,
+                       "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
+                       true),
+          engine)},
+      clock, scheduler, default_journal,
+      {kTestApplicationStartId, CellId("cell.test"), 8U});
+  auto& kernel = *kernel_heap_test_owner;
+  auto intent = motion_operation();
+  auto& motion = std::get<MotionParticipantIntentDTO>(intent.participants.front().payload);
+  motion.collision_rules = {CollisionRuleDTO{
+      "wrist_on_part",
+      {CollisionRuleCollisionBodySelection{
+          {ControllableComponentId("robot.1"), CollisionBodyRoleId("wrist_collision")}}},
+      {CollisionRuleSceneObjectSelection{SceneResourceId("part.7")}},
+      CollisionContactRule{std::nullopt, 0.0, std::nullopt}}};
+
+  const auto result = kernel.execute(intent);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "missing_reference");
+  EXPECT_EQ(result.error().details.at("reason"), "collision_rule_selection_unresolved");
+  EXPECT_EQ(result.error().details.at("collision_rule_id"), "wrist_on_part");
+  EXPECT_EQ(result.error().details.at("selection_kind"), "collision_body");
+  EXPECT_EQ(result.error().details.at("reference_id"), "robot.1/wrist_collision");
   EXPECT_EQ(engine.execute_calls, 0);
 
-  // Selecting a different runtime object still names the one the policy needs,
-  // never the selected one.
-  auto other = motion_operation("request.contact_grasp.other_object");
-  auto& other_motion = std::get<MotionParticipantIntentDTO>(other.participants.front().payload);
-  other_motion.contact_policy_id = ContactPolicyId("selected_object_grasp");
-  other_motion.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
-      RuntimeObjectId("other_object"), SceneResourceId("part.7")}};
-  const auto other_result = kernel.execute(other);
-  ASSERT_FALSE(other_result.ok());
-  expect_policy_object_named(other_result.error());
+  // A malformed rule is refused by the intent's shape check.
+  auto malformed = motion_operation("request.collision_rule.malformed");
+  std::get<MotionParticipantIntentDTO>(malformed.participants.front().payload).collision_rules = {
+      CollisionRuleDTO{"both_sides",
+                       {CollisionRuleSceneObjectsSelection{}},
+                       {},
+                       CollisionContactRule{std::nullopt, 0.0, std::nullopt}}};
+  const auto malformed_result = kernel.execute(malformed);
+  ASSERT_FALSE(malformed_result.ok());
+  EXPECT_EQ(malformed_result.error().details.at("reason"), "collision_rule_selection_invalid");
   EXPECT_EQ(engine.execute_calls, 0);
 }
 
@@ -13142,7 +13464,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   const auto preview = kernel.preview_capability_command(command_operation());
   ASSERT_TRUE(preview.ok()) << preview.error().message;
-  EXPECT_EQ(preview.value().binding.program_id.value(), "program.pick");
+  EXPECT_EQ(preview.value().binding.program_revision, ProgramRevision(test_digest('0')));
   EXPECT_EQ(preview.value().binding.command_target_id.value(), "gripper.target");
   EXPECT_EQ(preview.value().command_request.joint_name, "mf2_finger_joint");
   EXPECT_DOUBLE_EQ(preview.value().command_request.target_position, 0.02);
@@ -15619,8 +15941,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   auto& kernel = *kernel_heap_test_owner;
   // Run equality: the alias Program's work names the run the Kernel holds,
   // so that run is claimed and captured for the alias Program.
-  establish_program_as(kernel, direct_control_binding.value().program_id,
-                       direct_control_binding.value().program_revision,
+  establish_program_as(kernel, direct_control_binding.value().program_revision,
                        direct_control_binding.value().program_binding_id);
 
   const auto configured = kernel.set_runtime_scale_control(
@@ -15636,7 +15957,6 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_DOUBLE_EQ(shared_projection.value().requested_scale, 0.4);
 
   auto direct = motion_operation("request.scale.control.direct");
-  direct.program_id = direct_control_binding.value().program_id;
   direct.program_revision = direct_control_binding.value().program_revision;
   direct.program_binding_id = direct_control_binding.value().program_binding_id;
   retarget(direct.participants.front(), direct_control_binding.value().controllable_component_id, direct_control_binding.value().command_target_id);
@@ -16844,24 +17164,96 @@ TEST(CellLatchTest, EveryAcceptedStopCallsTheStopListenerOnce) {
   EXPECT_EQ(listener.calls.load(), 2);
 }
 
-TEST(CellLatchTest, AFaultDuringExecutionLatchesWithoutAStop) {
+// OD-379: a component fault while motion executes latches the cell and
+// stops every moving robot with its fault Stop profile, under its own typed
+// Stop kind and cause naming the component; the move needs the operator.
+TEST(CellLatchTest, AFaultDuringExecutionLatchesAndStopsTheMoveWithItsFaultProfile) {
   CellLatchFixture fixture;
   fixture.kernel.observe_component_states(
-      {CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kIdle)});
+      {CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kIdle),
+       CellComponentState("io.bank", ComponentLifecycle::kEnabled, ComponentActivity::kIdle)});
   const auto running = fixture.kernel.execute(motion_operation("request.latch.running"));
   ASSERT_TRUE(running.ok()) << running.error().message;
+  const auto operation_id = running.value().operation_id;
+  fixture.engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  fixture.engine.translate_stop_stage_hook = [&] {
+    fixture.engine.emit_transition(ExecutionState::kStopping, ExecutionState::kStopped);
+  };
   fixture.kernel.observe_component_states(
-      {CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kBusy)});
+      {CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kBusy),
+       CellComponentState("io.bank", ComponentLifecycle::kEnabled, ComponentActivity::kIdle)});
   EXPECT_FALSE(fixture.kernel.get_cell_latch().latched);
-  fixture.kernel.observe_component_states(
-      {CellComponentState(fixture.Arm(), ComponentLifecycle::kFault, ComponentActivity::kIdle)});
+  EXPECT_FALSE(fixture.kernel.get_operation_state(operation_id).value().stop_event_id);
+
+  const std::vector<ComponentState> faulted{
+      CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kBusy),
+      CellComponentState("io.bank", ComponentLifecycle::kFault, ComponentActivity::kIdle)};
+  fixture.kernel.observe_component_states(faulted);
   const auto latch = fixture.kernel.get_cell_latch();
   ASSERT_TRUE(latch.latched);
   ASSERT_EQ(latch.causes.size(), 1U);
+  EXPECT_EQ(latch.causes.front().component_id, "io.bank");
   EXPECT_EQ(latch.causes.front().kind, CellLatchCauseKind::kFault);
+
+  std::optional<StopEventId> stop_id;
+  ASSERT_TRUE(wait_until([&] {
+    const auto operation = fixture.kernel.get_operation_state(operation_id);
+    if (!operation.ok() || !operation.value().stop_event_id) return false;
+    stop_id = operation.value().stop_event_id;
+    const auto status = fixture.kernel.read_stop(*stop_id);
+    return status.ok() && status.value().result != StopEventResult::kPending &&
+           terminal(operation.value().state);
+  }));
+  const auto status = fixture.kernel.read_stop(*stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().requested, StopKind::kComponentFault);
+  EXPECT_EQ(status.value().applied, StopKind::kComponentFault);
+  ASSERT_TRUE(fixture.engine.last_stop_stage.has_value());
+  const auto& plan = fixture.engine.last_stop_stage->participant_stop_plan;
+  EXPECT_EQ(plan.participant_stop_profile_purpose, ParticipantStopProfilePurposeDTO::kFault);
+  ASSERT_TRUE(plan.participant_stop_profile.has_value());
+  EXPECT_EQ(plan.participant_stop_profile->profile_id, "fault_spring_back_hold");
+
+  const auto ended = fixture.kernel.get_operation_state(operation_id).value();
+  ASSERT_EQ(ended.participants.size(), 1U);
+  // As the runtime monitor's non-contact Stops: the operator decides.
+  EXPECT_EQ(ended.participants.front().state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(ended.participants.front().terminal_error.has_value());
+  const auto& cause = *ended.participants.front().terminal_error;
+  EXPECT_EQ(cause.code, error_codes::kComponentFault);
+  EXPECT_EQ(cause.details.at("reason"), "component_fault");
+  EXPECT_EQ(cause.details.at("component_id"), "io.bank");
+  EXPECT_TRUE(cause.details.contains("fault_code"));
+
+  // The same fault reported again is the same episode: no second Stop.
+  const int stages = fixture.engine.translate_stop_stage_calls.load();
+  fixture.kernel.observe_component_states(faulted);
+  EXPECT_EQ(fixture.kernel.get_operation_state(operation_id).value().stop_event_id, stop_id);
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls.load(), stages);
   const auto next = fixture.kernel.execute(motion_operation("request.latch.next"));
   ASSERT_FALSE(next.ok());
   EXPECT_EQ(next.error().code, "cell_latched");
+}
+
+// OD-379: a simulation that is not playing is simulator state, not a fault:
+// the move is neither latched nor stopped.
+TEST(CellLatchTest, ASimulationNotPlayingDuringExecutionStopsNothing) {
+  CellLatchFixture fixture;
+  fixture.kernel.observe_component_states(
+      {CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kIdle)});
+  const auto running = fixture.kernel.execute(motion_operation("request.latch.paused"));
+  ASSERT_TRUE(running.ok()) << running.error().message;
+  fixture.engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  auto paused =
+      CellComponentState(fixture.Arm(), ComponentLifecycle::kEnabled, ComponentActivity::kBusy);
+  paused.reason = ComponentStateReason{"simulation_not_playing", "The simulation is not playing"};
+  paused.streams = {{"measured_joints", StreamFreshness::kStale, 500}};
+  fixture.kernel.observe_component_states({paused});
+  EXPECT_FALSE(fixture.kernel.get_cell_latch().latched);
+  const auto state = fixture.kernel.get_operation_state(running.value().operation_id).value();
+  EXPECT_FALSE(state.stop_event_id);
+  EXPECT_FALSE(terminal(state.state));
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls.load(), 0);
 }
 
 TEST(CellLatchTest, EstopDuringExecutionLatchesUntilStopClears) {
@@ -18028,8 +18420,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {held.intent.owner_role, held.intent.owner_transaction_id, held.intent.request_key,
        held.acquired_admission_generation, held.claim_generation,
        {CellAdmissionSettlementKindDTO::kExplicitReset, ContentDigest(test_digest('2'))}}).ok());
-  establish_program_as(kernel, candidate_binding.value().program_id,
-                       candidate_binding.value().program_revision,
+  establish_program_as(kernel, candidate_binding.value().program_revision,
                        candidate_binding.value().program_binding_id,
                        candidate_binding.value().retained_bundle_id,
                        candidate_binding.value().graph_revision);
@@ -18141,8 +18532,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(reconfigured.ok()) << reconfigured.error().message;
   // Run equality: the candidate Program's work names the run the Kernel
   // holds, so that run is claimed and captured for the candidate product.
-  establish_program_as(kernel, candidate_binding.value().program_id,
-                       candidate_binding.value().program_revision,
+  establish_program_as(kernel, candidate_binding.value().program_revision,
                        candidate_binding.value().program_binding_id,
                        candidate_binding.value().retained_bundle_id,
                        candidate_binding.value().graph_revision);
@@ -25772,6 +26162,93 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_TRUE(outcome.stop_result);
 }
 
+// OD-379: a Real I/O bank whose stream goes stale both loses its rule's
+// source and enters `fault`. Whichever arrives first, the move is stopped:
+// the rule's own Stop when its loss is evaluated first (the later fault Stop
+// covers it, never restarts it), the component fault's Stop when the fault
+// latches the cell first and pauses interrupt evaluation.
+TEST(ResourceAddressedExecutionKernelTest, IoBankRuleLossBeforeItsFaultStopsTheMoveByTheRule) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto operation_id = accepted.value().operation_id;
+  ASSERT_TRUE(fixture.Registered(operation_id));
+  const auto arm = fixture.binding.value().controllable_component_id.value();
+  fixture.kernel->observe_component_states(
+      {CellComponentState(arm, ComponentLifecycle::kEnabled, ComponentActivity::kBusy),
+       CellComponentState("io.bank", ComponentLifecycle::kEnabled, ComponentActivity::kIdle)});
+
+  ASSERT_TRUE(fixture.service
+                  ->MarkSourceUnavailable(InterruptSourceId("gpio.source"),
+                                          IoSourceIncarnation("gpio.1"), 1U,
+                                          ErrorDTO{"source_disconnected", "stream stale", {}})
+                  .ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(fixture.kernel->get_operation_state(operation_id).value().stop_event_id);
+  fixture.kernel->observe_component_states(
+      {CellComponentState(arm, ComponentLifecycle::kEnabled, ComponentActivity::kBusy),
+       CellComponentState("io.bank", ComponentLifecycle::kFault, ComponentActivity::kIdle)});
+  EXPECT_TRUE(fixture.kernel->get_cell_latch().latched);
+
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = fixture.kernel->get_operation_state(operation_id);
+    return state.ok() && terminal(state.value().state);
+  }));
+  const auto ended = fixture.kernel->get_operation_state(operation_id).value();
+  const auto& row = ended.participants.front();
+  ASSERT_TRUE(row.terminal_error.has_value());
+  EXPECT_EQ(row.terminal_error->code, "interrupt_source_unavailable");
+  ASSERT_EQ(row.io_rule_outcomes.size(), 1U);
+  EXPECT_FALSE(row.io_rule_outcomes.front().evidence.source_losses.empty());
+  ASSERT_TRUE(fixture.engine.last_stop_stage.has_value());
+  EXPECT_NE(fixture.engine.last_stop_stage->participant_stop_plan.participant_stop_profile_purpose,
+            ParticipantStopProfilePurposeDTO::kFault);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, IoBankFaultBeforeItsRuleLossStopsTheMoveByTheFault) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto operation_id = accepted.value().operation_id;
+  ASSERT_TRUE(fixture.Registered(operation_id));
+  const auto arm = fixture.binding.value().controllable_component_id.value();
+  fixture.kernel->observe_component_states(
+      {CellComponentState(arm, ComponentLifecycle::kEnabled, ComponentActivity::kBusy),
+       CellComponentState("io.bank", ComponentLifecycle::kEnabled, ComponentActivity::kIdle)});
+
+  fixture.kernel->observe_component_states(
+      {CellComponentState(arm, ComponentLifecycle::kEnabled, ComponentActivity::kBusy),
+       CellComponentState("io.bank", ComponentLifecycle::kFault, ComponentActivity::kIdle)});
+  ASSERT_TRUE(fixture.kernel->get_cell_latch().latched);
+  // The rule's loss arrives while latched: its evaluation is paused.
+  ASSERT_TRUE(fixture.service
+                  ->MarkSourceUnavailable(InterruptSourceId("gpio.source"),
+                                          IoSourceIncarnation("gpio.1"), 1U,
+                                          ErrorDTO{"source_disconnected", "stream stale", {}})
+                  .ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = fixture.kernel->get_operation_state(operation_id);
+    return state.ok() && terminal(state.value().state);
+  }));
+  const auto ended = fixture.kernel->get_operation_state(operation_id).value();
+  ASSERT_TRUE(ended.stop_event_id);
+  const auto status = fixture.kernel->read_stop(*ended.stop_event_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().requested, StopKind::kComponentFault);
+  const auto& row = ended.participants.front();
+  EXPECT_EQ(row.state, OperationStateKind::kInterventionRequired);
+  ASSERT_TRUE(row.terminal_error.has_value());
+  EXPECT_EQ(row.terminal_error->code, error_codes::kComponentFault);
+  EXPECT_EQ(row.terminal_error->details.at("component_id"), "io.bank");
+  ASSERT_TRUE(fixture.engine.last_stop_stage.has_value());
+  EXPECT_EQ(fixture.engine.last_stop_stage->participant_stop_plan.participant_stop_profile_purpose,
+            ParticipantStopProfilePurposeDTO::kFault);
+}
+
 TEST(ResourceAddressedExecutionKernelTest, IoRuleIntegrationNaturalCompletionKeepsNoSignalTrip) {
   IoRuleIntegrationFixture fixture;
   fixture.profile.allow_natural_completion_on_short_path = true;
@@ -27538,7 +28015,6 @@ struct BbKernelIntegrationFixture final {
   static AppliedProgramBlackboardContextDTO Context() {
     const auto capture = program_execution_capture();
     return {ActiveBundlePublicationGeneration(1U),
-               capture.program_id,
                capture.program_revision,
                capture.program_binding_id,
                capture.retained_bundle_id,
@@ -28291,7 +28767,7 @@ TEST(ResourceAddressedExecutionKernelTest,
                        fixture.context.active_publication_generation, fixture.installed_service)
                    .ok());
   auto other = *fixture.context.program_binding;
-  other.program_id = ProgramId(test_digest('9'));
+  other.program_revision = ProgramRevision(test_digest('9'));
   EXPECT_FALSE(fixture.kernel
                    ->ValidatePendingProgramBlackboardScope(
                        scope, other, fixture.context.active_publication_generation,
@@ -32037,9 +32513,9 @@ TEST(ResourceAddressedExecutionKernelTest, GroupStopDuringATakeoverEndsThePrepar
 // already sent (its effect settled, retired at once). The Kernel keeps its
 // rest for the node's next attempt, as Resume keeps it for any stopped
 // motion; the slot is released when that attempt completes. Without a
-// verified send, or for a Cartesian path (its progress is unknown before
-// the hand-over), that attempt is refused as such a Resume is. A newcomer
-// never sent keeps nothing: the next attempt is a fresh one.
+// verified send that attempt is refused as such a Resume is. A newcomer
+// never sent keeps nothing: the next attempt is a fresh one. A Cartesian
+// path never becomes such a newcomer: it is refused at admission (OD-347).
 TEST(ResourceAddressedExecutionKernelTest,
      GroupStopDuringATakeoverKeepsTheSentNewcomersRestForItsNextAttempt) {
   enum class Newcomer { kSentJoint, kSentCartesian, kSentUnverified, kUnsent };
@@ -32093,6 +32569,23 @@ TEST(ResourceAddressedExecutionKernelTest,
     }
     engine.defer_prepare_completion = !sent;
     const auto newcomer = kernel.execute(newcomer_intent);
+    if (kind == Newcomer::kSentCartesian) {
+      // OD-347: refused before anything is prepared, stopped or sent; the
+      // running motion continues untouched.
+      ASSERT_FALSE(newcomer.ok());
+      EXPECT_EQ(newcomer.error().code, "cartesian_path_moving_takeover_refused");
+      EXPECT_EQ(newcomer.error().details.at("running_operation_id"),
+                std::to_string(incumbent.value().operation_id.value()));
+      EXPECT_EQ(newcomer.error().details.at("running_node_instance_id"), "move.0");
+      EXPECT_EQ(engine.prepare_motion_calls.load(), 1);
+      EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 1);
+      const auto running = kernel.get_operation_state(incumbent.value().operation_id);
+      ASSERT_TRUE(running.ok()) << running.error().message;
+      EXPECT_FALSE(running.value().preemption);
+      EXPECT_FALSE(running.value().stop_event_id);
+      EXPECT_EQ(running.value().state, OperationStateKind::kExecuting);
+      continue;
+    }
     ASSERT_TRUE(newcomer.ok()) << newcomer.error().message;
     const auto newcomer_id = newcomer.value().operation_id;
     std::optional<ResolvedMotionSpecDTO> sent_motion;
@@ -32158,12 +32651,10 @@ TEST(ResourceAddressedExecutionKernelTest,
     next.participants.front().execution_scope->node_attempt_id = NodeAttemptNumber(2U);
     const int prepared_before = engine.prepare_motion_calls.load();
     const auto again = kernel.execute(next);
-    if (kind == Newcomer::kSentCartesian || kind == Newcomer::kSentUnverified) {
+    if (kind == Newcomer::kSentUnverified) {
       ASSERT_FALSE(again.ok());
       EXPECT_EQ(again.error().code, "operation_recovery_invalid");
-      EXPECT_EQ(again.error().details.at("reason"),
-                kind == Newcomer::kSentCartesian ? "cartesian_resume_progress_unavailable"
-                                                 : "motion_continuation_dispatch_unsettled");
+      EXPECT_EQ(again.error().details.at("reason"), "motion_continuation_dispatch_unsettled");
       EXPECT_EQ(engine.prepare_motion_calls.load(), prepared_before);
       continue;
     }

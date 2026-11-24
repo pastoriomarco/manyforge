@@ -270,10 +270,10 @@ export interface ApplyPreview {
   }[];
   /** What the Preview was computed from; sent back verbatim with its Apply. */
   scope: Record<string, unknown>;
-  /** Whether the Program stays executable after this Apply. */
+  /** Whether the Program stays executable after this Apply; a non-executable
+   * Program always names at least one unresolved reference. */
   program: {
     executable: boolean;
-    program_id: string | null;
     unresolved_references: ApplyUnresolvedReference[];
     affected_nodes: string[];
     affected_execution_groups: string[];
@@ -281,6 +281,45 @@ export interface ApplyPreview {
   attachment_changed_components: string[];
   /** Kept in the cell, detached at their authored position. */
   detached_components: string[];
+  /** The cell collision rules this Apply adds, removes or changes; confirming the Preview confirms them. */
+  collision_rules: ApplyCollisionRuleChange[];
+  /** Depth rules and trip depths that select a mesh that is not closed; a report, not a confirmation. */
+  mesh_depth_reports: ApplyMeshDepthReport[];
+}
+
+/**
+ * A cell rule with a depth (`collision_rule_id`) or a Mock input with a trip
+ * depth (`signal_id`) that selects a mesh that is not closed: its depth
+ * cannot be measured.
+ */
+export interface ApplyMeshDepthReport {
+  code: 'mesh_not_closed';
+  collision_rule_id?: string;
+  signal_id?: string;
+  member:
+    | { kind: 'link'; component_id: string; link: string }
+    | { kind: 'scene_object'; scene_resource_id: string };
+  mesh_uri: string;
+}
+
+/** One member of a rule side, resolved against the cell model. */
+export type ApplyCollisionRuleMember =
+  | { kind: 'link'; component_id: string; link: string }
+  | { kind: 'attached_object'; component_id: string }
+  | { kind: 'scene_objects' };
+
+/** A rule's authored row and its resolved members, before or after the Apply. */
+export interface ApplyCollisionRuleState {
+  rule: Record<string, unknown>;
+  a: ApplyCollisionRuleMember[];
+  b: ApplyCollisionRuleMember[];
+}
+
+export interface ApplyCollisionRuleChange {
+  rule_id: string;
+  change: 'added' | 'removed' | 'changed';
+  now: ApplyCollisionRuleState | null;
+  was: ApplyCollisionRuleState | null;
 }
 
 /** Apply, Load and New. */

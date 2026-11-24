@@ -37,11 +37,9 @@ const node: ProgramTreeNode = {
 };
 
 const program: ProgramAuthoringDocument = {
-  api_version: 'manyforge.program.v3',
-  program_id: 'schema_editor',
+  api_version: 'manyforge.program.v4',
   program_profile: 'composable-cell-v1',
-  name: 'Schema editor',
-  catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+  catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
   schema_version: 'manyforge.composer_authoring_forest.v2',
   forest: [node],
   positions: {},

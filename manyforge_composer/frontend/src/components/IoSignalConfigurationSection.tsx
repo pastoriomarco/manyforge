@@ -724,6 +724,10 @@ export function IoSignalInputFields({
                 contact or no contact.</li>
               <li><code>contact_bodies_static</code>: at least one contact body is static relative to
                 this robot&apos;s motion group, so it does not move with the robot.</li>
+              <li><code>mesh_not_closed</code>: a trip depth between two meshes, and one of them is
+                not a closed surface.</li>
+              <li><code>mesh_depth_vertex_cap_reached</code>: a trip depth between two meshes, with
+                more than 256 vertices of one mesh inside the other.</li>
             </ul>
             <p>
               Before the first sample the signal has no value. A valid sample becomes stale when it

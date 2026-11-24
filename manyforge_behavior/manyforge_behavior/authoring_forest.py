@@ -5,7 +5,6 @@ from __future__ import annotations
 from copy import deepcopy
 import math
 import re
-import uuid
 from typing import Any, Mapping, NoReturn
 
 from manyforge_behavior.canonical_artifact import compute_content_identity
@@ -22,7 +21,7 @@ from manyforge_behavior.program_expressions import CheckedExpression
 
 
 AUTHORING_FOREST_VERSION = "manyforge.composer_authoring_forest.v2"
-PROGRAM_API_VERSION = "manyforge.program.v3"
+PROGRAM_API_VERSION = "manyforge.program.v4"
 MAXIMUM_NODES = 100_000
 MAXIMUM_DEPTH = 256
 MAXIMUM_POSITIONS = MAXIMUM_NODES
@@ -84,13 +83,13 @@ def empty_authoring(catalog: NodeCatalog) -> dict[str, Any]:
     return {
         "schema_version": AUTHORING_FOREST_VERSION,
         "api_version": PROGRAM_API_VERSION,
-        "program_id": f"program-{uuid.uuid4().hex}",
         "program_profile": "composable-cell-v1",
-        "name": "Untitled Program",
         "catalog": {
             "api_version": catalog.api_version,
             "content_version": catalog.content_version,
         },
+        # Applicable as created: any lane; with or without an assistant.
+        "compatibility": {"assistant": "optional"},
         "parameters": [
             {
                 "parameter_id": "acceleration_scale",

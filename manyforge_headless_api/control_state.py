@@ -643,7 +643,6 @@ class HeadlessControlStateSource:
                 {
                     key: key
                     for key in (
-                        "program_id",
                         "program_revision",
                         "graph_revision",
                         "retained_bundle_id",

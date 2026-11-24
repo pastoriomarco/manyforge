@@ -22,6 +22,7 @@ import { cartesianMoveOffsetsFromTarget, computeCartesianMoveDraft, DEFAULT_MOVE
 import type { CartesianMoveDraftOptions, MoveToDraft, MoveToDraftSource } from '../utils/moveTo';
 import { poseTupleFromValue, poseValueFromTuple, samePose } from '../utils/poseTransforms';
 import { manualPneumaticEndpoint } from './pneumaticManual';
+import { EVERYTHING_COLLISION_RULE_ID, MAX_COLLISION_CLEARANCE_M } from '../utils/collisionRules';
 import type { StructuredError } from '../types/api';
 
 export const ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS = 150;
@@ -562,7 +563,7 @@ function positionsAreValid(
 }
 
 /** Upper bound of a motion's own collision clearance (the backend's). */
-export const MAX_CLEARANCE_M = 0.05;
+export const MAX_CLEARANCE_M = MAX_COLLISION_CLEARANCE_M;
 
 function motionSettingsAreValid(status: ExecutionOwnerStatus, settings: ManualMotionSettings): boolean {
   const { jointLimits, clearanceM, ...positiveValues } = settings;
@@ -654,7 +655,6 @@ function commonReceiptMatches(
   const participant = intent.participants[0];
   return receipt.commitEligible
     && sameClientRequestKey(receipt.requestKey, intent.request_context.request_key)
-    && receipt.programId === intent.program_id
     && receipt.programRevision === intent.program_revision
     && receipt.programBindingId === intent.program_binding_id
     && receipt.graphRevision === intent.expected_graph_revision
@@ -1690,19 +1690,18 @@ function buildMotionIntent(
     target_reference: null,
     offset_reference: null,
     motion,
-    contact_policy_id: null,
     per_joint_dynamics_limits: jointLimits,
     motion_interrupt_scopes: [],
     runtime_object_bindings: [],
-    // Sent only when the operator set one; absent keeps the Deployment's.
-    ...(settings.clearanceM === null ? {} : { clearance_m: settings.clearanceM }),
+    // A row only when the operator set a clearance; none keeps the Deployment's.
+    collision_rules: settings.clearanceM === null
+      ? [] : [{ rule_id: EVERYTHING_COLLISION_RULE_ID, clearance_m: settings.clearanceM }],
   };
   return {
     request_context: {
       request_key: requestKey,
       source_label: 'composer_ui',
     },
-    program_id: requireSelectedMotion(status).motion.programId,
     program_revision: requireSelectedMotion(status).motion.programRevision,
     program_binding_id: requireSelectedMotion(status).motion.programBindingId,
     expected_graph_revision: status.graphRevision,
@@ -1862,7 +1861,6 @@ export function buildGripperCommandIntent(
       request_key: requestKey,
       source_label: 'composer_ui',
     },
-    program_id: gripper.programId,
     program_revision: gripper.programRevision,
     program_binding_id: gripper.programBindingId,
     expected_graph_revision: status.graphRevision,

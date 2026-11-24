@@ -9,7 +9,7 @@ const entry = {
   componentProfileId: 'io_device_v0',
   modelFamilyId: null,
   tags: [],
-  lane: 'manyforge-only',
+  lane: 'mock',
   description: null,
   sources: ['examples/mock_lite6_pneumatic_pick_and_place.scenario'],
   components: [{ component_id: 'gripper_io', component_profile_id: 'io_device_v0', target_settings: {}, configuration: {} }],
@@ -102,6 +102,31 @@ describe('component catalog parser', () => {
       ...catalog,
       componentProfiles: { hand_v0: { ...catalog.componentProfiles.hand_v0, frameTargets: [{ commandTargetId: 'gripper' }] } },
     })).toThrow('frameTargets[0]');
+  });
+
+  it('reads the collision bodies of each target with its TCP contact bodies and grip body', () => {
+    const bodies = [{
+      commandTargetId: 'gripper', collisionBodyRoleIds: ['gripper_collision', 'gripper_fingers'],
+      tcpContactBodyRoleIds: { tcp: ['gripper_fingers'] }, gripBodyRoleId: 'gripper_collision',
+    }, {
+      commandTargetId: 'probe', collisionBodyRoleIds: ['tip'], tcpContactBodyRoleIds: {}, gripBodyRoleId: null,
+    }];
+    const parsed = parseComponentCatalog({
+      ...catalog,
+      componentProfiles: { hand_v0: { ...catalog.componentProfiles.hand_v0, collisionBodyTargets: bodies } },
+    });
+    expect(parsed.componentProfiles.hand_v0.collisionBodyTargets).toEqual(bodies);
+    expect(parseComponentCatalog(catalog).componentProfiles.hand_v0).not.toHaveProperty('collisionBodyTargets');
+    for (const invalid of [
+      { commandTargetId: 'gripper', collisionBodyRoleIds: ['gripper_collision'] },
+      { ...bodies[0], tcpContactBodyRoleIds: { tcp: 'gripper_fingers' } },
+      { ...bodies[0], gripBodyRoleId: 1 },
+    ]) {
+      expect(() => parseComponentCatalog({
+        ...catalog,
+        componentProfiles: { hand_v0: { ...catalog.componentProfiles.hand_v0, collisionBodyTargets: [invalid] } },
+      })).toThrow('collisionBodyTargets[0]');
+    }
   });
 
   it('reads the motion capability fact when known', () => {

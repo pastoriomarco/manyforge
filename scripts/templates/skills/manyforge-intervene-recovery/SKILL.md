@@ -82,8 +82,8 @@ Use when the failure requires running a custom recovery sequence.
 ## Safety rules
 
 1. **Max 3 recovery attempts** — if 3 attempts fail, escalate to human
-2. **Save before persistent edits** — call `manyforge_program_save()` before
-   intentional saved tree changes
+2. **Save before persistent edits** — call `manyforge_scenario(action="save")`
+   before intentional saved tree changes
 3. **Validate before executing** — always validate intervention trees
 4. **Monitor after recovery** — watch at least 2 digest polls after resume
 5. **Don't remove original scene objects** — only add or adjust

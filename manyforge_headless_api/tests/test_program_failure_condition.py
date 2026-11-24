@@ -97,7 +97,6 @@ def _cycle(
             "schema_version": "manyforge.program_run_capture.v3",
             "program_run_id": run_id,
             "scenario_id": "pick",
-            "program_id": "program.pick",
             "node_policies": [],
             "node_policy_digest": "sha256:" + hashlib.sha256(b"[]").hexdigest(),
             "owner_identities": [

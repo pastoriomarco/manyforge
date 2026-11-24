@@ -1,7 +1,7 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
 # `scripts/manyforge component check manyforge_example_models/models/ur5e`.
 # The arm only: a tool mounts on `flange` as its own component.
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: robot
 id: universal_robots.ur5e
 version: 1.0.0
@@ -39,3 +39,4 @@ lanes:
 defaults:
   initial_joint_positions_rad: [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
   maximum_tcp_linear_speed_mps: 0.25
+  controlled_stop_max_deceleration_rad_s2: 5.0  # UR publishes none; ur_moveit_config joint_limits.yaml uses 5.0, chosen conservatively

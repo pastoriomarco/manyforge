@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <tuple>
 
+#include "activation_deployment_compiler_internal.hpp"
 #include "content_identity_internal.hpp"
 
 namespace manyforge::deployment::detail {
@@ -61,44 +62,27 @@ const Value &member(const Value &value, std::string_view name) {
   return selected;
 }
 
+// The base link of a gripper target: the one link of its grip body that a
+// fixed joint hangs under a link outside the grip body.
 [[nodiscard]] std::string unique_gripper_base_link(
-    const ActivationPreparedModel &model, const Value &target_configuration) {
-  const auto &asset = model.verified_asset.value();
-  const auto binding = std::find_if(
-      asset.collision_body_role_bindings.begin(),
-      asset.collision_body_role_bindings.end(), [](const auto &row) {
-        return row.collision_body_role_id.value() == "gripper_collision";
-      });
-  if (binding == asset.collision_body_role_bindings.end())
-    return {};
-  const std::set<std::string, std::less<>> collision_links(
-      binding->source_link_names.begin(), binding->source_link_names.end());
-  const auto *touch_links =
-      target_configuration.find_object_member("touch_links");
-  if (touch_links == nullptr || !touch_links->is_array())
-    return {};
-  std::set<std::string, std::less<>> target_gripper_links;
-  for (const auto &touch_link : touch_links->as_array()) {
-    if (!touch_link.is_string())
-      return {};
-    if (collision_links.contains(touch_link.as_string()))
-      target_gripper_links.insert(touch_link.as_string());
-  }
-  if (target_gripper_links.empty())
+    const ActivationPreparedModel &model,
+    const std::vector<std::string> &grip_body_links) {
+  const std::set<std::string, std::less<>> grip_links(grip_body_links.begin(),
+                                                      grip_body_links.end());
+  if (grip_links.empty())
     return {};
   std::vector<std::string> candidates;
   for (const auto &joint : model.verified_asset.source_ir().urdf().joints) {
     if (joint.type == UrdfJointType::kFixed &&
-        target_gripper_links.contains(joint.child_link_name) &&
-        collision_links.contains(joint.child_link_name) &&
-        !collision_links.contains(joint.parent_link_name))
+        grip_links.contains(joint.child_link_name) &&
+        !grip_links.contains(joint.parent_link_name))
       candidates.push_back(joint.child_link_name);
   }
   // A separately mounted tool whose gripper base is its own model root has
   // no inner fixed parent: the root itself is the base.
   const auto &root =
       model.verified_asset.source_ir().semantic_index().root_link_name;
-  if (candidates.empty() && target_gripper_links.contains(root))
+  if (candidates.empty() && grip_links.contains(root))
     candidates.push_back(root);
   if (candidates.size() != 1U)
     return {};
@@ -121,7 +105,20 @@ const Value &member(const Value &value, std::string_view name) {
 [[nodiscard]] Value relative_references(
     const Value &configuration, const ActivationDeploymentIntent &intent,
     const std::map<std::string, const ActivationPreparedModel *,
-                   std::less<>> &models_by_component) {
+                   std::less<>> &models_by_component,
+    const std::map<std::string, const ActivationComponentProfile *,
+                   std::less<>> &profiles_by_component,
+    std::span<const QualifiedComponentType> component_types) {
+  const auto base_link = [&](const ActivationDeploymentComponent &component,
+                             const ActivationPreparedModel &model,
+                             std::string_view command_target_id) {
+    const auto profile = profiles_by_component.find(component.component_id);
+    if (profile == profiles_by_component.end())
+      return std::string{};
+    return unique_gripper_base_link(
+        model, activation_grip_body_links(component, *profile->second, model,
+                                          command_target_id, component_types));
+  };
   const auto *simulation = configuration.find_object_member("simulation");
   if (simulation == nullptr)
     return Value(nullptr);
@@ -163,7 +160,7 @@ const Value &member(const Value &value, std::string_view name) {
       throw std::invalid_argument(
           "scene_pose_source_relative_reference_gripper_link_invalid");
     const auto gripper_link =
-        unique_gripper_base_link(*model->second, *target);
+        base_link(robot, *model->second, command_target_id);
     if (gripper_link.empty())
       throw std::invalid_argument(
           "scene_pose_source_relative_reference_gripper_link_invalid");
@@ -206,7 +203,7 @@ const Value &member(const Value &value, std::string_view name) {
       throw std::invalid_argument(
           "scene_pose_source_relative_reference_gripper_link_invalid");
     const auto gripper_link =
-        unique_gripper_base_link(*model->second, *target);
+        base_link(*component, *model->second, command_target_id);
     const auto *stated_link = row.find_object_member("gripper_link");
     if (gripper_link.empty() ||
         (stated_link != nullptr &&
@@ -576,9 +573,14 @@ std::vector<ActivationPreparedIoType> prepare_activation_pose_source_types(
     const ActivationDeploymentIntent &intent,
     std::span<const ActivationComponentProfile> profiles,
     const std::vector<ActivationPreparedModel> &prepared_models,
-    std::span<const QualifiedCapabilityDefinition> capabilities) {
+    std::span<const QualifiedCapabilityDefinition> capabilities,
+    std::span<const QualifiedComponentType> component_types) {
   if (intent.components.size() != profiles.size())
     throw std::invalid_argument("pose-source component profile join differs");
+  std::map<std::string, const ActivationComponentProfile *, std::less<>>
+      profiles_by_component;
+  for (const auto &profile : profiles)
+    profiles_by_component.emplace(profile.component_id, &profile);
   const auto *link_rows = intent.policies.find_object_member("scene_pose_sources");
   const auto links = link_rows ? DecodeScenePoseSources(*link_rows)
                                : std::vector<core::ScenePoseSourcePolicyDTO>{};
@@ -624,7 +626,8 @@ std::vector<ActivationPreparedIoType> prepare_activation_pose_source_types(
     auto configuration = normalize_configuration(
         member(component.configuration, "runtime_configuration"));
     const auto references =
-        relative_references(configuration, intent, models_by_component);
+        relative_references(configuration, intent, models_by_component,
+                            profiles_by_component, component_types);
     configuration = with_relative_references(
         std::move(configuration), references);
     result.push_back(prepare_model_free_type(

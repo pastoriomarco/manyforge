@@ -65,7 +65,6 @@ Bundle(std::vector<RuntimeUnitDTO> runtime_units,
   return {
       "manyforge.retained_bundle.test",
       RetainedBundleId("bundle.candidate"),
-      DeploymentArtifactId("deployment.test"),
       DeploymentRevision("deployment.revision.test"),
       CellGraphDTO{"manyforge.cell_graph.test", GraphRevision("graph.candidate"),
                    CellId("cell.1"), std::move(runtime_units), {}, {}, {}, {},

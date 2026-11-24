@@ -1,6 +1,7 @@
 import type {
   JsonValue,
   SourceModelTarget,
+  ToolReplacement,
 } from '../types/api';
 import {
   IO_OUTPUT_PROFILE_LABELS,
@@ -76,8 +77,9 @@ function record(value: JsonValue | undefined): Record<string, JsonValue> | null 
 
 /**
  * A model row is a tool when its component type is tagged `tool`, else a
- * robot; a member without a model source is an I/O bank (its signals come
- * from its model).
+ * robot; a row with neither a runtime kind nor a model source that isn't a
+ * machine's owner (the caller tells owners apart) is an I/O bank, a member's
+ * or an owner-less device's (its signals come from its model).
  */
 export function componentKindOf(
   row: Record<string, JsonValue>,
@@ -85,7 +87,7 @@ export function componentKindOf(
 ): ComponentCatalogKind {
   const runtimeKind = record(row.configuration)?.runtime_kind;
   return (typeof runtimeKind === 'string' ? RUNTIME_KINDS[runtimeKind] : undefined)
-    ?? (typeof row.owner === 'string' && row.model_source === undefined ? 'io_device' : undefined)
+    ?? (runtimeKind === undefined && row.model_source === undefined ? 'io_device' : undefined)
     ?? (facts?.tags.includes('tool') ? 'tool' : 'robot');
 }
 
@@ -194,7 +196,7 @@ export function componentManagerRows(
   profiles: Readonly<Record<string, ComponentProfileFacts>> = {},
 ): ComponentManagerRow[] {
   const applied = new Set(appliedIds ?? []);
-  if (document?.api_version !== 'manyforge.deployment_intent.v2') {
+  if (document?.api_version !== 'manyforge.deployment_intent.v3') {
     return [...applied].sort().map((id): ComponentManagerRow => ({
       componentId: id, profileId: null, kind: null, mount: null, owner: null, role: null, active: true, change: 'applied',
       depth: 0,
@@ -364,6 +366,26 @@ export function withMountRobot(
   return rows.map((row) => bind(row, null) as Record<string, JsonValue>);
 }
 
+/**
+ * What Replace tool did (OD-367), and what the references now naming the new
+ * tool name that it does not declare: fix those before Apply.
+ */
+export function toolReplacementText(replacement: ToolReplacement): string {
+  const { componentId: previous, replacementComponentId: next, lacks } = replacement;
+  const done = `${previous} replaced by ${next} in the Drafts; Apply brings it into the cell.`;
+  if (lacks === null) {
+    return `${done} What ${next} declares could not be read (check its parameters); Preview shows what is missing.`;
+  }
+  const missing = ([
+    ['command targets', lacks.commandTargets],
+    ['frames', lacks.frames],
+    ['collision bodies', lacks.collisionBodies],
+  ] as const).filter(([, ids]) => ids.length > 0).map(([label, ids]) => `${label} ${ids.join(', ')}`);
+  return missing.length === 0 ? done
+    : `${done} ${next} does not declare what the Program or Deployment names on it: ${missing.join('; ')}. `
+      + 'Change those references, or the tool, before Apply.';
+}
+
 /** Why the renamed rows cannot be added to the Draft, or null. */
 export function addComponentProblem(
   rows: ReadonlyArray<Record<string, JsonValue>>,
@@ -411,7 +433,7 @@ export function componentFrameTargets(
 
 /** The authored gripper rows of a Draft (intent components or compiled runtime units). */
 function gripperRows(document: Record<string, JsonValue> | null): Array<Record<string, JsonValue>> {
-  const holders = document?.api_version === 'manyforge.deployment_intent.v2'
+  const holders = document?.api_version === 'manyforge.deployment_intent.v3'
     ? document.components : record(document?.graph)?.runtime_units;
   return (Array.isArray(holders) ? holders : []).flatMap((holder) => {
     const configuration = record(record(holder)?.configuration);

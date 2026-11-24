@@ -92,7 +92,6 @@ def _applied_binding() -> dict[str, Any]:
     """The Applied Program binding a run was admitted with (subset)."""
 
     return {
-        "program_id": "program-1",
         "program_revision": "sha256:" + "1" * 64,
         "program_binding_id": "binding-1",
         "graph_revision": "sha256:" + "2" * 64,
@@ -359,6 +358,5 @@ def test_runner_takes_program_identity_from_the_applied_binding_only() -> None:
         target={"component_id": "lite6_arm", "command_target_id": "arm"}, **arguments
     )
     assert transport.submitted is not None
-    assert transport.submitted["program_id"] == "program-1"
     assert transport.submitted["program_revision"] == "sha256:" + "1" * 64
     assert "motion_target_role_id" not in repr(transport.submitted)

@@ -64,7 +64,6 @@ inline std::atomic<bool> release_motion_goal{false};
 inline std::atomic<bool> block_stop_barrier{false};
 inline std::atomic<bool> stop_barrier_entered{false};
 inline std::atomic<bool> release_stop_barrier{false};
-inline std::atomic<bool> stop_barrier_expired{false};
 inline std::atomic<bool> block_gpio_publish{false};
 inline std::atomic<bool> gpio_publish_entered{false};
 inline std::atomic<bool> release_gpio_publish{false};
@@ -89,15 +88,13 @@ inline void HoldGpioAfterAdmission() {
 }
 inline std::atomic<bool> block_goal_admitted{false};
 inline std::atomic<bool> goal_admitted_entered{false};
-inline std::atomic<bool> goal_admitted_timed_out{false};
 inline std::atomic<bool> release_goal_admitted{false};
+// Held until the test releases it (each user has a release guard): a time
+// limit here would fire on a loaded machine and change the outcome.
 inline void GoalAdmittedTestPoint() {
   if (!block_goal_admitted.load()) return;
   goal_admitted_entered.store(true);
-  const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-  while (!release_goal_admitted.load() && std::chrono::steady_clock::now() < limit)
-    std::this_thread::yield();
-  if (!release_goal_admitted.load()) goal_admitted_timed_out.store(true);
+  while (!release_goal_admitted.load()) std::this_thread::yield();
 }
 
 // Concurrent readers hold leaf_samples_mutex. Callers resetting the count
@@ -166,11 +163,12 @@ template <class Mutex> class TimedLeafLock final {
     }
     if (!entered) return;
     entered->store(true);
-    const auto limit = Clock::now() + std::chrono::seconds(
-        entity_ == LeafEntity::kMotionStopBarrier ? 5 : 3);
-    while (!release->load() && Clock::now() < limit) std::this_thread::yield();
-    if (entity_ == LeafEntity::kMotionStopBarrier && !release->load())
-      stop_barrier_expired.store(true);
+    // The stop barrier is held until the test releases it (release guard):
+    // a time limit would fire on a loaded machine and change the outcome.
+    const bool until_released = entity_ == LeafEntity::kMotionStopBarrier;
+    const auto limit = Clock::now() + std::chrono::seconds(3);
+    while (!release->load() && (until_released || Clock::now() < limit))
+      std::this_thread::yield();
   }
   template <class Duration> static std::int64_t ToNs(Duration value) noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(value).count();

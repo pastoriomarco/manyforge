@@ -15,6 +15,7 @@
 #include <variant>
 #include <vector>
 
+#include "activation_generated_tool_internal.hpp"
 #include "build_manifest_internal.hpp"
 #include "manyforge_core/types/capability_definition.hpp"
 #include "manyforge_core/types/collision_world_snapshot.hpp"
@@ -211,49 +212,65 @@ void add_capability_provenance(
   }
 }
 
-[[nodiscard]] std::vector<core::ProgramContactGraspBindingDTO>
-resolve_contact_grasp_bindings(
+// The collision bodies that node collision rules select, with the ids the
+// retained collision world gives their links.
+[[nodiscard]] std::vector<core::ProgramCollisionRuleBodyBindingDTO>
+resolve_collision_rule_bodies(
     const core::ProgramBindingContractDTO& contract,
     const std::vector<core::ProgramComponentBindingDTO>& components,
     const std::vector<core::ProgramCollisionBodyBindingDTO>& collision_bodies) {
-  std::vector<core::ProgramContactGraspBindingDTO> resolved;
-  resolved.reserve(contract.contact_grasp_templates.size());
-  for (const auto& policy : contract.contact_grasp_templates) {
-    std::vector<core::ProgramContactGraspBodyBindingDTO> bodies;
-    bodies.reserve(policy.allowed_body_selectors.size());
-    for (const auto& selector : policy.allowed_body_selectors) {
-      const auto* component = find_exactly_one<core::ProgramComponentBindingDTO>(
-          components, [&](const auto& row) {
-            return row.component_id == selector.body.component_id;
-          });
-      const auto* body = find_exactly_one<core::ProgramCollisionBodyBindingDTO>(
-          collision_bodies, [&](const auto& row) {
-            return row.reference == selector.body;
-          });
-      if (!component || !body)
-        fail("contact-grasp selector has no unique component/body binding");
-      const bool model_owned = std::any_of(
-          component->model_bindings.begin(), component->model_bindings.end(),
-          [&](const auto& row) {
-            return row.model_instance_id == body->model_instance_id &&
-                   row.model_revision == body->model_revision;
-          });
-      if (!model_owned)
-        fail("contact-grasp body has no exact component model binding");
-      std::vector<core::CollisionBodyId> body_ids;
-      body_ids.reserve(body->compiled_collision_body_names.size());
-      for (std::size_t index = 0; index < body->compiled_collision_body_names.size(); ++index)
-        body_ids.push_back(core::make_component_collision_body_id(
-            selector.body.component_id, body->model_instance_id,
-            selector.body.collision_body_id, index));
-      bodies.push_back(core::ProgramContactGraspBodyBindingDTO{
-          selector.body, std::nullopt, body->model_instance_id,
-          body->model_revision, std::move(body_ids)});
-    }
-    resolved.push_back(core::ProgramContactGraspBindingDTO{
-        policy.contact_policy_id, policy.contact_policy_revision,
-        policy.runtime_object_id, std::move(bodies), policy.envelope,
-        policy.bodies_from_motion_endpoint});
+  std::vector<core::ProgramCollisionRuleBodyBindingDTO> resolved;
+  resolved.reserve(contract.collision_rule_bodies.size());
+  for (const auto& reference : contract.collision_rule_bodies) {
+    const auto* component = find_exactly_one<core::ProgramComponentBindingDTO>(
+        components, [&](const auto& row) {
+          return row.component_id == reference.component_id;
+        });
+    const auto* body = find_exactly_one<core::ProgramCollisionBodyBindingDTO>(
+        collision_bodies, [&](const auto& row) {
+          return row.reference == reference;
+        });
+    if (!component || !body)
+      fail("collision-rule body has no unique component/body binding");
+    const bool model_owned = std::any_of(
+        component->model_bindings.begin(), component->model_bindings.end(),
+        [&](const auto& row) {
+          return row.model_instance_id == body->model_instance_id &&
+                 row.model_revision == body->model_revision;
+        });
+    if (!model_owned)
+      fail("collision-rule body has no exact component model binding");
+    std::vector<core::CollisionBodyId> body_ids;
+    body_ids.reserve(body->compiled_collision_body_names.size());
+    for (std::size_t index = 0; index < body->compiled_collision_body_names.size(); ++index)
+      body_ids.push_back(core::make_component_collision_body_id(
+          reference.component_id, body->model_instance_id,
+          reference.collision_body_id, index));
+    resolved.push_back(core::ProgramCollisionRuleBodyBindingDTO{
+        reference, std::nullopt, body->model_instance_id,
+        body->model_revision, std::move(body_ids)});
+  }
+  return resolved;
+}
+
+// The spring sliders that node collision rules switch on (OD-371), with the
+// numbers a motion spells each `spring_slider` row out with. Reference
+// validation refused every reference that names no generated tool's slider.
+[[nodiscard]] std::vector<core::ProgramSpringSliderBindingDTO>
+resolve_collision_rule_spring_sliders(const core::ProgramBindingContractDTO& contract,
+                                      const RetainedBundle& retained_bundle,
+                                      const ICatalogArtifactSource& catalog_artifact_store) {
+  std::vector<core::ProgramSpringSliderBindingDTO> resolved;
+  resolved.reserve(contract.collision_rule_spring_sliders.size());
+  for (const auto& reference : contract.collision_rule_spring_sliders) {
+    const auto slider = detail::generated_spring_slider(
+        qualified_program_component_type(reference.component_id, retained_bundle,
+                                         catalog_artifact_store),
+        reference.collision_body_id.value());
+    if (!slider)
+      fail("collision-rule spring slider is no spring slider of a generated tool");
+    resolved.push_back({reference, slider->axis, slider->stroke_m,
+                        slider->max_compression_step_m});
   }
   return resolved;
 }
@@ -438,17 +455,18 @@ struct DirectTargetBindings final {
   for (const auto& target : targets)
     for (const auto& capability : target.capability_bindings)
       add_capability_provenance(bundle, capability, resolved_records);
-  auto contact = resolve_contact_grasp_bindings(contract, components, references.bodies);
+  auto rule_bodies = resolve_collision_rule_bodies(contract, components, references.bodies);
   const auto current = detail::BuildQualifiedRetentionAuthority::qualify();
   core::ProgramBindingDTO value{
       std::string(core::kProgramBindingApiVersion), core::ProgramBindingId(std::string(kZeroDigest)),
-      contract.program_id, contract.program_revision, retained_bundle.retained_bundle_id(),
+      contract.program_revision, retained_bundle.retained_bundle_id(),
       bundle.cell_graph.graph_revision, bundle.catalogs.node_environment,
       std::move(components), std::move(targets), std::move(references.frames),
       std::move(references.signals), std::move(references.bodies),
       {current.compiler_contract_digest(), bundle.provenance.source_records,
        std::move(resolved_records)},
-      std::move(contact), contract.node_policies};
+      std::move(rule_bodies), contract.node_policies,
+      resolve_collision_rule_spring_sliders(contract, retained_bundle, catalog_artifact_store)};
   auto sealed = detail::ProgramBindingConstructionAuthority::seal(std::move(value));
   return reload_verified_program_binding(sealed->canonical_bytes(), retained_bundle, model_map,
                                          catalog_artifact_store);
@@ -491,7 +509,7 @@ struct DirectTargetBindings final {
                                                role).binding);
   }
   auto frame_associations = resolve_target_frame_associations(requirement.target, requirement.frame_references, target_type,
-                                                               *target_model, model_map, frames);
+                                                               *target_model, bundle.cell_graph, model_map, frames);
   auto contact_bodies = resolve_target_contact_bodies(frame_associations, frames, model_map);
   auto body_references = requirement.collision_body_references;
   for (const auto& reference : body_references) {
@@ -908,12 +926,24 @@ void require_direct_control_model_roles(
   return result;
 }
 
+// Collision bodies the composed target binds: a declared default the model
+// does not bind is not one of them (OD-350).
+[[nodiscard]] std::set<std::string> target_collision_roles(
+    const CompositionTargetResolution* composed) {
+  std::set<std::string> roles;
+  if (composed != nullptr)
+    for (const auto& body : composed->collision_bodies)
+      roles.insert(body.collision_body_role_id.value());
+  return roles;
+}
+
 [[nodiscard]] core::ProgramBindingContractDTO
 make_direct_control_motion_contract(
     const core::RetainedNodeEnvironmentDTO& node_environment,
     const core::ControllableComponentDTO& component,
     const core::ComponentTypeCommandTargetDTO& target,
     const std::set<std::string>& tcp_roles,
+    const std::set<std::string>& collision_role_names,
     const std::optional<DirectControlMountedTool>& tool) {
   std::set<std::string> model_role_names;
   for (const auto& group : target.model_group_roles) {
@@ -932,7 +962,7 @@ make_direct_control_motion_contract(
     model_role_names.insert(body.model_role_id.value());
   }
   if (model_role_names.empty() || target.frame_roles.empty() ||
-      target.resource_roles.empty() || target.collision_body_roles.empty()) {
+      target.resource_roles.empty() || collision_role_names.empty()) {
     fail("direct-control motion target has no complete model/frame/resource/"
          "collision contract");
   }
@@ -959,10 +989,6 @@ make_direct_control_motion_contract(
   std::set<std::string> resource_role_names;
   for (const auto& resource : target.resource_roles) {
     resource_role_names.insert(core::resource_role_id(resource).value());
-  }
-  std::set<std::string> collision_role_names;
-  for (const auto& body : target.collision_body_roles) {
-    collision_role_names.insert(body.collision_body_role_id.value());
   }
   const auto frame_roles =
       sorted_ids<core::FrameRoleId>(frame_role_names);
@@ -1023,8 +1049,6 @@ make_direct_control_motion_contract(
            {"environment_digest",
             CanonicalValue(node_environment.environment_digest.value())},
        })},
-      {"program_id",
-       CanonicalValue(std::string(kDirectControlMotionProgramId))},
       {"target_requirements",
        CanonicalValue(CanonicalValue::Object{
            {"capabilities",
@@ -1064,7 +1088,6 @@ make_direct_control_motion_contract(
   for (const auto& role : collision_roles)
     bodies.push_back({component.controllable_component_id, role});
   core::ProgramBindingContractDTO contract{
-      core::ProgramId(std::string(kDirectControlMotionProgramId)),
       core::ProgramRevision(sha256_digest(revision_preimage)), node_environment,
       {{direct_target, std::move(capabilities), frames, bodies, {}}},
       frames, {}, bodies};
@@ -1104,7 +1127,6 @@ make_direct_control_motion_contract(
         {"signal_name", CanonicalValue(signal.signal_name)}});
   auto projection_fields = CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.direct_control_io_program.v2")},
-      {"program_id", CanonicalValue(std::string(kDirectControlIoProgramId))},
       {"target", direct_target_projection(direct_target)},
       {"capability_id", CanonicalValue(capability->capability_id.value())},
       {"capability_definition_revision",
@@ -1137,8 +1159,7 @@ make_direct_control_motion_contract(
   std::string preimage("manyforge.direct-control-io-program-revision.v2");
   preimage.push_back('\0');
   preimage.append(canonical_json(projection));
-  return {core::ProgramId(std::string(kDirectControlIoProgramId)),
-          core::ProgramRevision(sha256_digest(preimage)),
+  return {core::ProgramRevision(sha256_digest(preimage)),
           node_environment,
           {{direct_target, std::move(capabilities), {}, {}, signals}},
           {}, signals, {}};
@@ -1148,7 +1169,8 @@ make_direct_control_motion_contract(
 make_direct_control_gripper_contract(
     const core::RetainedNodeEnvironmentDTO &node_environment,
     const core::ControllableComponentDTO &component,
-    const core::ComponentTypeCommandTargetDTO &target) {
+    const core::ComponentTypeCommandTargetDTO &target,
+    const std::set<std::string> &collision_role_names) {
   const auto *command_capability =
       find_target_capability(target, "tool.gripper.command");
   if (command_capability == nullptr) {
@@ -1191,10 +1213,6 @@ make_direct_control_gripper_contract(
   std::set<std::string> resource_role_names;
   for (const auto& resource : target.resource_roles) {
     resource_role_names.insert(core::resource_role_id(resource).value());
-  }
-  std::set<std::string> collision_role_names;
-  for (const auto& body : target.collision_body_roles) {
-    collision_role_names.insert(body.collision_body_role_id.value());
   }
   const auto frame_roles = sorted_ids<core::FrameRoleId>(frame_role_names);
   const auto resource_roles =
@@ -1246,8 +1264,6 @@ make_direct_control_gripper_contract(
            {"environment_digest",
             CanonicalValue(node_environment.environment_digest.value())},
        })},
-      {"program_id",
-       CanonicalValue(std::string(kDirectControlGripperProgramId))},
       {"target_requirements",
        CanonicalValue(CanonicalValue::Object{
            {"capabilities",
@@ -1269,7 +1285,6 @@ make_direct_control_gripper_contract(
   for (const auto& role : collision_roles)
     bodies.push_back({component.controllable_component_id, role});
   return core::ProgramBindingContractDTO{
-      core::ProgramId(std::string(kDirectControlGripperProgramId)),
       core::ProgramRevision(sha256_digest(revision_preimage)), node_environment,
       {{direct_target, std::move(capabilities), frames, bodies, {}}},
       frames, {}, bodies};
@@ -1372,7 +1387,6 @@ ProgramBindingOutcome compile_program_binding_outcome(
       program_contract.execution_table(), targets);
   const auto& bundle = retained_bundle.value();
   ProgramNonExecutableOutcomeDTO outcome{
-      program_contract.value().program_id,
       program_contract.value().program_revision,
       retained_bundle.retained_bundle_id(),
       bundle.cell_graph.graph_revision,
@@ -1441,7 +1455,6 @@ ProgramBindingOutcome compile_program_binding_outcome(
   const auto affected = program_binding_affected_scope(
       program_contract.execution_table(), targets);
   ProgramNonExecutableOutcomeDTO outcome{
-      program_contract.value().program_id,
       program_contract.value().program_revision,
       retained_bundle.retained_bundle_id(),
       bundle.cell_graph.graph_revision,
@@ -1480,11 +1493,11 @@ compile_direct_control_motion_program_binding(
     const auto tool = direct_control_mounted_tool(
         bundle, retained_model_map, controllable_component_id,
         catalog.capabilities, catalog_artifact_store);
+    const auto* composed =
+        retained_model_map.find_target(controllable_component_id, command_target_id);
     auto contract = make_direct_control_motion_contract(
         bundle.catalogs.node_environment, component, target,
-        target_tcp_roles(target, retained_model_map.find_target(
-                                     controllable_component_id,
-                                     command_target_id), false),
+        target_tcp_roles(target, composed, false), target_collision_roles(composed),
         tool);
     const DirectControlResourceRequirements resources{
         {{controllable_component_id, command_target_id}, direct_control_resource_roles(target)}};
@@ -1521,7 +1534,9 @@ compile_direct_control_gripper_program_binding(
         bundle, component, catalog.capabilities, catalog_artifact_store);
     const auto& target = require_target_type(component_type, command_target_id);
     auto contract = make_direct_control_gripper_contract(
-        bundle.catalogs.node_environment, component, target);
+        bundle.catalogs.node_environment, component, target,
+        target_collision_roles(
+            retained_model_map.find_target(controllable_component_id, command_target_id)));
     const DirectControlResourceRequirements resources{
         {{controllable_component_id, command_target_id}, direct_control_resource_roles(target)}};
     auto binding = compile_program_binding_contract(
@@ -1635,12 +1650,12 @@ compile_direct_control_program_binding_inventory(
           const auto tool = direct_control_mounted_tool(
               bundle, retained_model_map, component.controllable_component_id,
               catalog.capabilities, catalog_artifact_store);
+          const auto* composed = retained_model_map.find_target(
+              component.controllable_component_id, target.command_target_id);
           auto contract = make_direct_control_motion_contract(
               bundle.catalogs.node_environment, component, target,
-              target_tcp_roles(target, retained_model_map.find_target(
-                                           component.controllable_component_id,
-                                           target.command_target_id), false),
-              tool);
+              target_tcp_roles(target, composed, false),
+              target_collision_roles(composed), tool);
           const DirectControlResourceRequirements resources{
               {{component.controllable_component_id, target.command_target_id},
                direct_control_resource_roles(target)}};
@@ -1656,7 +1671,9 @@ compile_direct_control_program_binding_inventory(
         }
         if (find_target_capability(target, "tool.gripper.command") != nullptr) {
           auto contract = make_direct_control_gripper_contract(
-              bundle.catalogs.node_environment, component, target);
+              bundle.catalogs.node_environment, component, target,
+              target_collision_roles(retained_model_map.find_target(
+                  component.controllable_component_id, target.command_target_id)));
           const DirectControlResourceRequirements resources{
               {{component.controllable_component_id, target.command_target_id},
                direct_control_resource_roles(target)}};

@@ -65,7 +65,7 @@ def test_runtime_program_checks_captured_match_and_allowed_frames() -> None:
     )
 
     program = object.__new__(Program)
-    program._data = {"api_version": "manyforge.program.v3", "scene": []}
+    program._data = {"api_version": "manyforge.program.v4", "scene": []}
     program.blackboard_keys = {
         "pose": BlackboardKeyDeclaration("pose", "stored_pose", "read_write", "run", {}),
     }
@@ -104,7 +104,7 @@ def test_run_and_between_run_values_keep_the_same_typed_frame_evidence() -> None
 
     declaration = BlackboardKeyDeclaration("pose", "stored_pose", "read_write", "persistent", {})
     base = object.__new__(Program)
-    base._data = {"api_version": "manyforge.program.v3", "scene": []}
+    base._data = {"api_version": "manyforge.program.v4", "scene": []}
     base.blackboard_keys = {"pose": declaration}
     snapshot = ProgramFrameFacts.from_capture(facts(), IDENTITY)
     for captured in (base.with_program_frame_facts(snapshot), base.with_program_frame_facts(snapshot)):
@@ -133,7 +133,7 @@ def test_reset_keeps_existing_removal_semantics_but_dynamic_write_uses_facts() -
         has_initial=True, initial=pose("ambiguous"),
     )
     program = object.__new__(Program)
-    program._data = {"api_version": "manyforge.program.v3", "scene": []}
+    program._data = {"api_version": "manyforge.program.v4", "scene": []}
     program.blackboard_keys = {"pose": declaration}
     program.parameters = {}
     captured = program.with_program_frame_facts(ProgramFrameFacts.from_capture(facts(), IDENTITY))
@@ -164,7 +164,7 @@ def test_node_input_failure_keeps_typed_ambiguous_reference() -> None:
 
     declaration = BlackboardKeyDeclaration("pose", "stored_pose", "read_write", "run", {})
     program = object.__new__(Program)
-    program._data = {"api_version": "manyforge.program.v3", "scene": []}
+    program._data = {"api_version": "manyforge.program.v4", "scene": []}
     program.blackboard_keys = {"pose": declaration}
     program.parameters = {}
     from types import SimpleNamespace

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import time
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
@@ -76,6 +77,7 @@ from manyforge_headless_api.history_query import (
 from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
 )
+from .deployment_defaults import with_defaults
 from .draft_session import DraftSessionError
 from .authoring_workspace import AuthoringWorkspaceIdentity, AuthoringWorkspaceError
 from .source_model_client import (
@@ -306,7 +308,8 @@ def _require_applied_authoring_drafts(state: ComposerState) -> None:
         if projection.get("ready") is True and isinstance(published, dict)
         else None
     )
-    if applied != draft:
+    # Applied holds the compiled input (required defaults filled at Apply).
+    if applied != with_defaults(draft):
         raise HTTPException(
             status_code=409,
             detail={
@@ -570,6 +573,18 @@ def create_headless_router(
         return _call(lambda: client.request(
             "GET",
             _run_path(program_run_id, "/runtime-controls"),
+            params=_start_params(application_start_id),
+        ))
+
+    @router.get("/api/program/runs/{program_run_id}/blackboard-values")
+    def program_runtime_blackboard_values(
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Read-only: the run's declared keys with their current values."""
+        return _call(lambda: client.request(
+            "GET",
+            _run_path(program_run_id, "/blackboard-values"),
             params=_start_params(application_start_id),
         ))
 
@@ -870,6 +885,9 @@ def create_headless_router(
         openapi_extra=_documented_body(ExecutionCommandRequestDTO),
     )
     async def submit_control_command(request: Request) -> JSONResponse:
+        # Headless ages the command's freshness to this receipt, so Composer's
+        # own work below (lock, Draft check, forwarding) never expires it.
+        received_monotonic_ns = time.monotonic_ns()
         received = _json_object_or_empty(await request.body())
         envelope = received.get("command_envelope")
         kind = envelope.get("command_kind") if isinstance(envelope, dict) else None
@@ -891,7 +909,9 @@ def create_headless_router(
             if start and _resumes_execution(kind, command.get("payload")):
                 _require_applied_authoring_drafts(state)
                 _require_no_assistant_turn(state)
-            return client.submit_control_command(command)
+            return client.submit_control_command(
+                command, received_monotonic_ns=received_monotonic_ns
+            )
 
         assert state.authoring_admission is not None
         return await control_call(

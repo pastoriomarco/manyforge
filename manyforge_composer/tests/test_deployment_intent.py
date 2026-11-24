@@ -13,9 +13,14 @@ from manyforge_composer.backend.deployment_intent import (
     iter_source_references,
     rebase_deployment_intent_sources,
     resolve_source_reference,
+    unmounted_component_ids,
     validate_deployment_intent,
 )
-from manyforge_composer.backend.deployment_draft import DeploymentDraftSession
+from manyforge_composer.backend.deployment_draft import (
+    DeploymentDraftError,
+    DeploymentDraftSession,
+    validate_deployment_draft_document,
+)
 
 
 def test_deployment_intent_is_portable_and_rejects_authored_runtime_identity() -> None:
@@ -47,8 +52,16 @@ def test_mounted_child_omits_its_root_pose() -> None:
         validate_deployment_intent(intent, source="test")
     intent["attachments"] = []
     del child["root_pose_in_cell"]
-    with pytest.raises(DeploymentIntentError, match="root_pose_in_cell"):
-        validate_deployment_intent(intent, source="test")
+    # Unattached without a root pose is unmounted (OD-366): the envelope
+    # accepts it, the Draft only for a tool.
+    assert unmounted_component_ids(validate_deployment_intent(intent, source="test")) == [
+        "robot_b"]
+    with pytest.raises(DeploymentDraftError, match="only a tool may be unmounted"):
+        validate_deployment_draft_document(json.dumps(intent))
+    child["component_profile_id"] = "manyforge.passive_tool"
+    document = validate_deployment_draft_document(json.dumps(intent)).document
+    assert "root_pose_in_cell" not in {
+        row["component_id"]: row for row in document["components"]}["robot_b"]
 
 
 def test_custom_tcps_are_validated_and_sorted() -> None:
@@ -93,6 +106,114 @@ def test_custom_tcps_are_validated_and_sorted() -> None:
         validate_deployment_intent(intent, source="test")
 
 
+def test_custom_tcp_contact_bodies_are_optional_sorted_and_unique() -> None:
+    intent = _intent()
+    robot = next(row for row in intent["components"] if row["component_id"] == "robot_a")
+    pose = {"position_m": [0, 0, 0.1], "orientation": {"rpy_deg": [0, 0, 0]}}
+    robot["custom_tcps"] = [
+        {"tcp_id": "pads", "parent_frame": "flange", "pose": pose,
+         "contact_bodies": ["right_pad", "Left_Pad"]},
+        {"tcp_id": "bare", "parent_frame": "flange", "pose": pose, "contact_bodies": []},
+        {"tcp_id": "plain", "parent_frame": "flange", "pose": pose},
+    ]
+    rows = {
+        row["tcp_id"]: row
+        for row in next(
+            row for row in validate_deployment_intent(intent, source="test")["components"]
+            if row["component_id"] == "robot_a"
+        )["custom_tcps"]
+    }
+    assert rows["pads"]["contact_bodies"] == ["Left_Pad", "right_pad"]
+    # An empty list means no contact bodies; an absent key keeps the default.
+    assert rows["bare"]["contact_bodies"] == []
+    assert "contact_bodies" not in rows["plain"]
+
+    for bad, message in (
+        (["pad", "pad"], "repeats a collision body"),
+        (["has space"], "collision body id"),
+        ("pad", "bounded list"),
+    ):
+        robot["custom_tcps"] = [
+            {"tcp_id": "pads", "parent_frame": "flange", "pose": pose, "contact_bodies": bad}
+        ]
+        with pytest.raises(DeploymentIntentError, match=message):
+            validate_deployment_intent(intent, source="test")
+
+
+def _rule(rule_id: str, **value: object) -> dict:
+    return {
+        "rule_id": rule_id,
+        "a": [{"kind": "component", "component_id": "robot_a"}],
+        "b": [{"kind": "scene_objects"}],
+        **value,
+    }
+
+
+def test_collision_rules_start_with_the_first_rule_and_keep_their_order() -> None:
+    intent = _intent()
+    rules = [
+        {"rule_id": "everything", "clearance_m": 0.002},
+        _rule("wide", clearance_m=0.01),
+        {
+            "rule_id": "robots_apart",
+            "a": [{"kind": "collision_body", "component_id": "robot_a",
+                   "collision_body_id": "default_collision"},
+                  {"kind": "link", "component_id": "robot_a", "link": "link5"}],
+            "b": [{"kind": "component", "component_id": "robot_b"},
+                  {"kind": "attached_object", "component_id": "robot_b"}],
+            "contact": {"max_penetration_m": 0.001},
+        },
+        _rule("lift", release={"release_evidence_mode": "binary_contact"}),
+    ]
+    intent["collision_rules"] = rules
+    assert validate_deployment_intent(intent, source="test")["collision_rules"] == rules
+
+
+@pytest.mark.parametrize(("rules", "message"), [
+    (None, "collision_rules"),
+    ([], "starts with the row without selections"),
+    ([_rule("wide", clearance_m=0.01)], "starts with the row without selections"),
+    ([{"rule_id": "everything", "clearance_m": 0.001},
+      {"rule_id": "second", "clearance_m": 0.002}], "second row without selections"),
+    ([{"rule_id": "everything", "contact": {}}], "clearance only"),
+    ([{"rule_id": "everything", "clearance_m": 0.051}], "clearance_m"),
+    ([{"rule_id": "everything", "clearance_m": 0.001},
+      _rule("everything", clearance_m=0.01)], "collision_rule_id_duplicate"),
+    ([{"rule_id": "everything", "clearance_m": 0.001},
+      {**_rule("tip", contact={}), "a": [{"kind": "active_tcp_contact_bodies"}]}],
+     "move's rules only"),
+    ([{"rule_id": "everything", "clearance_m": 0.001},
+      {**_rule("part", contact={}),
+       "b": [{"kind": "scene_object", "scene_resource_id": "part"}]}],
+     "move's rules only"),
+    ([{"rule_id": "everything", "clearance_m": 0.001},
+      {**_rule("lift", contact={}), "leg": "retreat"}], "unknown fields"),
+    ([{"rule_id": "everything", "clearance_m": 0.001},
+      _rule("both", clearance_m=0.01, contact={})], "exactly one of"),
+    ([{"rule_id": "everything", "clearance_m": 0.001},
+      _rule("lift", release={"release_evidence_mode": "binary_contact",
+                             "max_start_penetration_m": 0.01})],
+     "binary_contact"),
+])
+def test_collision_rules_are_refused_by_shape(rules: object, message: str) -> None:
+    intent = _intent()
+    if rules is None:
+        del intent["collision_rules"]
+    else:
+        intent["collision_rules"] = rules
+    with pytest.raises(DeploymentIntentError, match=message):
+        validate_deployment_intent(intent, source="test")
+
+
+def test_an_older_intent_version_names_the_converter() -> None:
+    # A v2 file has no collision_rules; the version is what the refusal names.
+    intent = _intent()
+    intent["api_version"] = "manyforge.deployment_intent.v2"
+    del intent["collision_rules"]
+    with pytest.raises(DeploymentIntentError, match="convert_scenario_od46.py"):
+        validate_deployment_intent(intent, source="test")
+
+
 def test_default_tcp_and_primary_mount_pass_through() -> None:
     # A component's `default_tcp` pair and a mount's `primary` flag are
     # authored fields; the compiler checks them against the component types.
@@ -126,9 +247,6 @@ def test_default_tcp_and_primary_mount_pass_through() -> None:
 def _intent() -> dict:
     return {
         "api_version": DEPLOYMENT_INTENT_API_VERSION,
-        "deployment_artifact_id": "dual_robot_cell",
-        "name": "Dual robot cell",
-        "description": "Editable source intent",
         "components": [
             {
                 "component_id": "robot_b",
@@ -182,9 +300,10 @@ def _intent() -> dict:
             },
         ],
         "attachments": [],
+        "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
         "policies": {},
         "assistant_profile_id": None,
-        "compatibility": {"lane": "simulation"},
+        "compatibility": {"provides": [], "tags": []},
     }
 
 
@@ -293,6 +412,75 @@ def test_source_reference_inventory_is_exact_and_stable() -> None:
     ]
 
 
+def _parameter_file_intent() -> dict:
+    value = _intent()
+    value["components"][1]["model_source"] = {
+        "parameters": {"project_path": "tool/probe.tool.yaml"}}
+    return value
+
+
+def test_a_parameter_file_replaces_urdf_srdf_and_package_roots(tmp_path: Path) -> None:
+    # OD-352: `model_source.parameters` is a source reference of its own.
+    normalized = validate_deployment_intent(_parameter_file_intent(), source="fixture")
+    (row,) = [component for component in normalized["components"]
+              if component["component_id"] == "robot_a"]
+    assert row["model_source"] == {"parameters": {"project_path": "tool/probe.tool.yaml"}}
+    rows = list(iter_source_references(_parameter_file_intent()))
+    assert [(path[-1], directory) for path, _reference, directory in rows] == [
+        ("parameters", False),
+        ("urdf", False),
+        ("srdf", False),
+        ("manyforge_example_models", True),
+    ]
+    rebased = rebase_deployment_intent_sources(
+        _parameter_file_intent(),
+        source_project_root=tmp_path / "old" / "cell",
+        destination_project_root=tmp_path / "new" / "cell",
+    )
+    (row,) = [component for component in rebased["components"]
+              if component["component_id"] == "robot_a"]
+    assert row["model_source"] == {
+        "parameters": {"project_path": "../../old/cell/tool/probe.tool.yaml"}}
+
+
+def test_inline_parameters_reference_no_file(tmp_path: Path) -> None:
+    # OD-357: a Tool's parameters inline in its row; nothing to rebase.
+    parameters = {"api_version": "manyforge.parametric_tool.v1", "kind": "tool",
+                  "body": [], "chains": [], "tcps": [{"id": "tcp"}]}
+    value = _intent()
+    value["components"][1]["model_source"] = {"parameters": parameters}
+    normalized = validate_deployment_intent(value, source="fixture")
+    (row,) = [component for component in normalized["components"]
+              if component["component_id"] == "robot_a"]
+    assert row["model_source"] == {"parameters": parameters}
+    rows = list(iter_source_references(value))
+    assert "parameters" not in [path[-1] for path, _reference, _directory in rows]
+    rebased = rebase_deployment_intent_sources(
+        value,
+        source_project_root=tmp_path / "old" / "cell",
+        destination_project_root=tmp_path / "new" / "cell",
+    )
+    assert [component for component in rebased["components"]
+            if component["component_id"] == "robot_a"][0]["model_source"] == {
+                "parameters": parameters}
+
+
+@pytest.mark.parametrize(
+    "model_source",
+    [
+        {"parameters": {"project_path": "tool/probe.tool.yaml"}, "package_roots": {}},
+        {"parameters": {"project_path": "tool/probe.tool.yaml"},
+         "urdf": {"project_path": "tool/probe.urdf"}},
+        {"parameters": {"path": "tool/probe.tool.yaml"}},
+    ],
+)
+def test_a_parameter_file_row_names_nothing_else(model_source: dict) -> None:
+    value = _intent()
+    value["components"][1]["model_source"] = model_source
+    with pytest.raises(DeploymentIntentError):
+        validate_deployment_intent(value, source="fixture")
+
+
 def test_save_as_rebases_only_project_references(tmp_path: Path) -> None:
     source = tmp_path / "old" / "cell"
     destination = tmp_path / "new" / "cell-copy"
@@ -332,7 +520,6 @@ def test_draft_session_owns_intent_without_inventing_compiled_revisions() -> Non
     assert snapshot["draft"]["document"] == validate_deployment_intent(
         _intent(), source="fixture"
     )
-    assert snapshot["draft"]["deploymentArtifactId"] == "dual_robot_cell"
     assert snapshot["draft"]["deploymentRevision"] is None
     assert snapshot["draft"]["graphRevision"] is None
     assert snapshot["draft"]["differsFromSaved"] is False
@@ -560,14 +747,17 @@ def test_io_device_component_has_no_model_source_closure(tmp_path: Path) -> None
         ModelSourceCaptureError,
         capture_deployment_model_sources,
     )
+    from manyforge_behavior.project_paths import ProjectPathRule
 
     closure = capture_deployment_model_sources(
-        {"components": [_io_device()]}, project_root=tmp_path
+        {"components": [_io_device()]}, project_root=tmp_path,
+        paths=ProjectPathRule([tmp_path]),
     )
     assert closure["components"] == []
     with pytest.raises(ModelSourceCaptureError):
         capture_deployment_model_sources(
-            {"components": [_io_device(), _io_device()]}, project_root=tmp_path
+            {"components": [_io_device(), _io_device()]}, project_root=tmp_path,
+            paths=ProjectPathRule([tmp_path]),
         )
 
 
@@ -1048,10 +1238,9 @@ def _sensor_intent(**changes: object) -> dict:
     }
     return {
         "api_version": DEPLOYMENT_INTENT_API_VERSION,
-        "deployment_artifact_id": "sensor_check",
-        "name": "sensor check",
         "components": [row],
         "attachments": [],
+        "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
         "policies": {},
     }
 
@@ -1080,3 +1269,72 @@ def test_sensor_row_refuses_a_lane_targets_models_and_missing_settings(changes: 
     intent = _sensor_intent(**changes)
     with pytest.raises(DeploymentIntentError):
         validate_deployment_intent(intent, source="test")
+
+
+def test_an_io_member_keeps_its_mock_inputs_from_geometry() -> None:
+    # OD-356: TI0 true on Mock while the carried tube presses into the endplate.
+    from manyforge_composer.backend.deployment_intent import _validate_io_member
+
+    row = {
+        "component_id": "uf850_tool_io",
+        "component_profile_id": "ufactory.uf850_tool_io",
+        "owner": "uf850",
+        "role": "tool_io",
+        "mock_inputs": [{
+            "signal_name": "TI0",
+            "geometric_contact": {
+                "robot_component_id": "uf850_robot",
+                "a": [{"kind": "attached_object", "component_id": "holder"}],
+                "b": [{"kind": "scene_object", "scene_resource_id": "endplate"}],
+                "trip_depth_m": 0.004,
+                "release_depth_m": 0.003,
+            },
+        }],
+    }
+    assert _validate_io_member(row, "components[3]")["mock_inputs"] == row["mock_inputs"]
+    for change, message in (
+        ({"mock_inputs": [{"signal_name": "TI0"}]}, "geometric_contact"),
+        ({"mock_inputs": [row["mock_inputs"][0], row["mock_inputs"][0]]}, "once per list"),
+        ({"mock_inputs": [{**row["mock_inputs"][0], "geometric_contact": {
+            **row["mock_inputs"][0]["geometric_contact"], "b": []}}]}, "non-empty list"),
+        ({"mock_inputs": [{**row["mock_inputs"][0], "geometric_contact": {
+            **row["mock_inputs"][0]["geometric_contact"], "release_depth_m": -1}}]},
+         "release_depth_m"),
+    ):
+        with pytest.raises(DeploymentIntentError, match=message):
+            _validate_io_member({**row, **change}, "components[3]")
+
+
+def test_a_mock_input_follows_a_spring_slider() -> None:
+    # OD-371: TI0 follows the tube holder's slider pressed into the endplate.
+    from manyforge_composer.backend.deployment_intent import _validate_io_member
+
+    slider_row = {
+        "signal_name": "TI0",
+        "spring_slider": {"component_id": "tube_holder", "element_id": "holder_rod"},
+        "b": [{"kind": "scene_object", "scene_resource_id": "endplate"}],
+        "maximum_sample_age_ms": 500,
+    }
+    row = {
+        "component_id": "uf850_tool_io",
+        "component_profile_id": "ufactory.uf850_tool_io",
+        "owner": "uf850",
+        "role": "tool_io",
+        "mock_inputs": [slider_row],
+    }
+    assert _validate_io_member(row, "components[3]")["mock_inputs"] == [slider_row]
+    contact = {
+        "robot_component_id": "uf850_robot",
+        "a": [{"kind": "attached_object", "component_id": "tube_holder"}],
+        "b": slider_row["b"],
+    }
+    for bad, message in (
+        ({**slider_row, "geometric_contact": contact}, "exactly one of"),
+        ({key: value for key, value in slider_row.items() if key != "b"}, "missing b"),
+        ({**slider_row, "b": []}, "non-empty list"),
+        ({**slider_row, "trip_depth_m": 0.01}, "unexpected field trip_depth_m"),
+        ({**slider_row, "spring_slider": {"component_id": "tube_holder"}}, "element_id"),
+        ({**slider_row, "maximum_sample_age_ms": -1}, "maximum_sample_age_ms"),
+    ):
+        with pytest.raises(DeploymentIntentError, match=message):
+            _validate_io_member({**row, "mock_inputs": [bad]}, "components[3]")

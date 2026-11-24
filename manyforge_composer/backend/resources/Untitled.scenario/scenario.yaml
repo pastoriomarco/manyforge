@@ -6,14 +6,14 @@
   },
   "description": "",
   "members": {
-    "deployment.yaml": "sha256:ebd6ea8ea48b577f1fabfad65e80cd7957c1ea1effd3fc8f23d908ea51212e88",
-    "program.yaml": "sha256:48c354c10f2efd8f10a6f649e52253e2eaff5d148cef11f031106bc2233d1843"
+    "deployment.yaml": "sha256:29374ec9547f1bd529371b912b074d564ac275d5ea9f9e9d3347ad13385929cb",
+    "program.yaml": "sha256:ed52f3240bc27578709e116d53afea39fae1a636b50471e2a7324fa5c062ebec"
   },
   "name": "Untitled",
   "saved_status": {
-    "checked_content_digest": "sha256:e181a4d92c2ef586c90aad5d0e50d2d2b85c2a98e24e977c5c7702fd7a23cb80",
+    "checked_content_digest": "sha256:9c9a3242708503c00b7dded14f803535646f824e2a8a9d87348e9b07c920c291",
     "last_known_status": "incomplete",
-    "manyforge_version": "0.3.1"
+    "manyforge_version": "0.4.0"
   },
   "scenario_id": "Untitled",
   "source_snapshot": {

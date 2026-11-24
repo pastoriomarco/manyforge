@@ -28,7 +28,6 @@ const armWithGripperTargets = (targetIds: string[]) => ({
       open_state_ref: 'open',
       closed_state_ref: 'closed',
       command_duration_s: 0.8,
-      touch_links: ['tool_base_link'],
       mount_frame: 'tool0',
       attach_frame: 'tool0',
       tcp_frame: 'tool0',
@@ -103,9 +102,7 @@ async function mount(
     workspace: {
       draft: {
         document: {
-          api_version: 'manyforge.deployment_intent.v2',
-          deployment_artifact_id: 'cell-a',
-          name: 'Cell A',
+          api_version: 'manyforge.deployment_intent.v3',
           components,
           attachments: [],
           policies: { scene_pose_sources: links },

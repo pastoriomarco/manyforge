@@ -29,6 +29,22 @@ const KINDS: readonly ComponentCatalogKind[] = ['machine', 'robot', 'tool', 'io_
 /** An absolute ROS topic name (the compiler checks it fully). */
 const ROS_TOPIC = /^\/[A-Za-z0-9_/~{}]*$/;
 
+/** Vendor names of the model id prefixes (`<vendor>.<model>`); other prefixes are shown capitalised, an id without one under Other. */
+const VENDOR_LABELS: Record<string, string> = {
+  manyforge: 'ManyForge',
+  nvidia: 'NVIDIA',
+  robotiq: 'Robotiq',
+  ufactory: 'UFACTORY',
+  universal_robots: 'Universal Robots',
+  ur: 'Universal Robots',
+};
+
+export function vendorLabel(modelId: string): string {
+  if (!modelId.includes('.')) return 'Other';
+  const prefix = modelId.slice(0, modelId.indexOf('.'));
+  return VENDOR_LABELS[prefix] ?? (prefix.charAt(0).toUpperCase() + prefix.slice(1));
+}
+
 interface AddDraft {
   entry: ComponentCatalogEntry;
   /** A machine model: `entry` is its owner and member rows. */
@@ -43,7 +59,7 @@ interface AddDraft {
   ids: Record<string, string>;
   framePrefix: string;
   position: [string, string, string];
-  /** A tool's robot (its `flange`); empty for other kinds. */
+  /** A tool's robot (its `flange`); empty for other kinds and for a tool not mounted yet (OD-366). */
   mountOn: string;
 }
 
@@ -91,11 +107,11 @@ function initialDraft(
     taken.add(ids[original]);
   }
   const main = entry.components.find((row) => row.component_id === mainId);
-  // The same model twice needs a frame prefix to keep its frame names apart.
-  const urdf = JSON.stringify(object(main?.model_source)?.urdf ?? null);
-  const sameModel = main?.model_source !== undefined && existing.some((row) => (
-    JSON.stringify(object(row.model_source)?.urdf ?? null) === urdf
-  ));
+  // Frame names of different models can repeat (every xArm has `link1`,
+  // every passive tool `passive_tool_mount`): once the cell holds a model,
+  // each further one gets a frame prefix (OD-349).
+  const prefixed = main?.model_source !== undefined
+    && existing.some((row) => row.model_source !== undefined);
   return {
     entry,
     machine,
@@ -103,7 +119,7 @@ function initialDraft(
     topic: '',
     sourceFrame: '',
     ids,
-    framePrefix: sameModel ? framePrefixFor(ids[mainId]) : String(main?.frame_prefix ?? ''),
+    framePrefix: prefixed ? framePrefixFor(ids[mainId]) : String(main?.frame_prefix ?? ''),
     position: rowPosition(main),
     mountOn: entry.kind === 'tool' ? mounts[0] ?? '' : '',
   };
@@ -127,7 +143,8 @@ function withId(draft: AddDraft, original: string, id: string): AddDraft {
 /**
  * The Draft rows the add sends: renamed, with the main robot's prefix and
  * position. A tool gets its prefix and no `root_pose_in_cell`: its mount row
- * places it on the robot flange. A machine's rows are built for its lane;
+ * places it on the robot flange, or it stays unmounted until it is mounted on
+ * its page. A machine's rows are built for its lane;
  * the members' `owner` follows the owner's id.
  */
 function addedComponentRows(
@@ -156,7 +173,7 @@ function addedComponentRows(
   const aiModels = aiModelComponents(document);
   if (entry.kind === 'assistant' && aiModels.length === 0) return NO_AI_MODEL_FOR_ASSISTANT;
   const renamed = renameComponentRows(entry.components, draft.ids);
-  const rows = entry.kind === 'tool' ? withMountRobot(renamed, draft.mountOn) : renamed;
+  const rows = entry.kind === 'tool' && draft.mountOn !== '' ? withMountRobot(renamed, draft.mountOn) : renamed;
   return rows.map((row) => {
     if (row.component_id !== mainId) return row;
     if (entry.kind === 'sensor') {
@@ -216,6 +233,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, onAdded }
   onAdded: (componentId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [openVendors, setOpenVendors] = useState<Set<string>>(() => new Set());
   const [kind, setKind] = useState<ComponentCatalogKind>('robot');
   const [draft, setDraft] = useState<AddDraft | null>(null);
   // Local validation (red, blocks Add until an edit) or a pointer to the owner's refusal (neutral).
@@ -230,13 +248,30 @@ export function AddComponentPanel({ controller, catalog, catalogError, onAdded }
       }))
       : (catalog?.entries ?? []).filter((entry) => entry.kind === kind).map((entry) => ({ entry, machine: null }))
   ), [catalog, kind]);
+  // The entries by vendor (the model id's prefix), vendors in name order.
+  const groups = useMemo(() => {
+    const byVendor = new Map<string, typeof entries>();
+    for (const item of entries) {
+      const vendor = vendorLabel(item.machine?.modelId ?? item.entry.componentProfileId);
+      byVendor.set(vendor, [...(byVendor.get(vendor) ?? []), item]);
+    }
+    return [...byVendor.entries()].sort(([a], [b]) => a.localeCompare(b));
+  }, [entries]);
+  const toggleVendor = (vendor: string, isOpen: boolean) => {
+    setOpenVendors((current) => {
+      if (current.has(vendor) === isOpen) return current;
+      const next = new Set(current);
+      if (isOpen) next.add(vendor); else next.delete(vendor);
+      return next;
+    });
+  };
   const mounts = useMemo(
     () => mountCandidates(document, catalog?.componentProfiles ?? {}),
     [catalog, document],
   );
   const unavailable = document === null
     ? 'Open or create a Scenario first.'
-    : document.api_version !== 'manyforge.deployment_intent.v2'
+    : document.api_version !== 'manyforge.deployment_intent.v3'
       ? 'Add component needs a Scenario Deployment (source-referenced intent).'
       : !controller.mutationAvailable
         ? controller.mutationUnavailableReason ?? 'Deployment Draft edits are unavailable.'
@@ -250,15 +285,14 @@ export function AddComponentPanel({ controller, catalog, catalogError, onAdded }
       setError({ message: rows, refused: false });
       return;
     }
-    const problem = draft.entry.kind === 'tool' && !mounts.includes(draft.mountOn)
-      ? 'Choose a robot with a free flange to mount this tool on.'
-      : addComponentProblem(rows, document);
+    const problem = addComponentProblem(rows, document);
     if (problem !== null) {
       setError({ message: problem, refused: false });
       return;
     }
-    // A tool is added together with the attachment row that mounts it.
-    const attachments = draft.entry.kind === 'tool'
+    // A tool is added together with the attachment row that mounts it, or
+    // unmounted (OD-366): it is mounted later on its page.
+    const attachments = draft.entry.kind === 'tool' && draft.mountOn !== ''
       ? [toolMountRow(draft.mountOn, draft.ids[draft.entry.componentId])] : [];
     const result = await controller.addComponents(rows, attachments);
     if (result === null) {
@@ -303,40 +337,46 @@ export function AddComponentPanel({ controller, catalog, catalogError, onAdded }
           </button>
         ))}
       </div>
-      <div className="drows" role="listbox" aria-label="Available components">
-        {catalog !== null && entries.length === 0 && <p className="muted">No component of this kind is available.</p>}
-        {entries.map(({ entry, machine }) => {
-          const selected = draft?.entry.entryId === entry.entryId;
-          const others = entry.components.map((row) => row.component_id as string)
-            .filter((id) => id !== entry.componentId);
-          return (
-            <button key={entry.entryId} type="button" role="option" aria-selected={selected}
-              className={`dpick${selected ? ' selected' : ''}`}
-              title={entry.description ?? undefined}
-              onClick={() => {
-                setDraft(initialDraft(entry, machine, document, mounts));
-                setError(null);
-              }}>
-              <span>
-                <strong>{machine?.title ?? entry.componentProfileId}</strong>
-                <small>
-                  {entry.componentId}
-                  {others.length > 0 ? ` + ${others.join(', ')}` : ''}
-                  {machine !== null ? ` · ${machine.modelId}` : entry.lane !== null ? ` · ${entry.lane}` : ''}
-                  {entry.kind === 'sensor' || entry.kind === 'assistant' ? ` · ${entry.description ?? ''}` : ''}
-                  {entry.tags.length > 0 ? ` · ${entry.tags.join(', ')}` : ''}
-                </small>
-              </span>
-              <small>
-                {machine !== null ? `${machine.members.length} members`
-                    : entry.kind === 'sensor' ? 'sensor model'
-                    : entry.kind === 'assistant' ? 'assistant model'
-                    : `from ${entry.sources[0]}${entry.sources.length > 1 ? ` +${entry.sources.length - 1}` : ''}`}
-              </small>
-            </button>
-          );
-        })}
-      </div>
+      {catalog !== null && entries.length === 0 && <p className="muted">No component of this kind is available.</p>}
+      {groups.map(([vendor, items]) => (
+        <details key={vendor} className="dcard" open={openVendors.has(vendor)}
+          onToggle={(event) => toggleVendor(vendor, event.currentTarget.open)}>
+          <summary>{vendor} <small className="muted">({items.length})</small></summary>
+          <div className="drows" role="listbox" aria-label={`${vendor} components`}>
+            {items.map(({ entry, machine }) => {
+              const selected = draft?.entry.entryId === entry.entryId;
+              const others = entry.components.map((row) => row.component_id as string)
+                .filter((id) => id !== entry.componentId);
+              return (
+                <button key={entry.entryId} type="button" role="option" aria-selected={selected}
+                  className={`dpick dpick-stack${selected ? ' selected' : ''}`}
+                  title={entry.description ?? undefined}
+                  onClick={() => {
+                    setDraft(initialDraft(entry, machine, document, mounts));
+                    setError(null);
+                  }}>
+                  <strong>{machine?.title ?? catalog?.componentProfiles[entry.componentProfileId]?.title ?? entry.componentProfileId}</strong>
+                  <small>
+                    {machine === null && catalog?.componentProfiles[entry.componentProfileId]?.title
+                      ? `${entry.componentProfileId} · ` : ''}
+                    {entry.componentId}
+                    {others.length > 0 ? ` + ${others.join(', ')}` : ''}
+                    {machine !== null ? ` · ${machine.modelId}` : entry.lane !== null ? ` · ${entry.lane}` : ''}
+                    {entry.kind === 'sensor' || entry.kind === 'assistant' ? ` · ${entry.description ?? ''}` : ''}
+                    {entry.tags.length > 0 ? ` · ${entry.tags.join(', ')}` : ''}
+                  </small>
+                  <small>
+                    {machine !== null ? `${machine.members.length} members`
+                        : entry.kind === 'sensor' ? 'sensor model'
+                        : entry.kind === 'assistant' ? 'assistant model'
+                        : `from ${entry.sources[0]}${entry.sources.length > 1 ? ` +${entry.sources.length - 1}` : ''}`}
+                  </small>
+                </button>
+              );
+            })}
+          </div>
+        </details>
+      ))}
       {catalog !== null && catalog.profilesWithoutEntry.length > 0 && (
         <p className="field-help">
           Also defined, without a ready component row yet: {catalog.profilesWithoutEntry.join(', ')}.
@@ -395,11 +435,11 @@ export function AddComponentPanel({ controller, catalog, catalogError, onAdded }
               <span>Mount on</span>
               <select aria-label="New tool mount" value={draft.mountOn} disabled={controller.busy}
                 onChange={(event) => { setDraft({ ...draft, mountOn: event.target.value }); setError(null); }}>
-                {mounts.length === 0 && <option value="">No robot with a free flange</option>}
                 {mounts.map((id) => <option key={id} value={id}>{id}.flange</option>)}
+                <option value="">Not mounted yet</option>
               </select>
-              <small>{mounts.length === 0
-                ? 'Add a robot first: each robot flange takes one tool.'
+              <small>{draft.mountOn === ''
+                ? 'Added without a robot: mount it on its page later (each robot flange takes one tool). Apply is refused until it is mounted or removed.'
                 : 'The tool is mounted on this robot\'s flange; its default TCP becomes the robot\'s tcp.'}</small>
             </label>
           )}

@@ -82,11 +82,11 @@ Value Device(std::string id, std::optional<double> timeout = std::nullopt) {
 }
 
 Value Intent(Array devices) {
-  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v2")},
-                      {"deployment_artifact_id", Value("authored_io")},
-                      {"name", Value("authored_io")},
+  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v3")},
+      {"collision_rules",
+       Value(Array{Value(Object{{"clearance_m", Value(0.001)},
+                   {"rule_id", Value("everything")}})})},
                       {"compatibility", Value(Object{
-                          {"lane", Value("manyforge-only")},
                           {"provides", Value(Array{})},
                           {"tags", Value(Array{})}})},
                       {"attachments", Value(Array{})},

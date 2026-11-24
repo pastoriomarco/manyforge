@@ -6,14 +6,14 @@
   },
   "description": "Real Lite6 pneumatic example without a grasp sensor: a valve-only gripper on site address lite6_main, illustrative controller output CO0 and output polarity. Close completes after its dwell; there is no grasp sensor and no workpiece-loss rule. Configure the actual cell wiring and polarity before use.",
   "members": {
-    "deployment.yaml": "sha256:8bdf22ae48c913527a4883ca3f80a9dcc4415aa1ede7340ae4d4b6afcfa85851",
-    "program.yaml": "sha256:16f8356ee8fd06df9d77e5dfab2244ca39d78dab1a503f1aede8e91ff59f51f5"
+    "deployment.yaml": "sha256:d5162bec7a2333a1cd68f1ee0ec77732111037a963805fa16ca6da448b2a39fa",
+    "program.yaml": "sha256:8718d4650625c1badba7c9f1d0c07b0ae06ac546b93e59d8a6cc801cbf775371"
   },
   "name": "real_lite6_pneumatic_valve_only",
   "saved_status": {
-    "checked_content_digest": "sha256:9dfc936acbd8ae1342bc7e8212c50af5be3889c5200be8e040b17c8634784536",
+    "checked_content_digest": "sha256:6f9cbf0fbe3d4646ad124509fa3907b02f7b8a1f7058ea52d5f183b7e378307d",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.1"
+    "manyforge_version": "0.4.0"
   },
   "scenario_id": "real_lite6_pneumatic_valve_only",
   "source_snapshot": {

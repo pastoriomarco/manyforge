@@ -554,8 +554,15 @@ TEST(ComponentSpec, PlannerSettingsAreTheHostConfiguration) {
       EXPECT_EQ(settings.rng_seed, configuration.planner_rng_seed);
       EXPECT_EQ(settings.collision_check_step_rad,
                 configuration.collision_check_step_rad.value_or(core::kDefaultCollisionCheckStepRad));
-      EXPECT_EQ(settings.collision_clearance_m,
-                configuration.collision_clearance_m.value_or(core::kDefaultCollisionClearanceM));
+      // Absent rules are the default first rule: 1 mm for every robot x
+      // environment pair.
+      EXPECT_EQ(settings.collision_rules,
+                configuration.collision_rules.value_or(
+                    std::vector<core::CollisionRuleDTO>{core::CollisionRuleDTO{
+                        std::string(core::kEverythingCollisionRuleId),
+                        {},
+                        {},
+                        core::CollisionClearanceRule{core::kDefaultCollisionClearanceM}}}));
       EXPECT_EQ(settings.collision_check_fresh_plans,
                 configuration.collision_check_fresh_plans.value_or(
                     core::kDefaultCollisionCheckFreshPlans));
@@ -649,7 +656,7 @@ TEST(ComponentSpec, TypedFactsAreTheComponentsOwnHashedRows) {
                   own(host.default_fault_stop_profiles) && own(host.pose_sources) &&
                   own(host.ai_models) && own(host.component_streams));
       EXPECT_EQ(host.planner_rng_seed, 0U);
-      EXPECT_FALSE(host.collision_clearance_m || host.collision_check_step_rad ||
+      EXPECT_FALSE(host.collision_rules || host.collision_check_step_rad ||
                    host.collision_check_fresh_plans);
       if (!IsMotion(bundle, id)) {
         EXPECT_EQ(host.execution_tick_hz, 0U);

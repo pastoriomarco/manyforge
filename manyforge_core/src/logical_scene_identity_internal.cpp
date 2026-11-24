@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <functional>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -134,16 +133,17 @@ CanonicalValue PairSet(const std::vector<CollisionPairId>& values,
   return CanonicalValue(std::move(result));
 }
 
-std::string_view ContactMode(CollisionContactPolicyMode mode) {
-  switch (mode) {
-    case CollisionContactPolicyMode::kContactRelease:
-      return "contact_release";
-    case CollisionContactPolicyMode::kBoundedPenetration:
-      return "bounded_penetration";
-    case CollisionContactPolicyMode::kContactProcess:
-      return "contact_process";
+CanonicalValue BodySet(const std::vector<CollisionBodyId>& values,
+                       std::string_view field) {
+  RequireStrictlyIncreasing(
+      values, [](const auto& left, const auto& right) { return left < right; },
+      field);
+  CanonicalValue::Array result;
+  result.reserve(values.size());
+  for (const auto& value : values) {
+    result.push_back(String(value, field));
   }
-  Fail("support contact has an unknown mode");
+  return CanonicalValue(std::move(result));
 }
 
 std::string_view ReleaseEvidence(ContactReleaseEvidenceMode mode) {
@@ -153,210 +153,112 @@ std::string_view ReleaseEvidence(ContactReleaseEvidenceMode mode) {
     case ContactReleaseEvidenceMode::kBinaryContact:
       return "binary_contact";
   }
-  Fail("support contact has an unknown release-evidence mode");
+  Fail("release rule has an unknown release-evidence mode");
 }
 
-void RequireNormalizedSupportContact(const SupportContactPolicyEntry& entry,
-                                     std::string_view field) {
-  RequireCanonicalPair(entry.pair, std::string(field) + ".pair");
-  (void)Number(entry.max_start_penetration_m,
-               std::string(field) + ".max_start_penetration_m", false, true);
-  (void)Number(entry.release_tolerance_m,
-               std::string(field) + ".release_tolerance_m", false, true);
-  (void)Number(entry.min_release_progress_m,
-               std::string(field) + ".min_release_progress_m", false, true);
-  (void)Number(entry.max_contact_penetration_m,
-               std::string(field) + ".max_contact_penetration_m", false, true);
-
-  if (entry.mode == CollisionContactPolicyMode::kContactRelease) {
-    Require(entry.max_contact_penetration_m == 0.0,
-            std::string(field) + ".max_contact_penetration_m must be neutral");
-    if (entry.release_evidence_mode ==
-        ContactReleaseEvidenceMode::kBinaryContact) {
-      Require(
-          !entry.enforce_max_start_penetration &&
-              entry.max_start_penetration_m == 0.0 &&
-              entry.release_tolerance_m == 0.0 &&
-              entry.min_release_progress_m == 0.0 &&
-              !entry.require_strictly_decreasing_penetration,
-          std::string(field) + " binary-contact metric fields must be neutral");
+CanonicalValue ContactRuleValue(const CollisionContactRule& rule,
+                                std::string_view field) {
+  CanonicalValue::Object result;
+  if (rule.max_penetration_m.has_value()) {
+    result.emplace_back(
+        "max_penetration_m",
+        Number(*rule.max_penetration_m,
+               std::string(field) + ".max_penetration_m", false, true));
+  }
+  Require(rule.end_from_fraction >= 0.0 && rule.end_from_fraction <= 1.0,
+          std::string(field) + ".end_from_fraction must be within [0, 1]");
+  result.emplace_back("end_from_fraction",
+                      Number(rule.end_from_fraction,
+                             std::string(field) + ".end_from_fraction"));
+  if (rule.max_compression_step_m.has_value()) {
+    result.emplace_back(
+        "max_compression_step_m",
+        Number(*rule.max_compression_step_m,
+               std::string(field) + ".max_compression_step_m", false, true));
+  }
+  if (rule.spring_group.has_value()) {
+    const auto& group = *rule.spring_group;
+    const auto group_field = std::string(field) + ".spring_group";
+    CanonicalValue::Array axis;
+    for (std::size_t index = 0U; index < group.axis.size(); ++index) {
+      const double value = group.axis[index];
+      axis.push_back(Number(value == 0.0 ? 0.0 : value,
+                            group_field + ".axis[" + std::to_string(index) + "]"));
     }
-    return;
+    result.emplace_back(
+        "spring_group",
+        CanonicalValue(CanonicalValue::Object{
+            {"component_id", String(group.component_id.value(), group_field + ".component_id")},
+            {"element_id", String(group.element_id, group_field + ".element_id")},
+            {"axis", CanonicalValue(std::move(axis))},
+        }));
   }
-
-  Require(entry.release_evidence_mode ==
-                  ContactReleaseEvidenceMode::kSignedPenetration &&
-              !entry.enforce_max_start_penetration &&
-              entry.max_start_penetration_m == 0.0 &&
-              entry.release_tolerance_m == 0.0 &&
-              entry.min_release_progress_m == 0.0 &&
-              !entry.require_separation_by_end &&
-              !entry.require_strictly_decreasing_penetration &&
-              !entry.allow_recontact,
-          std::string(field) + " mode-scoped release fields must be neutral");
-  if (entry.mode == CollisionContactPolicyMode::kContactProcess) {
-    Require(entry.max_contact_penetration_m == 0.0,
-            std::string(field) + ".max_contact_penetration_m must be neutral");
-  }
+  return CanonicalValue(std::move(result));
 }
 
-CanonicalValue SupportContact(const SupportContactPolicyEntry& entry,
-                              std::string_view field) {
-  RequireNormalizedSupportContact(entry, field);
+CanonicalValue ReleaseRuleValue(const CollisionReleaseRule& rule,
+                                std::string_view field) {
+  if (rule.release_evidence_mode ==
+      ContactReleaseEvidenceMode::kBinaryContact) {
+    Require(!rule.enforce_max_start_penetration &&
+                rule.max_start_penetration_m == 0.0 &&
+                rule.release_tolerance_m == 0.0 &&
+                rule.min_release_progress_m == 0.0 &&
+                !rule.require_strictly_decreasing_penetration,
+            std::string(field) +
+                " binary-contact metric fields must be neutral");
+  }
   return CanonicalValue(CanonicalValue::Object{
-      {"pair", Pair(entry.pair, std::string(field) + ".pair")},
-      {"mode", CanonicalValue(std::string(ContactMode(entry.mode)))},
       {"release_evidence_mode", CanonicalValue(std::string(ReleaseEvidence(
-                                    entry.release_evidence_mode)))},
+                                    rule.release_evidence_mode)))},
       {"enforce_max_start_penetration",
-       Bool(entry.enforce_max_start_penetration)},
+       Bool(rule.enforce_max_start_penetration)},
       {"max_start_penetration_m",
-       Number(entry.max_start_penetration_m,
+       Number(rule.max_start_penetration_m,
               std::string(field) + ".max_start_penetration_m", false, true)},
       {"release_tolerance_m",
-       Number(entry.release_tolerance_m,
+       Number(rule.release_tolerance_m,
               std::string(field) + ".release_tolerance_m", false, true)},
       {"min_release_progress_m",
-       Number(entry.min_release_progress_m,
+       Number(rule.min_release_progress_m,
               std::string(field) + ".min_release_progress_m", false, true)},
-      {"max_contact_penetration_m",
-       Number(entry.max_contact_penetration_m,
-              std::string(field) + ".max_contact_penetration_m", false, true)},
-      {"require_separation_by_end", Bool(entry.require_separation_by_end)},
+      {"require_separation_by_end", Bool(rule.require_separation_by_end)},
       {"require_strictly_decreasing_penetration",
-       Bool(entry.require_strictly_decreasing_penetration)},
-      {"allow_recontact", Bool(entry.allow_recontact)},
+       Bool(rule.require_strictly_decreasing_penetration)},
+      {"allow_recontact", Bool(rule.allow_recontact)},
   });
 }
 
-CanonicalValue SupportContacts(
-    const std::vector<SupportContactPolicyEntry>& entries) {
+CanonicalValue ContactRule(const CollisionPairContactRule& entry,
+                           std::string_view field) {
+  CanonicalValue::Object result{
+      {"pair", Pair(entry.pair, std::string(field) + ".pair")},
+      {"rule_id", String(entry.rule_id, std::string(field) + ".rule_id")},
+  };
+  if (const auto* contact = entry.contact(); contact != nullptr) {
+    result.emplace_back(
+        "contact", ContactRuleValue(*contact, std::string(field) + ".contact"));
+  } else {
+    result.emplace_back(
+        "release", ReleaseRuleValue(std::get<CollisionReleaseRule>(entry.value),
+                                    std::string(field) + ".release"));
+  }
+  return CanonicalValue(std::move(result));
+}
+
+CanonicalValue ContactRules(
+    const std::vector<CollisionPairContactRule>& entries) {
   RequireStrictlyIncreasing(
       entries,
       [](const auto& left, const auto& right) {
         return left.pair < right.pair;
       },
-      "support_contacts");
+      "contact_rules");
   CanonicalValue::Array result;
   result.reserve(entries.size());
   for (std::size_t index = 0U; index < entries.size(); ++index) {
-    result.push_back(SupportContact(
-        entries[index], "support_contacts[" + std::to_string(index) + "]"));
-  }
-  return CanonicalValue(std::move(result));
-}
-
-void RequireNormalizedSupportDeclaration(const SupportContactDTO& entry,
-                                         std::string_view field) {
-  (void)String(entry.support_object_id,
-               std::string(field) + ".support_object_id");
-  (void)Number(entry.max_start_penetration_m,
-               std::string(field) + ".max_start_penetration_m", false, true);
-  (void)Number(entry.release_tolerance_m,
-               std::string(field) + ".release_tolerance_m", false, true);
-  (void)Number(entry.min_release_progress_m,
-               std::string(field) + ".min_release_progress_m", false, true);
-  (void)Number(entry.max_contact_penetration_m,
-               std::string(field) + ".max_contact_penetration_m", false, true);
-  Require(logical_scene_detail::NormalizedSupportContact(entry),
-          std::string(field) + " is not a normalized support declaration");
-}
-
-CanonicalValue SupportDeclaration(const SupportContactDTO& entry,
-                                  std::string_view field) {
-  RequireNormalizedSupportDeclaration(entry, field);
-  return CanonicalValue(CanonicalValue::Object{
-      {"support_object_id", String(entry.support_object_id,
-                                   std::string(field) + ".support_object_id")},
-      {"mode", CanonicalValue(std::string(ContactMode(entry.mode)))},
-      {"release_evidence_mode", CanonicalValue(std::string(ReleaseEvidence(
-                                    entry.release_evidence_mode)))},
-      {"enforce_max_start_penetration",
-       Bool(entry.enforce_max_start_penetration)},
-      {"max_start_penetration_m",
-       Number(entry.max_start_penetration_m,
-              std::string(field) + ".max_start_penetration_m", false, true)},
-      {"release_tolerance_m",
-       Number(entry.release_tolerance_m,
-              std::string(field) + ".release_tolerance_m", false, true)},
-      {"min_release_progress_m",
-       Number(entry.min_release_progress_m,
-              std::string(field) + ".min_release_progress_m", false, true)},
-      {"max_contact_penetration_m",
-       Number(entry.max_contact_penetration_m,
-              std::string(field) + ".max_contact_penetration_m", false, true)},
-      {"require_separation_by_end", Bool(entry.require_separation_by_end)},
-      {"require_strictly_decreasing_penetration",
-       Bool(entry.require_strictly_decreasing_penetration)},
-      {"allow_recontact", Bool(entry.allow_recontact)},
-  });
-}
-
-CanonicalValue SupportDeclarations(
-    const std::vector<SupportContactDTO>& entries, std::string_view field) {
-  RequireStrictlyIncreasing(
-      entries,
-      [](const auto& left, const auto& right) {
-        return left.support_object_id < right.support_object_id;
-      },
-      field);
-  CanonicalValue::Array result;
-  result.reserve(entries.size());
-  for (std::size_t index = 0U; index < entries.size(); ++index) {
-    result.push_back(SupportDeclaration(
-        entries[index],
-        std::string(field) + "[" + std::to_string(index) + "]"));
-  }
-  return CanonicalValue(std::move(result));
-}
-
-CanonicalValue ContactGrasp(const ContactGraspPolicyEntry& entry,
-                            std::string_view field) {
-  (void)String(entry.policy_id, std::string(field) + ".policy_id");
-  (void)String(entry.selected_object_id,
-               std::string(field) + ".selected_object_id");
-  RequireStrictlyIncreasing(entry.allowed_robot_links, std::less<std::string>{},
-                            std::string(field) + ".allowed_robot_links");
-  CanonicalValue::Array links;
-  links.reserve(entry.allowed_robot_links.size());
-  for (std::size_t index = 0U; index < entry.allowed_robot_links.size();
-       ++index) {
-    links.push_back(String(entry.allowed_robot_links[index],
-                           std::string(field) + ".allowed_robot_links[" +
-                               std::to_string(index) + "]"));
-  }
-  Require(entry.terminal_window_start_fraction >= 0.0 &&
-              entry.terminal_window_start_fraction <= 1.0,
-          std::string(field) +
-              ".terminal_window_start_fraction must be within [0, 1]");
-  return CanonicalValue(CanonicalValue::Object{
-      {"policy_id", String(entry.policy_id, std::string(field) + ".policy_id")},
-      {"selected_object_id",
-       String(entry.selected_object_id,
-              std::string(field) + ".selected_object_id")},
-      {"allowed_robot_links", CanonicalValue(std::move(links))},
-      {"max_penetration_m",
-       Number(entry.max_penetration_m,
-              std::string(field) + ".max_penetration_m", false, true)},
-      {"terminal_window_start_fraction",
-       Number(entry.terminal_window_start_fraction,
-              std::string(field) + ".terminal_window_start_fraction")},
-  });
-}
-
-CanonicalValue ContactGrasps(
-    const std::vector<ContactGraspPolicyEntry>& entries) {
-  RequireStrictlyIncreasing(
-      entries,
-      [](const auto& left, const auto& right) {
-        return left.policy_id < right.policy_id;
-      },
-      "contact_grasps");
-  CanonicalValue::Array result;
-  result.reserve(entries.size());
-  for (std::size_t index = 0U; index < entries.size(); ++index) {
-    result.push_back(ContactGrasp(
-        entries[index], "contact_grasps[" + std::to_string(index) + "]"));
+    result.push_back(ContactRule(
+        entries[index], "contact_rules[" + std::to_string(index) + "]"));
   }
   return CanonicalValue(std::move(result));
 }
@@ -364,13 +266,10 @@ CanonicalValue ContactGrasps(
 CanonicalValue PolicySemantics(const CollisionPolicySnapshot& policy) {
   return CanonicalValue(CanonicalValue::Object{
       {"policy_id", String(policy.policy_id, "policy_id")},
-      {"allowed_static_static_pairs",
-       PairSet(policy.allowed_static_static_pairs,
-               "allowed_static_static_pairs")},
+      {"static_body_ids", BodySet(policy.static_body_ids, "static_body_ids")},
       {"allowed_touch_link_pairs",
        PairSet(policy.allowed_touch_link_pairs, "allowed_touch_link_pairs")},
-      {"support_contacts", SupportContacts(policy.support_contacts)},
-      {"contact_grasps", ContactGrasps(policy.contact_grasps)},
+      {"contact_rules", ContactRules(policy.contact_rules)},
       {"require_full_diagnostics", Bool(policy.require_full_diagnostics)},
   });
 }
@@ -440,8 +339,15 @@ CanonicalValue Shape(const CollisionShapeDTO& shape, std::string_view field) {
                       true)},
           });
         } else {
+          Require(manyforge::content_identity::is_sha256_digest(
+                      value.content_digest),
+                  std::string(field) +
+                      ".mesh_content_digest has invalid spelling");
           return CanonicalValue(CanonicalValue::Object{
               {"type", CanonicalValue("mesh")},
+              {"mesh_content_digest",
+               String(value.content_digest,
+                      std::string(field) + ".mesh_content_digest")},
               {"mesh_resource_uri",
                String(value.resource_uri,
                       std::string(field) + ".mesh_resource_uri")},
@@ -548,9 +454,6 @@ CanonicalValue SceneObject(const SceneObjectSnapshotDTO& object,
       {"placement",
        Placement(object.placement, std::string(field) + ".placement",
                  snapshot_cell)},
-      {"support_contacts",
-       SupportDeclarations(object.support_contacts,
-                           std::string(field) + ".support_contacts")},
   };
   // Absent at zero so massless rows keep their identity bytes.
   Require(std::isfinite(object.mass_kg) && object.mass_kg >= 0.0,
@@ -607,14 +510,10 @@ CanonicalValue FrameRef(const SceneFrameRefDTO& frame, std::string_view field) {
 
 CanonicalValue AttachmentPayload(const CarriedObjectAttachmentDTO& attachment,
                                  std::string_view field) {
-  const auto* component_frame =
-      std::get_if<ComponentSceneFrameRefDTO>(&attachment.carrier_frame_ref);
-  Require(component_frame != nullptr,
+  // OD-372: the frame may belong to a component mounted on the holder.
+  Require(std::holds_alternative<ComponentSceneFrameRefDTO>(
+              attachment.carrier_frame_ref),
           std::string(field) + ".carrier_frame_ref must be a component frame");
-  Require(component_frame->controllable_component_id ==
-              attachment.controllable_component_id,
-          std::string(field) +
-              ".carrier_frame_ref component does not own the attachment");
   RequireStrictlyIncreasing(
       attachment.touch_body_roles,
       [](const auto& left, const auto& right) {

@@ -415,16 +415,11 @@ public:
          candidate.value().cell_graph.controllable_components) {
       const auto wanted = deployment::derive_component_runtime_identity(
           candidate, site_facts, component.controllable_component_id);
-      const auto count = std::count_if(
-          inventory.value().process_occurrences.begin(),
-          inventory.value().process_occurrences.end(), [&](const auto &row) {
-            return row.controllable_component_id ==
-                       component.controllable_component_id &&
-                   (row.process_presence == ProcessPresenceState::kPresent ||
-                    row.process_owner_kind == ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) &&
-                   row.installed_runtime_identity == wanted;
-          });
-      RequireInstalledState(count <= 1, "component has multiple current process owners");
+      // One present process, or its local owners (one per gripper target).
+      const auto owners = CurrentComponentProcessOwners(
+          component.controllable_component_id, wanted, inventory.value().process_occurrences);
+      RequireInstalledState(owners.has_value(), "component has multiple current process owners");
+      const auto count = *owners;
       if (count == 0)
         restart.insert(component.controllable_component_id);
     }
@@ -763,7 +758,6 @@ bool ManagerNamedApplyRequestDTO::valid() const noexcept {
   return (scene_initialization == ManagerSceneInitialization::kPreserve ||
           scene_initialization == ManagerSceneInitialization::kInitialize) &&
          (direct || parent) && !request_context.source_label.empty() &&
-         !deployment_artifact_id.empty() &&
          core::IsExactLowercaseSha256Digest(deployment_revision.value()) &&
          !expected_current_retained_bundle_id.empty() &&
          !expected_current_graph_revision.empty() &&
@@ -1289,12 +1283,9 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
       LoadBundle(retained_bundle_source_, request.candidate_retained_bundle_id,
                  "candidate");
   const auto &candidate_value = candidate->value();
-  Require(candidate_value.deployment_artifact_id ==
-                  request.deployment_artifact_id &&
-              candidate_value.deployment_revision ==
-                  request.deployment_revision,
+  Require(candidate_value.deployment_revision == request.deployment_revision,
           "selected candidate does not match the requested deployment "
-          "identity and revision");
+          "revision");
   Require(candidate_value.cell_graph.cell_id == apply_journal_.cell_id(),
           "selected candidate belongs to another cell");
   const auto inventory = apply_journal_.ReadStatusInventory();

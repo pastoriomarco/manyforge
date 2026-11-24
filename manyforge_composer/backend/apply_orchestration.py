@@ -109,7 +109,6 @@ class Preview:
     program: dict[str, Any] = field(
         default_factory=lambda: {
             "executable": True,
-            "program_id": None,
             "unresolved_references": [],
             "affected_nodes": [],
             "affected_execution_groups": [],
@@ -117,6 +116,36 @@ class Preview:
     )
     attachment_changed_components: tuple[str, ...] = ()
     detached_components: tuple[str, ...] = ()
+    # The cell collision rules the Apply adds, removes or changes (their
+    # authored row or their resolved members), as the Manager lists them:
+    # ``{rule_id, change, now, was}``.
+    collision_rules: tuple[dict[str, Any], ...] = ()
+    # Depth rules and trip depths that select a mesh that is not closed
+    # (OD-363), as the Manager reports them; a report, not a confirmation:
+    # ``{code, collision_rule_id | signal_id, member, mesh_uri}``.
+    mesh_depth_reports: tuple[dict[str, Any], ...] = ()
+
+    def collision_rule_ids(self) -> list[str]:
+        """The ids of the rules the Apply changes, which it must confirm."""
+
+        return [str(row["rule_id"]) for row in self.collision_rules]
+
+
+COLLISION_RULE_CONFIRMATION_REQUIRED = "collision_rule_confirmation_required"
+
+
+def unconfirmed_collision_rules(
+    preview: Preview, confirmed: list[str] | None
+) -> list[str]:
+    """The changed rules of ``preview`` that ``confirmed`` leaves out.
+
+    ``None`` is a caller that is itself the confirmation (a Scenario Load):
+    nothing is left out.
+    """
+
+    if confirmed is None:
+        return []
+    return [rule_id for rule_id in preview.collision_rule_ids() if rule_id not in confirmed]
 
 
 class ApplyPorts(Protocol):
@@ -166,7 +195,6 @@ def candidate_preview(response: dict[str, Any] | None) -> Preview:
         ),
         program={
             "executable": program.get("executable") is not False,
-            "program_id": program.get("program_id"),
             "unresolved_references": [
                 deepcopy(row)
                 for row in outcome.get("unresolved_targets") or ()
@@ -181,6 +209,16 @@ def candidate_preview(response: dict[str, Any] | None) -> Preview:
             impact.get("attachment_changed_components") or ()
         ),
         detached_components=tuple(impact.get("detached_components") or ()),
+        collision_rules=tuple(
+            deepcopy(row)
+            for row in impact.get("collision_rules") or ()
+            if isinstance(row, dict)
+        ),
+        mesh_depth_reports=tuple(
+            deepcopy(row)
+            for row in impact.get("mesh_depth_reports") or ()
+            if isinstance(row, dict)
+        ),
     )
 
 
@@ -205,6 +243,9 @@ def preview_view(preview: Preview, scope: dict[str, Any]) -> dict[str, Any]:
         "program": dict(preview.program),
         "attachment_changed_components": list(preview.attachment_changed_components),
         "detached_components": list(preview.detached_components),
+        # The Apply sends these rule ids back in ``confirmed_collision_rule_ids``.
+        "collision_rules": [deepcopy(row) for row in preview.collision_rules],
+        "mesh_depth_reports": [deepcopy(row) for row in preview.mesh_depth_reports],
     }
 
 
@@ -300,6 +341,7 @@ def run_apply(
     ports: ApplyPorts,
     *,
     error_code: Callable[[Exception], tuple[str, str] | None] = lambda _e: None,
+    confirmed_collision_rule_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run one orchestrated Apply and return its ApplyResult.
 
@@ -316,6 +358,9 @@ def run_apply(
     to ``(code, message)``; an exception it doesn't map propagates. Removed
     components carry no ``lifecycle_after``. A finished or held run is Reset
     before the Preview; a failed Reset ends the Apply with no component rows.
+    A Preview that changes collision rules ``confirmed_collision_rule_ids``
+    does not name ends the Apply ``collision_rule_confirmation_required``
+    before any component step (``None``: the caller is the confirmation).
     """
 
     def failed(failure: Exception) -> dict[str, str]:
@@ -342,7 +387,19 @@ def run_apply(
     except Exception as failure:  # noqa: BLE001 - the Apply's result
         return {"outcome": "failed", "components": [], "error": failed(failure)}
     apply_step("previewing")
-    rows = ports.preview().components
+    preview = ports.preview()
+    unconfirmed = unconfirmed_collision_rules(preview, confirmed_collision_rule_ids)
+    if unconfirmed:
+        return {
+            "outcome": "failed",
+            "components": [],
+            "error": {
+                "code": COLLISION_RULE_CONFIRMATION_REQUIRED,
+                "message": "Confirm the collision rule changes of the Preview first: "
+                + ", ".join(unconfirmed),
+            },
+        }
+    rows = preview.components
     disposition = {row.component_id: row.disposition for row in rows}
     errors: dict[str, dict[str, str]] = {}
     first: list[dict[str, str]] = []

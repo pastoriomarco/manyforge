@@ -864,7 +864,7 @@ export function useRobotControl(
     const id = newRequestKey();
     const intent: DirectControlSetTcpIntent = {
       request_context: { request_key: id, source_label: 'composer_ui' },
-      program_id: motion.programId, program_revision: motion.programRevision,
+      program_revision: motion.programRevision,
       program_binding_id: motion.programBindingId,
       expected_graph_revision: status.graphRevision, expected_retained_bundle_id: status.retainedBundleId,
       expected_scene_revision: null, coordination_policy: 'independent',

@@ -6,14 +6,14 @@
   },
   "description": "Mock Lite6 motion preemption. A slow priority-10 move is taken over after 1 s by a priority-50 move (expect preempted plus a smooth takeover or spring-back); then a priority-10 newcomer against a running priority-50 move is refused_by_priority. Both losers return success (preempted_result) so the tree continues to the outcome-key checks.",
   "members": {
-    "deployment.yaml": "sha256:f539310d25eb982c30469e98e578c31fde2a1c14ce22e4c778a83e46b1f6804a",
-    "program.yaml": "sha256:f3293b85403dcc53522932a1ec5f72c75065d4012737acf2e78e73f95de552d0"
+    "deployment.yaml": "sha256:9b35c919c52e4f7b66f114641567e700feb198a0735fed6d6752fd8a26a238dc",
+    "program.yaml": "sha256:517ea8235f41da406d6c8c650ff1881654d49e3018c2de26f8ecd20764f60666"
   },
   "name": "mock_lite6_motion_preemption",
   "saved_status": {
-    "checked_content_digest": "sha256:0fb932bf9db54c57deff845a8f5692ab335ba92ebfce07f61c8696213996df63",
+    "checked_content_digest": "sha256:dcf3869e9e5955a24d6a43742ad20a69dbab9adae950f1972054f3cc378a1396",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.1"
+    "manyforge_version": "0.4.0"
   },
   "scenario_id": "mock_lite6_motion_preemption",
   "source_snapshot": {

@@ -1,4 +1,4 @@
-import type { ProgramFrameReference, ProgramViewerMetadata } from '../types/api';
+import type { ProgramFrameReference, ProgramViewerDefaultView, ProgramViewerMetadata } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 
 export interface ViewerPresentationDraft {
@@ -10,6 +10,8 @@ export interface ViewerPresentationDraft {
   objectAxesGizmoSizeM: number;
   /** Execution groups the Motion panel hides; null keeps the default. */
   hiddenExecutionGroups: string[] | null;
+  /** The Scenario's default 3D view (OD-355); null keeps the built-in view. */
+  defaultView: ProgramViewerDefaultView | null;
 }
 
 export type ViewerPresentationDraftAction =
@@ -18,7 +20,8 @@ export type ViewerPresentationDraftAction =
   | { type: 'set_resource_visibility'; sceneResourceId: string; visible: boolean }
   | { type: 'set_scene_resource_axes_visibility'; sceneResourceId: string; visible: boolean }
   | { type: 'set_frame_gizmo_size'; sizeM: number }
-  | { type: 'set_object_axes_gizmo_size'; sizeM: number };
+  | { type: 'set_object_axes_gizmo_size'; sizeM: number }
+  | { type: 'set_default_view'; view: ProgramViewerDefaultView | null };
 
 export const DEFAULT_VIEWER_PRESENTATION_DRAFT: ViewerPresentationDraft = {
   frameVisibility: [],
@@ -28,6 +31,7 @@ export const DEFAULT_VIEWER_PRESENTATION_DRAFT: ViewerPresentationDraft = {
   frameGizmoSizeM: 0.1,
   objectAxesGizmoSizeM: 0.1,
   hiddenExecutionGroups: null,
+  defaultView: null,
 };
 
 /**
@@ -89,6 +93,10 @@ export function viewerPresentationDraftFromProgram(
     hiddenExecutionGroups: viewer?.hidden_execution_groups === undefined
       ? null
       : [...viewer.hidden_execution_groups],
+    defaultView: viewer?.default_view === undefined ? null : {
+      position_m: [...viewer.default_view.position_m],
+      target_m: [...viewer.default_view.target_m],
+    },
   };
 }
 
@@ -107,6 +115,12 @@ export function programViewerMetadata(
     object_axes_gizmo_size_m: draft.objectAxesGizmoSizeM,
     ...(draft.hiddenExecutionGroups === null ? {} : {
       hidden_execution_groups: [...new Set(draft.hiddenExecutionGroups)].sort(),
+    }),
+    ...(draft.defaultView === null ? {} : {
+      default_view: {
+        position_m: [...draft.defaultView.position_m],
+        target_m: [...draft.defaultView.target_m],
+      },
     }),
   };
 }
@@ -159,5 +173,7 @@ export function viewerPresentationDraftReducer(
       return validGizmoSize(action.sizeM)
         ? { ...state, objectAxesGizmoSizeM: action.sizeM }
         : state;
+    case 'set_default_view':
+      return { ...state, defaultView: action.view };
   }
 }

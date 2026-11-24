@@ -34,7 +34,7 @@ function status(
     lastProgress: { phase, recordDigest: digest },
     sceneInitialization: 'preserve',
     preparedActivation: {
-      capturedInputDigest: digest, deploymentArtifactId: 'deployment.fixture',
+      capturedInputDigest: digest,
       deploymentRevision: digest, programBindingId: digest, preparedActivationId: digest,
     },
     requestKey: `c0${'3'.repeat(30)}`,

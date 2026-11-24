@@ -13,6 +13,7 @@
 #include <future>
 #include <functional>
 #include <manyforge_collision/scene_asset_root.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <limits>
@@ -488,6 +489,95 @@ TEST(ProcessContainedCandidateClientTest,
   EXPECT_EQ(ik.value().size(), fixture.binding.resources.size());
 }
 
+class FixedTestClock final : public IClock {
+ public:
+  TimePoint now() const override { return 1'000; }
+};
+
+// Another component of the cell with one model coordinate, its publication
+// and its stream-stale flag, installed as the client's cell sources.
+struct OtherComponentOfTheCell final {
+  std::shared_ptr<ObservedRobotStatePublication> publication{
+      std::make_shared<ObservedRobotStatePublication>(
+          std::vector<std::string>{"peer_joint"},
+          std::vector<ObservedRobotStateSourceConfig>{ObservedRobotStateSourceConfig{
+              ObservedRobotStateSourceKind::kCommandedState, "peer",
+              ObservedRobotStateAuthorityProfile::kCommandedSimulation, 0}})};
+  std::shared_ptr<ComponentStreamStaleFlag> stream_stale{
+      std::make_shared<ComponentStreamStaleFlag>()};
+  std::shared_ptr<CellModelStateHandle> cell{std::make_shared<CellModelStateHandle>()};
+
+  OtherComponentOfTheCell() {
+    cell->Replace(std::make_shared<const CellModelStateSources>(CellModelStateSources{
+        {ControllableComponentId("peer_robot"), publication, stream_stale}}));
+  }
+};
+
+TEST(ProcessContainedCandidateClientTest,
+     PlanAndIkAreRefusedWhileAnotherComponentsStateIsAbsentOrStale) {
+  auto fixture = make_fixture();
+  const OtherComponentOfTheCell other;
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.cell_model_state = other.cell;
+  process_config.clock = std::make_shared<FixedTestClock>();
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01}, process_config);
+  const auto goal_pose = pose(fixture.reference_scene->forwardKinematics(
+      fixture.goal, "tool0", "base"));
+  const auto &base = fixture.binding.permitted_frames[0];
+  const auto &tcp = fixture.binding.permitted_frames[1];
+  // Each request keeps its own code; the reason is the component's stream
+  // condition, and the component is named.
+  const auto expect_refused = [](const ErrorDTO &error, const char *code,
+                                 const std::string_view reason) {
+    EXPECT_EQ(error.code, code);
+    ASSERT_TRUE(error.details.contains("reason"));
+    EXPECT_EQ(error.details.at("reason"), reason);
+    ASSERT_TRUE(error.details.contains("peer_component_id"));
+    EXPECT_EQ(error.details.at("peer_component_id"), "peer_robot");
+  };
+  const auto expect_all_refused = [&](const std::string_view reason) {
+    const auto planned = client.compute(request(fixture));
+    ASSERT_FALSE(planned.ok());
+    expect_refused(planned.error(), "planning_failed", reason);
+    const auto ik = client.solve_ik(goal_pose, base, tcp, state(fixture), 3.0);
+    ASSERT_FALSE(ik.ok());
+    expect_refused(ik.error(), "ik_failed", reason);
+    const auto diagnostic = client.solve_ik_diagnostic(goal_pose, base, tcp, state(fixture),
+                                                       3.0, TolerancesDTO{1e-4, 5e-3, 1e-2});
+    ASSERT_FALSE(diagnostic.ok());
+    expect_refused(diagnostic.error(), "ik_failed", reason);
+  };
+
+  // The other component has published nothing.
+  expect_all_refused("component_stream_absent");
+
+  // It has, and it is in its stream-stale condition.
+  const std::vector<std::string> names{"peer_joint"};
+  const std::vector<double> positions{0.4};
+  ASSERT_TRUE(other.publication
+                  ->publish(ObservedRobotStateSourceKind::kCommandedState, names, positions, {},
+                            900, 900)
+                  .published);
+  other.stream_stale->value.store(true);
+  expect_all_refused("component_stream_stale");
+
+  // Live: its coordinate is not a joint of this planner's model. Refused with
+  // a typed reason by the client, never sent for the worker to fail on.
+  other.stream_stale->value.store(false);
+  const auto unknown = client.compute(request(fixture));
+  ASSERT_FALSE(unknown.ok());
+  expect_refused(unknown.error(), "planning_failed", "kinematic_coordinate_missing");
+  EXPECT_EQ(unknown.error().details.at("joint"), "peer_joint");
+
+  // The worker was never involved: without that component the same request
+  // plans.
+  other.cell->Replace(nullptr);
+  const auto planned = client.compute(request(fixture));
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+}
+
 TEST(ProcessContainedCandidateClientTest, DiagnosticDeadlineAndQualifiedTargetCrossProcess) {
   auto fixture = make_fixture();
   fixture.model.native_scene_name = "inspect-preview-diagnostic";
@@ -620,12 +710,11 @@ TEST(ProcessContainedCandidateClientTest,
   ASSERT_TRUE(repeated.ok()) << repeated.error().message;
   EXPECT_EQ(std::filesystem::file_size(generation_counter), 1U);
 
-  // New scene/world revisions and a contact selector that relaxes no pair
+  // New scene/world revisions and a contact allowance that relaxes no pair
   // project byte-identical worker content: the worker is kept.
   for (auto same_content : {projection(1U, 2U), projection(2U, 3U)}) {
-    for (const auto &contact : {std::optional<std::string>{},
-                                std::optional<std::string>("absent-policy")}) {
-      same_content.contact_policy_id = contact;
+    for (const bool allowed : {false, true}) {
+      same_content.end_contact_pairs_allowed = allowed;
       const auto kept = client.select_retained_projection(same_content);
       ASSERT_TRUE(kept.ok()) << kept.error().message;
       const auto planned = client.compute(request(fixture));
@@ -689,12 +778,12 @@ public:
     // that worker spawn rewrites (protocol, package root, executable).
     const int opened = ::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (opened < 0) {
-      throw std::runtime_error("could not open test scene-asset root");
+      throw std::runtime_error("could not open test scene content root");
     }
     descriptor_ = ::fcntl(opened, F_DUPFD_CLOEXEC, 10);
     static_cast<void>(::close(opened));
     if (descriptor_ < 0) {
-      throw std::runtime_error("could not place test scene-asset root");
+      throw std::runtime_error("could not place test scene content root");
     }
   }
 
@@ -710,7 +799,11 @@ private:
   int descriptor_{-1};
 };
 
+// The URI names the mesh only; no file exists at it anywhere. The worker
+// reads the captured bytes from the content store by digest.
 constexpr std::string_view kSceneMeshUri = "examples/x/meshes/a.obj";
+constexpr std::string_view kAbsoluteSceneMeshUri =
+    "/nonexistent-manyforge-scene/meshes/a.obj";
 constexpr std::string_view kTriangleObj =
     "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
 constexpr std::string_view kChangedTriangleObj =
@@ -726,29 +819,13 @@ void write_file(const std::filesystem::path &path, std::string_view bytes) {
   }
 }
 
-/// Emulates the collision model: the first read of each URI below the scene
-/// descriptor pins its digest; later queries return the pinned digest.
-[[nodiscard]] std::function<Result<std::string>(const std::string &)>
-pinned_scene_mesh_digests(const int scene_root_fd) {
-  auto pinned = std::make_shared<std::map<std::string, std::string>>();
-  return [scene_root_fd, pinned](const std::string &uri) {
-    if (const auto found = pinned->find(uri); found != pinned->end()) {
-      return Result<std::string>::Ok(found->second);
-    }
-    std::string error;
-    const auto opened =
-        collision::OpenedSceneMesh::open(scene_root_fd, uri, error);
-    if (!opened.has_value()) {
-      return Result<std::string>::Err(ErrorDTO{
-          "invalid_request", error, {{"reason", "scene_mesh_unavailable"}}});
-    }
-    pinned->emplace(uri, opened->content_digest());
-    return Result<std::string>::Ok(opened->content_digest());
-  };
+[[nodiscard]] std::string mesh_digest(std::string_view bytes) {
+  return manyforge::content_identity::sha256_digest(bytes);
 }
 
 [[nodiscard]] RoboPlanCandidateProjectionDTO
 scene_mesh_projection(const std::uint64_t revision, const std::string &uri,
+                      const std::optional<std::string> &content_digest,
                       const std::vector<Vector3DTO> &scales = {
                           Vector3DTO{1.0, 1.0, 1.0}}) {
   CollisionWorldBody body;
@@ -763,6 +840,7 @@ scene_mesh_projection(const std::uint64_t revision, const std::string &uri,
     geometry.geometry_kind = CollisionGeometryKind::kTriangleMesh;
     geometry.local_pose = identity_pose();
     geometry.source_uri = uri;
+    geometry.source_hash = content_digest;
     geometry.mesh_scale = scale;
     body.geometries.push_back(std::move(geometry));
   }
@@ -795,17 +873,18 @@ scene_mesh_projection(const std::uint64_t revision, const std::string &uri,
       std::move(world.value()), std::move(policy)};
 }
 
-/// A package root without examples/ and a separate scene root holding the
-/// relative scene mesh, below one per-test temporary parent.
+/// A package root and a separate scene content root (activation-root layout)
+/// holding the captured triangle mesh in its raw-artifact store, below one
+/// per-test temporary parent.
 struct SeparatedSceneRoots final {
   explicit SeparatedSceneRoots(const std::string &name)
       : parent(std::filesystem::temp_directory_path() /
                ("manyforge-" + name + "-" + std::to_string(::getpid()))),
-        package_root(parent / "package"), scene_root(parent / "scene") {
+        package_root(parent / "package"), content_root(parent / "content") {
     std::error_code ignored;
     std::filesystem::remove_all(parent, ignored);
     std::filesystem::create_directories(package_root);
-    write_file(scene_root / kSceneMeshUri, kTriangleObj);
+    store(kTriangleObj);
   }
   ~SeparatedSceneRoots() {
     std::error_code ignored;
@@ -814,64 +893,111 @@ struct SeparatedSceneRoots final {
   SeparatedSceneRoots(const SeparatedSceneRoots &) = delete;
   SeparatedSceneRoots &operator=(const SeparatedSceneRoots &) = delete;
 
+  /// Stores `bytes` under their digest and returns the digest.
+  std::string store(std::string_view bytes) const {
+    const auto digest = mesh_digest(bytes);
+    write_file(blob(digest), bytes);
+    return digest;
+  }
+  [[nodiscard]] std::filesystem::path blob(const std::string &digest) const {
+    return content_root / collision::scene_mesh_store_path(digest);
+  }
+
   std::filesystem::path parent;
   std::filesystem::path package_root;
-  std::filesystem::path scene_root;
+  std::filesystem::path content_root;
 };
 
 [[nodiscard]] ProcessContainedCandidateClientConfig
 scene_mesh_config(const std::filesystem::path &worker,
-                  const std::optional<int> scene_root_fd,
+                  const std::optional<int> content_root_fd,
                   const std::optional<int> package_root_fd = 6) {
   auto process_config = config(worker);
   process_config.require_retained_projection = true;
   process_config.retained_package_root_fd = package_root_fd;
-  process_config.scene_asset_root_fd = scene_root_fd;
-  if (scene_root_fd.has_value()) {
-    process_config.scene_mesh_content_digest =
-        pinned_scene_mesh_digests(*scene_root_fd);
-  }
+  process_config.scene_content_root_fd = content_root_fd;
   return process_config;
 }
 
 TEST(ProcessContainedCandidateClientTest,
-     RetainedWorkerResolvesWorkspaceRelativeSceneMeshUnderSceneAssetDescriptor) {
+     RetainedWorkerReadsSceneMeshByDigestBelowTheContentRootDescriptor) {
   auto fixture = make_fixture();
   SeparatedSceneRoots roots("worker-scene-root");
   ASSERT_FALSE(std::filesystem::exists(roots.package_root / "examples"));
   ScopedPackageRootDescriptor package_root(roots.package_root);
-  ScopedDirectoryDescriptor scene_root(roots.scene_root);
+  ScopedDirectoryDescriptor content_root(roots.content_root);
   ProcessContainedRoboPlanCandidateClient client(
       fixture.model, fixture.binding,
       RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
       scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
-                        scene_root.get()));
+                        content_root.get()));
   const std::vector<Vector3DTO> scales{Vector3DTO{1.0, 1.0, 1.0},
                                        Vector3DTO{1.0, 1.5, 1.15}};
+  const auto digest = mesh_digest(kTriangleObj);
 
   const auto selected = client.select_retained_projection(
-      scene_mesh_projection(1U, std::string(kSceneMeshUri), scales));
+      scene_mesh_projection(1U, std::string(kSceneMeshUri), digest, scales));
   ASSERT_TRUE(selected.ok()) << selected.error().message;
   const auto planned = client.compute(request(fixture));
   ASSERT_TRUE(planned.ok()) << planned.error().message;
 
-  // Rename the approved root and put a different tree at its old path. The
+  // An absolute URI follows the same rule: read by digest, never opened.
+  const auto absolute = client.select_retained_projection(scene_mesh_projection(
+      2U, std::string(kAbsoluteSceneMeshUri), digest, scales));
+  ASSERT_TRUE(absolute.ok()) << absolute.error().message;
+  const auto absolute_planned = client.compute(request(fixture));
+  ASSERT_TRUE(absolute_planned.ok()) << absolute_planned.error().message;
+
+  // Rename the content root and put an empty tree at its old path. The
   // descriptor still names the original directory and its exact bytes.
-  std::filesystem::rename(roots.scene_root, roots.parent / "scene-displaced");
-  write_file(roots.scene_root / kSceneMeshUri, kChangedTriangleObj);
+  std::filesystem::rename(roots.content_root,
+                          roots.parent / "content-displaced");
+  std::filesystem::create_directories(roots.content_root);
   const auto reselected = client.select_retained_projection(
-      scene_mesh_projection(2U, std::string(kSceneMeshUri), scales));
+      scene_mesh_projection(3U, std::string(kSceneMeshUri), digest, scales));
   ASSERT_TRUE(reselected.ok()) << reselected.error().message;
   const auto replanned = client.compute(request(fixture));
   ASSERT_TRUE(replanned.ok()) << replanned.error().message;
 }
 
 TEST(ProcessContainedCandidateClientTest,
-     RetainedWorkerRefusesSceneMeshesOutsideTheSceneAssetDescriptor) {
+     RetainedWorkerUsesTheNewDigestForTheSameUriWithoutAPin) {
+  auto fixture = make_fixture();
+  SeparatedSceneRoots roots("worker-scene-content");
+  const auto changed_digest = roots.store(kChangedTriangleObj);
+  ScopedPackageRootDescriptor package_root(roots.package_root);
+  ScopedDirectoryDescriptor content_root(roots.content_root);
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
+                        content_root.get()));
+
+  ASSERT_TRUE(client
+                  .select_retained_projection(scene_mesh_projection(
+                      1U, std::string(kSceneMeshUri),
+                      mesh_digest(kTriangleObj)))
+                  .ok());
+  const auto first = client.compute(request(fixture));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+
+  // Same URI captured again with other bytes (a re-Apply): the next worker
+  // generation loads the new content; nothing is pinned per URI.
+  ASSERT_TRUE(client
+                  .select_retained_projection(scene_mesh_projection(
+                      2U, std::string(kSceneMeshUri), changed_digest))
+                  .ok());
+  const auto second = client.compute(request(fixture));
+  ASSERT_TRUE(second.ok()) << second.error().message;
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RetainedWorkerRefusesUnavailableOrMismatchedSceneMeshContent) {
   auto fixture = make_fixture();
   SeparatedSceneRoots roots("worker-scene-refusals");
   ScopedPackageRootDescriptor package_root(roots.package_root);
-  ScopedDirectoryDescriptor scene_root(roots.scene_root);
+  ScopedDirectoryDescriptor content_root(roots.content_root);
+  const auto digest = mesh_digest(kTriangleObj);
   const auto refused = [](const Result<void> &result,
                           std::string_view message) {
     ASSERT_FALSE(result.ok());
@@ -880,119 +1006,69 @@ TEST(ProcessContainedCandidateClientTest,
     EXPECT_NE(result.error().message.find(message), std::string::npos)
         << result.error().message;
   };
+  const auto worker_refused = [&](ProcessContainedRoboPlanCandidateClient &client,
+                                  const RoboPlanCandidateProjectionDTO &selected) {
+    ASSERT_TRUE(client.select_retained_projection(selected).ok());
+    const auto planned = client.compute(request(fixture));
+    ASSERT_FALSE(planned.ok());
+    // The worker's own refusal arrives typed, naming the mesh.
+    EXPECT_EQ(planned.error().code,
+              std::string(to_string(ErrorCode::kPlanningFailed)));
+    EXPECT_EQ(planned.error().details.at("reason"), "scene_mesh_unavailable");
+    EXPECT_NE(planned.error().details.at("detail").find(kSceneMeshUri),
+              std::string::npos)
+        << planned.error().details.at("detail");
+  };
 
   {
-    // No scene descriptor: the existing fail-closed error, even though the
-    // package root descriptor is configured.
+    // No content root descriptor: fail closed, even though the package root
+    // descriptor is configured.
     ProcessContainedRoboPlanCandidateClient unconfigured(
         fixture.model, fixture.binding,
         RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
         scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
                           std::nullopt));
     refused(unconfigured.select_retained_projection(scene_mesh_projection(
-                1U, std::string(kSceneMeshUri))),
-            "has no exact staged asset path");
-  }
-
-  const auto meshes = roots.scene_root / "examples/x/meshes";
-  std::filesystem::create_directory_symlink(meshes.parent_path(),
-                                            roots.scene_root / "examples/link");
-  std::filesystem::create_symlink(meshes / "a.obj", meshes / "leaf.obj");
-  write_file(roots.package_root / "examples/x/meshes/package-only.obj",
-             kTriangleObj);
-  {
-    const std::filesystem::path oversized = meshes / "oversized.obj";
-    write_file(oversized, kTriangleObj);
-    std::filesystem::resize_file(oversized,
-                                 collision::kMaximumSceneMeshBytes + 1U);
+                1U, std::string(kSceneMeshUri), digest)),
+            "has no scene content root");
   }
 
   ProcessContainedRoboPlanCandidateClient client(
       fixture.model, fixture.binding,
       RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
       scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
-                        scene_root.get()));
-  refused(client.select_retained_projection(
-              scene_mesh_projection(1U, "../scene/" + std::string(kSceneMeshUri))),
-          "asset path is invalid");
-  refused(client.select_retained_projection(
-              scene_mesh_projection(2U, "examples/link/meshes/a.obj")),
-          "scene mesh is unavailable");
-  refused(client.select_retained_projection(
-              scene_mesh_projection(3U, "examples/x/meshes/leaf.obj")),
-          "scene mesh is unavailable");
-  refused(client.select_retained_projection(
-              scene_mesh_projection(4U, "examples/x/meshes/oversized.obj")),
-          "byte bound");
-  refused(client.select_retained_projection(
-              scene_mesh_projection(5U, "examples/x/meshes/package-only.obj")),
-          "scene mesh is unavailable");
+                        content_root.get()));
+  // A scene mesh without its captured digest never reaches the worker.
+  refused(client.select_retained_projection(scene_mesh_projection(
+              2U, std::string(kSceneMeshUri), std::nullopt)),
+          "has no captured content digest");
 
-  // The worker re-walks below its own descriptor: a leaf replaced by a
-  // symlink after the digest was pinned is still refused.
-  const auto selected = client.select_retained_projection(
-      scene_mesh_projection(6U, std::string(kSceneMeshUri)));
-  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  // A digest whose blob is missing from the store.
+  worker_refused(client, scene_mesh_projection(3U, std::string(kSceneMeshUri),
+                                               mesh_digest(kChangedTriangleObj)));
+  // A blob whose bytes do not match its digest.
+  const auto forged = mesh_digest("not the stored bytes");
+  write_file(roots.blob(forged), kTriangleObj);
+  worker_refused(client,
+                 scene_mesh_projection(4U, std::string(kSceneMeshUri), forged));
+
+  // A worker walks below its own descriptor: a blob replaced by a symlink is
+  // refused by a worker that has to load it.
+  ASSERT_TRUE(client
+                  .select_retained_projection(scene_mesh_projection(
+                      5U, std::string(kSceneMeshUri), digest))
+                  .ok());
   ASSERT_TRUE(client.compute(request(fixture)).ok());
-  std::filesystem::rename(meshes / "a.obj", meshes / "a-original.obj");
-  std::filesystem::create_symlink(meshes / "a-original.obj", meshes / "a.obj");
-  ASSERT_TRUE(client
-                  .select_retained_projection(
-                      scene_mesh_projection(7U, std::string(kSceneMeshUri)))
-                  .ok());
-  const auto symlinked = client.compute(request(fixture));
-  ASSERT_FALSE(symlinked.ok());
-  EXPECT_EQ(symlinked.error().details.at("reason"),
-            "native_planner_worker_protocol_failure");
-}
-
-TEST(ProcessContainedCandidateClientTest,
-     RetainedWorkerRefusesSceneMeshContentChangedAfterFirstLoad) {
-  auto fixture = make_fixture();
-  SeparatedSceneRoots roots("worker-scene-content");
-  ScopedPackageRootDescriptor package_root(roots.package_root);
-  ScopedDirectoryDescriptor scene_root(roots.scene_root);
-  ProcessContainedRoboPlanCandidateClient client(
+  const auto blob = roots.blob(digest);
+  std::filesystem::rename(blob, roots.parent / "original.blob");
+  std::filesystem::create_symlink(roots.parent / "original.blob", blob);
+  ProcessContainedRoboPlanCandidateClient fresh(
       fixture.model, fixture.binding,
       RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
       scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
-                        scene_root.get()));
-
-  ASSERT_TRUE(client
-                  .select_retained_projection(
-                      scene_mesh_projection(1U, std::string(kSceneMeshUri)))
-                  .ok());
-  const auto first = client.compute(request(fixture));
-  ASSERT_TRUE(first.ok()) << first.error().message;
-
-  // Same path, different bytes: the worker generation for the next
-  // projection hashes what it loads and refuses the pinned-digest mismatch.
-  write_file(roots.scene_root / kSceneMeshUri, kChangedTriangleObj);
-  ASSERT_TRUE(client
-                  .select_retained_projection(
-                      scene_mesh_projection(2U, std::string(kSceneMeshUri)))
-                  .ok());
-  const auto changed = client.compute(request(fixture));
-  ASSERT_FALSE(changed.ok());
-  EXPECT_EQ(changed.error().details.at("reason"), "scene_mesh_content_changed");
-
-  // A digest source that itself observed changed bytes refuses selection
-  // with the same reason.
-  auto process_config = scene_mesh_config(
-      MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH, scene_root.get());
-  process_config.scene_mesh_content_digest = [](const std::string &) {
-    return Result<std::string>::Err(ErrorDTO{
-        "invalid_request", "scene_mesh_content_changed: bytes differ",
-        {{"reason", "scene_mesh_content_changed"}}});
-  };
-  ProcessContainedRoboPlanCandidateClient refusing(
-      fixture.model, fixture.binding,
-      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
-      std::move(process_config));
-  const auto refused = refusing.select_retained_projection(
-      scene_mesh_projection(1U, std::string(kSceneMeshUri)));
-  ASSERT_FALSE(refused.ok());
-  EXPECT_EQ(refused.error().details.at("reason"), "scene_mesh_content_changed");
+                        content_root.get()));
+  worker_refused(fresh,
+                 scene_mesh_projection(6U, std::string(kSceneMeshUri), digest));
 }
 
 TEST(ProcessContainedCandidateClientTest,
@@ -1001,22 +1077,23 @@ TEST(ProcessContainedCandidateClientTest,
   SeparatedSceneRoots roots("worker-fd-alt");
   ScopedPackageRootDescriptor package_root(roots.package_root);
   ScopedDuplicatePackageRootDescriptor alternate_package_root(6);
-  ScopedDirectoryDescriptor opened_scene_root(roots.scene_root);
-  ScopedDuplicatePackageRootDescriptor alternate_scene_root(
-      opened_scene_root.get());
+  ScopedDirectoryDescriptor opened_content_root(roots.content_root);
+  ScopedDuplicatePackageRootDescriptor alternate_content_root(
+      opened_content_root.get());
 
   ProcessContainedRoboPlanCandidateClient client(
       fixture.model, fixture.binding,
       RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
       scene_mesh_config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH,
-                        alternate_scene_root.get(),
+                        alternate_content_root.get(),
                         alternate_package_root.get()));
   ASSERT_TRUE(client
-                  .select_retained_projection(
-                      scene_mesh_projection(1U, std::string(kSceneMeshUri)))
+                  .select_retained_projection(scene_mesh_projection(
+                      1U, std::string(kSceneMeshUri), mesh_digest(kTriangleObj)))
                   .ok());
-  std::filesystem::rename(roots.scene_root, roots.parent / "scene-displaced");
-  ASSERT_TRUE(std::filesystem::create_directory(roots.scene_root));
+  std::filesystem::rename(roots.content_root,
+                          roots.parent / "content-displaced");
+  ASSERT_TRUE(std::filesystem::create_directory(roots.content_root));
   const auto planned = client.compute(request(fixture));
   ASSERT_TRUE(planned.ok()) << planned.error().message;
 }
@@ -1173,7 +1250,7 @@ TEST(ProcessContainedCandidateClientTest,
   auto projected = replacement;
   projected.geometries.push_back(RoboPlanWorkerGeometryDTO{
       "projected", "base", BoxShapeDTO{{0.1, 0.1, 0.1}}, identity_pose(),
-      std::nullopt, std::nullopt});
+      std::nullopt});
   const auto rejected = client.replace_retained_model(projected);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"),
@@ -1490,8 +1567,13 @@ make_contact_fixture(const std::filesystem::path &root) {
   return fixture;
 }
 
+/// A world with a finger, a palm and one object, and a policy with the named
+/// end-window contact rule (`finger-contact` or `palm-contact` against
+/// `probe-object`; any other name: no rule). Without a name the policy has
+/// the finger rule but the projection does not allow end-window contact
+/// pairs, as for IK.
 [[nodiscard]] RoboPlanCandidateProjectionDTO
-contact_projection(const std::optional<std::string> &active_policy,
+contact_projection(const std::optional<std::string> &active_rule,
                    const std::string &object_id = "probe-object",
                    const bool at_palm = false,
                    const bool include_second_object = false) {
@@ -1527,16 +1609,15 @@ contact_projection(const std::optional<std::string> &active_policy,
   auto policy = std::make_shared<CollisionPolicySnapshot>();
   policy->policy_id = "operation-contact-projection";
   policy->revision = CollisionPolicyRevision{1U, std::string(kDigestZero)};
-  policy->contact_grasps = {{"finger-contact",
-                             "probe-object",
-                             {robot_body("finger").body_id},
-                             0.001,
-                             0.8},
-                            {"palm-contact",
-                             "probe-object",
-                             {robot_body("palm").body_id},
-                             0.001,
-                             0.8}};
+  const std::string rule = active_rule.value_or("finger-contact");
+  if (object_id == "probe-object" &&
+      (rule == "finger-contact" || rule == "palm-contact")) {
+    policy->contact_rules = {CollisionPairContactRule{
+        CollisionPairId{
+            robot_body(rule == "finger-contact" ? "finger" : "palm").body_id,
+            object_body("probe-object").body_id},
+        rule, CollisionContactRule{0.001, 0.8, std::nullopt}}};
+  }
   auto builder =
       CollisionWorldSnapshotBuilder()
           .set_publisher_id("operation-contact-test")
@@ -1551,7 +1632,7 @@ contact_projection(const std::optional<std::string> &active_policy,
   if (!world.ok())
     throw std::runtime_error(world.error().message);
   return {projection().projection_binding, std::move(world.value()),
-          std::move(policy), active_policy};
+          std::move(policy), active_rule.has_value()};
 }
 
 TEST(ProcessContainedCandidateClientTest,
@@ -1577,40 +1658,99 @@ TEST(ProcessContainedCandidateClientTest,
   EXPECT_EQ(result.value().waypoints.back().positions_rad,
             values(fixture.goal));
 
-  // Same world/policy identity: only the operation selector changes. A cached
-  // contact allowance must not leak to another policy or an ordinary request.
+  // Same world/policy identity: only the move's contact rules change. A
+  // cached contact allowance must not leak to another rule, a move without
+  // one, or a request that does not allow end-window contact pairs.
   for (const auto &id : {std::optional<std::string>("palm-contact"),
-                         std::optional<std::string>("absent-policy"),
+                         std::optional<std::string>("absent-rule"),
                          std::optional<std::string>{}}) {
-    selected.contact_policy_id = id;
+    selected = contact_projection(id);
     ASSERT_TRUE(client.select_retained_projection(selected).ok());
     const auto strict = client.compute(request(fixture));
-    ASSERT_FALSE(strict.ok()) << "selector=" << id.value_or("<none>");
+    ASSERT_FALSE(strict.ok()) << "rule=" << id.value_or("<none>");
     EXPECT_EQ(strict.error().details.at("reason"),
               "native_goal_state_collision");
   }
-  selected.contact_policy_id = "finger-contact";
+  selected = contact_projection("finger-contact");
   ASSERT_TRUE(client.select_retained_projection(selected).ok());
   result = client.compute(request(fixture));
   ASSERT_TRUE(result.ok()) << result.error().message;
 }
 
-/// This process's live child PIDs (the spawned workers).
+/// This process's live child PIDs (the spawned workers): every process whose
+/// `/proc/<pid>/status` names this process as `PPid`. Unlike
+/// `/proc/self/task/*/children`, this needs no CONFIG_PROC_CHILDREN.
 [[nodiscard]] std::set<pid_t> child_pids() {
+  const auto self = std::to_string(::getpid());
   std::set<pid_t> pids;
-  for (const auto &task :
-       std::filesystem::directory_iterator("/proc/self/task")) {
-    std::ifstream children(task.path() / "children");
-    pid_t pid = 0;
-    while (children >> pid) {
-      pids.insert(pid);
+  std::error_code error;
+  for (std::filesystem::directory_iterator entry("/proc", error), end;
+       !error && entry != end; entry.increment(error)) {
+    const auto name = entry->path().filename().string();
+    if (name.empty() ||
+        !std::all_of(name.begin(), name.end(),
+                     [](const char c) { return c >= '0' && c <= '9'; })) {
+      continue;
+    }
+    std::ifstream status(entry->path() / "status");
+    for (std::string line; std::getline(status, line);) {
+      if (line.rfind("PPid:", 0) == 0) {
+        std::istringstream fields(line.substr(5));
+        std::string parent;
+        fields >> parent;
+        if (parent == self) {
+          pids.insert(static_cast<pid_t>(std::stol(name)));
+        }
+        break;
+      }
     }
   }
   return pids;
 }
 
 TEST(ProcessContainedCandidateClientTest,
-     RealWorkerContactPolicyChangesKeepTheWorkerAndMatchAFreshWorker) {
+     RetainedWorkerIsReusedForTheSameSceneMeshContentAndRestartedForNew) {
+  // The fake worker records each start with the scene mesh digests it was
+  // initialized with (not every kernel has /proc/<pid>/task/*/children).
+  auto fixture = make_fixture();
+  const auto starts =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-worker-scene-mesh-starts-" + std::to_string(::getpid()));
+  std::error_code ignored;
+  std::filesystem::remove(starts, ignored);
+  fixture.model.native_scene_name = "record-mesh-starts:" + starts.string();
+  SeparatedSceneRoots roots("worker-scene-reuse");
+  const auto changed_digest = roots.store(kChangedTriangleObj);
+  ScopedPackageRootDescriptor package_root(roots.package_root);
+  ScopedDirectoryDescriptor content_root(roots.content_root);
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01},
+      scene_mesh_config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH,
+                        content_root.get()));
+  const auto plan = [&](std::uint64_t revision, const std::string &digest) {
+    EXPECT_TRUE(client
+                    .select_retained_projection(scene_mesh_projection(
+                        revision, std::string(kSceneMeshUri), digest))
+                    .ok());
+    const auto planned = client.compute(request(fixture));
+    EXPECT_TRUE(planned.ok()) << planned.error().message;
+    std::ifstream input(starts);
+    return std::string(std::istreambuf_iterator<char>(input), {});
+  };
+  const auto digest = mesh_digest(kTriangleObj);
+  // The first plan starts a worker initialized with the mesh's digest.
+  EXPECT_EQ(plan(1U, digest), digest + " \n");
+  // A new revision with the same mesh content keeps the running worker.
+  EXPECT_EQ(plan(2U, digest), digest + " \n");
+  // New content under the same URI starts a worker that loads it.
+  EXPECT_EQ(plan(3U, changed_digest), digest + " \n" + changed_digest + " \n");
+  EXPECT_EQ(plan(4U, changed_digest), digest + " \n" + changed_digest + " \n");
+  std::filesystem::remove(starts, ignored);
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RealWorkerContactRuleChangesKeepTheWorkerAndMatchAFreshWorker) {
   SeparatedSceneRoots roots("contact-reuse");
   auto fixture = make_contact_fixture(roots.package_root);
   auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
@@ -1624,15 +1764,17 @@ TEST(ProcessContainedCandidateClientTest,
                          std::optional<std::string>("palm-contact"),
                          std::optional<std::string>{},
                          std::optional<std::string>("finger-contact"),
-                         std::optional<std::string>("absent-policy"),
+                         std::optional<std::string>("absent-rule"),
                          std::optional<std::string>("palm-contact")}) {
-    SCOPED_TRACE("selector=" + id.value_or("<none>"));
+    SCOPED_TRACE("rule=" + id.value_or("<none>"));
     const auto selected = contact_projection(id);
     ASSERT_TRUE(reused.select_retained_projection(selected).ok());
     const auto result = reused.compute(request(fixture));
-    // Every policy change after the first plan keeps the same worker.
+    // Every rule change after the first plan keeps the same worker.
     if (!workers) {
       workers = child_pids();
+      // One running worker: the comparison below proves it stays the same.
+      ASSERT_EQ(workers->size(), 1U);
     }
     EXPECT_EQ(child_pids(), *workers);
 
@@ -1675,10 +1817,10 @@ TEST(ProcessContainedCandidateClientTest,
         EXPECT_EQ(strict.error().details.at("reason"),
                   "native_goal_state_collision");
       };
-  // Same policy and object, but collision belongs to the unlisted palm.
+  // Same rule and object, but collision belongs to the unlisted palm.
   assert_goal_collision(
       contact_projection("finger-contact", "probe-object", true));
-  // Similar object ID is not the selected runtime object.
+  // A similar object ID is not the rule's object.
   assert_goal_collision(
       contact_projection("finger-contact", "probe-object-extra"));
   // Allowing the selected object's pair does not allow another contacting one.

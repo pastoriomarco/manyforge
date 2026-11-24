@@ -198,7 +198,7 @@ class _ScopePort:
 
     def execution_scope(self, program_run_id: int) -> Mapping[str, Any]:
         return {
-            "schema_version": "manyforge.program_execution_scope.v3",
+            "schema_version": "manyforge.program_execution_scope.v4",
             "claim_generation": 1,
             "program_run_id": program_run_id,
             "hold_revision": self.hold_revision,
@@ -209,6 +209,7 @@ class _ScopePort:
             "selection_release_block_reason": None,
             "stopped_by": None,
             "rule_id": None,
+            "program_held_nodes": [],
             "frozen": "none",
             "frozen_by": None,
             "all_groups_held": False,
@@ -292,7 +293,6 @@ def _held_run():
         graph_revision=_DIGEST_C,
         program_binding={
             "program_binding_id": _DIGEST_A,
-            "program_id": program.program_id,
             "program_revision": program.program_revision,
             "retained_bundle_id": _DIGEST_B,
             "graph_revision": _DIGEST_C,
@@ -332,7 +332,7 @@ def _held_run():
             ],
             "collision_body_bindings": [],
             "signal_bindings": [],
-            "contact_grasp_bindings": [],
+            "collision_rule_bodies": [],
         },
         readiness=readiness,
         owner_identities=(
@@ -374,7 +374,6 @@ def _request(owner, run_id, held, **changes) -> ProgramNodeCorrectionPreviewRequ
         "schema_version": "manyforge.program_node_correction_preview_request.v2",
         "request_key": _key("node-preview.1"),
         "program_run_id": run_id,
-        "program_id": capture.program_id,
         "program_revision": capture.program_revision,
         "program_binding_id": capture.program_binding_id,
         "node_instance_id": _NODE,
@@ -486,7 +485,7 @@ def test_held_run_preview_is_the_execution_request_and_has_no_effects() -> None:
 @pytest.mark.parametrize(
     ("changes", "code"),
     [
-        ({"program_id": "another_program"}, "program_node_preview_identity_stale"),
+        ({"program_revision": "sha256:" + "f" * 64}, "program_node_preview_identity_stale"),
         ({"node_attempt_id": 999}, "program_node_preview_attempt_stale"),
         ({"node_instance_id": "remove_table"}, "program_node_preview_attempt_stale"),
         (
@@ -514,6 +513,25 @@ def test_held_run_preview_is_the_execution_request_and_has_no_effects() -> None:
                 "proposed_inputs": [
                     {"path": "goal", "value": _NEW_GOAL},
                     {"path": "goal[0].position_rad", "value": 0.1},
+                ]
+            },
+            "program_node_preview_input_invalid",
+        ),
+        (
+            # Of a collision rule only a row's clearance can be proposed.
+            {
+                "proposed_inputs": [
+                    {
+                        "path": "collision_rules",
+                        "value": [
+                            {
+                                "rule_id": "tip_on_objects",
+                                "a": [{"kind": "active_tcp_contact_bodies"}],
+                                "b": [{"kind": "scene_objects"}],
+                                "contact": {},
+                            }
+                        ],
+                    }
                 ]
             },
             "program_node_preview_input_invalid",

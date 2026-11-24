@@ -242,7 +242,7 @@ RuntimeProgramTargetBinding resolve_runtime_program_target(
   }
 
   return RuntimeProgramTargetBinding(
-      binding_value.program_id, binding_value.program_revision,
+      binding_value.program_revision,
       binding_value.program_binding_id, binding_value.retained_bundle_id,
       binding_value.graph_revision, component_binding, target_binding,
       std::move(frames), binding_value.frame_bindings, std::move(bodies),
@@ -250,7 +250,7 @@ RuntimeProgramTargetBinding resolve_runtime_program_target(
       component, *model_target, std::move(control_binding),
       std::move(control_domain), std::move(desired_configuration),
       std::move(desired_route), std::move(coordinate_map),
-      std::move(provider_binding), binding_value.contact_grasp_bindings);
+      std::move(provider_binding), binding_value.collision_rule_bodies);
 }
 
 core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
@@ -465,8 +465,7 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
   std::vector<core::RuntimeCapabilityProviderPathDTO> supporting_paths;
   supporting_paths.reserve(supporting_capabilities.size());
   for (const auto &supporting : supporting_capabilities) {
-    if (supporting.program_id() != target.program_id() ||
-        supporting.program_revision() != target.program_revision() ||
+    if (supporting.program_revision() != target.program_revision() ||
         supporting.program_binding_id() != target.program_binding_id() ||
         supporting.retained_bundle_id() != target.retained_bundle_id() ||
         supporting.graph_revision() != target.graph_revision() ||
@@ -548,7 +547,6 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
   }
 
   return core::RuntimeParticipantBindingDTO{
-      target.program_id(),
       target.program_revision(),
       target.program_binding_id(),
       target.retained_bundle_id(),
@@ -569,7 +567,7 @@ core::RuntimeParticipantBindingDTO build_runtime_participant_binding_dto(
       std::move(provider_path),
       std::move(supporting_paths),
       std::move(runtime_epochs),
-      target.contact_grasp_bindings(),
+      target.collision_rule_bodies(),
       std::nullopt,
       target.program_frame_bindings(),
       target.program_collision_body_bindings(),

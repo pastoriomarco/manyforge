@@ -100,9 +100,9 @@ protected:
   }
   void BindProgram() {
     auto value = d::parse_strict_json_model_yaml(R"({
-      "api_version":"manyforge.program.v3","program_id":"catalog_projection",
+      "api_version":"manyforge.program.v4",
       "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "program_profile":"composable-cell-v1","name":"Catalog projection fixture",
+      "program_profile":"composable-cell-v1",
       "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
         "blackboard":{"namespaces":[],"keys":[{"key":"ready","type":"bool",
         "access":"read_write","persistence":"run","initial":false}]},
@@ -115,7 +115,7 @@ protected:
     value = d::normalize_program_authoring(value);
     value = replace(value, "program_revision",
                     V(d::detail::compute_content_identity(
-                        value, {"program-revision", "manyforge.program.v3",
+                        value, {"program-revision", "manyforge.program.v4",
                                 "program_revision"})));
     if (bundle->value().compiled_products.symbol_role_maps.size() != 1U)
       throw std::logic_error("genuine sole retained model-map product missing");
@@ -246,7 +246,7 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
   const auto &identity = fixture.binding->value();
   const c::ProgramRunExecutionCaptureDTO request{
       c::CellAdmissionClaimGeneration(1U), c::ProgramRunNumber(139U),
-      identity.program_id, identity.program_revision, identity.program_binding_id,
+      identity.program_revision, identity.program_binding_id,
       identity.retained_bundle_id, identity.graph_revision, {}};
   const auto captured = resolver.ResolveProgramCapture(request);
   ASSERT_TRUE(captured.ok()) << captured.error().message;
@@ -489,7 +489,7 @@ c::OperationIntentDTO JointMove(const c::RuntimeParticipantBinding &physical,
   std::vector<double> goal(joints.size(), 0.0);
   return c::OperationIntentDTO{
       c::PublicRequestContextDTO{c::TestRequestKey("request.tcp.fixture"), "tcp_fixture"},
-      value.program_id, value.program_revision, value.program_binding_id,
+      value.program_revision, value.program_binding_id,
       c::ProgramRunNumber(113U), value.graph_revision, value.retained_bundle_id,
       std::nullopt,
       {c::OperationParticipantIntentDTO{
@@ -501,7 +501,7 @@ c::OperationIntentDTO JointMove(const c::RuntimeParticipantBinding &physical,
               c::TolerancesDTO{1.0e-4, 5.0e-3, 1.0e-2}, c::SpeedProfileDTO{0.5, 0.5, std::nullopt},
               c::TimeoutsDTO{3.0, 5.0}, c::CacheMode::kDefault, c::PlannerOverrideDTO{},
               c::MotionTargetModeDTO::kAbsolute, std::nullopt, std::nullopt,
-              c::JointGoalDTO{std::move(joints), std::move(goal)}, std::nullopt, {}, {}}}},
+              c::JointGoalDTO{std::move(joints), std::move(goal)}, {}, {}}}},
       c::OperationCoordinationPolicy::kIndependent};
 }
 

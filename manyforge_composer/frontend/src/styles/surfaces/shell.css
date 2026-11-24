@@ -499,8 +499,9 @@
   transform: translateY(-50%);
 }
 
+/* Clears the Program attention badge that overhangs its button. */
 .document-state-letters.left {
-  right: calc(100% + 0.6rem);
+  right: calc(100% + 1rem);
 }
 
 /* Clears the Deployment health dot that overhangs its button. */
@@ -833,6 +834,32 @@
   pointer-events: auto;
 }
 
+/* Notifications over the 3D viewer are semi-transparent too (maintainer, 2026-11-24). */
+.workbench-notification-stack .runtime-observability-surface {
+  background: color-mix(in srgb, var(--mf-bg-neutral-08) var(--mf-viewer-overlay-fill), transparent);
+  backdrop-filter: blur(0.35rem);
+}
+
+.workbench-notification-stack .notification-rail {
+  background: color-mix(in srgb, var(--mf-bg-neutral-12) var(--mf-viewer-overlay-fill), transparent);
+}
+
+.workbench-notification-stack .runtime-observability-surface.has-attention.attention-error .runtime-observability-rail {
+  background: color-mix(in srgb, var(--mf-bg-danger-13) var(--mf-viewer-overlay-fill), transparent);
+}
+
+.workbench-notification-stack .workbench-notice.severity-info {
+  background: color-mix(in srgb, var(--mf-bg-neutral-15) var(--mf-viewer-overlay-fill), transparent);
+}
+
+.workbench-notification-stack .workbench-notice.severity-warning {
+  background: color-mix(in srgb, var(--mf-bg-warning-13) var(--mf-viewer-overlay-fill), transparent);
+}
+
+.workbench-notification-stack .workbench-notice.severity-error {
+  background: color-mix(in srgb, var(--mf-bg-danger-16) var(--mf-viewer-overlay-fill), transparent);
+}
+
 .workbench-notification-stack > .runtime-observability-surface {
   position: static;
   width: auto;
@@ -877,6 +904,20 @@
 
 .workbench-notice-row.severity-info .notification-rail-summary {
   color: var(--mf-text-neutral-81);
+}
+
+/* Lines a notice keeps in view while it exists (the Program's active waits). */
+.workbench-notice-lines {
+  display: grid;
+  gap: 0.15rem;
+  max-height: 9rem;
+  margin: 0;
+  overflow-y: auto;
+  padding: 0.35rem 0.6rem 0.45rem 1.6rem;
+  border-top: 1px solid var(--mf-border-neutral-23);
+  color: var(--mf-text-neutral-81);
+  font-size: var(--mf-font-size-072);
+  overflow-wrap: anywhere;
 }
 
 .workbench-notice-list {

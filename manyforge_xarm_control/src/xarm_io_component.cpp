@@ -25,7 +25,6 @@ namespace manyforge::xarm_control {
 using core::ActionOutcome;
 using core::ComponentAction;
 using core::ComponentLifecycle;
-using core::IoSignalSampleSource;
 
 namespace {
 
@@ -41,6 +40,17 @@ constexpr std::string_view kStreamId = "io_states";
                                                std::optional<std::string> vendor = std::nullopt) {
   return {outcome, core::ActionError{std::move(code), std::move(message), std::move(vendor),
                                      std::nullopt}};
+}
+
+[[nodiscard]] std::vector<roboplan_backend::IoBankSignal>
+bank_signals(const std::vector<XArmIoSignal> &signals) {
+  std::vector<roboplan_backend::IoBankSignal> bank;
+  for (const auto &signal : signals) {
+    if (signal.pin < 0 || signal.pin > 15)
+      throw std::invalid_argument("an xArm I/O pin is a bit of a 16-bit word: " + signal.name);
+    bank.push_back({signal.name, signal.direction, signal.pin});
+  }
+  return bank;
 }
 
 [[nodiscard]] core::ActionResult action_result(const ComponentAction action,
@@ -70,30 +80,18 @@ XArmIoComponent::XArmIoComponent(XArmIoComponentConfig config,
                                  core::IClock &clock, std::function<bool()> owner_arming)
     : config_(std::move(config)),
       confirmation_bound_ns_(xarm_io_confirmation_bound_ns(config_.settings)),
-      stale_after_ns_(xarm_io_stale_after_ns(config_.settings)),
       driver_(std::move(driver)), owner_usable_(std::move(owner_usable)), clock_(clock),
-      owner_arming_(std::move(owner_arming)), tracks_(config_.signals.size()) {
+      owner_arming_(std::move(owner_arming)),
+      tracker_(config_.component_id, bank_signals(config_.signals),
+               xarm_io_stale_after_ns(config_.settings)) {
   if (!driver_ || !owner_usable_) throw std::invalid_argument("the xArm I/O needs its owner");
   if (!(config_.settings.rate_hz > 0.0) || !(config_.settings.tgpio_monitor_frequency_hz > 0.0))
     throw std::invalid_argument("the xArm I/O stream settings must be positive");
-  for (const auto &signal : config_.signals) {
-    if (signal.pin < 0 || signal.pin > 15)
-      throw std::invalid_argument("an xArm I/O pin is a bit of a 16-bit word: " + signal.name);
-  }
 }
 
 const XArmIoSignal *XArmIoComponent::Find(const std::string &name) const {
-  const auto found = std::find_if(config_.signals.begin(), config_.signals.end(),
-                                  [&](const auto &signal) { return signal.name == name; });
-  return found == config_.signals.end() ? nullptr : &*found;
-}
-
-core::IoSignalId XArmIoComponent::Id(const XArmIoSignal &signal) const {
-  return {core::ControllableComponentId(config_.component_id), signal.name};
-}
-
-bool XArmIoComponent::StreamFresh(const std::int64_t now_ns) const {
-  return last_sample_at_ns_ && now_ns - *last_sample_at_ns_ <= stale_after_ns_;
+  const auto found = tracker_.Find(name);
+  return found ? &config_.signals[*found] : nullptr;
 }
 
 bool XArmIoComponent::OwnedLocked(const XArmIoSignal &signal) const {
@@ -112,48 +110,8 @@ std::vector<core::IoSignalUpdateDTO> XArmIoComponent::OnIoStates(const XArmIoSta
   const bool tool = config_.bank == XArmIoBank::kTool;
   const auto inputs = tool ? sample.tgpio_digital_inputs : sample.cgpio_digital_inputs;
   const auto outputs = tool ? sample.tgpio_digital_outputs : sample.cgpio_digital_outputs;
-  std::vector<core::IoSignalUpdateDTO> updates;
   std::lock_guard lock(mutex_);
-  last_sample_at_ns_ = sample.received_at_ns;
-  for (std::size_t index = 0U; index < config_.signals.size(); ++index) {
-    const auto &signal = config_.signals[index];
-    auto &track = tracks_[index];
-    const bool output = signal.direction == core::IoSignalDirection::kOutput;
-    const bool value = (((output ? outputs : inputs) >> signal.pin) & 1U) != 0U;
-    if (!output) {
-      track.reported = value;
-      track.source = IoSignalSampleSource::kDevice;
-    } else if (track.unknown) {
-      // A write with no answer: the stream reports whether it took effect.
-      if (value != track.reported) {
-        track.reported = value;
-        track.source = value == *track.unknown ? IoSignalSampleSource::kManyforgeWrite
-                                               : IoSignalSampleSource::kDevice;
-      }
-      track.unknown.reset();
-    } else if (track.pending) {
-      if (value == track.pending->value) {
-        // Our write seen: confirmed, nothing more happens.
-        track.pending.reset();
-      } else if (sample.received_at_ns > track.pending->deadline_ns) {
-        // Not seen within the bound: an outside write raced ours.
-        track.pending.reset();
-        track.reported = value;
-        track.source = IoSignalSampleSource::kOutside;
-      }
-      // Otherwise a sample still showing the old value: ignored.
-    } else if (!track.reported) {
-      track.reported = value;
-      track.source = IoSignalSampleSource::kDevice;
-    } else if (value != *track.reported && (!track.last_stream || value != *track.last_stream)) {
-      track.reported = value;
-      track.source = IoSignalSampleSource::kOutside;
-    }
-    if (output) track.last_stream = value;
-    updates.push_back({Id(signal), core::IoSampleValidity::kValid, track.reported, std::nullopt,
-                       track.source});
-  }
-  return updates;
+  return tracker_.OnSample(inputs, outputs, sample.received_at_ns, sample.received_at_ns);
 }
 
 void XArmIoComponent::OnGpioModuleStatus(const XArmGpioModuleStatus &status) {
@@ -162,17 +120,8 @@ void XArmIoComponent::OnGpioModuleStatus(const XArmGpioModuleStatus &status) {
 }
 
 std::vector<core::SignalSample> XArmIoComponent::Samples(const std::int64_t now_ns) const {
-  std::vector<core::SignalSample> samples;
   std::lock_guard lock(mutex_);
-  const bool fresh = StreamFresh(now_ns);
-  for (std::size_t index = 0U; index < config_.signals.size(); ++index) {
-    const auto &track = tracks_[index];
-    core::SignalSample sample{Id(config_.signals[index]), std::nullopt, track.source, 0, fresh};
-    if (track.reported) sample.value = *track.reported;
-    if (last_sample_at_ns_) sample.age_ns = now_ns - *last_sample_at_ns_;
-    samples.push_back(std::move(sample));
-  }
-  return samples;
+  return tracker_.Samples(now_ns);
 }
 
 core::ComponentState XArmIoComponent::State(const std::int64_t now_ns) const {
@@ -182,15 +131,14 @@ core::ComponentState XArmIoComponent::State(const std::int64_t now_ns) const {
   const bool owner_arming = owner_arming_ && owner_arming_();
   std::lock_guard lock(mutex_);
   core::ComponentStream stream{std::string(kStreamId), core::StreamFreshness::kNone, std::nullopt};
-  if (last_sample_at_ns_) {
+  if (const auto &last = tracker_.LastSampleAt()) {
     stream.freshness =
-        StreamFresh(now_ns) ? core::StreamFreshness::kFresh : core::StreamFreshness::kStale;
-    stream.age_ns = now_ns - *last_sample_at_ns_;
+        tracker_.Fresh(now_ns) ? core::StreamFreshness::kFresh : core::StreamFreshness::kStale;
+    stream.age_ns = now_ns - *last;
   }
   state.streams.push_back(stream);
   state.lifecycle = lifecycle_;
-  const bool unknown = std::any_of(tracks_.begin(), tracks_.end(),
-                                   [](const Track &track) { return track.unknown.has_value(); });
+  const bool unknown = tracker_.AnyUnknown();
   state.activity = writes_in_flight_ > 0 ? core::ComponentActivity::kBusy
                    : unknown             ? core::ComponentActivity::kUnknown
                                          : core::ComponentActivity::kIdle;
@@ -227,7 +175,7 @@ core::ActionResult XArmIoComponent::Run(const ComponentAction action, const std:
     const auto deadline = clock_.now() + config_.action_timeout.count();
     const auto fresh = [&] {
       std::lock_guard lock(mutex_);
-      return StreamFresh(clock_.now());
+      return tracker_.Fresh(clock_.now());
     };
     while (!fresh() && !stop.stop_requested() && clock_.now() < deadline) {
       if (config_.pause)
@@ -241,7 +189,7 @@ core::ActionResult XArmIoComponent::Run(const ComponentAction action, const std:
   case ComponentAction::kPrepare:
   case ComponentAction::kRecover:
   case ComponentAction::kEnable:
-    if (!StreamFresh(clock_.now()))
+    if (!tracker_.Fresh(clock_.now()))
       return action_result(action, ActionOutcome::kFailed,
                            core::ActionError{"fault_stream_stale",
                                              "the robot's I/O stream (xarm_io_states) isn't "
@@ -292,15 +240,12 @@ XArmIoComponent::SetOutput(const std::string_view name,
   const auto at = clock_.now();
   std::lock_guard lock(mutex_);
   --writes_in_flight_;
-  auto &track = tracks_[static_cast<std::size_t>(signal - config_.signals.data())];
+  const auto index = static_cast<std::size_t>(signal - config_.signals.data());
   // `ret=1`: a controller error is present and the write still takes effect;
   // the error is the owner's fault.
   if (call.outcome == XArmServiceCallOutcome::kSucceeded || call.vendor_return == 1) {
     // Trust the controller: the reported value is the written one at once.
-    track.reported = value;
-    track.source = IoSignalSampleSource::kManyforgeWrite;
-    track.pending = Pending{value, at + confirmation_bound_ns_};
-    track.unknown.reset();
+    tracker_.WriteAccepted(index, value, at + confirmation_bound_ns_);
     return {ActionOutcome::kSucceeded, std::nullopt};
   }
   if (call.outcome == XArmServiceCallOutcome::kNotSent)
@@ -312,8 +257,7 @@ XArmIoComponent::SetOutput(const std::string_view name,
     return write_failed("io_output_write_failed", "the robot controller refused the write",
                         ActionOutcome::kFailed, "ret=" + std::to_string(*call.vendor_return));
   // Sent, no answer: unknown until the stream reports, never replayed.
-  track.pending.reset();
-  track.unknown = value;
+  tracker_.WriteUnanswered(index, value);
   return write_failed(XArmCallUnanswered(call.reason)
                           ? std::string(kRobotControllerUnresponsiveCode)
                           : std::string("component_action_interrupted_by_stop"),

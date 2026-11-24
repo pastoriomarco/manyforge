@@ -1395,8 +1395,7 @@ ResourceAddressedExecutionKernel::bind_captured_node_io_rule(
         !program_cycle_claim_run_->capture->io_conditions)
       return Reply::Ok(std::move(registration));
     const auto& current = *program_cycle_claim_run_->capture;
-    if (current.program_id != operation.program_id ||
-        current.program_revision != operation.program_revision ||
+    if (current.program_revision != operation.program_revision ||
         current.program_binding_id != operation.program_binding_id ||
         current.retained_bundle_id != operation.expected_retained_bundle_id ||
         current.graph_revision != operation.expected_graph_revision)
@@ -1456,7 +1455,6 @@ ResourceAddressedExecutionKernel::bind_captured_node_io_rule(
       capability->control_binding->control_binding_id != control.control_binding_id ||
       capability->control_binding->control_binding_revision != control.control_binding_revision ||
       capture->program_binding_id != binding.program_binding_id ||
-      capture->program_id != binding.program_id ||
       capture->program_revision != binding.program_revision ||
       capture->retained_bundle_id != binding.retained_bundle_id ||
       capture->graph_revision != binding.graph_revision)

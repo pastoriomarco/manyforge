@@ -19,7 +19,6 @@ struct PreparedParticipantStopPlanContextDTO final {
   OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
-  ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
   std::optional<ProgramRunNumber> program_run_id;

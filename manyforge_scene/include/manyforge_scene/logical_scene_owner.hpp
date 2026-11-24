@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <manyforge_core/ports/iactive_bundle_publication_store.hpp>
 #include <manyforge_core/ports/imanager_scene_projection.hpp>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
@@ -23,35 +22,18 @@ class CanonicalEmptyRetainedBundleAdmission;
 class IVerifiedRetainedBundleSource;
 } // namespace manyforge::deployment
 
-namespace manyforge::persistence {
-class SqliteRecordWriter;
-} // namespace manyforge::persistence
-
 namespace manyforge::scene {
 
-inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
-    "manyforge.internal.logical-scene.i4.v2";
-inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
-inline constexpr std::string_view kLogicalSceneStoreSchemaId =
-    "manyforge.internal.logical-scene.r8f2.v12";
-/// v11: Scene requests are keyed by their 16-byte request key (contract 1.4);
-/// the request owner epoch is gone; the store holds no migration-result state
-/// (every start begins with a fresh store). A store of any other version is refused,
-/// never converted. v12: metadata `records_lost`, set by the record writer when
-/// records of this start were not written.
-inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 12;
-inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
-    1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;
-inline constexpr std::int64_t kMaximumSceneStoreDatabasePageImageBytes =
-    64LL * 1024LL * 1024LL;
-inline constexpr std::int64_t kMaximumSceneStoreWalBytes =
-    16LL * 1024LL * 1024LL;
 inline constexpr std::size_t kMaximumNativeProjectionBindings = 256U;
 inline constexpr std::size_t kMaximumMaintenanceInitializations = 256U;
 inline constexpr std::size_t kMaximumLogicalSceneTransactions = 256U;
-inline constexpr std::size_t kMaximumLogicalSceneTransactionBytes =
-    128U * 1024U;
+/// The largest Scene a Commit accepts, in bytes of its canonical encoding
+/// (EncodeLogicalSceneSnapshot); a larger result is refused `scene_too_large`
+/// before anything is recorded. The Manager status stream's frame bound is
+/// this plus room for the section's access part and envelope, so every
+/// committed Scene can be published.
+inline constexpr std::size_t kMaximumLogicalSceneSnapshotBytes = 384U * 1024U;
 
 class LogicalSceneOwnerError : public std::runtime_error {
 public:
@@ -76,18 +58,6 @@ public:
   using LogicalSceneOwnerError::LogicalSceneOwnerError;
 };
 
-class LogicalSceneOwnerBusyError final
-    : public LogicalSceneOwnerError {
-public:
-  using LogicalSceneOwnerError::LogicalSceneOwnerError;
-};
-
-class LogicalSceneOwnerClosedError final
-    : public LogicalSceneOwnerError {
-public:
-  using LogicalSceneOwnerError::LogicalSceneOwnerError;
-};
-
 enum class CanonicalEmptySceneBootstrapPhase {
   kInitialCommandFenced,
   kAccepted,
@@ -101,11 +71,11 @@ enum class CanonicalEmptySceneBootstrapPhase {
 ToString(CanonicalEmptySceneBootstrapPhase phase) noexcept;
 
 /// Read-only evidence for the scene-write and projection-lease gates owned by
-/// this logical-scene database.
+/// the logical-scene owner.
 ///
-/// The gates are not mutable booleans. They are closed until the immutable
-/// finalization row is durably committed and open exactly when that row and
-/// its complete publication receipt pass integrity verification.
+/// The gates are not mutable booleans. They are closed until the finalization
+/// is recorded and open exactly when it and its complete publication receipt
+/// pass integrity verification.
 struct CanonicalEmptySceneAccessStatus final {
   CanonicalEmptySceneBootstrapPhase phase;
   bool scene_writes_open;
@@ -127,9 +97,6 @@ struct LogicalScenePublicationRead final {
 
 struct CanonicalEmptySceneStoreIntegrityReport final {
   manyforge::core::ProjectionBootstrapPrerequisiteQueryDTO fixed_query;
-  std::string schema_id;
-  std::int64_t schema_version;
-  std::string schema_artifact_digest;
   std::int64_t acceptance_row_count;
   std::int64_t rebuild_row_count;
   std::int64_t finalization_row_count;
@@ -144,7 +111,7 @@ struct CanonicalEmptySceneStoreIntegrityReport final {
 
 /// Private continuation input, captured by the original Manager Apply before
 /// effects. Scene independently verifies the current Scene, candidate,
-/// bindings and still-held parent. This value and durable readback are never
+/// bindings and still-held parent. This value and recorded rows are never
 /// authority.
 using QualifiedSceneConfigurationAdoptionRequest =
     manyforge::core::QualifiedSceneConfigurationAdoptionRequestDTO;
@@ -152,28 +119,27 @@ using QualifiedSceneConfigurationAdoptionRequest =
 /// Production owner for one exact logical-scene lineage.
 ///
 /// Construction accepts only the deployment-owned sealed canonical-empty
-/// admission, derives its fixed cell/bundle/graph prerequisite query, and opens
-/// a scene-owned SQLite database after the shared mechanical read-only
-/// preflight. A caller-authored query or retained bundle cannot establish a
-/// parallel scene lineage. The database is separate from every Component
-/// Manager store.
+/// admission and derives its fixed cell/bundle/graph prerequisite query. A
+/// caller-authored query or retained bundle cannot establish a parallel scene
+/// lineage. The owner's rows are held in memory only: every owner starts
+/// empty, and nothing of the Scene outlives its process.
 /// Begin atomically rechecks the fixed command-fenced empty state, mints the
-/// logical lineage through the qualified Core identity codec, and persists the
+/// logical lineage through the qualified Core identity codec, and records the
 /// complete revision-one snapshot before returning. Rebuild records exact
 /// healthy zero-native evidence. Finalize independently rereads the current
-/// active-bundle publication receipt and durably records it before the access
-/// gates can become open.
+/// active-bundle publication receipt and records it before the access gates
+/// can become open.
 ///
-/// The publication-head read and this package's scene-database commit remain
-/// deliberately separate durable boundaries. Their ordering relies on the
-/// Manager port contract: Manager is the sole publication writer, and a later
-/// publication cannot begin until the scene owner has admitted and completed
-/// its corresponding maintenance initialization. During initial bootstrap no
-/// successor can be admitted before this Finalize completes.
+/// The publication-head read and this owner's record remain separate
+/// boundaries. Their ordering relies on the Manager port contract: Manager is
+/// the sole publication writer, and a later publication cannot begin until the
+/// scene owner has admitted and completed its corresponding maintenance
+/// initialization. During initial bootstrap no successor can be admitted
+/// before this Finalize completes.
 ///
 /// With an independently verified retained-bundle source and an injected
 /// projection resolver, the same owner initializes the candidate-only native
-/// set during an admitted maintenance window. It also owns durable
+/// set during an admitted maintenance window. It also owns
 /// compare-and-commit logical-scene transactions, immutable reads, exact
 /// replay, projection acknowledgement, retained component/passive-frame
 /// resolution, carried-object attachment/detachment, immutable projection
@@ -187,26 +153,22 @@ class LogicalSceneOwner final
       public manyforge::core::ISceneAuthority {
 public:
   LogicalSceneOwner(
-      std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
       const manyforge::core::IActiveBundlePublicationReader
           &publication_reader);
   LogicalSceneOwner(
-      std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
       manyforge::core::IKernelCellAdmissionPort &cell_admission);
   LogicalSceneOwner(
-      std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
       const manyforge::deployment::IVerifiedRetainedBundleSource
           &retained_bundle_source);
   LogicalSceneOwner(
-      std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
@@ -215,7 +177,6 @@ public:
       const manyforge::core::IPlannerSceneProjectionResolver
           &projection_resolver);
   LogicalSceneOwner(
-      std::filesystem::path database_path,
       const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
           &admission,
       const manyforge::core::IActiveBundlePublicationReader &publication_reader,
@@ -224,20 +185,6 @@ public:
       const manyforge::core::IPlannerSceneProjectionResolver
           &projection_resolver,
       manyforge::core::IKernelCellAdmissionPort &cell_admission);
-  /// The store's file is written afterwards through `record_writer`, which
-  /// its owner drains before Close. With nullptr the owner writes through a
-  /// writer of its own, drained by Close.
-  LogicalSceneOwner(
-      std::filesystem::path database_path,
-      const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
-          &admission,
-      const manyforge::core::IActiveBundlePublicationReader &publication_reader,
-      const manyforge::deployment::IVerifiedRetainedBundleSource
-          &retained_bundle_source,
-      const manyforge::core::IPlannerSceneProjectionResolver
-          &projection_resolver,
-      manyforge::core::IKernelCellAdmissionPort &cell_admission,
-      manyforge::persistence::SqliteRecordWriter *record_writer);
   ~LogicalSceneOwner() override;
 
   LogicalSceneOwner(LogicalSceneOwner &&) noexcept;
@@ -246,7 +193,6 @@ public:
   LogicalSceneOwner &
   operator=(const LogicalSceneOwner &) = delete;
 
-  [[nodiscard]] const std::filesystem::path &database_path() const noexcept;
   [[nodiscard]] const manyforge::core::ProjectionBootstrapPrerequisiteQueryDTO &
   fixed_query() const noexcept;
 
@@ -340,11 +286,21 @@ public:
   ActiveProjectionHealth() const override;
 
   [[nodiscard]] CanonicalEmptySceneAccessStatus ReadAccessStatus() const;
-  /// Reconciles durable authored-scene admission claims after the exact
+  /// Reconciles recorded authored-scene admission claims after the exact
   /// Kernel owner becomes reachable. Owner unavailability is returned as a
   /// typed fail-closed result and never prevents read-only scene recovery.
   [[nodiscard]] manyforge::core::Result<void>
   ReconcileAuthoredSceneAdmissionClaims();
+  /// Holds the owner lock only to read and write owner state, never across a
+  /// host or Kernel call (OD-376). The candidate is validated and digested
+  /// once here; each native projection is asked once for its health and the
+  /// candidate's effective policy, then applies the owner's delta without
+  /// validating it again. The intent is recorded only if no other change
+  /// reached the owner meanwhile (compare-and-commit); otherwise, or while
+  /// another Commit is in flight, the request is refused `stale_revision`.
+  /// Until its outcome, readers see the predecessor and the Apply-lane
+  /// writers wait for it. Precondition: one Commit caller, the Manager's
+  /// command lane; a second Commit at the same time is refused, not queued.
   [[nodiscard]] manyforge::core::SceneCommitResultDTO
   Commit(const manyforge::core::SceneTransactionRequestDTO &request) override;
   /// Exact result lookup only: never submit/retry a Scene effect. Absence is
@@ -368,22 +324,13 @@ public:
   /// Returns the current immutable logical-scene snapshot after bootstrap has
   /// established a real active projection. During maintenance initialization
   /// the snapshot remains immutable and admission stays closed until the
-  /// completion record is durable. Before bootstrap Finalize there is no
+  /// completion is recorded. Before bootstrap Finalize there is no
   /// public logical-scene truth and the result is empty.
   [[nodiscard]] std::optional<manyforge::core::LogicalSceneSnapshotRoot>
   ReadActiveSnapshot() const;
   /// ReadAccessStatus and ReadActiveSnapshot of one state, numbered.
   [[nodiscard]] LogicalScenePublicationRead ReadPublication() const;
   [[nodiscard]] CanonicalEmptySceneStoreIntegrityReport VerifyIntegrity() const;
-  /// The file bytes the held rows can take, an over-count; folding and
-  /// eviction keep it within the page image less a reserve while anything
-  /// can give way.
-  [[nodiscard]] std::uint64_t record_file_bytes() const;
-
-  /// Drains an owned writer, then checkpoints and closes the file. Later
-  /// calls fail with LogicalSceneOwnerClosedError.
-  void Close();
-
 private:
   template <typename Request>
   [[nodiscard]] std::vector<manyforge::core::ProjectionHealthDTO>

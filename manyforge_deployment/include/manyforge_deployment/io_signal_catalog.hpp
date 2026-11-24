@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/collision_rule.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/json_value.hpp>
@@ -45,6 +46,19 @@ struct IoSignalProviderConfiguration final {
   std::optional<core::SceneResourceId> target_scene_resource_id{};
   /// Robot observed by geometric contact.
   std::optional<core::ControllableComponentId> robot_component_id{};
+  /// Geometric contact between two selections (OD-356), in place of the
+  /// robot's TCP contact bodies against `target_scene_resource_id`: the
+  /// collision-rule kinds `component`, `collision_body` (OD-371), `link`,
+  /// `attached_object` (optionally of one collision body role, OD-371),
+  /// `scene_objects` and `scene_object` (by id), as authored; the provider
+  /// resolves them against its collision world.
+  std::vector<core::CollisionRuleSelectionDTO> contact_a{};
+  std::vector<core::CollisionRuleSelectionDTO> contact_b{};
+  /// True only while a pair penetrates deeper than this; absent: any contact.
+  std::optional<double> trip_depth_m{};
+  /// Hysteresis (OD-360): once true, false again only when the depth falls
+  /// below this (above 0, below `trip_depth_m`); absent: `trip_depth_m`.
+  std::optional<double> release_depth_m{};
   /// Optional synthetic feedback from an output of this I/O component.
   std::optional<std::string> echo_output_signal_name{};
   std::optional<core::Duration> echo_delay_ns{};

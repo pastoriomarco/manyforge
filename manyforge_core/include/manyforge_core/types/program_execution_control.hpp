@@ -20,6 +20,9 @@ struct ProgramExecutionSelectionRequestDTO final {
   RequestAttributionDTO attribution;
   // Individual hold release only; mutually exclusive with nonempty group_ids.
   std::optional<ProgramNodeInstanceId> node_instance_id{};
+  // Stop only, from the Program owner: the Program node whose own Stop this
+  // is (OD-342). The nodes it holds are attributed `stopped_by: program`.
+  std::optional<ProgramNodeInstanceId> stopped_by_node_instance_id{};
   friend bool operator==(const ProgramExecutionSelectionRequestDTO&,
                          const ProgramExecutionSelectionRequestDTO&) = default;
 };
@@ -38,7 +41,7 @@ struct ProgramNodeMotionAttentionCheckDTO final {
 };
 
 inline constexpr std::string_view kProgramExecutionScopeSchema =
-    "manyforge.program_execution_scope.v3";
+    "manyforge.program_execution_scope.v4";
 inline constexpr std::string_view kProgramExecutionSelectionSchema =
     "manyforge.program_execution_selection.v3";
 
@@ -57,6 +60,16 @@ enum class ProgramNodeHoldStateDTO : std::uint8_t {
 struct ProgramNodeHoldDTO final {
   std::uint32_t node_index;
   ProgramNodeHoldStateDTO state;
+};
+
+/// A held node whose hold a Program node's own Stop set (OD-342,
+/// `stopped_by: program`): the held node and the requesting node, both as
+/// captured node indices.
+struct ProgramNodeProgramHoldDTO final {
+  std::uint32_t node_index;
+  std::uint32_t stopped_by_node_index;
+  friend bool operator==(const ProgramNodeProgramHoldDTO&,
+                         const ProgramNodeProgramHoldDTO&) = default;
 };
 
 enum class ProgramSelectionReleaseBlockReasonDTO : std::uint8_t {
@@ -82,7 +95,7 @@ enum class ProgramSelectionReleaseBlockReasonDTO : std::uint8_t {
   return "selection_release_unavailable";
 }
 
-/// The scope read (`manyforge.program_execution_scope.v3`): one memory read
+/// The scope read (`manyforge.program_execution_scope.v4`): one memory read
 /// of the claimed run's hold state.
 struct ProgramExecutionScopeStateDTO final {
   CellAdmissionClaimGeneration claim_generation{0U};
@@ -95,6 +108,9 @@ struct ProgramExecutionScopeStateDTO final {
   std::optional<ProgramSelectionReleaseBlockReasonDTO> selection_release_block_reason{};
   /// A global rule's `hold` trip held the run (stopped_by: rule).
   std::optional<std::string> stopped_by_rule_id{};
+  /// Node-index ordered: the held nodes a Program node's own Stop holds
+  /// (stopped_by: program), until their release.
+  std::vector<ProgramNodeProgramHoldDTO> program_held_nodes{};
   RunFrozenLevel frozen{RunFrozenLevel::kNone};
   /// The event that froze the run; absent while not frozen.
   std::optional<StopEventId> frozen_by{};

@@ -17,6 +17,7 @@ import type {
   ProgramParameterDeclaration,
   ProgramTreeNode,
   ProgramValueSource,
+  SourceModelProjection,
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
 import type { ManualPreviewToNodeController } from '../hooks/useRobotControl';
@@ -104,6 +105,8 @@ import type { ReferenceIssue, ReferenceSelectorFacts } from '../utils/referenceV
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 import { StopStagePicker } from './StopStagePicker';
 import { GraspLostPolicyEditor } from './GraspLostPolicyEditor';
+import { CollisionRulesTable } from './CollisionRulesTable';
+import { COLLISION_RULE_SEQUENCE_NODE_IDS, sourceModelCollisionChoices } from '../utils/collisionRules';
 import { TripPresetEditor } from './TripPresetEditor';
 import { manualPreviewToNode, type ManualFillNotice } from '../utils/manualPreviewToNode';
 import { manualFillPreviewValues as getManualFillPreviewValues } from '../utils/manualFillPreview';
@@ -147,6 +150,8 @@ interface ProgramPropertyEditorProps {
   diagnostics?: ProgramAuthoringDiagnostic[];
   referenceIssues?: ReferenceIssue[];
   selectorFacts?: ReferenceSelectorFacts | null;
+  /** The applied source model: the link names a move rule's link selection picks from. */
+  sourceModel?: SourceModelProjection | null;
 }
 
 function isProgramMotionField(field: string): field is ProgramMotionField {
@@ -318,6 +323,7 @@ export function ProgramPropertyEditor({
   diagnostics = [],
   referenceIssues = [],
   selectorFacts = null,
+  sourceModel = null,
 }: ProgramPropertyEditorProps) {
   const programParameters = program.parameters ?? [];
   const deploymentDocument = deploymentWorkspace?.draft?.document ?? null;
@@ -965,12 +971,14 @@ export function ProgramPropertyEditor({
             ))).size === literal.length);
           const graspLostPolicyField = selected.node_id === 'scene.attach_carried_object'
             && parameter.id === 'on_grasp_lost' && source === undefined && !repairMode;
+          // Literal rows only; a Scene object selection may name a scene_resource key.
+          const collisionRulesField = parameter.id === 'collision_rules' && source === undefined && !repairMode;
           const parameterLabel = hasMotionTcpEndpoint && parameter.id === 'tcp_endpoint'
             ? 'Motion TCP endpoint'
             : parameter.id === 'max_tcp_linear_speed_mps'
             ? 'TCP speed ceiling (m/s)'
-            : parameter.id === 'clearance_m'
-            ? 'Collision clearance (m)'
+            : parameter.id === 'collision_rules'
+            ? 'Collision rules'
             : parameter.id === 'wait_for_duration'
             ? 'Wait for command duration'
             : parameter.id;
@@ -1022,7 +1030,7 @@ export function ProgramPropertyEditor({
                     </span>
                   )}
                 </label>
-                <span>{parameter.required ? 'required' : 'optional'}</span>
+                <span>{parameter.required || rule.required ? 'required' : 'optional'}</span>
                 {showReset && (
                   <button
                     type="button"
@@ -1048,9 +1056,11 @@ export function ProgramPropertyEditor({
                     : `Currently applied Deployment maximum for ${selectedDeploymentSpeed.target}: ${selectedDeploymentSpeed.maximum} m/s. ${typeof displayedSpeed === 'number' && Number.isFinite(displayedSpeed) && displayedSpeed > 0 ? `With ${source === undefined ? 'request' : 'parameter default'} ${displayedSpeed} m/s, the effective ceiling is ${Math.min(displayedSpeed, selectedDeploymentSpeed.maximum)} m/s. ` : 'The backend resolves the effective ceiling when the request is known. '}The authored value is unchanged.`}
                 </p>
               )}
-              {parameter.id === 'clearance_m' && (
+              {parameter.id === 'collision_rules' && (
                 <p className="muted">
-                  Optional. Omitted, the move keeps the Deployment clearance (0.001 m unless the Deployment sets one); 0 turns the clearance off for this move.
+                  {COLLISION_RULE_SEQUENCE_NODE_IDS.includes(selected.node_id)
+                    ? 'Optional. Each rule applies to one leg of the sequence (approach, descend or retreat) and replaces the Deployment\'s value for its pairs on that leg.'
+                    : 'Optional. Without rules the move keeps the Deployment\'s collision rules. A rule applies to this move only.'}
                 </p>
               )}
               {parameter.id === 'wait_for_duration' && (
@@ -1092,7 +1102,32 @@ export function ProgramPropertyEditor({
                   {literal} does not apply to this key; choose {rule.choices.join(' or ')}.
                 </p>
               )}
-              {graspLostPolicyField ? (
+              {collisionRulesField ? (
+                <div id={`property-${selected.instance_id}-${parameter.id}`}>
+                  <CollisionRulesTable
+                    key={`${selected.instance_id}:${parameter.id}:${discardEpoch}`}
+                    value={literal}
+                    scope={COLLISION_RULE_SEQUENCE_NODE_IDS.includes(selected.node_id) ? 'sequence' : 'node'}
+                    choices={{
+                      // Unknown until the Draft is validated: ids are then typed, not picked.
+                      componentIds: selectorFacts === null ? null
+                        : selectorFacts.components.map((row) => row.component_id).sort(),
+                      bodies: selectorFacts === null ? null
+                        : bodyFacts.filter((row) => !row.ambiguous).map((row) => row.reference),
+                      links: sourceModelCollisionChoices(sourceModel).links,
+                      sceneObjectIds: (program.scene ?? []).map((row) => row.scene_resource_id).sort(),
+                      sceneResourceKeys: blackboardKeys.filter((row) => row.type === 'scene_resource')
+                        .map((row) => row.key).sort(),
+                      sceneResourceKeyFields: blackboardKeys.flatMap((row) => (row.fields ?? [])
+                        .filter((field) => field.type === 'scene_resource')
+                        .map((field) => ({ key: row.key, field: field.field }))),
+                    }}
+                    disabled={busy || rule.locked !== undefined}
+                    onCommit={(rows) => (rows.length === 0
+                      ? removeLiteral(parameter) : commitLiteral(parameter, rows))}
+                  />
+                </div>
+              ) : graspLostPolicyField ? (
                 <GraspLostPolicyEditor
                   key={`${selected.instance_id}:${parameter.id}:${discardEpoch}`}
                   value={literal}

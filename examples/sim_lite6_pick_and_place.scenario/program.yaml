@@ -1,14 +1,11 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "isaac-sim"
-    ],
     "requires": [
       "lite_gripper",
       "ros2_control"
@@ -19,7 +16,6 @@
       "pick-and-place"
     ]
   },
-  "description": "Isaac Lite 6 pick-and-place Program: scan poses, scene and rest coordinates, linear lite-gripper commands, carried-object transitions and simulator play/pause.",
   "forest": [
     {
       "children": [
@@ -654,7 +650,6 @@
       "parameters": {}
     }
   ],
-  "name": "isaac_lite6_lite_gripper_pick_and_place",
   "parameters": [
     {
       "constraints": {
@@ -668,7 +663,6 @@
     }
   ],
   "positions": {},
-  "program_id": "isaac_lite6_lite_gripper_pick_and_place",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

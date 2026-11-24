@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -13,8 +13,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "isaac-sim",
     "provides": [
       "robotiq_2f_140_gripper",
       "ros2_control"
@@ -229,20 +234,7 @@
               "mount_frame": "robotiq_2f_140_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "grasp_frame",
-              "touch_links": [
-                "left_inner_finger",
-                "left_inner_finger_pad",
-                "left_inner_knuckle",
-                "left_outer_finger",
-                "left_outer_knuckle",
-                "right_inner_finger",
-                "right_inner_finger_pad",
-                "right_inner_knuckle",
-                "right_outer_finger",
-                "right_outer_knuckle",
-                "robotiq_base_link"
-              ]
+              "tcp_frame": "grasp_frame"
             }
           ]
         },
@@ -266,9 +258,6 @@
       "target_settings": {}
     }
   ],
-  "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
-  "description": "Isaac UR10e light-scene deployment with the measured cheese-box pose source, for the grasp-loss example.",
-  "name": "isaac_manipulator_scene_light_ros2_control",
   "policies": {
     "component_streams": [
       {

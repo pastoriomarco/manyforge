@@ -45,8 +45,8 @@ const core::CommandTargetId kGripper("gripper");
   frames.end_effector_tcp_frame = "tool_tcp";
   frames.carriers = {kRobot, kTool};
   frames.carrier_frames = {
-      {{kTool, kGripper, core::FrameRoleId("tcp")}, "tool_tcp"},
-      {{kTool, kGripper, core::FrameRoleId("finger")}, "finger_tip"}};
+      {{kTool, core::FrameRoleId("tcp")}, "tool_tcp"},
+      {{kTool, core::FrameRoleId("finger")}, "finger_tip"}};
   // The tool's centre of mass 20 mm along its own x, 40 mm out.
   frames.tool_payloads = {{"tool_mount", {tool_mass_kg, {0.02, 0.0, 0.04}}}};
   return frames;
@@ -62,7 +62,6 @@ Carrying(double mass_kg, core::ControllableComponentId carrier = kTool,
       core::CarriedSceneObjectPlacementDTO{core::CarriedObjectAttachmentId("attach.box"),
                                            core::CarriedObjectAttachmentRevision("r1")},
       std::nullopt,
-      {},
       mass_kg};
   core::CarriedObjectAttachmentDTO attachment{
       core::CarriedObjectAttachmentId("attach.box"),
@@ -184,6 +183,20 @@ TEST(RetainedToolContext, AttachAddsTheObjectAtItsPoseAndDetachRemovesIt) {
   const auto unknown = source.Compose(std::nullopt);
   ASSERT_FALSE(unknown.ok());
   EXPECT_EQ(unknown.error().details.at("reason"), "tool_context_frame_unknown");
+}
+
+// OD-372: an object the robot's arm target holds on the mounted tool's frame
+// is found by that frame, whatever the holder's command target.
+TEST(RetainedToolContext, ArmHeldObjectOnAToolFrameAddsItsMass) {
+  auto held = *Carrying(1.0);
+  held.carried_object_attachments.front().controllable_component_id = kRobot;
+  held.carried_object_attachments.front().command_target_id = core::CommandTargetId("arm");
+  const RetainedToolContextSource source(CellUrdf(), Frames(), nullptr);
+  const auto by_arm = source.Compose(std::nullopt, held);
+  const auto by_tool = source.Compose(std::nullopt, *Carrying(1.0));
+  ASSERT_TRUE(by_arm.ok()) << by_arm.error().message;
+  ASSERT_TRUE(by_tool.ok());
+  EXPECT_EQ(by_arm.value(), by_tool.value());
 }
 
 TEST(RetainedToolContext, ExplicitCommittedSnapshotDoesNotReadProjection) {

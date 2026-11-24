@@ -80,7 +80,7 @@ RUN set -eu; \
         manyforge_assistant_bridge \
         manyforge_ros/manyforge_ros \
         manyforge_operator \
-        manyforge_ros_bringup \
+        manyforge_ros_bringup manyforge_io_interfaces \
         manyforge_deployment/resources/maintained manyforge_deployment/resources/catalog \
         components \
         manyforge_example_models/models \

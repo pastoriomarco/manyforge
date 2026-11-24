@@ -60,7 +60,6 @@ def _snapshot(*, state: str = "running") -> dict[str, Any]:
             "applied_record_digest": _DIGEST_C,
             "scenario_id": "cell-pick",
             "source_document_digest": _DIGEST_A,
-            "program_id": "pick",
             "program_revision": _DIGEST_B,
             "program_binding_id": _DIGEST_C,
             "retained_bundle_id": _DIGEST_A,
@@ -244,6 +243,10 @@ class FakeRuntime:
         self.calls.append(("runtime_controls", program_run_id))
         return {"program_run_id": program_run_id}
 
+    def read_runtime_blackboard(self, program_run_id: int) -> dict[str, Any]:
+        self.calls.append(("read_runtime_blackboard", program_run_id))
+        return {"program_run_id": program_run_id, "keys": []}
+
     def write_runtime_blackboard(self, program_run_id: str, request) -> dict[str, Any]:
         self.calls.append(("write_runtime_blackboard", (program_run_id, request)))
         return {"accepted": True}
@@ -312,7 +315,7 @@ def _caller() -> dict[str, Any]:
 def test_node_availability_is_a_read_only_runner_projection() -> None:
     runtime = FakeRuntime()
     body = {
-        "applied": {"program_id": "program_a"},
+        "applied": {"program_revision": "sha256:" + "a" * 64},
     }
     with TestClient(create_app(runtime)) as client:
         response = client.post("/api/program/node-availability", json=body)
@@ -778,13 +781,24 @@ def test_runtime_override_routes_are_removed_and_key_writes_remain() -> None:
     assert "/api/program/runs/{program_run_id}/runtime-controls" in paths
 
 
+def test_key_values_read_is_a_plain_runner_query() -> None:
+    runtime = FakeRuntime()
+    with TestClient(create_app(runtime)) as client:
+        response = client.get("/api/program/runs/3/blackboard-values")
+        invalid = client.get("/api/program/runs/0/blackboard-values")
+
+    assert response.status_code == 200
+    assert response.json() == {"program_run_id": 3, "keys": []}
+    assert invalid.status_code == 422
+    assert ("read_runtime_blackboard", 3) in runtime.calls
+
+
 def test_node_correction_preview_is_a_plain_runner_query() -> None:
     runtime = FakeRuntime()
     body = {
         "schema_version": "manyforge.program_node_correction_preview_request.v2",
         "request_key": _key("node-preview.1"),
         "program_run_id": 1,
-        "program_id": "lite6_program",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "a" * 64,
         "node_instance_id": "move",

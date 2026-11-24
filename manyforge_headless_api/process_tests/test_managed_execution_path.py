@@ -331,7 +331,7 @@ def _planning_motion(
         "target_reference": None,
         "offset_reference": None,
         "motion": motion,
-        "contact_policy_id": None,
+        "collision_rules": [],
         "per_joint_dynamics_limits": {},
         "motion_interrupt_scopes": [],
         "runtime_object_bindings": [],
@@ -391,7 +391,6 @@ def _direct_control_joint_operation(
     assert len(joint_names) == len(positions_rad)
     return {
         "request_context": _context(label, "composer_ui"),
-        "program_id": manual_control["program_id"],
         "program_revision": manual_control["program_revision"],
         "program_binding_id": manual_control["program_binding_id"],
         "program_run_id": None,
@@ -444,7 +443,6 @@ def _direct_control_gripper_operation(
     )
     return {
         "request_context": _context(label, "composer_ui"),
-        "program_id": manual_control["program_id"],
         "program_revision": manual_control["program_revision"],
         "program_binding_id": manual_control["program_binding_id"],
         "program_run_id": None,

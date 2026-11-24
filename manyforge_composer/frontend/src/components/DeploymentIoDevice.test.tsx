@@ -49,9 +49,7 @@ async function mount(components: JsonValue[]) {
     workspace: {
       draft: {
         document: {
-          api_version: 'manyforge.deployment_intent.v2',
-          deployment_artifact_id: 'cell-a',
-          name: 'Cell A',
+          api_version: 'manyforge.deployment_intent.v3',
           components,
           attachments: [],
           policies: {},

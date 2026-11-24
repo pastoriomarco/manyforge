@@ -119,7 +119,8 @@ def test_dual_deployment_has_exact_models_and_placements() -> None:
             and row["mount_frame"]
             and row["attach_frame"]
             and row["tcp_frame"]
-            and row["touch_links"]
+            # The grip body comes from the component type, not from the row.
+            and "touch_links" not in row
             for rows in grippers.values()
             for row in rows
         )
@@ -183,8 +184,7 @@ def test_both_variants_are_registered_as_qualified_scenarios() -> None:
         manifest = load_strict_json_yaml(path / "scenario.yaml")
         assert manifest["scenario_id"] == SCENARIO_NAMES[variant]
         deployment = load_strict_json_yaml(path / "deployment.yaml")
-        assert deployment["api_version"] == "manyforge.deployment_intent.v2"
-        assert deployment["deployment_artifact_id"] == "ur5e_lite6_wall"
+        assert deployment["api_version"] == "manyforge.deployment_intent.v3"
         # Each robot's gripper is its own mounted component.
         # The Lite 6 is a machine: its owner and every member.
         assert {row["component_id"] for row in deployment["components"]} == {

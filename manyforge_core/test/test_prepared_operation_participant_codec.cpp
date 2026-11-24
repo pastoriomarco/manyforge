@@ -95,7 +95,6 @@ namespace {
   runtime_unit_epochs.push_back({base.source_runtime_unit_id, base.source_runtime_epoch});
   runtime_unit_epochs.push_back({target.runtime_unit_id, target.runtime_unit_epoch});
   RuntimeParticipantBindingDTO value{
-      ProgramId("program.1"),
       ProgramRevision(Digest('1')),
       ProgramBindingId(Digest('2')),
       base.retained_bundle_id,
@@ -258,7 +257,6 @@ struct SealedInputs final {
   PreparedParticipantStopPlanContextDTO stop_context{OperationNumber(1U),
                                                      OperationRevision(1U),
                                                      OperationParticipantId{OperationNumber(1U), 1U},
-                                                     binding.program_id,
                                                      binding.program_revision,
                                                      binding.program_binding_id,
                                                      ProgramRunNumber(1U),
@@ -277,7 +275,6 @@ struct SealedInputs final {
           OperationNumber(1U),
           OperationRevision(1U),
           OperationParticipantId{OperationNumber(1U), 1U},
-          binding.program_id,
           binding.program_revision,
           binding.program_binding_id,
           ProgramRunNumber(1U),
@@ -365,7 +362,6 @@ struct SealedInputs final {
   PlanRequestDTO request{
       OperationNumber(1U),
       OperationParticipantId{OperationNumber(1U), 1U},
-      binding.program_id,
       binding.program_revision,
       binding.program_binding_id,
       ProgramRunNumber(1U),
@@ -413,7 +409,6 @@ struct SealedInputs final {
       TolerancesDTO{0.01, 0.01, 0.01},
       SpeedProfileDTO{0.5, 0.5, 0.5},
       PlannerOverrideDTO{},
-      std::nullopt,
       {},
       2.0,
       0U,
@@ -437,7 +432,7 @@ struct SealedInputs final {
            ValidationResultDTO{true, std::nullopt,
                                TrajectoryValidationMetricsDTO{1.0, {0.5, 0.5}, {0.0, 0.0}, 0.1}},
            world, CollisionPolicyRevision{1U, Digest('1')}, decision},
-          std::nullopt,
+          std::vector<CollisionRule>{},
           0.5,
           0.5,
           {},
@@ -557,6 +552,38 @@ TEST(PreparedOperationParticipantCodecTest, RejectsCartesianMilestonesForAnother
             "prepared_cartesian_waypoint_milestones_mismatch");
 }
 
+TEST(PreparedOperationParticipantCodecTest, CollisionRulesArePartOfThePreparedContract) {
+  const auto base = BasePlan();
+  auto inputs = Inputs(base, false);
+  const auto encode = [&](const PreparedMotionExecutionDTO& payload) {
+    auto made = MakePreparedOperationParticipant(
+        Candidate(inputs.binding, inputs.readiness, payload), inputs.binding, inputs.readiness,
+        DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+    EXPECT_TRUE(made.ok());
+    return EncodePreparedOperationParticipant(made.value(), inputs.binding, inputs.readiness,
+                                              DefaultLimits(),
+                                              MotionInterruptNodeCategory::kGeneric)
+        .value();
+  };
+  const auto plain = MotionPayload(inputs);
+  // A motion without rules writes no `collision_rules` member.
+  EXPECT_EQ(encode(plain).find("collision_rules"), std::string::npos);
+
+  auto ruled = plain;
+  ruled.collision_rules = {
+      CollisionRule{"tip_on_part",
+                    {CollisionRuleResolvedBodiesSelection{{"component/robot/body/tip/collision/0"}}},
+                    {CollisionRuleSceneObjectSelection{SceneResourceId("part")}},
+                    CollisionContactRule{0.002, 0.8, std::nullopt}}};
+  const auto ruled_bytes = encode(ruled);
+  EXPECT_NE(ruled_bytes.find("collision_rules"), std::string::npos);
+  EXPECT_NE(ruled_bytes.find("tip_on_part"), std::string::npos);
+
+  auto deeper = ruled;
+  std::get<CollisionContactRule>(deeper.collision_rules.front().value).max_penetration_m = 0.004;
+  EXPECT_NE(encode(deeper), ruled_bytes);
+}
+
 TEST(PreparedOperationParticipantCodecTest, RejectsSelfAttestedClaimsAndDigestForgery) {
   const auto base = BasePlan();
   auto inputs = Inputs(base, true);
@@ -613,7 +640,6 @@ TEST(PreparedOperationParticipantCodecTest,
   ASSERT_TRUE(made.ok());
 
   auto physical_value = inputs.binding.value();
-  physical_value.program_id = ProgramId("direct-control.product-owner");
   physical_value.program_revision = ProgramRevision(Digest('e'));
   physical_value.program_binding_id = ProgramBindingId(Digest('f'));
   auto physical = verify_runtime_participant_binding(std::move(physical_value));
@@ -622,7 +648,7 @@ TEST(PreparedOperationParticipantCodecTest,
   EXPECT_EQ(
       prepared_participant_backend_binding_field_error(
           made.value(), physical.value(), PreparedParticipantPayloadKindDTO::kMotionExecution),
-      "prepared_participant_backend_program_id_mismatch");
+      "prepared_participant_backend_program_revision_mismatch");
   EXPECT_FALSE(
       prepared_participant_backend_physical_binding_field_error(
           made.value(), physical.value(), PreparedParticipantPayloadKindDTO::kMotionExecution)
@@ -705,7 +731,6 @@ TEST(PreparedOperationParticipantCodecTest,
       candidate.operation_id,
       candidate.operation_revision,
       candidate.participant_id,
-      candidate.program_id,
       candidate.program_revision,
       candidate.program_binding_id,
       candidate.program_run_id,
@@ -933,7 +958,6 @@ TEST(PreparedOperationParticipantCodecTest,
       candidate.operation_id,
       candidate.operation_revision,
       candidate.participant_id,
-      candidate.program_id,
       candidate.program_revision,
       candidate.program_binding_id,
       candidate.program_run_id,

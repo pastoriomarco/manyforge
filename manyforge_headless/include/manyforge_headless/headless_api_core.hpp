@@ -262,6 +262,10 @@ public:
   /// answers (no core lock).
   [[nodiscard]] std::optional<std::pair<std::string, std::string>>
   ViewerPoseSources() const;
+  /// The logical scene's active projection revision (canonical JSON) from
+  /// the mirror's last valid value, whatever its freshness (no core lock;
+  /// OD-378).
+  [[nodiscard]] std::optional<std::string> LogicalSceneActiveProjection() const;
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   AcknowledgeAlarm(std::string condition_id, std::string activation_id,
                    std::uint64_t expected_record_revision,
@@ -307,10 +311,15 @@ public:
   CommitProgramModelAttempt(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordProgramDiagnostic(manyforge::content_identity::CanonicalValue record);
-  /// One finished component action, Apply or Program Reset terminal
+  /// One finished component action, Apply or Program Reset terminal, Program
+  /// node attempt (stamped at its end on the Runner's clocks) or scene change
+  /// outside a Program node
   /// (`manyforge.activity_event.v1`): `component_action_finished` under the
   /// component's id, `apply_finished` under `manyforge.composer`,
-  /// `program_reset_finished` under `manyforge.program_runner` (OD-305).
+  /// `program_reset_finished` under `manyforge.program_runner` (OD-305),
+  /// `program_node_attempt_finished` under `manyforge.program_runner` (WARN
+  /// when failed, else INFO) and `scene_change_finished` under
+  /// `manyforge.scene` (OD-375, OD-378).
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordActivity(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue

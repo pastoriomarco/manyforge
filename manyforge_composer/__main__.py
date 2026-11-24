@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any, Final, Sequence
 
 import uvicorn
@@ -83,7 +84,7 @@ def _open_startup_scenario_document(
     Any refusal (for example a Scenario still applied in Manager) logs one
     warning and records the notice the GUI shows; Composer still starts
     serving. A refusal before the workspace commit leaves it empty. There is
-    no retry.
+    no retry; it runs once the headless API listens.
     """
 
     try:
@@ -112,6 +113,31 @@ def _open_startup_scenario_document(
             "code": code if isinstance(code, str) else "startup_scenario_load_failed",
             "message": message,
         }
+
+
+def _wait_for_headless_listening(headless_client: Any) -> None:
+    """Return once the headless API answers (OD-332).
+
+    The Manager starts Composer after its first converged baseline, which
+    may come before the headless API listens. Any answer counts, an error
+    status included; only a request that reached no server is repeated. No
+    time limit: if the headless API exits, the Manager ends the application.
+    """
+
+    from manyforge_headless_api.client import HeadlessClientError
+
+    logged = False
+    while True:
+        try:
+            headless_client.health()
+            return
+        except HeadlessClientError as error:
+            if error.code != "headless_http_unavailable":
+                return
+        if not logged:
+            logging.getLogger(__name__).info("waiting for the headless API to listen")
+            logged = True
+        time.sleep(0.1)
 
 
 class _StartupLoadFailed(RuntimeError):
@@ -183,13 +209,12 @@ def main() -> None:
             args.headless_api_url,
             timeout_seconds=args.headless_api_timeout_s,
         )
+        _wait_for_headless_listening(headless_client)
     try:
         state = ComposerState.from_paths(
             application_start_id=args.application_start_id,
             program_path=args.program_path,
             allowed_fs_roots=security.allowed_fs_roots,
-            allowed_program_write_roots=security.allowed_program_write_roots,
-            allowed_deployment_write_roots=security.allowed_deployment_write_roots,
             headless_client=headless_client,
         )
         state_dir = os.environ.get("MANYFORGE_STATE_DIR", "").strip()

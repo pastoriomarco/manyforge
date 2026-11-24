@@ -159,8 +159,8 @@ const jointNode: ProgramTreeNode = {
   },
 };
 const program: ProgramAuthoringDocument = {
-  api_version: 'manyforge.program.v3', program_id: 'manual_fill_fixture',
-  name: 'Manual fill visual fixture', program_profile: 'composable-cell-v1',
+  api_version: 'manyforge.program.v4',
+  program_profile: 'composable-cell-v1',
   catalog: { api_version: 'manyforge.node_catalog.v3', content_version: 'fixture' },
   schema_version: 'manyforge.composer_authoring_forest.v2',
   forest: [poseNode, jointNode], positions: {},

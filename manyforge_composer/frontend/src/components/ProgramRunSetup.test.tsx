@@ -17,7 +17,6 @@ const motion = (id: string, component: string, commandTarget = 'arm') => ({
 });
 
 const applied = {
-  programId: 'dual',
   scenarioId: 'dual_cell',
   programRevision: 'sha256:0123456789abcdef',
   program: {

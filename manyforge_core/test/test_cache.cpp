@@ -34,7 +34,6 @@ ExecuteRequestDTO make_cartesian_request() {
       .compiled_frame_name = "tool";
   request.tolerances = {0.01, 0.001, 0.01};
   request.speed_profile = {0.5, 0.5, 0.2};
-  request.contact_policy_id = "free_space";
   CartesianPathDTO path;
   path.waypoints = {make_pose(0.0, 0.0, 0.0), make_pose(0.1, 0.0, 0.0),
                     make_pose(0.2, 0.0, 0.0)};
@@ -319,13 +318,26 @@ TEST(TrajectoryCacheIntentTest, GoalFrameAndReferenceRobotChangeIdentity) {
   EXPECT_EQ(identities.size(), 4U);
 }
 
-TEST(TrajectoryCacheIntentTest, ContactPolicyChangesIdentity) {
-  auto lhs = make_cartesian_request();
+TEST(TrajectoryCacheIntentTest, ContactAndReleaseRulesChangeIdentity) {
+  const auto lhs = make_cartesian_request();
   auto rhs = lhs;
-  rhs.contact_policy_id = "contact_grasp";
+  rhs.collision_rules = {CollisionRule{
+      "tip_on_part",
+      {CollisionRuleResolvedBodiesSelection{{"component/robot/model/arm/body/tip/collision/0"}}},
+      {CollisionRuleSceneObjectSelection{SceneResourceId("part")}},
+      CollisionContactRule{0.002, 0.8, std::nullopt}}};
+  EXPECT_NE(trajectory_cache_intent_identity(lhs), trajectory_cache_intent_identity(rhs));
 
-  EXPECT_NE(trajectory_cache_intent_identity(lhs),
-            trajectory_cache_intent_identity(rhs));
+  auto deeper = rhs;
+  std::get<CollisionContactRule>(deeper.collision_rules.front().value).max_penetration_m = 0.004;
+  EXPECT_NE(trajectory_cache_intent_identity(rhs), trajectory_cache_intent_identity(deeper));
+}
+
+TEST(TrajectoryCacheIntentTest, ClearanceRowsDoNotChangeIdentity) {
+  const auto lhs = make_cartesian_request();
+  auto rhs = lhs;
+  rhs.collision_rules = {CollisionRule{"this_move", {}, {}, CollisionClearanceRule{0.004}}};
+  EXPECT_EQ(trajectory_cache_intent_identity(lhs), trajectory_cache_intent_identity(rhs));
 }
 
 TEST(TrajectoryCacheIntentTest, CanonicalModelBindingChangesIdentity) {

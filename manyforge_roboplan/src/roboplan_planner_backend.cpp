@@ -182,7 +182,7 @@ validate_plan_binding(const core::PlanRequestDTO &request,
                  "native_planner_projection_binding_mismatch");
   }
   if (!request.operation_id.nonzero() || !request.participant_id.nonzero() ||
-      request.program_id.empty() || request.program_revision.empty() ||
+      request.program_revision.empty() ||
       request.program_binding_id.empty() ||
       request.move_id.empty() || request.component_type_id.empty() ||
       request.component_type_revision.empty() ||
@@ -402,7 +402,7 @@ RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
         RoboPlanCandidateProjectionDTO{request.projection_binding,
                                        request.retained_collision_world,
                                        request.retained_collision_policy,
-                                       request.contact_policy_id,
+                                       true,
                                        request.retained_clearance_margins});
     if (!selected.ok()) {
       return plan_error(selected.error());

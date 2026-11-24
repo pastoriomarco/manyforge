@@ -18,7 +18,6 @@ import type {
 } from '../types/api';
 import type { ReferenceSelectorFacts } from '../utils/referenceValidation';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
-import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { DocumentControls } from './DocumentControls';
 import { programDocumentHeader } from './ProgramDocumentControls';
 import { ScenarioActionControls } from './ScenarioActionControls';
@@ -128,10 +127,8 @@ function authoringProgram(
   keys: BlackboardKeyDeclaration[] = [],
 ): ProgramAuthoringDocument {
   return {
-    api_version: 'manyforge.program.v3',
-    program_id: 'test_program',
+    api_version: 'manyforge.program.v4',
     program_profile: 'composable-cell-v1',
-    name: 'Test Program',
     catalog: {
       api_version: 'manyforge.node_catalog.v3',
       content_version: '2.4.0',
@@ -493,7 +490,7 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('node-info-button execution-unavailable');
   });
 
-  it('exposes templates and contact policy authoring as Draft-only surfaces', () => {
+  it('exposes the pick and place templates as Draft-only surfaces', () => {
     const program: ProgramAuthoringDocument = {
       ...authoringProgram([tree], [], [{
         key: 'selected_object',
@@ -510,7 +507,6 @@ describe('Program authoring panels', () => {
           orientation: { xyzw: [0, 0, 0, 1] },
         },
       }],
-      contact_policies: [],
     };
     // The arm and its gripper as direct references of the qualified Draft candidate.
     const arm = { component_id: 'robot', command_target_id: 'arm' };
@@ -541,22 +537,11 @@ describe('Program authoring panels', () => {
         busy={false}
         onMutate={vi.fn()}
       />
-      <ProgramContactPolicyEditor
-        program={program}
-        selectorFacts={facts}
-        draftRevision={1}
-        busy={false}
-        mutate={vi.fn() as ProgramWorkspaceController['mutate']}
-      />
     </div>);
 
     expect(markup).toContain('Pick subtree');
     expect(markup).toContain('Place subtree');
-    expect(markup).toContain('Contact policies');
-    expect(markup).not.toContain('Support contacts');
-    expect(markup).toContain('Runtime object key');
-    expect(markup).toContain('Contact body source');
-    expect(markup).toContain('Selected motion endpoint');
+    expect(markup).not.toContain('Contact policy');
   });
 
   it('renders the three portable TCP selector forms', () => {
@@ -885,8 +870,8 @@ describe('Program authoring panels', () => {
       { id: 'goal', required: true, schema: { type: 'object', properties: {
         position_m: { type: 'array' }, orientation: { type: 'object' } } },
         schemaHash: 'sha256:goal', hasDefault: false },
-      { id: 'clearance_m', required: false, hasDefault: true, default: 0.001,
-        schema: { type: 'number' }, schemaHash: 'sha256:clearance' },
+      { id: 'collision_rules', required: false, hasDefault: true, default: [],
+        schema: { type: 'array' }, schemaHash: 'sha256:rules' },
     ] };
     const render = (parameters: ProgramTreeNode['parameters']) => renderToStaticMarkup(
       <ProgramPropertyEditor
@@ -898,7 +883,12 @@ describe('Program authoring panels', () => {
     );
     const goal = { frame_ref: { kind: 'cell_frame' }, position_m: [0, 0, 0],
       orientation: { xyzw: [0, 0, 0, 1] } };
-    const bound = render({ target: { component_id: 'lite6_robot', command_target_id: 'arm' }, target_mode: 'relative', goal, clearance_m: 0.004 });
+    const bound = render({ target: { component_id: 'lite6_robot', command_target_id: 'arm' }, target_mode: 'relative', goal,
+      collision_rules: [{ rule_id: 'everything', clearance_m: 0.004 }] });
+    // The move's collision rules: the Everything else clearance and one row per rule.
+    expect(bound).toContain('Collision rules');
+    expect(bound).toMatch(/aria-label="Everything else clearance"[^>]*value="0\.004"|value="0\.004"[^>]*aria-label="Everything else clearance"/);
+    expect(bound).toContain('Add collision rule');
     expect(bound).toContain('FILL FROM');
     expect(bound).toContain('Robot pose');
     expect(bound).toContain('Move preview');
@@ -956,7 +946,7 @@ describe('Program authoring panels', () => {
         programDraftId: 'program', programDraftRevision: 1,
         deploymentDraftId: 'deployment', deploymentDraftRevision: 1 },
       draft: { id: 'deployment', revision: 1, document: null,
-        deploymentArtifactId: null, deploymentRevision: null, graphRevision: null,
+        deploymentRevision: null, graphRevision: null,
         differsFromSaved: false },
       saved: { path: null, deploymentRevision: null, differsFromApplied: null },
       managerApplied: { activationOrder: null, deploymentRevision: null, scenarioId: null },
@@ -1579,8 +1569,6 @@ describe('Program authoring panels', () => {
       mutate: vi.fn(),
       newScenarioDocument: vi.fn(),
       openDraft: vi.fn(),
-      save: vi.fn(),
-      saveAs: vi.fn(),
       apply: vi.fn(),
       discard: vi.fn(),
       discardScenario: vi.fn(),
@@ -1635,8 +1623,10 @@ describe('Program authoring panels', () => {
       resumeHalt: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
+      answerOperatorQuestion: vi.fn(),
       writeRuntimeBlackboard: vi.fn(),
       persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
+      readRunKeyValues: vi.fn(() => new Promise<never>(() => undefined)),
       stageManualResult: vi.fn(),
       readiness: null,
       cellLatch: null,
@@ -1695,10 +1685,8 @@ describe('Program authoring panels', () => {
         programLoaded: true,
         authoring: {
           schema_version: 'manyforge.composer_authoring_forest.v2',
-          api_version: 'manyforge.program.v3',
-          program_id: 'program-blocked',
+          api_version: 'manyforge.program.v4',
           program_profile: 'composable-cell-v1',
-          name: 'Blocked',
           catalog: {
             api_version: 'manyforge.node_catalog.v3',
             content_version: 'fixture',
@@ -1709,11 +1697,9 @@ describe('Program authoring panels', () => {
         candidateAvailable: true,
         programRevision: `sha256:${'a'.repeat(64)}`,
         program: {
-          api_version: 'manyforge.program.v3',
-          program_id: 'program-blocked',
+          api_version: 'manyforge.program.v4',
           program_revision: `sha256:${'a'.repeat(64)}`,
           program_profile: 'composable-cell-v1',
-          name: 'Blocked',
           catalog: {
             api_version: 'manyforge.node_catalog.v3',
             content_version: 'fixture',
@@ -1770,8 +1756,6 @@ describe('Program authoring panels', () => {
       mutate: vi.fn(),
       newScenarioDocument: vi.fn(),
       openDraft: vi.fn(),
-      save: vi.fn(),
-      saveAs: vi.fn(),
       apply: vi.fn(),
       discard: vi.fn(),
       discardScenario: vi.fn(),
@@ -1826,8 +1810,10 @@ describe('Program authoring panels', () => {
       resumeHalt: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
+      answerOperatorQuestion: vi.fn(),
       writeRuntimeBlackboard: vi.fn(),
       persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
+      readRunKeyValues: vi.fn(() => new Promise<never>(() => undefined)),
       stageManualResult: vi.fn(),
       readiness: null,
       cellLatch: null,
@@ -1837,6 +1823,7 @@ describe('Program authoring panels', () => {
       <div>
         <DocumentControls
           {...programDocumentHeader(controller)}
+          scenarioPath={null}
           scenarioCommands={<ScenarioDocumentCommands controller={controller} />}
           actions={(
             <ScenarioActionControls

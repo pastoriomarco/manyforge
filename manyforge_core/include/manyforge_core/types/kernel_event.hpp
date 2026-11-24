@@ -67,7 +67,7 @@ enum class KernelEventType {
   // once when a controlled-stop monitor window closes; details retain exact
   // attempts/queries/unavailable gaps without creating a new runtime fault.
   kRuntimeCollisionCoverage,
-  kContactPolicyViolation,
+  kContactRuleViolation,
   // The outcome of a committed motion send, reported only to an addressed
   // Stop whose fence found that send still in flight: `details["dispatched"]`
   // is "true" once the session is marked dispatched; otherwise "false", with

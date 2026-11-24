@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [
       {
@@ -25,20 +25,16 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "lite6",
       "r5-live-trial"
     ]
   },
-  "description": "Mock Lite6 I/O nodes. Mock: read_part_initial scripts part_present false and reads it; wait_part scripts part_present false then true after 250 ms (timeout 2 s); check_part reads the value left true; set clamp and lamp. ROS: set plc_start (SetBool ack, 500 ms), wait for plc_ready (Bool topic, timeout 5 s). wait_operator_ack scripts operator_ack false with no change, so it times out after 5 s into a Fallback unless operator_ack is set true in the Tool & I/O panel during the wait.",
   "forest": [
     {
       "children": [
@@ -206,10 +202,8 @@
       "parameters": {}
     }
   ],
-  "name": "mock_lite6_io_nodes",
   "parameters": [],
   "positions": {},
-  "program_id": "mock_lite6_io_nodes",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

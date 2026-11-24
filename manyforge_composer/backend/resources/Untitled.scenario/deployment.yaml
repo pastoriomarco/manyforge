@@ -1,8 +1,16 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "attachments": [],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
+  "compatibility": {
+    "provides": [],
+    "tags": []
+  },
   "components": [],
-  "deployment_artifact_id": "empty_scenario",
-  "name": "Empty Deployment",
   "policies": {}
 }

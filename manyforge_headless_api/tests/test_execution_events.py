@@ -672,7 +672,7 @@ def test_execution_client_releases_a_halt_at_its_hold_revision(
             "api_version": "manyforge.execution_command_response.v6",
             "command": "release_halt",
             "ok": True,
-            "scope": {"schema_version": "manyforge.program_execution_scope.v3"},
+            "scope": {"schema_version": "manyforge.program_execution_scope.v4"},
         }
 
     monkeypatch.setattr(client, "_exchange", exchange)
@@ -857,7 +857,6 @@ def _direct_motion_request() -> OperationIntentRequest:
                 "request_key": _PREVIEW_KEY,
                 "source_label": "composer_ui",
             },
-            "program_id": "manyforge.direct_control.motion",
             "program_revision": "sha256:program",
             "program_binding_id": "sha256:binding",
             "program_run_id": None,
@@ -898,7 +897,7 @@ def _direct_motion_request() -> OperationIntentRequest:
                             "joint_names": ["joint1"],
                             "positions_rad": [0.2],
                         },
-                        "contact_policy_id": None,
+                        "collision_rules": [],
                         "per_joint_dynamics_limits": {},
                         "motion_interrupt_scopes": [],
                         "runtime_object_bindings": [],
@@ -928,7 +927,6 @@ def _preview_response(operation: dict[str, Any]) -> dict[str, Any]:
             "sha256:" + hashlib.sha256(rfc8785.dumps(operation)).hexdigest()
         ),
         "program_binding_id": "sha256:binding",
-        "program_id": "manyforge.direct_control.motion",
         "program_revision": "sha256:program",
         "program_run_id": None,
         "request_key": _PREVIEW_KEY,
@@ -981,7 +979,6 @@ def test_motion_request_keeps_mounted_tcp_owner_and_direct_frame() -> None:
 def _direct_command_request() -> OperationIntentRequest:
     value = _direct_motion_request().model_dump(mode="json")
     value["request_context"]["request_key"] = _GRIPPER_KEY
-    value["program_id"] = "manyforge.direct_control.gripper"
     value["program_revision"] = "sha256:gripper-program"
     value["program_binding_id"] = "sha256:gripper-binding"
     participant = value["participants"][0]
@@ -1015,7 +1012,6 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "max_position": 0.04,
         "min_position": 0.0,
         "program_binding_id": "sha256:gripper-binding",
-        "program_id": "manyforge.direct_control.gripper",
         "program_revision": "sha256:gripper-program",
         "program_run_id": None,
         "request_key": _GRIPPER_KEY,

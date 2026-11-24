@@ -299,3 +299,30 @@ def test_removed_contact_release_clearance_field_stays_out_of_the_repository() -
         )
 
     assert failures == []
+
+
+def test_change_request_fields_come_from_the_request_schemas() -> None:
+    module = _load_generator_module()
+    spec = {
+        "components": {"schemas": {
+            "Base": {"properties": {"draftId": {}, "requestKey": {}}},
+            "Edit": {"allOf": [{"$ref": "#/components/schemas/Base"}],
+                     "properties": {"path": {}}},
+        }},
+    }
+    operation = {"requestBody": {"content": {"application/json": {
+        "schema": {"$ref": "#/components/schemas/Edit"}}}}}
+    assert module._body_fields(spec, operation) == ["path", "draftId", "requestKey"]
+    documented = {"requestBody": {"content": {"application/json": {"schema": {
+        "$ref": "#/$defs/Body",
+        "$defs": {"Body": {"properties": {"request_key": {}}}},
+    }}}}}
+    assert module._body_fields(spec, documented) == ["request_key"]
+
+
+def test_change_requests_fail_when_a_fence_field_is_renamed() -> None:
+    module = _load_generator_module()
+    spec = {"paths": {"/api/program/save": {"post": {"requestBody": {"content": {
+        "application/json": {"schema": {"properties": {"requestKey": {}}}}}}}}}}
+    with pytest.raises(RuntimeError, match="fence fields no longer"):
+        module._append_change_requests([], spec, {"sources": {}, "drafts": {}})

@@ -27,11 +27,13 @@ import type {
   DeploymentControlledStopUpdate,
   JsonValue,
   LocalWorkspaceFenceRequest,
+  ToolReplacement,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { newRequestKey, type ApplicationStartId } from '../api/applicationIdentity';
 import { deploymentActionUnavailableReason } from '../state/documentStates';
+import { toolReplacementText } from '../utils/componentManager';
 
 /**
  * The text of a refused Preview/Apply/Load/New: the
@@ -403,6 +405,35 @@ export function useDeploymentWorkspace(
       'edit',
       'edit',
     ),
+    /** Remove a component and the attachment rows that name it, in one Draft edit. */
+    removeComponent: (componentId: string) => run(
+      (requestFence) => api.deploymentWorkspace.removeComponent(requestFence, componentId),
+      'Component removed from the Deployment Draft; Apply removes it from the cell.',
+      'edit',
+      'edit',
+    ),
+    /**
+     * Replace tool (OD-367): `replacementId` takes over the mount of the tool
+     * `componentId` and every reference to it, in one Draft edit. Resolves to
+     * what the new tool lacks, or null when refused.
+     */
+    replaceTool: async (componentId: string, replacementId: string): Promise<ToolReplacement | null> => {
+      const result: { replacement: ToolReplacement | null } = { replacement: null };
+      const next = await run(
+        async (requestFence) => {
+          const response = await api.deploymentWorkspace.replaceTool(requestFence, componentId, replacementId);
+          result.replacement = response.replacement;
+          return response.workspace;
+        },
+        `${componentId} replaced by ${replacementId} in the Drafts; Apply brings it into the cell.`,
+        'edit',
+        'edit',
+      );
+      if (next === null || result.replacement === null) return null;
+      // What it lacks stays shown on the Components page until dismissed.
+      if (mounted.current) setFeedback(toolReplacementText(result.replacement));
+      return result.replacement;
+    },
     /**
      * The per-component impact of applying the Draft; effect-free.
      * Null when another operation is in progress.
@@ -431,20 +462,6 @@ export function useDeploymentWorkspace(
       'edit',
       'edit',
     ),
-    save: () => run(
-      (requestFence) => api.deploymentWorkspace.save(requestFence),
-      'Deployment Draft saved; Manager Applied was unchanged.',
-      'document',
-      'save',
-    ),
-    saveAs: (path: string, confirmOverwrite: boolean) => run(
-      (requestFence) => api.deploymentWorkspace.saveAs(
-        requestFence, path, confirmOverwrite,
-      ),
-      'Deployment Draft saved to the selected path; Manager Applied was unchanged.',
-      'document',
-      'save_as',
-    ),
     discard: () => run(
       (requestFence) => api.deploymentWorkspace.discard(requestFence),
       'Deployment Draft changes discarded; Manager Applied was unchanged.',
@@ -472,12 +489,14 @@ export function useDeploymentWorkspace(
      * The Apply of a Preview confirmed earlier, sent by Reset and Apply once
      * the run's Reset settled. Resolves to null when it was refused.
      */
-    applyConfirmedScope: (scope: ApplyPreview['scope']) => (
-      sendApply(() => api.cellApply.apply(scope), 'Deployment Apply request failed.', 'apply')
+    applyConfirmedScope: (scope: ApplyPreview['scope'], confirmedCollisionRuleIds: string[] = []) => (
+      sendApply(() => api.cellApply.apply(scope, confirmedCollisionRuleIds),
+        'Deployment Apply request failed.', 'apply')
     ),
     /** The Revert of a Preview confirmed earlier, sent by Reset and Revert. */
-    revertConfirmedScope: (scope: ApplyPreview['scope']) => (
-      sendApply(() => api.cellApply.revert(scope), 'Deployment Revert request failed.', 'revert')
+    revertConfirmedScope: (scope: ApplyPreview['scope'], confirmedCollisionRuleIds: string[] = []) => (
+      sendApply(() => api.cellApply.revert(scope, confirmedCollisionRuleIds),
+        'Deployment Revert request failed.', 'revert')
     ),
     /**
      * Send the Apply (or Revert) the operator confirmed, bound to the Preview
@@ -486,10 +505,12 @@ export function useDeploymentWorkspace(
     confirmApply: () => {
       if (applyPreview === null) return Promise.resolve(null);
       const { scope } = applyPreview;
+      // Confirming the Preview confirms the collision rule changes it lists.
+      const ruleIds = applyPreview.collision_rules.map((row) => row.rule_id);
       openConfirmation(false);
       return applyPreviewKind === 'revert'
-        ? sendApply(() => api.cellApply.revert(scope), 'Deployment Revert request failed.', 'revert')
-        : sendApply(() => api.cellApply.apply(scope), 'Deployment Apply request failed.', 'apply');
+        ? sendApply(() => api.cellApply.revert(scope, ruleIds), 'Deployment Revert request failed.', 'revert')
+        : sendApply(() => api.cellApply.apply(scope, ruleIds), 'Deployment Apply request failed.', 'apply');
     },
     cancelApplyConfirmation: () => openConfirmation(false),
   }), [applyPreview, applyPreviewKind, mutationUnavailableReason, openConfirmation, revertPreviewUnavailableReason, preview, run, sendApply, showPreview, workspace]);

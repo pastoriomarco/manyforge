@@ -96,17 +96,9 @@ namespace {
 }
 
 [[nodiscard]] ScenarioDeploymentCompatibilityDTO Compatibility(
-    const CanonicalValue &value, const std::string &path) {
-  const auto &object = Object(value, path);
-  if (object.size() != 2U || value.find_object_member("lane") == nullptr ||
-      value.find_object_member("provides") == nullptr)
-    Fail(path + " must contain exactly lane and provides");
-  ScenarioDeploymentCompatibilityDTO result{
-      IdentifierValue(Member(value, "lane", path), path + ".lane"), {}};
-  if (result.lane != "manyforge-only" && result.lane != "isaac-sim" &&
-      result.lane != "real-robot")
-    Fail(path + ".lane is unsupported");
-  const auto &provides = Array(Member(value, "provides", path), path + ".provides");
+    const CanonicalValue &provides_value, const std::string &path) {
+  ScenarioDeploymentCompatibilityDTO result;
+  const auto &provides = Array(provides_value, path + ".provides");
   if (provides.size() > 4096U)
     Fail(path + ".provides exceeds its fixed bound");
   for (std::size_t index = 0; index < provides.size(); ++index)
@@ -127,12 +119,9 @@ ScenarioDeploymentCompatibilityDTO scenario_deployment_compatibility(
       deployment.normalized_authored_root(), "compatibility", "deployment");
   if (compatibility == nullptr)
     Fail("scenario deployment has no compatibility projection");
-  CanonicalValue::Object projection{
-      {"lane", Member(*compatibility, "lane", "deployment.compatibility")},
-      {"provides", Member(*compatibility, "provides", "deployment.compatibility")},
-  };
-  return Compatibility(CanonicalValue(std::move(projection)),
-                       "deployment.compatibility");
+  return Compatibility(
+      Member(*compatibility, "provides", "deployment.compatibility"),
+      "deployment.compatibility");
 }
 
 void verify_scenario_program_admission(
@@ -142,12 +131,8 @@ void verify_scenario_program_admission(
   CanonicalValue::Array provides;
   for (const auto &item : deployment_compatibility.provides)
     provides.emplace_back(item);
-  static_cast<void>(Compatibility(
-      CanonicalValue(CanonicalValue::Object{
-          {"lane", CanonicalValue(deployment_compatibility.lane)},
-          {"provides", CanonicalValue(std::move(provides))},
-      }),
-      "scenario.deployment_compatibility"));
+  static_cast<void>(Compatibility(CanonicalValue(std::move(provides)),
+                                  "scenario.deployment_compatibility"));
 
   if (Text(Member(program, "program_profile", "Program"),
            "Program.program_profile") != core::kComposableCellProgramProfile)
@@ -160,19 +145,15 @@ void verify_scenario_program_admission(
           bundle.catalogs.node_environment.content_version)
     Fail("scenario Program selects another retained node catalog");
 
-  std::set<std::string, std::less<>> lanes;
   std::set<std::string, std::less<>> requirements;
   std::optional<std::string> program_assistant;
   if (const auto *compatibility = OptionalObject(program, "compatibility", "Program");
       compatibility != nullptr) {
-    lanes = StringSet(*compatibility, "lanes", "Program.compatibility");
     requirements = StringSet(*compatibility, "requires", "Program.compatibility");
     if (const auto *assistant = compatibility->find_object_member("assistant");
         assistant != nullptr)
       program_assistant = Text(*assistant, "Program.compatibility.assistant");
   }
-  if (!lanes.empty() && !lanes.contains(deployment_compatibility.lane))
-    Fail("scenario deployment lane is incompatible with the Program");
   const std::set<std::string, std::less<>> provided(
       deployment_compatibility.provides.begin(),
       deployment_compatibility.provides.end());

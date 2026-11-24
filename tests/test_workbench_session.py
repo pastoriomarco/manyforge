@@ -17,7 +17,7 @@ FIRST = "a" * 32
 SECOND = "b" * 32
 THIRD = "c" * 32
 JOURNALS = (
-    "program-cycle.sqlite3", "logical-scene.sqlite3", "manager/journal.sqlite3",
+    "program-cycle.sqlite3", "manager/journal.sqlite3",
     "execution-state/operation-journal.sqlite3",
 )
 
@@ -99,8 +99,8 @@ def test_fresh_selection_contains_only_marker_and_history_is_stable(tmp_path):
     assert report["archive_relative_path"] == "previous-runs/" + FIRST
     assert report["history_coverage"] == "not_imported"
     assert "Up to five previous runs (2 GiB in total) are normally kept" in report["message"]
-    assert set(report["journal_families"]) == {"program_cycle", "scene", "manager", "kernel_operation"}
-    assert report["schema_version"] == "manyforge.workbench_previous_session.v2"
+    assert report["journal_families"] == ["program_cycle", "manager", "kernel_operation"]
+    assert report["schema_version"] == "manyforge.workbench_previous_session.v3"
     # No Kernel journal in that run: the unfinished operations are unknown.
     assert report["unfinished_operations"] is None
     assert report["unfinished_operation_count"] is None
@@ -584,7 +584,7 @@ def test_report_marks_the_program_family_incomplete_from_its_writer_mark(tmp_pat
     if lost:
         assert report["effects"] == "unknown"
         assert ("Unknown journal families: kernel_operation, manager, program_cycle "
-                "(some records of that start could not be written), scene.") in report["message"]
+                "(some records of that start could not be written).") in report["message"]
         assert "Unresolved journal families" not in report["message"]
     else:
         assert report["effects"] == "unresolved"
@@ -616,19 +616,31 @@ def test_classifier_marks_the_manager_family_incomplete_from_any_store_mark(tmp_
     assert "manager" not in unresolved
 
 
-def test_classifier_marks_the_scene_family_incomplete_from_its_store_mark(tmp_path):
-    resources = Path(__file__).resolve().parents[1] / "manyforge_scene/resources"
-    path = tmp_path / "logical-scene.sqlite3"
-    with closing(sqlite3.connect(path)) as database:
-        for resource in sorted(resources.glob("00*.sql")):
-            database.executescript(resource.read_text())
-        _insert_metadata_row(database, "logical_scene_store_metadata")
-        database.commit()
+def test_the_scene_has_no_journal_family(tmp_path):
+    # The Scene is held in memory; a scene file left by an earlier version is
+    # archived with the run but is not a journal family.
+    (tmp_path / "logical-scene.sqlite3").write_bytes(b"earlier scene file")
     _, unknown, unresolved, incomplete = sessions.run_session._effect_observations(tmp_path)
-    assert "scene" not in incomplete
-    _mark_records_lost(path, "logical_scene_store_metadata")
-    _, unknown, unresolved, incomplete = sessions.run_session._effect_observations(tmp_path)
-    assert "scene" in unknown and "scene" in incomplete and "scene" not in unresolved
+    assert sorted(unknown) == ["kernel_operation", "manager", "program_cycle"]
+    assert unresolved == [] and incomplete == []
+
+
+def test_a_pending_report_of_the_earlier_version_is_kept_as_recorded(tmp_path):
+    # A v2 report (four families, "scene" among them) that Headless had not
+    # filed yet stays pending, byte for byte; Headless files it as recorded.
+    root = tmp_path / "runtime"
+    select(root, FIRST)
+    select(root, SECOND)
+    pending = root / "session-reports/pending" / (FIRST + ".json")
+    earlier = dict(json.loads(pending.read_text()),
+                   schema_version="manyforge.workbench_previous_session.v2",
+                   journal_families=["program_cycle", "scene", "manager", "kernel_operation"])
+    pending.write_text(json.dumps(earlier))
+    recorded = pending.read_bytes()
+    marker = select(root, THIRD)
+    assert pending.read_bytes() == recorded
+    assert marker["previous_session"]["schema_version"] == "manyforge.workbench_previous_session.v3"
+    assert json.loads((root / "session-reports/pending" / (SECOND + ".json")).read_text()) == marker["previous_session"]
 
 
 def test_selection_below_the_disk_floor_is_refused_before_anything_is_written(tmp_path, monkeypatch, capsys):

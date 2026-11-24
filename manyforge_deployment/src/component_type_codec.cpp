@@ -301,6 +301,30 @@ decode_collision_body_roles(const CanonicalValue& value) {
   std::vector<core::ComponentTypeCollisionBodyRoleDTO> result;
   result.reserve(source.size());
   for (const auto& item : source) {
+    bool optional = false;
+    if (const auto* tagged = item.find_object_member("optional")) {
+      const auto* flag = std::get_if<bool>(&tagged->storage());
+      if (flag == nullptr) {
+        fail("component-type normalized field is not a boolean: optional");
+      }
+      optional = *flag;
+    }
+    std::optional<core::ComponentTypeSpringSliderDTO> spring_slider;
+    if (const auto* slider = item.find_object_member("spring_slider")) {
+      const auto& axis = require_array(require_member(*slider, "axis"), "axis");
+      if (axis.size() != 3U) fail("component-type spring slider axis is not 3 numbers");
+      core::ComponentTypeSpringSliderDTO decoded;
+      for (std::size_t index = 0; index != axis.size(); ++index)
+        decoded.axis[index] = require_number(axis[index], "axis");
+      decoded.stroke_m = require_number(require_member(*slider, "stroke_m"), "stroke_m");
+      decoded.trip_depth_m =
+          require_number(require_member(*slider, "trip_depth_m"), "trip_depth_m");
+      if (const auto* release = slider->find_object_member("release_depth_m"))
+        decoded.release_depth_m = require_number(*release, "release_depth_m");
+      decoded.max_compression_step_m = require_number(
+          require_member(*slider, "max_compression_step_m"), "max_compression_step_m");
+      spring_slider = decoded;
+    }
     result.push_back({
         core::CollisionBodyRoleId(require_string(
             require_member(item, "collision_body_role_id"),
@@ -310,6 +334,8 @@ decode_collision_body_roles(const CanonicalValue& value) {
         core::CollisionBodyRoleId(require_string(
             require_member(item, "asset_collision_body_role_id"),
             "asset_collision_body_role_id")),
+        optional,
+        std::move(spring_slider),
     });
   }
   return result;
@@ -344,6 +370,11 @@ decode_command_targets(const CanonicalValue& value) {
       default_tcp = core::FrameRoleId(
           require_string(*selected, "default_tcp_frame_role_id"));
     }
+    std::optional<core::CollisionBodyRoleId> grip_body;
+    if (const auto* selected = item.find_object_member("grip_body_role_id")) {
+      grip_body = core::CollisionBodyRoleId(
+          require_string(*selected, "grip_body_role_id"));
+    }
     result.push_back({
         core::CommandTargetId(require_string(
             require_member(item, "command_target_id"),
@@ -355,6 +386,7 @@ decode_command_targets(const CanonicalValue& value) {
             require_member(item, "collision_body_roles")),
         decode_capabilities(require_member(item, "capabilities")),
         std::move(default_tcp),
+        std::move(grip_body),
     });
   }
   return result;
@@ -674,6 +706,18 @@ void validate_target(
   if (has_tcp && motion_target && !tagged(core::FrameRoleId("flange"))) {
     fail("robot_flange_tcp_missing: motion target '" +
          target.command_target_id.value() + "' exposes no flange TCP");
+  }
+  // The grip body is one of the target's own collision-body roles.
+  if (target.grip_body_role_id.has_value() &&
+      std::none_of(target.collision_body_roles.begin(),
+                   target.collision_body_roles.end(),
+                   [&target](const auto& body) {
+                     return body.collision_body_role_id ==
+                            *target.grip_body_role_id;
+                   })) {
+    fail("grip_body_unknown: command target '" +
+         target.command_target_id.value() +
+         "' names a grip body that is none of its collision bodies");
   }
   // O5: a passive tool's frame-only target (frame and collision roles only)
   // selects no capability.

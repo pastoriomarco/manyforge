@@ -5,6 +5,7 @@
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/collision_rule.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/io_signal.hpp>
@@ -266,10 +267,11 @@ struct Configuration final {
   std::optional<std::uint32_t> runtime_collision_lookahead_workers;
   std::optional<double> runtime_dynamic_body_max_age_cap_ms;
   std::optional<std::uint32_t> validation_collision_workers;
-  /// Collision clearance (m), the planner/validation collision-check
+  /// The cell's collision rules (the Deployment's `collision_rules`, the
+  /// first without selections), the planner/validation collision-check
   /// step (rad) and whether fresh plans get the pre-dispatch waypoint check;
   /// absent keeps the kernel defaults.
-  std::optional<double> collision_clearance_m;
+  std::optional<std::vector<core::CollisionRuleDTO>> collision_rules;
   std::optional<double> collision_check_step_rad;
   std::optional<bool> collision_check_fresh_plans;
 
@@ -345,8 +347,7 @@ struct Configuration final {
 [[nodiscard]] CanonicalValue empty_host_configuration();
 
 [[nodiscard]] CanonicalValue empty_host_deployment(
-    const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference,
-    std::string_view deployment_id, std::string_view name);
+    const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference);
 
 [[nodiscard]] Configuration
 require_configuration(const RetainedBundle &retained_bundle,

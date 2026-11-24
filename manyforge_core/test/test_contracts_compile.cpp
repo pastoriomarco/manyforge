@@ -249,6 +249,8 @@ TEST(ContractsCompile, CollisionShapeVariant) {
   MeshShapeDTO mesh;
   mesh.resource_uri = "package://mesh.stl";
   mesh.scale = {1.0, 1.0, 1.0};
+  mesh.content_digest =
+      "sha256:0000000000000000000000000000000000000000000000000000000000000000";
   CollisionShapeDTO s4 = mesh;
   EXPECT_TRUE(std::holds_alternative<MeshShapeDTO>(s4));
 }
@@ -263,8 +265,8 @@ TEST(ContractsCompile, ErrorCodeConstants) {
   EXPECT_STREQ(kErrorPlanningTimeout, "planning_timeout");
   EXPECT_STREQ(kErrorStartStateMismatch, "start_state_mismatch");
   EXPECT_STREQ(kErrorValidationCollision, "validation_collision");
-  EXPECT_STREQ(kErrorInvalidContactPolicy, "invalid_contact_policy");
-  EXPECT_STREQ(kErrorContactPolicyViolation, "contact_policy_violation");
+  EXPECT_STREQ(kErrorInvalidCollisionRule, "invalid_collision_rule");
+  EXPECT_STREQ(kErrorContactRuleViolation, "contact_rule_violation");
   EXPECT_STREQ(kErrorObjectAlreadyExists, "object_already_exists");
   EXPECT_STREQ(kErrorExecutionRejected, "execution_rejected");
   EXPECT_STREQ(kErrorExecutionAborted, "execution_aborted");
@@ -273,10 +275,10 @@ TEST(ContractsCompile, ErrorCodeConstants) {
   EXPECT_STREQ(kErrorInvariantViolation, "invariant_violation");
   EXPECT_STREQ(to_string(ErrorCode::kInvalidRequest), kErrorInvalidRequest);
   EXPECT_STREQ(to_string(ErrorCode::kPlanningFailed), kErrorPlanningFailed);
-  EXPECT_STREQ(to_string(ErrorCode::kInvalidContactPolicy),
-               kErrorInvalidContactPolicy);
-  EXPECT_STREQ(to_string(ErrorCode::kContactPolicyViolation),
-               kErrorContactPolicyViolation);
+  EXPECT_STREQ(to_string(ErrorCode::kInvalidCollisionRule),
+               kErrorInvalidCollisionRule);
+  EXPECT_STREQ(to_string(ErrorCode::kContactRuleViolation),
+               kErrorContactRuleViolation);
 }
 
 // Test CacheMode enum values

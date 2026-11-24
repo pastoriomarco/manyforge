@@ -1,4 +1,4 @@
-"""Direct-reference mutations against the genuine native v3 binding fixture."""
+"""Direct-reference mutations against the genuine native v4 binding fixture."""
 
 import copy
 import json
@@ -15,7 +15,7 @@ from manyforge_headless_api.program_binding_transport import (
 
 FIXTURE = (Path(__file__).resolve().parents[2] /
            "manyforge_deployment/resources/program_binding_lite6_native.fixture.json")
-VERSION = "manyforge.program_binding.v3"
+VERSION = "manyforge.program_binding.v4"
 
 
 @pytest.mark.parametrize("collection", ["target_bindings", "frame_bindings", "collision_body_bindings"])
@@ -23,7 +23,7 @@ VERSION = "manyforge.program_binding.v3"
 def test_direct_reference_is_a_closed_qualified_identity(collection, fault):
     document = json.loads(FIXTURE.read_text(encoding="utf-8"))
     if document.get("api_version") != VERSION:
-        pytest.skip("genuine native v3 binding fixture is not available")
+        pytest.skip("genuine native v4 binding fixture is not available")
     validate_program_binding(document)
     mutated = copy.deepcopy(document)
     reference = mutated[collection][0]["target" if collection == "target_bindings" else "reference"]

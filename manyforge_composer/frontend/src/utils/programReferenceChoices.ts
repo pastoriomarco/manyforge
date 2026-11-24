@@ -101,7 +101,7 @@ export function programSceneResourceIds(
   return (program.scene ?? []).map((resource) => resource.scene_resource_id);
 }
 
-/** Contact-policy runtime objects are only Scene-resource blackboard keys. */
+/** The blackboard keys of type scene_resource: the keys a collision rule's Scene object selection can read. */
 export function programSceneResourceBlackboardKeys(
   program: Pick<ProgramAuthoringDocument, 'blackboard'>,
 ): string[] {

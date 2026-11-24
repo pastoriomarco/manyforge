@@ -3,11 +3,12 @@ import { parseApplyPreview } from './components';
 
 const preview = () => ({
   components: [], scope: {},
-  program: { executable: false, program_id: 'program', unresolved_references: [{
+  program: { executable: false, unresolved_references: [{
     target: { component_id: 'robot', command_target_id: 'arm' },
     reason: 'component_missing', detail: 'component is absent',
   }], affected_nodes: ['move'], affected_execution_groups: [] },
-  attachment_changed_components: [], detached_components: [],
+  attachment_changed_components: [], detached_components: [], collision_rules: [],
+  mesh_depth_reports: [],
 });
 
 describe('direct deployment-preview references', () => {

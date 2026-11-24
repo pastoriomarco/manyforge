@@ -35,6 +35,7 @@ import type {
 } from '../types/headless';
 import type {
   ExecutionObservationFrame,
+  ExecutionObservationSpringCompression,
   ExecutionObservationTarget,
   ExecutionObservationReader,
   ExecutionObservationTransportPhase,
@@ -101,7 +102,8 @@ function sameExecutionObservationFrame(
     && current.retainedBundleId === candidate.retainedBundleId
     && current.graphRevision === candidate.graphRevision
     && sameExecutionObservationTargets(current.targets, candidate.targets)
-    && sameExecutionObservationTargets(current.measuredTargets, candidate.measuredTargets);
+    && sameExecutionObservationTargets(current.measuredTargets, candidate.measuredTargets)
+    && JSON.stringify(current.springCompressions ?? []) === JSON.stringify(candidate.springCompressions ?? []);
 }
 
 export function parseExecutionObservationFrame(raw: unknown): ExecutionObservationFrame {
@@ -126,6 +128,9 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
     'source_epoch',
     'source_sequence',
     'targets',
+    // Present only while a spring pair is compressed.
+    ...(raw !== null && typeof raw === 'object' && 'spring_compressions' in raw
+      ? ['spring_compressions'] : []),
   ]);
   const text = (key: string, source = record): string => {
     const value = source[key];
@@ -212,6 +217,8 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
   }
   const targets = parseTargets('targets');
   const measuredTargets = parseTargets('measured_targets');
+  const springCompressions = record.spring_compressions === undefined
+    ? undefined : parseSpringCompressions(record.spring_compressions, object, text);
   return Object.freeze({
     schemaVersion: EXECUTION_OBSERVATION_SCHEMA,
     deliverySequence: integer('delivery_sequence'),
@@ -225,6 +232,44 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
     receivedAtMonotonicUs: integer('received_at_monotonic_us'),
     targets,
     measuredTargets,
+    ...(springCompressions === undefined ? {} : { springCompressions }),
+  });
+}
+
+function parseSpringCompressions(
+  raw: unknown,
+  object: (value: unknown, keys: string[]) => Record<string, unknown>,
+  text: (key: string, source: Record<string, unknown>) => string,
+): ExecutionObservationSpringCompression[] {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 64) {
+    throw new Error('Execution observation spring compression count is invalid.');
+  }
+  return raw.map((value) => {
+    const row = object(value, ['a', 'depth_m', 'push_direction', 'rule_id']);
+    const side = row.a as Record<string, unknown> | null;
+    const kind = side !== null && typeof side === 'object' ? side.kind : undefined;
+    const a: ExecutionObservationSpringCompression['a'] = kind === 'component_link'
+      ? (() => {
+        const fields = object(side, ['component_id', 'kind', 'link']);
+        return { kind: 'component_link' as const, componentId: text('component_id', fields), link: text('link', fields) };
+      })()
+      : kind === 'scene_object'
+        ? { kind: 'scene_object' as const, sceneResourceId: text('scene_resource_id', object(side, ['kind', 'scene_resource_id'])) }
+        : (() => { throw new Error('Execution observation spring compression side is invalid.'); })();
+    const depth = row.depth_m;
+    const direction = row.push_direction;
+    if (typeof depth !== 'number' || !Number.isFinite(depth) || depth <= 0
+      || !Array.isArray(direction) || direction.length !== 3
+      || direction.some((item) => typeof item !== 'number' || !Number.isFinite(item))
+      || Math.abs(Math.hypot(...(direction as number[])) - 1) > 1e-6) {
+      throw new Error('Execution observation spring compression is invalid.');
+    }
+    return Object.freeze({
+      ruleId: text('rule_id', row),
+      a: Object.freeze(a),
+      depthM: depth,
+      pushDirection: [...direction] as [number, number, number],
+    });
   });
 }
 

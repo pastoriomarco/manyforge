@@ -1,12 +1,11 @@
 #pragma once
 
-#include <manyforge_core/types/contact_policy.hpp>
-
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/tcp_entry.hpp>
 
+#include <array>
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -16,7 +15,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kProgramBindingApiVersion =
-    "manyforge.program_binding.v3";
+    "manyforge.program_binding.v4";
 inline constexpr std::size_t kMaxProgramRoleBindings = 4096U;
 inline constexpr std::size_t kMaxProgramNestedRoleBindings = 4096U;
 inline constexpr std::size_t kMaxProgramCapabilityBindings = 4096U;
@@ -188,35 +187,34 @@ struct ProgramTargetBindingDTO final {
                          const ProgramTargetBindingDTO&) = default;
 };
 
-/// One direct body selector resolved through the exact retained model map. `collision_body_ids` use the immutable component/model/
-/// role/index identity consumed by the retained collision-world projector.
-struct ProgramContactGraspBodyBindingDTO final {
+/// One collision body that a node's collision rule selects, resolved through
+/// the exact retained model map. `collision_body_ids` use the immutable
+/// component/model/role/index identity consumed by the retained
+/// collision-world projector.
+struct ProgramCollisionRuleBodyBindingDTO final {
   ProgramCollisionBodyReferenceDTO body;
   std::optional<ModelRoleId> model_role_id;
   ModelInstanceId model_instance_id;
   ModelRevision model_revision;
   std::vector<std::string> collision_body_ids;
 
-  friend bool operator==(const ProgramContactGraspBodyBindingDTO&,
-                         const ProgramContactGraspBodyBindingDTO&) = default;
+  friend bool operator==(const ProgramCollisionRuleBodyBindingDTO&,
+                         const ProgramCollisionRuleBodyBindingDTO&) = default;
 };
 
-/// Closed Program-Binding form of one geometry-only contact-grasp template.
-/// The runtime object remains portable until an operation binds it to one
-/// current logical-scene resource.
-struct ProgramContactGraspBindingDTO final {
-  ContactPolicyId contact_policy_id;
-  ContactPolicyRevision contact_policy_revision;
-  RuntimeObjectId runtime_object_id;
-  std::vector<ProgramContactGraspBodyBindingDTO> allowed_body_bindings;
-  ContactZoneEnvelopeDTO envelope{ContactGraspEnvelopeDTO{}};
+/// One generated-tool spring slider that a node's collision rule switches on
+/// (OD-371), with the numbers a motion spells the rule out with: `body` is
+/// {tool, slider element = its collision body role}; `axis` the unit slider
+/// axis in the slider link frame; `stroke_m` the rule's max_penetration_m and
+/// `max_compression_step_m` its step limit.
+struct ProgramSpringSliderBindingDTO final {
+  ProgramCollisionBodyReferenceDTO body;
+  std::array<double, 3> axis{};
+  double stroke_m{};
+  double max_compression_step_m{};
 
-  /// Omitted from canonical bytes when false. Endpoint bodies are selected
-  /// only at operation admission, never mixed with explicit body bindings.
-  bool bodies_from_motion_endpoint{};
-
-  friend bool operator==(const ProgramContactGraspBindingDTO&,
-                         const ProgramContactGraspBindingDTO&) = default;
+  friend bool operator==(const ProgramSpringSliderBindingDTO&,
+                         const ProgramSpringSliderBindingDTO&) = default;
 };
 
 struct ProgramBindingProvenanceDTO final {
@@ -228,7 +226,7 @@ struct ProgramBindingProvenanceDTO final {
                          const ProgramBindingProvenanceDTO&) = default;
 };
 
-/// Complete closed `manyforge.program_binding.v3` semantic value.
+/// Complete closed `manyforge.program_binding.v4` semantic value.
 ///
 /// This aggregate is an untrusted value representation. The deployment
 /// package's binding compiler and reload authority are the only producers of
@@ -236,7 +234,6 @@ struct ProgramBindingProvenanceDTO final {
 struct ProgramBindingDTO final {
   std::string api_version;
   ProgramBindingId program_binding_id;
-  ProgramId program_id;
   ProgramRevision program_revision;
   RetainedBundleId retained_bundle_id;
   GraphRevision graph_revision;
@@ -247,8 +244,11 @@ struct ProgramBindingDTO final {
   std::vector<ProgramSignalBindingDTO> signal_bindings;
   std::vector<ProgramCollisionBodyBindingDTO> collision_body_bindings;
   ProgramBindingProvenanceDTO provenance;
-  std::vector<ProgramContactGraspBindingDTO> contact_grasp_bindings{};
+  /// Sorted by `body`, unique.
+  std::vector<ProgramCollisionRuleBodyBindingDTO> collision_rule_bodies{};
   std::vector<ProgramNodePolicyDTO> node_policies{};
+  /// Sorted by `body`, unique; every slider is also a collision-rule body.
+  std::vector<ProgramSpringSliderBindingDTO> collision_rule_spring_sliders{};
 
   friend bool operator==(const ProgramBindingDTO&,
                          const ProgramBindingDTO&) = default;

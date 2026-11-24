@@ -53,6 +53,53 @@ RoboPlanSceneInput bounded_input() {
                                std::vector<double>{10.0}}}};
 }
 
+// Two links on one base, each turning about z with a sphere 0.5 m out: at
+// equal angles the spheres coincide. Only joint_a is in the planned group.
+constexpr std::string_view kTwoBranchRobot = R"(
+<robot name="two_branch_robot" version="1.0">
+  <link name="base"/>
+  <link name="link_a">
+    <collision>
+      <origin xyz="0.5 0 0"/>
+      <geometry><sphere radius="0.05"/></geometry>
+    </collision>
+  </link>
+  <link name="link_b">
+    <collision>
+      <origin xyz="0.5 0 0"/>
+      <geometry><sphere radius="0.05"/></geometry>
+    </collision>
+  </link>
+  <joint name="joint_a" type="revolute">
+    <parent link="base"/>
+    <child link="link_a"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3" upper="3" effort="5" velocity="2"/>
+  </joint>
+  <joint name="joint_b" type="revolute">
+    <parent link="base"/>
+    <child link="link_b"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3" upper="3" effort="5" velocity="2"/>
+  </joint>
+</robot>)";
+
+constexpr std::string_view kTwoBranchSemanticRobot = R"(
+<robot name="two_branch_robot">
+  <group name="arm"><joint name="joint_a"/></group>
+</robot>)";
+
+RoboPlanSceneInput two_branch_input() {
+  const auto limits = [](std::string joint) {
+    return RoboPlanJointLimitInput{std::move(joint), std::vector<double>{-3.0},
+                                   std::vector<double>{3.0}, std::vector<double>{1.5},
+                                   std::vector<double>{10.0}};
+  };
+  return RoboPlanSceneInput{"two_branch", std::string(kTwoBranchRobot),
+                            std::string(kTwoBranchSemanticRobot), {},
+                            {limits("joint_a"), limits("joint_b")}};
+}
+
 std::shared_ptr<roboplan::Scene> make_scene(const std::string& name) {
   const auto models = roboplan::example_models::get_package_models_dir();
   const auto package_share =
@@ -83,6 +130,82 @@ TEST(RoboPlanSceneGenerationTest,
   const auto group = scene->getJointGroupInfo("arm");
   ASSERT_TRUE(group.has_value());
   EXPECT_EQ(group->joint_names, std::vector<std::string>{"joint1"});
+}
+
+TEST(RoboPlanSceneGenerationTest, AGroupIsCheckedAgainstTheOtherJointsWhereTheyWerePosed) {
+  using manyforge::roboplan_backend::set_scene_joint_positions;
+  auto scene = make_roboplan_scene(two_branch_input());
+  constexpr double kQuarterTurn = 1.5707963267948966;
+  const Eigen::VectorXd initial_q = scene->getCurrentJointPositions();
+  const std::vector<double> initial(initial_q.data(), initial_q.data() + initial_q.size());
+  Eigen::VectorXd arm(1);
+  arm << 0.0;
+  // Unposed, the other joint is at its all-zero position: inside the arm.
+  EXPECT_TRUE(scene->hasCollisions(scene->toFullJointPositions("arm", arm)));
+
+  set_scene_joint_positions(*scene, initial, {"joint_b"}, {kQuarterTurn});
+  // The arm at zero is now free, and a quarter turn puts it into the other
+  // link where that link actually is.
+  EXPECT_FALSE(scene->hasCollisions(scene->toFullJointPositions("arm", arm)));
+  arm << kQuarterTurn;
+  EXPECT_TRUE(scene->hasCollisions(scene->toFullJointPositions("arm", arm)));
+
+  // A later request without other coordinates keeps nothing of this one: the
+  // other joint is back at its initial position.
+  set_scene_joint_positions(*scene, initial, {}, {});
+  EXPECT_TRUE(scene->getCurrentJointPositions().isApprox(initial_q));
+  EXPECT_FALSE(scene->hasCollisions(scene->toFullJointPositions("arm", arm)));
+  arm << 0.0;
+  EXPECT_TRUE(scene->hasCollisions(scene->toFullJointPositions("arm", arm)));
+
+  EXPECT_THROW(set_scene_joint_positions(*scene, initial, {"absent"}, {0.0}),
+               std::runtime_error);
+  EXPECT_THROW(set_scene_joint_positions(*scene, initial, {"joint_b"}, {}),
+               std::runtime_error);
+  EXPECT_THROW(set_scene_joint_positions(*scene, {}, {"joint_b"}, {0.0}), std::runtime_error);
+}
+
+// OD-359: two robots in one cell, `arm` (joint_a) planning. The other robot's
+// (joint_b) carried tube pressed into a fixed Scene object is not the arm's
+// pair; the other robot's body against the arm's own link still is.
+TEST(RoboPlanSceneGenerationTest, AGroupIgnoresPairsWithoutItsOwnBodies) {
+  using manyforge::roboplan_backend::ignore_pairs_without_group_bodies;
+  constexpr double kQuarterTurn = 1.5707963267948966;
+  // The tube carried on link_b and the fixed endplate, both where link_b's
+  // own sphere is at joint_b = 0.
+  const auto cell = [] {
+    auto scene = make_roboplan_scene(two_branch_input());
+    Eigen::Matrix4d at_sphere = Eigen::Matrix4d::Identity();
+    at_sphere(0, 3) = 0.5;
+    const Eigen::Vector4d color(0.2, 0.4, 0.8, 1.0);
+    const auto tube = scene->addSphereGeometry("tube", "link_b", roboplan::Sphere(0.05),
+                                               at_sphere, color);
+    EXPECT_TRUE(tube.has_value()) << tube.error();
+    const auto endplate = scene->addSphereGeometry("endplate", "universe",
+                                                   roboplan::Sphere(0.05), at_sphere, color);
+    EXPECT_TRUE(endplate.has_value()) << endplate.error();
+    return scene;
+  };
+  Eigen::VectorXd away(1);
+  away << kQuarterTurn;
+  Eigen::VectorXd onto(1);
+  onto << 0.0;
+
+  auto scene = cell();
+  // The arm a quarter turn away touches nothing; only the other robot's
+  // parts and the endplate overlap.
+  ASSERT_TRUE(scene->hasCollisions(scene->toFullJointPositions("arm", away)));
+  ignore_pairs_without_group_bodies(*scene, {"joint_a"});
+  EXPECT_FALSE(scene->hasCollisions(scene->toFullJointPositions("arm", away)));
+  // Its own link on the other robot's link and tube: still in collision.
+  ASSERT_TRUE(scene->setCollisions("endplate", "link_a", false).has_value());
+  EXPECT_TRUE(scene->hasCollisions(scene->toFullJointPositions("arm", onto)));
+
+  // The carrying robot keeps its pairs with the endplate: the tube (on
+  // link_b's frame) is its own. With the arm away, those are the only overlaps.
+  auto carrier = cell();
+  ignore_pairs_without_group_bodies(*carrier, {"joint_b"});
+  EXPECT_TRUE(carrier->hasCollisions(carrier->toFullJointPositions("arm", away)));
 }
 
 TEST(RoboPlanSceneGenerationTest, DiagnosticCopyKeepsLimitsGroupsAndGeometryIndependent) {

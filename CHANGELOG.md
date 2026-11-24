@@ -7,9 +7,232 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Before 1.0, a minor release (0.x.0) may change public interfaces and file
 formats; such changes are listed explicitly.
 
-## Unreleased
+## 0.4.0 – unreleased
+
+Upgrading: Scenarios saved with 0.3.x are converted by
+`python3 scripts/convert_scenario_od46.py <Scenario folder>` (Program v4,
+Deployment intent v3; see Breaking changes), then by
+`python3 scripts/convert_scenarios_od369.py <Scenario folder>`.
+
+### Breaking changes
+
+- **A Scenario has one name and one description.** A Scenario is named by its
+  folder (`<name>.scenario`) and described in its `scenario.yaml`. The Program
+  no longer has a `program_id`, `name` or `description`, and the Deployment no
+  longer has a `deployment_artifact_id`, `name` or `description`; the Program
+  settings no longer edit a name or description. What is applied is identified
+  by the Scenario and the content revisions (`deployment_revision`,
+  `program_revision`, retained bundle, graph revision): `program_id` and
+  `deployment_artifact_id` are gone from the Apply, run, operation and status
+  payloads too. Loading a Scenario that still has these fields is refused
+  (`scenario_document_dropped_fields`);
+  `python3 scripts/convert_scenarios_od369.py <Scenario folder>` removes them
+  and updates `scenario.yaml`. The separate Program and Deployment saves
+  (`POST /api/program/save`, `/api/program/save-as`, `/api/deployment/save`,
+  `/api/deployment/save-as`, their assistant tool actions and the
+  `MANYFORGE_PROGRAM_WRITE_ROOTS`/`MANYFORGE_DEPLOYMENT_WRITE_ROOTS` settings)
+  are removed: Save and Save as save the whole Scenario, and the assistant
+  saves with `manyforge_scenario` `save`. A Manager Apply journal of an
+  earlier version is refused; start with a fresh journal.
+- **Collision rules replace clearance settings, contact policies and support
+  contacts.** How close two parts may come, and which may touch, is now set in
+  one place: a list of collision rules, each holding the pairs of its two
+  selections with one value, `clearance_m`, `contact` (optional
+  `max_penetration_m`; `end_from_fraction`, 0.8 when left out, 0 for the
+  whole move) or `release`. Cell rules
+  are in the Deployment (`collision_rules`, the **Collision rules** section of
+  the Deployment editor); move rules are the `collision_rules` parameter of
+  the five motion nodes and, with a leg per rule, of Plan pick sequence and
+  Plan place sequence. Removed: the robots' `collision_clearance_m` (now the
+  Deployment's first rule, still 1 mm by default and still for robot against
+  Scene object pairs only), the motion nodes' `clearance_m`,
+  `contact_policy_id` and `contact_scene_resource_id`, the Program's
+  `contact_policies` (`manyforge.contact_policy.v1`) with their editor and
+  assistant tools, and Scene objects' `support_contacts` with their card. The
+  attach node's `touch_bodies`, SRDF disabled pairs and attachment
+  `collision_exclusions` are unchanged. No node requires a rule any more:
+  Plan pick sequence and Probe search take a contact rule only when the
+  Scenario wants the contact. A pick allows no contact by itself: without a
+  contact rule on the descend leg the gripper may not touch the object.
+  - **Holder contacts are per move.** A carried object's contact with its
+    support was allowed for every move while it was carried; it is now a
+    `release` rule on the lift and a `contact` rule on the last place move,
+    and the moves in between keep the normal clearance to the support.
+  - **One depth code.** `contact_penetration_exceeded` (rule, pair, depth,
+    limit) replaces `grasp_contact_penetration_exceeded` and
+    `contact_penetration_exceeds_policy`, and `contact_rule_violation`
+    replaces `contact_policy_violation`. A clearance refusal names its rule
+    (`collision_rule_id`). The execution history filters by
+    `collision_rule_id` instead of `contact_policy_id`; its file is now
+    `history.v9.sqlite3`, and an earlier History file stays on disk unopened.
+  - **TCP contact bodies.** A descriptor's `tcps` row and a custom TCP can
+    list `contact_bodies`. Without the key a gripper's TCP takes its pads,
+    else its fingers, and a passive tool's TCP none.
+  - **Grip body.** A gripper descriptor's `gripper.touch_links` and the
+    Deployment gripper row's `touch_links` are replaced by one collision body
+    named in the descriptor, `gripper.grip_body`.
+  - **File formats.** Program `manyforge.program.v4`, Deployment
+    `manyforge.deployment_intent.v3`, Program Binding
+    `manyforge.program_binding.v4`, node catalog content 4.0.0. Older files
+    are refused. Convert a saved Scenario (or a single Program file) once:
+    `python3 scripts/convert_scenario_od46.py path/to/my.scenario`. The script
+    rewrites `program.yaml` and `deployment.yaml` together, prints what it
+    changed, and names what it cannot convert. The bundled examples are
+    converted.
+  - **Picking links and model groups.** A cell rule can select an SRDF group
+    of a component's model (`model_group`). The rule table lists the cell
+    model's links and planning groups of the chosen component instead of
+    taking typed names.
+  - **Preview and confirm.** The Deployment Preview lists the collision rules
+    an Apply adds, removes or changes, with the members of both selections
+    before and after. Confirming the Preview confirms them; an Apply request
+    without the rule ids (`confirmed_collision_rule_ids`) ends with
+    `collision_rule_confirmation_required`. Two cell rules that hold the same
+    pair are refused by the Preview and the Apply (`collision_rules_overlap`).
+
+  See [Collision rules](docs/authoring/COLLISION_RULES.md) and
+  [TCPs](docs/authoring/TCPS.md#contact-bodies).
+
+- **Fixed and static bodies form one collision class.** The effective
+  collision policy lists `static_body_ids` (sorted, unique) instead of
+  `allowed_static_static_pairs`: two static bodies (cell-fixed Scene object
+  shapes and static component bodies) are never checked against each other,
+  with the same meaning as before. The policy format is
+  `manyforge.collision_policy.v3`, and a `SetCollisionPolicy` request carries
+  `static_body_ids`. A large cell no longer builds a pair list that grows
+  with the square of its fixed objects.
+- **The scene store is in memory only.** `logical-scene.sqlite3` and the
+  Manager option `--logical-scene-database` are gone; the previous-session
+  report is `manyforge.workbench_previous_session.v3` without a scene family
+  (a pending v2 report is still accepted). A scene larger than the status
+  stream can publish is refused at commit with `scene_too_large`.
+- **Removed error codes:** `kinematic_receiver_time_skew_exceeded` (see
+  Changed) and `native_projection_effective_policy_mismatch`.
 
 ### Added
+
+- **Springs.** A contact rule with `max_compression_step_m` is a spring: the
+  pair may press in up to `max_penetration_m` (the stroke), and the overlap
+  may grow by at most the step limit between samples, checked at most 1 mm of
+  tool travel apart (`contact_compression_step_exceeded`); it may shrink
+  freely. A Tool's `spring_slider` declares its stroke, trip depth, optional
+  release depth and step limit, and with `swept_space: true` adds a
+  collision body over everything the slider reaches. The slider is a frame of
+  the tool: an object attached to it is carried by the slider. A move rule
+  that names the slider (`spring_slider`, with `b`) takes its numbers from
+  the slider and treats the slider and its carried objects as one spring,
+  compressed by their deepest overlap. An `attached_object` selection may
+  name the carrying body (`collision_body_role_id`). The viewer draws a
+  pressed part shifted back by its live compression, a slider together with
+  its carried objects (display only). See [Collision rules](docs/authoring/COLLISION_RULES.md#springs).
+- **Mock inputs from geometry.** An I/O member row's `mock_inputs` makes an
+  input follow the cell on Mock and Isaac, for example a holder sensor that is
+  true while a carried tube is pressed into a part deeper than a trip depth;
+  on Real the physical input is read, so a Program uses one signal on every
+  lane. A row may name a Tool's spring slider instead (`spring_slider`, with
+  `b`): the input then follows the slider's trip and release depths, for the
+  slider and the objects it carries. See [Mock inputs from geometry](docs/authoring/ADDING_A_COMPONENT.md#mock-inputs-from-geometry).
+- **Depth between two meshes.** Where a depth is checked (a contact rule's
+  `max_penetration_m` and `max_compression_step_m`, a Mock input's
+  `trip_depth_m`) and both parts are triangle meshes, the depth is how far one
+  mesh is inside the other, measured from its vertices; it used to be the
+  overlap of the deepest two triangles and read far too low. Both meshes must
+  be closed surfaces (`mesh_not_closed`, listed in the Deployment Preview);
+  the precision follows the triangulation. See [Depth between two meshes](docs/authoring/COLLISION_RULES.md#depth-between-two-meshes).
+- **Robots see each other.** Planning, pre-dispatch validation, the runtime
+  monitor and the look-ahead use the other robots' measured positions, every
+  gripper's fingers and every carried object; a stale or missing peer follows
+  the stream-stale rule.
+- **Waiting conditions are shown.** While a Program waits for a key value, an
+  input or a gripper state, the viewer's Activity row lists each condition and
+  the nodes waiting on it. An open operator question shows as a warning with
+  one button per answer.
+- **A Scenario's default 3D view.** Viewer settings → Default view saves the
+  camera; Load and Reset camera go to it.
+- **Program reference status on the Program tab:** a dot, green when every
+  reference resolves, red with the count of issues, grey when unknown; it
+  opens the list.
+
+- **Tools made from parameters.** The Tool model (`manyforge.tool`) makes a
+  tool without a controller of its own from its parameters: a body, chains of
+  fixed elements leading to its tool ends (jaw pairs, spring sliders, probe
+  tips) and its TCPs, each belonging to a tool end or the body. The
+  parameters live inline in the Deployment row (or in a parameter file it
+  names) and are edited on the tool's component page (Body, Chains, TCPs,
+  Wiring, Mass) with a 3D preview and Export. Each jaw pair is a gripper
+  target; the Deployment holds only its wiring (valve outputs, optional
+  sensors). An Apply that leaves the tool unchanged keeps it running.
+  Mesh paths follow the project path rule, as Scene meshes do: relative to
+  the Scenario folder (or to the parameter file's folder) or absolute, `..`
+  allowed, inside an allowed folder; a mesh picker writes them. Load keeps
+  the meshes' content with the model and writes nothing into the project.
+  Export names the meshes where they are, or copies them into the export
+  folder.
+  [Adding a component](docs/authoring/ADDING_A_COMPONENT.md#a-tool-from-its-parameters).
+
+- **Current key values in the Keys panel.** The viewer's **Keys** panel
+  lists every declared key of the run with its type and current value
+  (poses compact), re-read while the panel is open whenever the run's state
+  or a node's status changes; *No run is active* without a run. A value
+  beyond the diagnostic bounds shows *too large to show*. New read-only
+  `GET /api/program/runs/{program_run_id}/blackboard-values?application_start_id=<id>`
+  (`manyforge.program_runtime_blackboard_values.v1`), on Headless and
+  Composer. See [Blackboard keys](docs/authoring/BLACKBOARD_KEYS.md).
+- **A project's own passive tool.** One generic passive tool,
+  `manyforge.passive_tool`: a mount frame and a TCP frame only, no joints,
+  groups, gripper or controller, so it names no lane and runs on every lane
+  (Mock, Isaac, Real) on the host's generic adapter. A project supplies its
+  own URDF (no SRDF needed), meshes and TCP through the component's
+  `model_source`: its tool folder is the package `passive_tool` (mesh URIs
+  `package://passive_tool/...`),
+  and the tool's mass and centre of mass come from the URDF's `<inertial>`
+  elements (none is 0 kg) into the robot's payload, on Real the controller's
+  TCP payload. It mounts on a robot's `flange` like every tool. Add component
+  offers it with a neutral placeholder model; the Components page shows its
+  lane as "Every lane". A tool descriptor without a `gripper` section is
+  passive and declares `lanes: {}`; a model folder named after its
+  `model.package_name` is its own package. See
+  [Adding a component](docs/authoring/ADDING_A_COMPONENT.md#a-projects-own-passive-tool).
+- **Motion group state keys.** Every motion group of a Program (each
+  execution group a node names, and `all`) has a read-only system key
+  `motion_group_state.<group>` holding the group's state as the Motion panel
+  shows it: `ready` (waiting for Run), `running`, `stopping`, `held`
+  (stopped), `mixed`, `faulted` or `unavailable` (no current Run). Program
+  logic can now test whether a robot is stopped. `motion_group_state` is a
+  reserved name, like `node_outcome` and `interrupt_state`. A Halt now shows
+  every group in the Motion panel and the key as Stopping, then Stopped
+  (before, the groups showed no state while halted). See
+  [Blackboard keys](docs/authoring/BLACKBOARD_KEYS.md#motion-group-state).
+- **Linear pose moves.** Move to pose, Move until signal and Probe search take
+  `motion_type: joint | linear` (default `joint`, existing Programs unchanged).
+  `linear` moves the tool on the strict straight line from the move's start
+  pose to the goal, planned as a Cartesian path with no joint-space fallback,
+  with Follow Cartesian path's step, timing and angular settings; interrupt
+  rules work in both modes. A linear move joins a still-moving robot when its
+  connector is proven within the joint limits and the move's tolerances of the
+  line, and otherwise the robot stops first. A Follow Cartesian path that
+  would take over a still-moving robot is refused at once
+  (`cartesian_path_moving_takeover_refused`) and the running move continues;
+  before, it was attempted and always failed. See
+  [RoboPlan adapter notes](docs/reference/ROBOPLAN_ADAPTER_NOTES.md#cartesian-paths).
+- **I/O banks: a PLC as an I/O device.** A device with up to 64 digital
+  inputs and 64 outputs per bank, such as a PLC, is an owner-less model-form
+  I/O device on the new `ros_io_bank` adapter family: state and command on
+  `/<component_id>/io_bank/state` and `/command` (new package
+  `manyforge_io_interfaces`, 200 Hz by default). One command in flight per
+  bank: writes that arrive meanwhile go out merged in the next command
+  (`uint8[64]` OFF/ON/KEEP, one write per output, order kept). The device
+  decides it in its state (`applied_seq`, `applied_result`, `device_code`,
+  `refused[64]`): each caller gets its own outcome, a refused output
+  `io_output_source_rejected`; no decision within 40 device cycles, a stale
+  stream or a device restart is `io_output_acceptance_unknown` for every
+  write in the command; outputs read back with
+  `manyforge_write` and `outside` sources, as the xArm's. A shipped generic
+  model `manyforge.io_bank_64x64` (`I0`-`I63`, `Q0`-`Q63`) is offered by Add
+  component; Mock and Isaac lanes use the host's Mock I/O. `sim_plc` gains a
+  bank mode (`mode: bank`) with test switches. The xArm's I/O read-back now
+  runs on the same shared bank tracker, unchanged. Guide:
+  docs/authoring/IO_BANKS.md, with a ROXSIE example.
 
 - **A prebuilt ManyForge image.** GitHub builds the complete application
   (native programs, Python modules, the built GUI) for amd64 and arm64 on the
@@ -38,9 +261,128 @@ formats; such changes are listed explicitly.
   tagged commit. Both refuse a tag other than `v<VERSION>` on the commit built.
 - **`./scripts/compose-dev.sh logs`** shows the workbench container's log,
   passing its options to `docker logs`.
+- **Ask operator node** (`operator.request_choice`, category Recovery): asks
+  the operator a question (`message`, `severity`) with 2 to 8 answers, each
+  with the node result it gives; the chosen `option_id` can go to an
+  `output_key`. Only its branch waits; the tree keeps running, and several
+  questions can be open at once. `hold_motion` stops the named motion groups
+  (or all) at node start like the operator's Stop; they stay stopped until
+  Run. The question shows in the Program run panel with the recovery offers
+  and is answered there or through `POST /api/cycle/recovery-actions`; it has
+  no time limit and is recorded in History. A failure answer fails the node
+  with `operator_choice_failed`. See
+  [Interrupts](docs/authoring/INTERRUPTS.md#asking-the-operator-from-the-program).
+- **Stop motion groups node** (`motion.stop_groups`, category Recovery): stops
+  the listed motion groups (or all) like the operator's Stop and succeeds once
+  the Stop completed; the groups stay stopped until Run. A Stop that ends
+  uncontained fails it with `motion_group_stop_failed`.
+- **Tools without a robot.** Add component → Tool offers **Not mounted yet**
+  under **Mount on** (also when no robot has a free flange): the tool row is
+  added without an attachment row and without a root pose, and is mounted
+  later, or unmounted again, with **Mounted on** on its page. Only a tool may
+  be unmounted. Preview and Apply refuse while a tool is unmounted
+  (`deployment_tool_unmounted`, naming the tool). See
+  [Unmounted tools and Replace tool](docs/authoring/ADDING_A_COMPONENT.md#unmounted-tools-and-replace-tool).
+- **Replace tool.** **Replace with…** on a mounted tool's page swaps it for
+  another tool of the Draft in one Draft edit: the new tool takes over the
+  mount, every reference to the old tool in the Deployment and Program Drafts
+  names the new one, and the old tool leaves. The page then lists the command
+  targets, frames and collision bodies those references name that the new
+  tool does not declare, to fix before Apply
+  (`POST /api/deployment/draft/components/replace-tool`).
+- **Node attempts and scene changes in History.** History records one
+  `program_node_attempt_finished` event per finished Program node attempt
+  (node instance, node type, run, attempt, start time, duration, result with
+  its typed error, and for a scene node the scene operation and object), and
+  one `scene_change_finished` event per scene change made outside a Program
+  node (Composer, the assistant, MCP, any HTTP caller, and the Program
+  runner's own scene preparation and clears): the operation, object, caller,
+  time taken, result and committed scene revision.
+  A run's node timeline and its scene changes can be read afterwards; the
+  events stay within History's existing retention limits. See
+  [History](docs/operations/OBSERVABILITY.md).
 
 ### Changed
 
+- **Scene changes are about three times faster.** A Program scene step
+  (add, move, remove, attach, detach) took 140-200 ms on a Jetson Thor and
+  now takes 35-60 ms: the static-body class rule above, one validation and
+  one digest per commit, fewer Manager-to-host calls (the scene owner no
+  longer holds its lock across them; a concurrent change is refused as
+  `stale_revision`), pose-only updates without a policy projection, the
+  Headless scene read without the discarded second refresh, and a
+  publication wait that reads only the committed revision.
+- **A component fault stops every robot in motion.** When any component
+  (robot, tool or I/O device) enters a fault while motion runs, every moving
+  robot stops with its fault Stop profile, as for a runtime collision, in
+  addition to the cell latch. The Stop has kind `component_fault`; the
+  stopped move ends with the error `component_fault` naming the component,
+  and its node fails or holds for the operator per its recovery policy.
+  Before, the fault only latched the cell. An e-stop, an offline component
+  and a simulation that is not playing are unchanged.
+- **A runtime-collision Stop can be retried.** A move whose collision Stop
+  was contained cleanly ends Stopped, with Retry (a new plan from where the
+  robot stopped) and Continue; automatic retries follow the node's recovery
+  policy. Robots added in the Composer get the fault Stop profile
+  `soft_on_path`.
+- **Readings of several robots are not refused for arriving apart.** A goal
+  in the frame of an object another robot holds no longer fails when the two
+  robots' states were received more than 10 ms apart (a busy machine);
+  each source's own freshness check stays.
+- **A command's age is measured when it arrives.** The 750 ms freshness of a
+  control command now ends when the backend receives it, so a busy backend
+  no longer refuses it as outdated; the message says to send it again.
+- **Program Reset retires a motion preparation that failed before it
+  started**, and Apply checks that the kept components' kernels are idle
+  before any effect (`apply_requires_idle_kept_component`).
+- **Attach accepts the frames and bodies of a tool mounted on the arm** (for
+  example a spring slider), with the arm as the target.
+- **The top bar shows the Scenario's name**, with the shown document and
+  folder in its tooltip.
+- **Keys panel:** a stored key offers Edit value, Edit initial (opens its
+  declaration) and Reset to initial. The panels over the 3D viewer are
+  semi-transparent.
+
+- **Save writes only what is applied** (Save Scenario, Save Scenario as, and
+  the Program and Deployment Save into the open Scenario), so every saved
+  Scenario loads again. With Draft edits that are not applied, Save asks once
+  and writes the applied state; the Drafts keep the edits. Over the API the
+  request needs `confirmUnappliedExcluded: true`, else it is refused with
+  `scenario_save_unapplied_edits`. Such a save records the Scenario as
+  `ready`.
+- **Collision geometry comes from the model.** A model-bearing component's
+  collision links that no named body covers form its `default_collision` body;
+  an unbound default contributes nothing.
+- **The runtime blackboard editor moved to the viewer's Keys panel** (with the
+  stored values); Program run details keep the audit.
+
+- **Scene meshes from any project folder reach collision checks and the
+  planner.** Apply (Load, Program Apply, Revert) stores a copy of every Program
+  scene mesh in the activation, named by its content, as it does for model
+  sources; the Program keeps its paths. The collision checks and the planner
+  read only that copy, so a mesh in a mounted project folder works like one in
+  `examples/`, and absolute and relative paths behave the same. An object added
+  later by a Scene call has its mesh stored when it is added. One path rule,
+  in the viewer, Load, Apply and Export, for scene meshes and for Deployment
+  model sources (`urdf`, `srdf`, `package_roots`): relative to the Scenario
+  project folder, or absolute, inside an allowed folder (the checkout,
+  `examples/`, the site `project_folders`); a model source or mesh outside
+  them is now refused, naming the path and the allowed folders; no URI scheme
+  in a mesh path, no current-directory fallback. The planner worker keeps
+  running across projections whose scene content is unchanged. A re-Apply
+  uses the current file content (`scene_mesh_content_changed` is gone). The
+  bundled examples' mesh paths are now project-relative. Formats: activation
+  preparation request v5, prepared activation v8, logical-scene store v13,
+  planner worker protocol 17; the Manager option `--scene-asset-root` is
+  removed. See
+  [Paths inside a project](docs/operations/DEVELOPMENT_WORKBENCH.md#paths-inside-a-project).
+
+- **Component descriptors are `manyforge.component_package.v2`** (file
+  format change). Version 2 adds an optional `index` per signal of a
+  model-form I/O device and leaves its `lanes.real` keys other than
+  `adapter` and `input_maximum_age_ms` to its adapter family, which checks
+  them at Apply (the xArm family its `bank`). A `v1` descriptor is still
+  read as before; new and shipped descriptors are `v2`.
 - **Install options renumbered**: 1 runs the prebuilt image, 2 pulls the ROS
   image and builds from the checkout, 3 builds the ROS image from source, 4 is
   the operator launcher.
@@ -49,8 +391,50 @@ formats; such changes are listed explicitly.
   mode does.
 - **`start --project` also accepts a project in a project folder**, by its
   absolute host path, besides `examples/`.
+- **Scenario lane labels removed** (file format change). The Program's
+  `compatibility.lanes` and the Deployment's `compatibility.lane` are gone,
+  with the **Supported lanes** checkboxes in Program settings; a Program or
+  Deployment that still names them is refused as an unknown field. Each
+  component's own lane is the only lane, and one Scenario may mix lanes.
+  Component-catalog entries from example Scenarios now carry their row's own
+  lane.
+- **`node_outcome.<node>` is `none` again at each new attempt** of the node
+  (tree entry, operator Retry, a hold release, automatic retry); it still
+  changes to the outcome when the node ends. Before, it kept the previous
+  outcome until the node ended again.
+- **Runtime controls and recovery actions carry operator questions**
+  (interface change).
+  `manyforge.program_runtime_control_projection` is v11 (was v10): it adds
+  `operator_questions` (new `manyforge.program_operator_question.v1`), and
+  each `execution_selections.groups[]` row adds `stopped_by` (`program` or
+  `null`) and `stopped_by_node_instance_id`.
+  `CycleRecoveryActionRequest.action_id` is now any identifier (a lower-case
+  letter, then lower-case letters, digits, `_`, `.`, `-`; at most 128 bytes)
+  instead of a closed list; the runner checks it against the offer.
+  The Kernel records who stopped them: `manyforge.program_execution_scope` is
+  v4 (was v3) and adds `program_held_nodes`, `[held node index, requesting
+  node index]` pairs for the holds a Program node's own Stop raised (cleared
+  by their Run or Resume); a `stop_program_selection` request from the
+  Program runner may name `stopped_by_node_instance_id`. The group rows'
+  `stopped_by` comes from there.
 
 ### Fixed
+
+- **A scene request too large for the execution host is refused,**
+  `native_projection_rpc_bound_exceeded`, instead of ending the execution
+  host and the application.
+
+- **The look-ahead checks the other robots where they are now.** It had been
+  checking with the path only, without the peers' live positions.
+- **Reference validation works for a Deployment that relies on defaults**
+  (it reported "unavailable" for such a Draft).
+- **Viewer:** a group stopped by a Program node no longer stretches the Motion
+  panel over its neighbour; scene meshes without normals or material are
+  shaded like primitives.
+
+- **Export of a Deployment with `package://` model resources.** Export
+  refused every such Scenario ("invalid transfer shape"); it now copies the
+  resources into the exported project, which loads and activates on its own.
 
 - **New empties the Scene again.** Since 0.3.0 each New removed only one
   object from the Scene: the Program Runner's check of each removal's receipt
@@ -84,6 +468,13 @@ formats; such changes are listed explicitly.
   offset** now ends with `component_action_interrupted_by_stop`.
 - **E-stop warning:** a pressed e-stop shows as a warning notice with a link to
   Components.
+- **Operator hold texts corrected** (behaviour unchanged). Without
+  intervention a node failure goes to the node's parent (a Fallback can catch
+  it); only an uncaught failure ends the run. Retry and Continue release the
+  hold's own motion groups (with `intervention_stop_scope: all`, also the
+  groups no other hold owns), not all motion. The Reset offered with a held
+  node is the Program's Reset, which ends the run. `intervention_stop_scope`
+  is now documented.
 
 ## 0.3.1 – 2026-11-19
 

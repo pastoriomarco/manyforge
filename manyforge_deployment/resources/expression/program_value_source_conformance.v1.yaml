@@ -222,10 +222,10 @@ refused:
     value_sources:
       expected_state: {kind: program_parameter, reference: label}
     reason: cannot dynamically select runtime/binding semantics
-  - name: contact policy selector
+  - name: collision rules selector
     node: probe
     value_sources:
-      contact_policy_id: {kind: program_parameter, reference: label}
+      collision_rules: {kind: program_parameter, reference: label}
     reason: cannot dynamically select runtime/binding semantics
   - name: pose into a frame reference
     node: offset

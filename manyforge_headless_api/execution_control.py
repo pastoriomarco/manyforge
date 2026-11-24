@@ -318,12 +318,14 @@ class ExecutionControlIngress:
         self,
         request: ExecutionCommandRequestDTO,
         stamp: ExecutionIngressStamp,
+        received_at_ns: int,
     ) -> ExecutionControlSubmission:
         envelope = request.command_envelope
         if not is_stop_command(envelope.command_kind):
             valid_until_ns = self._authority.validate(
                 envelope.freshness,
                 current_control_revision=self._projection(),
+                received_at_ns=received_at_ns,
             )
             # The envelope DTO already pins expected_* to the token fields, and
             # validate() rejected any token not matching this same projection.
@@ -380,13 +382,19 @@ class ExecutionControlIngress:
         transport_kind: Literal["rest", "websocket", "ros2", "local"],
         trusted_principal_id: str | None = None,
         assurance: str | None = None,
+        received_monotonic_ns: int | None = None,
     ) -> ExecutionControlSubmission:
+        """``received_monotonic_ns``: when Composer received a command it
+        forwards, on the shared monotonic clock; freshness is aged to that
+        moment instead of this ingress's own receipt."""
+
         return await asyncio.shield(
             self._start_submission(
                 request,
                 transport_kind=transport_kind,
                 trusted_principal_id=trusted_principal_id,
                 assurance=assurance,
+                received_monotonic_ns=received_monotonic_ns,
             )
         )
 
@@ -397,6 +405,7 @@ class ExecutionControlIngress:
         transport_kind: Literal["rest", "websocket", "ros2", "local"],
         trusted_principal_id: str | None,
         assurance: str | None,
+        received_monotonic_ns: int | None = None,
     ) -> asyncio.Future[ExecutionControlSubmission]:
         stamp: ExecutionIngressStamp | None = None
 
@@ -413,9 +422,14 @@ class ExecutionControlIngress:
         def callback() -> ExecutionControlSubmission:
             if stamp is None:
                 raise RuntimeError("execution-control admission stamp is missing")
+            # Freshness is aged to the command's receipt, not to this worker
+            # turn: the projection read and lane wait never expire it.
             return self._submit_sync(
                 request,
                 stamp,
+                stamp.received_monotonic_ns
+                if received_monotonic_ns is None
+                else received_monotonic_ns,
             )
 
         lane = (

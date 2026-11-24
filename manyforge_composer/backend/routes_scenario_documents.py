@@ -20,6 +20,7 @@ from manyforge_behavior.model_source_capture import (
     ModelSourceCaptureError,
     capture_deployment_model_sources,
 )
+from manyforge_behavior.model_source_capture import SceneMeshPathError
 from manyforge_headless_api.client import HeadlessClientError
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -59,6 +60,8 @@ from .authoring_workspace_fence import (
     require_captured_workspace_identity,
 )
 from .deployment_draft import DeploymentDraftError
+from .deployment_intent import DeploymentIntentError, rebase_deployment_intent_sources
+from manyforge_behavior.model_source_capture import rebase_program_scene_mesh_paths
 from .draft_session import DraftSessionError
 from .apply_orchestration import (
     ApplyRefused,
@@ -74,11 +77,19 @@ from .routes_deployment_draft import (
     HeadlessApplyPorts,
     _workspace as deployment_workspace,
     apply_slot,
+    deployment_unapplied,
     orchestrated_apply,
     prepare_deployment_discard,
+    prepare_deployment_saved_baseline,
+    read_applied_deployment,
     server_admission_generation,
 )
-from .routes_draft import _workspace as program_workspace, prepare_program_discard
+from .routes_draft import (
+    _workspace as program_workspace,
+    applied_program_authoring,
+    prepare_program_discard,
+    prepare_program_saved_baseline,
+)
 from .scenario_artifacts import (
     SCENARIO_NAME_PATTERN,
     SCENARIO_PROJECT_MEMBERS,
@@ -89,6 +100,7 @@ from .scenario_artifacts import (
     capture_scenario_artifact_with_diagnostics,
     discover_scenario_artifacts,
     export_scenario_artifact,
+    require_unapplied_edits_excluded,
     save_scenario_artifact,
     scenario_project_path,
     scenario_project_stem,
@@ -153,6 +165,11 @@ class SaveScenarioDocumentRequest(_ScenarioFence):
     name: str = Field(pattern=SCENARIO_NAME_PATTERN)
     description: str = Field(default="", max_length=4096)
     confirm_overwrite: bool = Field(default=False, alias="confirmOverwrite")
+    # Save writes only what is applied (OD-365): with unapplied Draft edits
+    # it writes the Applied state only on this confirmation.
+    confirm_unapplied_excluded: bool = Field(
+        default=False, alias="confirmUnappliedExcluded"
+    )
 
 
 class LoadScenarioDocumentRequest(_ScenarioFence):
@@ -218,7 +235,12 @@ class ExportScenarioDocumentRequest(_ScenarioFence):
 def _raise(error: Exception) -> NoReturn:
     if isinstance(error, ModelSourceCaptureError):
         raise scenario_artifact_http_exception(ScenarioArtifactError(
-            "scenario_model_source_unavailable", str(error), status_code=409,
+            error.code or "scenario_model_source_unavailable", str(error),
+            status_code=409,
+        )) from error
+    if isinstance(error, SceneMeshPathError):
+        raise scenario_artifact_http_exception(ScenarioArtifactError(
+            error.code, str(error), status_code=409,
         )) from error
     if isinstance(error, HeadlessClientError):
         raise headless_client_http_exception(error) from error
@@ -247,23 +269,6 @@ def _raise(error: Exception) -> NoReturn:
             detail["workspace"] = error.detail["workspace"]
         raise HTTPException(status_code=error.status_code, detail=detail) from error
     raise error
-
-
-def _deployment_unapplied(view: dict[str, Any]) -> bool:
-    """Something is applied and the Deployment Draft is not it.
-
-    The publication identity (revision) decides when both sides carry one;
-    otherwise the backend's document comparison (run admission) decides.
-    """
-
-    draft = view.get("draft") or {}
-    applied = (view.get("managerApplied") or {}).get("deploymentRevision")
-    if draft.get("document") is None or applied is None:
-        return False
-    revision = draft.get("deploymentRevision")
-    if revision is not None:
-        return revision != applied
-    return (view.get("runAdmission") or {}).get("ready") is not True
 
 
 def _version() -> str:
@@ -445,25 +450,70 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             project = captured_workspace["project"]
             authoring = captured_workspace["program"]["authoring"]
             deployment = captured_workspace["deployment"]["document"]
+            target = scenario_project_path(body.directory, body.name)
+            saved_folder = Path(target).expanduser().resolve()
+            current_target = project["document_path"]
+            source_project_root = (
+                state.deployment_draft_session.source_project_root
+                or current_target
+            )
+            # Save writes only what is applied, so every saved Scenario
+            # reopens (OD-365). A Draft with unapplied edits keeps them, and
+            # its Applied document is written and becomes Saved, on the
+            # caller's confirmation.
+            program_view = program_workspace(state)
+            deployment_view = deployment_workspace(state)
+            program_unapplied = program_view.get("hasUnappliedChanges") is True
+            deployment_differs = deployment_unapplied(deployment_view)
+            require_unapplied_edits_excluded(
+                program_unapplied or deployment_differs,
+                body.confirm_unapplied_excluded,
+            )
+            draft_authoring, draft_deployment = authoring, deployment
+            if program_unapplied:
+                authoring = applied_program_authoring(state)
+            written_source_root = source_project_root
+            if deployment_differs:
+                deployment, applied_root, _identity = read_applied_deployment(state)
+                written_source_root = applied_root or source_project_root
             complete = (
                 isinstance(authoring, dict)
                 and isinstance(deployment, dict)
             )
-            # Ready only when the saved content is exactly what is Applied:
-            # both Applied views read at this captured identity, both Drafts
-            # match an applied counterpart.
-            ready = False
-            if complete:
-                program_view = program_workspace(state)
-                deployment_view = deployment_workspace(state)
-                ready = (
-                    program_view["authoringWorkspace"] == snapshot.identity.as_dict()
-                    and deployment_view["authoringWorkspace"] == snapshot.identity.as_dict()
-                    and program_view.get("hasUnappliedChanges") is False
-                    and deployment_view["managerApplied"]["deploymentRevision"] is not None
-                    and not _deployment_unapplied(deployment_view)
+            # Ready when the saved content is exactly what is Applied: both
+            # Applied views read at this captured identity, and each written
+            # document is the Applied one or a Draft that matches it.
+            ready = (
+                complete
+                and program_view["authoringWorkspace"] == snapshot.identity.as_dict()
+                and deployment_view["authoringWorkspace"] == snapshot.identity.as_dict()
+                and program_view.get("hasUnappliedChanges") is not None
+                and deployment_view["managerApplied"]["deploymentRevision"] is not None
+            )
+            moved = (
+                current_target is not None
+                and Path(current_target).resolve() != saved_folder
+            )
+
+            def rebased_program(value: Any) -> Any:
+                # Saved into another project folder, relative Program scene
+                # mesh paths are rebased to it (as model sources are), so they
+                # name the same files from the saved project (OD-335).
+                if not moved or not isinstance(value, dict):
+                    return value
+                return rebase_program_scene_mesh_paths(
+                    value,
+                    source_project_folder=current_target,
+                    destination_project_folder=saved_folder,
                 )
-            target = scenario_project_path(body.directory, body.name)
+
+            rebased_authoring = rebased_program(authoring)
+            if rebased_authoring == authoring:
+                rebased_authoring = None
+            if rebased_authoring is not None:
+                authoring = rebased_authoring
+                # The saved Program now differs from the Applied one.
+                ready = False
             document = build_scenario_document(
                 scenario_id=body.name,
                 name=body.name,
@@ -475,14 +525,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "ready" if ready else "unknown" if complete else "incomplete"
                 ),
             )
-            current_target = project["document_path"]
-            source_project_root = (
-                state.deployment_draft_session.source_project_root
-                or current_target
-            )
             overwrite = body.confirm_overwrite or (
                 current_target is not None
-                and str(Path(target).expanduser().resolve()) == current_target
+                and str(saved_folder) == current_target
             )
             program_save = (
                 state.draft_session.prepare_save(
@@ -491,17 +536,54 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     target_path=str(Path(target) / SCENARIO_PROJECT_MEMBERS["program_draft"]),
                     confirm_overwrite=True,
                 )
-                if captured_workspace["program"]["candidateAvailable"] else None
+                if captured_workspace["program"]["candidateAvailable"]
+                and not program_unapplied else None
             )
-            empty_program_save = None
-            if (isinstance(authoring, dict) and authoring.get("forest") == []
+            program_replacement = None
+            if program_unapplied:
+                # The Draft keeps its edits (rebased with the project); the
+                # written Applied Program becomes Saved.
+                program_replacement = prepare_program_saved_baseline(
+                    state, authoring,
+                    str(saved_folder / SCENARIO_PROJECT_MEMBERS["program_draft"]),
+                    draft_authoring=rebased_program(draft_authoring),
+                )
+            elif rebased_authoring is not None:
+                # The Program Draft adopts the rebased authoring it saves,
+                # with the saved baseline of that content.
+                retained = state.draft_session.retained_state()
+                rebased_draft, rebased_diagnostics = derive_candidate(
+                    deepcopy(rebased_authoring), state.node_catalog
+                )
+                retained.update(
+                    draft_revision=retained["draft_revision"] + 1,
+                    authoring=deepcopy(rebased_authoring),
+                    program=(
+                        rebased_draft.to_dict()
+                        if rebased_draft is not None else None
+                    ),
+                    diagnostics=rebased_diagnostics,
+                )
+                if program_save is not None and rebased_draft is not None:
+                    retained.update(
+                        saved_path=str(
+                            saved_folder / SCENARIO_PROJECT_MEMBERS["program_draft"]
+                        ),
+                        saved_program_revision=rebased_draft.program_revision,
+                        saved_document=rebased_draft.to_dict(),
+                    )
+                program_save = None
+                program_replacement = state.draft_session.prepare_load_replacement(
+                    retained, state.node_catalog
+                )
+            elif (isinstance(authoring, dict) and authoring.get("forest") == []
                     and not authoring.get("scene")):
                 retained = state.draft_session.retained_state()
                 retained.update(
                     saved_path=str(Path(target) / SCENARIO_PROJECT_MEMBERS["program_draft"]),
                     saved_program_revision=None, saved_document=deepcopy(authoring),
                 )
-                empty_program_save = state.draft_session.prepare_load_replacement(retained, state.node_catalog)
+                program_replacement = state.draft_session.prepare_load_replacement(retained, state.node_catalog)
             deployment_save = (
                 state.deployment_draft_session.prepare_save(
                     draft_id=body.deployment_draft_id,
@@ -509,8 +591,38 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     target_path=str(Path(target) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]),
                     confirm_overwrite=True,
                 )
-                if deployment is not None else None
+                if deployment is not None and not deployment_differs else None
             )
+            deployment_replacement = None
+            if deployment_differs:
+                # The Draft keeps its edits (its sources rebased with the
+                # project); the written Applied Deployment becomes Saved.
+                def rebased_deployment(value: Any, root: str | None) -> Any:
+                    if root is None or Path(root).resolve() == saved_folder:
+                        return value
+                    return rebase_deployment_intent_sources(
+                        value,
+                        source_project_root=Path(root),
+                        destination_project_root=saved_folder,
+                    )
+
+                try:
+                    deployment_replacement = prepare_deployment_saved_baseline(
+                        state,
+                        saved_document=rebased_deployment(deployment, written_source_root),
+                        saved_path=str(
+                            saved_folder / SCENARIO_PROJECT_MEMBERS["deployment_draft"]
+                        ),
+                        source_project_root=str(saved_folder),
+                        draft_document=(
+                            None if draft_deployment is None
+                            else rebased_deployment(draft_deployment, source_project_root)
+                        ),
+                    )
+                except DeploymentIntentError as error:
+                    raise ScenarioArtifactError(
+                        "scenario_deployment_intent_invalid", str(error)
+                    ) from error
 
             def install_saved_baselines() -> bool:
                 assert saved_path is not None
@@ -520,12 +632,33 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         saved_path=str(Path(saved_path) / SCENARIO_PROJECT_MEMBERS["program_draft"]),
                     ) if program_save is not None else False
                 )
-                if empty_program_save is not None:
-                    program_changed = state.draft_session.install_prepared_replacement(empty_program_save)
+                if program_replacement is not None:
+                    program_changed = state.draft_session.install_prepared_replacement(program_replacement)
+                if deployment_replacement is not None:
+                    return state.deployment_draft_session.install_prepared_replacement(
+                        deployment_replacement
+                    ) or program_changed
+                # Saved into another project folder, the written Deployment
+                # has its project-relative sources rebased to it; the Draft
+                # adopts that content and folder, so paths authored afterwards
+                # resolve against the saved project, as the file does.
+                rebased = (
+                    None
+                    if deployment_save is None
+                    or source_project_root is None
+                    or Path(source_project_root).resolve() == Path(saved_path).resolve()
+                    else rebase_deployment_intent_sources(
+                        deployment,
+                        source_project_root=Path(source_project_root),
+                        destination_project_root=Path(saved_path),
+                    )
+                )
                 deployment_changed = (
                     state.deployment_draft_session.install_prepared_save(
                         deployment_save,
                         saved_path=str(Path(saved_path) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]),
+                        saved_document=rebased,
+                        source_project_root=None if rebased is None else saved_path,
                     ) if deployment_save is not None else False
                 )
                 return program_changed or deployment_changed
@@ -545,7 +678,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         target,
                         allowed_roots=state.allowed_fs_roots,
                         overwrite=overwrite,
-                        source_project_path=source_project_root,
+                        source_project_path=written_source_root,
                         effects=effects,
                     )
                 # Readback of the published project; its failure is a
@@ -724,7 +857,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             diagnostics: list[dict[str, str]] = []
             if authoring is not None:
                 try:
-                    require_program_format(authoring, supported_api_version="manyforge.program.v3")
+                    require_program_format(authoring, supported_api_version="manyforge.program.v4")
                     adopt_active_catalog(authoring, authoring_catalog)
                     validate_invariants(authoring, authoring_catalog)
                     program, diagnostics = derive_candidate(
@@ -789,10 +922,15 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             # Drafts keep the document as authored.
             deployment = with_defaults(deployment)
             source_closure = capture_deployment_model_sources(
-                deployment, project_root=Path(source_path)
+                deployment, project_root=Path(source_path),
+                paths=state.project_paths,
             )
             # The project folder scopes the Scenario's persistent values.
             project_path = canonical_project_path(source_path)
+            program_document = program.to_dict() if program is not None else None
+            scene_mesh_closure = state.capture_scene_mesh_closure(
+                program_document, project_path=project_path
+            )
             captured_digest = raw_sha256_digest(
                 canonical_json_bytes(
                     {
@@ -801,7 +939,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "source_document_digest": source_digest,
                         "deployment": deployment,
                         "model_source_closure": source_closure,
-                        "program": program.to_dict() if program is not None else None,
+                        "program": program_document,
+                        "scene_mesh_closure": scene_mesh_closure,
                     }
                 )
             )
@@ -819,7 +958,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "captured_input_digest": captured_digest,
                     "deployment": deepcopy(deployment),
                     "model_source_closure": source_closure,
-                    "program": program.to_dict() if program is not None else None,
+                    "scene_mesh_closure": scene_mesh_closure,
+                    "program": deepcopy(program_document),
                     "program_authoring": deepcopy(authoring),
                     "expected_manager_current": {
                         "retained_bundle_id": bundle,
@@ -1175,7 +1315,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             # contain the workspace instead of refusing.
             _require_captured_workspace_fence(body, state.authoring_workspace.identity())
             steps = []
-            if _deployment_unapplied(deployment_workspace(state)):
+            if deployment_unapplied(deployment_workspace(state)):
                 steps.append(prepare_deployment_discard(
                     state, body.deployment_draft_id, body.expected_deployment_draft_revision
                 ))

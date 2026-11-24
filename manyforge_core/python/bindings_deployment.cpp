@@ -97,7 +97,6 @@ template <typename Record>
         append_catalog_record_ref_if_exact_type<CommandSchemaCatalogRecordRefDTO>(item, bounded) ||
         append_catalog_record_ref_if_exact_type<CapabilityDefinitionCatalogRecordRefDTO>(item,
                                                                                          bounded) ||
-        append_catalog_record_ref_if_exact_type<ContactPolicyCatalogRecordRefDTO>(item, bounded) ||
         append_catalog_record_ref_if_exact_type<StopEvidencePolicyCatalogRecordRefDTO>(item,
                                                                                        bounded);
     if (!appended) {
@@ -1061,10 +1060,6 @@ void register_deployment_candidate_bindings(py::module_& module) {
 
   py::class_<deployment::RevisionVerifiedDeploymentArtifact>(
       module, "RevisionVerifiedDeploymentArtifact", py::is_final())
-      .def_property_readonly("deployment_artifact_id",
-                             [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
-                               return artifact.deployment_artifact_id();
-                             })
       .def_property_readonly("deployment_revision",
                              [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
                                return artifact.deployment_revision();
@@ -1072,14 +1067,6 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def_property_readonly("cell_id",
                              [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
                                return artifact.cell_id();
-                             })
-      .def_property_readonly("name",
-                             [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
-                               return artifact.name();
-                             })
-      .def_property_readonly("description",
-                             [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {
-                               return artifact.description();
                              })
       .def_property_readonly("catalog_records",
                              [](const deployment::RevisionVerifiedDeploymentArtifact& artifact) {

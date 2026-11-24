@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <manyforge_component_manager/manager_apply_journal.hpp>
@@ -8,6 +9,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
+#include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -228,7 +230,6 @@ component_manager::ManagerApplyIntentDTO ApplyIntent(
       admission.graph_revision(),
       component_manager::ManagerApplyPreparedActivationDTO{
           core::ContentDigest(std::string(kDigestOne)),
-          core::DeploymentArtifactId("owner-publication-deployment"),
           core::DeploymentRevision(std::string(kDigestTwo)),
           core::ProgramBindingId(std::string(kDigestOne)),
           core::ContentDigest(std::string(kDigestTwo)),
@@ -261,7 +262,7 @@ core::LogicalSceneSnapshotRoot SceneSnapshot(
           }));
 }
 
-core::LogicalSceneSnapshotRoot SceneSnapshotWithSupport(
+core::LogicalSceneSnapshotRoot SceneSnapshotWithObjects(
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission) {
   auto policy = SceneSnapshot(admission).shared()->configured_collision_policy;
   const auto fixed_placement = core::CellFixedSceneObjectPlacementDTO{
@@ -286,14 +287,12 @@ core::LogicalSceneSnapshotRoot SceneSnapshotWithSupport(
                       {core::SphereShapeDTO{0.01}},
                       fixed_placement,
                       std::nullopt,
-                      {core::SupportContactDTO{.support_object_id = "table"}},
                   },
                   core::SceneObjectSnapshotDTO{
                       core::SceneResourceId("table"),
                       {core::BoxShapeDTO{core::Vector3DTO{1.0, 1.0, 0.1}}},
                       fixed_placement,
                       std::nullopt,
-                      {},
                   },
               },
               {},
@@ -723,7 +722,7 @@ TEST(LogicalSceneSourcePublication, RejectsCrossOwnerRevisionMismatch) {
 }
 
 TEST(LogicalSceneSourcePublication,
-     PublishesPortableSupportDeclarationWithoutNativeBodyNames) {
+     PublishesSceneObjectsWithoutNativeBodyNames) {
   const auto admission = LoadAdmission();
   const auto projection = ProjectionRevision(admission);
   const auto bytes =
@@ -734,11 +733,109 @@ TEST(LogicalSceneSourcePublication,
               true,
               projection,
           },
-          SceneSnapshotWithSupport(admission)));
+          SceneSnapshotWithObjects(admission)));
 
-  EXPECT_NE(bytes.find("\"support_object_id\":\"table\""), std::string::npos);
-  EXPECT_NE(bytes.find("\"mode\":\"contact_release\""), std::string::npos);
+  EXPECT_NE(bytes.find("\"scene_resource_id\":\"part\""), std::string::npos);
+  EXPECT_NE(bytes.find("\"scene_resource_id\":\"table\""), std::string::npos);
+  // Contact and release allowances are collision rules of a move, never part
+  // of a published Scene object or of the Scene's policy.
+  EXPECT_EQ(bytes.find("support_contacts"), std::string::npos);
+  EXPECT_EQ(bytes.find("contact_rules"), std::string::npos);
   EXPECT_EQ(bytes.find("scene/part/shape/0"), std::string::npos);
+}
+
+// The status stream's frame bound is the owner's largest Scene plus 16 KiB, so
+// the published `logical_scene` payload may exceed the Scene codec's bytes
+// only by its fixed access part. The worst repeated row is a cell-fixed
+// object with one sphere and no provider evidence (+1 byte: the explicit
+// `provider_evidence: null` outweighs the shorter pose and shape keys); every
+// other shape, placement, attachment and policy row is equal or smaller.
+TEST(LogicalSceneSourcePublication,
+     PayloadStaysWithinTheSceneCodecBytesPlusTheAccessPart) {
+  const auto admission = LoadAdmission();
+  const auto projection = ProjectionRevision(admission);
+  const auto padded = [](const std::size_t index) {
+    const auto text = std::to_string(index);
+    return std::string(5U - text.size(), '0') + text;
+  };
+  const auto pose = core::Pose3DTO{core::Vector3DTO{0.25, -0.5, 0.125},
+                                   core::QuaternionDTO{0.0, 0.0, 0.0, 1.0}};
+  const auto mesh = core::MeshShapeDTO{"package://parts/meshes/part.stl",
+                                       core::Vector3DTO{1.0, 1.0, 1.0},
+                                       std::string(kDigestTwo)};
+  auto value = *SceneSnapshot(admission).shared();
+  for (std::size_t index = 0U; index < 64U; ++index) {
+    value.configured_collision_policy.static_body_ids.push_back("body-" +
+                                                                padded(index));
+  }
+  for (std::size_t index = 0U; index + 1U < 64U; ++index) {
+    value.configured_collision_policy.allowed_touch_link_pairs.push_back(
+        {"body-" + padded(index), "body-" + padded(index + 1U)});
+  }
+  for (std::size_t index = 0U; index < 1200U; ++index) {
+    const auto id = core::SceneResourceId("object-" + padded(index));
+    const auto kind = index < 900U ? 0U : index % 6U;
+    core::SceneObjectSnapshotDTO object{
+        id,
+        {core::SphereShapeDTO{0.01}},
+        core::CellFixedSceneObjectPlacementDTO{admission.cell_id(), pose},
+        std::nullopt,
+        0.0,
+    };
+    if (kind == 1U) {
+      object.collision_shapes = {
+          core::BoxShapeDTO{core::Vector3DTO{1.0, 1.0, 0.1}},
+          core::CylinderShapeDTO{0.05, 0.2},
+          mesh,
+      };
+      object.mass_kg = 0.5;
+    } else if (kind == 2U) {
+      object.provider_evidence = core::SceneObjectProviderEvidenceDTO{
+          core::ProviderInstanceId("camera"),
+          core::ProviderManifestId("camera-manifest"),
+          core::ProviderManifestRevision("revision-1"),
+          "epoch-1",
+      };
+    } else if (kind == 3U) {
+      const auto attachment_id =
+          core::CarriedObjectAttachmentId("attachment-" + padded(index));
+      const auto revision = core::CarriedObjectAttachmentRevision("revision-1");
+      object.placement =
+          core::CarriedSceneObjectPlacementDTO{attachment_id, revision};
+      value.carried_object_attachments.push_back(
+          core::CarriedObjectAttachmentDTO{
+              attachment_id,
+              revision,
+              id,
+              core::ControllableComponentId("arm"),
+              core::CommandTargetId("arm.tool"),
+              core::ComponentSceneFrameRefDTO{
+                  core::ControllableComponentId("arm"),
+                  core::ModelInstanceId("arm"),
+                  core::FrameRoleId("tool"),
+              },
+              pose,
+              {core::CollisionBodyRoleId("finger")},
+              std::nullopt,
+          });
+    }
+    value.objects.push_back(std::move(object));
+  }
+  ASSERT_TRUE(value.locally_valid());
+  const auto codec_bytes = manyforge::scene::EncodeLogicalSceneSnapshot(value);
+  const auto payload_bytes =
+      content_identity::canonical_json(BuildLogicalSceneSourcePayload(
+          manyforge::scene::CanonicalEmptySceneAccessStatus{
+              manyforge::scene::CanonicalEmptySceneBootstrapPhase::kFinalized,
+              true,
+              true,
+              projection,
+          },
+          core::LogicalSceneSnapshotRoot(
+              std::make_shared<const core::LogicalSceneSnapshotDTO>(
+                  std::move(value)))));
+
+  EXPECT_LE(payload_bytes.size(), codec_bytes.size() + 8U * 1024U);
 }
 
 TEST(SceneRuntimeSourcePublication,

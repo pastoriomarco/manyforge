@@ -101,7 +101,7 @@ struct RuntimeCapabilityProviderPathDTO final {
 struct RuntimeMotionEndpointBindingDTO final {
   ProgramTargetReferenceDTO target;
   ProgramFrameBindingDTO frame;
-  std::vector<ProgramContactGraspBodyBindingDTO> contact_body_bindings;
+  std::vector<ProgramCollisionRuleBodyBindingDTO> contact_body_bindings;
   std::vector<CollisionBodyRoleId> contact_body_role_ids{};
   friend bool operator==(const RuntimeMotionEndpointBindingDTO&,
                          const RuntimeMotionEndpointBindingDTO&) = default;
@@ -133,7 +133,6 @@ struct RuntimeMotionEndpointBindingDTO final {
 /// Complete owner-to-owner value before sealing. Public operation callers
 /// never construct or submit this record.
 struct RuntimeParticipantBindingDTO final {
-  ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
   RetainedBundleId retained_bundle_id;
@@ -158,9 +157,9 @@ struct RuntimeParticipantBindingDTO final {
   /// bound provider. Public callers cannot add or select these paths.
   std::vector<RuntimeCapabilityProviderPathDTO> supporting_capability_provider_paths;
   std::vector<RuntimeUnitEpochBindingDTO> runtime_unit_epochs;
-  /// Exact Program-owned templates copied from the sealed Program Binding.
-  /// Runtime object selection remains unresolved until operation admission.
-  std::vector<ProgramContactGraspBindingDTO> contact_grasp_bindings{};
+  /// The collision bodies the Program's collision rules select, copied from
+  /// the sealed Program Binding. Sorted by `body`, unique.
+  std::vector<ProgramCollisionRuleBodyBindingDTO> collision_rule_bodies{};
   std::optional<RuntimeMotionEndpointBindingDTO> motion_endpoint{};
   /// Program-wide references used for motion reference projection only.
   /// They do not grant participant, target or endpoint authority.

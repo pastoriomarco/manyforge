@@ -27,7 +27,7 @@ export function trialEDeployment(
   inputs: readonly string[] = ['curtain_blocked', 'edge_sensor', 'probe_contact'],
 ): Record<string, JsonValue> {
   return {
-    api_version: 'manyforge.deployment_intent.v2',
+    api_version: 'manyforge.deployment_intent.v3',
     components: [
       {
         component_id: 'lite6_robot',
@@ -60,8 +60,8 @@ export function trialEDeployment(
 
 export function trialEProgram(forest: ProgramTreeNode[]): ProgramAuthoringDocument {
   return {
-    api_version: 'manyforge.program.v3', program_id: 'mock_lite6_signal_moves', program_profile: 'composable-cell-v1',
-    name: 'mock_lite6_signal_moves', catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+    api_version: 'manyforge.program.v4', program_profile: 'composable-cell-v1',
+    catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
     parameters: [],
     blackboard: { namespaces: [], keys: [] },
     schema_version: 'manyforge.composer_authoring_forest.v2', forest, positions: {},

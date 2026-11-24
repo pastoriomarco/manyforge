@@ -1,18 +1,10 @@
-api_version: manyforge.program.v3
-program_id: trocar_lite6_foundationpose_pick
-program_revision: sha256:eead1a0eec72be8bd4fe479ed37e4d3773905d7a07f922d29708b9665a32434a
+api_version: manyforge.program.v4
+program_revision: sha256:a21d3fefda3a9e53b57f05094b3c783ebc6e9433d8f17ef6bae6a43a91a1c992
 program_profile: composable-cell-v1
-name: trocar_lite6_foundationpose_pick
-description: Retained Isaac-compatible Lite6 trocar pick Program. The Manager latches the FoundationPose
-  observation for graspable immediately before planning; this Program then synthesizes and executes the
-  original top-down pick and place sequence using the physical lite-gripper and typed simulator lifecycle.
-  When another Active TCP is selected, pick offsets stay relative to the gripper TCP.
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
-  lanes:
-  - isaac-sim
   assistant: forbidden
   requires:
   - foundationpose
@@ -48,17 +40,6 @@ scene:
       - 0.0
   resource_roles:
   - pick_object
-  metadata:
-    support_contacts:
-    - support_object_id: ground
-      release_evidence_mode: signed_penetration
-      enforce_max_start_penetration: true
-      max_start_penetration_m: 0.03
-      release_tolerance_m: 0.001
-      min_release_progress_m: 0.0
-      require_separation_by_end: true
-      require_strictly_decreasing_penetration: true
-      allow_recontact: false
 - scene_resource_id: ground
   shape:
     type: box
@@ -131,32 +112,6 @@ blackboard:
       type: scene_resource
     - field: tool_position
       type: coordinate_position
-  - key: selected_object
-    type: scene_resource
-    access: read_write
-    persistence: run
-    description: Operation-scoped FoundationPose-selected object binding.
-contact_policies:
-- api_version: manyforge.contact_policy.v1
-  policy_id: selected_object_grasp
-  version: sha256:4dd457c3867359c71b3ff8a1885042786887a79dec93808446726efa1dabc5c1
-  mode: contact_grasp
-  sensing_mode: geometry_only
-  default_unmatched_response: hard_stop
-  zones:
-  - zone_id: tool_contact
-    body_pairs:
-    - body_a:
-        kind: component_model_body
-        body:
-          component_id: lite_gripper
-          collision_body_id: gripper_collision
-      body_b:
-        kind: runtime_object
-        runtime_object_id: selected_object
-    violation_response: hard_stop
-    max_penetration_m: 0.002
-    terminal_window_start_fraction: 0.8
 tree:
   node_id: sequence
   instance_id: trocar_foundationpose_pick
@@ -299,7 +254,36 @@ tree:
         value_n: 10.0
       tool_command_duration_s: 0.8
       output_key: planning.pick_plan
-      contact_policy_id: selected_object_grasp
+      collision_rules:
+      - rule_id: selected_object_grasp
+        leg: descend
+        a:
+        - kind: collision_body
+          component_id: lite_gripper
+          collision_body_id: gripper_collision
+        b:
+        - kind: scene_object
+          scene_resource_id: graspable
+        contact:
+          max_penetration_m: 0.002
+          end_from_fraction: 0.8
+      - rule_id: lift_from_ground
+        leg: retreat
+        a:
+        - kind: attached_object
+          component_id: lite_gripper
+        b:
+        - kind: scene_object
+          scene_resource_id: ground
+        release:
+          release_evidence_mode: signed_penetration
+          enforce_max_start_penetration: true
+          max_start_penetration_m: 0.03
+          min_release_progress_m: 0.0
+          release_tolerance_m: 0.001
+          require_strictly_decreasing_penetration: true
+          require_separation_by_end: true
+          allow_recontact: false
     children: []
   - node_id: motion.move_to_pose
     instance_id: move_to_planned_pick_approach
@@ -402,6 +386,23 @@ tree:
         kind: current
       planning_timeout_s: 10.0
       execution_timeout_s: 30.0
+      collision_rules:
+      - rule_id: lift_from_ground
+        a:
+        - kind: attached_object
+          component_id: lite_gripper
+        b:
+        - kind: scene_object
+          scene_resource_id: ground
+        release:
+          release_evidence_mode: signed_penetration
+          enforce_max_start_penetration: true
+          max_start_penetration_m: 0.03
+          min_release_progress_m: 0.0
+          release_tolerance_m: 0.001
+          require_strictly_decreasing_penetration: true
+          require_separation_by_end: true
+          allow_recontact: false
     children: []
     value_sources:
       goal:
@@ -473,6 +474,17 @@ tree:
       velocity_scale: 0.2
       planning_timeout_s: 10.0
       execution_timeout_s: 30.0
+      collision_rules:
+      - rule_id: place_on_ground
+        a:
+        - kind: attached_object
+          component_id: lite_gripper
+        b:
+        - kind: scene_object
+          scene_resource_id: ground
+        contact:
+          max_penetration_m: 0.03
+          end_from_fraction: 0.8
     children: []
   - node_id: gripper.command_position
     instance_id: open_gripper_release

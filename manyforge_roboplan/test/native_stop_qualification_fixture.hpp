@@ -38,7 +38,6 @@ make_binding(bool distinct_compiled_joint_names = false) {
         core::CoordinateKind::kAngular});
   }
   core::RuntimeParticipantBindingDTO value{
-      core::ProgramId("program.native.stop_qualification"),
       core::ProgramRevision("program-revision"),
       core::ProgramBindingId("program-binding"),
       core::RetainedBundleId("bundle"),

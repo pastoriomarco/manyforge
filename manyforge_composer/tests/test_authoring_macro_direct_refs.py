@@ -23,14 +23,13 @@ def _arguments():
                          "frame": {"component_id": "tool", "frame_id": "tcp"}},
         "touch_bodies": [{"component_id": "tool", "collision_body_id": "fingers"}],
         "tool_position": {"kind": "linear_m", "value_m": 0.0},
-        "contact_policy_id": "grasp", "blackboard_namespace_id": "planning",
+        "blackboard_namespace_id": "planning",
         "blackboard_key": "planning.pick", "instance_prefix": "pick",
     }
 
 
 def _document():
     return {"scene": [{"scene_resource_id": "part"}],
-            "contact_policies": [{"policy_id": "grasp"}],
             "forest": [], "positions": {}}
 
 
@@ -46,6 +45,43 @@ def test_macro_preserves_direct_references_and_mounted_tcp():
     assert children[4]["parameters"]["touch_bodies"] == arguments["touch_bodies"]
 
 
+def test_pick_macro_puts_each_leg_rule_on_the_plan_and_on_its_move():
+    catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
+    session = object.__new__(ComposerDraftSession)
+    document, arguments = _document(), _arguments()
+    contact = {
+        "rule_id": "grasp", "leg": "descend",
+        "a": [{"kind": "active_tcp_contact_bodies"}],
+        "b": [{"kind": "scene_object", "scene_resource_id": "part"}],
+        "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8},
+    }
+    arguments["collision_rules"] = [contact]
+    session._authoring_macro_expand(document, arguments, catalog)
+    carried = [
+        child["parameters"]["collision_rules"]
+        for child in document["forest"][0]["children"]
+        if "collision_rules" in child["parameters"]
+    ]
+    move_row = {name: value for name, value in contact.items() if name != "leg"}
+    # The planning node keeps the row with its leg; the descend move gets the
+    # row itself. No other node carries a rule.
+    assert sorted(carried, key=lambda rows: "leg" in rows[0]) == [[move_row], [contact]]
+
+    # Without rules the macro adds none: a pick needs no contact rule.
+    plain_document, plain = _document(), _arguments()
+    session._authoring_macro_expand(plain_document, plain, catalog)
+    assert all(
+        "collision_rules" not in child["parameters"]
+        for child in plain_document["forest"][0]["children"]
+    )
+
+    refused_document, refused = _document(), _arguments()
+    refused["collision_rules"] = {"rule_id": "grasp"}
+    with pytest.raises(DraftSessionError):
+        session._authoring_macro_expand(refused_document, refused, catalog)
+    assert refused_document == _document()
+
+
 def test_place_macro_preserves_direct_frame_and_targets():
     catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
     session = object.__new__(ComposerDraftSession)
@@ -56,7 +92,6 @@ def test_place_macro_preserves_direct_frame_and_targets():
                     "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]}},
         approach_offset_m=[0.0, 0.0, 0.1],
     )
-    arguments.pop("contact_policy_id")
     arguments.pop("touch_bodies")
     session._authoring_macro_expand(document, arguments, catalog)
     children = document["forest"][0]["children"]

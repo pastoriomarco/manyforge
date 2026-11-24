@@ -21,8 +21,7 @@ def _projection() -> dict:
     tool_ids = [
         "blackboard_draft_remove_keys", "blackboard_draft_remove_namespaces",
         "blackboard_draft_upsert_keys", "blackboard_draft_upsert_namespaces",
-        "program_draft_remove_contact_policies", "program_draft_remove_parameters",
-        "program_draft_upsert_contact_policies", "program_draft_upsert_parameters",
+        "program_draft_remove_parameters", "program_draft_upsert_parameters",
         "scene_draft_add_object", "scene_draft_remove_objects",
         "scene_draft_update_object", "scene_draft_upsert_objects",
         "tree_draft_change_node_kind", "tree_draft_delete_node", "tree_draft_insert_node",
@@ -82,7 +81,7 @@ def test_draft_owner_tool_set_is_exactly_the_generated_callback_set() -> None:
     generated = set(draft_tools)
 
     assert generated == set(SUPPORTED_DRAFT_MUTATIONS)
-    assert len(generated) == 20
+    assert len(generated) == 18
     assert all(
         "force_discard_overrides"
         not in json.dumps(row["input_schema"], sort_keys=True)
@@ -114,63 +113,43 @@ def test_generated_scene_schema_accepts_only_the_strict_v1_envelope() -> None:
         )
 
 
-def _grasp_policy() -> dict:
-    return {
-        "api_version": "manyforge.contact_policy.v1",
-        "policy_id": "grasp_contact",
-        "mode": "contact_grasp",
-        "sensing_mode": "geometry_only",
-        "default_unmatched_response": "hard_stop",
-        "zones": [{
-            "zone_id": "fingertips",
-            "body_pairs": [{
-                "body_a": {"kind": "component_model_body",
-                           "body": {"component_id": "gripper", "collision_body_id": "Finger_Left"}},
-                "body_b": {"kind": "runtime_object", "runtime_object_id": "pick_target"},
-            }],
-            "max_penetration_m": 0.002,
-            "terminal_window_start_fraction": 0.8,
-            "violation_response": "hard_stop",
-        }],
+def test_collision_rules_are_node_parameters_without_a_dedicated_tool() -> None:
+    assert not any("contact_polic" in tool_id for tool_id in _tools())
+    assert "contact_policy" not in _types()
+    nodes = _nodes()
+    contact = {
+        "rule_id": "tip_on_part",
+        "a": [{"kind": "active_tcp_contact_bodies"}],
+        "b": [{"kind": "scene_object", "blackboard_key": "trial.probe_object"}],
+        "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8},
     }
-
-
-def test_generated_contact_policy_schema_accepts_the_v1_grasp_and_release_shapes() -> None:
-    tools = _tools()
-    upsert = tools["program_draft_upsert_contact_policies"]
-    remove = tools["program_draft_remove_contact_policies"]
-    assert upsert["argument_types"] == {"contact_policies": "contact_policy[]"}
-    assert upsert["input_schema"]["properties"]["contact_policies"]["type"] == "array"
-    assert remove["input_schema"]["properties"]["contact_policy_ids"]["type"] == "array"
-    assert "contact_grasp" in upsert["description"]
-    assert "planning.plan_pick_sequence" in upsert["description"]
-    schema = _types()["contact_policy"]
-
-    validate_callback_arguments({"contact_policies": [_grasp_policy()]}, upsert["input_schema"])
-    validate_callback_arguments({"contact_policy_ids": ["grasp_contact"]}, remove["input_schema"])
-    validate_callback_arguments(_grasp_policy(), schema)
-    release = _grasp_policy()
-    release["mode"] = "contact_release"
-    zone = release["zones"][0]
-    del zone["max_penetration_m"], zone["terminal_window_start_fraction"]
-    zone["release_evidence_mode"] = "binary_contact"
-    zone["require_separation_by_end"] = True
-    validate_callback_arguments(release, schema)
-
-    with pytest.raises(CallbackSchemaValidationError):
-        validate_callback_arguments({"contact_policy_ids": []}, remove["input_schema"])
-    for mutate in (
-        lambda policy: policy.update(version="sha256:" + "0" * 64),  # Composer computes it
-        lambda policy: policy.update(sensing_mode="force"),
-        lambda policy: policy["zones"].append(policy["zones"][0]),
-        lambda policy: policy["zones"][0].pop("max_penetration_m"),
-        lambda policy: policy["zones"][0].update(max_penetration_m=0),
-        lambda policy: policy["zones"][0]["body_pairs"][0].update(body_b={"kind": "scene"}),
+    rules = [{"rule_id": "everything_else", "clearance_m": 0.002}, contact]
+    validate_callback_arguments(
+        {"parameters": {"collision_rules": rules}},
+        nodes["motion.probe_search"]["update_schema"],
+    )
+    # A pick or place sequence row names the leg it applies to.
+    validate_callback_arguments(
+        {"parameters": {"collision_rules": [{**contact, "leg": "descend"}]}},
+        nodes["planning.plan_pick_sequence"]["update_schema"],
+    )
+    for invalid in (
+        {**contact, "contact": {"max_depth_m": 0.002}},
+        {**contact, "a": [{"kind": "model_group"}]},
+        {**contact, "leg": "descend"},
     ):
-        invalid = _grasp_policy()
-        mutate(invalid)
         with pytest.raises(CallbackSchemaValidationError):
-            validate_callback_arguments(invalid, schema)
+            validate_callback_arguments(
+                {"parameters": {"collision_rules": [invalid]}},
+                nodes["motion.probe_search"]["update_schema"],
+            )
+    # Rule values are plain numbers: the parameter takes no value source.
+    with pytest.raises(CallbackSchemaValidationError):
+        validate_callback_arguments(
+            {"value_sources": {"collision_rules": {
+                "kind": "blackboard_key", "reference": "trial.rules"}}},
+            nodes["motion.probe_search"]["update_schema"],
+        )
 
 
 def test_generated_relative_orientation_and_tree_union_schemas_are_enforced() -> None:

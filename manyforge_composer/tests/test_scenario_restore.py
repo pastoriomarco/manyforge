@@ -14,17 +14,17 @@ def _state(saved):
 
 
 def test_revisions_decide_when_both_documents_carry_one() -> None:
-    saved = {"deployment_revision": "sha256:" + "1" * 64, "name": "cell"}
-    assert not saved_deployment_differs_from(_state(saved), {**saved, "name": "other"})
+    saved = {"deployment_revision": "sha256:" + "1" * 64, "label": "cell"}
+    assert not saved_deployment_differs_from(_state(saved), {**saved, "label": "other"})
     assert saved_deployment_differs_from(
         _state(saved), {**saved, "deployment_revision": "sha256:" + "2" * 64}
     )
 
 
 def test_documents_decide_without_revisions_and_absence_is_no_difference() -> None:
-    saved = {"api_version": "manyforge.deployment_intent.v2", "name": "cell"}
+    saved = {"api_version": "manyforge.deployment_intent.v3", "label": "cell"}
     assert saved_deployment_differs_from(_state(saved), dict(saved)) is False
-    assert saved_deployment_differs_from(_state(saved), {**saved, "name": "edited"}) is True
+    assert saved_deployment_differs_from(_state(saved), {**saved, "label": "edited"}) is True
     # Unknown, which the Revert guard treats as no proven difference.
     assert saved_deployment_differs_from(_state(None), saved) is None
     assert saved_deployment_differs_from(_state(saved), None) is None

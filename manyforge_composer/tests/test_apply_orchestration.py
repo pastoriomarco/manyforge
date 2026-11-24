@@ -475,7 +475,6 @@ def test_preview_view_carries_the_impact_program_attachments_and_scope() -> None
             "detached_components": ["tray"],
             "program": {
                 "executable": False,
-                "program_id": "pick",
                 "program_revision": "sha256:" + "1" * 64,
                 "non_executable": {
                     "unresolved_targets": [reference],
@@ -496,25 +495,98 @@ def test_preview_view_carries_the_impact_program_attachments_and_scope() -> None
         "scope": scope,
         "program": {
             "executable": False,
-            "program_id": "pick",
             "unresolved_references": [reference],
             "affected_nodes": ["move_1"],
             "affected_execution_groups": ["main"],
         },
         "attachment_changed_components": ["gripper"],
         "detached_components": ["tray"],
+        "collision_rules": [],
+        "mesh_depth_reports": [],
     }
+
+
+_RULE_CHANGE = {
+    "rule_id": "pads_part",
+    "change": "added",
+    "now": {
+        "rule": {"rule_id": "pads_part", "a": [{"kind": "model_group", "component_id": "gripper",
+                                               "group": "fingers"}],
+                 "b": [{"kind": "attached_object", "component_id": "gripper"}],
+                 "contact": {"end_from_fraction": 0.8}},
+        "a": [{"kind": "link", "component_id": "gripper", "link": "left_pad"}],
+        "b": [{"kind": "attached_object", "component_id": "gripper"}],
+    },
+    "was": None,
+}
+
+
+_MESH_REPORT = {
+    "code": "mesh_not_closed",
+    "collision_rule_id": "pads_part",
+    "member": {"kind": "scene_object", "scene_resource_id": "endplate"},
+    "mesh_uri": "meshes/endplate.stl",
+}
+
+
+def test_preview_view_lists_the_mesh_depth_reports() -> None:
+    view = preview_view(
+        candidate_preview({"impact": {"components": [], "mesh_depth_reports": [_MESH_REPORT]}}),
+        {},
+    )
+    assert view["mesh_depth_reports"] == [_MESH_REPORT]
+    # A report needs no confirmation.
+    assert candidate_preview({"impact": {"mesh_depth_reports": [_MESH_REPORT]}}).collision_rule_ids() == []
+
+
+def test_preview_view_lists_the_collision_rule_changes() -> None:
+    view = preview_view(
+        candidate_preview({"impact": {"components": [], "collision_rules": [_RULE_CHANGE]}}), {}
+    )
+    assert view["collision_rules"] == [_RULE_CHANGE]
+
+
+class _RuleCell(_FakeCell):
+    def preview(self) -> Preview:
+        self.calls.append(("preview",))
+        return Preview(components=tuple(self.impact), collision_rules=(_RULE_CHANGE,))
+
+
+def test_an_unconfirmed_rule_change_ends_the_apply_before_any_step() -> None:
+    cell = _RuleCell({"robot": "enabled"}, _impact(robot="replace"))
+    result = run_apply(cell, confirmed_collision_rule_ids=[])
+    assert cell.calls == [("preview",)]
+    assert result["outcome"] == "failed" and result["components"] == []
+    assert result["error"]["code"] == "collision_rule_confirmation_required"
+    assert "pads_part" in result["error"]["message"]
+
+
+def test_confirmed_rule_changes_apply() -> None:
+    cell = _RuleCell(
+        {"robot": "enabled"}, _impact(robot="replace"), after_apply={"robot": "not_prepared"}
+    )
+    result = run_apply(cell, confirmed_collision_rule_ids=["pads_part"])
+    assert result["outcome"] == "succeeded"
+    assert ("apply",) in cell.calls
+
+
+def test_a_caller_that_is_the_confirmation_needs_no_rule_ids() -> None:
+    # A Scenario Load confirms the whole candidate itself.
+    cell = _RuleCell(
+        {"robot": "enabled"}, _impact(robot="replace"), after_apply={"robot": "not_prepared"}
+    )
+    assert run_apply(cell)["outcome"] == "succeeded"
 
 
 def test_an_executable_program_has_no_unresolved_references() -> None:
     view = preview_view(
         candidate_preview({"impact": {"components": [], "program": {
-            "executable": True, "program_id": "pick", "non_executable": None,
+            "executable": True, "non_executable": None,
         }}}),
         {},
     )
     assert view["program"] == {
-        "executable": True, "program_id": "pick", "unresolved_references": [],
+        "executable": True, "unresolved_references": [],
         "affected_nodes": [], "affected_execution_groups": [],
     }
 

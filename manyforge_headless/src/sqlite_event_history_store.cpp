@@ -31,7 +31,7 @@ namespace {
 using content_identity::CanonicalValue;
 
 constexpr int kHistorianApplicationId = 0x4D464548;
-constexpr int kHistorianUserVersion = 8;
+constexpr int kHistorianUserVersion = 9;
 /// A maximal record (256-KiB payload plus its bounded envelope) always fits
 /// one capture, so a trigger is never dropped for its size.
 constexpr std::int64_t kMinimumCaptureBytes = 512LL * 1024LL;
@@ -173,11 +173,13 @@ ALTER TABLE historian_events ADD COLUMN summary_digest TEXT NOT NULL DEFAULT '';
 
 constexpr std::string_view kCorrelationNames =
     "'program_run_id','operation_id','action_span_id','node_instance_id','node_attempt_id',"
-    "'intervention_session_id','contact_policy_id','incident_id','condition_id','alarm_condition_id',"
+    "'intervention_session_id','rule_id','incident_id','condition_id','alarm_condition_id',"
     "'activation_id','stop_event_id','resource_id','phase','parent_node_attempt_id'";
 // Error and reason codes at any depth are keyed for search only (revision 5;
 // revision 6 adds the incident cause and closure codes); they are not
-// correlation filters or discovery kinds.
+// correlation filters or discovery kinds. Revision 9 keys `rule_id` (the
+// collision rule or global rule an event names) in place of the contact
+// policy id.
 constexpr std::string_view kSearchCodeNames = "'code','reason','reason_code','cause_class','closure_reason'";
 const std::string kIndexedKeyNames = std::string(kCorrelationNames) + "," + std::string(kSearchCodeNames);
 // Ids minted inside one application start are integers (contract 1.5). They
@@ -230,7 +232,7 @@ const std::string kProgramDiagnosticSchemaList = [] {
 }();
 const std::set<std::string> kCorrelationKeys{
     "program_run_id", "operation_id", "action_span_id", "node_instance_id", "node_attempt_id",
-    "intervention_session_id", "contact_policy_id", "incident_id", "condition_id", "alarm_condition_id",
+    "intervention_session_id", "collision_rule_id", "incident_id", "condition_id", "alarm_condition_id",
     "activation_id", "stop_event_id", "resource_id", "channel", "phase", "parent_node_attempt_id"};
 
 std::optional<std::string> RecordedClockOwner(const HistorianEvent &event) {

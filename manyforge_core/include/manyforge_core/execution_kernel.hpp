@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -143,18 +144,21 @@ struct ExecutionKernelConfig {
   int validation_collision_workers = 4;
   bool validation_collision_workers_declared = false;
 
-  // Cell collision clearance (coal security margin) for validation and
-  // planning, in [0, kMaxCollisionClearanceM] m (Deployment
-  // `collision_clearance_m`). A move keeps at least this from every
-  // environment body; pairs the collision policy allows to touch (static,
-  // touch-link, support-contact and the active contact-grasp pairs) and
-  // self pairs keep 0. A motion's `clearance_m` replaces it for that move.
-  // The runtime monitor and lookahead keep 0. Default 0.1 mm; 0 disables it.
-  double collision_clearance_m = kDefaultCollisionClearanceM;
+  // The cell's collision rules (the Deployment's `collision_rules`) for
+  // validation and planning. Row 0 has no selections: its clearance (coal
+  // security margin, in [0, kMaxCollisionClearanceM] m, default 1 mm, 0
+  // disables it) holds every robot x environment pair; the other rows give
+  // their value to their pairs. Static-static pairs and an attachment's grip
+  // pairs are outside the rules, and self pairs keep 0 unless a row names
+  // them. A motion's own `collision_rules` replace the values of its pairs
+  // for that move. The runtime monitor and lookahead keep clearance 0.
+  std::vector<CollisionRule> collision_rules{CollisionRule{
+      std::string(kEverythingCollisionRuleId), {}, {},
+      CollisionClearanceRule{kDefaultCollisionClearanceM}}};
 
-  // Whether a fresh plan without an active contact policy gets the
+  // Whether a fresh plan without contact or release rules gets the
   // pre-dispatch waypoint check (ManyForge's collision engine on every timed
-  // waypoint) like a cached trajectory or a contact-policy move; a failing
+  // waypoint) like a cached trajectory or a move with such rules; a failing
   // plan is replanned within the authoritative-validation attempts. Off: the
   // planner's own checks stand for it (Deployment
   // `collision_check_fresh_plans`).
@@ -207,6 +211,29 @@ enum class RuntimeCollisionMonitorRelease {
   kWorkerRetirement,
 };
 
+/// One spring pair's current compression for the live view (OD-358). The a
+/// side is a component's link or a carried scene object.
+struct SpringCompressionDTO {
+  enum class SideKind { kComponentLink, kSceneObject };
+  std::string rule_id;
+  SideKind a_kind = SideKind::kComponentLink;
+  /// kComponentLink: the component and the compiled link of its body.
+  std::string a_component_id;
+  std::string a_link;
+  /// kSceneObject: the carried object.
+  std::string a_scene_resource_id;
+  double depth_m = 0.0;
+  /// Unit vector (world frame) that moves side a out of side b.
+  std::array<double, 3> push_direction{};
+};
+
+/// The live view's rows of one spring-compression snapshot (OD-358): one per
+/// compressed spring pair, its side-a body. A grouped spring in contact
+/// (OD-371) gives every side-a body of its rule, touching or not, its deepest
+/// pair's depth and direction. NRT.
+[[nodiscard]] std::vector<SpringCompressionDTO> spring_compression_rows(
+    const RuntimeSpringCompressionSnapshot& snapshot);
+
 struct RuntimeCollisionProtectionSnapshot {
   bool active = false;
   std::uint64_t generation = 0;
@@ -232,6 +259,11 @@ struct ExecutionKernelPorts {
   /// thread ends with the engine. Empty: the engine's scheduler runs the
   /// checks (fixtures).
   std::shared_ptr<IScheduler> runtime_collision_check_scheduler{};
+  /// The cell's observed-state sources: the other components (other robots,
+  /// grippers) are placed where they are observed in this robot's collision
+  /// validation, runtime collision checks and look-ahead. Empty: a cell whose
+  /// only model coordinates are this robot's (and fixtures).
+  std::shared_ptr<const CellModelStateHandle> cell_model_state{};
 };
 
 /// Per-participant motion execution: planning, validation, preview,
@@ -383,11 +415,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// there is no authoritative collision policy.
   void set_collision_validation_policy_snapshot(std::optional<CollisionPolicySnapshot> snapshot);
 
-  /// Replace the cell collision clearance (Deployment `collision_clearance_m`,
-  /// cell context): a retained component takes the new value at Apply. A
-  /// move already validated keeps its margins. Throws std::invalid_argument
-  /// outside [0, kMaxCollisionClearanceM].
-  void set_collision_clearance_m(double clearance_m);
+  /// Replace the cell's collision rules (the Deployment's `collision_rules`,
+  /// cell context): a retained component takes the new rules at Apply. A
+  /// move already validated keeps its table. Throws std::invalid_argument
+  /// when the rules are malformed, when row 0 is not the row without
+  /// selections, or when a row selects one Scene object.
+  void set_collision_rules(std::vector<CollisionRule> rules);
 
   /// Replace the fresh-plan pre-dispatch check setting (Deployment
   /// `collision_check_fresh_plans`, cell context): a retained component takes
@@ -418,6 +451,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       const ConfigurationFenceScopeDTO& apply_fence_scope,
       const IResourceOperationAdmissionGate& admission_gate,
       CollisionPipelineResourceOwners candidate);
+
+  /// The refusal the replacement above would give now (OD-370 (B)): Apply
+  /// asks it of every kept owner before any effect. NRT.
+  [[nodiscard]] std::optional<ErrorDTO> collision_resource_replacement_refusal();
 
   /// Return the currently installed exact owned resource set. Initial legacy
   /// bootstrap resources without a shared publisher owner cannot be returned
@@ -456,6 +493,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       const noexcept;
   /// The configured check period (fixed at construction).
   [[nodiscard]] Duration runtime_collision_check_period_ns() const noexcept;
+  /// OD-358: the spring pairs that overlapped at the last clear check of the
+  /// current position, while a move's monitor runs, as
+  /// `spring_compression_rows`; empty otherwise. NRT; presentation only.
+  [[nodiscard]] std::vector<SpringCompressionDTO> spring_compressions() const;
 
  private:
   Result<bool> retire_prepared_motion_membership_for_recovery(std::uint64_t candidate_id,
@@ -511,10 +552,13 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   Result<std::size_t> discover_dynamic_carried_start_contacts(
       CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& observed_start,
       std::uint64_t execution_id);
-  void install_collision_clearance(const ExecuteRequestDTO& request,
+  /// Install the clearance margins of the move's resolved rule table into the
+  /// inventory, after the start-in-margin release.
+  void install_collision_clearance(std::shared_ptr<const CollisionClearanceMargins> margins,
                                    CollisionWorldLeaseInventory& projection_inventory,
                                    const RobotStateDTO& observed_start,
                                    std::uint64_t execution_id);
+  [[nodiscard]] std::shared_ptr<const std::vector<CollisionRule>> cell_collision_rules() const;
 
   /// Move-only ownership of one retained scene/projection revision. Destruction
   /// releases the publisher lookup entry on every success, rejection,
@@ -565,6 +609,13 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       std::optional<MotionPathPreview>* path_preview = nullptr,
       bool diagnostic_preview = false,
       std::optional<std::int64_t> diagnostic_deadline_ns = std::nullopt);
+
+  /// The trajectory on the collision model's coordinates, with every other
+  /// component of the cell at its observed position at this moment. Refused
+  /// with that component's stream condition when its state is stale or absent.
+  Result<TrajectoryDTO> expand_for_collision_in_cell(const TrajectoryDTO& trajectory,
+                                                     const RobotStateDTO& start_state);
+  [[nodiscard]] std::shared_ptr<const CellModelStateSources> cell_model_state_sources() const;
 
   /// Shared computation only. The caller owns planner serialization, the
   /// deadline/cancellation registration, projection lifetime and admission.
@@ -628,9 +679,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   };
   /// A prepare failure leaves the generation active but unarmed; the caller
   /// must stop it fail-closed and must not dispatch.
-  /// keep_admitted_policy: the move admitted an operation-local contact policy;
-  /// the monitor keeps admission_inventory's policy for the whole move and
-  /// pairs it with the latest published world.
+  /// keep_admitted_policy: the move has contact or release rules; the monitor
+  /// keeps admission_inventory's policy for the whole move and pairs it with
+  /// the latest published world.
   CollisionMonitoringStart start_collision_monitoring(
       std::string reason, const CollisionWorldLeaseInventory* admission_inventory,
       bool keep_admitted_policy = false);
@@ -640,7 +691,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   void arm_runtime_collision_lookahead(std::uint64_t execution_id,
                                        std::uint64_t execution_generation,
                                        std::shared_ptr<const TrajectoryDTO> collision_trajectory,
-                                       const std::string& contact_policy_id,
                                        const CollisionWorldLeaseInventory& admission_inventory);
   void revoke_runtime_collision_lookahead_clear_permits() noexcept;
   void apply_runtime_collision_lookahead_result(
@@ -650,7 +700,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       RuntimeCollisionLookaheadResult& result,
       const RuntimeCollisionLookaheadSession* source_session);
   void emit_runtime_collision_lookahead_evidence(RuntimeCollisionLookaheadResult result);
-  void emit_contact_policy_violation_event(
+  void emit_contact_rule_violation_event(
       std::uint64_t execution_id, const std::map<std::string, std::string>& source_details,
       std::optional<std::string_view> response_override = std::nullopt);
   // The runtime monitor's fault fact (a collision, lost position feedback,
@@ -848,8 +898,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   IScheduler& scheduler_;
   TrajectoryCache& cache_;
   ExecutionKernelConfig config_;
-  // config_.collision_clearance_m as last set (set_collision_clearance_m).
-  std::atomic<double> collision_clearance_m_;
+  // config_.collision_rules as last set (set_collision_rules). Leaf lock: held
+  // only to copy or replace the pointer.
+  mutable std::mutex collision_rules_mutex_;
+  std::shared_ptr<const std::vector<CollisionRule>> collision_rules_;
   // config_.collision_check_fresh_plans as last set
   // (set_collision_check_fresh_plans).
   std::atomic<bool> collision_check_fresh_plans_;
@@ -934,6 +986,10 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::optional<RuntimeCollisionStateProjection> runtime_collision_state_projection_;
   std::atomic<std::uint64_t> runtime_collision_snapshot_invalidation_epoch_{0};
   std::atomic<std::shared_ptr<RuntimeCollisionQuerySession>> runtime_collision_query_session_;
+  // Leaf lock: the check thread only try-locks it (a busy reader skips one
+  // publication), the reader copies under it.
+  mutable std::mutex spring_compression_mutex_;
+  RuntimeSpringCompressionSnapshot spring_compression_;
   std::atomic<std::shared_ptr<RuntimeCollisionLookaheadSession>>
       runtime_collision_lookahead_session_;
   // Held across an admission timeout; serialized by scheduler_detach_mutex_.

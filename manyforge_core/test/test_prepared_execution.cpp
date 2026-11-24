@@ -18,7 +18,6 @@ namespace {
   const OperationNumber operation_id(1U);
   const OperationRevision operation_revision(3U);
   const OperationParticipantId participant_id{OperationNumber(1U), 1U};
-  const ProgramId program_id("program.1");
   const ProgramRevision program_revision(Digest('1'));
   const ProgramBindingId program_binding_id(Digest('2'));
   const ProgramRunNumber program_run_id(1U);
@@ -28,7 +27,6 @@ namespace {
       operation_id,
       operation_revision,
       participant_id,
-      program_id,
       program_revision,
       program_binding_id,
       program_run_id,
@@ -52,7 +50,6 @@ namespace {
       operation_id,
       operation_revision,
       participant_id,
-      program_id,
       program_revision,
       program_binding_id,
       program_run_id,

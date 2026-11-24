@@ -58,20 +58,6 @@ NativeSceneProviderBindings(const RetainedBundleDTO &bundle) {
   return result;
 }
 
-template <typename Row>
-void BindProjection(Row &statement, const int first_column,
-                    const ProjectionRevisionDTO &projection) {
-  statement.Bind(first_column, projection.retained_bundle_id.value());
-  statement.Bind(first_column + 1, projection.graph_revision.value());
-  statement.Bind(first_column + 2,
-                 projection.scene_revision.scene_id.value());
-  statement.Bind(first_column + 3,
-                 CheckedSafeCounter(projection.scene_revision.revision_id,
-                                    "scene revision"));
-  statement.Bind(first_column + 4,
-                 projection.scene_revision.content_hash.value());
-}
-
 ProjectionMaintenanceInitializationStatusDTO MaintenanceStatus(
     const MaintenanceInitializationState &state,
     const ProjectionMaintenanceInitializationState visible_state) {
@@ -112,13 +98,7 @@ ContentDigest InitialSceneRequestDigest(
         {}, request.expected_active_projection_revision,
         request.initial_scene_objects[index], std::nullopt, std::nullopt,
         std::nullopt};
-    const auto part = logical_scene_codec_internal::EncodeRequest(item);
-    if (part.size() > kMaximumLogicalSceneTransactionBytes ||
-        encoded.size() > kMaximumLogicalSceneTransactionBytes - part.size()) {
-      throw LogicalSceneOwnerLimitError(
-          "initial Scene input exceeds the bounded snapshot extent");
-    }
-    encoded += part;
+    encoded += logical_scene_codec_internal::EncodeRequest(item);
   }
   return ContentDigest(manyforge::content_identity::sha256_digest(encoded));
 }
@@ -167,20 +147,23 @@ LogicalSceneSnapshotDTO BuildInitialSceneBaseline(
         operation.scene_resource_id, {operation.shape},
         core::CellFixedSceneObjectPlacementDTO{candidate.cell_id,
                                                pose.pose_in_cell},
-        std::nullopt, {}, operation.mass_kg});
-  }
-  for (std::size_t index = 0U; index < candidate.objects.size(); ++index) {
-    candidate.objects[index].support_contacts = NormalizeSupportContacts(
-        candidate.objects[index].scene_resource_id,
-        request.initial_scene_objects[index].support_contacts, candidate);
+        std::nullopt, operation.mass_kg});
   }
   candidate.revision.content_hash =
       core::logical_scene_identity::ComputeLogicalSceneContentHash(candidate);
-  if (!candidate.locally_valid() ||
-      logical_scene_codec_internal::EncodeSnapshot(candidate).size() > 131072U) {
+  if (!candidate.locally_valid()) {
     throw SceneRequestRejectionError(
-        "invalid_request", "initial Scene baseline is invalid or too large",
-        {});
+        "invalid_request", "initial Scene baseline is invalid", {});
+  }
+  // The same bound as a Commit: the Scene must fit its status publication.
+  if (const auto bytes =
+          logical_scene_codec_internal::EncodeSnapshot(candidate).size();
+      bytes > kMaximumLogicalSceneSnapshotBytes) {
+    throw SceneRequestRejectionError(
+        "scene_too_large", "the initial Scene would exceed its size limit",
+        {{"scene_bytes", std::to_string(bytes)},
+         {"maximum_scene_bytes",
+          std::to_string(kMaximumLogicalSceneSnapshotBytes)}});
   }
   static_cast<void>(ProjectEffectivePolicy(candidate, projections));
   return candidate;
@@ -196,47 +179,11 @@ ProjectionMaintenanceInitializationStatusDTO MaintenanceStatus(
                 ProjectionMaintenanceInitializationState::kInitializing));
 }
 
-// Records the result row in memory, as the file returns it, and appends its
-// insert.
-void InsertMaintenanceResult(
-    SceneStoreMemory &memory, MaintenanceInitializationState &row,
-    persistence::SqliteRecord &result, const std::uint64_t sequence,
+// Records the result of `row`; an error keeps its code and message only.
+void RecordMaintenanceResult(
+    MaintenanceInitializationState &row,
     const ProjectionMaintenanceInitializationState state,
     const std::optional<ErrorDTO> &error, const bool effects_unknown) {
-  const char *stored_state = nullptr;
-  switch (state) {
-  case ProjectionMaintenanceInitializationState::kInitialized:
-    stored_state = "initialized";
-    break;
-  case ProjectionMaintenanceInitializationState::kFailed:
-    stored_state = "failed";
-    break;
-  case ProjectionMaintenanceInitializationState::kInterrupted:
-    stored_state = "interrupted";
-    break;
-  case ProjectionMaintenanceInitializationState::kInitializing:
-  case ProjectionMaintenanceInitializationState::kCompleted:
-    throw LogicalSceneOwnerIntegrityError(
-        "invalid durable maintenance result state");
-  }
-  SizedRow inserted(
-      result,
-      "INSERT INTO logical_scene_maintenance_initialization_results("
-      "initialization_sequence,state,first_error_code,first_error_message,"
-      "effects_unknown) VALUES(?,?,?,?,?)");
-  inserted.Bind(1, CheckedSafeCounter(sequence, "initialization sequence"));
-  inserted.Bind(2, std::string_view(stored_state));
-  if (error.has_value()) {
-    inserted.Bind(3, error->code);
-    inserted.Bind(4, error->message);
-  } else {
-    inserted.BindNull(3);
-    inserted.BindNull(4);
-  }
-  inserted.Bind(5, std::int64_t{effects_unknown ? 1 : 0});
-  memory.maintenance_file_bytes[sequence] += SceneRowFileBytes(
-      inserted.record_bytes(),
-      SceneTable("logical_scene_maintenance_initialization_results"));
   row.result_state = state;
   row.effects_unknown = effects_unknown;
   if (error.has_value()) {
@@ -255,45 +202,16 @@ MaintenanceInitializationState &MaintenanceRow(SceneStoreMemory &memory,
                        });
 }
 
-// Records the completion of `found` with `receipt` and appends its insert and
-// the repair watermark. Memory holds the row as the file returns it: the
-// receipt is formed from the stored columns and the row's own target.
-void InsertMaintenanceCompletion(SceneStoreMemory &memory,
-                                 persistence::SqliteRecord &insert,
+// Records the completion of `found` with `receipt` and raises the repair
+// watermark. The recorded receipt names the row's own target.
+void RecordMaintenanceCompletion(SceneStoreMemory &memory,
                                  const MaintenanceInitializationState &found,
                                  const ActiveBundlePublicationReceiptDTO &receipt) {
-  SizedRow completion(
-      insert,
-      "INSERT INTO logical_scene_maintenance_initialization_completions("
-      "initialization_sequence,expected_previous_publication_generation,"
-      "publication_generation,private_materialization_content_digest,"
-      "durable_public_pointer_content_digest) VALUES(?,?,?,?,?)");
-  completion.Bind(1, CheckedSafeCounter(found.initialization_sequence,
-                                        "initialization sequence"));
   const auto previous_generation = CheckedSafeCounter(
       receipt.request.expected_previous_publication_generation->value(),
       "previous publication generation");
-  completion.Bind(2, previous_generation);
   const auto publication_generation = CheckedSafeCounter(
       receipt.publication_generation.value(), "publication generation");
-  completion.Bind(3, publication_generation);
-  completion.Bind(4,
-                  receipt.request.private_materialization_content_digest.value());
-  completion.Bind(5, receipt.durable_public_pointer_content_digest.value());
-  memory.maintenance_file_bytes[found.initialization_sequence] +=
-      SceneRowFileBytes(
-          completion.record_bytes(),
-          SceneTable("logical_scene_maintenance_initialization_completions"));
-  if (found.repaired_transaction_sequence.has_value()) {
-    insert.Statement(
-        "UPDATE logical_scene_history_state SET "
-        "recovered_through_transaction_sequence=? WHERE singleton=1 AND "
-        "recovered_through_transaction_sequence<=?");
-    insert.Bind(1, CheckedSafeCounter(*found.repaired_transaction_sequence,
-                                      "repaired transaction sequence"));
-    insert.Bind(2, CheckedSafeCounter(*found.repaired_transaction_sequence,
-                                      "repaired transaction sequence"));
-  }
   auto &row = MaintenanceRow(memory, found.initialization_sequence);
   row.publication_receipt = ActiveBundlePublicationReceiptDTO{
       ActiveBundlePublicationRequestDTO{
@@ -325,13 +243,14 @@ constexpr std::string_view kAdoptionEndedWithoutPublicationMessage =
     "the Apply ended before its publication; the Scene keeps its previous "
     "configuration";
 
-// A new initialization row as the file returns it: no result yet, and an
-// uninstalled baseline when its request is recorded.
+// A new initialization row: no result yet, and an uninstalled baseline when
+// its request is recorded.
 MaintenanceInitializationState NewMaintenanceInitialization(
     const std::uint64_t sequence, const ApplyId &apply_id,
     const ApplyGeneration &apply_generation,
     const ProjectionRevisionDTO &predecessor,
-    const ProjectionRevisionDTO &target, const std::string &snapshot_json,
+    const ProjectionRevisionDTO &target,
+    const LogicalSceneSnapshotDTO &snapshot,
     std::vector<core::ProjectionExecutionHostBindingDTO> bindings,
     const std::optional<std::uint64_t> repaired_transaction_sequence,
     const std::optional<ContentDigest> &baseline_request_digest) {
@@ -341,7 +260,7 @@ MaintenanceInitializationState NewMaintenanceInitialization(
       apply_generation,
       predecessor,
       target,
-      logical_scene_codec_internal::DecodeSnapshot(snapshot_json),
+      snapshot,
       std::move(bindings),
       std::nullopt,
       std::nullopt,
@@ -354,62 +273,6 @@ MaintenanceInitializationState NewMaintenanceInitialization(
       false,
       false,
   };
-}
-
-// Appends the intent and binding inserts of one initialization.
-void InsertMaintenanceIntent(
-    SceneStoreMemory &memory, persistence::SqliteRecord &insert,
-    const std::uint64_t sequence,
-    const ApplyId &apply_id, const std::int64_t apply_generation,
-    const ProjectionRevisionDTO &predecessor,
-    const ProjectionRevisionDTO &target, const std::string &snapshot_json,
-    const std::vector<core::ProjectionExecutionHostBindingDTO> &bindings,
-    const std::optional<std::uint64_t> repaired_transaction_sequence) {
-  SizedRow intent(
-      insert,
-      "INSERT INTO logical_scene_maintenance_initialization_intents("
-      "initialization_sequence,apply_id,apply_generation,"
-      "predecessor_retained_bundle_id,predecessor_graph_revision,"
-      "predecessor_scene_id,predecessor_scene_revision_id,"
-      "predecessor_scene_content_hash,target_retained_bundle_id,"
-      "target_graph_revision,target_scene_id,target_scene_revision_id,"
-      "target_scene_content_hash,authoritative_snapshot_json,"
-      "native_binding_count,repaired_transaction_sequence) "
-      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-  intent.Bind(1, static_cast<std::int64_t>(sequence));
-  intent.Bind(2, static_cast<std::int64_t>(apply_id.value()));
-  intent.Bind(3, apply_generation);
-  BindProjection(intent, 4, predecessor);
-  BindProjection(intent, 9, target);
-  intent.Bind(14, snapshot_json);
-  intent.Bind(15, static_cast<std::int64_t>(bindings.size()));
-  if (repaired_transaction_sequence.has_value()) {
-    intent.Bind(16, static_cast<std::int64_t>(*repaired_transaction_sequence));
-  } else {
-    intent.BindNull(16);
-  }
-  auto &file_bytes = memory.maintenance_file_bytes[sequence];
-  file_bytes += SceneRowFileBytes(
-      intent.record_bytes(),
-      SceneTable("logical_scene_maintenance_initialization_intents"));
-  for (std::size_t index = 0U; index < bindings.size(); ++index) {
-    const auto &binding = bindings[index];
-    SizedRow row(
-        insert,
-        "INSERT INTO logical_scene_maintenance_initialization_bindings("
-        "initialization_sequence,binding_ordinal,provider_binding_id,"
-        "provider_binding_revision,runtime_unit_id,runtime_epoch) "
-        "VALUES(?,?,?,?,?,?)");
-    row.Bind(1, static_cast<std::int64_t>(sequence));
-    row.Bind(2, static_cast<std::int64_t>(index));
-    row.Bind(3, binding.provider_binding_id.value());
-    row.Bind(4, binding.provider_binding_revision.value());
-    row.Bind(5, binding.runtime_unit_id.value());
-    row.Bind(6, binding.runtime_epoch.value());
-    file_bytes += SceneRowFileBytes(
-        row.record_bytes(),
-        SceneTable("logical_scene_maintenance_initialization_bindings"));
-  }
 }
 
 bool CandidateBindingsMatch(
@@ -725,90 +588,68 @@ MaintenanceRows(const DurableState &state) {
 
 } // namespace
 
-std::vector<const MaintenanceInitializationState *>
-MaintenanceEvictions(const SceneStoreMemory &memory, const DurableState &state,
-                     std::size_t folded, std::uint64_t freed,
-                     const std::uint64_t bytes, bool one) {
-  // The rule applied again after each eviction, as the count limit applies
-  // it once per new initialization.
-  auto rows = MaintenanceRows(state);
-  std::vector<const MaintenanceInitializationState *> evictions;
-  while (one || SceneFileBytes(memory) - freed + bytes >
-                    kSceneStoreRecordFileBytes) {
-    const auto evictable = OldestEvictableMaintenanceInitialization(rows, folded);
-    if (!evictable.has_value()) {
-      break;
-    }
-    const auto *row = rows[*evictable];
-    if (const auto found =
-            memory.maintenance_file_bytes.find(row->initialization_sequence);
-        found != memory.maintenance_file_bytes.end()) {
-      freed += found->second;
-    }
-    if (row->publication_receipt.has_value()) {
-      --folded;
-    }
-    evictions.push_back(row);
-    rows.erase(rows.begin() + static_cast<std::ptrdiff_t>(*evictable));
-    one = false;
-  }
-  return evictions;
-}
-
-// Deletes one initialization and its rows in every child table inside the
-// caller's write transaction (the delete guards open only while
-// compaction_in_progress is set). A folded completion leaves the checkpoint's
+// Deletes one initialization. A folded completion leaves the checkpoint's
 // folded-completion count, which indexes the retained completions.
 void DeleteMaintenanceInitialization(SceneStoreMemory &memory,
-                                     persistence::SqliteRecord &record,
                                      const MaintenanceInitializationState &row) {
-  const auto sequence =
-      CheckedSafeCounter(row.initialization_sequence, "initialization sequence");
-  record.Statement("UPDATE logical_scene_history_state SET "
-                   "compaction_in_progress=1 WHERE singleton=1 AND "
-                   "compaction_in_progress=0");
-  record.ExpectChanges(1);
-  for (const std::string_view table :
-       {"logical_scene_initial_baseline_results",
-        "logical_scene_initial_baseline_intents",
-        "logical_scene_initial_baseline_requests",
-        "logical_scene_maintenance_initialization_completions",
-        "logical_scene_maintenance_initialization_results",
-        "logical_scene_maintenance_initialization_bindings",
-        "logical_scene_maintenance_initialization_intents"}) {
-    record.Statement("DELETE FROM " + std::string(table) +
-                     " WHERE initialization_sequence=?");
-    record.Bind(1, sequence);
-  }
-  record.Statement(row.publication_receipt.has_value()
-                       ? "UPDATE logical_scene_history_state SET "
-                         "compacted_maintenance_completion_count="
-                         "compacted_maintenance_completion_count-1,"
-                         "compaction_in_progress=0 WHERE singleton=1"
-                       : "UPDATE logical_scene_history_state SET "
-                         "compaction_in_progress=0 WHERE singleton=1");
+  const bool completed = row.publication_receipt.has_value();
+  const auto sequence = row.initialization_sequence;
   std::erase_if(memory.maintenance_initializations,
                 [&](const MaintenanceInitializationState &value) {
-                  return value.initialization_sequence ==
-                         row.initialization_sequence;
+                  return value.initialization_sequence == sequence;
                 });
-  if (row.publication_receipt.has_value()) {
+  if (completed) {
     --memory.history.compacted_maintenance_completion_count;
   }
-  memory.maintenance_file_bytes.erase(row.initialization_sequence);
 }
 
 namespace {
 
+struct MaintenanceRoom final {
+  // The fold of the Scene history that makes an initialization evictable.
+  std::optional<PreparedSceneHistoryCompaction> compaction;
+  std::optional<SceneTransactionStoreState> transactions;
+  // The initialization that gives way, when the history is full.
+  const MaintenanceInitializationState *eviction{};
+  // A fold needs the recovered authored claims settled first; the caller
+  // settles them without the owner lock and asks again.
+  bool claims_to_settle{false};
+};
+
+// Whether the recovered authored claims a fold preserves are settled.
+enum class RecoveredClaimSettlement { kPending, kSettled, kUnavailable };
+
+[[nodiscard]] RecoveredClaimSettlement InitialRecoveredClaimSettlement(
+    const core::IKernelCellAdmissionPort *cell_admission) {
+  return cell_admission == nullptr ? RecoveredClaimSettlement::kSettled
+                                   : RecoveredClaimSettlement::kPending;
+}
+
+// Under `lock` on entry and on return: settles the recovered claims copied
+// under it, with the lock released (no Kernel call under the owner lock).
+[[nodiscard]] RecoveredClaimSettlement SettleRecoveredClaimsUnlocked(
+    const SceneStoreMemory &memory, core::IKernelCellAdmissionPort &admission,
+    std::unique_lock<std::mutex> &lock) {
+  const auto claims = RecoveredAuthoredSceneClaims(memory);
+  lock.unlock();
+  auto settlement = RecoveredClaimSettlement::kSettled;
+  try {
+    SettleRecoveredAuthoredSceneClaims(claims, admission);
+  } catch (const CellAdmissionTemporarilyUnavailable &) {
+    settlement = RecoveredClaimSettlement::kUnavailable;
+  }
+  lock.lock();
+  return settlement;
+}
+
 // Bound the maintenance-initialization history by eviction instead of
-// refusal. When it is full, or the new initialization's rows would not fit
-// the store's file bytes (od212), delete, inside the caller's write
-// transaction and before its insert, the oldest initialization no reader can
-// still need:
+// refusal. When it is full, delete, before the new initialization is
+// recorded, the oldest initialization no reader can still need:
 //  - not the latest: AccessStatus, health, the Begin/Install/Complete
 //    continuation and the Manager's in-flight Apply read it;
-//  - not the latest completed one: ActiveExecutionHostBindings, the durable
-//    head's Deployment identity and legacy-uncertainty repair read it;
+//  - not the latest completed one: ActiveExecutionHostBindings, the
+//    recorded head's Deployment identity and legacy-uncertainty repair read
+//    it;
 //  - not one that may still progress: no result yet, or initialized without
 //    completion (InstallInitialScene and CompleteMaintenanceInitialization
 //    find any row by Apply identity);
@@ -824,140 +665,62 @@ namespace {
 // evicted Manager Apply. When rows are needed only because completions are not
 // yet folded, fold them first with the transparent history compaction at the
 // settled head, settling held authored-Scene claims first as the commit path
-// does. For the file bytes, the resident Scene transactions are folded first
-// (a fold loses nothing), then initializations are evicted one after the
-// other until the rows fit. Returns nullopt when every retained
-// initialization is still needed, for the count or for the bytes; nothing
-// has changed then.
-// The file bytes one more initialization can take, error texts aside
-// (od212): its intent with `snapshot_bytes` of Scene, its `bindings`, its
-// result and completion, and with `baseline` its Program baseline request,
-// intent (the largest Scene) and result, every identifier at its bound.
-[[nodiscard]] std::uint64_t
-MaintenanceInitializationFileBytesBound(const std::size_t snapshot_bytes,
-                                        const std::size_t bindings,
-                                        const bool baseline) {
-  constexpr std::size_t kIdentifier = kMaximumSceneStoreIdentifierBytes;
-  const auto sized = [](const std::size_t integers, const std::size_t ids,
-                        const std::size_t nulls, const std::size_t text) {
-    RecordSize size;
-    for (std::size_t index = 0U; index < integers; ++index) {
-      size.Integer(std::numeric_limits<std::int64_t>::max());
-    }
-    for (std::size_t index = 0U; index < ids; ++index) {
-      size.Text(kIdentifier);
-    }
-    for (std::size_t index = 0U; index < nulls; ++index) {
-      size.Null();
-    }
-    if (text != 0U) {
-      size.Text(text);
-    }
-    return size.bytes();
-  };
-  auto bytes =
-      SceneRowFileBytes(
-          sized(7U, 8U, 0U, snapshot_bytes),
-          SceneTable("logical_scene_maintenance_initialization_intents")) +
-      bindings * SceneRowFileBytes(
-                     sized(2U, 4U, 0U, 0U),
-                     SceneTable("logical_scene_maintenance_initialization_bindings")) +
-      SceneRowFileBytes(
-          sized(2U, 1U, 2U, 0U),
-          SceneTable("logical_scene_maintenance_initialization_results")) +
-      SceneRowFileBytes(
-          sized(3U, 2U, 0U, 0U),
-          SceneTable("logical_scene_maintenance_initialization_completions"));
-  if (baseline) {
-    bytes += SceneRowFileBytes(sized(1U, 1U, 0U, 0U),
-                               SceneTable("logical_scene_initial_baseline_requests")) +
-             SceneRowFileBytes(sized(2U, 4U, 0U, kMaximumLogicalSceneTransactionBytes),
-                               SceneTable("logical_scene_initial_baseline_intents")) +
-             SceneRowFileBytes(sized(1U, 1U, 2U, 0U),
-                               SceneTable("logical_scene_initial_baseline_results"));
-  }
-  return bytes;
-}
-
-struct MaintenanceRoom final {
-  std::vector<const MaintenanceInitializationState *> evictions;
-  std::optional<PreparedSceneHistoryCompaction> compaction;
-  std::optional<SceneTransactionStoreState> transactions;
-};
-
+// does. Returns nullopt when every retained initialization is still needed;
+// nothing has changed then.
 [[nodiscard]] std::optional<MaintenanceRoom>
 MakeRoomForMaintenanceInitialization(
-    const SceneStoreMemory &memory,
-    core::IKernelCellAdmissionPort *cell_admission,
-    const DurableState &state, const std::uint64_t bytes) {
-  const bool full = state.maintenance_initializations.size() >=
-                    kMaximumMaintenanceInitializations;
-  const auto fits = [&](const std::uint64_t freed) {
-    return SceneFileBytes(memory) - freed + bytes <= kSceneStoreRecordFileBytes;
-  };
-  if (!full && fits(0U)) {
+    const SceneStoreMemory &memory, const RecoveredClaimSettlement claims,
+    const DurableState &state) {
+  if (state.maintenance_initializations.size() <
+      kMaximumMaintenanceInitializations) {
     return MaintenanceRoom{};
   }
   const auto rows = MaintenanceRows(state);
   auto folded = memory.history.compacted_maintenance_completion_count;
-  const bool fold_for_count =
-      full && !OldestEvictableMaintenanceInitialization(rows, folded) &&
-      OldestEvictableMaintenanceInitialization(
-          rows, kMaximumMaintenanceInitializations);
-  if (full && !fold_for_count &&
-      !OldestEvictableMaintenanceInitialization(rows, folded)) {
-    return std::nullopt;
-  }
   MaintenanceRoom room;
-  std::uint64_t freed = 0U;
-  if (fold_for_count || (!fits(0U) && memory.transaction_file_bytes != 0U)) {
+  if (!OldestEvictableMaintenanceInitialization(rows, folded)) {
+    if (!OldestEvictableMaintenanceInitialization(
+            rows, kMaximumMaintenanceInitializations)) {
+      return std::nullopt;
+    }
     auto transactions = ReadSceneTransactionStoreState(memory, state);
     bool settled = !state.projection_desynchronized &&
                    !state.unresolved_scene_transaction &&
                    !transactions.projection_desynchronized &&
                    !transactions.unresolved_native_attempt;
-    if (settled && cell_admission != nullptr &&
-        transactions.resident_transaction_count != 0U) {
-      try {
-        SettleRecoveredAuthoredSceneClaims(memory, *cell_admission);
-      } catch (const CellAdmissionTemporarilyUnavailable &) {
-        settled = false;
+    if (settled && transactions.resident_transaction_count != 0U) {
+      if (claims == RecoveredClaimSettlement::kPending) {
+        MaintenanceRoom pending;
+        pending.claims_to_settle = true;
+        return pending;
       }
+      settled = claims == RecoveredClaimSettlement::kSettled;
     }
-    if (settled) {
-      room.compaction =
-          PrepareSceneHistoryCompaction(memory, state, transactions, true);
-      room.transactions = std::move(transactions);
-      folded = room.compaction->history.compacted_maintenance_completion_count;
-      freed = memory.transaction_file_bytes;
-    } else if (fold_for_count) {
+    if (!settled) {
       return std::nullopt;
     }
+    room.compaction =
+        PrepareSceneHistoryCompaction(memory, state, transactions, true);
+    room.transactions = std::move(transactions);
+    folded = room.compaction->history.compacted_maintenance_completion_count;
   }
-  room.evictions =
-      MaintenanceEvictions(memory, state, folded, freed, bytes, full);
-  for (const auto *row : room.evictions) {
-    freed += memory.maintenance_file_bytes.contains(row->initialization_sequence)
-                 ? memory.maintenance_file_bytes.at(row->initialization_sequence)
-                 : 0U;
-  }
-  if ((full && room.evictions.empty()) || !fits(freed)) {
+  const auto evictable = OldestEvictableMaintenanceInitialization(rows, folded);
+  if (!evictable.has_value()) {
     return std::nullopt;
   }
+  room.eviction = rows[*evictable];
   return room;
 }
 
-// Applies the fold and the evictions to memory, ahead of the new row's
-// statements in the same record.
-void ApplyMaintenanceRoom(SceneStoreMemory &memory,
-                          persistence::SqliteRecord &record,
-                          MaintenanceRoom room, const DurableState &state) {
+// Applies the fold and the eviction, before the new row is recorded.
+void ApplyMaintenanceRoom(SceneStoreMemory &memory, MaintenanceRoom room,
+                          const DurableState &state) {
   if (room.compaction.has_value()) {
-    CompactSceneTransactionHistory(memory, record, std::move(*room.compaction),
-                                   state, *room.transactions);
+    CompactSceneTransactionHistory(memory, std::move(*room.compaction), state,
+                                   *room.transactions);
   }
-  for (const auto *row : room.evictions) {
-    DeleteMaintenanceInitialization(memory, record, *row);
+  if (room.eviction != nullptr) {
+    DeleteMaintenanceInitialization(memory, *room.eviction);
   }
 }
 
@@ -1026,6 +789,7 @@ LogicalSceneOwner::OriginalManagerAdoptionProjectionHealthImpl(
                             &original_fence_attempt);
   RequireCurrentPublication(impl_->publication_reader_, request.expected_predecessor_publication);
   std::unique_lock lock(impl_->mutex_);
+  impl_->AwaitNoCommitInFlight(lock);
   const auto state = impl_->ReadStateTransaction();
   RequireAdoptionCurrentScene(state, request);
   if (impl_->live_adoption_.has_value() || !AccessStatus(state).scene_writes_open) {
@@ -1046,7 +810,7 @@ LogicalSceneOwner::OriginalManagerAdoptionProjectionHealthImpl(
   for (const auto &binding : request.execution_host_bindings) {
     auto projection = ResolveRequiredProjection(
             binding, impl_->projection_resolver_, target);
-    auto observed = projection.preflight_health;
+    auto observed = *projection.preflight_health;
     if (observed.execution_host_binding != binding ||
         (observed.state == ProjectionHealthState::kHealthy &&
          !observed.healthy_for_identity(target))) {
@@ -1085,6 +849,7 @@ LogicalSceneOwner::OriginalManagerAdoptionProjectionHealthImpl(
                             &original_fence_attempt);
   RequireCurrentPublication(impl_->publication_reader_, request.expected_predecessor_publication);
   lock.lock();
+  impl_->AwaitNoCommitInFlight(lock);
   const auto current = impl_->ReadStateTransaction();
   RequireAdoptionCurrentScene(current, request);
   if (!AccessStatus(current).scene_writes_open) {
@@ -1115,6 +880,7 @@ LogicalSceneOwner::BeginQualifiedAdoptionImpl(
                             request.expected_predecessor_publication);
 
   std::unique_lock lock(impl_->mutex_);
+  impl_->AwaitNoCommitInFlight(lock);
   auto state = impl_->ReadStateTransaction();
   RequireAdoptionCurrentScene(state, request);
   const auto &owner = AdoptionOwner(request);
@@ -1146,7 +912,7 @@ LogicalSceneOwner::BeginQualifiedAdoptionImpl(
   for (const auto &binding : request.execution_host_bindings) {
     const auto projection = ResolveRequiredProjection(
             binding, impl_->projection_resolver_, staged_target);
-    if (!projection.preflight_health.healthy_for_identity(staged_target)) {
+    if (!projection.preflight_health->healthy_for_identity(staged_target)) {
       throw LogicalSceneOwnerConflictError(
           "qualified Scene adoption requires already healthy candidate projections");
     }
@@ -1157,17 +923,30 @@ LogicalSceneOwner::BeginQualifiedAdoptionImpl(
   RequireCurrentPublication(impl_->publication_reader_,
                             request.expected_predecessor_publication);
   lock.lock();
-  impl_->InvalidateSceneCommitState();
-  state = impl_->ReadStateTransaction();
-  RequireAdoptionCurrentScene(state, request);
-  found = find_operation(state);
-  if (found != state.maintenance_initializations.end()) {
-    RequireAdoptionRow(*found, request);
-    return MaintenanceStatus(*found);
-  }
-  if (!AccessStatus(state).scene_writes_open) {
-    throw LogicalSceneOwnerConflictError(
-        "qualified Scene adoption lost its maintenance window");
+  auto &memory = impl_->memory_;
+  auto recovered_claims =
+      InitialRecoveredClaimSettlement(impl_->cell_admission_);
+  std::optional<MaintenanceRoom> room;
+  for (;;) {
+    impl_->AwaitNoCommitInFlight(lock);
+    impl_->InvalidateSceneCommitState();
+    state = impl_->ReadStateTransaction();
+    RequireAdoptionCurrentScene(state, request);
+    found = find_operation(state);
+    if (found != state.maintenance_initializations.end()) {
+      RequireAdoptionRow(*found, request);
+      return MaintenanceStatus(*found);
+    }
+    if (!AccessStatus(state).scene_writes_open) {
+      throw LogicalSceneOwnerConflictError(
+          "qualified Scene adoption lost its maintenance window");
+    }
+    room = MakeRoomForMaintenanceInitialization(memory, recovered_claims, state);
+    if (!room.has_value() || !room->claims_to_settle) {
+      break;
+    }
+    recovered_claims =
+        SettleRecoveredClaimsUnlocked(memory, *impl_->cell_admission_, lock);
   }
   // Capture the latest Scene. Writes close with this row, so it stays the
   // adopted Scene until completion.
@@ -1180,38 +959,24 @@ LogicalSceneOwner::BeginQualifiedAdoptionImpl(
   // refusal before the row is recorded releases the capture.
   impl_->live_adoption_ = request;
   try {
-    auto &memory = impl_->memory_;
-    const auto snapshot_json =
-        logical_scene_codec_internal::EncodeSnapshot(snapshot);
-    auto room = MakeRoomForMaintenanceInitialization(
-        memory, impl_->cell_admission_, state,
-        MaintenanceInitializationFileBytesBound(
-            snapshot_json.size(), request.execution_host_bindings.size(),
-            false));
     if (!room.has_value()) {
       throw LogicalSceneOwnerConflictError(
           "qualified Scene adoption cannot enter this maintenance window");
     }
     const auto sequence = NextMaintenanceInitializationSequence(state);
     static_cast<void>(CheckedSafeCounter(sequence, "initialization sequence"));
-    const auto apply_generation = CheckedSafeCounter(
-        owner.apply_generation.value(), "Apply generation");
+    static_cast<void>(CheckedSafeCounter(owner.apply_generation.value(),
+                                         "Apply generation"));
     auto row = NewMaintenanceInitialization(
         sequence, owner.apply_id, owner.apply_generation, predecessor, target,
-        snapshot_json, request.execution_host_bindings, std::nullopt,
+        snapshot, request.execution_host_bindings, std::nullopt,
         std::nullopt);
-    persistence::SqliteRecord record;
-    ApplyMaintenanceRoom(memory, record, std::move(*room), state);
-    InsertMaintenanceIntent(memory, record, sequence, owner.apply_id,
-                            apply_generation,
-                            predecessor, target, snapshot_json,
-                            request.execution_host_bindings, std::nullopt);
+    ApplyMaintenanceRoom(memory, std::move(*room), state);
     // No Program baseline row: the exact authoritative Scene is already final.
-    InsertMaintenanceResult(memory, row, record, sequence,
-                            ProjectionMaintenanceInitializationState::kInitialized,
-                            std::nullopt, false);
+    RecordMaintenanceResult(
+        row, ProjectionMaintenanceInitializationState::kInitialized,
+        std::nullopt, false);
     memory.maintenance_initializations.push_back(std::move(row));
-    impl_->Post(std::move(record));
   } catch (...) {
     impl_->live_adoption_.reset();
     throw;
@@ -1225,7 +990,7 @@ LogicalSceneOwner::BeginQualifiedAdoptionImpl(
   for (const auto &binding : request.execution_host_bindings) {
     const auto projection = ResolveRequiredProjection(
         binding, impl_->projection_resolver_, target);
-    const auto &health = projection.preflight_health;
+    const auto &health = *projection.preflight_health;
     if (health.healthy_for_target(target)) {
       continue;
     }
@@ -1249,7 +1014,7 @@ LogicalSceneOwner::BeginQualifiedAdoptionImpl(
   }
   if (original_parent_fence != nullptr) {
     // A lost/changed remote response after commit is uncertainty, not rollback.
-    // Keep the original continuation and durable row for observation only.
+    // Keep the original continuation and recorded row for observation only.
     RequireHeldAdoptionParent(request, impl_->cell_admission_, original_parent_fence);
     RequireCurrentPublication(impl_->publication_reader_, request.expected_predecessor_publication);
   }
@@ -1285,106 +1050,97 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
   }
 
   std::unique_lock lock(impl_->mutex_);
-  impl_->InvalidateSceneCommitState();
-  auto state = impl_->ReadStateTransaction();
-  auto found = std::find_if(
-      state.maintenance_initializations.begin(),
-      state.maintenance_initializations.end(), [&](const auto &value) {
-        return value.apply_id == request.apply_id &&
-               value.apply_generation == request.apply_generation;
-      });
+  auto recovered_claims =
+      InitialRecoveredClaimSettlement(impl_->cell_admission_);
+  DurableState state;
+  auto found = state.maintenance_initializations.end();
   bool inserted_intent = false;
-  if (found == state.maintenance_initializations.end()) {
-    const auto access = AccessStatus(state);
-    const auto *latest = state.LatestMaintenanceInitialization();
-    const bool prior_settled =
-        latest == nullptr || latest->result_state.has_value() ||
-        latest->publication_receipt.has_value();
-    const bool explicitly_repairable =
-        state.projection_desynchronized || state.unresolved_scene_transaction;
-    if (!state.active_projection.has_value() ||
-        !state.active_scene_snapshot.has_value() ||
-        *state.active_projection !=
-            request.expected_active_projection_revision ||
-        (!access.scene_writes_open && latest == nullptr &&
-         !explicitly_repairable) ||
-        !prior_settled) {
-      throw LogicalSceneOwnerConflictError(
-          "maintenance initialization does not match the exact active Scene");
-    }
-    auto provisional_snapshot = *state.active_scene_snapshot;
-    if (provisional_snapshot.revision.revision_id >= kMaximumSafeIntegral ||
-        provisional_snapshot.topology_epoch >= kMaximumSafeIntegral) {
-      throw LogicalSceneOwnerLimitError(
-          "candidate Scene revision cannot advance");
-    }
-    provisional_snapshot.objects.clear();
-    provisional_snapshot.carried_object_attachments.clear();
-    ++provisional_snapshot.revision.revision_id;
-    ++provisional_snapshot.topology_epoch;
-    provisional_snapshot.revision.content_hash =
-        core::logical_scene_identity::ComputeLogicalSceneContentHash(
-            provisional_snapshot);
-    if (!provisional_snapshot.locally_valid()) {
-      throw LogicalSceneOwnerIntegrityError(
-          "private empty candidate Scene is invalid");
-    }
-    const ProjectionRevisionDTO target{
-        request.candidate_retained_bundle.retained_bundle_id,
-        request.candidate_retained_bundle.cell_graph.graph_revision,
-        provisional_snapshot.revision,
-    };
-    auto &memory = impl_->memory_;
-    const auto snapshot_json =
-        logical_scene_codec_internal::EncodeSnapshot(provisional_snapshot);
-    auto room = MakeRoomForMaintenanceInitialization(
-        memory, impl_->cell_admission_, state,
-        MaintenanceInitializationFileBytesBound(
-            snapshot_json.size(), request.execution_host_bindings.size(),
-            true));
-    if (!room.has_value()) {
-      throw LogicalSceneOwnerConflictError(
-          "maintenance initialization does not match the exact active Scene");
-    }
-    const auto sequence = NextMaintenanceInitializationSequence(state);
-    const auto apply_generation = CheckedSafeCounter(
-        request.apply_generation.value(), "Apply generation");
-    std::optional<std::uint64_t> repaired_transaction_sequence;
-    if (state.projection_desynchronized &&
-        state.latest_uncertain_transaction_sequence.has_value()) {
-      static_cast<void>(
-          CheckedSafeCounter(*state.latest_uncertain_transaction_sequence,
-                             "uncertain transaction sequence"));
-      repaired_transaction_sequence =
-          state.latest_uncertain_transaction_sequence;
-    }
-    auto row = NewMaintenanceInitialization(
-        sequence, request.apply_id, request.apply_generation,
-        request.expected_active_projection_revision, target, snapshot_json,
-        request.execution_host_bindings, repaired_transaction_sequence,
-        initial_scene_digest);
-    persistence::SqliteRecord record;
-    ApplyMaintenanceRoom(memory, record, std::move(*room), state);
-    InsertMaintenanceIntent(memory, record, sequence, request.apply_id,
-                            apply_generation,
-                            request.expected_active_projection_revision,
-                            target, snapshot_json,
-                            request.execution_host_bindings,
-                            repaired_transaction_sequence);
-    SizedRow baseline_request(
-        record,
-        "INSERT INTO logical_scene_initial_baseline_requests("
-        "initialization_sequence,request_digest) VALUES(?,?)");
-    baseline_request.Bind(1, static_cast<std::int64_t>(sequence));
-    baseline_request.Bind(2, initial_scene_digest.value());
-    memory.maintenance_file_bytes[sequence] += SceneRowFileBytes(
-        baseline_request.record_bytes(),
-        SceneTable("logical_scene_initial_baseline_requests"));
-    memory.maintenance_initializations.push_back(std::move(row));
-    impl_->Post(std::move(record));
-    inserted_intent = true;
+  for (;;) {
+    impl_->AwaitNoCommitInFlight(lock);
+    impl_->InvalidateSceneCommitState();
     state = impl_->ReadStateTransaction();
-    found = std::prev(state.maintenance_initializations.end());
+    found = std::find_if(
+        state.maintenance_initializations.begin(),
+        state.maintenance_initializations.end(), [&](const auto &value) {
+          return value.apply_id == request.apply_id &&
+                 value.apply_generation == request.apply_generation;
+        });
+    if (found == state.maintenance_initializations.end()) {
+      const auto access = AccessStatus(state);
+      const auto *latest = state.LatestMaintenanceInitialization();
+      const bool prior_settled =
+          latest == nullptr || latest->result_state.has_value() ||
+          latest->publication_receipt.has_value();
+      const bool explicitly_repairable =
+          state.projection_desynchronized || state.unresolved_scene_transaction;
+      if (!state.active_projection.has_value() ||
+          !state.active_scene_snapshot.has_value() ||
+          *state.active_projection !=
+              request.expected_active_projection_revision ||
+          (!access.scene_writes_open && latest == nullptr &&
+           !explicitly_repairable) ||
+          !prior_settled) {
+        throw LogicalSceneOwnerConflictError(
+            "maintenance initialization does not match the exact active Scene");
+      }
+      auto provisional_snapshot = *state.active_scene_snapshot;
+      if (provisional_snapshot.revision.revision_id >= kMaximumSafeIntegral ||
+          provisional_snapshot.topology_epoch >= kMaximumSafeIntegral) {
+        throw LogicalSceneOwnerLimitError(
+            "candidate Scene revision cannot advance");
+      }
+      provisional_snapshot.objects.clear();
+      provisional_snapshot.carried_object_attachments.clear();
+      ++provisional_snapshot.revision.revision_id;
+      ++provisional_snapshot.topology_epoch;
+      provisional_snapshot.revision.content_hash =
+          core::logical_scene_identity::ComputeLogicalSceneContentHash(
+              provisional_snapshot);
+      if (!provisional_snapshot.locally_valid()) {
+        throw LogicalSceneOwnerIntegrityError(
+            "private empty candidate Scene is invalid");
+      }
+      const ProjectionRevisionDTO target{
+          request.candidate_retained_bundle.retained_bundle_id,
+          request.candidate_retained_bundle.cell_graph.graph_revision,
+          provisional_snapshot.revision,
+      };
+      auto &memory = impl_->memory_;
+      auto room =
+          MakeRoomForMaintenanceInitialization(memory, recovered_claims, state);
+      if (room.has_value() && room->claims_to_settle) {
+        recovered_claims =
+            SettleRecoveredClaimsUnlocked(memory, *impl_->cell_admission_, lock);
+        continue;
+      }
+      if (!room.has_value()) {
+        throw LogicalSceneOwnerConflictError(
+            "maintenance initialization does not match the exact active Scene");
+      }
+      const auto sequence = NextMaintenanceInitializationSequence(state);
+      static_cast<void>(CheckedSafeCounter(request.apply_generation.value(),
+                                           "Apply generation"));
+      std::optional<std::uint64_t> repaired_transaction_sequence;
+      if (state.projection_desynchronized &&
+          state.latest_uncertain_transaction_sequence.has_value()) {
+        static_cast<void>(
+            CheckedSafeCounter(*state.latest_uncertain_transaction_sequence,
+                               "uncertain transaction sequence"));
+        repaired_transaction_sequence =
+            state.latest_uncertain_transaction_sequence;
+      }
+      auto row = NewMaintenanceInitialization(
+          sequence, request.apply_id, request.apply_generation,
+          request.expected_active_projection_revision, target,
+          provisional_snapshot, request.execution_host_bindings,
+          repaired_transaction_sequence, initial_scene_digest);
+      ApplyMaintenanceRoom(memory, std::move(*room), state);
+      memory.maintenance_initializations.push_back(std::move(row));
+      inserted_intent = true;
+      state = impl_->ReadStateTransaction();
+      found = std::prev(state.maintenance_initializations.end());
+    }
+    break;
   }
 
   if (found->predecessor != request.expected_active_projection_revision ||
@@ -1420,7 +1176,7 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
     try {
       auto projection = ResolveRequiredProjection(
           binding, impl_->projection_resolver_, initialization.target);
-      if (projection.preflight_health.healthy_for_target(
+      if (projection.preflight_health->healthy_for_target(
               initialization.target)) {
         // A previous poll may already have installed this projection. Its
         // effect still counts if another participant subsequently refuses.
@@ -1438,17 +1194,17 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
               initialization.predecessor.scene_revision.revision_id;
       const bool exact_apply_predecessor =
           same_retained_product &&
-          projection.preflight_health.healthy_for_target(
+          projection.preflight_health->healthy_for_target(
               initialization.predecessor);
       if (!inserted_intent) {
-        if (projection.preflight_health.state ==
+        if (projection.preflight_health->state ==
                 ProjectionHealthState::kRebuilding ||
-            projection.preflight_health.state ==
+            projection.preflight_health->state ==
                 ProjectionHealthState::kUninitialized) {
           progressing = true;
           projection_effect_pending_or_committed =
               projection_effect_pending_or_committed ||
-              projection.preflight_health.state ==
+              projection.preflight_health->state ==
                   ProjectionHealthState::kRebuilding;
           continue;
         }
@@ -1460,9 +1216,9 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
               {}};
           effects_unknown =
               projection_effect_pending_or_committed ||
-              projection.preflight_health.state ==
+              projection.preflight_health->state ==
                   ProjectionHealthState::kDesynchronized ||
-              projection.preflight_health.state ==
+              projection.preflight_health->state ==
                   ProjectionHealthState::kUnavailable;
           break;
         }
@@ -1533,18 +1289,16 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
         ProjectionMaintenanceInitializationState::kInitializing);
   }
   lock.lock();
-  persistence::SqliteRecord result;
-  InsertMaintenanceResult(
-      impl_->memory_,
+  // A write follows: the generation moves (OD-376).
+  impl_->InvalidateSceneCommitState();
+  RecordMaintenanceResult(
       MaintenanceRow(impl_->memory_, initialization.initialization_sequence),
-      result, initialization.initialization_sequence,
       failure.has_value()
           ? (effects_unknown
                  ? ProjectionMaintenanceInitializationState::kInterrupted
                  : ProjectionMaintenanceInitializationState::kFailed)
           : ProjectionMaintenanceInitializationState::kInitialized,
       failure, effects_unknown);
-  impl_->Post(std::move(result));
   const auto completed = impl_->ReadStateTransaction();
   return MaintenanceStatus(*completed.LatestMaintenanceInitialization());
 }
@@ -1606,7 +1360,7 @@ LogicalSceneOwner::InstallInitialScene(
       auto projection =
           ResolveRequiredProjection(
             binding, impl_->projection_resolver_, provisional.target);
-      if (!projection.preflight_health.healthy_for_target(
+      if (!projection.preflight_health->healthy_for_target(
               provisional.target)) {
         throw LogicalSceneOwnerConflictError(
             "candidate projection is not healthy at its private revision");
@@ -1625,6 +1379,8 @@ LogicalSceneOwner::InstallInitialScene(
   }
 
   lock.lock();
+  // A write follows: the generation moves (OD-376).
+  impl_->InvalidateSceneCommitState();
   state = impl_->ReadStateTransaction();
   found = find_initialization(state);
   if (found == state.maintenance_initializations.end() ||
@@ -1634,10 +1390,8 @@ LogicalSceneOwner::InstallInitialScene(
     throw LogicalSceneOwnerConflictError(
         "initial Scene preparation lost its exact owner intent");
   }
-  const auto sequence = static_cast<std::int64_t>(
-      provisional.initialization_sequence);
   // A failed or interrupted baseline result dominates the provisional
-  // result, as the file replay applies it.
+  // result.
   const auto record_baseline_failure = [](MaintenanceInitializationState &row,
                                           const ErrorDTO &error,
                                           const bool effects_unknown) {
@@ -1650,49 +1404,17 @@ LogicalSceneOwner::InstallInitialScene(
     row.effects_unknown = effects_unknown;
   };
   if (preflight_error.has_value()) {
-    persistence::SqliteRecord failed;
-    SizedRow failed_row(
-        failed,
-        "INSERT INTO logical_scene_initial_baseline_results("
-        "initialization_sequence,state,first_error_code,first_error_message) "
-        "VALUES(?,'failed',?,?)");
-    failed_row.Bind(1, sequence);
-    failed_row.Literal("failed");
-    failed_row.Bind(2, preflight_error->code);
-    failed_row.Bind(3, preflight_error->message);
-    impl_->memory_.maintenance_file_bytes[provisional.initialization_sequence] +=
-        SceneRowFileBytes(failed_row.record_bytes(),
-                          SceneTable("logical_scene_initial_baseline_results"));
     record_baseline_failure(
         MaintenanceRow(impl_->memory_, provisional.initialization_sequence),
         *preflight_error, false);
-    impl_->Post(std::move(failed));
     state = impl_->ReadStateTransaction();
     return MaintenanceStatus(*find_initialization(state));
   }
   const ProjectionRevisionDTO final_target{
       provisional.target.retained_bundle_id,
       provisional.target.graph_revision, final_snapshot->revision};
-  const auto final_snapshot_json =
-      logical_scene_codec_internal::EncodeSnapshot(*final_snapshot);
-  {
-    persistence::SqliteRecord accepted;
-    SizedRow intent(
-        accepted,
-        "INSERT INTO logical_scene_initial_baseline_intents("
-        "initialization_sequence,target_retained_bundle_id,"
-        "target_graph_revision,target_scene_id,target_scene_revision_id,"
-        "target_scene_content_hash,snapshot_json) VALUES(?,?,?,?,?,?,?)");
-    intent.Bind(1, sequence);
-    BindProjection(intent, 2, final_target);
-    intent.Bind(7, final_snapshot_json);
-    impl_->memory_.maintenance_file_bytes[provisional.initialization_sequence] +=
-        SceneRowFileBytes(intent.record_bytes(),
-                          SceneTable("logical_scene_initial_baseline_intents"));
-    MaintenanceRow(impl_->memory_, provisional.initialization_sequence)
-        .initial_baseline_intent_recorded = true;
-    impl_->Post(std::move(accepted));
-  }
+  MaintenanceRow(impl_->memory_, provisional.initialization_sequence)
+      .initial_baseline_intent_recorded = true;
   lock.unlock();
 
   bool any_committed = false;
@@ -1737,40 +1459,18 @@ LogicalSceneOwner::InstallInitialScene(
   }
 
   lock.lock();
-  persistence::SqliteRecord result;
-  SizedRow result_row(
-      result,
-      "INSERT INTO logical_scene_initial_baseline_results("
-      "initialization_sequence,state,first_error_code,first_error_message) "
-      "VALUES(?,?,?,?)");
-  result_row.Bind(1, sequence);
-  result_row.Bind(2, std::string_view(effect_error.has_value()
-                                          ? (uncertain ? "interrupted" : "failed")
-                                          : "installed"));
-  if (effect_error.has_value()) {
-    result_row.Bind(3, effect_error->code);
-    result_row.Bind(4, effect_error->message);
-  } else {
-    result_row.BindNull(3);
-    result_row.BindNull(4);
-  }
-  impl_->memory_.maintenance_file_bytes[provisional.initialization_sequence] +=
-      SceneRowFileBytes(result_row.record_bytes(),
-                        SceneTable("logical_scene_initial_baseline_results"));
+  // A write follows: the generation moves (OD-376).
+  impl_->InvalidateSceneCommitState();
   auto &row =
       MaintenanceRow(impl_->memory_, provisional.initialization_sequence);
   if (effect_error.has_value()) {
     record_baseline_failure(row, *effect_error, uncertain);
   } else {
-    // The installed baseline replaces the provisional target and Scene, as
-    // the file returns them.
-    auto installed =
-        logical_scene_codec_internal::DecodeSnapshot(final_snapshot_json);
+    // The installed baseline replaces the provisional target and Scene.
     row.target = final_target;
-    row.authoritative_snapshot = std::move(installed);
+    row.authoritative_snapshot = *final_snapshot;
     row.initial_baseline_installed = true;
   }
-  impl_->Post(std::move(result));
   state = impl_->ReadStateTransaction();
   return MaintenanceStatus(*find_initialization(state));
 }
@@ -1874,7 +1574,7 @@ LogicalSceneOwner::CompleteMaintenanceInitializationImpl(
     auto projection =
         ResolveRequiredProjection(
             binding, impl_->projection_resolver_, initialization.target);
-    if (!projection.preflight_health.healthy_for_target(
+    if (!projection.preflight_health->healthy_for_target(
             initialization.target)) {
       throw LogicalSceneOwnerConflictError(
           "maintenance completion lost exact native initialization health");
@@ -1933,14 +1633,12 @@ LogicalSceneOwner::CompleteMaintenanceInitializationImpl(
     throw LogicalSceneOwnerConflictError(
         "maintenance initialization is no longer ready for completion");
   }
-  persistence::SqliteRecord insert;
-  InsertMaintenanceCompletion(impl_->memory_, insert, *found,
+  RecordMaintenanceCompletion(impl_->memory_, *found,
                               completion.publication_receipt);
-  impl_->Post(std::move(insert));
   const auto completed = impl_->ReadStateTransaction();
   const auto result = MaintenanceStatus(*completed.LatestMaintenanceInitialization());
   if (original_parent_fence != nullptr) {
-    // The completion remains durable if this observation is uncertain. The
+    // The completion remains recorded if this observation is uncertain. The
     // original Manager must retain its exclusions and must not infer success.
     lock.unlock();
     RequireHeldAdoptionParent(*adoption, impl_->cell_admission_, original_parent_fence);
@@ -1981,7 +1679,6 @@ void LogicalSceneOwner::EndOriginalManagerConfigurationAdoption(
     release_capture();
     return;
   }
-  persistence::SqliteRecord record;
   if (publication.has_value()) {
     RequireCurrentPublication(impl_->publication_reader_, *publication);
     const auto *named = std::get_if<NamedApplyPublicationTransactionDTO>(
@@ -1998,41 +1695,9 @@ void LogicalSceneOwner::EndOriginalManagerConfigurationAdoption(
           "Scene adoption end publication does not name its target");
     }
     impl_->InvalidateSceneCommitState();
-    InsertMaintenanceCompletion(impl_->memory_, record, *found, *publication);
+    RecordMaintenanceCompletion(impl_->memory_, *found, *publication);
   } else {
-    record.Statement(
-        "UPDATE logical_scene_maintenance_initialization_results SET "
-        "state='interrupted',first_error_code=?,first_error_message=?,"
-        "effects_unknown=1 WHERE initialization_sequence=? AND "
-        "state='initialized'");
-    record.Bind(1, kAdoptionEndedWithoutPublicationCode);
-    record.Bind(2, kAdoptionEndedWithoutPublicationMessage);
-    record.Bind(3, CheckedSafeCounter(found->initialization_sequence,
-                                      "initialization sequence"));
-    record.ExpectChanges(1);
     impl_->InvalidateSceneCommitState();
-    // The result row grows by the error it now carries.
-    const auto result_bytes = [&](const std::string_view state,
-                                  const bool error) {
-      RecordSize size;
-      size.Integer(static_cast<std::int64_t>(found->initialization_sequence));
-      size.Text(state.size());
-      if (error) {
-        size.Text(kAdoptionEndedWithoutPublicationCode.size());
-        size.Text(kAdoptionEndedWithoutPublicationMessage.size());
-      } else {
-        size.Null();
-        size.Null();
-      }
-      size.Integer(error ? 1 : 0);
-      return SceneRowFileBytes(
-          size.bytes(),
-          SceneTable("logical_scene_maintenance_initialization_results"));
-    };
-    auto &file_bytes =
-        impl_->memory_.maintenance_file_bytes[found->initialization_sequence];
-    file_bytes = file_bytes + result_bytes("interrupted", true) -
-                 result_bytes("initialized", false);
     auto &row = MaintenanceRow(impl_->memory_, found->initialization_sequence);
     row.result_state = ProjectionMaintenanceInitializationState::kInterrupted;
     row.first_error =
@@ -2041,7 +1706,6 @@ void LogicalSceneOwner::EndOriginalManagerConfigurationAdoption(
                  {}};
     row.effects_unknown = true;
   }
-  impl_->Post(std::move(record));
   release_capture();
 }
 

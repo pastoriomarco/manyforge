@@ -64,7 +64,7 @@ const char* kernel_event_type_name(KernelEventType type) {
     case kRecoveryActionAccepted: return "recovery_action_accepted";
     case kRecoveryActionRejected: return "recovery_action_rejected";
     case kRuntimeCollisionCoverage: return "runtime_collision_coverage";
-    case kContactPolicyViolation: return "contact_policy_violation";
+    case kContactRuleViolation: return "contact_rule_violation";
     case kParticipantDispatchOutcome: return "participant_dispatch_outcome";
   }
   return "unknown";

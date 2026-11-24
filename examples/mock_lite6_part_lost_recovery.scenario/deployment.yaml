@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -51,8 +51,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [
       "lite_gripper"
     ],
@@ -87,7 +92,6 @@
           "stop_mode": "spring_back_fast"
         },
         "runtime_configuration": {
-          "collision_clearance_m": 0.001,
           "collision_monitor_period_ms": 50.0,
           "component_streams": [
             {
@@ -228,12 +232,7 @@
               "mount_frame": "lite_gripper_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "link_tcp",
-              "touch_links": [
-                "lite_gripper_base_link",
-                "lite_gripper_left_finger",
-                "lite_gripper_right_finger"
-              ]
+              "tcp_frame": "link_tcp"
             }
           ]
         },
@@ -257,9 +256,6 @@
       "target_settings": {}
     }
   ],
-  "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-  "description": "Lite6 Mock-commanded pick-and-place example. Grasp-loss reaction is simulated by writing the Program key part_lost; Mock does not measure object loss.",
-  "name": "lite6_lite_gripper_pick_and_place",
   "policies": {
     "interrupt_rules": [
       {

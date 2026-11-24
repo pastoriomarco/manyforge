@@ -158,10 +158,10 @@ def test_kernel_client_only_forwards_bounded_headless_operations() -> None:
     client = KernelClient(transport)
 
     assert client.identity()["identity"]["graph_revision"] == "graph-1"
-    assert client.execute({"program_id": "program-1"})["accepted"][
+    assert client.execute({"program_run_id": 1})["accepted"][
         "operation_id"
     ] == 1
-    assert transport.submitted == {"program_id": "program-1"}
+    assert transport.submitted == {"program_run_id": 1}
     assert client.plan_pick({"sequence_id": "pick-1"})["planning_job"][
         "kind"
     ] == "pick"
@@ -201,7 +201,7 @@ def test_execute_preserves_explicit_rejection_and_unknown_transport_failure() ->
             }
 
     with pytest.raises(KernelOperationAdmissionRejectedError) as rejected:
-        KernelClient(RejectedTransport()).execute({"program_id": "program-1"})
+        KernelClient(RejectedTransport()).execute({"program_run_id": 1})
     assert rejected.value.code == "invalid_state_transition"
     assert rejected.value.details == {"reason": "program_run_stop_fence_active"}
 
@@ -210,7 +210,7 @@ def test_execute_preserves_explicit_rejection_and_unknown_transport_failure() ->
             raise TimeoutError("acceptance reply lost")
 
     with pytest.raises(TimeoutError, match="acceptance reply lost"):
-        KernelClient(LostTransport()).execute({"program_id": "program-1"})
+        KernelClient(LostTransport()).execute({"program_run_id": 1})
 
 
 def test_only_exact_operation_owner_unavailability_is_typed_for_retry() -> None:
@@ -322,7 +322,7 @@ def test_read_stop_refuses_another_event_or_shape(patch) -> None:
 
 
 def test_release_halt_names_the_hold_revision_and_returns_the_scope() -> None:
-    scope = {"schema_version": "manyforge.program_execution_scope.v3",
+    scope = {"schema_version": "manyforge.program_execution_scope.v4",
              "program_run_id": 3, "hold_revision": 12, "frozen": "none"}
     transport = StopTransport({"ok": True, "command": "release_halt", "scope": scope})
     assert KernelClient(transport).release_halt(3, 11) == scope

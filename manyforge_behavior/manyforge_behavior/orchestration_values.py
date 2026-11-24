@@ -17,6 +17,7 @@ from manyforge_behavior.program import (
     BlackboardFieldDeclaration,
     BlackboardKeyDeclaration,
     INTERRUPT_STATE_VALUES,
+    MOTION_GROUP_STATE_VALUES,
     NODE_ENDED_OUTCOMES,
     NODE_OUTCOME_NONE,
     Program,
@@ -26,7 +27,9 @@ from manyforge_behavior.program import (
     interrupt_state_key,
     is_active_tcp_key,
     is_interrupt_state_key,
+    is_motion_group_state_key,
     is_node_outcome_key,
+    motion_group_state_key,
     node_outcome_key,
 )
 from manyforge_behavior.program_expressions import (
@@ -765,7 +768,11 @@ class ProgramValueStore:
             for key in sorted(self._values):
                 if self._declarations[key].persistence == "persistent":
                     continue
-                if is_interrupt_state_key(key) or is_active_tcp_key(key):
+                if (
+                    is_interrupt_state_key(key)
+                    or is_active_tcp_key(key)
+                    or is_motion_group_state_key(key)
+                ):
                     # System-owned and always current across a Run reset.
                     continue
                 if is_node_outcome_key(key):
@@ -864,6 +871,27 @@ class ProgramValueStore:
             )
             self._publish_locked(key, current)
 
+    def reset_node_outcome(
+        self,
+        node_instance_id: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        """A motion node starts a new attempt: its key is `none` again until
+        that attempt ends (the system-owned start value)."""
+
+        key = node_outcome_key(node_instance_id)
+        if key not in self._declarations:
+            raise ProgramValueError(f"blackboard key {key!r} is undeclared")
+        with self._lock:
+            current = self._values.get(key)
+            if current is not None and current.value == NODE_OUTCOME_NONE:
+                return
+            self._values[key] = ProgramValueRecord(
+                status="succeeded", value=NODE_OUTCOME_NONE, metadata=metadata or {}
+            )
+            self._publish_locked(key, current)
+
     def write_interrupt_state(self, rule_id: str, state: str | None) -> bool:
         """Mirror one global rule's Kernel state into its reserved key.
 
@@ -891,6 +919,28 @@ class ProgramValueStore:
                 )
             self._publish_locked(key, current)
         return True
+
+    def write_motion_group_state(self, group_id: str, state: str) -> None:
+        """Store one motion group's state in its system-owned key (OD-339).
+
+        The one writer is the Program-run owner, from the facts its runtime
+        controls show; read-only for nodes and the operator. An unchanged
+        state is not written again.
+        """
+
+        key = motion_group_state_key(group_id)
+        if key not in self._declarations:
+            raise ProgramValueError(f"blackboard key {key!r} is undeclared")
+        if state not in MOTION_GROUP_STATE_VALUES:
+            raise ProgramValueError(f"{state!r} is not a motion group state")
+        with self._lock:
+            current = self._values.get(key)
+            if current is not None and current.value == state:
+                return
+            self._values[key] = ProgramValueRecord(
+                status="succeeded", value=state, metadata={"writer": "program_run_owner"}
+            )
+            self._publish_locked(key, current)
 
     def write_active_tcp(
         self, component_id: str, command_target_id: str, entry: Mapping[str, Any] | None
@@ -995,6 +1045,41 @@ class ProgramValueStore:
                 ((key, record.value) for key, record in self._values.items()),
                 total_count=len(self._values),
             )
+
+    def current_values(self) -> list[dict[str, Any]]:
+        """Every declared key's current value for display, in key order.
+
+        One locked view; computed keys are evaluated in it. A value beyond the
+        diagnostic per-value budgets (or not portable JSON) is not copied and
+        its row says ``omitted``; a key without a value, or a computed key
+        whose expression fails, says ``no_value``.
+        """
+        from .program_diagnostics import bounded_entry
+
+        with self._lock:
+            computed, _failures = self._evaluate_computed_locked({
+                key for key, declaration in self._declarations.items()
+                if declaration.expression is not None
+            })
+            rows: list[dict[str, Any]] = []
+            for key, declaration in sorted(self._declarations.items()):
+                row: dict[str, Any] = {"key": key, "type": declaration.type}
+                if declaration.expression is not None:
+                    present, value = key in computed, computed.get(key)
+                else:
+                    record = self._values.get(key)
+                    present = record is not None
+                    value = None if record is None else record.value
+                if not present:
+                    row["value_state"] = "no_value"
+                else:
+                    try:
+                        row["value"] = bounded_entry(key, value)[0][key]
+                        row["value_state"] = "value"
+                    except (ValueError, TypeError):
+                        row["value_state"] = "omitted"
+                rows.append(row)
+            return rows
 
     def snapshot(
         self, keys: tuple[str, ...], *, optional: tuple[str, ...] = ()
@@ -1267,6 +1352,42 @@ class NodeAttemptInputResolver:
             blackboard_keys.add(key)
             key_readers.setdefault(key, []).append((parameter_id, "blackboard_key", key))
 
+        # A collision rule may name its Scene object by a blackboard key; the
+        # key is read with the node's other inputs.
+        rule_object_keys: list[tuple[int, str, int, str, str | None]] = []
+        rules = resolved.get("collision_rules")
+        for row_index, row in enumerate(rules if isinstance(rules, list) else ()):
+            if not isinstance(row, Mapping):
+                continue
+            for side in ("a", "b"):
+                selections = row.get(side)
+                for selection_index, selection in enumerate(
+                    selections if isinstance(selections, list) else ()
+                ):
+                    if not (
+                        isinstance(selection, Mapping)
+                        and selection.get("kind") == "scene_object"
+                        and "blackboard_key" in selection
+                    ):
+                        continue
+                    key = selection["blackboard_key"]
+                    path = (
+                        f"collision_rules[{row_index}].{side}[{selection_index}]"
+                        ".blackboard_key"
+                    )
+                    if not isinstance(key, str) or not key:
+                        raise failure(
+                            f"collision rule blackboard key at {path!r} is invalid",
+                            INPUT_INVALID,
+                            path,
+                            "parameter",
+                        )
+                    rule_object_keys.append(
+                        (row_index, side, selection_index, key, selection.get("field"))
+                    )
+                    blackboard_keys.add(key)
+                    key_readers.setdefault(key, []).append((path, "blackboard_key", key))
+
         # Current's key is fixed from the bound target role by the node
         # binder, not selected by an authored blackboard-key parameter.
         if derived_active_tcp_key is not None:
@@ -1317,6 +1438,28 @@ class NodeAttemptInputResolver:
             raise failure(
                 f"blackboard key {key!r} has no value", INPUT_MISSING, *key_reader(key)
             ) from None
+
+        for row_index, side, selection_index, key, field in rule_object_keys:
+            scene_resource_id = blackboard_snapshot[key]
+            if field is not None:
+                scene_resource_id = (
+                    scene_resource_id.get(field)
+                    if isinstance(scene_resource_id, Mapping)
+                    else None
+                )
+            if not isinstance(scene_resource_id, str) or not scene_resource_id:
+                raise failure(
+                    f"blackboard key {key!r} names no Scene object",
+                    INPUT_INVALID,
+                    f"collision_rules[{row_index}].{side}[{selection_index}]"
+                    ".blackboard_key",
+                    "blackboard_key",
+                    key,
+                )
+            resolved["collision_rules"][row_index][side][selection_index] = {
+                "kind": "scene_object",
+                "scene_resource_id": scene_resource_id,
+            }
 
         def resolve_source(path: str, source: Mapping[str, Any]) -> Any:
             if path in expressions:

@@ -26,6 +26,7 @@ typedef std::shared_ptr<ModelInterface> ModelInterfaceSharedPtr;
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <charconv>
@@ -37,7 +38,9 @@ typedef std::shared_ptr<ModelInterface> ModelInterfaceSharedPtr;
 #include <fstream>
 #include <iterator>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_collision/mesh_depth.hpp>
 #include <manyforge_collision/scene_asset_root.hpp>
+#include <manyforge_core/types/projection_common.hpp>
 #include <map>
 #include <optional>
 #include <pinocchio/algorithm/frames.hpp>
@@ -364,6 +367,8 @@ std::optional<std::size_t> component_body_collision_index(
   return index;
 }
 
+}  // namespace
+
 bool link_is_static_wrt_group(const pinocchio::Model& model,
                               const std::string& link_name,
                               const std::vector<std::string>& group_joint_names) {
@@ -397,106 +402,7 @@ bool link_is_static_wrt_group(const pinocchio::Model& model,
   return true;
 }
 
-std::vector<std::filesystem::path> split_env_paths(const char* value) {
-  std::vector<std::filesystem::path> paths;
-  if (value == nullptr || *value == '\0') {
-    return paths;
-  }
-  std::stringstream stream(value);
-  std::string item;
-  while (std::getline(stream, item, ':')) {
-    if (!item.empty()) {
-      paths.emplace_back(item);
-    }
-  }
-  return paths;
-}
-
-std::optional<std::filesystem::path> first_existing_path(
-    const std::vector<std::filesystem::path>& candidates) {
-  for (const auto& candidate : candidates) {
-    std::error_code ec;
-    if (!candidate.empty() && std::filesystem::exists(candidate, ec)) {
-      auto canonical = std::filesystem::canonical(candidate, ec);
-      return ec ? candidate : canonical;
-    }
-  }
-  return std::nullopt;
-}
-
-std::optional<std::filesystem::path> resolve_mesh_resource_uri(
-    const std::string& source_uri,
-    const std::vector<std::filesystem::path>& package_paths,
-    std::string& error) {
-  if (source_uri.empty()) {
-    error = "mesh source_uri must not be empty";
-    return std::nullopt;
-  }
-
-  constexpr const char* kFilePrefix = "file://";
-  constexpr const char* kPackagePrefix = "package://";
-  std::string path_text = source_uri;
-  if (path_text.rfind(kFilePrefix, 0) == 0) {
-    path_text = path_text.substr(std::char_traits<char>::length(kFilePrefix));
-  } else if (path_text.rfind(kPackagePrefix, 0) == 0) {
-    const std::string rest =
-        path_text.substr(std::char_traits<char>::length(kPackagePrefix));
-    const auto slash = rest.find('/');
-    if (slash == std::string::npos || slash == 0 || slash + 1 >= rest.size()) {
-      error = "invalid package:// mesh URI: " + source_uri;
-      return std::nullopt;
-    }
-    const std::string package_name = rest.substr(0, slash);
-    const std::filesystem::path package_rel_path = rest.substr(slash + 1);
-
-    std::vector<std::filesystem::path> candidates;
-    for (const auto& prefix : package_paths) {
-      candidates.push_back(prefix / package_rel_path);
-      candidates.push_back(prefix / package_name / package_rel_path);
-      candidates.push_back(prefix / "share" / package_name / package_rel_path);
-      if (prefix.filename() == package_name) {
-        candidates.push_back(prefix / package_rel_path);
-      }
-    }
-    for (const auto& prefix : split_env_paths(std::getenv("AMENT_PREFIX_PATH"))) {
-      candidates.push_back(prefix / "share" / package_name / package_rel_path);
-    }
-    for (const auto& prefix : split_env_paths(std::getenv("COLCON_PREFIX_PATH"))) {
-      candidates.push_back(prefix / "share" / package_name / package_rel_path);
-    }
-    for (const auto& root : split_env_paths(std::getenv("ROS_PACKAGE_PATH"))) {
-      candidates.push_back(root / package_name / package_rel_path);
-      if (root.filename() == package_name) {
-        candidates.push_back(root / package_rel_path);
-      }
-    }
-    candidates.push_back(std::filesystem::path("/opt/ros/jazzy/share") /
-                         package_name / package_rel_path);
-    candidates.push_back(std::filesystem::path("/usr/local/share") /
-                         package_name / package_rel_path);
-    if (auto resolved = first_existing_path(candidates)) {
-      return resolved;
-    }
-    error = "could not resolve package mesh URI: " + source_uri;
-    return std::nullopt;
-  }
-
-  const std::filesystem::path candidate(path_text);
-  if (candidate.is_relative()) {
-    // Relative scene meshes resolve only below the approved scene-asset root
-    // descriptor (OpenedSceneMesh); never through the current directory, a
-    // package path, or a hard-coded workspace.
-    error = "relative mesh URI is not a plain path below the approved "
-            "scene-asset root: " +
-            source_uri;
-    return std::nullopt;
-  }
-  if (auto resolved = first_existing_path({candidate})) {
-    return resolved;
-  }
-  error = "mesh resource does not exist: " + source_uri;
-  return std::nullopt;
-}
+namespace {
 
 Eigen::Vector3d effective_mesh_scale(
     const std::optional<core::Vector3DTO>& scale) {
@@ -506,9 +412,9 @@ Eigen::Vector3d effective_mesh_scale(
   return Eigen::Vector3d(scale->x_m, scale->y_m, scale->z_m);
 }
 
-std::string mesh_cache_key(const std::string& source_uri,
+std::string mesh_cache_key(const std::string& content_digest,
                            const Eigen::Vector3d& scale) {
-  return source_uri + "|" + std::to_string(scale.x()) + "|" +
+  return content_digest + "|" + std::to_string(scale.x()) + "|" +
          std::to_string(scale.y()) + "|" + std::to_string(scale.z());
 }
 
@@ -585,6 +491,56 @@ void reset_distance_warm_start(coal::DistanceRequest& request) {
   // same deterministic support state.
   request.cached_gjk_guess = coal::Vec3s(1.0, 0.0, 0.0);
   request.cached_support_func_guess = coal::support_func_guess_t::Zero();
+}
+
+/// Penetration of a colliding pair of two prepared meshes (OD-363): coal's
+/// signed distance of two triangle meshes is the overlap of the deepest
+/// triangle pair, not how far one body is inside the other. The inside-vertex
+/// depth replaces `distance` and `normal` (first object toward second) when it
+/// is deeper. Any other pair is left as coal gave it. A status other than kOk
+/// means the pair has no depth.
+detail::MeshDepthStatus deepen_mesh_pair(
+    const detail::MeshDepthShape* first, const detail::MeshDepthShape* second,
+    const pinocchio::GeometryData& data, const std::size_t pair_index,
+    const pinocchio::CollisionPair& pair, double& distance,
+    coal::Vec3s& normal) noexcept {
+  if (first == nullptr || second == nullptr) {
+    return detail::MeshDepthStatus::kOk;
+  }
+  const auto& collision = data.collisionResults[pair_index];
+  const auto seed = [](const int triangle) {
+    return triangle >= 0 ? static_cast<std::uint32_t>(triangle)
+                         : detail::kNoSeedTriangle;
+  };
+  const bool contact = collision.numContacts() > 0U;
+  const auto pose = [&](const std::size_t geometry) {
+    return detail::MeshPose{data.oMg[geometry].rotation(),
+                            data.oMg[geometry].translation()};
+  };
+  const auto depth = detail::mesh_depth(
+      *first, pose(pair.first),
+      contact ? seed(collision.getContact(0).b1) : detail::kNoSeedTriangle,
+      *second, pose(pair.second),
+      contact ? seed(collision.getContact(0).b2) : detail::kNoSeedTriangle);
+  if (depth.status == detail::MeshDepthStatus::kOk && depth.found &&
+      !(distance <= -depth.depth_m)) {
+    distance = -depth.depth_m;
+    normal = depth.normal_first_to_second;
+  }
+  return depth.status;
+}
+
+core::RuntimeCollisionQueryFailureReason mesh_depth_failure_reason(
+    const detail::MeshDepthStatus status) noexcept {
+  return status == detail::MeshDepthStatus::kMeshNotClosed
+             ? core::RuntimeCollisionQueryFailureReason::kMeshNotClosed
+             : core::RuntimeCollisionQueryFailureReason::kMeshDepthVertexCapReached;
+}
+
+const char* mesh_depth_failure_code(const detail::MeshDepthStatus status) noexcept {
+  return status == detail::MeshDepthStatus::kMeshNotClosed
+             ? "mesh_not_closed"
+             : "mesh_depth_vertex_cap_reached";
 }
 
 bool requests_distance_capability(const core::CollisionQuery& query) noexcept {
@@ -732,6 +688,15 @@ core::CollisionGeometryDescriptor retained_geometry_descriptor(
 
 }  // namespace
 
+std::string scene_mesh_store_path(const std::string_view content_digest) {
+  if (!core::IsExactLowercaseSha256Digest(content_digest)) {
+    return {};
+  }
+  return "raw-artifacts/sha256/" +
+         std::string(content_digest.substr(core::kSha256DigestPrefix.size())) +
+         ".blob";
+}
+
 bool is_plain_relative_resource_path(const std::string_view path) noexcept {
   try {
     if (path.empty() || path.size() > 4096U ||
@@ -792,7 +757,7 @@ std::optional<OpenedSceneMesh> OpenedSceneMesh::open(
   struct stat root_status {};
   if (root_fd < 0 || ::fstat(root_fd, &root_status) != 0 ||
       !S_ISDIR(root_status.st_mode)) {
-    error = "scene-asset root descriptor is unavailable";
+    error = "scene content root descriptor is unavailable";
     return std::nullopt;
   }
   struct Owned final {
@@ -814,7 +779,7 @@ std::optional<OpenedSceneMesh> OpenedSceneMesh::open(
                  O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NOCTTY |
                      (last ? O_NONBLOCK : O_DIRECTORY));
     if (next < 0) {
-      error = "scene mesh is unavailable below the scene-asset root "
+      error = "scene mesh is unavailable below the scene content root "
               "(missing, symlinked, or not a directory path): " +
               uri;
       return std::nullopt;
@@ -893,63 +858,55 @@ struct ManyForgeCollisionEngine::SharedModel {
   SharedModel(const SharedModel&) = delete;
   SharedModel& operator=(const SharedModel&) = delete;
   ~SharedModel() {
-    if (scene_asset_root_fd >= 0) {
-      static_cast<void>(::close(scene_asset_root_fd));
+    if (scene_content_root_fd >= 0) {
+      static_cast<void>(::close(scene_content_root_fd));
     }
   }
 
   std::string model_name;
   pinocchio::Model model;
   pinocchio::GeometryModel base_collision_model;
+  /// Per base geometry object: its mesh prepared for depth (OD-363), or
+  /// null when it is not a triangle mesh.
+  std::vector<std::shared_ptr<const detail::MeshDepthShape>> base_mesh_depth;
   std::vector<std::filesystem::path> package_paths;
   std::vector<std::string> group_joint_names;
   std::string group_name;
-  /// Model-owned duplicate of the approved scene-asset root, or -1.
-  int scene_asset_root_fd{-1};
-  /// First-read digest of each relative scene mesh URI, shared by every
-  /// collision context and by the planner-worker projection of this model.
-  mutable std::mutex scene_mesh_digest_mutex;
-  mutable std::map<std::string, std::string> scene_mesh_digests;
+  /// Model-owned duplicate of the activation (scene content) root, or -1.
+  int scene_content_root_fd{-1};
 };
 
 namespace {
 
-constexpr std::size_t kMaximumPinnedSceneMeshes = 4096U;
-
-/// Opens one relative scene mesh below the model's approved root and checks
-/// its bytes against (or pins) the model's first-read digest for that URI.
-std::optional<OpenedSceneMesh> open_pinned_scene_mesh(
+/// Opens one captured scene mesh from the model's content root by its digest
+/// and verifies the bytes read against that digest. The URI only names the
+/// mesh in refusals; it is never opened.
+std::optional<OpenedSceneMesh> open_captured_scene_mesh(
     const ManyForgeCollisionEngine::SharedModel& model,
-    const std::string& relative_uri, std::string& error,
-    std::string& reason) {
-  reason = "scene_mesh_unavailable";
-  if (model.scene_asset_root_fd < 0) {
-    error = "relative scene mesh URI has no approved scene-asset root: " +
-            relative_uri;
+    const std::string& resource_uri, const std::string& content_digest,
+    std::string& error) {
+  const auto refuse = [&](const std::string& detail) {
+    error = "scene_mesh_unavailable: scene mesh " + resource_uri +
+            " (content " + content_digest + ") " + detail;
     return std::nullopt;
+  };
+  if (model.scene_content_root_fd < 0) {
+    return refuse("has no scene content root");
   }
+  const auto store_path = scene_mesh_store_path(content_digest);
+  if (store_path.empty()) {
+    return refuse("has no exact sha256 content digest");
+  }
+  std::string open_error;
   auto opened =
-      OpenedSceneMesh::open(model.scene_asset_root_fd, relative_uri, error);
+      OpenedSceneMesh::open(model.scene_content_root_fd, store_path, open_error);
   if (!opened.has_value()) {
-    return std::nullopt;
+    return refuse("is not in the content store: " + open_error);
   }
-  std::lock_guard lock(model.scene_mesh_digest_mutex);
-  const auto pinned = model.scene_mesh_digests.find(relative_uri);
-  if (pinned != model.scene_mesh_digests.end()) {
-    if (pinned->second != opened->content_digest()) {
-      reason = std::string(kSceneMeshContentChangedReason);
-      error = std::string(kSceneMeshContentChangedReason) +
-              ": scene mesh bytes differ from the bytes first loaded for " +
-              relative_uri;
-      return std::nullopt;
-    }
-    return opened;
+  if (opened->content_digest() != content_digest) {
+    return refuse("store bytes do not match the digest (read " +
+                  opened->content_digest() + ")");
   }
-  if (model.scene_mesh_digests.size() >= kMaximumPinnedSceneMeshes) {
-    error = "pinned scene mesh inventory exceeds its bound";
-    return std::nullopt;
-  }
-  model.scene_mesh_digests.emplace(relative_uri, opened->content_digest());
   return opened;
 }
 
@@ -959,6 +916,8 @@ struct ManyForgeCollisionEngine::PreparedScene {
   struct RuntimePairBinding {
     bool mapped = false;
     core::CollisionPairId pair;
+    /// The geometry pair's first object belongs to `pair.body_b`.
+    bool swapped = false;
   };
 
   std::string publisher_id;
@@ -969,18 +928,25 @@ struct ManyForgeCollisionEngine::PreparedScene {
   std::map<std::string, core::CollisionBodyId> raw_to_body_map;
   std::vector<RuntimePairBinding> runtime_pair_bindings;
   std::map<core::CollisionBodyId, bool> motion_relevant_by_body;
+  /// Per geometry object of `collision_model`: its mesh prepared for depth,
+  /// or null.
+  std::vector<std::shared_ptr<const detail::MeshDepthShape>> mesh_depth;
 };
 
 struct ManyForgeCollisionEngine::SharedSceneCache {
   explicit SharedSceneCache(SharedModelPtr model)
       : shared_model(std::move(model)) {}
 
+  struct CachedMesh {
+    std::shared_ptr<coal::CollisionGeometry> geometry;
+    std::shared_ptr<const detail::MeshDepthShape> depth;
+  };
+
   SharedModelPtr shared_model;
   std::atomic<std::shared_ptr<const PreparedScene>> latest;
   std::atomic<std::uint64_t> build_count{0};
   std::mutex mesh_cache_mutex;
-  std::map<std::string, std::shared_ptr<coal::CollisionGeometry>>
-      mesh_geometry_cache;
+  std::map<std::string, CachedMesh> mesh_geometry_cache;
 };
 
 ManyForgeCollisionEngine::SharedModelPtr
@@ -989,24 +955,24 @@ ManyForgeCollisionEngine::load_shared_model(
     const std::filesystem::path& urdf_path,
     const std::filesystem::path& srdf_path,
     const std::vector<std::filesystem::path>& package_paths,
-    std::string group_name, const std::optional<int> scene_asset_root_fd) {
+    std::string group_name, const std::optional<int> scene_content_root_fd) {
   auto shared = std::make_shared<SharedModel>();
   shared->model_name = model_name;
   shared->package_paths = package_paths;
   shared->group_name = std::move(group_name);
-  if (scene_asset_root_fd.has_value()) {
+  if (scene_content_root_fd.has_value()) {
     struct stat root_status {};
-    if (*scene_asset_root_fd < 0 ||
-        ::fstat(*scene_asset_root_fd, &root_status) != 0 ||
+    if (*scene_content_root_fd < 0 ||
+        ::fstat(*scene_content_root_fd, &root_status) != 0 ||
         !S_ISDIR(root_status.st_mode)) {
       throw std::invalid_argument(
-          "collision scene-asset root descriptor is not a directory");
+          "collision scene content root descriptor is not a directory");
     }
-    shared->scene_asset_root_fd =
-        ::fcntl(*scene_asset_root_fd, F_DUPFD_CLOEXEC, 3);
-    if (shared->scene_asset_root_fd < 0) {
+    shared->scene_content_root_fd =
+        ::fcntl(*scene_content_root_fd, F_DUPFD_CLOEXEC, 3);
+    if (shared->scene_content_root_fd < 0) {
       throw std::runtime_error(
-          "collision scene-asset root descriptor could not be duplicated");
+          "collision scene content root descriptor could not be duplicated");
     }
   }
   const auto urdf_bytes = read_text_file(urdf_path);
@@ -1035,6 +1001,9 @@ ManyForgeCollisionEngine::load_shared_model(
   std::istringstream geometry_source(urdf_bytes);
   pinocchio::urdf::buildGeom(shared->model, geometry_source, pinocchio::COLLISION,
                              shared->base_collision_model, package_path_strings);
+  for (const auto& object : shared->base_collision_model.geometryObjects) {
+    shared->base_mesh_depth.push_back(detail::prepare_mesh_depth(object.geometry));
+  }
   // buildGeom loads shapes, not their pair inventory. SRDF removal must start
   // from the full inventory or every component self-collision is omitted.
   shared->base_collision_model.addAllCollisionPairs();
@@ -1062,47 +1031,19 @@ ManyForgeCollisionEngine::bind_shared_model_group(
   // Copies the geometry inventory and pairs; the loaded collision shapes stay
   // shared, exactly as every prepared scene already shares them.
   shared->base_collision_model = loaded->base_collision_model;
+  shared->base_mesh_depth = loaded->base_mesh_depth;
   shared->group_name = std::move(group_name);
-  if (loaded->scene_asset_root_fd >= 0) {
-    shared->scene_asset_root_fd =
-        ::fcntl(loaded->scene_asset_root_fd, F_DUPFD_CLOEXEC, 3);
-    if (shared->scene_asset_root_fd < 0) {
+  if (loaded->scene_content_root_fd >= 0) {
+    shared->scene_content_root_fd =
+        ::fcntl(loaded->scene_content_root_fd, F_DUPFD_CLOEXEC, 3);
+    if (shared->scene_content_root_fd < 0) {
       throw std::runtime_error(
-          "collision scene-asset root descriptor could not be duplicated");
+          "collision scene content root descriptor could not be duplicated");
     }
   }
   shared->group_joint_names = group_joint_names_from_srdf_xml(
       srdf_xml, [&] { return urdf_xml; }, shared->group_name);
   return shared;
-}
-
-core::Result<std::string> ManyForgeCollisionEngine::scene_mesh_content_digest(
-    const SharedModelPtr& shared_model, const std::string& relative_uri) {
-  const auto refusal = [&](std::string message, std::string reason) {
-    return core::Result<std::string>::Err(core::ErrorDTO{
-        std::string(core::to_string(core::ErrorCode::kInvalidRequest)),
-        std::move(message),
-        {{"reason", std::move(reason)}}});
-  };
-  if (!shared_model) {
-    return refusal("scene mesh digest requires a loaded collision model",
-                   "scene_mesh_unavailable");
-  }
-  {
-    std::lock_guard lock(shared_model->scene_mesh_digest_mutex);
-    const auto pinned = shared_model->scene_mesh_digests.find(relative_uri);
-    if (pinned != shared_model->scene_mesh_digests.end()) {
-      return core::Result<std::string>::Ok(pinned->second);
-    }
-  }
-  std::string error;
-  std::string reason;
-  auto opened =
-      open_pinned_scene_mesh(*shared_model, relative_uri, error, reason);
-  if (!opened.has_value()) {
-    return refusal(std::move(error), std::move(reason));
-  }
-  return core::Result<std::string>::Ok(opened->content_digest());
 }
 
 ManyForgeCollisionEngine::SharedSceneCachePtr
@@ -1385,14 +1326,15 @@ ManyForgeCollisionEngine::project_retained_component_collision(
     const OccurrenceKey occurrence{
         input.controllable_component_id, input.model_instance_id,
         input.model_revision};
+    // A model occurrence may have frames and no collision body (OD-350: a
+    // visual-only passive tool still projects its tcp frame).
     if (input.controllable_component_id.empty() ||
         input.model_instance_id.empty() || input.model_revision.empty() ||
         input.frame_role_id.empty() || input.compiled_frame_name.empty() ||
-        !collision_occurrences.contains(occurrence) ||
         !shared_model->model.existFrame(input.compiled_frame_name)) {
       return projection_error(
-          "retained component-model frame mapping is incomplete, foreign, "
-          "or names an unknown compiled frame");
+          "retained component-model frame mapping is incomplete or names an "
+          "unknown compiled frame");
     }
     const FrameKey frame_key{input.controllable_component_id,
                              input.model_instance_id, input.frame_role_id};
@@ -1907,8 +1849,21 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
                    pair_equal(*observation.pair, pair);
           });
     };
-    auto merge_finite_distance = [&](const core::CollisionPairId* pair,
-                                     double distance) {
+    // The engine's normal points from the geometry pair's first object to
+    // its second (coal: p2 = p1 + distance * normal); as body_a -> body_b.
+    auto normal_a_to_b = [](const auto& binding, const coal::Vec3s& normal)
+        -> std::optional<std::array<double, 3>> {
+      const double norm = normal.norm();
+      if (!std::isfinite(norm) || norm < 0.5) {
+        return std::nullopt;
+      }
+      const double sign = binding.swapped ? -1.0 : 1.0;
+      return std::array<double, 3>{sign * normal[0] / norm, sign * normal[1] / norm,
+                                   sign * normal[2] / norm};
+    };
+    auto merge_finite_distance =
+        [&](const core::CollisionPairId* pair, double distance,
+            std::optional<std::array<double, 3>> normal) {
       if (pair == nullptr || !std::isfinite(distance)) {
         return;
       }
@@ -1919,16 +1874,18 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
                    pair_equal(*observation.pair, *pair);
           });
       if (clearance == runtime_clearance_observations_.end()) {
-        runtime_clearance_observations_.push_back({pair, distance});
+        runtime_clearance_observations_.push_back({pair, distance, normal});
       } else if (!clearance->signed_clearance_m ||
                  distance < *clearance->signed_clearance_m) {
         clearance->signed_clearance_m = distance;
+        clearance->normal_a_to_b = normal;
       }
       auto collision = find_collision_observation(*pair);
       if (collision != runtime_collision_observations_.end() &&
           (!collision->signed_clearance_m ||
            distance < *collision->signed_clearance_m)) {
         collision->signed_clearance_m = distance;
+        collision->normal_a_to_b = normal;
       }
     };
 
@@ -1954,7 +1911,7 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
       const auto* pair = &prepared_scene->runtime_pair_bindings[i].pair;
       if (find_collision_observation(*pair) ==
           runtime_collision_observations_.end()) {
-        runtime_collision_observations_.push_back({pair, std::nullopt});
+        runtime_collision_observations_.push_back({pair, std::nullopt, std::nullopt});
       }
     }
     std::sort(runtime_collision_observations_.begin(),
@@ -2016,13 +1973,16 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
                 .distance_evaluated_logical_pair_count;
         }
         merge_finite_distance(
-            pair, active_collision_data_->distanceResults[i].min_distance);
+            pair, active_collision_data_->distanceResults[i].min_distance,
+            normal_a_to_b(prepared_scene->runtime_pair_bindings[i],
+                          active_collision_data_->distanceResults[i].normal));
       }
     } else if (request.distance_request_mode ==
                    core::CollisionDistanceRequestMode::kAllCollidingPairs ||
                request.distance_request_mode ==
                    core::CollisionDistanceRequestMode::kSelectedCollidingPairs) {
       bool selected_distance_evidence_complete = true;
+      std::optional<detail::MeshDepthStatus> mesh_depth_failure;
       for (const auto& collision : runtime_collision_observations_) {
         if (request.distance_request_mode ==
                 core::CollisionDistanceRequestMode::kAllCollidingPairs ||
@@ -2058,25 +2018,42 @@ core::RuntimeCollisionQueryResultView ManyForgeCollisionEngine::check_runtime(
         ++last_query_mechanism_counters_.distance_api_call_count;
         ++last_query_mechanism_counters_
               .distance_evaluated_geometry_pair_count;
+        double distance = distance_result.min_distance;
+        coal::Vec3s normal = distance_result.normal;
+        const auto& geometry_pair =
+            prepared_scene->collision_model.collisionPairs[i];
+        const auto mesh_status = deepen_mesh_pair(
+            prepared_scene->mesh_depth[geometry_pair.first].get(),
+            prepared_scene->mesh_depth[geometry_pair.second].get(),
+            *active_collision_data_, i, geometry_pair, distance, normal);
+        if (mesh_status != detail::MeshDepthStatus::kOk) {
+          if (!mesh_depth_failure) mesh_depth_failure = mesh_status;
+          selected_distance_evidence_complete = false;
+          continue;
+        }
         detail::SelectedCollidingDistanceEvidence selected_evidence;
-        selected_evidence.observe(distance_result.min_distance);
+        selected_evidence.observe(distance);
         if (!selected_evidence.complete ||
             !selected_evidence.deepest_finite_m) {
           selected_distance_evidence_complete = false;
           continue;
         }
         merge_finite_distance(&binding.pair,
-                              *selected_evidence.deepest_finite_m);
+                              *selected_evidence.deepest_finite_m,
+                              normal_a_to_b(binding, normal));
       }
 
       if (!selected_distance_evidence_complete) {
         for (auto& observation : runtime_collision_observations_) {
           observation.signed_clearance_m.reset();
+          observation.normal_a_to_b.reset();
         }
         runtime_clearance_observations_.clear();
         return finish(
             core::RuntimeCollisionQueryStatus::kInconclusive,
-            core::RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete,
+            mesh_depth_failure
+                ? mesh_depth_failure_reason(*mesh_depth_failure)
+                : core::RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete,
             core::CollisionEngineStatus::kDiagnosticIncomplete);
       }
 
@@ -2613,9 +2590,27 @@ core::CollisionResult ManyForgeCollisionEngine::check_locked(
         ++last_query_mechanism_counters_.distance_api_call_count;
         ++last_query_mechanism_counters_
               .distance_evaluated_geometry_pair_count;
-        const double distance = distance_result.min_distance;
+        double distance = distance_result.min_distance;
+        coal::Vec3s normal = distance_result.normal;
+        const auto& geometry_pair =
+            prepared_scene->collision_model.collisionPairs[pair_index];
+        const auto mesh_status = deepen_mesh_pair(
+            prepared_scene->mesh_depth[geometry_pair.first].get(),
+            prepared_scene->mesh_depth[geometry_pair.second].get(),
+            *active_collision_data_, pair_index, geometry_pair, distance,
+            normal);
         auto& selected_evidence =
             selected_distance_evidence_by_pair[binding.pair];
+        if (mesh_status != detail::MeshDepthStatus::kOk) {
+          // The pair has no depth: its evidence stays incomplete.
+          selected_evidence.complete = false;
+          incomplete_distance_evidence = true;
+          result.raw_diagnostics["mesh_depth_inconclusive"] =
+              mesh_depth_failure_code(mesh_status);
+          result.raw_diagnostics["mesh_depth_inconclusive_pairs"] +=
+              raw_pair_description(pair_index) + ";";
+          continue;
+        }
         selected_evidence.observe(distance);
         if (!std::isfinite(distance)) {
           incomplete_distance_evidence = true;
@@ -2824,6 +2819,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
   prepared->publisher_id = snapshot.publisher_id;
   prepared->revision = snapshot.revision;
   prepared->collision_model = shared_model_->base_collision_model;
+  prepared->mesh_depth = shared_model_->base_mesh_depth;
   // Rebuild the active subset below using the retained SRDF inventory plus
   // logical-body and motion-relevance filters (including selected subgroups).
   prepared->collision_model.removeAllCollisionPairs();
@@ -3009,6 +3005,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
       const std::string raw_name =
           sanitized_geometry_name(body.body_id, index++);
       std::shared_ptr<coal::CollisionGeometry> shape;
+      std::shared_ptr<const detail::MeshDepthShape> mesh_depth;
       switch (geom.geometry_kind) {
         case core::CollisionGeometryKind::kBox: {
           if (!geom.box_dimensions_m) {
@@ -3039,19 +3036,28 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
             return "triangle mesh geometry missing source_uri: " +
                    body.body_id;
           }
+          // Scene meshes are captured at activation: their bytes are read
+          // only from the content store by `source_hash`, never by URI.
+          if (!geom.source_hash ||
+              !core::IsExactLowercaseSha256Digest(*geom.source_hash)) {
+            return "scene_mesh_unavailable: triangle mesh geometry of " +
+                   body.body_id + " (" + *geom.source_uri +
+                   ") has no captured content digest";
+          }
           const Eigen::Vector3d scale = effective_mesh_scale(geom.mesh_scale);
           if (!(scale.array().isFinite()).all() ||
               !(scale.array() > 0.0).all()) {
             return "triangle mesh geometry has invalid mesh_scale: " +
                    body.body_id;
           }
-          const auto cache_key = mesh_cache_key(*geom.source_uri, scale);
+          const auto cache_key = mesh_cache_key(*geom.source_hash, scale);
           {
             std::lock_guard<std::mutex> cache_lock(
                 scene_cache_->mesh_cache_mutex);
             auto cached = scene_cache_->mesh_geometry_cache.find(cache_key);
             if (cached != scene_cache_->mesh_geometry_cache.end()) {
-              shape = cached->second;
+              shape = cached->second.geometry;
+              mesh_depth = cached->second.depth;
             } else {
               if (!allow_resource_io) {
                 return "runtime snapshot references an unprepared triangle "
@@ -3064,36 +3070,24 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
                        "bound";
               }
               std::string mesh_error;
-              // A relative scene mesh is read only through its validated
-              // descriptor below the approved root; the descriptor stays open
-              // until the loader returns and its digest is pinned per URI.
-              std::optional<OpenedSceneMesh> scene_mesh;
-              std::optional<std::filesystem::path> mesh_path;
-              if (is_plain_relative_resource_path(*geom.source_uri)) {
-                std::string reason;
-                scene_mesh = open_pinned_scene_mesh(
-                    *shared_model_, *geom.source_uri, mesh_error, reason);
-                if (scene_mesh.has_value()) {
-                  mesh_path = scene_mesh->loader_path();
-                }
-              } else {
-                mesh_path = resolve_mesh_resource_uri(
-                    *geom.source_uri, shared_model_->package_paths,
-                    mesh_error);
-              }
-              if (!mesh_path) {
-                return "triangle mesh geometry could not resolve source_uri "
-                       "for " +
+              // The verified descriptor stays open until the loader returns,
+              // so the loader reads exactly the digest-checked bytes.
+              const auto scene_mesh = open_captured_scene_mesh(
+                  *shared_model_, *geom.source_uri, *geom.source_hash,
+                  mesh_error);
+              if (!scene_mesh.has_value()) {
+                return "triangle mesh geometry could not be read for " +
                        body.body_id + ": " + mesh_error;
               }
               coal::MeshLoader loader;
-              auto mesh = loader.load(mesh_path->string(), scale);
+              auto mesh = loader.load(scene_mesh->loader_path().string(), scale);
               if (!mesh) {
                 return "triangle mesh loader returned null for " +
                        body.body_id + ": " + *geom.source_uri;
               }
               shape = std::move(mesh);
-              scene_cache_->mesh_geometry_cache[cache_key] = shape;
+              mesh_depth = detail::prepare_mesh_depth(shape);
+              scene_cache_->mesh_geometry_cache[cache_key] = {shape, mesh_depth};
             }
           }
           break;
@@ -3125,6 +3119,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
       }
       prepared->collision_model.addGeometryObject(*object,
                                                   shared_model_->model);
+      prepared->mesh_depth.push_back(std::move(mesh_depth));
       prepared->scene_geometry_names.push_back(raw_name);
       prepared->raw_name_to_body_id[raw_name] = body.body_id;
     }
@@ -3176,6 +3171,8 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
       const bool a_motion_relevant = motion_relevant_by_body[body_a->second];
       const bool b_motion_relevant = motion_relevant_by_body[body_b->second];
       if (!a_motion_relevant && !b_motion_relevant) {
+        // Neither body is the group's own: the owning component's rules and
+        // checks govern this pair (OD-359).
         continue;
       }
 
@@ -3236,6 +3233,7 @@ std::optional<std::string> ManyForgeCollisionEngine::sync_snapshot_locked(
     binding.pair = {body_a->second, body_b->second};
     if (binding.pair.body_b < binding.pair.body_a) {
       std::swap(binding.pair.body_a, binding.pair.body_b);
+      binding.swapped = true;
     }
   }
 

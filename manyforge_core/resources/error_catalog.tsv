@@ -104,6 +104,7 @@ apply_refused_starting_execution	Apply refused while execution starts	The Apply 
 apply_refused_stopping_execution	Apply refused while execution stops	The Apply was refused because the execution is stopping. Wait until it has ended, then Apply.
 apply_refused_terminal_awaiting_reset	Apply refused until the run is reset	The Apply was refused because the completed execution has not been reset. Reset it, then Apply.
 apply_rejected	Apply refused	The Manager refused this Apply.
+apply_requires_idle_kept_component	Reset first: a kept robot holds an operation	This Apply keeps a component whose execution owner still holds a failed or unfinished operation, so nothing was changed. Reset the Program, then Apply again.
 apply_requires_inactive_component	Deactivate component first	This Apply replaces or removes an Active component. Deactivate it first.
 apply_status_not_found	Apply unknown to the Manager	The Manager has no record of this Apply. Collect the logs and report it.
 apply_status_unavailable	Apply status unavailable	The status of the running Apply could not be read, so Apply is reported as failed; the details give the reason. Check the cell state, then Apply again.
@@ -190,7 +191,6 @@ before_planning_scene_latch_failed	Scene could not be latched before planning	Th
 boolean_required	Encoded value must be true or false	An internal check failed: an encoded motion record has a value that must be true or false. Collect the logs and report it.
 bootstrap_rebuild	Planning scene rebuild still in progress	An internal check failed: a planning scene rebuild could not settle because a previous scene construction is still in progress. Collect the logs and report it.
 bootstrap_status	Planning scene status still in progress	An internal check failed: a planning scene status query could not settle because scene construction is still in progress. Collect the logs and report it.
-bounded_penetration_field_not_applicable	Penetration limit not used by this policy	A support contact sets max_contact_penetration_m, which only the bounded penetration contact policy accepts. Remove the field or choose that policy.
 budget_exhausted	Perception budget exhausted	Perception ran out of its time or work budget, so the result is partial: only some of the instances were produced. Retry, or relax the budget or reduce the work.
 cached_plan_request_failed	Cached plan request failed	The request to reuse a cached plan could not be built, so the motion was not executed. Run again; if it persists, collect the logs and report it.
 candidate_binding_revision_conflict	Component start binding conflict	An internal check failed: the components to start name conflicting revisions of the same control binding. Collect the logs and report it.
@@ -251,6 +251,7 @@ cartesian_joint_limit_violation	Cartesian path exceeds joint limits	The Cartesia
 cartesian_model_dynamics_limits_unavailable	Dynamics limits unavailable	Cartesian planning needs complete dynamics limits from the robot model and they are not available. Check the robot model limits.
 cartesian_numeric_option_invalid	Cartesian tolerances invalid	Cartesian planning needs positive translation and rotation tolerances. Set both tolerances to values above zero.
 cartesian_path_incomplete	Cartesian path incomplete	The Cartesian path could not be followed to the end. The details give the fraction completed. Change the path or target and try again.
+cartesian_path_moving_takeover_refused	Cartesian path cannot take over a moving robot	A Follow Cartesian path starts at its first waypoint, so it cannot take over a robot that is still moving. The running motion continues. Use a Move to pose (linear or joint) to take over a moving robot, or start the path when the robot is at rest.
 cartesian_path_parameter_invalid	Cartesian path parameters invalid	The Cartesian path is empty or has non-positive tolerances. Give the path at least one pose and positive tolerances.
 cartesian_path_tolerance_exceeded	Cartesian path tolerance exceeded	The Cartesian path could not be followed within the requested tolerance. Relax the tolerance or change the path.
 cartesian_request_invalid	Cartesian request invalid	The Cartesian request has an invalid shape, policy, step, limit or blend radius. Check the motion's settings.
@@ -314,6 +315,17 @@ collision_resource_runtime_monitor_active	Collision resources busy: monitoring a
 collision_resource_set_not_installed	Collision resources not installed	Collision resources have not been installed yet. Wait until the cell is ready and try again.
 collision_resource_validation_active	Collision resources busy: validation active	The collision resources could not be replaced while a motion is being checked for collisions. Wait until it has finished and try again.
 collision_resource_validation_capacity_mismatch	Validation engines below worker capacity	An internal check failed: the new collision validation engines do not match the configured worker count. Collect the logs and report it.
+collision_rule_confirmation_required	Collision rule changes not confirmed	The Apply adds, removes or changes collision rules that were not confirmed in its Preview, so nothing was applied. Preview again, check the listed rules and confirm them.
+collision_rule_id_duplicate	Collision rule id repeated	Two collision rules of one list have the same id. Give each rule its own id.
+collision_rule_id_invalid	Collision rule id invalid	A collision rule has no id, or an id longer than 128 bytes. Enter a shorter id.
+collision_rule_selection_invalid	Collision rule selection invalid	The selections of a collision rule are not valid: A and B must each hold 1 to 16 selections of a kind allowed there, or both be left out on the one row without selections. Correct the rule.
+collision_rule_selection_unresolved	Collision rule selection not found	A collision rule selects a component, collision body, link, model group, Scene object or TCP contact body that does not exist for this move or Deployment. Correct the selection.
+collision_rule_spring_slider_unresolved	Spring slider not found	A collision rule switches on a spring slider that the Deployment does not have: the component is missing, is not a generated tool, or has no spring slider of that id. The details name the component and the element. Choose a spring slider of a generated tool in the Deployment.
+collision_rule_value_invalid	Collision rule value invalid	A collision rule needs exactly one value: a clearance from 0 to 0.05 m, a contact allowance or a release, with every number in range. Correct the value of the rule.
+collision_rules_bound_exceeded	Too many collision rules	A list holds more than 64 collision rules, or is not a list. Reduce the rules.
+collision_rules_overlap	Collision rules overlap	Two collision rules hold the same pair of bodies; the details name the pair and both rules. Remove the pair from one of them.
+collision_rules_tracked_pair_capacity_exceeded	Too many pairs under contact rules	The release rules and the whole-move contact rules with a depth limit hold more than 64 pairs in this move, so the motion was refused. Narrow the selections of these rules.
+collision_rules_world_unavailable	Collision rules could not be applied	The move has collision rules, but no collision world and policy were available to apply them, so it was refused. Check that the Scene is loaded, then try again.
 collision_validation_cancelled	Collision check cancelled	The collision check of the motion was cancelled before it finished, so the motion was not validated.
 collision_validation_serial_fallback_exception	Collision check fallback raised an error	An internal check failed: the serial fallback of the collision check raised an error, so the motion was not validated. Collect the logs and report it.
 collision_validation_trajectory_unsampleable	Motion cannot be collision-checked	An internal check failed: the motion trajectory could not be sampled for its collision check. Collect the logs and report it.
@@ -349,6 +361,7 @@ component_default_tcp_required	Default TCP not chosen	The component has TCPs on 
 component_default_tcp_unknown	Default TCP not found	The chosen default TCP is not a TCP of the component's targets. Choose one of its TCPs.
 component_driver_restart_failed	Driver restart failed	The component's driver process could not be started again; the message says why. Check the driver, then Recover again.
 component_enabled	Component is enabled	The component is enabled, so Prepare doesn't apply. Disable it first.
+component_fault	A component fault stopped motion	Motion stopped: a component of the cell entered a fault while motion ran, so every moving robot stopped with its fault Stop profile. The details name the component. Fix it with its own actions (Recover, Prepare, Enable); the cell latch clears when every component is healthy and idle. Then reset the stopped motion and run again.
 component_folder_exists	Component folder already exists	The folder already holds a component descriptor, so no new one was created.
 component_frame_lookup_invalid	Component frame lookup request invalid	The component frame lookup request is invalid. Correct the exact reference and try again.
 component_frame_lookup_stale	Applied component frame capture changed	The applied bundle or graph changed before the lookup. Refresh the capture and try again.
@@ -388,7 +401,7 @@ component_rebooting	Component is rebooting	The component's controller is rebooti
 component_recovery_confirmation_changed	Recovery causes changed	The causes changed since you confirmed them, so nothing more was run. Review them and confirm again.
 component_reference_missing	Component reference not found	The referenced component is not present in the applied bundle.
 component_registration_stale	Component registration out of date	The registered rows of this robot or tool differ from its descriptor. Register the component again.
-component_role_unknown_link	Component link not in model	A frame, collision, TCP, mount, attach or touch link role names a link the URDF does not have. Correct the component descriptor.
+component_role_unknown_link	Component link not in model	A frame, collision, TCP, mount or attach role names a link the URDF does not have. Correct the component descriptor.
 component_runtime_scale_mismatch	Speed scaling declaration differs from controller	The robot's lane row declares runtime_scale, but the arm controller its adapter generates does not match it (only a controller that commands position alone accepts runtime speed scaling), so the Scenario was not loaded. Correct the model's lane row or its controllers.
 component_scenario_mismatch	Scenario component does not match	A Scenario's component of this robot or tool does not match its descriptor. Update the Scenario or the component.
 component_schema_refuses	Component profile not accepted yet	The runtime schema does not accept this component's Mock profile yet. Complete the component setup steps.
@@ -477,18 +490,11 @@ configured_robot_missing	Configured robot not found	An internal check failed: an
 confirmation_required	Confirmation required	This Apply has effects that must be confirmed first. Review the preview and confirm it.
 confirmation_stale	Confirmation out of date	The Apply impact changed after it was previewed and confirmed. Preview and confirm again.
 conflicting_active_projection	Empty Scene already finalized	An internal check failed: the Scene start-up was asked to finalize an empty Scene that was already finalized. Collect the logs and report it.
-contact_before_terminal_window	Contact before the grasp window	The motion touches the grasp target before the terminal window in which grasp contact is allowed, so it is refused. Correct the path or the contact policy.
+contact_before_terminal_window	Contact before the end window	The motion touches a pair before the fraction of the move from which its contact rule allows contact, so it is refused. Correct the path or the rule.
 contact_bodies_static	Contact body is static	The contact input is unavailable because a contact body is static in the collision world.
-contact_grasp_body_binding_empty	Contact grasp has no robot bodies	An internal check failed: the contact-grasp policy resolved no robot collision bodies. Collect the logs and report it.
-contact_grasp_motion_endpoint_unresolved	Contact grasp endpoint unresolved	The contact-grasp policy needs a resolved motion endpoint and has none. Check the motion's target and the policy.
-contact_grasp_robot_body_projection_mismatch	Contact grasp robot body mismatch	A contact-grasp robot body differs from the retained collision world. Refresh the scene and try again.
-contact_grasp_runtime_object_mismatch	Contact grasp object mismatch	The resolved contact-grasp object differs from the one in the operation intent. Select the object again and retry.
-contact_grasp_runtime_object_unresolved	Contact grasp has no object	The contact-grasp policy has no selected runtime object. Select the object to grasp, or run the detection before it.
-contact_grasp_selected_object_not_detached	Grasp object missing or carried	The selected contact-grasp object is missing from the scene, already carried, or has no shape. Check the scene and the object.
-contact_grasp_selected_object_projection_mismatch	Grasp object differs from world	The selected contact-grasp object differs from the retained collision world. Refresh the scene and try again.
-contact_penetration_exceeds_policy	Contact penetration too deep	A contact penetrated deeper than the contact policy allows. Adjust the approach or the policy limit.
-contact_policy_violation	Contact not allowed	The motion touches something its contact policy does not allow. Change the path or the contact policy.
-contact_release_entering_state_identity_mismatch	Contact release state mismatch	An internal check failed: the entering contact-release state does not match the policy's support contacts. Collect the logs and report it.
+contact_compression_step_exceeded	Spring compressed in a jump	Between two samples 1 mm of tool travel apart, a pair under a contact rule with a spring got deeper by more than the rule's compression step: the path meets a step or an obstacle instead of pressing the spring in smoothly. The details name the rule, the pair, the depths and the limit. Change the path, or the step limit of the rule.
+contact_penetration_exceeded	Contact too deep	Two bodies under a contact rule touch deeper than the rule's maximum penetration; the details name the rule, the pair, the depth and the limit. Change the path or the limit of the rule.
+contact_release_entering_state_identity_mismatch	Contact release state mismatch	An internal check failed: the entering contact-release state does not match the move's release rules. Collect the logs and report it.
 contact_release_entering_state_invalid	Contact release state invalid	An internal check failed: the entering contact-release state lacks its initial depth. Collect the logs and report it.
 contact_release_final_sample_missing	Contact release final sample missing	An internal check failed: the contact-release evidence has no final sample. Collect the logs and report it.
 contact_release_initial_sample_missing	Contact release first sample missing	An internal check failed: the contact-release evidence has no sample at the first waypoint. Collect the logs and report it.
@@ -496,12 +502,15 @@ contact_release_state_missing_initial_depth	Contact release depth missing	An int
 contact_release_summary_identity_mismatch	Contact release summary missing	An internal check failed: the contact-release summary for a contact pair is missing. Collect the logs and report it.
 contact_release_violation_policy_index_invalid	Contact release violation index invalid	An internal check failed: a contact-release violation names a policy entry that does not exist. Collect the logs and report it.
 contact_release_violation_record_missing	Contact release violation record missing	An internal check failed: the waypoint record for a contact-release violation is missing. Collect the logs and report it.
+contact_rule_pair_bound_exceeded	Contact rule pair limit exceeded	A move has more than 64 pairs under release rules and whole-move contact rules with a depth limit. Narrow the selections of these rules.
+contact_rule_summary_identity_mismatch	Contact rule summary mismatch	An internal check failed: a validation summary does not match the move's contact rules. Collect the logs and report it.
+contact_rule_violation	Contact not allowed	The motion touches something its collision rules do not allow. Change the path or the rules.
 container_configuration_required	Container configuration missing	Isaac Sim cannot start without the full ROS container configuration. Complete the launcher profile and try again.
 container_identity_mismatch	Runtime container does not match launch	The remote runtime container is not the one this launch created. Stop the cell with the launcher and start it again.
 continuous_measured_joint_source_required	Measured joint source required	An internal check failed: continuous measured robot state needs exactly one joint-state source with measured authority and a freshness limit. Collect the logs and report it.
 control_bindings	Control bindings invalid	An internal check failed: the control bindings of the configuration are invalid or exceed their limit. Collect the logs and report it.
 control_epoch_changed	Control state changed	The control state changed since the recovery was requested, so nothing was done. Refresh the recovery view and try again.
-control_freshness_expired	Command based on outdated view	The command was refused because the view it was based on is too old. Refresh and send the command again.
+control_freshness_expired	Command based on outdated view	The command was refused because it arrived too late after the last status update. Send the command again.
 control_freshness_invalid	Command freshness data invalid	An internal check failed: a command carried malformed or unsigned freshness data. Collect the logs and report it.
 control_monotonic_clock_invalid	Control clock out of range	An internal check failed: the backend clock value is out of range. Collect the logs and report it.
 control_path_required	Prepared operation has no control path	An internal check failed: a prepared operation has no control path for its component. Collect the logs and report it.
@@ -564,6 +573,7 @@ current_route_missing	Robot has no active control route	The robot has no active 
 current_route_read_failed	Robot control route could not be read	The active control configuration of the robot could not be read, so its state was not observed.
 current_route_unqualified	Robot control route changed	The robot state source does not belong to the current control configuration, so it was not used. This can happen while a configuration change completes.
 current_validation_failed	Move failed validation at start	The move was checked again against the current state when it started and failed, so it did not run. The details name the validation error; correct the target or the scene and try again.
+custom_tcp_contact_body_unknown	Custom TCP contact body not found	A custom TCP names a contact body that is not a collision body of its component. Choose one of the component's collision bodies.
 custom_tcp_duplicate	Custom TCP repeated	A custom TCP id is used more than once. Give each custom TCP its own id.
 custom_tcp_invalid	Custom TCP invalid	A custom TCP has an invalid position or orientation. Enter finite numbers and a valid orientation.
 custom_tcp_name_collision	Custom TCP name already used	A custom TCP name is already used by a link or frame of the model. Choose another name.
@@ -626,10 +636,11 @@ deployment_motion_target_limit_invalid	TCP speed limit invalid	The TCP speed lim
 deployment_motion_target_limit_scope_mismatch	Motion target not unique	The Deployment must contain exactly one matching motion target for this speed limit. Refresh the Draft and try again.
 deployment_motion_target_limit_unavailable	No motion targets to limit	This Deployment has no motion targets whose speed limit can be edited.
 deployment_retained_draft_invalid	Stored Deployment Draft invalid	The stored Deployment Draft is invalid and could not be restored. Collect the logs and report it.
-deployment_saved_baseline_not_adopted	Saved, but not adopted as baseline	The Deployment was written to disk but not adopted as the Saved version. The view was refreshed; check the current state.
 deployment_saved_path_unavailable	Deployment has no saved path	This Deployment has not been saved yet. Use Save As.
 deployment_saved_unavailable	No Saved Deployment	The Deployment has no Saved version to return to.
 deployment_signal_member_inactive	Signal of a deactivated part	A component or rule uses a signal of a deactivated machine member. Activate the member or change the reference.
+deployment_tool_replacement_invalid	Tool cannot be replaced	Replace tool takes a mounted tool of the Deployment Draft and another tool of the Draft. Refresh the Draft and choose again.
+deployment_tool_unmounted	Tool not mounted	A tool of the Deployment Draft is not mounted on a robot, so the cell would hold a floating tool. Mount it on a robot on its component page, or remove it, then Apply.
 derived_collision_policy_fields_are_read_only	Derived collision fields read-only	The configured collision policy cannot contain static, touch or support allowances, because the owner derives them. Remove those entries from the configured policy.
 derived_scope_invalid	Configuration hold scope invalid	An internal check failed: the configuration hold for starting components is malformed. Collect the logs and report it.
 descriptor_duplicate	Robot geometry source repeated	An internal check failed: a robot geometry source was supplied twice. Collect the logs and report it.
@@ -655,7 +666,6 @@ domain_observation_generation_exhausted	Controller observation counter exhausted
 draft_arguments_invalid	Edit request invalid	The Draft edit was refused because an argument is invalid. The details name the problem.
 draft_authoring_macro_unknown	Authoring macro unknown	The authoring macro is not one the Composer knows. Use pick_subtree or place_subtree.
 draft_candidate_response_too_large	Draft candidate response too large	The qualified Draft candidate exceeds the response size limit. Reduce the Draft and try again.
-draft_contact_policy_not_found	Contact policy not declared	The pick names a contact policy that the Program does not declare. Choose a declared contact policy.
 draft_declaration_conflict	Declaration conflicts with the Program	The authoring macro's blackboard namespace is not owned by the Program, or its key is already declared differently. Choose another namespace or key.
 draft_declaration_duplicate	Declaration repeated in one edit	The same declaration id appears twice in one upsert. Give each id once.
 draft_declaration_not_found	Declaration not in the Draft	The removal names declarations that are not in the Draft. Remove only declared ids.
@@ -714,17 +724,18 @@ driver_timer_cancellation_failed	I/O device timer cancellation failed	An interna
 driver_transport_lost	Driver connection lost	The connection to the component's driver was lost while it was enabled. Check the driver, then Recover.
 driver_transport_unavailable	I/O device driver not reachable	The I/O device's driver doesn't answer. Check that it is running, then try again.
 duplicate_component_instance	Duplicate component instance detected	More than one process publishes for the same component topic, so the component cannot be used. Stop the duplicate driver or node and try again.
-duplicate_support_contact_identity	Duplicate support contact	The collision policy lists the same support contact pair twice, so it is invalid. Remove the duplicate entry.
-duplicate_support_contact_pair	Support object listed twice	A support object is declared more than once in the contact list. Keep one contact per support object.
+duplicate_contact_rule_pair	Contact rule pair repeated	An internal check failed: the move's resolved collision rules list one pair twice. Collect the logs and report it.
 dynamic_start_contact_capacity_exceeded	Too many start contacts	The carried object's start contacts exceed the runtime bound, so the motion was refused. Reduce the contacts at the start pose, for example by moving the object away from other items.
-dynamic_start_contact_policy_identity_failed	Start contact policy not identified	An internal check failed: the contact policy for the carried object could not be identified. Collect the logs and report it.
 dynamic_start_contact_query_inconclusive	Start contact check inconclusive	The collision check of the carried object at the start pose gave no conclusive answer, so the motion was refused. Check the Scene and the object, then try again.
+dynamic_start_contact_rule_identity_failed	Start contact release not identified	An internal check failed: the automatic start release for the carried object could not be identified. Collect the logs and report it.
 edited_outside_manyforge	Edited outside ManyForge	This file was changed outside ManyForge since it was saved. It still loads with its current content; review it.
 effective_collision_policy_contract_mismatch	Collision policy semantics changed	An internal check failed: the native projection changed the configured collision-policy semantics. Collect the logs and report it.
 effective_collision_policy_digest_mismatch	Collision policy digest mismatch	An internal check failed: the native projection returned an inexact collision-policy digest. Collect the logs and report it.
 effective_collision_policy_mismatch	Collision policies disagree	An internal check failed: the active native projections disagree on the effective collision policy. Collect the logs and report it.
 effective_collision_policy_not_canonical	Collision policy not canonical	An internal check failed: the effective collision policy returned by the native projection is not canonical. Collect the logs and report it.
+effective_collision_policy_unavailable	Collision policy unavailable	A motion-planning scene answered no collision policy for the changed Scene, so the change was refused and nothing changed. Check the Scene component status and try again.
 effort_kind_invalid	Effort unit invalid	An internal check failed: an effort value does not use newtons. Collect the logs and report it.
+element_not_spring_slider	Element is not a spring slider	A Mock input follows a tool element that is not a spring slider. Choose a spring slider element of the generated tool.
 emitted_trajectory_shape_invalid	Stop trajectory shape invalid	The emitted trajectory of this controlled Stop candidate has an invalid shape, so the candidate is not used.
 empty_trajectory	Trajectory has no points	An internal check failed: a motion trajectory has no waypoints. The motion did not start. Collect the logs and report it.
 end_effector_tcp_unavailable	No end-effector TCP	This robot has no end-effector TCP: the tool on its flange has no TCP. Mark one of the tool's frames as a TCP in its component type, or choose a TCP explicitly.
@@ -860,7 +871,7 @@ fault_stop_plan_identity_mismatch	Fault Stop plan mismatch	An internal check fai
 fault_stop_plan_invalid	Fault Stop plan invalid	An internal check failed: the prepared fault Stop plan of this motion is invalid. Collect the logs and report it.
 fault_stream_stale	Device stopped reporting	The device stopped sending its data. Check the device and its connection, then Recover.
 fault_vendor	Device fault	The device reported a fault; see the vendor code and text for details, then Recover.
-final_sample_not_separated	Still in contact at motion end	The support contact was still touching at the end of the motion although separation was required, so the collision validation failed. Change the motion so the object separates by its end.
+final_sample_not_separated	Still in contact at motion end	A pair under a release rule was still touching at the end of the motion although separation was required, so the collision validation failed. Change the motion so the object separates by its end.
 finite_number_required	Encoded value must be a finite number	An internal check failed: an encoded motion record has a value that must be a finite number. Collect the logs and report it.
 float_literal_out_of_range	Number out of range	A number in the expression is outside the supported range. Correct the expression.
 forward_kinematics_batch_failed	Forward kinematics failed	The forward kinematics of several frames could not be computed; the details give the reason. Check the robot model and the joint values.
@@ -878,6 +889,10 @@ frame_unresolved	Pose source frame not resolved	The pose source could not transf
 fresh_apply_success_foreign_claim	Apply success blocked by another claim	Cell authoring is not ready to record the Apply as finished: a claim held by another owner is still open. Check the cell status, then try again.
 fresh_apply_success_not_exact	Apply result mismatch	An internal check failed: the fresh Apply success does not match its admission claim. Collect the logs and report it.
 full_stack_restart_required	Full restart required	The Manager software changed, so all of ManyForge must be restarted. Restart ManyForge.
+generated_tool_parameters_required	Tool has no parameters	A Tool (manyforge.tool) is made from its parameters, but its row has none. Edit the tool on its component page, or name a parameter file in model_source.parameters.
+generated_tool_wiring_invalid	Tool end wiring invalid	A tool end's wiring row holds only its valve outputs and optional sensor inputs (pneumatic_io); states, frames and motion time come from the tool's parameters. Remove the other fields, or add the valve outputs.
+generated_tool_wiring_missing	Tool end not wired	An actuated tool end (a jaw pair) of the tool has no wiring. Pick its valve outputs in the tool's Wiring section and Load again.
+generated_tool_wiring_unknown	Wiring names no tool end	A wiring row of the tool names no actuated tool end of its parameters, or names one twice. Remove the row, or correct the tool end.
 global_interrupt_group_unbound	Global rule names an unknown execution group	A global interrupt rule names an execution group that the applied Program does not declare. Correct the rule's group or the Program and Apply again.
 global_interrupt_owner_not_current	Global rules need current owner	Global interrupt rules require the current managed product owner, which is not current, so the request was refused. Apply again.
 global_interrupt_program_binding_missing	Global rule needs an applied Program	A global interrupt rule selects execution groups, but no Program is applied to resolve them. Apply a Program that declares the group, or change the rule's scope.
@@ -892,9 +907,10 @@ grasp_confirmation_invalid	Grasp confirmation setting invalid	The gripper's gras
 grasp_confirmation_lost	Grasp confirmation lost	The gripper lost the grasp confirmation during its command, so the command was aborted. Check the part and the gripper before you continue.
 grasp_confirmation_source_missing	Grasp confirmation has no source	Grasp confirmation is required but the gripper has no source for it: a pneumatic gripper needs a workpiece-grasped input, a position gripper a stall window. Add it in the gripper settings.
 grasp_confirmation_unavailable	Grasp confirmation not supported	This gripper has no feedback source that can confirm a grasp.
-grasp_contact_before_terminal_window	Contact before the grasp window	The motion touches the grasp target before the terminal window in which grasp contact is allowed, so it is refused. Correct the path or the contact policy.
-grasp_contact_penetration_exceeded	Grasp contact penetration too deep	A contact with the selected object penetrates it more than the grasp contact policy allows. Check the grasp and the contact policy.
+grasp_contact_before_terminal_window	Contact before the end window	The motion touches a pair before the fraction of the move from which its contact rule allows contact, so it is refused. Correct the path or the rule.
 grasp_not_confirmed	Grasp not confirmed	The gripper closed, but no grasp was confirmed or the grasp evidence could not be read, so the Run failed. Check the workpiece and the grasp sensor, then Reset.
+grip_body_missing	Grip body missing	The component type of a gripper names no grip body for its target. Add grip_body to the gripper's component descriptor.
+grip_body_unknown	Grip body not found	A component type names a grip body that is not one of its target's collision bodies. Correct the component descriptor.
 gripper_action_server_unavailable	Gripper action server unavailable	The gripper action server is not available, so the gripper command was aborted. Check that the gripper controller is running.
 gripper_busy	Gripper already busy	The gripper is already executing a command, so the new gripper command was refused. Wait for the current command to finish.
 gripper_command_coordinate_kind_mismatch	Gripper unit mismatch	The gripper command unit differs from the unit of its resource (angular or linear), so it was refused. Use the matching unit.
@@ -1016,7 +1032,7 @@ installed_process_inspection_scope_stale	Process inspection out of date	The inst
 installed_process_inventory_exceeds_bound	Too many component processes	The installed component processes exceed the supported number. Collect the logs and report it.
 installed_process_inventory_invalid	Process inventory invalid	An internal check failed: the installed component processes are attributed inconsistently. Collect the logs and report it.
 instance_unavailable	No launch instance found	No launch was recorded for this instance. Check the instance id or start the cell first.
-insufficient_release_progress	Insufficient release progress	The support contact did not separate enough during the motion, so the collision validation failed. Change the motion so the object leaves the contact.
+insufficient_release_progress	Insufficient release progress	A pair under a release rule did not separate enough during the motion, so the collision validation failed. Change the motion so the object leaves the contact.
 integer_literal_out_of_range	Integer out of range	An integer in the expression is too large. Correct the expression.
 integer_overflow	Integer overflow	The expression result does not fit in an integer. Correct the expression.
 interfaces_invalid	Controller interface list invalid	An internal check failed: a prepared operation has a missing or oversized controller interface list. Collect the logs and report it.
@@ -1049,10 +1065,9 @@ intervention_required	Operator intervention required	The operation stopped and n
 invalid_ali_timing	Stop retiming input invalid	An internal check failed: the controlled Stop planner received invalid timing input. Collect the logs and report it.
 invalid_anchor_negative_time_s	Anchor time invalid	The dispatch-latency anchor time must be finite and negative, so the Stop could not be planned. Check the Stop configuration.
 invalid_character	Invalid character	The expression contains an invalid character or operator. Correct the expression.
+invalid_collision_rule	Collision rule invalid	The collision rules of this motion or Deployment are malformed or cannot be applied; the details name the reason and the rule. Correct the rule.
 invalid_compute_latency_s	Compute latency invalid	The dispatch-latency shift needs a finite, non-negative compute latency, so the Stop could not be planned. Check the Stop configuration.
-invalid_contact_grasp_policy	Grasp contact policy invalid	The grasp contact policy is incomplete or out of range: it needs a selected object, allowed robot links, a penetration limit of zero or more, and a terminal window start between 0 and 1. Correct the contact policy.
-invalid_contact_grasp_sample_fractions	Grasp sample fractions invalid	The sample fractions of the motion must be increasing values between 0 and 1, one per waypoint, so the grasp contact check cannot run. Correct the motion's sampling.
-invalid_contact_policy	Invalid contact policy	The contact policy of this motion is invalid.
+invalid_contact_rule_sample_fractions	Sample fractions invalid	The sample fractions of the motion must be increasing values between 0 and 1, one per waypoint, so the end window of a contact rule cannot be checked. Correct the motion's sampling.
 invalid_covariance	Pose source covariance invalid	The pose source sent a pose with a malformed covariance. Check the sensor or detector output.
 invalid_detection_array	Detection message invalid	The pose source received a malformed or oversized detection message. Check the detector output.
 invalid_escape	Invalid escape in string	Only \" and \\ escapes are allowed in expression strings. Correct the expression.
@@ -1088,7 +1103,6 @@ invalid_state_transition	Not possible in the current state	This action is not po
 invalid_stop_deadline_s	Stop deadline invalid	An internal check failed: the spring-back Stop deadline is not a finite positive number. Check the robot before any further motion, collect the logs and report it.
 invalid_stop_journal_projection	Stop record invalid	An internal check failed: a Stop record could not be encoded or decoded. Collect the logs and report it.
 invalid_stop_traj_delta_s	Stop trajectory delta invalid	An internal check failed: the controlled Stop trajectory delta is negative or not finite. Collect the logs and report it.
-invalid_support_contact_reference	Support object reference invalid	The support object named by a contact is not a valid identifier. Correct its support_object_id.
 invalid_timestamp	Pose source timestamp invalid	The pose source received a message with an invalid timestamp. Check the publisher clock and message stamps.
 invalid_transform	Pose source transform invalid	The pose source received an incomplete or non-finite transform. Check the publisher of that transform.
 invalid_trip_path_rate	Stop trip path rate invalid	An internal check failed: the controlled Stop planner received an invalid path rate at the trip point. Collect the logs and report it.
@@ -1154,6 +1168,7 @@ io_input_has_output_contract	Input signal has an output resource	An internal che
 io_input_unavailable	Input signal not readable	The input signal has no fresh value, so the step cannot read it. Check the device that sends the signal, then try again.
 io_manual_write_motion_executing	Motion is executing	Manual output writes wait until no motion is executing. Stop or wait for the motion to finish, then write the output.
 io_mock_echo_output_not_found	Mock input echo output missing	An internal check failed: a Mock input echoes to an output signal that the configuration does not have. Collect the logs and report it.
+io_mock_input_invalid	Mock input behaviour invalid	A row of an I/O member's mock_inputs is malformed: each row names one input of the member's model (signal_name) once and gives either its geometric_contact with robot_component_id, a and b, and optionally trip_depth_m, release_depth_m and maximum_sample_age_ms, or a spring_slider (component_id, element_id) with b and optionally maximum_sample_age_ms. A spring_slider must name a spring slider of a generated tool mounted on a robot (details: tool_component_id, element_id, reason). The message names the row and the field.
 io_output_acceptance_unknown	Output write outcome unknown	The device didn't confirm whether it accepted the output write; it isn't resent. The output stays unknown until the device reports it.
 io_output_alias_predecessor_mismatch	Output aliases changed before the change	The output alias change was refused because the output aliases changed after it was prepared. Nothing was changed; refresh the output components and try again.
 io_output_alias_rebind_stale	Output alias change is stale	The output alias change was refused as stale: its output channel is retired, or it is older than the current output publication. Nothing was changed; refresh and try again.
@@ -1356,7 +1371,6 @@ kinematic_path_disconnected	Kinematic path disconnected or malformed	An internal
 kinematic_path_not_cell_rooted	Kinematic path not rooted at cell	An internal check failed: the kinematic frame path does not begin at a cell anchor. Collect the logs and report it.
 kinematic_path_wrong_terminal	Kinematic path ends at another frame	An internal check failed: the kinematic frame path ends at a frame other than its terminal frame. Collect the logs and report it.
 kinematic_query_identity_invalid	Kinematic query identity incomplete	An internal check failed: a kinematic state query is missing its bundle, graph revision or terminal frame, or has a negative time skew allowance. Collect the logs and report it.
-kinematic_receiver_time_skew_exceeded	Observed states too far apart in time	The observed states of this path were received further apart in time than the allowed budget, so no coherent state is available. Wait for fresh states and try again.
 kinematic_resource_scope_mismatch	Path resources not all covered	An internal check failed: the state source projections do not exactly cover the dynamic resources of the path. Collect the logs and report it.
 kinematic_source_binding_invalid	Source bindings invalid	An internal check failed: a kinematic state source's control bindings are incomplete or not in canonical order. Collect the logs and report it.
 kinematic_source_not_required_by_path	State source not needed by path	An internal check failed: a state source is registered for a binding that the path does not depend on. Collect the logs and report it.
@@ -1482,7 +1496,8 @@ measured_state_lane_unavailable	Measured joint state source missing	An internal 
 measured_state_lane_unqualified	Measured joint state source not qualified	An internal check failed: the measured joint state source of the bound controller has a wrong topic, freshness budget, authority or profile. Collect the logs and report it.
 measured_state_owner_mismatch	Measured-state owner not ready	The measured-state source owner is not ready, or it changed during the rebind, so the rebind was refused.
 measured_state_physical_source_mismatch	Measured source differs from controller	An internal check failed: a measured-state source does not match the bound controller and its joints. Collect the logs and report it.
-metric_field_for_binary_contact	Metric field not used by binary contact	A support contact with binary contact evidence sets signed-distance metric fields, which this evidence mode does not accept. Clear the metric fields or choose another evidence mode.
+mesh_depth_vertex_cap_reached	Mesh depth too large to measure	The depth between two meshes would need more than 256 vertices of one mesh inside the other, so it is not measured: a contact input with a trip depth is unavailable, and a move under a rule with a depth limit stops. Use a coarser mesh or a primitive shape for one of the two bodies.
+mesh_not_closed	Mesh not closed	A trip depth or a depth limit of a collision rule needs the depth between two meshes, and one of them is not a closed surface (each edge shared by two triangles, wound the same way), so the depth is unavailable: the contact input is unavailable, and a move under the rule stops. Close the mesh, or use a primitive shape.
 mismatched_execution_id	Execution id does not match	The acknowledgement names a different execution than the current one. Refresh the view and acknowledge the current execution.
 missing_collision_world_snapshot_publisher	Collision world publisher missing	Collision validation cannot run because no collision world snapshot publisher is configured. Check the scene and collision configuration, then try again.
 missing_command_cursor	Stop command position missing	An internal check failed: a command-anchored Stop has no commanded trajectory position. Collect the logs and report it.
@@ -1490,7 +1505,7 @@ missing_contact_release_clearance	Contact release clearance missing	The contact 
 missing_entity	Simulation entity missing	The configured entity is missing from the simulation pose snapshot. Check the entity name and that it exists in the simulation.
 missing_error_on_failed	Execution failed without details	An internal check failed: an execution failed without a captured error. Collect the logs and report it.
 missing_error_on_intervention	Intervention without details	An internal check failed: an execution required intervention without a captured error. Check the robot state, use Recover, and collect the logs and report it.
-missing_grasp_contact_clearance	Grasp contact clearance missing	The grasp contact check has no clearance measurement for a contact pair, so it cannot judge the grasp. Check the collision models of the robot and the object.
+missing_grasp_contact_clearance	Contact clearance missing	The contact check has no clearance measurement for a pair under a contact rule with a depth limit, so it cannot judge the contact. Check the collision models of the pair.
 missing_joint_deceleration_limit	Joint deceleration limit missing	The controlled Stop needs a positive deceleration limit for every joint of the motion, and this joint has none. Set the joint's limit in the controlled Stop settings.
 missing_per_joint_limit	Joint Stop limits missing	An internal check failed: the controlled Stop planner lacks deceleration or jerk limits for a joint. Collect the logs and report it.
 missing_per_joint_max_deceleration	Joint Stop deceleration missing	An internal check failed: the controlled Stop planner lacks a valid maximum deceleration for a joint. Collect the logs and report it.
@@ -1554,7 +1569,6 @@ model_transport_response_invalid	AI model transport reply invalid	An internal ch
 model_velocity_not_authorized	Stop needs measured joint velocity	The path-following Stop needs measured joint velocity, but none is available, and model velocity is not allowed as a fallback. Check the robot's joint velocity feedback.
 monitor_thread_still_shutting_down	Controller monitor still shutting down	A controller monitor thread has not stopped, so reset and resync are blocked. The lifecycle is stuck until an operator intervenes.
 motion_admission_closed	Motion admission closed	The cell closed admission before this motion was dispatched, so the motion was cancelled or stopped before it took effect.
-motion_clearance_invalid	Motion clearance out of range	The motion clearance must be between 0 and 0.05 m. Correct the clearance value.
 motion_continuation_capture_failed	Motion continuation could not be captured	The motion continuation could not be captured before recovery, so recovery did not start. Check the motion state before trying again.
 motion_continuation_dispatch_unsettled	Motion dispatch outcome not settled	The motion's dispatch outcome is not settled, so the motion cannot be continued and recovery did not start. Check the robot and its motion state before continuing.
 motion_continuation_identity_mismatch	Motion continuation identity changed	An internal check failed: the motion continuation changed its preparation identity during capture. Collect the logs and report it.
@@ -1583,6 +1597,7 @@ motion_dynamics_limit_invalid	Motion dynamics limit invalid	A per-joint dynamics
 motion_dynamics_source_joint_unresolved	Dynamics limit joint unresolved	A joint named in the dynamics limits is not an angular joint of the robot. Correct the joint names.
 motion_endpoint_not_mounted	Target not on the robot or its tool	The motion target frame is not on the selected component or a tool mounted on it. Choose a target on that component or its mounted tool.
 motion_frame_role_unresolved	Motion frames not resolved	The base and tool frames of the motion do not resolve through the robot's binding. Check the frame selection and robot configuration.
+motion_group_stop_failed	Motion group Stop failed	A Stop that a Program node requested for its motion groups ended uncontained. Recover or Reset the cell.
 motion_identity_empty	Motion identity missing	The motion has an empty move id or base frame. Fill in the move and its base frame.
 motion_interrupt_action_not_admitted	Interrupt action not admitted	The interrupt action of the prepared motion is no longer admitted. Prepare the motion again.
 motion_interrupt_arm_failed	Signal interrupt not armed	The motion's signal interrupt could not be armed; the motion did not start.
@@ -1662,7 +1677,7 @@ motion_replacement_goal_conflict	Motion takeover controller goal conflict	An int
 motion_replacement_in_flight	Motion takeover already being sent	The new motion did not take over the moving robot because another takeover is already being sent to the robot.
 motion_replacement_join_origin_expired	Motion takeover join window passed	The new motion did not take over the moving robot because it was sent after its join window had passed.
 motion_replacement_membership_changed	Motion takeover superseded	An internal check failed: The new motion did not take over the moving robot because the prepared takeover changed while it was being sent. Collect the logs and report it.
-motion_replacement_monitor_context_changed	Motion takeover contact settings differ	The new motion did not take over the moving robot because its contact policy or monitored robot shape differs from the current motion.
+motion_replacement_monitor_context_changed	Motion takeover contact settings differ	The new motion did not take over the moving robot because its contact rules or monitored robot shape differ from the current motion.
 motion_replacement_payload_invalid	Motion takeover is not a motion	An internal check failed: The new motion did not take over the moving robot because the prepared takeover is not a motion or names another source. Collect the logs and report it.
 motion_replacement_planning_budget_expired	Replacement planning time ran out	Planning the moving replacement motion used up its time budget before a path was ready, so the running motion was not replaced. Try again, or relax the planning time in the Deployment if it repeats.
 motion_replacement_preparation_budget_expired	Replacement preparation ran out of time	The replacement motion was not prepared within its time budget, so it was not used. Check the robot's motion state before sending another motion.
@@ -1789,7 +1804,7 @@ native_model_refresh_incomplete	Cell model refresh incomplete	An internal check 
 native_model_refresh_motion_not_idle	Robot model refresh waits for motion	The robot model could not be refreshed because the controller still has active or unresolved motion. Wait until motion has finished or been stopped, then try again.
 native_model_refresh_readback_mismatch	Cell model refresh not confirmed	An internal check failed: after a cell model refresh, its users did not all read back the new model. Collect the logs and report it.
 native_motion_type_unsupported	Motion type not supported by planner	RoboPlan cannot plan this kind of motion. Use a supported motion type.
-native_moving_cartesian_blend_proof_unavailable	Moving Cartesian blend not supported	A Cartesian path cannot yet be joined to a moving motion because its joint-space bounds are not qualified. Let the robot stop before the Cartesian path, or use a joint motion.
+native_moving_cartesian_blend_proof_unavailable	Move cannot join the moving robot	This move cannot be joined to the robot's running motion: a Cartesian path never can, and for a linear move the connection could not be proven to stay on its line within the move's tolerances and the robot's limits. The robot stops first and the move starts from rest.
 native_moving_incoming_limits_violated	Moving join exceeds successor limits	The speed or acceleration carried over from the running motion exceeds the successor motion's limits. Raise the successor's speed settings or let the robot stop first.
 native_moving_position_bounds_unqualified	Moving motion position bounds unproven	The position bounds of the moving trajectory could not be proved within the joint limits, so it was rejected. Let the robot stop first or use a different target.
 native_moving_source_invalid	Moving source differs from plan context	An internal check failed: the running motion used as the replacement source differs from the captured planning context. Collect the logs and report it.
@@ -1857,7 +1872,6 @@ native_projection_clock_invalid	Scene projection clock negative	The native plann
 native_projection_collision_world_build_failed	Collision world build failed	Building the collision world for the planning scene failed, so the scene is uncertain. The details give the cause; collect the logs and report it.
 native_projection_configuration_invalid	Scene projection configuration invalid	The retained planner scene projection configuration is incomplete or unbounded. Collect the logs and report it.
 native_projection_construction_failed	Scene projection construction failed	Creating the retained planner scene projection failed. The details give the cause; collect the logs and report it.
-native_projection_effective_policy_mismatch	Collision policy differs from projection	The collision policy supplied by the owner differs from the one derived from the retained projection. Collect the logs and report it.
 native_projection_generation_exhausted	Scene projection generations exhausted	The native projection generation counter is exhausted. Restart the runtime and report it.
 native_projection_initial_publication_failed	Initial scene publication failed	Publishing the initial planning scene failed. The details give the cause; collect the logs and report it.
 native_projection_initial_scene_mismatch	Initial scene does not match projection	The initial logical scene does not match the exact retained projection. Collect the logs and report it.
@@ -1886,6 +1900,7 @@ native_projection_rebuild_worker_failed	Scene rebuild worker failed	The worker r
 native_projection_request_failed	Planning scene request failed	An internal check failed: a request to the planning scene of the motion controller failed. Collect the logs and report it.
 native_projection_resolution_failed	Scene component not resolved	An internal check failed: the planning component holding the Scene could not be resolved. Collect the logs and report it.
 native_projection_resolved_delta_mismatch	Scene change does not apply	An internal check failed: the resolved Scene change cannot be applied to the retained Scene. Collect the logs and report it.
+native_projection_rpc_bound_exceeded	Scene request too large	The Scene request was refused: it exceeds a bound of the planning scene transport of the motion controller (at most 4096 entries in one list, 256 KiB in one message), for example a Scene with too many objects. Nothing changed. Remove objects or split the change and try again.
 native_projection_sequence_exhausted	Scene health sequence exhausted	An internal check failed: the Scene health sequence counter reached its limit. Collect the logs and report it.
 native_projection_transaction_conflict	Scene update reused with different content	An internal check failed: a Scene update sequence number was reused with different content. Collect the logs and report it.
 native_projection_transaction_invalid	Scene update revision invalid	An internal check failed: a Scene update carries an invalid proposed revision. Collect the logs and report it.
@@ -2055,9 +2070,10 @@ operator_alarm_resource_registry_unavailable	Alarm resource list unavailable	The
 operator_alarm_scope_inactive	Alarm scope not active	An alarm update names resources that are not in the active configuration, so it was refused. Use resources of the active configuration.
 operator_alarm_source_refresh_overdue	Alarm sources not refreshed	The alarm sources were not refreshed in time, so the alarm view may not be up to date.
 operator_alarm_state_filter_invalid	Alarm state filter not supported	The requested alarm state filter is not supported. Choose a valid filter.
+operator_choice_failed	Operator chose a failure option	The operator answered a Program question with an option whose result is failure, so the node failed.
 operator_configuration_invalid	Launcher configuration invalid	The launcher profile is incomplete or invalid. Correct the profile and try again.
 operator_stop_requires_owner_recovery	Use the offered recovery after a Stop	After an operator Stop the step cannot be given a manual result. Use the offered recovery action to continue.
-ordered_contact_policy_finalize_exception	Contact validation failed	An internal check failed: the ordered-contact policy raised an exception while finishing its collision validation, so the motion was refused. Collect the logs and report it.
+ordered_contact_rule_finalize_exception	Contact validation failed	An internal check failed: the ordered contact check raised an exception while finishing its collision validation, so the motion was refused. Collect the logs and report it.
 ordered_contact_summary_coverage_mismatch	Contact summaries do not cover the trajectory	An internal check failed: the ordered-contact summaries do not cover the whole trajectory, so the collision validation was refused. Collect the logs and report it.
 ordered_contact_summary_invalid	Contact summary invalid	An internal check failed: a worker's ordered-contact summary is invalid, so the collision validation was refused. The details name the cause. Collect the logs and report it.
 ordered_contact_summary_missing	Contact summary missing	An internal check failed: the ordered-contact validation received no summaries, so the collision validation was refused. Collect the logs and report it.
@@ -2098,6 +2114,11 @@ owner_unavailable	Unavailable through its machine	This part is unavailable becau
 package_aggregate_mismatch	Installed packages do not match	The installed packages do not match the expected build, so the launcher refused to start. Rebuild or reinstall the packages.
 package_aggregate_unavailable	Installed packages could not be checked	The launcher could not check the installed packages and refused to start.
 packet_refused	Liveness message refused	An internal check failed: the execution host refused a malformed or unexpected liveness message from the Manager. Collect the logs and report it.
+parametric_tool_export_format_unsupported	Export format not available yet	A parametric tool cannot be exported in this format yet: USDA comes with the Isaac support of parametric tools. Export the URDF and SRDF.
+parametric_tool_invalid	Tool parameters invalid	The tool parameters do not match manyforge.parametric_tool.v1. The details name the field; correct it and Load again.
+parametric_tool_kind_unsupported	Tool parameters not supported	The tool parameters name a kind ManyForge cannot generate, or the component's model takes no parameters. The kind is tool, and only the Tool model (manyforge.tool) takes parameters; a passive tool uses its own URDF.
+parametric_tool_mesh_unavailable	Tool mesh unavailable	A mesh named by the tool parameters could not be read. A mesh path is relative to the parameter file's folder (inline parameters: the Scenario folder) or absolute, and must lie inside an allowed folder; check the path and that the file is present.
+parametric_tool_swept_space_unsupported	Spring slider cannot be swept	A spring slider with swept_space needs parts ManyForge can sweep along its axis: a box or a cylinder whose own axis is the slider axis, or a sphere. A mesh part, or a box or cylinder at an angle to the axis, is refused. Change the part's collision shape or turn swept_space off.
 parent_cycle_intervention_unsettled	Program cycle intervention unsettled	Cell authoring is not ready: the Program cycle still has an unsettled intervention on its child claims, so it cannot be released. Check the Program run state, then try again.
 partial_dispatch_operation_mismatch	Partial dispatch operation changed	An internal check failed: the operation authority of a partially dispatched Stop scope changed, so the Stop was refused. Collect the logs and report it.
 partial_dispatch_participant_not_released	Partial dispatch names unreleased work	An internal check failed: the partial-dispatch Stop scope names work that was not released to a backend, so the Stop was refused. Collect the logs and report it.
@@ -2163,7 +2184,6 @@ payload_tag_invalid	Prepared operation payload invalid	An internal check failed:
 peer_closed	Connection closed	The other side closed the connection. Retry; if it repeats, check that the service is running.
 pending_replacement_has_no_controlled_source	Stop failed: pending motion change not contained	The Stop could not be carried out as a controlled Stop because a replacement motion was pending and could not be contained. Check the robot; the cell needs Recover before further motion.
 pending_replacement_not_settled	Stop failed: newer motion not contained	A newer motion that may already have been sent to the controller still needed to be contained, so this Stop stage failed. Check the robot; the cell needs Recover before further motion.
-penetration_exceeds_policy	Penetration above contact limit	A contact penetrates more than its contact policy allows, so the motion is refused. Change the path or the contact policy.
 penetration_increased	Contact penetration increased	The collision check failed because the contact penetration increased while the robot should have been leaving the contact. Move the robot or the object away from the contact and plan again.
 persistent_key_access_conflict	Key is read-only	The Program declares this persistent key as read-only for the operator. Only the Program changes it.
 persistent_key_activation_unavailable	Applied Scenario not available	The applied Scenario needed for persistent keys could not be read or has no Scenario. Apply a Scenario and try again.
@@ -2202,11 +2222,9 @@ pick_candidate_orientation_invalid	Pick candidate orientation invalid	A pick can
 pick_candidate_planning_request_invalid	Pick planning request invalid	An internal check failed: a pick planning request is incomplete or inconsistent. Collect the logs and report it.
 pick_candidate_search_cancelled	Pick candidate search cancelled	The pick candidate search was cancelled before it found a candidate.
 pick_carrier_frame_unresolved	Pick carrier frame not found	The pick's carrier frame is not on the selected tool, so the pick cannot be planned. Check the pick's tool and carrier frame in the Program.
-pick_carrier_touch_roles_unresolved	Pick contact body not found	The pick's contact policy has no touch body on the selected tool, or the tool is not the carrier, so the pick cannot be planned. Check the pick's tool and contact policy in the Program.
-pick_contact_grasp_template_unresolved	Pick contact policy unresolved	The pick contact policy could not be resolved: it is bound to a runtime object other than the one selected by the Program, or its grasp template is missing. Select the matching object or correct the contact policy.
+pick_carrier_touch_roles_unresolved	Pick tool is not the carrier	The tool the pick operates is not the component that carries the selected TCP, so the pick cannot be planned. Check the pick's tool and TCP in the Program.
 pick_execution_plan_invalid	Pick plan not chained	An internal check failed: the attach previews of the selected pick candidate do not form one chain, so no pick plan was made. Collect the logs and report it.
 pick_frame_resolution_receipt_invalid	Pick frame resolution mismatch	An internal check failed: the resolved pick frames differ from the exact arm and carrier binding. Collect the logs and report it.
-pick_motion_endpoint_unresolved	Pick motion endpoint missing	The pick contact policy takes its bodies from a motion endpoint, but none is selected. Select a motion endpoint for the pick.
 pick_offset_reference_invalid	Pick offset reference invalid	The pick offset reference is malformed, or its type and identity do not match.
 pick_offset_reference_result_incomplete	Pick offset result incomplete	An internal check failed: the pick offset resolver returned an incomplete ordered result. Collect the logs and report it.
 pick_offset_runtime_object_unbound	Pick offset names another object	The pick offset reference names a runtime object other than the selected object, so it is not bound to this pick.
@@ -2221,9 +2239,9 @@ pick_touch_body_binding_stale	Pick touch body binding stale	An internal check fa
 place_carrier_frame_unresolved	Place carrier frame not found	The place's carrier frame is not on the selected tool, so the place cannot be planned. Check the place's tool and carrier frame in the Program.
 place_execution_plan_invalid	Place plan not chained	An internal check failed: the selected place plan does not form one chain of detach previews, so no place plan was made. Collect the logs and report it.
 place_planning_cancelled	Place planning cancelled	Place planning was cancelled before a plan was made.
-place_planning_request_invalid	Place planning request invalid	An internal check failed: the place planning request is incomplete or mixes bindings, carriers or contact policies. Collect the logs and report it.
+place_planning_request_invalid	Place planning request invalid	An internal check failed: the place planning request is incomplete or mixes bindings or carriers. Collect the logs and report it.
 place_predecessor_projection_stale	Scene changed during place	The scene changed during place validation: the retained planning scene does not include the pose capture. Try the place again.
-place_public_phase_contract_invalid	Place phase contract invalid	The place motion phases carry contact-grasp or runtime-object bindings, which place motions cannot have.
+place_public_phase_contract_invalid	Place phase contract invalid	The place motion phases carry runtime-object bindings, which place motions cannot have.
 place_selected_attachment_mismatch	Object not held by this carrier	Place requires the selected object to be carried by the selected gripper or tool. Check which object is attached.
 place_selected_attachment_unresolved	Place object not carried by tool	The place needs the selected object to be carried by the selected tool, but it is missing or carried by another tool. Check which tool holds the object.
 place_selected_carrier_frame_mismatch	Object held by a different frame	The selected object is attached to a different carrier frame than the one selected for Place. Select the frame that holds the object.
@@ -2327,8 +2345,7 @@ prepared_motion_cancelled_during_planning	Motion cancelled during planning	The p
 prepared_motion_cancelled_during_validation	Motion cancelled during validation	The prepared motion was cancelled during validation, so the machine did not move.
 prepared_motion_cancelled_during_validation_replan	Motion cancelled during replanning	The prepared motion was cancelled while it was being replanned after validation, so the machine did not move.
 prepared_motion_cancelled_pre_dispatch	Motion cancelled before dispatch	The prepared motion was cancelled before it was dispatched, so the machine did not move.
-prepared_motion_contact_policy_mismatch	Contact policy differs from request	An internal check failed: the resolved contact policy differs from the one in the accepted motion request. The motion did not start. Collect the logs and report it.
-prepared_motion_contact_policy_revision_missing	Contact policy version missing	An internal check failed: the motion names a contact policy without a version. The motion did not start. Collect the logs and report it.
+prepared_motion_collision_rules_mismatch	Collision rules differ from request	An internal check failed: the collision rules of the prepared motion differ from those of the accepted motion request. The motion did not start. Collect the logs and report it.
 prepared_motion_control_path_missing	Motion has no control path	An internal check failed: the prepared motion has no control path to the robot. The motion did not start. Collect the logs and report it.
 prepared_motion_cursor_invalid	Trajectory cursor invalid	An internal check failed: the backend returned an invalid cursor for the original trajectory. Collect the logs and report it.
 prepared_motion_diagnostics_missing	Motion diagnostics missing	An internal check failed: the prepared motion has no accepted-trajectory diagnostics. Collect the logs and report it.
@@ -2497,7 +2514,7 @@ program_execution_scope_unavailable	Program scope not current	The Program execut
 program_execution_scope_unknown	Program node not recognized	The node transaction does not match its sealed owner API in the captured Program. Apply the Program again and retry.
 program_execution_synchronization_mismatch	Operation not a Program sync group	A coordinated operation does not match any synchronized group authored in the Program. Check the synchronization in the Program, then Apply.
 program_execution_synchronization_required	Program motion must be synchronized	This Program motion belongs to a synchronized group and cannot be dispatched on its own. Run it with its group.
-program_format_unsupported	Program format not supported	This Program uses an unsupported format. Re-author it in the supported Program format.
+program_format_unsupported	Program format not supported	This Program uses an unsupported format. Convert the Scenario with scripts/convert_scenario_od46.py, or re-author the Program in the supported format.
 program_frame_resolution_context_invalid	Program reference context changed	The Program reference context differs from the one retained at admission, so the motion was refused. Try again.
 program_frame_role_ambiguous	Frame role matches several frames	The Program's frame role matches more than one frame in the applied component model. Correct the component descriptor.
 program_frame_role_missing	Frame role not found	The Program's frame role is not present in the applied component model. Check the role assignment and Apply again.
@@ -2604,7 +2621,6 @@ program_runtime_object_missing	Program runtime object has no binding	The Program
 program_runtime_retry_count_exhausted	Retry counter exhausted	The retry counter of this node cannot advance. The retry was refused.
 program_runtime_retry_forbidden_by_policy	Retry not allowed for this node	The node recovery policy does not allow operator intervention. The retry was refused.
 program_runtime_retry_limit_reached	Retry limit reached	This node has reached its retry limit. The retry was refused.
-program_saved_baseline_not_adopted	Saved Program changed elsewhere	The saved Program changed since it was loaded. Refresh to load the current version.
 program_scene_attachment_mismatch	Carried resource attachment mismatch	The carried Scene resource has no retained attachment that matches its attachment revision. Apply the Program again.
 program_scene_carrier_ambiguous	Carried resource has several carriers	The carried Scene resource maps to more than one carrier frame, so its pose cannot be resolved. Check its attachment in the Scene.
 program_scene_carrier_missing	Carried resource has no carrier	The carried Scene resource has no carrier frame in the retained model. Check its attachment in the Scene.
@@ -2652,8 +2668,8 @@ recognized_stop_payload_invalid	Stop request payload invalid	The Stop request bo
 recognized_stop_start_not_current	Stop named another start	The Stop named an earlier application start, or none, so it was carried out as Stop all.
 reconciliation_evidence_invalid	Reconciliation evidence invalid	An internal check failed: the Manager reconciliation evidence digest is not a valid SHA-256 digest. Collect the logs and report it.
 reconciliation_identity_or_state_mismatch	Manager reconciliation refused	The Manager reconciliation does not match the current Manager identity or state, so it was refused.
-recontact_after_release	Re-contact after release	The robot touched the object again after it was released, which the contact policy does not allow. Adjust the release motion or allow re-contact in the policy.
-recontact_penetration_exceeds_policy	Re-contact penetration too deep	After release the robot re-contacted the object with penetration above the policy limit. Adjust the motion or the contact policy.
+recontact_after_release	Re-contact after release	The robot touched the object again after it was released, which the release rule does not allow. Adjust the release motion or allow re-contact in the rule.
+recontact_penetration_exceeds_policy	Re-contact penetration too deep	After release the robot re-contacted the object with penetration above the limit of the release rule. Adjust the motion or the rule.
 recovery_action_accepted	Recovery accepted	The recovery action was accepted and the component returned to Idle. No action needed.
 recovery_action_rejected	Recovery refused	The owner refused this recovery action in the current state.
 recovery_assessment_unavailable	No recovery assessment active	There is no active command recovery assessment, so no recovery action can be taken now.
@@ -2691,9 +2707,6 @@ relative_motion_type_unsupported	Relative mode not supported	The relative target
 relative_named_target_unsupported	Named targets are absolute only	Named targets cannot be relative. Use an absolute named target.
 relative_reference_context_unavailable	Relative motion needs start context	Relative spatial motion needs one exact Program start context, and none is available. Run it inside a running Program, or try again.
 relative_target_reference_missing	Relative target needs a reference	Relative pose and Cartesian motion require a target reference. Set the target reference.
-release_evidence_mode_not_applicable	Release evidence mode does not fit	Bounded penetration needs signed-penetration release evidence, so this binary release evidence was refused. Correct the support contact in the Scene.
-release_field_for_bounded_penetration	Release field used by bounded penetration	Release-only fields are set on a support contact in bounded penetration mode, where they don't apply. Clear them in the Scene.
-release_field_not_applicable	Release field used by contact process	Release-only fields are set on a support contact in contact process mode, where they don't apply. Clear them in the Scene.
 release_hold_ended	Stop hold failed: robot state stale	Robot state updates became stale while the Stop held the robot, so the Stop stage failed. Check the robot and its connection; the cell needs Recover before further motion.
 release_identity_invalid	Claim release identity invalid	An internal check failed: a cell admission claim release has an invalid acquired admission generation, claim generation or settlement. Collect the logs and report it.
 remote_protocol_invalid	Remote host reply invalid	The launcher received an invalid reply from the remote simulation host.
@@ -2737,10 +2750,7 @@ reset_position_raw_source_unavailable	Mock robot state unavailable	The joint sta
 reset_position_simulator_unsupported	Arm does not support Reset position	Reset position is available only for an arm whose adapter supports it, such as Mock or Isaac. Real hardware does not support it.
 reset_position_switch_failed	Position reset did not complete	The position reset of the Mock robot did not complete. The robot may have moved; check it before continuing.
 reset_position_write_baseline_missing	Mock robot reset baseline missing	An internal check failed: the Mock robot writer had no reference reading before the position reset. Collect the logs and report it.
-resolved_contact_grasp_binding_invalid	Grasp contact binding incomplete	The resolved contact-grasp binding is incomplete. Collect the logs and report it.
-resolved_contact_grasp_identity_failed	Grasp contact policy not identified	An internal check failed: the resolved contact-grasp policy could not be identified. Collect the logs and report it.
-resolved_contact_release_capacity_exceeded	Release contacts exceed limit	The resolved release exceeds the runtime contact limit. Reduce the contact pairs in the release.
-resolved_contact_release_pair_conflict	Release conflicts with contact pair	The resolved release conflicts with an existing contact pair. Check the contact policy.
+resolved_collision_rules_identity_failed	Collision rules not identified	An internal check failed: the move's resolved collision rules could not be identified. Collect the logs and report it.
 resolved_resource_missing_from_observed_state	Joint missing from observed state	The robot's reported state has no value for a joint the motion needs, so the motion was refused. Check the component's joint state.
 resolved_resource_projection_shape_mismatch	Motion joints do not match model group	An internal check failed: the motion's resources do not match the joints of its model group. Collect the logs and report it.
 resolved_runtime_scale_binding_mismatch	Speed scale does not match	The runtime-scale command does not match the active binding. Refresh and try again.
@@ -2962,7 +2972,7 @@ runtime_active_control_configuration_changed	Occupied control configuration chan
 runtime_bound_target_resolution_failed	Bound target cannot be resolved	The exact bound target of the program could not be resolved in the runtime. Check that the target exists in the current configuration, then try again. The message gives the detail.
 runtime_capacity_unavailable	Too many lifecycle steps in progress	The component start was refused because too many lifecycle steps are already in progress. Wait for them to finish and apply again.
 runtime_collision_body_alias_table_invalid	Collision body aliases invalid	An internal check failed: the runtime collision-body alias table is incomplete or ambiguous. Collect the logs and report it.
-runtime_collision_body_alias_unresolved	Contact-grasp body unresolved	A body allowed for contact grasping has no unique exact physical collision body. Check the contact-grasp body bindings in the configuration and Apply again.
+runtime_collision_body_alias_unresolved	Collision rule body unresolved	A collision body selected by a collision rule or by a TCP's contact bodies has no unique exact physical collision body. Check the selection in the configuration and Apply again.
 runtime_collision_bundle_capacity_exceeded	Collision world too large	The collision world has more bodies than the collision engine is qualified to check at runtime, so the collision monitor stopped motion. Reduce the number of collision bodies or use a larger qualified engine, then Reset.
 runtime_collision_bundle_lookup_order_invalid	Collision bundle order invalid	An internal check failed: the published collision bundle has an invalid lookup order, and the collision monitor stopped motion. Collect the logs and report it.
 runtime_collision_cancel_unqualified	Controller cancel not qualified	Motion without a fault Stop profile needs a qualified controller-goal cancel, and this controller has none. Configure a fault Stop profile or use a controller whose cancel is qualified.
@@ -2984,6 +2994,7 @@ runtime_collision_query_capability_unsupported	Collision engine not admitted	The
 runtime_collision_query_joint_bound_exceeded	Collision joint count too large	The runtime collision projection has more joints than the engine's qualified joint bound. Reduce the joints in the collision query or use an engine qualified for more.
 runtime_collision_query_prepare_failed	Collision query preparation failed	The runtime collision query could not be prepared, so the motion was not sent. The details give the prepare status. Check the collision configuration and try again.
 runtime_collision_query_session_unavailable	Collision query session unavailable	An internal check failed: the runtime collision query session is missing while the collision monitor runs, and the monitor stopped motion. Collect the logs and report it.
+runtime_collision_rule_body_invalid	Runtime rule body bindings invalid	An internal check failed: the collision bodies bound for the Program's collision rules are incomplete, unsorted or inconsistent. Collect the logs and report it.
 runtime_collision_snapshot_not_published	Collision snapshot not published	No collision world snapshot has been published yet, so the runtime collision monitor cannot check motion. Wait for the collision world to be ready, then try again. If it persists, collect the logs and report it.
 runtime_collision_snapshot_prepare_failed	Collision snapshot preparation failed	The collision world snapshot could not be prepared for runtime queries. The details give the prepare status. Check the collision model and try again.
 runtime_collision_stop_coverage_summary	Collision stop coverage summary	Summary of how fully the runtime collision monitor covered stopping during the last monitored motion. No action needed.
@@ -3006,11 +3017,9 @@ runtime_configuration_staging_failed	Configuration staging failed	An internal fa
 runtime_configuration_staging_fence_missing	Configuration staging not fenced	The candidate configuration is not covered by its Apply fence, so it was not staged. Apply the configuration again; if it persists, Collect the logs and report it.
 runtime_configuration_staging_gate_missing	Configuration staging has no admission gate	An internal check failed: the runtime has no durable admission gate for staging the candidate configuration. Collect the logs and report it.
 runtime_configuration_staging_scope_invalid	Configuration staging scope invalid	An internal check failed: the scope of the candidate configuration staging is empty or invalid. Collect the logs and report it.
-runtime_contact_grasp_binding_invalid	Runtime grasp contact bindings invalid	An internal check failed: the grasp contact bindings of a runtime participant are incomplete, unsorted or inconsistent. Collect the logs and report it.
-runtime_contact_grasp_invalid_policy	Runtime grasp contact policy invalid	The active contact policy of the runtime collision check is invalid, so grasp contact cannot be checked. Correct the contact policy.
-runtime_contact_grasp_unknown_policy	Runtime grasp contact policy unknown	The active contact policy of the runtime collision check is not one the runtime knows. Choose a known contact policy.
+runtime_contact_rule_invalid	Runtime contact rule invalid	A contact rule of the running move holds an invalid value, so the runtime collision check cannot use it. Correct the rule.
 runtime_contact_state_identity_invalid	Runtime contact state invalid	An internal check failed: a contact entry of the runtime collision check has no collision pair, so the trajectory could not be checked and nothing was sent. Collect the logs and report it.
-runtime_contact_state_unavailable	Runtime contact state unavailable	The contact state needed by the runtime collision check is missing or does not match the policy's support contacts, so the trajectory could not be checked and nothing was sent. Reset is required if it persists; Collect the logs and report it.
+runtime_contact_state_unavailable	Runtime contact state unavailable	The contact state needed by the runtime collision check is missing or does not match the move's release rules, so the trajectory could not be checked and nothing was sent. Reset is required if it persists; Collect the logs and report it.
 runtime_container_unready	Remote ROS runtime not ready	The remote ManyForge ROS runtime did not report ready, so the simulation launch stopped.
 runtime_contract_incompatible	Component runtime not compatible	A component runtime does not provide an interface or capability that the configuration requires. Use a compatible component version.
 runtime_contract_manifest_set_digest_mismatch	Runtime interface list checksum mismatch	An internal check failed: a runtime interface list does not match its checksum. Collect the logs and report it.
@@ -3177,6 +3186,7 @@ scenario_directory_not_found	Scenario folder not found	The Scenario folder does 
 scenario_directory_outside_roots	Scenario folder not allowed	The Scenario folder is outside the configured folders.
 scenario_discard_confirmation_required	Load would discard unsaved changes	Loading would replace unsaved Program or Deployment Draft changes. Save them, or confirm that they can be discarded.
 scenario_discard_nothing_to_discard	Nothing to discard	Every Draft already matches the applied configuration.
+scenario_document_dropped_fields	Scenario saved in an older format	The Scenario's Program or Deployment still has fields a Scenario no longer carries (Program program_id, name, description; Deployment deployment_artifact_id, name, description), so it was not loaded. A Scenario is named by its folder and described in scenario.yaml. Convert it with scripts/convert_scenarios_od369.py and load it again.
 scenario_export_asset_changed	Asset changed during export	A Scenario asset file changed while it was being exported. Export again.
 scenario_export_asset_invalid	Asset cannot be exported	A Scenario asset is a link, not a plain file within the size limit, or could not be read.
 scenario_export_failed	Scenario export failed	Writing the exported project failed. The details give the reason.
@@ -3194,6 +3204,7 @@ scenario_project_name_invalid	Scenario folder name mismatch	A Scenario project f
 scenario_project_read_only	Untitled Scenario is read-only	The Untitled Scenario is read-only. Use Save As to save it in a folder.
 scenario_project_save_interrupted	Scenario save was interrupted	The Scenario project contains an interrupted save. Check the project folder before opening it.
 scenario_revert_requires_deployment	Revert the whole Scenario	The Saved Deployment differs from the Applied one. Use the Deployment Revert to revert the whole Scenario.
+scenario_save_unapplied_edits	Confirm saving the applied state	Saves the applied state; your unapplied Draft edits are not included. Apply first to save them.
 scenario_saved_baseline_not_adopted	Scenario written but not marked Saved	The Scenario project was written, but the workspace did not adopt it as the Saved version. Refresh the workspace and save again if needed.
 scenario_saved_path_unavailable	Scenario saved without a path	An internal check failed: Scenario Save completed without reporting its file path. Collect the logs and report it.
 scenario_source_changed	Referenced source changed	A source referenced by the Scenario was added, removed or changed since it was saved. Review it and save the Scenario again.
@@ -3217,6 +3228,8 @@ scene_changed_during_validation	Scene changed	The scene changed while the motion
 scene_clear_failed	Scene clear failed	The Scene could not be cleared. Check the listed reason and repeat New or Load.
 scene_clear_partial	Scene partly cleared	Some objects remain in the Scene. Check the listed objects and reasons, then repeat New or Load.
 scene_clear_unknown	Scene clear outcome unknown	A Scene transaction could not be confirmed. Inspect the Scene before repeating New or Load.
+scene_commit_concurrent_change	Scene changed meanwhile	The Scene changed while this request was being prepared, so it was refused and nothing changed. Refresh the Scene and send it again as a new request.
+scene_commit_in_progress	Another Scene change in progress	Another Scene change was being committed, so this request was refused and nothing changed. Send it again as a new request once that change has finished.
 scene_frame_context_mismatch	Scene frame reference differs from its context	An internal check failed: a scene-frame reference differs from the immutable context it was resolved in. Collect the logs and report it.
 scene_frame_evidence_failed	Scene frame evidence not computed	An internal check failed: the scene-frame resolution evidence could not be computed. Collect the logs and report it.
 scene_frame_lease_binding_mismatch	Scene revision mismatch	The native projection retained a different scene revision than requested. Try again; if it persists, collect the logs and report it.
@@ -3236,7 +3249,8 @@ scene_mesh_asset_unknown	Mesh no longer available	The requested mesh is no longe
 scene_mesh_bounds_exceeded	Mesh too large	The mesh exceeds the allowed file size or complexity. Simplify the mesh and upload it again.
 scene_mesh_conversion_failed	Mesh could not be converted	The mesh file could not be converted. Check that it is a valid mesh file.
 scene_mesh_conversion_timeout	Mesh conversion timed out	Converting the mesh took too long. Simplify the mesh and upload it again.
-scene_mesh_unavailable	Scene mesh unavailable	A scene mesh file could not be opened, for example because it has no approved scene asset root or is outside it. Check the mesh path and the scene asset location.
+scene_mesh_input_invalid	Mesh file not usable	The mesh file cannot be used: its format is not supported (use .stl) or its content is invalid.
+scene_mesh_unavailable	Scene mesh unavailable	A scene mesh could not be read or was not captured, for example because its path is outside the allowed folders or the file is missing. Use a path relative to the Scenario project folder, or an absolute path, inside an allowed folder.
 scene_object_attachment_precondition_failed	Attachment state differs	The scene object is not in the attached or detached state the request expected. Refresh the scene and try again.
 scene_object_is_attached	Carried object cannot be replaced	The scene object is attached to a robot and carried, so it cannot be replaced or removed. Detach it first.
 scene_object_state_conflict	Object state conflict	The object is not in the state this request expects.
@@ -3252,7 +3266,6 @@ scene_projection_changed	Scene changed before pose update	The Scene changed befo
 scene_projection_commit_uncertain	Scene edit outcome uncertain	At least one planning or collision component cannot confirm the Scene state after the edit. Check the Scene and component status before continuing.
 scene_projection_contract_violation	Scene component reply invalid	An internal check failed: a planning or collision component returned a contradictory confirmation for a Scene edit. Collect the logs and report it.
 scene_projection_take_failed	Scene projection stopped	An internal check failed: the scene projection worker could not take its next request and stopped. Collect the logs and report it.
-scene_removal_order_invalid	Scene removal order invalid	The removal order for the scene objects could not be worked out, so clearing failed. Check the scene attachments and try again.
 scene_request_attribution_invalid	Scene request user name invalid	An internal check failed: the user name attached to a Scene request is empty or invalid. Collect the logs and report it.
 scene_resource_ids_invalid	Scene selection invalid	The scene resources selected for the between-nodes latch are empty, duplicated or unsorted. Correct the selection.
 scene_resource_missing	Scene resource not found	A Program refers to a Scene resource that is not in the Scene. Correct the reference or add the resource to the Scene.
@@ -3291,6 +3304,7 @@ scene_runtime_pose_scene_unavailable	Scene object for pose unavailable	The objec
 scene_runtime_pose_writer_conflict	Object already updated by another source	Another pose source already updates this object in the Scene. Configure only one pose source per object.
 scene_runtime_source_absent	Scene runtime data not published yet	The Scene runtime has not published its data yet. Wait for it to start.
 scene_runtime_source_invalid	Scene runtime data invalid	The Scene runtime data received is invalid. Collect the logs and report it.
+scene_too_large	Scene too large	The Scene change was refused because the changed Scene would exceed its size limit (384 KiB encoded); nothing changed. Remove objects or use smaller meshes, then try again.
 scene_transaction_draft_stale	Scene edit refers to an old Draft	The Scene edit was made on a Draft that is no longer current. Reload the Draft and repeat the edit.
 scheduler_detach_timeout	Scheduler did not drain	The participant scheduler calls did not finish in time while detaching, so the request was refused. Try again.
 scheduler_not_ready	Motion scheduler unavailable	The motion scheduler is detached or the request came from its own callback, so the request was refused. Collect the logs and report it.
@@ -3319,7 +3333,6 @@ selection_object_pose_unavailable	Object pose unknown	A candidate object has no 
 selection_object_source_unsupported	Object source not supported	Scene selection supports only the cell Scene as object source.
 selection_scene_projection_invalid	Object selection Scene data invalid	An internal check failed: the Scene data for the object selection has invalid numbers. Collect the logs and report it.
 selection_scene_unavailable	Scene not available for selection	The Scene could not be read for scene selection. The step failed.
-self_support_contact	Object supports itself	A support contact names the same object it supports. Choose a different support object.
 sensor_configuration_invalid	Sensor settings invalid	A sensor component's settings are missing or invalid (its topic, source frame, point limit or minimum period); the details name the problem. Correct the component's settings, then Apply.
 services_invalid	Apply services invalid	An internal check failed: the Apply did not provide valid lifecycle services. Collect the logs and report it.
 session_selection_unavailable	Run folder could not be prepared	The launcher could not archive the previous run and create a fresh run folder, so nothing was started. The message gives the reason; check the instance folder, then start again.
@@ -3416,6 +3429,8 @@ spring_return_source_unavailable	No stopped motion to return to	The return motio
 spring_return_start_or_target_changed	Spring return start or target changed	The spring successor no longer matches the settled start state or the admitted target. Start the spring return again.
 spring_return_stop_not_settled	Return refused: Stop did not settle cleanly	The return to the path after Stop was refused because the Stop did not end cleanly with the robot at rest. Check the robot; if it is faulted, Recover it.
 spring_return_target_not_resolved	Spring-back return target not fixed	An internal check failed: the return motion target is not a fixed absolute target. The return motion did not start. Collect the logs and report it.
+spring_sample_budget_exceeded	Too many spring samples	A move with a spring contact rule is checked at samples at most 1 mm of tool travel apart; this move would need more samples than the limit. Split the move into shorter moves.
+spring_sample_densification_failed	Spring samples unavailable	A move with a spring contact rule is checked at samples at most 1 mm of tool travel apart; the tool position of a waypoint could not be computed, so the move is refused. The details name the cause.
 sqrt_of_negative	Square root of negative number	The expression takes sqrt() of a negative number. Correct the expression.
 stale_application_start_id	Request from before a restart	The request was addressed to an earlier run of the service, which has restarted since. Refresh the view and try again.
 stale_control_command	Control command superseded	A newer control command replaced this one, so it was ignored.
@@ -3484,10 +3499,6 @@ subordinate_execution_id_mismatch	Component execution id mismatch	An internal ch
 subordinate_progress_invalid	Component progress invalid	An internal check failed: a component reported a progress value that is not finite. Collect the logs and report it.
 subordinate_terminal_error	Component ended in error	A subordinate component reached a terminal error state. Check the component and recover it.
 superseded_active_publication	Runtime publication superseded	A newer runtime configuration replaced the one this request was for, so it was refused.
-support_contact_identity_bound_exceeded	Too many support contacts	The contact policy lists more support contacts than the supported limit. Reduce the support contacts.
-support_contact_metric_invalid	Support contact metric invalid	A support contact has a metric that is not finite or is negative. Enter non-negative numbers for its metrics in the Scene.
-support_contact_reference_exists	Object is still a support	The scene resource is still referenced as a support by another object. Remove or detach the dependent object first.
-support_contact_summary_identity_mismatch	Support contact summary mismatch	An internal check failed: the support contact summary does not match the contact policy. Collect the logs and report it.
 syntax_tree_too_large	Expression too large	The expression is too large. Simplify it.
 tcp_definition_invalid	TCP definition invalid	A TCP pose has invalid or non-finite values. Correct the TCP definition.
 tcp_endpoint_alias_ambiguous	TCP choice required	Choose the TCP for each listed move.
@@ -3507,8 +3518,12 @@ tool_context_frame_not_rigid	Tool frame not fixed to the flange	The TCP or attac
 tool_context_frame_unknown	Tool frame not found	An attachment uses a frame that neither the robot nor its mounted tools have. Check the attachment and the tool mounting.
 tool_context_not_applied	Tool settings not sent to the robot	The robot's TCP and payload for this motion could not be sent to its controller, so the motion was refused before it started. Check the robot connection and try again.
 tool_lane_required	Tool has no controller profile	Only a pneumatic gripper tool may leave out its Mock, Sim and Real controller profiles. Add the controller profile to the tool, or author its gripper as pneumatic.
+tool_mesh_not_draft_authorized	Mesh not part of this tool	The requested mesh is not one the tool in the current Deployment Draft uses. Reopen the tool preview.
+tool_not_generated	Tool is not a generated tool	A Mock input follows a spring slider of a tool that is not a generated tool. Choose a generated tool with a spring slider.
+tool_not_mounted	Tool not mounted on a robot	A Mock input follows a spring slider of a tool that is not mounted on a robot. Mount the tool on a robot first.
 tool_payload_composition_failed	Tool payload not composed	The tool payload for the motion could not be composed from the scene. See the attached message and check the tool configuration.
 tool_pneumatic_io_required	Pneumatic tool has no I/O outputs	A commanded pneumatic tool without a controller profile needs its pneumatic I/O outputs. Add the pneumatic I/O to the tool's gripper settings.
+tool_unknown	Tool not in the Deployment	A Mock input follows a spring slider of a tool that is not a component of the Deployment. Choose a tool of this Deployment.
 tracking_error_exceeded	Robot did not follow the path	The robot deviated from the planned path or final position by more than the allowed tolerance, so the motion was aborted. Check the robot and its surroundings before running again.
 tracking_sample_invalid	Trajectory tracking sample invalid	A tracking sample from the robot controller was invalid, so the motion was aborted. Check the controller's state messages.
 trajectory_acceleration_size_mismatch	Trajectory acceleration size mismatch	A waypoint of the trajectory has a different number of accelerations than joint names. Correct the trajectory.
@@ -3541,13 +3556,10 @@ trajectory_waypoints_array_required	Trajectory waypoints missing	An internal che
 trusted_authentication_adapter_invalid	Sign-in adapter returned incomplete identity	An internal check failed: the trusted sign-in adapter returned an incomplete user identity. Collect the logs and report it.
 unexpected_end	Expression incomplete	The expression is empty or ends too early. Complete the expression.
 unexpected_token	Unexpected symbol	The expression contains an unexpected symbol. Correct the expression.
-unknown_contact_policy_id	Contact policy not defined	The contact policy named for this motion is not defined. Choose one of the defined contact policies.
-unknown_contact_policy_mode	Support contact mode unsupported	The support contact uses a mode this version does not support. Choose a supported mode in the Scene.
 unknown_entry	Unknown node id	The assistant named an entry that is not in the node list. Use node ids from the node list.
 unknown_function	Unknown function	The expression calls a function that does not exist. Correct the expression.
 unknown_non_std_exception	Unknown internal failure	An internal check failed: a component raised an unidentified failure. Collect the logs and report it.
 unknown_or_missing_member	Unexpected or missing field	An internal check failed: a stored or exchanged record has unknown or missing fields. Collect the logs and report it.
-unknown_release_evidence_mode	Release evidence mode unsupported	The support contact uses a release evidence mode this version does not support. Choose a supported mode in the Scene.
 unresolved_named_target	Named target not resolved	A named target must be resolved to a pose before the motion is computed. Resolve the target first.
 unresolved_named_target_forbidden	Named target not resolved	An internal check failed: a prepared motion still names a target that should have been resolved to a position. Collect the logs and report it.
 unsupported_capability	Not supported	The selected robot or component does not offer this capability.

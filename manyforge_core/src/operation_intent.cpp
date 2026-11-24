@@ -62,7 +62,14 @@ namespace {
                  std::all_of(value.positions_rad.begin(), value.positions_rad.end(),
                              [](double item) { return std::isfinite(item); });
         } else if constexpr (std::is_same_v<Value, PoseGoalDTO>) {
-          return finite_pose(value.goal);
+          const auto positive = [](double item) { return std::isfinite(item) && item > 0.0; };
+          return finite_pose(value.goal) &&
+                 (!value.linear ||
+                  (positive(value.linear->max_translation_step_m) &&
+                   positive(value.linear->max_rotation_step_rad) &&
+                   positive(value.linear->max_angular_speed_rad_s) &&
+                   positive(value.linear->max_linear_acceleration_mps2) &&
+                   positive(value.linear->max_angular_acceleration_rad_s2)));
         } else if constexpr (std::is_same_v<Value, NamedTargetDTO>) {
           return !value.name.empty();
         } else {
@@ -119,9 +126,9 @@ namespace {
         *motion.speed_profile.max_tcp_linear_speed_mps <= 0.0))) {
     return invalid("motion speed profile is invalid", "motion_speed_profile_invalid");
   }
-  if (motion.clearance_m.has_value() &&
-      !(*motion.clearance_m >= 0.0 && *motion.clearance_m <= kMaxCollisionClearanceM)) {
-    return invalid("motion clearance must be within [0, 0.05] m", "motion_clearance_invalid");
+  if (const auto violation = collision_rules_shape_violation(motion.collision_rules);
+      !violation.empty()) {
+    return invalid("motion collision rules are malformed", std::string(violation));
   }
   if (!std::isfinite(motion.timeouts.planning_timeout_s) ||
       motion.timeouts.planning_timeout_s <= 0.0 ||
@@ -141,8 +148,7 @@ namespace {
        !valid_reference(*motion.goal_frame_reference))) {
     return invalid("motion reference is malformed", "motion_reference_invalid");
   }
-  if ((motion.contact_policy_id.has_value() && motion.contact_policy_id->empty()) ||
-      motion.runtime_object_bindings.size() > kMaxOperationRuntimeObjectBindings ||
+  if (motion.runtime_object_bindings.size() > kMaxOperationRuntimeObjectBindings ||
       !std::is_sorted(motion.runtime_object_bindings.begin(), motion.runtime_object_bindings.end(),
                       [](const auto& left, const auto& right) {
                         return left.runtime_object_id < right.runtime_object_id;
@@ -233,7 +239,7 @@ namespace {
 }  // namespace
 
 Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
-  if (intent.request_context.source_label.empty() || intent.program_id.empty() ||
+  if (intent.request_context.source_label.empty() ||
       intent.program_revision.empty() || intent.program_binding_id.empty() ||
       (intent.program_run_id && !intent.program_run_id->nonzero()) ||
       intent.expected_graph_revision.empty() ||

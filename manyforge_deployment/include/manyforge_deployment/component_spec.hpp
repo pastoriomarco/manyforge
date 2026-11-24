@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <manyforge_core/types/collision.hpp>
+#include <manyforge_core/types/collision_rule.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
 #include <manyforge_core/types/planner_settings.hpp>
 #include <manyforge_core/types/strong_id.hpp>
@@ -186,7 +187,7 @@ struct CellContext final {
   /// Global interrupt rules.
   CanonicalValue rules;
   /// Planner settings per execution host: seed, collision-check step,
-  /// collision clearance, the fresh-plan pre-dispatch check, search,
+  /// collision rules, the fresh-plan pre-dispatch check, search,
   /// optimize, n, node budget, Cartesian timing, motion timing.
   CanonicalValue planner;
   /// Assistant projection, external resources and the site overlay ref.
@@ -201,7 +202,13 @@ struct CellContext final {
 struct PlannerSettings final {
   std::uint32_t rng_seed{};
   double collision_check_step_rad{core::kDefaultCollisionCheckStepRad};
-  double collision_clearance_m{core::kDefaultCollisionClearanceM};
+  /// The cell's collision rules; the first has no selections and holds every
+  /// robot x environment pair (1 mm where the Deployment names none).
+  std::vector<core::CollisionRuleDTO> collision_rules{core::CollisionRuleDTO{
+      std::string(core::kEverythingCollisionRuleId),
+      {},
+      {},
+      core::CollisionClearanceRule{core::kDefaultCollisionClearanceM}}};
   bool collision_check_fresh_plans{core::kDefaultCollisionCheckFreshPlans};
   core::PlannerSearchDTO search{core::kDefaultPlannerSearch};
   core::PlannerOptimizeDTO optimize{core::kDefaultPlannerOptimize};

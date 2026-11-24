@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [
       {
@@ -22,13 +22,10 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [
       "lite_gripper"
     ],
@@ -37,7 +34,6 @@
       "pick-and-place"
     ]
   },
-  "description": "Mock key-path example. Mock does not measure grasp loss; write part_lost through the current-Run runtime blackboard control to simulate the key.",
   "execution_groups": {
     "carry": {
       "execution_policy": "independent"
@@ -871,7 +867,6 @@
       "parameters": {}
     }
   ],
-  "name": "lite6_grasp_lost",
   "parameters": [
     {
       "constraints": {
@@ -1043,7 +1038,6 @@
       "y": 996
     }
   },
-  "program_id": "lite6_grasp_lost",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

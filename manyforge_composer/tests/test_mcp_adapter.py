@@ -76,11 +76,11 @@ def test_optional_off_does_not_construct_mcp(tmp_path, monkeypatch):
         assert client.get("/api/program/draft").status_code == 200
 
 
-def test_all_21_tools_derive_action_schemas_from_real_routes(tmp_path):
+def test_all_20_tools_derive_action_schemas_from_real_routes(tmp_path):
     state = _mcp_state(object())
     app = create_app(state, security=_security(tmp_path))
     contracts = tool_contracts(app)
-    assert len(contracts) == len(TOOL_ROUTES) == 21
+    assert len(contracts) == len(TOOL_ROUTES) == 20
     api = app.openapi()
     for tool in contracts:
         jsonschema.Draft202012Validator.check_schema(tool["inputSchema"])
@@ -218,6 +218,7 @@ def test_mcp_has_parity_with_the_component_model_and_apply_routes(tmp_path):
     expected = {
         ("manyforge_scenario", "load"): ("POST", "/api/scenario/load"),
         ("manyforge_scenario", "new"): ("POST", "/api/scenario/new"),
+        ("manyforge_scenario", "save"): ("POST", "/api/scenario-documents/save"),
         ("manyforge_deployment", "preview"): ("POST", "/api/deployment/preview"),
         ("manyforge_deployment", "apply"): ("POST", "/api/deployment/apply"),
         ("manyforge_deployment", "effective"): ("GET", "/api/deployment/effective"),

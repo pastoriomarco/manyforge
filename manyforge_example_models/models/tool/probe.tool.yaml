@@ -1,0 +1,32 @@
+# An example tool parameter file (manyforge.parametric_tool.v1, kind: tool):
+# a touch probe with a stylus ball, its probe tip. A Deployment row holds
+# these parameters inline (model_source.parameters) or names this file:
+#   model_source: {parameters: {project_path: <path to this file>}}.
+# ManyForge generates the tool's URDF and SRDF from them at Load;
+# `scripts/manyforge component export <this file> <folder>` writes them.
+# Poses are in the mount frame (the robot flange plane), z out of the flange.
+api_version: manyforge.parametric_tool.v1
+kind: tool
+body:
+  - name: housing
+    pose: {position_m: [0, 0, 0.03]}
+    collision: {cylinder: {radius_m: 0.02, length_m: 0.06}}
+  - name: stylus
+    pose: {position_m: [0, 0, 0.08]}
+    collision: {cylinder: {radius_m: 0.002, length_m: 0.04}}
+chains:
+  - attach_to: body
+    pose: {position_m: [0, 0, 0.1]}
+    elements:
+      - tip:
+          id: tip                    # the only part that may touch the probed part
+          parts:
+            - name: stylus_ball
+              collision: {sphere: {radius_m: 0.003}}
+tcps:
+  - id: tcp                          # the default TCP, at the ball centre
+    attach_to: tip                   # contact bodies: the tip (default)
+  - id: flange_side                  # a further TCP, on the body: no contact bodies
+    pose: {position_m: [0.03, 0, 0.02], orientation: {rpy_deg: [0, 90, 0]}}
+mass_kg: 0.25
+center_of_mass_m: [0, 0, 0.035]

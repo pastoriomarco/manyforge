@@ -55,7 +55,8 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     catalog = client.get("/api/catalog")
     assert catalog.status_code == 200
     payload = catalog.json()
-    assert len(payload["entries"]) == 51  # rules.set_active, io.clear_outside_change
+    # rules.set_active, io.clear_outside_change, operator.request_choice, motion.stop_groups
+    assert len(payload["entries"]) == 53
     assert payload["apiVersion"] == "manyforge.node_catalog.v3"
     assert payload["contentVersion"] == NodeCatalog(BUILTIN_CATALOG_PATH).content_version
     assert payload["catalogId"] == "manyforge_builtin"
@@ -94,7 +95,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert environment.status_code == 200
     environment_payload = environment.json()
     assert environment_payload["catalog"]["catalogDigest"] == payload["catalogDigest"]
-    assert len(environment_payload["executableRegistry"]) == 51
+    assert len(environment_payload["executableRegistry"]) == 53
 
 
 def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None:
@@ -141,7 +142,7 @@ def test_program_workspace_is_available_while_effectful_actions_need_headless() 
     loaded = TestClient(create_app(state)).get("/api/program/draft")
     assert loaded.status_code == 200
     assert loaded.json()["program_loaded"] is True
-    assert loaded.json()["program"]["api_version"] == "manyforge.program.v3"
+    assert loaded.json()["program"]["api_version"] == "manyforge.program.v4"
     assert loaded.json()["draft_revision"] == 1
     assert loaded.json()["saved"] is True
     assert loaded.json()["applied"] is False
@@ -466,6 +467,8 @@ def test_filesystem_browser_preserves_bounded_sorted_authoring_entries(
     (allowed / "A.program.yml").write_text("x: 1\n", encoding="utf-8")
     (allowed / "ignored.deployment.yaml").write_text("x: 1\n", encoding="utf-8")
     (allowed / "part.glb").write_bytes(b"glTF")
+    (allowed / "jaw.STL").write_bytes(b"solid jaw\n")
+    (allowed / "housing.dae").write_text("<COLLADA/>\n", encoding="utf-8")
     (allowed / "ignored.txt").write_text("x\n", encoding="utf-8")
     client = _client(allowed_fs_roots=[str(allowed)])
 
@@ -511,7 +514,20 @@ def test_filesystem_browser_preserves_bounded_sorted_authoring_entries(
     assert [entry["name"] for entry in mesh_response.json()["entries"]] == [
         "A-directory",
         "z-directory",
+        "jaw.STL",
         "part.glb",
+    ]
+    # A generated tool's meshes (OD-364): .stl and .dae.
+    tool_mesh_response = client.get(
+        "/api/files/browse",
+        params={"path": str(allowed), "kind": "tool_mesh"},
+    )
+    assert tool_mesh_response.status_code == 200
+    assert [entry["name"] for entry in tool_mesh_response.json()["entries"]] == [
+        "A-directory",
+        "z-directory",
+        "housing.dae",
+        "jaw.STL",
     ]
 
 

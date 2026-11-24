@@ -28,6 +28,7 @@ import {
   parseOperationObservation,
   parseExpressionCheckResult,
   parsePersistentKeyValues,
+  parseProgramRunKeyValues,
   parseProgramCommandReply,
   parseApplyCommandReply,
   parseRuntimeScaleControlAccepted,
@@ -202,14 +203,12 @@ it('bounds discovery by encoded bytes and requires the exact continuation', () =
 
 function programFixture(): Record<string, unknown> {
   return {
-    api_version: 'manyforge.program.v3',
-    program_id: 'fixture',
+    api_version: 'manyforge.program.v4',
     program_revision: `sha256:${'a'.repeat(64)}`,
     program_profile: 'composable-cell-v1',
-    name: 'Fixture',
     catalog: {
       api_version: 'manyforge.node_catalog.v3',
-      content_version: '3.0.0',
+      content_version: '4.0.0',
     },
     parameters: [{
       parameter_id: 'duration',
@@ -300,12 +299,10 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
       revision: 4,
       document: {
         api_version: 'manyforge.deployment.v1',
-        deployment_artifact_id: 'deployment.fixture',
         deployment_revision: digestA,
         graph: { runtime_units: [], model_instances: [], controllable_components: [],
           control_domains: [], control_bindings: [], component_attachments: [] },
       },
-      deploymentArtifactId: 'deployment.fixture',
       deploymentRevision: digestA,
       graphRevision: digestC,
       differsFromSaved: false,
@@ -313,14 +310,12 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
     saved: { path: '/workspace/deployment.fixture.json', deploymentRevision: digestA, differsFromApplied: null },
     managerApplied: { activationOrder: null, deploymentRevision: digestA, scenarioId: 'fixture' },
     runAdmission: { ready: true, reason: null },
-    binding: programBindingFixture('fixture-program', digestB, digestA),
+    binding: programBindingFixture(digestB, digestA),
     scenarioCandidates: [{
       scenarioId: 'fixture',
       sourceDocumentDigest: digestB,
-      deploymentArtifactId: 'deployment.fixture',
       deploymentRevision: digestA,
       retainedBundleId: digestB,
-      programId: 'fixture-program',
       programRevision: digestB,
       programBindingId: digestA,
       description: 'Fixture Scenario',
@@ -328,10 +323,8 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
     savedScenarioCandidates: [{
       scenarioId: 'fixture',
       sourceDocumentDigest: digestB,
-      deploymentArtifactId: 'deployment.fixture',
       deploymentRevision: digestA,
       retainedBundleId: digestB,
-      programId: 'fixture-program',
       programRevision: digestB,
       programBindingId: digestA,
       description: 'Fixture Scenario',
@@ -341,7 +334,6 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
 }
 
 function programBindingFixture(
-  programId: string,
   programRevision: string,
   programBindingId: string,
 ): Record<string, unknown> {
@@ -350,15 +342,14 @@ function programBindingFixture(
   // generated transport suite separately requires the genuine native v3
   // Binding fixture; this object makes no producer or catalog claim.
   return {
-    api_version: 'manyforge.program_binding.v3',
+    api_version: 'manyforge.program_binding.v4',
     program_binding_id: programBindingId,
-    program_id: programId,
     program_revision: programRevision,
     retained_bundle_id: `sha256:${'b'.repeat(64)}`,
     graph_revision: `sha256:${'c'.repeat(64)}`,
     node_environment: {
       catalog_id: 'fixture_catalog',
-      content_version: '3.0.0',
+      content_version: '4.0.0',
       catalog_digest: digest,
       environment_digest: `sha256:${'a'.repeat(64)}`,
     },
@@ -377,7 +368,7 @@ function programBindingFixture(
     collision_body_bindings: [],
     signal_bindings: [],
     node_policies: [],
-    contact_grasp_bindings: [],
+    collision_rule_bodies: [],
     provenance: {
       binding_compiler_contract_digest: digest,
       source_records: [],
@@ -564,19 +555,18 @@ function managerApplyRecordFixture(): Record<string, unknown> {
     phase: 'fence_held',
     scene_initialization: 'preserve',
     prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v7',
+      schema_version: 'manyforge.prepared_activation_input.v8',
       prepared_activation_id: `sha256:${'a'.repeat(64)}`,
       origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: `sha256:${'b'.repeat(64)}`, project_path: '/projects/fixture.scenario' },
       captured_input_digest: `sha256:${'c'.repeat(64)}`,
-      deployment_artifact_id: 'deployment.fixture',
       deployment_revision: `sha256:${'d'.repeat(64)}`,
       retained_bundle_id: `sha256:${'e'.repeat(64)}`,
       graph_revision: `sha256:${'f'.repeat(64)}`,
-      program_id: 'fixture-program',
       program_revision: `sha256:${'a'.repeat(64)}`,
       program_outcome: { kind: 'bound', program_binding_id: `sha256:${'b'.repeat(64)}` },
       node_environment_digest: `sha256:${'c'.repeat(64)}`,
       assistant_mode: 'forbidden',
+      scene_meshes: [],
     },
     request: {
       request_key: `c0${'3'.repeat(30)}`,
@@ -614,7 +604,6 @@ function logicalSceneFixture(): Record<string, unknown> {
         },
         provider_evidence: null,
         scene_resource_id: 'part',
-        support_contacts: [],
       }],
       policy_epoch: 1,
       revision: (projectionRevisionFixture().scene_revision as Record<string, unknown>),
@@ -783,7 +772,6 @@ describe('Program product projections', () => {
         applied_record_digest: digestC,
         scenario_id: 'cell-pick',
         source_document_digest: digestA,
-        program_id: 'pick',
         program_revision: digestB,
         program_binding_id: digestC,
         retained_bundle_id: digestA,
@@ -873,7 +861,7 @@ describe('Program product projections', () => {
 
   function runtimeControlsProjection(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_runtime_control_projection.v10',
+      schema_version: 'manyforge.program_runtime_control_projection.v11',
       owner_id: 'program-runner.cell-a',
       program_run_id: 1,
       run_revision: 3,
@@ -892,6 +880,7 @@ describe('Program product projections', () => {
       },
       recovery_offer: null,
       recovery_offers: [],
+      operator_questions: [],
       execution_selections: {
         hold_revision: 0,
         motion_held: false,
@@ -906,10 +895,129 @@ describe('Program product projections', () => {
             command_target_id: 'arm',
           },
           runtime_scale_unavailable_reason: null,
-          resource_ids: ['robot.joint_1', 'robot.joint_2'] }],
+          resource_ids: ['robot.joint_1', 'robot.joint_2'],
+          stopped_by: null,
+          stopped_by_node_instance_id: null }],
       },
     };
   }
+
+  function operatorQuestion(
+    node = 'ask_bin_full',
+    offerId = digestA,
+  ): Record<string, unknown> {
+    return {
+      schema_version: 'manyforge.program_operator_question.v1',
+      offer_id: offerId,
+      offer_revision: 3,
+      program_run_id: 1,
+      node_instance_id: node,
+      node_attempt_id: 41,
+      message: 'Bin is full. Empty it, then choose.',
+      severity: 'warning',
+      options: [
+        { option_id: 'continue', label: 'Bin emptied, continue', result: 'success' },
+        { option_id: 'abort', label: 'Abort this cycle', result: 'failure' },
+      ],
+      hold_motion_group_ids: ['left_arm'],
+    };
+  }
+
+  it('parses open operator questions and Program Stop attribution on groups (v11)', () => {
+    const input: Record<string, unknown> = {
+      ...runtimeControlsProjection(),
+      operator_questions: [operatorQuestion(), operatorQuestion('ask_other', digestB)],
+    };
+    const group = (input.execution_selections as { groups: Record<string, unknown>[] }).groups[0];
+    group.stopped_by = 'program';
+    group.stopped_by_node_instance_id = 'ask_bin_full';
+    const parsed = parseProgramRuntimeControlProjection(input);
+    expect(parsed.schemaVersion).toBe('manyforge.program_runtime_control_projection.v11');
+    expect(parsed.operatorQuestions[0]).toEqual({
+      schemaVersion: 'manyforge.program_operator_question.v1',
+      offerId: digestA,
+      offerRevision: 3,
+      programRunId: 1,
+      nodeInstanceId: 'ask_bin_full',
+      nodeAttemptId: 41,
+      message: 'Bin is full. Empty it, then choose.',
+      severity: 'warning',
+      options: [
+        { optionId: 'continue', label: 'Bin emptied, continue', result: 'success' },
+        { optionId: 'abort', label: 'Abort this cycle', result: 'failure' },
+      ],
+      holdMotionGroupIds: ['left_arm'],
+    });
+    expect(parsed.operatorQuestions[1].nodeInstanceId).toBe('ask_other');
+    expect(parsed.executionSelections.groups[0]).toMatchObject({
+      stoppedBy: 'program', stoppedByNodeInstanceId: 'ask_bin_full',
+    });
+    const plain = parseProgramRuntimeControlProjection(runtimeControlsProjection());
+    expect(plain.operatorQuestions).toEqual([]);
+    expect(plain.executionSelections.groups[0]).toMatchObject({
+      stoppedBy: null, stoppedByNodeInstanceId: null,
+    });
+  });
+
+  it('refuses the v10 projection and a missing operator_questions field', () => {
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      schema_version: 'manyforge.program_runtime_control_projection.v10',
+    })).toThrow(/projection.v11/);
+    const missing = runtimeControlsProjection();
+    delete missing.operator_questions;
+    expect(() => parseProgramRuntimeControlProjection(missing)).toThrow(/exactly/);
+  });
+
+  it('refuses a malformed operator question', () => {
+    const refuses = (question: Record<string, unknown>) => () => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(), operator_questions: [question],
+    });
+    const base = operatorQuestion();
+    const options = base.options as Record<string, unknown>[];
+    expect(refuses({ ...base, extra: 1 })).toThrow(/exactly/);
+    expect(refuses({ ...base, schema_version: 'manyforge.program_operator_question.v2' }))
+      .toThrow(/program_operator_question.v1/);
+    expect(refuses({ ...base, severity: 'error' })).toThrow(/severity/);
+    expect(refuses({ ...base, message: '' })).toThrow(/message/);
+    expect(refuses({ ...base, offer_id: 'not-a-digest' })).toThrow(/offer_id/);
+    expect(refuses({ ...base, offer_revision: 0 })).toThrow(/offer_revision/);
+    expect(refuses({ ...base, options: [options[0]] })).toThrow(/2 to 8 options/);
+    expect(refuses({ ...base, options: [options[0], options[0]] })).toThrow(/2 to 8 options/);
+    expect(refuses({ ...base, options: Array.from({ length: 9 }, (_, index) => ({
+      ...options[0], option_id: `o${index}`,
+    })) })).toThrow(/options/);
+    expect(refuses({ ...base, options: [{ ...options[0], option_id: 'Continue' }, options[1]] }))
+      .toThrow(/option_id/);
+    expect(refuses({ ...base, options: [{ ...options[0], label: '' }, options[1]] }))
+      .toThrow(/label/);
+    expect(refuses({ ...base, options: [{ ...options[0], result: 'maybe' }, options[1]] }))
+      .toThrow(/result/);
+    expect(refuses({ ...base, options: [{ ...options[0], extra: true }, options[1]] }))
+      .toThrow(/exactly/);
+    expect(refuses({ ...base, hold_motion_group_ids: ['left_arm', 'left_arm'] }))
+      .toThrow(/hold_motion_group_ids/);
+    expect(refuses({ ...base, program_run_id: 2 })).toThrow(/one exact Program-run identity/);
+    expect(() => parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      operator_questions: [operatorQuestion('a', digestA), operatorQuestion('a', digestB)],
+    })).toThrow(/one question per node/);
+  });
+
+  it('refuses incoherent Program Stop attribution on a group', () => {
+    for (const [stoppedBy, node] of [
+      ['program', null], [null, 'ask'], ['operator', 'ask'], ['program', ''],
+    ] as const) {
+      const input = runtimeControlsProjection();
+      const group = (input.execution_selections as { groups: Record<string, unknown>[] }).groups[0];
+      group.stopped_by = stoppedBy;
+      group.stopped_by_node_instance_id = node;
+      expect(() => parseProgramRuntimeControlProjection(input)).toThrow(/stopped_by|Program Stop attribution/);
+    }
+    const missing = runtimeControlsProjection();
+    delete (missing.execution_selections as { groups: Record<string, unknown>[] }).groups[0].stopped_by;
+    expect(() => parseProgramRuntimeControlProjection(missing)).toThrow();
+  });
 
   it('parses the exact Applied owner identity', () => {
     const appliedInput = {
@@ -917,7 +1025,6 @@ describe('Program product projections', () => {
       assistant_projection: null,
       simulation_scene: null,
       baseline_program_binding_id: digestA,
-      deployment_artifact_id: 'cell-a',
       deployment_revision: digestB,
       graph_revision: digestC,
       node_environment_digest: digestA,
@@ -927,7 +1034,7 @@ describe('Program product projections', () => {
       }],
       preparation_digest: digestB,
       program: programFixture(),
-      program_binding: programBindingFixture('fixture', digestA, digestC),
+      program_binding: programBindingFixture(digestA, digestC),
       program_frame_facts: {
         applied_record_digest: digestC,
         program_binding_id: digestC,
@@ -938,7 +1045,6 @@ describe('Program product projections', () => {
         frames: [{ reference: { component_id: 'fixture_robot', frame_id: 'base' }, match_count: 1 }],
       },
       program_binding_id: digestC,
-      program_id: 'fixture',
       program_revision: digestA,
       retained_bundle_id: digestB,
       source_document_digest: digestA,
@@ -960,11 +1066,9 @@ describe('Program product projections', () => {
       current_scenario: {
         scenario_id: 'cell-pick',
         source_document_digest: digestA,
-        deployment_artifact_id: 'cell-a',
         deployment_revision: digestB,
         retained_bundle_id: digestC,
         graph_revision: digestB,
-        program_id: 'fixture',
         program_revision: digestA,
         program_binding_id: digestC,
       },
@@ -979,7 +1083,7 @@ describe('Program product projections', () => {
     })).toThrow(/unavailable reasons exactly when no current Scenario exists/);
     expect(applied.recordDigest).toBe(digestC);
     expect(applied).not.toHaveProperty('sourceOwnerEpoch');
-    expect(applied.program.program_id).toBe('fixture');
+    expect(applied.program).not.toHaveProperty('program_id');
     expect(applied.programBinding.program_binding_id).toBe(digestC);
     expect(applied.programBinding.component_bindings[0].component_id).toBe('fixture_robot');
     expect(applied.programFrameFacts.frames[0]).toEqual({
@@ -1014,7 +1118,7 @@ describe('Program product projections', () => {
       ...appliedInput,
       program_frame_facts: { ...appliedInput.program_frame_facts, unexpected: true },
     })).toThrow(/exactly/);
-    const nestedMalformed = programBindingFixture('fixture', digestA, digestC);
+    const nestedMalformed = programBindingFixture(digestA, digestC);
     (nestedMalformed.component_bindings as Record<string, unknown>[])[0]
       .model_bindings = [{ model_role_id: 'arm_model', model_instance_id: 'fixture_robot_model',
         model_revision: digestA, unknown: true }];
@@ -1024,36 +1128,28 @@ describe('Program product projections', () => {
     })).toThrow(/closed record/);
     expect(() => parseAppliedProgramSelection({
       ...appliedInput,
-      program_binding: programBindingFixture(
-        'another-program',
-        digestA,
-        digestC,
-      ),
+      program_binding: programBindingFixture(digestB, digestC),
     })).toThrow(/content-identical Program and Program Binding identities/);
     expect(() => parseAppliedProgramSelection({
       ...appliedInput,
       program_binding: {
-        ...programBindingFixture('fixture', digestA, digestC),
+        ...programBindingFixture(digestA, digestC),
         retained_bundle_id: digestA,
       },
     })).toThrow(/content-identical Program and Program Binding identities/);
     expect(() => parseAppliedProgramSelection({
       ...appliedInput,
       program_binding: {
-        ...programBindingFixture('fixture', digestA, digestC),
+        ...programBindingFixture(digestA, digestC),
         graph_revision: digestA,
       },
     })).toThrow(/content-identical Program and Program Binding identities/);
     expect(() => parseAppliedProgramSelection({
       ...appliedInput,
       program_binding: {
-        ...programBindingFixture('fixture', digestA, digestC),
+        ...programBindingFixture(digestA, digestC),
         node_environment: {
-          ...(programBindingFixture(
-            'fixture',
-            digestA,
-            digestC,
-          ).node_environment as Record<string, unknown>),
+          ...(programBindingFixture(digestA, digestC).node_environment as Record<string, unknown>),
           unknown: true,
         },
       },
@@ -1921,7 +2017,6 @@ describe('Program product projections', () => {
 describe('Applied Program status parser', () => {
   const digest = `sha256:${'a'.repeat(64)}`;
   const executable = {
-    deployment_artifact_id: 'deployment-a',
     deployment_revision: digest,
     executable: true,
     graph_revision: digest,
@@ -1929,7 +2024,6 @@ describe('Applied Program status parser', () => {
     non_executable: null,
     program: null,
     program_binding_id: digest,
-    program_id: 'pick',
     program_revision: digest,
     record_digest: digest,
     retained_bundle_id: digest,
@@ -1947,13 +2041,12 @@ describe('Applied Program status parser', () => {
     const absent = {
       ...executable,
       executable: false,
-      program_id: null,
       program_revision: null,
       program_binding_id: null,
       message: 'No Program is selected',
     };
     expect(parseAppliedProgramStatus(absent)).toMatchObject({
-      executable: false, programId: null, programRevision: null, unresolvedReferences: [],
+      executable: false, programRevision: null, unresolvedReferences: [],
     });
     expect(() => parseAppliedProgramStatus({ ...absent, program_binding_id: digest })).toThrow();
     expect(() => parseAppliedProgramStatus({ ...absent, program_revision: digest })).toThrow();
@@ -1965,7 +2058,7 @@ describe('Applied Program status parser', () => {
       ...executable,
       executable: false,
       message: 'Applied Program is not executable in the active Deployment',
-      program: { program_id: 'pick' },
+      program: {},
       program_binding_id: null,
       non_executable: {
         affected_execution_groups: ['grasp'],
@@ -2040,7 +2133,6 @@ describe('Deployment workspace parser', () => {
       api_version: 'manyforge.manager_command_response.v3',
       candidate_receipt: {
         schema_version: 'manyforge.manager_deployment_candidate_receipt.v3',
-        deployment_artifact_id: 'deployment.fixture',
         deployment_revision: digestA,
         prepared_activation_id: digestB,
         candidate_retained_bundle_id: 'bundle.next',
@@ -2065,6 +2157,7 @@ describe('Deployment workspace parser', () => {
       ].map((kind) => [kind, { added: [], changed: [], removed: [] }])),
       impact: {
         attachment_changed_components: [],
+        collision_rules: [],
         component_delta_digest: digestA,
         components: [
           { controllable_component_id: 'arm', disposition: 'retain', replacement_reasons: [] },
@@ -2072,6 +2165,7 @@ describe('Deployment workspace parser', () => {
         ],
         destructive: true,
         detached_components: ['gripper-2'],
+        mesh_depth_reports: [],
         program: {
           executable: false,
           non_executable: {
@@ -2079,7 +2173,6 @@ describe('Deployment workspace parser', () => {
             affected_nodes: ['close_gripper'],
             api_version: 'manyforge.program-binding-outcome.v2',
             graph_revision: digestA,
-            program_id: 'fixture-program',
             program_revision: digestB,
             retained_bundle_id: digestA,
             unresolved_targets: [{
@@ -2088,7 +2181,6 @@ describe('Deployment workspace parser', () => {
               reason: 'component_missing',
             }],
           },
-          program_id: 'fixture-program',
           program_revision: digestB,
         },
         shared_scene_projection_changed: false,
@@ -2132,10 +2224,9 @@ describe('Deployment workspace parser', () => {
     const fixture = deploymentWorkspaceFixture();
     Object.assign(fixture.draft as Record<string, unknown>, {
       document: {
-        api_version: 'manyforge.deployment_intent.v2',
-        deployment_artifact_id: 'deployment.fixture',
-        name: 'Fixture',
+        api_version: 'manyforge.deployment_intent.v3',
         components: [], attachments: [], policies: {},
+        collision_rules: [{ rule_id: 'everything', clearance_m: 0.001 }],
       },
       deploymentRevision: null, graphRevision: null,
     });
@@ -2144,12 +2235,20 @@ describe('Deployment workspace parser', () => {
     fixture.savedScenarioCandidates = [];
     fixture.saved = { path: '/workspace/deployment.yaml', deploymentRevision: null, differsFromApplied: null };
     const parsed = parseDeploymentWorkspaceResponse(fixture);
-    expect(parsed.draft.document?.api_version).toBe('manyforge.deployment_intent.v2');
+    expect(parsed.draft.document?.api_version).toBe('manyforge.deployment_intent.v3');
     expect(parsed.draft.graphRevision).toBeNull();
     expect(parsed.saved.path).toBe('/workspace/deployment.yaml');
     expect(parsed.saved.deploymentRevision).toBeNull();
     const intent = (fixture.draft as Record<string, unknown>).document as Record<string, unknown>;
-    for (const field of ['graph', 'graph_revision', 'deployment_revision']) {
+    // The cell's collision rules are a required list of the intent.
+    const rules = intent.collision_rules;
+    for (const refused of [undefined, {}]) {
+      if (refused === undefined) delete intent.collision_rules;
+      else intent.collision_rules = refused;
+      expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
+    }
+    intent.collision_rules = rules;
+    for (const field of ['graph', 'graph_revision', 'deployment_revision', 'deployment_artifact_id', 'name', 'description']) {
       intent[field] = `sha256:${'c'.repeat(64)}`;
       expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
       delete intent[field];
@@ -2213,7 +2312,6 @@ describe('Deployment workspace parser', () => {
     const fixture = deploymentWorkspaceFixture();
     Object.assign(fixture.draft as Record<string, unknown>, {
       document: null,
-      deploymentArtifactId: null,
       deploymentRevision: null,
       graphRevision: null,
     });
@@ -2241,9 +2339,8 @@ describe('Deployment workspace parser', () => {
     const fixture = deploymentWorkspaceFixture();
     Object.assign(fixture.draft as Record<string, unknown>, {
       document: null,
-      deploymentArtifactId: 'partial',
       deploymentRevision: null,
-      graphRevision: null,
+      graphRevision: `sha256:${'c'.repeat(64)}`,
     });
     expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow(
       /complete identities/,
@@ -2415,7 +2512,7 @@ describe('Program workspace parsers', () => {
     delete program.execution_groups;
     delete authoring.execution_groups;
     program.api_version = 'manyforge.program.v1';
-    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('manyforge.program.v3');
+    expect(() => parseProgramWorkspaceResponse(fixture)).toThrow('manyforge.program.v4');
   });
 
   it('keeps Draft, Saved, and unavailable Applied identities distinct', () => {
@@ -3662,7 +3759,6 @@ describe('headless projection parsers', () => {
       scene_initialization: 'preserve',
       prepared_activation: {
         captured_input_digest: `sha256:${'2'.repeat(64)}`,
-        deployment_artifact_id: 'deployment-1',
         deployment_revision: `sha256:${'3'.repeat(64)}`,
         program_binding_id: `sha256:${'4'.repeat(64)}`,
         prepared_activation_id: `sha256:${'5'.repeat(64)}`,
@@ -4475,7 +4571,6 @@ describe('addressed Robot Control parsers', () => {
             registration_generation: 1, sequence: 0 },
           operation_capability_id: 'execution.trajectory.execute',
           planning_capability_ids: ['planning.motion.joint_goal'],
-          program_id: 'manyforge.direct_control.motion',
           program_revision: 'sha256:program',
           program_binding_id: 'sha256:binding',
           observed_state: {
@@ -4561,7 +4656,6 @@ describe('addressed Robot Control parsers', () => {
           },
           operation_capability_id: 'tool.gripper.command',
           program_binding_id: 'sha256:gripper-binding',
-          program_id: 'manyforge.direct_control.gripper',
           program_revision: 'sha256:gripper-program',
           resource: {
             coordinate_kind: 'linear_m',
@@ -4595,7 +4689,7 @@ describe('addressed Robot Control parsers', () => {
             open_state_ref: 'open',
             closed_state_ref: 'closed',
             command_duration_s: 0.5,
-            touch_links: ['finger_link'],
+            grip_body_links: ['finger_link'],
             mount_frame: 'tool0',
             attach_frame: 'tool0',
             tcp_frame: 'tool0',
@@ -4673,7 +4767,6 @@ describe('addressed Robot Control parsers', () => {
         command_target_id: commandTargetId,
         operation_capability_id: operationCapabilityId,
         program_binding_id: programBindingId,
-        program_id: programId,
         program_revision: programRevision,
         ...command
       } = fields;
@@ -4682,7 +4775,6 @@ describe('addressed Robot Control parsers', () => {
           ...command,
           manual_control: {
             program_binding_id: programBindingId,
-            program_id: programId,
             program_revision: programRevision,
           },
         },
@@ -5150,7 +5242,6 @@ describe('addressed Robot Control parsers', () => {
       mount_frame: null,
       attach_frame: null,
       tcp_frame: null,
-      touch_links: [],
       auxiliary_frames: [],
     });
     const modelOnlyWire = composed(modelOnly);
@@ -5607,7 +5698,6 @@ describe('addressed Robot Control parsers', () => {
         receipt_digest: 'sha256:receipt',
         intent_digest: 'sha256:intent',
         request_key: 'c0112233445566778899aabbccddeeff',
-        program_id: 'manyforge.direct_control.motion',
         program_revision: 'sha256:program',
         program_binding_id: 'sha256:binding',
         program_run_id: null,
@@ -5730,7 +5820,6 @@ describe('addressed Robot Control parsers', () => {
         receipt_digest: 'sha256:receipt',
         intent_digest: 'sha256:intent',
         request_key: 'c0112233445566778899aabbccddeeff',
-        program_id: 'manyforge.direct_control.gripper',
         program_revision: 'sha256:gripper-program',
         program_binding_id: 'sha256:gripper-binding',
         program_run_id: null,
@@ -5986,27 +6075,57 @@ describe('expression check parser', () => {
 
 describe('typed prepared activation origin v6', () => {
   const digest = `sha256:${'a'.repeat(64)}`;
-  const receipt = () => ({ schema_version: 'manyforge.prepared_activation_input.v7',
+  const receipt = () => ({ schema_version: 'manyforge.prepared_activation_input.v8',
     origin: { kind: 'scenario', scenario_id: 'cell_a', source_document_digest: digest,
       project_path: '/projects/cell_a' },
-    prepared_activation_id: digest, captured_input_digest: digest, deployment_artifact_id: 'deployment_a',
+    prepared_activation_id: digest, captured_input_digest: digest,
     deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest,
-    program_id: null, program_revision: null, program_outcome: { kind: 'no_program' },
-    node_environment_digest: digest, assistant_mode: 'optional' });
+    program_revision: null, program_outcome: { kind: 'no_program' },
+    node_environment_digest: digest, assistant_mode: 'optional', scene_meshes: [] as unknown[] });
 
   it('keeps the Scenario origin of an empty-cell preparation without a Program', () => {
     const parsed = parsePreparedActivationInput(receipt(), 'prepared');
     expect(parsed.origin).toEqual({ kind: 'scenario', scenarioId: 'cell_a', sourceDocumentDigest: digest,
       projectPath: '/projects/cell_a' });
-    expect(parsed.programId).toBeNull();
+    expect(parsed.programRevision).toBeNull();
   });
 
-  it.each(['v3', 'v4', 'v5'])('refuses obsolete prepared schema %s', (version) => {
+  it.each(['v3', 'v4', 'v5', 'v7'])('refuses obsolete prepared schema %s', (version) => {
     expect(() => parsePreparedActivationInput({ ...receipt(), schema_version: `manyforge.prepared_activation_input.${version}` }, 'prepared')).toThrow();
   });
 
+  it('parses the captured scene meshes of a Program (OD-335)', () => {
+    const meshes = [
+      { byte_size: 7, content_digest: digest, resource_uri: '../shared/meshes/a.stl' },
+      { byte_size: 9, content_digest: `sha256:${'b'.repeat(64)}`, resource_uri: 'meshes/b.obj' },
+    ];
+    const parsed = parsePreparedActivationInput({ ...receipt(),
+      program_revision: digest, program_outcome: { kind: 'bound', program_binding_id: digest },
+      scene_meshes: meshes }, 'prepared');
+    expect(parsed.schemaVersion).toBe('manyforge.prepared_activation_input.v8');
+    expect(parsed.sceneMeshes).toEqual([
+      { byteSize: 7, contentDigest: digest, resourceUri: '../shared/meshes/a.stl' },
+      { byteSize: 9, contentDigest: `sha256:${'b'.repeat(64)}`, resourceUri: 'meshes/b.obj' },
+    ]);
+    const bound = { ...receipt(), program_revision: digest,
+      program_outcome: { kind: 'bound', program_binding_id: digest } };
+    for (const scene_meshes of [
+      [meshes[1], meshes[0]],
+      [meshes[0], meshes[0]],
+      [{ ...meshes[0], byte_size: 0 }],
+      [{ ...meshes[0], content_digest: 'sha256:short' }],
+      [{ ...meshes[0], resource_uri: '' }],
+      [{ ...meshes[0], extra: true }],
+      undefined,
+    ]) {
+      expect(() => parsePreparedActivationInput({ ...bound, scene_meshes }, 'prepared')).toThrow();
+    }
+    // No Program carries no scene meshes.
+    expect(() => parsePreparedActivationInput({ ...receipt(), scene_meshes: meshes }, 'prepared')).toThrow();
+  });
+
   it.each([
-    { scenario_id: 'fake' }, { program_id: 'fake' }, { program_revision: digest }, { assistant_mode: 'required' },
+    { scenario_id: 'fake' }, { program_id: 'fake' }, { deployment_artifact_id: 'fake' }, { program_revision: digest }, { assistant_mode: 'required' },
   ])('refuses branch-inconsistent receipt %j', (change) => {
     expect(() => parsePreparedActivationInput({ ...receipt(), ...change }, 'prepared')).toThrow();
   });
@@ -6021,9 +6140,9 @@ describe('typed prepared activation origin v6', () => {
 
 it('projects a no-Program status with its Scenario origin', () => {
   const digest = `sha256:${'a'.repeat(64)}`;
-  const status = { schema_version: 'manyforge.applied_program_status.v2', deployment_artifact_id: 'deployment_a',
+  const status = { schema_version: 'manyforge.applied_program_status.v2',
     deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest, record_digest: digest,
-    executable: false, program_id: null, program_revision: null, program_binding_id: null, program: null,
+    executable: false, program_revision: null, program_binding_id: null, program: null,
     non_executable: null, message: 'No Program is selected',
     origin: { kind: 'scenario', scenario_id: 'cell_a', source_document_digest: digest, project_path: '/projects/cell_a' } };
   expect(parseAppliedProgramStatus(status).origin.kind).toBe('scenario');
@@ -6140,5 +6259,47 @@ describe('failure diagnostic boundary', () => {
     expect(parseMotionPreviewDiagnostic({ detail: { ...envelope.detail, token: 'x' } })).toBeNull();
     expect(parseMotionPreviewDiagnostic({ detail: { ...envelope.detail, diagnostic_preview: { ...diagnostic, receipt_digest: 'x' } } })).toBeNull();
     expect(envelope.detail.message).toBe('refused');
+  });
+});
+
+describe('parseProgramRunKeyValues', () => {
+  const values = () => ({
+    schema_version: 'manyforge.program_runtime_blackboard_values.v1',
+    owner_id: 'runner.1',
+    application_start_id: '3f9a0000000000a1',
+    display: '3f9a/run3',
+    program_run_id: 3,
+    run_revision: 4,
+    node_status_revision: 5,
+    keys: [
+      { key: 'count', type: 'int64', value_state: 'value', value: 2 },
+      { key: 'label', type: 'string', value_state: 'no_value' },
+      { key: 'reply', type: 'model_response', value_state: 'omitted' },
+    ],
+  });
+
+  it('reads every declared key with its value state', () => {
+    expect(parseProgramRunKeyValues(values())).toEqual({
+      programRunId: 3,
+      runRevision: 4,
+      nodeStatusRevision: 5,
+      keys: [
+        { key: 'count', type: 'int64', valueState: 'value', value: 2 },
+        { key: 'label', type: 'string', valueState: 'no_value' },
+        { key: 'reply', type: 'model_response', valueState: 'omitted' },
+      ],
+    });
+  });
+
+  it('refuses another schema, an unknown state and a value without one', () => {
+    expect(() => parseProgramRunKeyValues({
+      ...values(), schema_version: 'manyforge.program_runtime_blackboard_values.v0',
+    })).toThrow(StructuralContractError);
+    const unknown = values();
+    unknown.keys[1] = { key: 'label', type: 'string', value_state: 'hidden' };
+    expect(() => parseProgramRunKeyValues(unknown)).toThrow(StructuralContractError);
+    const stray = values();
+    (stray.keys[1] as Record<string, unknown>).value = 'x';
+    expect(() => parseProgramRunKeyValues(stray)).toThrow(StructuralContractError);
   });
 });

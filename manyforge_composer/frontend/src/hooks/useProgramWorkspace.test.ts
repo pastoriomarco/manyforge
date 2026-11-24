@@ -137,11 +137,9 @@ function workspace(
   programRevision = `sha256:${String(draftRevision).padStart(64, '0')}`,
 ): ProgramWorkspaceResponse {
   const program = {
-    api_version: 'manyforge.program.v3' as const,
-    program_id: 'program-1',
+    api_version: 'manyforge.program.v4' as const,
     program_revision: programRevision,
     program_profile: 'composable-cell-v1' as const,
-    name: 'Fixture',
     catalog: {
       api_version: 'manyforge.node_catalog.v3' as const,
       content_version: 'fixture',
@@ -167,9 +165,7 @@ function workspace(
       authoring: {
         schema_version: 'manyforge.composer_authoring_forest.v2',
         api_version: program.api_version,
-        program_id: program.program_id,
         program_profile: program.program_profile,
-        name: program.name,
         catalog: program.catalog,
         forest: [program.tree],
         positions: {},
@@ -751,8 +747,8 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       schema_version: 'manyforge.current_scenario.v1', ready: true, unavailable_reasons: [],
       current_scenario: {
         scenario_id: 'mock_lite6_motion_preemption', source_document_digest: digest,
-        deployment_artifact_id: 'mock_lite6_motion_preemption', deployment_revision: digest,
-        retained_bundle_id: digest, graph_revision: digest, program_id: 'program',
+        deployment_revision: digest,
+        retained_bundle_id: digest, graph_revision: digest,
         program_revision: digest, program_binding_id: digest,
       },
     }) }));

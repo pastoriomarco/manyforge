@@ -8,20 +8,9 @@ import { ProgramTemplateIcon } from './programNodeGlyphs';
 
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 
-function record(value: JsonValue): Record<string, JsonValue> | null {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, JsonValue> : null;
-}
 const refKey = (value: object) => JSON.stringify(value);
 const sameTarget = (a: {component_id: string; command_target_id: string}, b: {component_id: string; command_target_id: string}) =>
   a.component_id === b.component_id && a.command_target_id === b.command_target_id;
-
-function contactPolicyIds(program: ProgramAuthoringDocument): string[] {
-  return (program.contact_policies ?? []).flatMap((value) => {
-    const identity = record(value)?.policy_id;
-    return typeof identity === 'string' ? [identity] : [];
-  }).sort();
-}
 
 export function ProgramAuthoringTemplate({
   program,
@@ -50,7 +39,6 @@ export function ProgramAuthoringTemplate({
     () => (program.scene ?? []).map((row) => row.scene_resource_id).sort(),
     [program.scene],
   );
-  const policies = useMemo(() => contactPolicyIds(program), [program]);
   const [sceneId, setSceneId] = useState('');
   const [armTargetId, setArmTargetId] = useState('');
   const [toolTargetId, setToolTargetId] = useState('');
@@ -59,7 +47,6 @@ export function ProgramAuthoringTemplate({
   const [showOtherRobotTcps, setShowOtherRobotTcps] = useState(false);
   const [carrierFrame, setCarrierFrame] = useState('');
   const [touchBody, setTouchBody] = useState('');
-  const [policyId, setPolicyId] = useState('');
   const [coordinateKind, setCoordinateKind] = useState<'linear_m' | 'angular_rad'>('linear_m');
   const [toolPosition, setToolPosition] = useState(0);
   const [namespaceId, setNamespaceId] = useState('planning');
@@ -95,7 +82,6 @@ export function ProgramAuthoringTemplate({
   const effectiveBase = selectedBase === undefined ? '' : refKey(selectedBase.reference);
   const effectiveCarrier = selectedCarrier === undefined ? '' : refKey(selectedCarrier.reference);
   const effectiveTouch = selectedTouch === undefined ? '' : refKey(selectedTouch.reference);
-  const effectivePolicy = policies.includes(policyId) ? policyId : policies[0] ?? '';
   const available = scenes.length > 0
     && arm !== undefined
     && tool !== undefined
@@ -103,7 +89,6 @@ export function ProgramAuthoringTemplate({
     && effectiveEndpoint !== undefined
     && effectiveCarrier !== ''
     && (operation === 'place' || effectiveTouch !== '')
-    && (operation === 'place' || effectivePolicy !== '')
     && PORTABLE_ID.test(namespaceId)
     && PORTABLE_ID.test(blackboardKey)
     && blackboardKey.startsWith(`${namespaceId}.`)
@@ -198,7 +183,6 @@ export function ProgramAuthoringTemplate({
                 ? { kind: coordinateKind, value_m: toolPosition }
                 : { kind: coordinateKind, value_rad: toolPosition },
               ...(operation === 'pick' ? {
-                contact_policy_id: effectivePolicy,
                 touch_bodies: selectedTouch === undefined ? [] : [selectedTouch.reference],
               } : {
                 place_pose: {
@@ -226,7 +210,7 @@ export function ProgramAuthoringTemplate({
           {!available && (
             <p className="scene-commit-error inline-message severity-error" role="status">
               The template needs a Program scene resource, pose-capable arm,
-              gripper target and qualified frames/bodies. Pick also needs a contact policy.
+              gripper target and qualified frames/bodies.
             </p>
           )}
           <label><span>{operation === 'pick' ? 'Object to pick' : 'Carried object'}</span><select value={effectiveScene} onChange={(event) => setSceneId(event.target.value)}>{scenes.map((id) => <option key={id}>{id}</option>)}</select></label>
@@ -245,7 +229,13 @@ export function ProgramAuthoringTemplate({
             <label><span>Carrier frame</span><select value={effectiveCarrier} onChange={(event) => setCarrierFrame(event.target.value)}>{toolFrameChoices.map((row) => <option key={refKey(row.reference)} value={refKey(row.reference)} disabled={!row.eligible} title={!row.eligible ? 'Not qualified for the selected target' : undefined}>{row.reference.component_id} · {row.reference.frame_id}{row.eligible ? '' : ' · Not qualified for the selected target'}</option>)}</select></label>
             {operation === 'pick' && <label><span>Touch body</span><select value={effectiveTouch} onChange={(event) => setTouchBody(event.target.value)}>{toolBodyChoices.map((row) => <option key={refKey(row.reference)} value={refKey(row.reference)} disabled={!row.eligible} title={!row.eligible ? 'Not qualified for the selected target' : undefined}>{row.reference.component_id} · {row.reference.collision_body_id}{row.eligible ? '' : ' · Not qualified for the selected target'}</option>)}</select></label>}
           </div>
-          {operation === 'pick' && <label><span>Contact policy</span><select value={effectivePolicy} onChange={(event) => setPolicyId(event.target.value)}>{policies.map((id) => <option key={id}>{id}</option>)}</select></label>}
+          {operation === 'pick' && (
+            <p className="program-form-hint">
+              The pick is inserted without collision rules, so the gripper may not touch the object before it is
+              attached. Where it must touch, add a contact rule to the inserted pick sequence (its collision
+              rules, descend leg).
+            </p>
+          )}
           {operation === 'place' && (
             <fieldset>
               <legend>Gripper (TCP) pose at release, in arm base frame</legend>

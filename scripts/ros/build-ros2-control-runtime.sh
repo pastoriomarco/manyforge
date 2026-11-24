@@ -159,6 +159,40 @@ PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "${PINOCCHIO_CMAKE_DIR}")")")
 export CMAKE_PREFIX_PATH="${TOPIC_INSTALL}:/usr/local:${PINOCCHIO_PREFIX}:${CMAKE_PREFIX_PATH:-}"
 
 mkdir -p "${ROBOPLAN_BUILD}" "${ROS_OVERLAY}"
+
+# The ROS prefix path without cmeel's Boost/TinyXML stack, for the ament-only
+# overlay packages.
+ros_prefix_path() {
+    local result= entry saved_ifs=${IFS}
+    IFS=:
+    for entry in ${CMAKE_PREFIX_PATH:-}; do
+        case "${entry}" in
+            */cmeel.prefix) ;;
+            *) result="${result:+${result}:}${entry}" ;;
+        esac
+    done
+    IFS=${saved_ifs}
+    printf '%s' "${result}"
+}
+
+# The I/O bank messages first: the ros_io_bank adapter family links them, and
+# the overlay below carries them for sim_plc and at run time.
+CMAKE_PREFIX_PATH="$(ros_prefix_path)" "${COLCON[@]}" --log-base "${ROS_OVERLAY}/log" build \
+    --base-paths "${WORKSPACE}/manyforge_io_interfaces" \
+    --build-base "${ROS_OVERLAY}/build" \
+    --install-base "${ROS_OVERLAY}/install" \
+    --symlink-install \
+    --packages-select manyforge_io_interfaces \
+    --cmake-args -DBUILD_TESTING=OFF
+# Source the overlay as the workbench does before it starts the host, and as
+# the image entrypoint sources the xArm and control overlays: the configured
+# tree's tests inherit this environment (their LD_LIBRARY_PATH), so the host
+# they start loads the ros_io_bank family's message libraries.
+set +u
+# shellcheck disable=SC1091
+source "${ROS_OVERLAY}/install/local_setup.bash"
+set -u
+export CMAKE_PREFIX_PATH="${ROS_OVERLAY}/install/manyforge_io_interfaces:${CMAKE_PREFIX_PATH}"
 CMAKE_GENERATOR_ARGS=()
 if [[ -n "${CMAKE_GENERATOR:-}" ]]; then
     CMAKE_GENERATOR_ARGS=(-G "$CMAKE_GENERATOR")
@@ -183,25 +217,15 @@ cmake --build "${ROBOPLAN_BUILD}" \
 # Keep cmeel's Boost/TinyXML stack out of the ament-only overlay.  The C++
 # runtime above consumes the qualified RoboPlan prefix; the ROS overlay below
 # must resolve the selected ROS distro's ABI-compatible dependency set.
-MANYFORGE_ROS_CMAKE_PREFIX_PATH=
-MANYFORGE_SAVED_IFS=${IFS}
-IFS=:
-for MANYFORGE_PREFIX_ENTRY in ${CMAKE_PREFIX_PATH:-}; do
-    case "${MANYFORGE_PREFIX_ENTRY}" in
-        */cmeel.prefix) ;;
-        *)
-            MANYFORGE_ROS_CMAKE_PREFIX_PATH="${MANYFORGE_ROS_CMAKE_PREFIX_PATH:+${MANYFORGE_ROS_CMAKE_PREFIX_PATH}:}${MANYFORGE_PREFIX_ENTRY}"
-            ;;
-    esac
-done
-IFS=${MANYFORGE_SAVED_IFS}
-export CMAKE_PREFIX_PATH=${MANYFORGE_ROS_CMAKE_PREFIX_PATH}
+CMAKE_PREFIX_PATH=$(ros_prefix_path)
+export CMAKE_PREFIX_PATH
 unset BOOST_ROOT BOOST_INCLUDEDIR BOOST_LIBRARYDIR
 
 ROS_OVERLAY_BASE_PATHS=(
+    "${WORKSPACE}/manyforge_io_interfaces"
     "${WORKSPACE}/manyforge_ros_bringup"
 )
-ROS_OVERLAY_PACKAGES=(manyforge_ros_bringup)
+ROS_OVERLAY_PACKAGES=(manyforge_io_interfaces manyforge_ros_bringup)
 if [[ "${MANYFORGE_ROS2_CONTROL_BUILD_TESTING:-OFF}" == ON ]]; then
     ROS_OVERLAY_BASE_PATHS=(
         "${WORKSPACE}/manyforge_perception_interfaces"

@@ -29,6 +29,7 @@
 #include <manyforge_core/ports/icomponent_adapter_port.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/io_signal.hpp>
+#include <manyforge_roboplan/io_bank_tracker.hpp>
 #include <manyforge_roboplan/io_output_writer.hpp>
 #include <manyforge_xarm_control/contract.hpp>
 
@@ -161,35 +162,20 @@ public:
             std::stop_token stop) override;
 
 private:
-  struct Pending final {
-    bool value{};
-    std::int64_t deadline_ns{};
-  };
-  struct Track final {
-    std::optional<bool> reported;
-    core::IoSignalSampleSource source{core::IoSignalSampleSource::kDevice};
-    std::optional<bool> last_stream;
-    std::optional<Pending> pending;
-    /// The value of a write with no answer, until the stream reports.
-    std::optional<bool> unknown;
-  };
-
-  [[nodiscard]] bool StreamFresh(std::int64_t now_ns) const;
   [[nodiscard]] bool OwnedLocked(const XArmIoSignal &signal) const;
   [[nodiscard]] const XArmIoSignal *Find(const std::string &name) const;
-  [[nodiscard]] core::IoSignalId Id(const XArmIoSignal &signal) const;
 
   const XArmIoComponentConfig config_;
   const std::int64_t confirmation_bound_ns_;
-  const std::int64_t stale_after_ns_;
   const std::shared_ptr<const IXArmDriver> driver_;
   const std::function<bool(std::int64_t)> owner_usable_;
   core::IClock &clock_;
   const std::function<bool()> owner_arming_;
   mutable std::mutex mutex_;
   core::ComponentLifecycle lifecycle_{core::ComponentLifecycle::kNotPrepared};
-  std::vector<Track> tracks_;
-  std::optional<std::int64_t> last_sample_at_ns_;
+  /// The bank's read-back (`roboplan_backend::IoBankTracker`), position =
+  /// receipt time: the confirmation bound ends a write's wait for its value.
+  roboplan_backend::IoBankTracker tracker_;
   std::optional<XArmGpioModuleStatus> gpio_;
   int writes_in_flight_{0};
   /// When the stream went stale while the owner was usable and not arming.

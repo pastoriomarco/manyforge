@@ -139,7 +139,17 @@ uses a frame of something that moves (another robot, a carried object), that
 frame is read once when the motion starts, and the target stays fixed from
 then on.
 
-**Writing, by the operator** (Program run details → Advanced):
+**Reading, by the operator:** the viewer's **Keys** panel lists every
+declared key of the run with its type and current value (poses in a compact
+form), re-read while the panel is open whenever the run's state or a node's
+status changes. A key without a value shows *no value*; a value too large to
+show (beyond 16 KiB, a text over 2048 bytes, more than 512 elements or nested
+deeper than 16 levels, for example a long model response) shows *too large to
+show*. Without a run the panel shows *No run is active*. The same values are
+read with `GET /api/program/runs/{program_run_id}/blackboard-values?application_start_id=<id>`
+(`manyforge.program_runtime_blackboard_values.v1`); the read changes nothing.
+
+**Writing, by the operator** (the viewer's **Keys** panel):
 
 - Runtime blackboard: write a value, with an editor for the key's type, for
   keys declared `write` or `read_write`, while the run is running or paused
@@ -152,15 +162,49 @@ then on.
 
 ## 7. System keys
 
-The system writes three families of read-only keys: `node_outcome.<node>`
-(each motion node's last outcome, `none` until it ends in this Run),
+The system writes four families of read-only keys: `node_outcome.<node>`
+(each motion node's last outcome, `none` until it ends in this Run and
+again while it runs a new attempt),
 `interrupt_state.<rule_id>` (each Deployment global rule's state: `inactive`,
-`clear` or `tripped`; no value while the rule can't watch its signals) and
+`clear` or `tripped`; no value while the rule can't watch its signals),
+`motion_group_state.<group>` (each motion group's state, as its row in the
+Motion panel shows it) and
 `active_tcp/<component_id>/<command_target_id>` (the
 [Active TCP](TCPS.md#the-active-tcp) of that robot target, as a `tcp_entry`). You never declare or write
 these keys, and no key, namespace or Program parameter may use the names
-`node_outcome`, `interrupt_state` or `active_tcp`. The first two values are
-listed in [Interrupts](INTERRUPTS.md#6-system-keys-and-their-values).
+`node_outcome`, `interrupt_state`, `motion_group_state` or `active_tcp`. The
+values of the first three are listed in
+[Interrupts](INTERRUPTS.md#6-system-keys-and-their-values).
+
+### Motion group state
+
+Every motion group of the Program has a `string` key
+`motion_group_state.<group>`: one for each execution group a node names, and
+`motion_group_state.all` for the **All groups** row. Program logic reads it
+like any key (Check value, Wait, conditions, computed keys, **Use key…**), for
+example to test whether one robot is stopped while another keeps working.
+
+| Value | Motion panel | Meaning |
+| --- | --- | --- |
+| `ready` | Waiting for Run | The group's work has not been released yet: it starts when Run is pressed |
+| `running` | Running | Released; none of its nodes is held |
+| `stopping` | Stopping | A Stop of the group is in progress, or a Halt is settling |
+| `held` | Stopped | Every node of the group is stopped (Resume continues it), or the run is halted (Execute continues it) |
+| `mixed` | Mixed | Some of its nodes are held, others are not |
+| `faulted` | Stop fault | A Stop of the group failed and needs recovery |
+| `unavailable` | — | No current Run (before the first Run, after Reset, once the Run has ended), or the group's state cannot be read |
+
+- The value is the group's state in the run's runtime controls, written by
+  the Program runner each time it changes. It is `unavailable` between
+  Runs and becomes the group's state when a Run starts (`ready` while its
+  work waits for Run).
+- A group stopped by a failure pause (all groups, or the failed node's own
+  groups with `intervention_stop_scope: own_groups`) is `held` until the
+  hold that owns it is retried or continued.
+- A Halt shows every group `stopping` until it settles, then `held`; a group
+  whose Stop failed shows `faulted`.
+- Neither nodes nor the operator can write it. A Program that reads the key
+  of a group it does not have is refused by validation.
 
 `active_tcp` is a structured key. The runtime uses it for a move's **Current**
 selector, and the run view displays it. Robot Control reads the robot's status.

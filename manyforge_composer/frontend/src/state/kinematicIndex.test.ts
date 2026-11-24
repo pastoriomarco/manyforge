@@ -16,7 +16,7 @@ const applied: Pick<SourceModelProjection, 'components'> = {
 
 function draft(attachments: Array<[string, string, string]>): Record<string, JsonValue> {
   return {
-    api_version: 'manyforge.deployment_intent.v2',
+    api_version: 'manyforge.deployment_intent.v3',
     components: ['lite6_robot', 'lite_gripper', 'camera', 'ur10e_robot'].map((id) => ({ component_id: id })),
     attachments: attachments.map(([parent, parentInterface, child]) => ({
       parent: { component_id: parent, interface: parentInterface },

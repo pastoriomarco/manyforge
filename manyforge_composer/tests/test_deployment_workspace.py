@@ -35,12 +35,13 @@ from manyforge_composer.backend.state import (
     ComposerState,
 )
 from manyforge_composer.backend.app import create_app
-from manyforge_composer.backend.security import UNTITLED_SCENARIO_PATH
 from manyforge_headless_api.client import HeadlessClientError
 
 
 _DIGEST = "sha256:" + "1" * 64
 _APPLY_KEY = "e" * 32
+# A Deployment intent field an ordinary Draft edit changes.
+_CLEARANCE = ["collision_rules", 0, "clearance_m"]
 
 
 def _command(client: TestClient, path: str, body: dict[str, Any], key: str = _APPLY_KEY):
@@ -305,7 +306,6 @@ def _compile(source: str) -> CompiledDeploymentDocument:
     return CompiledDeploymentDocument(
         document=document,
         canonical_json=canonical,
-        deployment_artifact_id=document["deployment_artifact_id"],
         deployment_revision=revision,
         graph_revision=graph_revision,
     )
@@ -314,10 +314,8 @@ def _compile(source: str) -> CompiledDeploymentDocument:
 def _document() -> dict[str, Any]:
     return {
         "api_version": "manyforge.deployment.v1",
-        "deployment_artifact_id": "cell_a",
         "deployment_revision": _DIGEST,
         "cell_id": "cell_a",
-        "name": "Cell A",
         "capability_provider_bindings": [],
         "graph": {
             "component_attachments": [],
@@ -523,6 +521,13 @@ class _Coordinator:
     ):
         if validate is not None:
             validate()
+        if session == "scenario":
+            return LocalAuthoringCommit(
+                snapshot=workspace.replace(
+                    expected_identity=expected_identity, install=install
+                ),
+                admission_generation=2,
+            )
         commit = (
             workspace.commit_deployment if session == "deployment"
             else workspace.commit_program
@@ -600,7 +605,6 @@ def _client(tmp_path: Path) -> tuple[TestClient, ComposerState]:
     state.authoring_admission = _Coordinator()  # type: ignore[assignment]
     state.headless_client = _Headless()  # type: ignore[assignment]
     state.allowed_fs_roots = [str(tmp_path)]
-    state.allowed_deployment_write_roots = [str(tmp_path)]
     app = FastAPI()
     app.include_router(create_deployment_draft_router(state))
     return TestClient(app), state
@@ -617,11 +621,9 @@ def test_workspace_read_while_apply_publishes_shows_not_ready(
         "ready": True,
         "unavailable_reasons": [],
         "published_scenario": {
-            "deployment_artifact_id": "cell",
             "deployment_revision": digest,
             "retained_bundle_id": digest,
             "graph_revision": digest,
-            "program_id": "p",
             "program_revision": digest,
             "scenario_id": "s",
             "source_document_digest": digest,
@@ -664,143 +666,7 @@ def test_workspace_read_while_apply_publishes_shows_not_ready(
     assert applied["activationOrder"] is None
 
 
-@pytest.mark.parametrize("route", ["save", "save-as"])
-def test_refused_deployment_save_writes_no_artifact(
-    tmp_path: Path, route: str
-) -> None:
-    """Admission precedes the artifact write, so its refusal has no effect."""
-
-    class Refusing:
-        def authoring_admission(self) -> dict[str, Any]:
-            return {"authoring_allowed": False, "admission_generation": 1}
-
-        def acquire_authoring_transaction(self, _request):
-            raise AssertionError("a refused Save takes no claim")
-
-    client, state = _client(tmp_path)
-    source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
-    workspace = client.get("/api/deployment/workspace").json()
-    workspace = client.post(
-        "/api/deployment/open-draft",
-        json=_request(workspace, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
-    workspace = client.post(
-        "/api/deployment/draft/mutations",
-        json=_request(workspace, path=["name"], value="Edited cell"),
-    ).json()
-    source_bytes = source.read_bytes()
-    state.authoring_admission = AuthoringAdmissionCoordinator(Refusing(), 0x3F9A0000000000A1)  # type: ignore[arg-type]
-
-    refused = client.post(
-        f"/api/deployment/{route}",
-        json=(
-            _request(workspace, kind="save")
-            if route == "save"
-            else _request(
-                workspace,
-                path=str(tmp_path / "saved"),
-                confirmOverwrite=False,
-                kind="save",
-            )
-        ),
-    )
-
-    assert refused.status_code == 409, refused.text
-    assert refused.json()["detail"]["code"] == "authoring_not_ready"
-    assert refused.json()["detail"]["effect"] == "none"
-    assert source.read_bytes() == source_bytes
-    assert not (tmp_path / "saved.deployment.yaml").exists()
-    assert client.get("/api/deployment/workspace").json() == workspace
-
-
-def test_deployment_save_as_never_writes_into_the_built_in_untitled_scenario(
-    tmp_path: Path,
-) -> None:
-    # A write root that contains the package still never reaches Untitled.
-    client, state = _client(tmp_path)
-    package = str(UNTITLED_SCENARIO_PATH.parent)
-    state.allowed_fs_roots = [str(tmp_path), package]
-    state.allowed_deployment_write_roots = [str(tmp_path), package]
-    untitled_files = {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()}
-    source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
-    workspace = client.get("/api/deployment/workspace").json()
-    workspace = client.post(
-        "/api/deployment/open-draft",
-        json=_request(workspace, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
-    for index, path in enumerate(
-        (UNTITLED_SCENARIO_PATH / "extra", UNTITLED_SCENARIO_PATH / "deployment.yaml")
-    ):
-        refused = client.post(
-            "/api/deployment/save-as",
-            json=_request(
-                workspace, path=str(path), confirmOverwrite=True, kind=f"untitled-{index}"
-            ),
-        )
-        assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"]["code"] == "scenario_project_read_only"
-        assert client.get("/api/deployment/workspace").json() == workspace
-    assert {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()} == untitled_files
-
-    saved = client.post(
-        "/api/deployment/save-as",
-        json=_request(workspace, path=str(tmp_path / "saved"), confirmOverwrite=False, kind="save"),
-    )
-    assert saved.status_code == 200, saved.text
-    assert (tmp_path / "saved.deployment.yaml").exists()
-
-
-@pytest.mark.parametrize("stale_at", ["before_write", "after_write"])
-def test_deployment_save_draft_refusal_is_marked_only_before_the_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_at: str
-) -> None:
-    client, state = _client(tmp_path)
-    source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
-    workspace = client.get("/api/deployment/workspace").json()
-    workspace = client.post(
-        "/api/deployment/open-draft",
-        json=_request(workspace, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
-
-    def stale(*_args, **_kwargs):
-        raise DeploymentDraftError(
-            "deployment_draft_stale", "Deployment Draft changed", status_code=409
-        )
-
-    monkeypatch.setattr(
-        state.deployment_draft_session,
-        "require_current" if stale_at == "before_write" else "install_prepared_save",
-        stale,
-    )
-    target = tmp_path / "saved.deployment.yaml"
-    refused = client.post(
-        "/api/deployment/save-as",
-        json=_request(
-            workspace, path=str(tmp_path / "saved"), confirmOverwrite=False, kind="save"
-        ),
-    )
-
-    detail = refused.json()["detail"]
-    if stale_at == "before_write":
-        # Nothing was written: the operation recorded no effect.
-        assert refused.status_code == 409, refused.text
-        assert detail["code"] == "deployment_draft_stale"
-        assert detail["effect"] == "none"
-        assert not target.exists()
-    else:
-        # Written, then the workspace owner contained the failed adoption.
-        assert refused.status_code == 409, refused.text
-        assert detail["code"] == "deployment_saved_baseline_not_adopted"
-        assert detail["causeCode"] == "composer_workspace_install_failed"
-        assert detail["path"] == str(target)
-        assert "effect" not in detail
-        assert target.exists()
-
-
-def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
+def test_deployment_open_edit_discard_share_one_revision_fenced_workspace(
     tmp_path: Path,
 ):
     client, state = _client(tmp_path)
@@ -808,9 +674,8 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     # component inventory), so the Applied baseline is a canonical intent.
     _replace_deployment_session(state, DeploymentDraftSession())
     authored = {
-        "api_version": "manyforge.deployment_intent.v2",
-        "deployment_artifact_id": "cell_a",
-        "name": "Cell A",
+        "api_version": "manyforge.deployment_intent.v3",
+        "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
         "components": [],
         "attachments": [],
         "policies": {},
@@ -825,7 +690,6 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     )
     assert response.status_code == 200, response.text
     workspace = response.json()
-    assert workspace["draft"]["deploymentArtifactId"] == "cell_a"
     assert workspace["draft"]["differsFromSaved"] is False
     applied = deepcopy(workspace["draft"]["document"])
     # Manager assigns the prepared Deployment revision; intent has none.
@@ -833,31 +697,12 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
 
     response = client.post(
         "/api/deployment/draft/mutations",
-        json=_request(workspace, path=["name"], value="Edited cell"),
+        json=_request(workspace, path=_CLEARANCE, value=0.002),
     )
     assert response.status_code == 200, response.text
     workspace = response.json()
-    assert workspace["draft"]["document"]["name"] == "Edited cell"
+    assert workspace["draft"]["document"]["collision_rules"][0]["clearance_m"] == 0.002
     assert workspace["draft"]["differsFromSaved"] is True
-
-    saved = tmp_path / "saved"
-    response = client.post(
-        "/api/deployment/save-as",
-        json=_request(workspace, path=str(saved), confirmOverwrite=False, kind="save"),
-    )
-    assert response.status_code == 200, response.text
-    workspace = response.json()
-    assert workspace["saved"]["path"].endswith("saved.deployment.yaml")
-    assert (
-        json.loads((tmp_path / "saved.deployment.yaml").read_text())["name"]
-        == "Edited cell"
-    )
-
-    response = client.post(
-        "/api/deployment/draft/mutations",
-        json=_request(workspace, path=["name"], value="Unsaved"),
-    )
-    workspace = response.json()
     assert applied is not None
     publication = {
         "origin": {"kind": "scenario", "scenario_id": "cell_a", "source_document_digest": _DIGEST,
@@ -875,6 +720,7 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
         {
             "deployment": applied,
             "model_source_closure": {},
+            "scene_mesh_closure": {},
             "program_role_assignment": {},
             "source_document_digest": _DIGEST,
             "scenario_id": "cell_a",
@@ -897,7 +743,7 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
         json=_request(workspace, kind="discard"),
     )
     assert response.status_code == 200, response.text
-    assert response.json()["draft"]["document"]["name"] == applied["name"]
+    assert response.json()["draft"]["document"]["collision_rules"] == applied["collision_rules"]
     assert response.json()["managerApplied"]["activationOrder"]["componentIds"] == [
         row["component_id"] for row in applied["components"]
     ]
@@ -983,25 +829,25 @@ def test_invalid_or_stale_deployment_mutation_never_changes_the_draft(
 
     accepted = client.post(
         "/api/deployment/draft/mutations",
-        json=_request(opened, path=["name"], value="Current", kind="accepted"),
+        json=_request(opened, path=["cell_id"], value="current", kind="accepted"),
     )
     assert accepted.status_code == 200
     current = accepted.json()
     redundant = client.post(
         "/api/deployment/draft/mutations",
-        json=_request(current, path=["name"], value="Current", kind="redundant"),
+        json=_request(current, path=["cell_id"], value="current", kind="redundant"),
     )
     assert redundant.status_code == 200
     assert redundant.json()["draft"]["revision"] == current["draft"]["revision"]
     stale = client.post(
         "/api/deployment/draft/mutations",
-        json=_request(opened, path=["name"], value="Stale", kind="stale"),
+        json=_request(opened, path=["cell_id"], value="stale", kind="stale"),
     )
     assert stale.status_code == 409
     assert stale.json()["detail"]["code"] == "deployment_draft_stale"
     assert (
-        client.get("/api/deployment/workspace").json()["draft"]["document"]["name"]
-        == "Current"
+        client.get("/api/deployment/workspace").json()["draft"]["document"]["cell_id"]
+        == "current"
     )
 
 
@@ -1035,7 +881,7 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
     base_revision = "sha256:" + "1" * 64
     edited = client.post(
         "/api/deployment/draft/mutations",
-        json=_request(opened, path=["name"], value="Authored", kind="edit"),
+        json=_request(opened, path=_CLEARANCE, value=0.002, kind="edit"),
     ).json()
     candidate_revision = "sha256:" + "8" * 64
     assert candidate_revision != base_revision
@@ -1248,6 +1094,10 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
     applied_context = {
         "deployment": document,
         "model_source_closure": capture_sources(state, document),
+        "scene_mesh_closure": state.capture_scene_mesh_closure(
+            state.draft_session.retained_state()["program"],
+            project_path=state.scenario_project_path,
+        ),
         "source_document_digest": state.scenario_source_document_digest,
         "scenario_id": state.scenario_document_id,
         "scenario_project_path": state.scenario_project_path,
@@ -1286,7 +1136,7 @@ def test_effective_values_read_the_current_deployment_draft(
     assert client.get("/api/deployment/effective").json() == {"fields": {}}
     retained = state.deployment_draft_session.retained_state()
     retained["document"] = {
-        "api_version": "manyforge.deployment_intent.v2",
+        "api_version": "manyforge.deployment_intent.v3",
         "components": [{"component_id": "robot", "configuration": {
             "runtime_kind": "ros2_control",
             "runtime_configuration": {"planner_rng_seed": 7}}}],
@@ -1373,13 +1223,13 @@ def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     opened = client.get("/api/deployment/workspace").json()
     client.post(
         "/api/deployment/draft/mutations",
-        json=_request(opened, path=["name"], value="Edited", kind="edit"),
+        json=_request(opened, path=_CLEARANCE, value=0.002, kind="edit"),
     )
     program_state = state.draft_session.retained_state()
     program_state["saved_document"] = deepcopy(saved_program)
     program_state["saved_path"] = str(project / "program.yaml")
     program_state["saved_program_revision"] = saved_program["program_revision"]
-    program_state["authoring"]["description"] = "Edited only in the Draft."
+    program_state["authoring"]["compatibility"]["tags"] = ["edited-only-in-the-draft"]
     program_state["draft_revision"] += 1
     candidate, program_state["diagnostics"] = derive_candidate(
         program_state["authoring"], state.node_environment.catalog)
@@ -1395,9 +1245,9 @@ def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             expected_revision=program_state["draft_revision"] - 1,
         ),
     )
-    assert state.draft_session.retained_state()["authoring"]["description"] == (
-        "Edited only in the Draft."
-    )
+    assert state.draft_session.retained_state()["authoring"]["compatibility"]["tags"] == [
+        "edited-only-in-the-draft"
+    ]
 
     class CandidateHeadless(_Headless):
         def manager_status(self):
@@ -1455,8 +1305,8 @@ def test_scenario_revert_activates_saved_program_and_deployment_and_restores_bot
     assert effects[0]["program"] == saved_program
     assert effects[0]["scene_initialization"] == "preserve"
     assert state.deployment_draft_session.retained_state()["document"] == compiled.document
-    assert state.draft_session.retained_state()["authoring"]["description"] == (
-        program_model.to_dict()["description"]
+    assert state.draft_session.retained_state()["authoring"]["compatibility"]["tags"] == (
+        program_model.to_dict()["compatibility"]["tags"]
     )
 
 
@@ -1531,21 +1381,20 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
         "candidate_graph_revision": "sha256:" + "5" * 64,
     }
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v7",
+        "schema_version": "manyforge.prepared_activation_input.v8",
         "origin": {"kind": "scenario", "scenario_id": "scenario-a",
                    "source_document_digest": "sha256:" + "7" * 64,
                    "project_path": "/projects/scenario-a.scenario"},
         "prepared_activation_id": "sha256:" + "6" * 64,
         "captured_input_digest": "sha256:" + "8" * 64,
-        "deployment_artifact_id": "cell-a",
         "deployment_revision": "sha256:" + "9" * 64,
         "retained_bundle_id": receipt["candidate_retained_bundle_id"],
         "graph_revision": receipt["candidate_graph_revision"],
-        "program_id": "program-a",
         "program_revision": "sha256:" + "a" * 64,
         "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "b" * 64},
         "node_environment_digest": "sha256:" + "c" * 64,
         "assistant_mode": "forbidden",
+        "scene_meshes": [],
     }
     manager_requests: list[dict[str, Any]] = []
 
@@ -1567,8 +1416,9 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
     parent_claim = {"intent": {"owner_role": "authoring_owner"}}
     result = state.execute_authored_deployment_candidate(
         {
-            "deployment": {"api_version": "manyforge.deployment_intent.v2"},
+            "deployment": {"api_version": "manyforge.deployment_intent.v3"},
             "model_source_closure": {},
+            "scene_mesh_closure": {},
             "program_role_assignment": {},
             "source_document_digest": prepared_activation["origin"]["source_document_digest"],
             "scenario_id": prepared_activation["origin"]["scenario_id"],
@@ -1583,7 +1433,6 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
                 "request_key": "1" * 32,
                 "application_start_id": "3f9a0000000000a1",
                 "source_label": "manyforge_composer_deployment_apply",
-                "deployment_artifact_id": "cell-a",
                 "deployment_revision": "sha256:" + "9" * 64,
                 "expected_current": receipt["expected_current"],
                 "reject_if_affected_busy": True,
@@ -1818,22 +1667,15 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
     assert rows[2]["default_contract_parameters"] == {}
     assert rows[3]["control_binding_id"] == "other_binding"
     workspace = updated.json()
-    saved = client.post(
-        "/api/deployment/save-as",
-        json=_request(
-            workspace,
-            path=str(tmp_path / "saved.deployment.yaml"),
-            confirmOverwrite=False,
-            kind="save-stop",
-        ),
-    )
-    assert saved.status_code == 200, saved.text
+    # The edited policies round-trip through a written Deployment document.
+    written = tmp_path / "written.deployment.yaml"
+    written.write_text(json.dumps(workspace["draft"]["document"]), encoding="utf-8")
     reopened = client.post(
         "/api/deployment/open-draft",
         json=_request(
-            saved.json(),
-            path=str(tmp_path / "saved.deployment.yaml"),
-            confirmDiscard=False,
+            workspace,
+            path=str(written),
+            confirmDiscard=True,
             kind="reopen-stop",
         ),
     )
@@ -1844,12 +1686,10 @@ def test_focused_controlled_stop_updates_all_derived_routes_and_not_hard_stop(
     )
 
 
-def test_deployment_artifacts_remain_confined_and_save_as_requires_overwrite(
+def test_deployment_artifacts_remain_confined(
     tmp_path: Path,
 ) -> None:
     client, _state = _client(tmp_path)
-    source = tmp_path / "cell_a.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
     outside = tmp_path.parent / f"{tmp_path.name}-outside.deployment.yaml"
     outside.write_text(json.dumps(_document()), encoding="utf-8")
     try:
@@ -1867,30 +1707,7 @@ def test_deployment_artifacts_remain_confined_and_save_as_requires_overwrite(
         assert rejected_open.json()["detail"]["code"] == (
             "deployment_artifact_path_invalid"
         )
-
-        opened = client.post(
-            "/api/deployment/open-draft",
-            json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
-        ).json()
-        existing = tmp_path / "existing.deployment.yaml"
-        existing.write_text("unchanged\n", encoding="utf-8")
-        rejected_save = client.post(
-            "/api/deployment/save-as",
-            json=_request(
-                opened,
-                path=str(existing),
-                confirmOverwrite=False,
-                kind="save-existing",
-            ),
-        )
-        assert rejected_save.status_code == 409
-        assert rejected_save.json()["detail"]["code"] == (
-            "deployment_artifact_overwrite_confirmation_required"
-        )
-        assert existing.read_text(encoding="utf-8") == "unchanged\n"
-        assert (
-            client.get("/api/deployment/workspace").json()["draft"] == opened["draft"]
-        )
+        assert client.get("/api/deployment/workspace").json()["draft"] == initial["draft"]
     finally:
         outside.unlink(missing_ok=True)
 
@@ -1926,8 +1743,8 @@ def test_deployment_draft_retained_state_round_trips_exactly() -> None:
     )
     opened = source.snapshot()
     changed = source.preview_update(
-        ["name"],
-        "Retained edit",
+        ["cell_id"],
+        "retained_edit",
         draft_id=opened["draft"]["id"],
         expected_revision=opened["draft"]["revision"],
     )
@@ -1955,9 +1772,8 @@ def test_save_as_path_rebase_matches_saved_scenario_but_real_edits_do_not() -> N
     source_root = Path("/workspace/source/cell")
     destination_root = Path("/workspace/copies/deep/cell")
     deployment = {
-        "api_version": "manyforge.deployment_intent.v2",
-        "deployment_artifact_id": "fixture_deployment",
-        "name": "Fixture deployment",
+        "api_version": "manyforge.deployment_intent.v3",
+        "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
         "components": [
             {
                 "component_id": "fixture_robot",
@@ -2010,7 +1826,7 @@ def test_save_as_path_rebase_matches_saved_scenario_but_real_edits_do_not() -> N
 
     draft = state.deployment_draft_session.retained_state()
     edited = deepcopy(compiled.document)
-    edited["name"] = "An actual edit"
+    edited["collision_rules"][0]["clearance_m"] = 0.002  # an actual edit
     changed = state.deployment_draft_session.preview_source(json.dumps(edited))
     state.deployment_draft_session.commit_compiled(
         changed,
@@ -2188,7 +2004,7 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
     }
 
     class Headless:
-        def submit_control_command(self, _body):
+        def submit_control_command(self, _body, *, received_monotonic_ns=None):
             assert command_kind != "program_motion_start"
             return {"accepted": True}
 
@@ -2205,7 +2021,7 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
         body = {
             "request_context": {"request_key": "b1" * 16, "source_label": "test"},
             "application_start_id": "3f9a0000000000a1",
-            "program_id": "manual", "program_revision": _DIGEST,
+            "program_revision": _DIGEST,
             "program_binding_id": _DIGEST, "program_run_id": None,
             "expected_graph_revision": _DIGEST, "expected_retained_bundle_id": _DIGEST,
             "expected_scene_revision": {"scene_id": _DIGEST, "revision_id": 1, "content_hash": _DIGEST},
@@ -2220,7 +2036,7 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
                                   "speed_profile": {"velocity_scale": 1.0, "acceleration_scale": 1.0,
                                                     "max_tcp_linear_speed_mps": None},
                                   "timeouts": {"planning_timeout_s": 2.0, "execution_timeout_s": 10.0},
-                                  "cache_mode": "default",
+                                  "cache_mode": "default", "collision_rules": [],
                                   "target_mode": "absolute", "per_joint_dynamics_limits": {},
                                   "motion_interrupt_scopes": [],
                                   "motion": {"kind": "joint_goal", "joint_names": ["joint1"], "positions_rad": [0.1]},
@@ -2279,7 +2095,9 @@ def test_retry_is_refused_with_unapplied_draft_and_reset_is_not(route: str) -> N
     submitted: list[str] = []
 
     class Headless:
-        def submit_control_command(self, body):
+        def submit_control_command(self, body, *, received_monotonic_ns):
+            # Composer's receipt time, taken before its own work (OD-240).
+            assert type(received_monotonic_ns) is int
             submitted.append(body["payload"]["action_id"])
             return {"accepted": True}
 
@@ -2337,20 +2155,19 @@ def test_retry_is_refused_with_unapplied_draft_and_reset_is_not(route: str) -> N
     assert submitted == ["reset_cycle", "retry_motion_from_current_state"]
 
 
-
 def _configuration_preparation(tmp_path: Path):
     digest = "sha256:" + "a" * 64
     current = {"retained_bundle_id": "bundle.current", "graph_revision": "graph.current"}
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v7",
+        "schema_version": "manyforge.prepared_activation_input.v8",
         "prepared_activation_id": digest, "origin": {"kind": "scenario", "scenario_id": "cell",
         "source_document_digest": digest, "project_path": "/projects/cell.scenario"},
         "captured_input_digest": digest,
-        "deployment_artifact_id": "deployment.fixture", "deployment_revision": digest,
+        "deployment_revision": digest,
         "retained_bundle_id": "bundle.next", "graph_revision": "graph.next",
-        "program_id": None, "program_revision": None,
+        "program_revision": None,
         "program_outcome": {"kind": "no_program"},
-        "node_environment_digest": digest, "assistant_mode": "forbidden",
+        "node_environment_digest": digest, "assistant_mode": "forbidden", "scene_meshes": [],
     }
     preview = {
         "api_version": "manyforge.manager_command_response.v3", "ok": True,
@@ -2361,7 +2178,7 @@ def _configuration_preparation(tmp_path: Path):
         )},
         "candidate_receipt": {
             "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
-            "deployment_artifact_id": "deployment.fixture", "deployment_revision": digest,
+            "deployment_revision": digest,
             "prepared_activation_id": digest,
             "candidate_retained_bundle_id": "bundle.next", "candidate_graph_revision": "graph.next",
             "expected_current": current, "expected_admission_generation": 1,
@@ -2375,7 +2192,7 @@ def _configuration_preparation(tmp_path: Path):
                 {"controllable_component_id": "arm.2", "disposition": "retain", "replacement_reasons": []},
             ],
             "destructive": False, "detached_components": [], "shared_scene_projection_changed": False,
-            "program": {"executable": False, "non_executable": None, "program_id": None, "program_revision": None},
+            "program": {"executable": False, "non_executable": None, "program_revision": None},
 
         },
     }
@@ -2413,7 +2230,7 @@ def _configuration_preparation(tmp_path: Path):
     intent = {
         "scenario_id": "cell", "project_path": "/projects/cell.scenario",
         "source_document_digest": digest, "captured_input_digest": digest,
-        "deployment": {}, "model_source_closure": {}, "program": None, "program_role_assignment": {},
+        "deployment": {}, "model_source_closure": {}, "scene_mesh_closure": {}, "program": None, "program_role_assignment": {},
         "expected_manager_current": current, "expected_admission_generation": 1,
         "application_start_id": "3f9a0000000000a1", "request_key": "d1" * 16,
         "confirmation_token": None, "draft_id": "draft", "draft_revision": 1,
@@ -2600,7 +2417,7 @@ def test_workspace_publishes_whether_saved_differs_from_the_exact_applied_deploy
                    "retained_bundle_id": "bundle", "graph_revision": _DIGEST}
     monkeypatch.setattr(state, "published_scenario", lambda: {"ready": True, "published_scenario": publication})
     saved = _compile(json.dumps({**_document(), "components": []}))
-    other = _compile(json.dumps({**_document(), "components": [], "name": "Cell B"}))
+    other = _compile(json.dumps({**_document(), "components": [], "cell_id": "cell_b"}))
     applied: dict[str, Any] = {"document": saved.document}
     monkeypatch.setattr(state, "applied_deployment_for_publication",
                         lambda _current: applied["document"])
@@ -2636,6 +2453,63 @@ def test_workspace_publishes_whether_saved_differs_from_the_exact_applied_deploy
     assert view["saved"]["differsFromApplied"] is False
 
 
+def test_draft_without_required_defaults_matches_the_deployment_it_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Draft built from catalog rows leaves the robot's required runtime
+    defaults absent; Apply captures the document with them filled. Run
+    admission, Saved-vs-Applied and the Execute gate compare the same way."""
+
+    from manyforge_composer.backend.deployment_defaults import with_defaults
+    from manyforge_composer.backend.routes_deployment_draft import _workspace
+    from manyforge_composer.backend.routes_headless import (
+        _require_applied_authoring_drafts,
+    )
+    from manyforge_composer.backend.scenario_restore import saved_deployment_differs
+
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
+    state.headless_client = object()  # type: ignore[assignment]
+    session = DeploymentDraftSession(compiler=_compile)
+    _replace_deployment_session(state, session)
+    robot = {
+        "component_id": "lite6_robot",
+        "target_settings": {"arm": {"maximum_tcp_linear_speed_mps": 0.25}},
+        "configuration": {"runtime_kind": "ros2_control",
+                          "runtime_configuration": {"component_streams": []}},
+    }
+    draft = _compile(json.dumps({**_document(), "components": [robot]}))
+    session.commit_open(draft, "/workspace/cell_a.deployment.yaml",
+                        draft_id=session.retained_state()["draft_id"],
+                        expected_revision=0, confirm_discard=False)
+    document = session.retained_state()["document"]
+    applied = with_defaults(document)
+    assert applied != document
+    publication = {"scenario_id": "cell_a", "deployment_revision": _DIGEST,
+                   "retained_bundle_id": "bundle", "graph_revision": _DIGEST,
+                   "program_revision": _DIGEST}
+    monkeypatch.setattr(state, "published_scenario",
+                        lambda: {"ready": True, "published_scenario": publication})
+    monkeypatch.setattr(state, "applied_deployment_for_publication",
+                        lambda _current: deepcopy(applied))
+    view = _workspace(state)
+    assert view["runAdmission"] == {"ready": True, "reason": None}
+    _require_applied_authoring_drafts(state)
+    authored = {key: value for key, value in document.items()
+                if key != "deployment_revision"}
+    assert saved_deployment_differs(
+        authored, {key: value for key, value in applied.items()
+                   if key != "deployment_revision"}) is False
+    # A real difference still counts.
+    changed = deepcopy(applied)
+    changed["components"][0]["configuration"]["runtime_configuration"][
+        "execution_tick_hz"] = 50
+    monkeypatch.setattr(state, "applied_deployment_for_publication",
+                        lambda _current: deepcopy(changed))
+    assert _workspace(state)["runAdmission"]["ready"] is False
+    with pytest.raises(HTTPException):
+        _require_applied_authoring_drafts(state)
+
+
 @pytest.mark.parametrize("origin", [
     {"kind": "scenario", "scenario_id": "foreign", "source_document_digest": _DIGEST,
      "project_path": "/projects/foreign.scenario"},
@@ -2649,7 +2523,7 @@ def test_workspace_publishes_whether_saved_differs_from_the_exact_applied_deploy
 def test_captured_authoring_context_requires_checked_scenario_origin(origin) -> None:
     state = ComposerState(application_start_id=0x3F9A0000000000A1)
     with pytest.raises(AuthoringOperationError) as error:
-        state._captured_deployment_context({"deployment": {"name": "current"},
+        state._captured_deployment_context({"deployment": {"cell_id": "current"},
             "scenario_id": "cell_a", "source_document_digest": _DIGEST,
             "project_path": "/projects/cell_a.scenario"}, {"origin": origin})
     assert error.value.code == "activation_authoring_capture_mismatch"
@@ -2688,9 +2562,8 @@ def _io_component(identity: str, timeout_s: int = 30) -> dict[str, Any]:
 
 def _io_intent(*components: dict[str, Any]) -> dict[str, Any]:
     return {
-        "api_version": "manyforge.deployment_intent.v2",
-        "deployment_artifact_id": "cell_a",
-        "name": "Cell A",
+        "api_version": "manyforge.deployment_intent.v3",
+        "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
         "components": list(components),
         "attachments": [],
         "policies": {},
@@ -2759,6 +2632,36 @@ def test_every_component_edit_is_an_ordinary_draft_edit(
 
     assert edited.status_code == 200, edited.text
     assert edited.json()["draft"]["revision"] == before["draft"]["revision"] + 1
+
+
+def test_removing_a_mounted_tool_drops_its_mount_row_in_the_same_edit(tmp_path: Path) -> None:
+    """A mounted tool and its attachment row leave together; the Draft never
+    holds an unattached tool without a root pose in between."""
+
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state, _scenario_robot_and_tool(), compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+
+    removed = client.post(
+        "/api/deployment/draft/components/remove",
+        json=_request(before, component_id="hand", kind="remove-hand"),
+    )
+
+    assert removed.status_code == 200, removed.text
+    document = removed.json()["draft"]["document"]
+    assert [row["component_id"] for row in document["components"]] == ["arm"]
+    assert document["attachments"] == []
+    assert removed.json()["draft"]["revision"] == before["draft"]["revision"] + 1
+    assert removed.json()["managerApplied"] == before["managerApplied"]
+
+    unknown = client.post(
+        "/api/deployment/draft/components/remove",
+        json=_request(removed.json(), component_id="hand", kind="remove-again"),
+    )
+    assert unknown.status_code == 404, unknown.text
+    assert "component_not_found" in unknown.text
 
 
 def _scenario_robot_and_tool() -> dict[str, Any]:
@@ -2968,3 +2871,144 @@ def test_changing_or_removing_an_attachment_is_a_draft_edit(
 
     assert edited.status_code == 200, edited.text
     assert edited.json()["draft"]["document"]["attachments"] == after()
+
+
+def _tool_component(identity: str, profile: str) -> dict[str, Any]:
+    """A tool row: no root pose (its mount places it, or it is unmounted)."""
+
+    row = _model_component(identity, mounted=True)
+    row["component_profile_id"] = profile
+    return row
+
+
+def test_an_unmounted_tool_is_accepted_in_the_draft_but_not_a_robot(tmp_path: Path) -> None:
+    """OD-366: a tool may be added with no robot (no attachment, no root pose);
+    another model component without a root pose is still refused."""
+
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state, _io_intent(_model_component("arm")),
+        compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+
+    added = client.post(
+        "/api/deployment/draft/components",
+        json=_request(
+            before, components=[_tool_component("probe", "manyforge.passive_tool")],
+            attachments=[], kind="add-tool",
+        ),
+    )
+
+    assert added.status_code == 200, added.text
+    document = added.json()["draft"]["document"]
+    rows = {row["component_id"]: row for row in document["components"]}
+    assert "root_pose_in_cell" not in rows["probe"]
+    assert document["attachments"] == []
+
+    refused = client.post(
+        "/api/deployment/draft/components",
+        json=_request(
+            added.json(), components=[_model_component("arm_2", mounted=True)],
+            attachments=[], kind="add-robot",
+        ),
+    )
+    assert refused.status_code == 400
+    assert refused.json()["detail"]["code"] == "deployment_draft_invalid"
+    assert "only a tool may be unmounted" in refused.json()["detail"]["message"]
+
+
+def test_preview_and_apply_refuse_an_unmounted_tool(tmp_path: Path) -> None:
+    """OD-366: the cell never holds a floating tool; the refusal names it."""
+
+    _unused, state = _client(tmp_path)
+    deployment = validate_deployment_draft_document(json.dumps(_io_intent(
+        _model_component("arm"), _tool_component("probe", "manyforge.passive_tool"),
+    ))).document
+
+    for apply in (False, True):
+        with pytest.raises(HTTPException) as refused:
+            state._prepare_authored_deployment_candidate(
+                {"deployment": deployment}, None, apply=apply
+            )
+        assert refused.value.status_code == 409
+        assert refused.value.detail["code"] == "deployment_tool_unmounted"
+        assert refused.value.detail["message"].startswith("Tool probe is not mounted")
+        assert refused.value.detail["details"] == {"component_ids": ["probe"]}
+        assert refused.value.detail["effect"] == "none"
+
+
+def test_replace_tool_moves_the_mount_and_rewrites_both_drafts(tmp_path: Path) -> None:
+    """OD-367: the new tool takes over the old tool's mount and every reference
+    to it in the Deployment and Program Drafts in one edit; the old tool
+    leaves, and what the new tool does not declare is listed."""
+
+    client, state = _client(tmp_path)
+    state.draft_session = ComposerDraftSession(Program(
+        Path(__file__).resolve().parents[2]
+        / "examples/lite6_lite_gripper_pick_and_place.program.yaml",
+        state.node_catalog,
+    ))
+    mount = {**_mount("arm", "lite_gripper"), "primary": True,
+             "pose": {"position_m": [0.0, 0.0, 0.01], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]}}
+    intent = _io_intent(
+        _model_component("arm"),
+        _tool_component("lite_gripper", "ufactory.lite_gripper"),
+        _tool_component("probe", "manyforge.passive_tool"),
+    )
+    intent["attachments"] = [mount]
+    intent["collision_rules"].append({
+        "rule_id": "fingers_clear",
+        "a": [{"kind": "collision_body", "component_id": "lite_gripper",
+               "collision_body_id": "gripper_fingers"}],
+        "b": [{"kind": "scene_objects"}],
+        "clearance_m": 0.002,
+    })
+    _seed_existing_deployment(state, intent, compiler=validate_deployment_draft_document)
+    before = client.get("/api/deployment/workspace").json()
+    program_revision = state.draft_session.revision
+
+    replaced = client.post(
+        "/api/deployment/draft/components/replace-tool",
+        json=_request(before, component_id="lite_gripper",
+                      replacement_component_id="probe", kind="replace"),
+    )
+
+    assert replaced.status_code == 200, replaced.text
+    body = replaced.json()
+    document = body["workspace"]["draft"]["document"]
+    assert [row["component_id"] for row in document["components"]] == ["arm", "probe"]
+    assert document["attachments"] == [{**mount, "child": {"component_id": "probe", "interface": "mount"}}]
+    assert document["collision_rules"][1]["a"][0]["component_id"] == "probe"
+    assert body["workspace"]["draft"]["revision"] == before["draft"]["revision"] + 1
+    forest = json.dumps(state.draft_session.snapshot()["authoring"]["forest"])
+    assert '"lite_gripper"' not in forest
+    assert state.draft_session.revision == program_revision + 1
+    assert body["replacement"]["programReferences"] == 8
+    # The passive tool's target is `tool`, its bodies default_collision and tip.
+    assert body["replacement"]["lacks"] == {
+        "collisionBodies": ["gripper_collision", "gripper_fingers"],
+        "commandTargets": ["gripper"],
+        "frames": [],
+    }
+
+
+def test_replace_tool_refuses_what_is_not_a_mounted_tool(tmp_path: Path) -> None:
+    client, state = _client(tmp_path)
+    _seed_existing_deployment(
+        state,
+        _io_intent(_model_component("arm"), _tool_component("probe", "manyforge.passive_tool")),
+        compiler=validate_deployment_draft_document,
+    )
+    before = client.get("/api/deployment/workspace").json()
+
+    for previous, replacement in (("probe", "arm"), ("arm", "probe")):
+        refused = client.post(
+            "/api/deployment/draft/components/replace-tool",
+            json=_request(before, component_id=previous,
+                          replacement_component_id=replacement, kind="replace"),
+        )
+        assert refused.status_code == 409
+        assert refused.json()["detail"]["code"] == "deployment_tool_replacement_invalid"
+    assert client.get("/api/deployment/workspace").json()["draft"] == before["draft"]
+

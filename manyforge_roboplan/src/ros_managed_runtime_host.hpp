@@ -43,6 +43,24 @@ LeavingComponentRefusesApply(const manyforge::core::ComponentState &state) {
            state.activity != manyforge::core::ComponentActivity::kBusy);
 }
 
+/// OD-370 (B): the typed refusal of an Apply that would re-seal the kept
+/// `component_id` while its Kernel refuses the collision resource
+/// replacement (`kernel_refusal`, e.g. not Idle after a failed operation).
+/// Raised before any effect, so nothing changed.
+[[nodiscard]] inline manyforge::core::ErrorDTO
+KeptOwnerNotIdleApplyRefusal(const std::string &component_id,
+                             const manyforge::core::ErrorDTO &kernel_refusal) {
+  const auto reason = kernel_refusal.details.find("reason");
+  return {"apply_requires_idle_kept_component",
+          "Reset the Program before this Apply: " + component_id +
+              " still holds an operation.",
+          {{"component_id", component_id},
+           {"kernel_reason", reason != kernel_refusal.details.end()
+                                 ? reason->second
+                                 : kernel_refusal.code},
+           {"effect", "none"}}};
+}
+
 /// A component's site address that can't be resolved (no site settings file,
 /// unknown `device_address_ref`): the resolver's typed error, naming the
 /// component in its message and `details.component_id`.

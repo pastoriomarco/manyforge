@@ -91,8 +91,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .value("kCartesianIncomplete", manyforge::core::ErrorCode::kCartesianIncomplete)
       .value("kStartStateMismatch", manyforge::core::ErrorCode::kStartStateMismatch)
       .value("kValidationCollision", manyforge::core::ErrorCode::kValidationCollision)
-      .value("kInvalidContactPolicy", manyforge::core::ErrorCode::kInvalidContactPolicy)
-      .value("kContactPolicyViolation", manyforge::core::ErrorCode::kContactPolicyViolation)
+      .value("kInvalidCollisionRule", manyforge::core::ErrorCode::kInvalidCollisionRule)
+      .value("kContactRuleViolation", manyforge::core::ErrorCode::kContactRuleViolation)
       .value("kValidationLimitsViolation", manyforge::core::ErrorCode::kValidationLimitsViolation)
       .value("kObjectAlreadyExists", manyforge::core::ErrorCode::kObjectAlreadyExists)
       .value("kObjectNotFound", manyforge::core::ErrorCode::kObjectNotFound)
@@ -290,6 +290,7 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def(py::init<>())
       .def(py::init<manyforge::core::Pose3DTO>(), py::arg("goal"))
       .def_readwrite("goal", &manyforge::core::PoseGoalDTO::goal)
+      .def_readwrite("linear", &manyforge::core::PoseGoalDTO::linear)
       .def("__repr__", [](const manyforge::core::PoseGoalDTO& p) {
         return py::str("PoseGoalDTO(goal={})").format(py::cast(p.goal));
       });
@@ -347,6 +348,20 @@ PYBIND11_MODULE(manyforge_core_py, m) {
   py::enum_<manyforge::core::CartesianSpeedModeDTO>(m, "CartesianSpeedMode")
       .value("kConstantSpeed", manyforge::core::CartesianSpeedModeDTO::kConstantSpeed)
       .value("kTimeOptimal", manyforge::core::CartesianSpeedModeDTO::kTimeOptimal);
+
+  py::class_<manyforge::core::LinearPoseMotionDTO>(m, "LinearPoseMotionDTO")
+      .def(py::init<>())
+      .def_readwrite("max_translation_step_m",
+                     &manyforge::core::LinearPoseMotionDTO::max_translation_step_m)
+      .def_readwrite("max_rotation_step_rad",
+                     &manyforge::core::LinearPoseMotionDTO::max_rotation_step_rad)
+      .def_readwrite("speed_mode", &manyforge::core::LinearPoseMotionDTO::speed_mode)
+      .def_readwrite("max_angular_speed_rad_s",
+                     &manyforge::core::LinearPoseMotionDTO::max_angular_speed_rad_s)
+      .def_readwrite("max_linear_acceleration_mps2",
+                     &manyforge::core::LinearPoseMotionDTO::max_linear_acceleration_mps2)
+      .def_readwrite("max_angular_acceleration_rad_s2",
+                     &manyforge::core::LinearPoseMotionDTO::max_angular_acceleration_rad_s2);
 
   py::enum_<manyforge::core::CartesianFallbackPolicyDTO>(m, "CartesianFallbackPolicy")
       .value("kFailClosed", manyforge::core::CartesianFallbackPolicyDTO::kFailClosed)
@@ -714,10 +729,11 @@ PYBIND11_MODULE(manyforge_core_py, m) {
 
   py::class_<manyforge::core::MeshShapeDTO>(m, "MeshShapeDTO")
       .def(py::init<>())
-      .def(py::init<const std::string&, manyforge::core::Vector3DTO>(), py::arg("resource_uri"),
-           py::arg("scale"))
+      .def(py::init<const std::string&, manyforge::core::Vector3DTO, const std::string&>(),
+           py::arg("resource_uri"), py::arg("scale"), py::arg("content_digest") = std::string{})
       .def_readwrite("resource_uri", &manyforge::core::MeshShapeDTO::resource_uri)
       .def_readwrite("scale", &manyforge::core::MeshShapeDTO::scale)
+      .def_readwrite("content_digest", &manyforge::core::MeshShapeDTO::content_digest)
       .def("__repr__", [](const manyforge::core::MeshShapeDTO& m) {
         return py::str("MeshShapeDTO(resource_uri='{}')").format(m.resource_uri);
       });
@@ -843,8 +859,8 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .value("kSupportContactRecontactViolation",
              manyforge::core::CollisionPairClassification::kSupportContactRecontactViolation)
       .value("kAllowedTouchLink", manyforge::core::CollisionPairClassification::kAllowedTouchLink)
-      .value("kAllowedContactGrasp",
-             manyforge::core::CollisionPairClassification::kAllowedContactGrasp)
+      .value("kAllowedContactRule",
+             manyforge::core::CollisionPairClassification::kAllowedContactRule)
       .value("kDiagnosticIncomplete",
              manyforge::core::CollisionPairClassification::kDiagnosticIncomplete);
 
@@ -867,50 +883,58 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             .format(r.signed_clearance_m);
       });
 
-  py::enum_<manyforge::core::CollisionContactPolicyMode>(m, "CollisionContactPolicyMode")
-      .value("kContactRelease", manyforge::core::CollisionContactPolicyMode::kContactRelease)
-      .value("kBoundedPenetration",
-             manyforge::core::CollisionContactPolicyMode::kBoundedPenetration)
-      .value("kContactProcess", manyforge::core::CollisionContactPolicyMode::kContactProcess);
-
   py::enum_<manyforge::core::ContactReleaseEvidenceMode>(m, "ContactReleaseEvidenceMode")
       .value("kSignedPenetration", manyforge::core::ContactReleaseEvidenceMode::kSignedPenetration)
       .value("kBinaryContact", manyforge::core::ContactReleaseEvidenceMode::kBinaryContact);
 
-  py::class_<manyforge::core::SupportContactPolicyEntry>(m, "SupportContactPolicyEntry")
+  py::class_<manyforge::core::CollisionSpringGroup>(m, "CollisionSpringGroup")
+      .def(py::init([](manyforge::core::ControllableComponentId component_id,
+                       std::string element_id, std::array<double, 3> axis) {
+             return manyforge::core::CollisionSpringGroup{
+                 std::move(component_id), std::move(element_id), axis};
+           }),
+           py::arg("component_id"), py::arg("element_id"), py::arg("axis"))
+      .def_readwrite("component_id", &manyforge::core::CollisionSpringGroup::component_id)
+      .def_readwrite("element_id", &manyforge::core::CollisionSpringGroup::element_id)
+      .def_readwrite("axis", &manyforge::core::CollisionSpringGroup::axis);
+
+  py::class_<manyforge::core::CollisionContactRule>(m, "CollisionContactRule")
       .def(py::init<>())
-      .def_readwrite("pair", &manyforge::core::SupportContactPolicyEntry::pair)
-      .def_readwrite("mode", &manyforge::core::SupportContactPolicyEntry::mode)
+      .def_readwrite("max_penetration_m",
+                     &manyforge::core::CollisionContactRule::max_penetration_m)
+      .def_readwrite("end_from_fraction",
+                     &manyforge::core::CollisionContactRule::end_from_fraction)
+      .def_readwrite("max_compression_step_m",
+                     &manyforge::core::CollisionContactRule::max_compression_step_m)
+      .def_readwrite("spring_group", &manyforge::core::CollisionContactRule::spring_group);
+
+  py::class_<manyforge::core::CollisionReleaseRule>(m, "CollisionReleaseRule")
+      .def(py::init<>())
       .def_readwrite("release_evidence_mode",
-                     &manyforge::core::SupportContactPolicyEntry::release_evidence_mode)
+                     &manyforge::core::CollisionReleaseRule::release_evidence_mode)
       .def_readwrite("enforce_max_start_penetration",
-                     &manyforge::core::SupportContactPolicyEntry::enforce_max_start_penetration)
+                     &manyforge::core::CollisionReleaseRule::enforce_max_start_penetration)
       .def_readwrite("max_start_penetration_m",
-                     &manyforge::core::SupportContactPolicyEntry::max_start_penetration_m)
+                     &manyforge::core::CollisionReleaseRule::max_start_penetration_m)
       .def_readwrite("release_tolerance_m",
-                     &manyforge::core::SupportContactPolicyEntry::release_tolerance_m)
+                     &manyforge::core::CollisionReleaseRule::release_tolerance_m)
       .def_readwrite("min_release_progress_m",
-                     &manyforge::core::SupportContactPolicyEntry::min_release_progress_m)
-      .def_readwrite("max_contact_penetration_m",
-                     &manyforge::core::SupportContactPolicyEntry::max_contact_penetration_m)
+                     &manyforge::core::CollisionReleaseRule::min_release_progress_m)
       .def_readwrite("require_separation_by_end",
-                     &manyforge::core::SupportContactPolicyEntry::require_separation_by_end)
+                     &manyforge::core::CollisionReleaseRule::require_separation_by_end)
       .def_readwrite(
           "require_strictly_decreasing_penetration",
-          &manyforge::core::SupportContactPolicyEntry::require_strictly_decreasing_penetration)
-      .def_readwrite("allow_recontact",
-                     &manyforge::core::SupportContactPolicyEntry::allow_recontact);
-  py::class_<manyforge::core::ContactGraspPolicyEntry>(m, "ContactGraspPolicyEntry")
+          &manyforge::core::CollisionReleaseRule::require_strictly_decreasing_penetration)
+      .def_readwrite("allow_recontact", &manyforge::core::CollisionReleaseRule::allow_recontact);
+
+  // `value` is a CollisionContactRule or a CollisionReleaseRule.
+  py::class_<manyforge::core::CollisionPairContactRule>(m, "CollisionPairContactRule")
       .def(py::init<>())
-      .def_readwrite("policy_id", &manyforge::core::ContactGraspPolicyEntry::policy_id)
-      .def_readwrite("selected_object_id",
-                     &manyforge::core::ContactGraspPolicyEntry::selected_object_id)
-      .def_readwrite("allowed_robot_links",
-                     &manyforge::core::ContactGraspPolicyEntry::allowed_robot_links)
-      .def_readwrite("max_penetration_m",
-                     &manyforge::core::ContactGraspPolicyEntry::max_penetration_m)
-      .def_readwrite("terminal_window_start_fraction",
-                     &manyforge::core::ContactGraspPolicyEntry::terminal_window_start_fraction);
+      .def_readwrite("pair", &manyforge::core::CollisionPairContactRule::pair)
+      .def_readwrite("rule_id", &manyforge::core::CollisionPairContactRule::rule_id)
+      .def_readwrite("value", &manyforge::core::CollisionPairContactRule::value)
+      .def_readwrite("side_a_is_body_b",
+                     &manyforge::core::CollisionPairContactRule::side_a_is_body_b);
 
   py::class_<manyforge::core::CollisionPolicyRevision>(m, "CollisionPolicyRevision")
       .def(py::init<>())
@@ -923,15 +947,15 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def(py::init<>())
       .def_readwrite("policy_id", &manyforge::core::CollisionPolicySnapshot::policy_id)
       .def_readwrite("revision", &manyforge::core::CollisionPolicySnapshot::revision)
-      .def_readwrite("allowed_static_static_pairs",
-                     &manyforge::core::CollisionPolicySnapshot::allowed_static_static_pairs)
+      .def_readwrite("static_body_ids",
+                     &manyforge::core::CollisionPolicySnapshot::static_body_ids)
       .def_readwrite("allowed_touch_link_pairs",
                      &manyforge::core::CollisionPolicySnapshot::allowed_touch_link_pairs)
-      .def_readwrite("support_contacts",
-                     &manyforge::core::CollisionPolicySnapshot::support_contacts)
-      .def_readwrite("contact_grasps", &manyforge::core::CollisionPolicySnapshot::contact_grasps)
+      .def_readwrite("contact_rules", &manyforge::core::CollisionPolicySnapshot::contact_rules)
       .def_readwrite("require_full_diagnostics",
-                     &manyforge::core::CollisionPolicySnapshot::require_full_diagnostics);
+                     &manyforge::core::CollisionPolicySnapshot::require_full_diagnostics)
+      .def("static_pair", &manyforge::core::CollisionPolicySnapshot::static_pair,
+           py::arg("pair"));
 
   py::class_<manyforge::core::CollisionGeometryDescriptor>(m, "CollisionGeometryDescriptor")
       .def(py::init<>())

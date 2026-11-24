@@ -462,3 +462,28 @@ details.dcard[open] > summary:first-child::before {
 .dpick:is(.selected, .active):is(:hover, :focus-visible):not(:disabled) {
   background: var(--mf-bg-neutral-17);
 }
+
+/* A pick row with a title over detail lines, left-aligned; long ids and
+   paths wrap instead of running into each other. */
+.dpick-stack {
+  display: grid;
+  gap: 0.15rem;
+  width: 100%;
+  padding-inline: 0.5rem;
+  text-align: left;
+}
+
+.dpick-stack > strong,
+.dpick-stack > small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.dpick-stack > small {
+  color: var(--mf-text-neutral-51);
+  font-size: var(--mf-font-size-065);
+}
+
+.dpick-stack.selected > small {
+  color: var(--mf-text-neutral-68);
+}

@@ -1,18 +1,10 @@
-api_version: manyforge.program.v3
-program_id: semantic_shape_pick
-program_revision: sha256:b337631267104c2383f626df2003deb5fa41a5ac8923614793548cf0501b0b95
+api_version: manyforge.program.v4
+program_revision: sha256:37c1527d5ec76fdd0e4baa1c3a72e8c0cb813319bb77ff8f7b930583b0e08600
 program_profile: composable-cell-v1
-name: semantic_shape_pick
-description: Semantic object-selection demo. Deterministic nodes build and validate a retained scene-selection
-  context around one bounded model request. A C++ planning preview supplies portable approach, pick, and
-  retreat poses; the original explicit motion, logical gripper, carried-object, and place sequence remains
-  visible in the Program.
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
-  lanes:
-  - manyforge-only
   assistant: required
   requires:
   - semantic_shape_inference
@@ -119,11 +111,6 @@ blackboard:
       type: scene_resource
     - field: tool_position
       type: coordinate_position
-  - key: selected_object
-    type: scene_resource
-    access: read_write
-    persistence: run
-    description: Operation-scoped selected-object binding for contact policy resolution.
   - key: selection.context
     type: scene_selection_context
     access: read_write
@@ -165,27 +152,6 @@ blackboard:
       type: string
     - field: selected_object_id
       type: scene_resource
-contact_policies:
-- api_version: manyforge.contact_policy.v1
-  policy_id: selected_object_grasp
-  version: sha256:cdd5cd17bdd43f72582cbc09806d1ebbe2e658b8ad896b3ce040e5a842a79977
-  mode: contact_grasp
-  sensing_mode: geometry_only
-  default_unmatched_response: hard_stop
-  zones:
-  - zone_id: tool_contact
-    body_pairs:
-    - body_a:
-        kind: component_model_body
-        body:
-          component_id: robotiq_2f_85
-          collision_body_id: gripper_collision
-      body_b:
-        kind: runtime_object
-        runtime_object_id: selected_object
-    violation_response: hard_stop
-    max_penetration_m: 0.002
-    terminal_window_start_fraction: 0.8
 tree:
   node_id: sequence
   instance_id: semantic_shape_pick_cycle
@@ -299,7 +265,20 @@ tree:
         kind: named_preset
         name: closed
       output_key: planning.pick_plan
-      contact_policy_id: selected_object_grasp
+      collision_rules:
+      - rule_id: selected_object_grasp
+        leg: descend
+        a:
+        - kind: collision_body
+          component_id: robotiq_2f_85
+          collision_body_id: gripper_collision
+        b:
+        - kind: scene_object
+          blackboard_key: selection.validated
+          field: selected_object_id
+        contact:
+          max_penetration_m: 0.002
+          end_from_fraction: 0.8
     children: []
     value_sources:
       selected_object_id:

@@ -293,6 +293,8 @@ class ProgramRunnerApplicationPort(Protocol):
 
     def read_runtime_controls(self, program_run_id: int) -> dict[str, Any]: ...
 
+    def read_runtime_blackboard(self, program_run_id: int) -> dict[str, Any]: ...
+
     def write_runtime_blackboard(
         self, program_run_id: int, request: RuntimeBlackboardWriteRequest
     ) -> dict[str, Any]: ...
@@ -421,7 +423,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
 
     app = FastAPI(
         title="ManyForge Program Runner",
-        version="0.3.1",
+        version="0.4.0",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -551,6 +553,12 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
         program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
     ) -> dict[str, Any]:
         return runtime.read_runtime_controls(program_run_id)
+
+    @app.get("/api/program/runs/{program_run_id}/blackboard-values")
+    def read_runtime_blackboard(
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
+    ) -> dict[str, Any]:
+        return runtime.read_runtime_blackboard(program_run_id)
 
     @app.post("/api/program/runs/{program_run_id}/blackboard-values")
     async def write_runtime_blackboard(

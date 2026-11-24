@@ -707,6 +707,30 @@ class ProgramRunTickHost:
             ),
         )
 
+    def answer_operator_question(
+        self,
+        program_run_id: int,
+        *,
+        node_instance_id: str,
+        node_attempt_id: int,
+        option_id: str,
+    ) -> Mapping[str, Any]:
+        """The operator's answer to an open question, applied by the run's
+        tick (no Kernel effect); the node ends on its next tick."""
+
+        try:
+            return self._through_tick(
+                program_run_id,
+                lambda: self._owner.answer_operator_question(
+                    program_run_id,
+                    node_instance_id=node_instance_id,
+                    node_attempt_id=node_attempt_id,
+                    option_id=option_id,
+                ),
+            )
+        finally:
+            self._observe_after_motion_control(program_run_id)
+
     def _observe_after_motion_control(self, program_run_id: int) -> None:
         snapshot = self._owner.read(program_run_id)
         if snapshot.state in {

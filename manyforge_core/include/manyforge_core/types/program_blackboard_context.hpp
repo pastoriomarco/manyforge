@@ -13,7 +13,6 @@ namespace manyforge::core {
 /// the exact Kernel service/configuration/current-owner recheck and commit.
 struct AppliedProgramBlackboardContextDTO final {
   ActiveBundlePublicationGeneration active_publication_generation{0U};
-  ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
   RetainedBundleId retained_bundle_id;

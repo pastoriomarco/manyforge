@@ -83,7 +83,6 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
                 "request_key": "5ce1" + "0" * 27 + "2",
                 "source_label": "composer_ui",
             },
-            "program_id": manual_control["program_id"],
             "program_revision": manual_control["program_revision"],
             "program_binding_id": manual_control["program_binding_id"],
             "program_run_id": None,

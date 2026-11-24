@@ -1,21 +1,17 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "lite6",
       "r5-live-trial"
     ]
   },
-  "description": "Mock Lite6 global rule light_curtain (Deployment, all_motion, on_trip stop, after_stop hold). Toggle curtain_blocked during move_a (Stop -> hold) and during idle_window (Run in flight, robot still -> the run holds like the operator's Stop; clear the curtain, then Resume). Watch interrupt_state.light_curtain in the key panel; curtain_clear_at_end checks it reads clear.",
   "forest": [
     {
       "children": [
@@ -246,10 +242,8 @@
       "parameters": {}
     }
   ],
-  "name": "mock_lite6_light_curtain_rule",
   "parameters": [],
   "positions": {},
-  "program_id": "mock_lite6_light_curtain_rule",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

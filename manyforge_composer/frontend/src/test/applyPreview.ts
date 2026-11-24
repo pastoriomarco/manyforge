@@ -9,11 +9,13 @@ export function applyPreviewFixture(
     components,
     scope: { deployment_draft_id: 'draft', deployment_draft_revision: 1 },
     program: {
-      executable: true, program_id: 'program', unresolved_references: [],
+      executable: true, unresolved_references: [],
       affected_nodes: [], affected_execution_groups: [],
     },
     attachment_changed_components: [],
     detached_components: [],
+    collision_rules: [],
+    mesh_depth_reports: [],
     ...extra,
   };
 }

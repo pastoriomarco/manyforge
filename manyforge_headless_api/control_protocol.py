@@ -41,6 +41,9 @@ CONTROL_HEARTBEAT_PERIOD_NS = 250_000_000
 CONTROL_HEARTBEAT_DELAYED_NS = 500_000_000
 CONTROL_HEARTBEAT_STALE_NS = 1_000_000_000
 CONTROL_FRESHNESS_VALID_FOR_NS = 750_000_000
+# Composer's receipt time of a forwarded command, on the monotonic clock it
+# shares with Headless (same host): the freshness age is measured there.
+CONTROL_RECEIVED_MONOTONIC_NS_HEADER = "X-ManyForge-Received-Monotonic-Ns"
 CONTROL_NODE_PROGRESS_PERIOD_NS = 50_000_000
 CONTROL_COLD_COMBINE_NS = 50_000_000
 CONTROL_MAXIMUM_CLIENTS = 16
@@ -673,8 +676,15 @@ class ControlFreshnessAuthority:
         context: ControlFreshnessContextDTO,
         *,
         current_control_revision: int,
+        received_at_ns: int,
     ) -> int:
-        now_ns = self._clock_ns()
+        """Admit a context no older than its lifetime when the command arrived.
+
+        ``received_at_ns`` is the moment the backend received the command, on
+        this authority's clock: time the backend spends before validating
+        never ages the context (OD-240).
+        """
+
         try:
             sequence = int(context.issued_server_sequence)
             token = base64.urlsafe_b64decode(context.context_id + "===")
@@ -705,11 +715,11 @@ class ControlFreshnessAuthority:
                 "control_projection_stale",
                 "control revision changed",
             )
-        elapsed = now_ns - issued_at_ns
+        elapsed = received_at_ns - issued_at_ns
         if elapsed < 0 or elapsed > context.valid_for_ns:
             raise ControlProtocolError(
                 "control_freshness_expired",
-                "freshness context expired before command admission",
+                "freshness context had expired when the command was received",
             )
         return issued_at_ns + context.valid_for_ns
 
@@ -731,6 +741,7 @@ __all__ = [
     "CONTROL_MAXIMUM_SNAPSHOT_BYTES",
     "CONTROL_NODE_PROGRESS_PERIOD_NS",
     "CONTROL_PROTOCOL_VERSION",
+    "CONTROL_RECEIVED_MONOTONIC_NS_HEADER",
     "ControlClientHelloDTO",
     "ControlClientIncidentDTO",
     "ControlClientIncidentKind",

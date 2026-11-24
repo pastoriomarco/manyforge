@@ -171,7 +171,7 @@ these points, the point writes one `program_runner_heap_settled` line with
 clean up) and, except at `run_start`, `frozen_objects`.
 
 The History file is named by its event format, `history.v<N>.sqlite3`
-(currently `history.v8.sqlite3`), in the History directory (`history/` under
+(currently `history.v9.sqlite3`), in the History directory (`history/` under
 the development state root and in an operator instance). Only the file of the
 current format is opened. An earlier History file
 (`history.sqlite3`, or a `history.v<N>.sqlite3` with a lower number) stays on
@@ -235,6 +235,46 @@ terminal, with the typed error code and message:
   `applied_record_digest`) and the logical-scene revision its verified
   readback left (`scene_revision_id`, `scene_content_hash`). The line reads
   like `Program reset succeeded · reloaded initial scene (scene revision 10)`.
+- `program_node_attempt_finished` — one per finished Program node attempt,
+  sent by the Program runner (component `manyforge.program_runner`). The
+  event's time is the attempt's end on the runner's clocks (`clock_owner`
+  `program_runner:<start>`), not the time History received it. The
+  payload has `subject` (the node type, for example `motion.move_to_pose`),
+  `outcome` (`succeeded`, `failed`, `interrupted`, `stopped`, `preempted`),
+  `error` (only when `failed` or `interrupted`: `code`, `message` and the
+  node's bounded `details` when it has them), and `attempt`: the
+  `program_run_id`, `node_instance_id`, `node_attempt_id`, `started_at_wall`,
+  `finished_at_ns`, `finished_at_wall`, `duration_ms` and, for a scene node,
+  `scene_operation` and `scene_resource_id` (null otherwise). The runner
+  sends these events in batches; any it could not deliver are counted in
+  `node_attempts.lost_count` of `GET /api/program/diagnostics/health`. Severity: WARN when failed, otherwise
+  INFO; a failed condition node is ordinary control flow. Filter a run's node
+  timeline with `program_run_id=<n>` (or `node_instance_id`,
+  `node_attempt_id`). The line reads like
+  `Node pick_1 (motion.move_to_pose) failed: <code>: <message> · run 3 attempt 12 · 1.24 s`,
+  with `· add object box_1` for a scene node.
+- `scene_change_finished` — one per scene change made outside a Program node
+  through `POST /api/scene/transactions` (component `manyforge.scene`):
+  Composer, the assistant, MCP, any HTTP caller, and the Program runner's own
+  changes (initial-scene preparation, a Program Reset's scene reload, the
+  scene clear of an empty Apply; `source_label`
+  `manyforge.behavior.program_scene` for the runner's). A Program node's
+  scene change is in its `program_node_attempt_finished` event, and a request
+  sent again that is answered with its first result records nothing again. The payload has `subject` (the operation:
+  `add_object`, `upsert_object`, `remove_object`, `update_object_pose`,
+  `attach_carried_object`, `detach_carried_object`,
+  `detach_carried_object_at_current_pose`, `set_collision_policy`),
+  `outcome` (`succeeded`, `refused` by the scene owner, `unknown` when the
+  owner could not tell whether its view of the scene changed, `failed` when
+  Headless could not complete the request, for example when the owner did not
+  answer or an added object's mesh could not be read), `error` (with the
+  owner's `details` when they fit 2 KiB), and
+  `scene_change`: `scene_resource_id` (null for an operation without an
+  object), `source_label` and `principal_id` of the caller, `duration_ms` in
+  Headless until the owner's answer, and `scene_revision_id` committed (null
+  unless succeeded). Severity: INFO on success, WARN when refused, ERROR when
+  failed or unknown. The line reads like
+  `Scene add object box_1 succeeded · composer_ui · 12 ms`.
 
 The list line reads like `Enable lite6_robot failed: <code>: <message>`; select
 the row for the full payload. Filter with `event_types=component_action_finished`
@@ -266,8 +306,8 @@ with `ready` and `unavailable_reasons`; it is the default check after `start`.
 
 | Endpoint | Use it when |
 | --- | --- |
-| `GET /api/cycle/status` | Cycle state and the one current versioned `recovery_offer`. |
-| `POST /api/cycle/recovery-actions` | Apply one exact action from that offer. Do not replay a cached offer after a conflict. |
+| `GET /api/cycle/status` | Cycle state and the focused versioned `recovery_offer`. Every held node's offer (`recovery_offers`) and every open operator question (`operator_questions`) are in the run's runtime controls (`GET /api/program/runs/{id}/runtime-controls`). |
+| `POST /api/cycle/recovery-actions` | Apply one exact action from a current offer, or answer an open operator question (its `offer_id` and `offer_revision`, the option id as `action_id`). Do not replay a cached offer after a conflict. |
 | `GET /api/execution/history?...` | Filtered event page. Filters include `event_types`, `minimum_severity`, `components`, `program_run_id`, `operation_id`, `recent_seconds`, `search`; an id filter needs the start identity (see [Runtime events](#runtime-events)); `limit` is at most 32, page with `before_sequence`. `search` is a case-insensitive substring (at least 3 characters) of the component, the event type, the message and reason codes, a component incident's cause, closure and vendor codes, the alarm subject, and the event's run/operation/Stop/incident/condition ids; other payload fields are not searched. |
 | `GET /api/execution/alarms` | Current four-state alarms. Raw event severity does not imply a current alarm. |
 | `POST /api/execution/alarms/{condition_id}/acknowledge` | Acknowledge one exact activation/revision. This records awareness only; it does not clear the condition or recover motion. |

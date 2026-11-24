@@ -2,6 +2,7 @@
 
 #include "manyforge_deployment/cell_composition.hpp"
 
+#include <manyforge_core/types/component_type.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 
 #include <algorithm>
@@ -266,6 +267,19 @@ void require_asset_root(
     const auto& role = require_role(
         roles, body.model_role_id, "command-target collision body");
     const auto& asset = role.asset->value();
+    // OD-350: a model whose collision links are all covered binds no default.
+    // OD-352 A1: a model without an optional body's links binds no such body.
+    // Either contributes nothing; any other unbound body is refused below.
+    if ((body.optional || body.asset_collision_body_role_id.value() ==
+                              core::kDefaultCollisionBodyRoleId) &&
+        std::none_of(asset.collision_body_role_bindings.begin(),
+                     asset.collision_body_role_bindings.end(),
+                     [&body](const auto& value) {
+                       return value.collision_body_role_id ==
+                              body.asset_collision_body_role_id;
+                     })) {
+      continue;
+    }
     const auto& binding = require_binding(
         asset.collision_body_role_bindings,
         body.asset_collision_body_role_id,

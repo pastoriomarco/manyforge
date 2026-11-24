@@ -24,6 +24,8 @@ from .security import normalize_allowed_roots
 _PROGRAM_SUFFIXES = (".program.yaml", ".program.yml")
 _DEPLOYMENT_SUFFIXES = (".deployment.yaml", ".deployment.yml")
 _MESH_SUFFIXES = (".obj", ".stl", ".ply", ".glb", ".gltf")
+# A generated tool's meshes (``manyforge.tool`` parameters, OD-364).
+_TOOL_MESH_SUFFIXES = (".stl", ".dae")
 # A folder with this suffix is a Scenario project (the project marker).
 _SCENARIO_PROJECT_SUFFIX = ".scenario"
 
@@ -123,6 +125,8 @@ def _matches_kind(path: Path, kind: str) -> bool:
         return name.endswith(_DEPLOYMENT_SUFFIXES)
     if kind == "mesh":
         return name.endswith(_MESH_SUFFIXES)
+    if kind == "tool_mesh":
+        return name.endswith(_TOOL_MESH_SUFFIXES)
     return False
 
 
@@ -542,7 +546,7 @@ def create_filesystem_router(allowed_roots: list[str] | None = None) -> APIRoute
         path: str | None = Query(default=None),
         # ``scenario`` lists folders only, marking Scenario project folders.
         kind: str = Query(
-            default="program", pattern="^(program|deployment|mesh|scenario)$"
+            default="program", pattern="^(program|deployment|mesh|tool_mesh|scenario)$"
         ),
         roots_only: bool = Query(default=False),
     ) -> dict:

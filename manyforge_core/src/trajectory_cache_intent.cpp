@@ -1,7 +1,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
+#include <manyforge_core/collision_rule_codec.hpp>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -109,8 +111,7 @@ void mix_resolved_frame(IntentIdentityBuilder& identity, const ResolvedFrameDTO&
 
 void mix_resolved_binding(IntentIdentityBuilder& identity,
                           const ResolvedExecutionBindingDTO& binding) {
-  identity.mix(binding.program_id.value())
-      .mix(binding.program_revision.value())
+  identity.mix(binding.program_revision.value())
       .mix(binding.program_binding_id.value())
       .mix(binding.controllable_component_id.value())
       .mix(binding.component_type_id.value())
@@ -207,6 +208,17 @@ void mix_motion(IntentIdentityBuilder& identity, const ResolvedMotionSpecDTO& mo
         } else if constexpr (std::is_same_v<T, PoseGoalDTO>) {
           identity.mix("pose_goal");
           mix_pose(identity, value.goal);
+          if (value.linear) {
+            // A joint pose goal keeps its identity; a linear one adds its line.
+            const auto& linear = *value.linear;
+            identity.mix("linear")
+                .mix(linear.max_translation_step_m)
+                .mix(linear.max_rotation_step_rad)
+                .mix(linear.speed_mode ? static_cast<std::int64_t>(*linear.speed_mode) : -1)
+                .mix(linear.max_angular_speed_rad_s)
+                .mix(linear.max_linear_acceleration_mps2)
+                .mix(linear.max_angular_acceleration_rad_s2);
+          }
         } else if constexpr (std::is_same_v<T, NamedTargetDTO>) {
           identity.mix("named_target").mix(value.name);
         } else if constexpr (std::is_same_v<T, CartesianPathDTO>) {
@@ -244,9 +256,17 @@ TrajectoryCacheKey trajectory_cache_key(const ExecuteRequestDTO& request) {
 
 std::string trajectory_cache_intent_identity(const ExecuteRequestDTO& request) {
   IntentIdentityBuilder identity;
-  identity.mix("manyforge_core/trajectory_cache_intent/v8");
+  identity.mix("manyforge_core/trajectory_cache_intent/v9");
   mix_resolved_binding(identity, request.binding);
-  identity.mix(request.contact_policy_id)
+  // Contact and release rules are part of the identity; clearance rows are
+  // not.
+  std::vector<CollisionRule> contact_rules;
+  for (const auto& rule : request.collision_rules) {
+    if (!std::holds_alternative<CollisionClearanceRule>(rule.value)) {
+      contact_rules.push_back(rule);
+    }
+  }
+  identity.mix(content_identity::canonical_json(CollisionRulesValue(contact_rules)))
       .mix(static_cast<std::int64_t>(request.target_mode))
       .mix(static_cast<std::int64_t>(request.planner.search.has_value()
                                          ? static_cast<int>(*request.planner.search)

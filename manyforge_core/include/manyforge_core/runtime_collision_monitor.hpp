@@ -99,9 +99,6 @@ class RuntimeCollisionMonitor {
   /// kernel's flight-ring dump). Startup wiring only; the hook must not block.
   void set_fail_closed_dump_hook(std::function<void()> hook);
 
-  void set_active_contact_policy_id(std::string contact_policy_id);
-  void clear_active_contact_policy_id();
-  std::string active_contact_policy_id() const;
   [[nodiscard]] RuntimeCollisionMonitorTimingMetrics timing_metrics() const
       noexcept;
 
@@ -149,8 +146,6 @@ class RuntimeCollisionMonitor {
   bool detach_completed_ = false;
   std::uint64_t callbacks_in_flight_ = 0;
 
-  mutable std::mutex contact_policy_mutex_;
-  std::string active_contact_policy_id_;
   std::atomic<std::uint64_t> timing_callbacks_started_{0};
   std::atomic<std::uint64_t> timing_start_jitter_max_ns_{0};
   std::atomic<std::uint64_t> timing_callback_duration_max_ns_{0};

@@ -665,11 +665,11 @@ TEST(DeploymentApplicabilityCodec,
      RetainsOnlyCanonicalClosedPolicyCatalogReferences) {
   const std::string retained =
       "[" +
-      catalog_record("stop_evidence_policy", "stop.alpha",
+      catalog_record("stop_evidence_policy", "stop.beta",
                      "manyforge.stop_evidence_policy.v2") +
       "," +
-      catalog_record("contact_policy", "contact.alpha",
-                     "manyforge.contact_policy.v1") +
+      catalog_record("stop_evidence_policy", "stop.alpha",
+                     "manyforge.stop_evidence_policy.v2") +
       "]";
 
   const auto candidate = decode(with_policies(
@@ -677,17 +677,19 @@ TEST(DeploymentApplicabilityCodec,
       policy_envelope(retained)));
   const auto &references = candidate.value().retained_policy_records;
   ASSERT_EQ(references.size(), 2U);
-  EXPECT_TRUE(std::holds_alternative<core::ContactPolicyCatalogRecordRefDTO>(
-      references[0]));
-  EXPECT_TRUE(
-      std::holds_alternative<core::StopEvidencePolicyCatalogRecordRefDTO>(
-          references[1]));
+  for (const auto &reference : references) {
+    EXPECT_TRUE(
+        std::holds_alternative<core::StopEvidencePolicyCatalogRecordRefDTO>(
+            reference));
+  }
+  EXPECT_EQ(core::catalog_record_id_value(references[0]), "stop.alpha");
+  EXPECT_EQ(core::catalog_record_id_value(references[1]), "stop.beta");
 
   ASSERT_TRUE(candidate.normalized_policies().has_value());
   const std::string normalized =
       canonical_json(*candidate.normalized_policies());
-  EXPECT_LT(normalized.find("\"contact_policy\""),
-            normalized.find("\"stop_evidence_policy\""));
+  EXPECT_LT(normalized.find("\"stop.alpha\""),
+            normalized.find("\"stop.beta\""));
 
   const auto revisioned =
       compute_capability_provider_binding_revisions(candidate);
@@ -712,8 +714,14 @@ TEST(DeploymentApplicabilityCodec,
                                   "manyforge.runtime_policy.v1")),
       "outside the closed v1 catalog registry");
 
+  // A contact policy is no catalog record kind.
+  expect_decode_error_containing(
+      document_for(catalog_record("contact_policy", "contact.alpha",
+                                  "manyforge.contact_policy.v1")),
+      "outside the closed v1 catalog registry");
+
   const std::string duplicate = catalog_record(
-      "contact_policy", "contact.alpha", "manyforge.contact_policy.v1");
+      "stop_evidence_policy", "stop.alpha", "manyforge.stop_evidence_policy.v2");
   expect_decode_error_containing(document_for(duplicate + "," + duplicate),
                                  "duplicate complete catalog-record identity");
 }

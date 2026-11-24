@@ -29,9 +29,10 @@ describe('DeploymentCompositionPanel Apply contract', () => {
     const add = readFileSync(new URL('./AddComponentPanel.tsx', import.meta.url), 'utf8');
     const components = readFileSync(new URL('./ComponentsWorkspace.tsx', import.meta.url), 'utf8');
 
-    // Changes previews and applies through the shared Deployment controller.
+    // Changes previews through the shared Deployment controller; Apply is
+    // the top bar's alone.
     expect(manager).toContain('controller.previewApply()');
-    expect(manager).toContain('controller.applyDraft()');
+    expect(manager).not.toContain('applyDraft');
     // Add component edits only the Draft; no Manager or Apply call.
     expect(add).toContain('controller.addComponents(rows, attachments)');
     for (const text of [manager, add, components]) {

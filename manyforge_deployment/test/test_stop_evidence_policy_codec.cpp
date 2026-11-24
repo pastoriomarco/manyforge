@@ -935,7 +935,7 @@ TEST(StopEvidencePolicyCodec,
                StopEvidencePolicyCodecError);
 
   auto wrong_schema_id = reference;
-  wrong_schema_id.schema_id = core::SchemaId("manyforge.contact_policy.v1");
+  wrong_schema_id.schema_id = core::SchemaId("manyforge.provider_manifest.v1");
   EXPECT_THROW(resolve_and_qualify_stop_evidence_policy(
                    wrong_schema_id, store_key, document),
                StopEvidencePolicyCodecError);

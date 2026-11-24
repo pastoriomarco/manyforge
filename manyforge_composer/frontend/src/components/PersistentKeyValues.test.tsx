@@ -64,6 +64,25 @@ function render(
 }
 
 describe('stored persistent values', () => {
+  it('offers Edit initial only where the declaration can be opened', () => {
+    expect(render(values())).not.toContain('Edit initial');
+    const markup = renderToStaticMarkup(
+      <PersistentKeyValuesView
+        values={values()}
+        applicationStartId={START}
+        sceneResourceIds={[]}
+        pending={false}
+        error={null}
+        onSet={vi.fn()}
+        onReset={vi.fn()}
+        onClear={vi.fn()}
+        onRefresh={vi.fn()}
+        onEditInitial={vi.fn()}
+      />,
+    );
+    expect(markup).toMatch(/data-stored-key="layer".*?>Edit value<\/button>.*?>Edit initial<\/button>.*?>Reset to initial<\/button>/);
+  });
+
   it('shows each key with its stored or starting value and its value edits', () => {
     const markup = render(values());
 
@@ -73,7 +92,7 @@ describe('stored persistent values', () => {
     expect(markup).toContain('<code>limit</code> · float64 · not stored, starts from empty');
     // Read-only keys refuse every operator change: Edit and Reset alike.
     expect(markup).toMatch(
-      /data-stored-key="limit".*?<button type="button" disabled="" title="Declared read-only: operator writes are refused.">Edit<\/button>/,
+      /data-stored-key="limit".*?<button type="button" disabled="" title="Declared read-only: operator writes are refused.">Edit value<\/button>/,
     );
     expect(markup).toMatch(
       /data-stored-key="limit".*?disabled="" title="Declared read-only: operator changes are refused.">Reset to initial<\/button>/,

@@ -11,7 +11,9 @@ it. In the Deployment:
 - The tool component is named after its tool family (`lite_gripper`,
   `robotiq_2f_140`, `robotiq_2f_85`) and selects the tool model by its id
   (`component_profile_id: ufactory.lite_gripper`). It carries the gripper row
-  (`gripper_target_configurations`, command target `gripper`). The row's
+  (`gripper_target_configurations`, command target `gripper`; a tool with
+  several gripper targets has one row per target, see
+  [Several gripper targets on one tool](#several-gripper-targets-on-one-tool)). The row's
   `mount_frame` is the tool's root link. The tool has no
   `root_pose_in_cell`.
 - One `attachments` row mounts the tool on the robot:
@@ -61,6 +63,29 @@ example when its Program only moves the arm.
 
 To add a tool to a Draft, use Add component with kind Tool and pick the robot
 to mount it on.
+
+A tool without a controller of its own (a probe, a tool body, a part
+holder, a pneumatic gripper with one or more jaw pairs) is best made from
+its parameters: the Tool model, `manyforge.tool`, edited on its component
+page ([A Tool from its parameters](ADDING_A_COMPONENT.md#a-tool-from-its-parameters)).
+A project that has its own URDF of a tool with nothing to drive uses the
+generic passive tool, `manyforge.passive_tool`
+([A project's own passive tool](ADDING_A_COMPONENT.md#a-projects-own-passive-tool)).
+A probe's tip is its default TCP's contact body
+([TCPs](TCPS.md#contact-bodies)). Neither has streams or a lane, and both
+mount and exclude collisions with their flange like every tool.
+
+Every link of a tool's URDF with `<collision>` geometry is collision-checked.
+Collision bodies such as `gripper_collision` and `gripper_fingers` name parts
+of the tool; links that none names go to the tool's `default_collision` body
+([Collision bodies](ADDING_A_COMPONENT.md#collision-bodies)).
+
+A gripper's descriptor names one of its collision bodies as its **grip body**
+(`gripper.grip_body`, `gripper_collision` in the curated grippers): the links
+that hold a part. The viewer draws these links when it shows the gripper at a
+previewed pose. Which bodies may touch a held object is set on the attach
+node (`touch_bodies`), and which may touch an object before it is attached by
+a [collision rule](COLLISION_RULES.md).
 
 ## Pneumatic grippers
 
@@ -134,6 +159,19 @@ condition is false, and clears by itself when the signal is fresh again.
   sensor before using hardware.
 
 Neither Real example alone qualifies the real robot or its safety setup.
+
+### Several gripper targets on one tool
+
+A tool component may have several gripper targets, each with its own state,
+valve and Stop. A Program's gripper nodes, the manual gripper control and a
+carried object's attachment name the component and the target. A Tool made
+from its parameters has one gripper target per jaw pair, under the pair's
+id; its Deployment holds only each pair's wiring (`pneumatic_io`), the rest
+comes from the parameters
+([A Tool from its parameters](ADDING_A_COMPONENT.md#a-tool-from-its-parameters)).
+Every other tool has the one target `gripper`. Several targets run on Mock
+and Real, without a controller of the tool's own; an Apply that leaves the
+tool unchanged keeps it running, like any unchanged component.
 
 ## Grasp confirmation
 

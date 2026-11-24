@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_deployment VERSION 0.3.1 LANGUAGES CXX)
+project(manyforge_deployment VERSION 0.4.0 LANGUAGES CXX)
 
 if(CMAKE_CONFIGURATION_TYPES)
   message(FATAL_ERROR
@@ -193,7 +193,7 @@ list(
   # and must not feed its own build identity through the recursive glob above.
 # Retain the shared Program-binding fixture under its existing native name.
   "${CMAKE_CURRENT_SOURCE_DIR}/resources/program_binding_lite6_native.fixture.json"
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/program_binding_transport.v3.json"
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/program_binding_transport.v4.json"
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_program_binding_transport.py"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_build_evidence.hpp.in"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/embedded_canonical_empty_deployment.hpp.in"
@@ -524,11 +524,6 @@ manyforge_embed_closed_schema(
   resources/closed_schema/catalog/manyforge.command_schema.v1.yaml
   mf_cmd_schema)
 manyforge_embed_closed_schema(
-  kEmbeddedContactPolicySchema
-  contact_policy
-  resources/closed_schema/catalog/manyforge.contact_policy.v1.yaml
-  mf_contact)
-manyforge_embed_closed_schema(
   kEmbeddedRuntimeProfileSchema
   runtime_profile
   resources/closed_schema/catalog/manyforge.runtime_profile.v1.yaml
@@ -633,10 +628,11 @@ add_library(manyforge_deployment_verification_core
   src/control_domain_control_verifier.cpp
   src/control_interface_contract_codec.cpp
   src/controller_topology_codec.cpp
-  src/contact_policy_codec.cpp
   src/cell_graph_codec.cpp
+  src/cell_collision_rule_members.cpp
   src/cell_kinematic_index.cpp
   src/closed_schema.cpp
+  src/collision_rule_codec.cpp
   src/content_identity.cpp
   src/deployment_applicability_codec.cpp
   src/deployment_artifact_codec.cpp
@@ -769,6 +765,7 @@ add_library(manyforge::deployment_program_io_condition_compiler ALIAS
 # provenance and are not interpreted as current-reader compatibility profiles.
 add_library(manyforge_deployment
   src/activation_content_collection.cpp
+  src/activation_generated_tool_internal.cpp
   src/activation_io_provider_internal.cpp
   src/activation_pose_source_internal.cpp
   src/activation_component_profile_internal.cpp
@@ -1322,6 +1319,20 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_program_binding_compiler
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_collision_rule_codec
+    test/test_collision_rule_codec.cpp)
+  target_link_libraries(test_collision_rule_codec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_collision_rule_codec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_cell_collision_rule_members
+    test/test_cell_collision_rule_members.cpp)
+  target_link_libraries(test_cell_collision_rule_members PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_cell_collision_rule_members
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_component_type_codec
     test/test_component_type_codec.cpp)
   target_link_libraries(test_component_type_codec PRIVATE
@@ -1408,13 +1419,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_control_interface_contract_codec PRIVATE
     manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_control_interface_contract_codec
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_contact_policy_codec
-    test/test_contact_policy_codec.cpp)
-  target_link_libraries(test_contact_policy_codec PRIVATE
-    manyforge_deployment GTest::gtest_main)
-  gtest_discover_tests(test_contact_policy_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_controller_topology_codec
@@ -1714,6 +1718,17 @@ if(BUILD_TESTING)
     PrepareActivationRos2Control
     "examples/sim_ur10e_pick_and_place.scenario"
     --ros2-control)
+  # Program scene meshes captured into the activation (OD-335).
+  manyforge_add_prepare_activation_test(
+    PrepareActivationSceneMeshes
+    "examples/sim_ur10e_pick_and_place.scenario"
+    --scene-meshes)
+  # Export -> reload -> activate with package:// model resources and scene
+  # meshes copied into the exported project.
+  manyforge_add_prepare_activation_test(
+    PrepareActivationExportReload
+    "examples/sim_ur10e_pick_and_place.scenario"
+    --export-reload)
   # The mounted lane-free pneumatic tool of the split Scenario.
   manyforge_add_prepare_activation_test(
     PrepareActivationToolSplit

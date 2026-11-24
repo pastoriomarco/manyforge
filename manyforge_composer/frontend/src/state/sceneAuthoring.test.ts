@@ -26,7 +26,6 @@ const object: LogicalSceneObject = {
     },
   },
   provider_evidence: null,
-  support_contacts: [],
 };
 
 function facts(): SceneOwnerFacts {

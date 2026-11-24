@@ -11,8 +11,11 @@ import type {
 export type { ProgramBindingDocument } from './programBindingTransport.generated';
 
 export type ArtifactKind = 'program' | 'deployment' | 'mesh';
-/** What a folder browse lists: one artifact kind, or folders only (`scenario`). */
-export type FileBrowseKind = ArtifactKind | 'scenario';
+/**
+ * What a folder browse lists: one artifact kind, a generated tool's meshes
+ * (`tool_mesh`: .stl, .dae), or folders only (`scenario`).
+ */
+export type FileBrowseKind = ArtifactKind | 'tool_mesh' | 'scenario';
 
 export interface RuntimeAvailability {
   code: string;
@@ -207,6 +210,13 @@ export interface ProgramViewerMetadata {
   object_axes_gizmo_size_m?: number;
   /** Execution groups the Motion panel does not show (absent: default). */
   hidden_execution_groups?: string[];
+  /** The Scenario's default 3D view (OD-355): Load and Reset camera go to it. */
+  default_view?: ProgramViewerDefaultView;
+}
+
+export interface ProgramViewerDefaultView {
+  position_m: [number, number, number];
+  target_m: [number, number, number];
 }
 
 /**
@@ -312,12 +322,9 @@ export interface BlackboardKeyDeclaration {
 }
 
 export interface ProgramDocument {
-  api_version: 'manyforge.program.v3';
-  program_id: string;
+  api_version: 'manyforge.program.v4';
   program_revision: string;
   program_profile: 'composable-cell-v1';
-  name: string;
-  description?: string;
   catalog: {
     api_version: 'manyforge.node_catalog.v3';
     content_version: string;
@@ -330,7 +337,6 @@ export interface ProgramDocument {
     namespaces: BlackboardNamespaceDeclaration[];
     keys: BlackboardKeyDeclaration[];
   };
-  contact_policies?: JsonValue[];
   execution_groups?: Record<string, ProgramExecutionGroupDefinition>;
   tree: ProgramTreeNode;
 }
@@ -444,6 +450,11 @@ export interface SaveScenarioDocumentInput {
   name: string;
   description: string;
   confirmOverwrite: boolean;
+  /**
+   * Save writes the applied state (OD-365): with unapplied Draft edits the
+   * server refuses unless the operator confirmed they are left out.
+   */
+  confirmUnappliedExcluded?: boolean;
 }
 
 /**
@@ -521,10 +532,8 @@ export interface ScenarioDocumentExportResponse {
 export interface DeploymentScenarioCandidate {
   scenarioId: string;
   sourceDocumentDigest: string;
-  deploymentArtifactId: string;
   deploymentRevision: string;
   retainedBundleId: string;
-  programId: string;
   programRevision: string;
   programBindingId: string;
   description: string | null;
@@ -539,7 +548,6 @@ export interface DeploymentWorkspaceResponse {
     id: string;
     revision: number;
     document: Record<string, JsonValue> | null;
-    deploymentArtifactId: string | null;
     deploymentRevision: string | null;
     graphRevision: string | null;
     differsFromSaved: boolean;
@@ -569,28 +577,54 @@ export interface DeploymentWorkspaceResponse {
   unavailableReasons: string[];
 }
 
+/**
+ * Replace tool (OD-367): the Deployment workspace after the edit, and what
+ * the rewritten references name that the new tool does not declare (null
+ * when its declarations cannot be read).
+ */
+export interface ToolReplacementResponse {
+  schemaVersion: 'manyforge.composer_tool_replacement.v1';
+  workspace: DeploymentWorkspaceResponse;
+  replacement: ToolReplacement;
+}
+
+export interface ToolReplacement {
+  componentId: string;
+  replacementComponentId: string;
+  /** How many Program places named the old tool. */
+  programReferences: number;
+  lacks: { commandTargets: string[]; frames: string[]; collisionBodies: string[] } | null;
+}
+
 export interface PreparedActivationOrigin {
   kind: 'scenario'; scenarioId: string; sourceDocumentDigest: string;
   /** The Scenario project folder; it scopes persistent values. */
   projectPath: string;
 }
 
+/** One Program scene mesh the activation captured (OD-335). */
+export interface PreparedSceneMesh {
+  byteSize: number;
+  contentDigest: string;
+  resourceUri: string;
+}
+
 export interface PreparedActivationInput {
-  schemaVersion: 'manyforge.prepared_activation_input.v7';
+  schemaVersion: 'manyforge.prepared_activation_input.v8';
   preparedActivationId: string;
   origin: PreparedActivationOrigin;
   capturedInputDigest: string;
-  deploymentArtifactId: string;
   deploymentRevision: string;
   retainedBundleId: string;
   graphRevision: string;
-  programId: string | null;
   programRevision: string | null;
   /** Null when no Program is selected or the preserved Program is non-executable in this
    * candidate; the named references are in the preview impact. */
   programBindingId: string | null;
   nodeEnvironmentDigest: string;
   assistantMode: 'required' | 'optional' | 'forbidden';
+  /** The captured Program scene meshes, sorted by URI; empty with no mesh. */
+  sceneMeshes: PreparedSceneMesh[];
 }
 
 export interface DeploymentControlledStopProfile {
@@ -631,11 +665,9 @@ export interface DeploymentControlledStopUpdate {
 export interface CurrentScenarioSelection {
   scenarioId: string;
   sourceDocumentDigest: string;
-  deploymentArtifactId: string;
   deploymentRevision: string;
   retainedBundleId: string;
   graphRevision: string;
-  programId: string;
   programRevision: string;
   programBindingId: string;
 }
@@ -653,7 +685,6 @@ export interface AppliedProgramSelection {
   /** The Applied Scenario project folder; it scopes persistent values. */
   projectPath: string;
   sourceDocumentDigest: string;
-  programId: string;
   programRevision: string;
   programBindingId: string;
   retainedBundleId: string;
@@ -727,7 +758,6 @@ export interface ProgramRunCapture {
   appliedRecordDigest: string;
   scenarioId: string;
   sourceDocumentDigest: string;
-  programId: string;
   programRevision: string;
   programBindingId: string;
   retainedBundleId: string;
@@ -956,6 +986,23 @@ export interface PersistentKeyValueEdit {
 }
 
 /** Stored persistent values of one Scenario, owned by the Program runner. */
+/**
+ * One declared key of a run with its current value. `omitted`: the value is
+ * beyond the display bounds (for example a long model response); `no_value`:
+ * the key has no value (or its formula cannot be evaluated now).
+ */
+export type ProgramRunKeyValue =
+  | { key: string; type: string; valueState: 'value'; value: JsonValue }
+  | { key: string; type: string; valueState: 'no_value' | 'omitted' };
+
+/** A run's declared keys with their current values (read-only). */
+export interface ProgramRunKeyValues {
+  programRunId: number;
+  runRevision: number;
+  nodeStatusRevision: number;
+  keys: ProgramRunKeyValue[];
+}
+
 export interface PersistentKeyValues {
   scenarioId: string;
   /** The Applied Scenario project folder the values belong to. */
@@ -1121,6 +1168,9 @@ export interface ProgramExecutionSelectionControls {
     runtimeScaleUnavailableReason: string | null;
     /** Exact resources the Kernel reserves to release this selection. */
     resourceIds: string[];
+    /** `'program'` while a Program node's Stop holds this group (it waits for Run). */
+    stoppedBy: 'program' | null;
+    stoppedByNodeInstanceId: string | null;
   }>;
 }
 
@@ -1140,8 +1190,31 @@ export interface ProgramRecoveryHold {
   offer: CycleRecoveryOffer;
 }
 
+export type ProgramOperatorQuestionSeverity = 'info' | 'warning' | 'fault';
+
+export interface ProgramOperatorQuestionOption {
+  optionId: string;
+  label: string;
+  result: 'success' | 'failure';
+}
+
+/** One open question a Program node asks the operator; answered as a recovery action. */
+export interface ProgramOperatorQuestion {
+  schemaVersion: 'manyforge.program_operator_question.v1';
+  offerId: string;
+  offerRevision: number;
+  programRunId: number;
+  nodeInstanceId: string;
+  nodeAttemptId: number;
+  message: string;
+  severity: ProgramOperatorQuestionSeverity;
+  options: ProgramOperatorQuestionOption[];
+  /** Groups the node stopped at its start; they wait for Run after the answer. */
+  holdMotionGroupIds: string[];
+}
+
 export interface ProgramRuntimeControlProjection {
-  schemaVersion: 'manyforge.program_runtime_control_projection.v10';
+  schemaVersion: 'manyforge.program_runtime_control_projection.v11';
   ownerId: string;
   programRunId: number;
   runRevision: number;
@@ -1150,6 +1223,8 @@ export interface ProgramRuntimeControlProjection {
   recoveryOffer: CycleRecoveryOffer | null;
   /** Every active failure hold, in arrival order. */
   recoveryHolds: ProgramRecoveryHold[];
+  /** Open operator questions, ordered by node instance ID. */
+  operatorQuestions: ProgramOperatorQuestion[];
   executionSelections: ProgramExecutionSelectionControls;
 }
 
@@ -1364,7 +1439,6 @@ export interface LogicalSceneObject {
   collision_shapes: LogicalSceneShape[];
   placement: LogicalScenePlacement;
   provider_evidence: Record<string, JsonValue> | null;
-  support_contacts: Array<Record<string, JsonValue>>;
   /** Present only when positive (kg). */
   mass_kg?: number;
 }
@@ -1663,7 +1737,6 @@ export type SceneTransactionOperation =
       shape: SceneShapeRequest;
       pose: ScenePoseRequest;
       frame_ref: SceneTransactionFrameRequest;
-      support_contacts: Array<Record<string, JsonValue>>;
     }
   | { kind: 'remove_object'; scene_resource_id: string }
   | {
@@ -1776,7 +1849,6 @@ export interface ScenarioDocumentFenceRequest extends LocalWorkspaceFenceRequest
 
 export interface ManagerDeploymentCandidateReceipt {
   schema_version: 'manyforge.manager_deployment_candidate_receipt.v3';
-  deployment_artifact_id: string;
   deployment_revision: string;
   prepared_activation_id: string;
   candidate_retained_bundle_id: string;
@@ -1812,10 +1884,8 @@ export interface ProgramUnresolvedReference {
 /** The Applied Program's derived status. A non-executable Program is
  * preserved as authored; the backend refuses Execute by these references. */
 export interface AppliedProgramStatus {
-  deploymentArtifactId: string;
   deploymentRevision: string;
   executable: boolean;
-  programId: string | null;
   programRevision: string | null;
   origin: PreparedActivationOrigin;
   message: string | null;
@@ -1835,7 +1905,6 @@ export interface ManagerDeploymentImpact {
   componentDeltaDigest: string;
   program: {
     executable: boolean;
-    programId: string | null;
     programRevision: string | null;
     unresolvedReferences: ProgramUnresolvedReference[];
     affectedNodes: string[];
@@ -1998,7 +2067,6 @@ export type ManagerApplyLifecyclePhase =
 
 export interface ManagerApplyPreparedActivation {
   capturedInputDigest: string;
-  deploymentArtifactId: string;
   deploymentRevision: string;
   /** Null exactly when the Apply left the preserved Program non-executable;
    * reported separately from the runtime outcome in `state`. */
@@ -2105,7 +2173,6 @@ export interface ProgramNodeCorrectionPreviewRequest {
   /** The application start the run belongs to (`A`, 16 hex). */
   application_start_id: ApplicationStartId;
   program_run_id: number;
-  program_id: string;
   program_revision: string;
   program_binding_id: string;
   node_instance_id: string;
@@ -2123,7 +2190,6 @@ export interface ProgramNodeCorrectionPreview {
   requestKey: string;
   applicationStartId: ApplicationStartId;
   programRunId: number;
-  programId: string;
   programRevision: string;
   programBindingId: string;
   nodeInstanceId: string;

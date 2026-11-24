@@ -33,6 +33,11 @@
       ],
       "collision_body_roles": [
         {
+          "asset_collision_body_role_id": "default_collision",
+          "collision_body_role_id": "default_collision",
+          "model_role_id": "tool_model"
+        },
+        {
           "asset_collision_body_role_id": "gripper_collision",
           "collision_body_role_id": "gripper_collision",
           "model_role_id": "tool_model"
@@ -56,6 +61,7 @@
           "tcp": true
         }
       ],
+      "grip_body_role_id": "gripper_collision",
       "model_group_roles": [
         {
           "asset_model_group_role_id": "gripper",
@@ -78,7 +84,7 @@
     "model_role_id": "tool_model"
   },
   "component_type_id": "lite_gripper.component",
-  "component_type_revision": "sha256:d779f7fea1e4e3567b2a7720f4db1cb4dca99e211f36ce5958491e15b840e55e",
+  "component_type_revision": "sha256:070135432ddee64f2c7a50ca62a82cf6ad321fdc08a9776929cc4bb505e5bfec",
   "model_mounts": [],
   "model_roles": [
     {

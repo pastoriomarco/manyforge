@@ -11,7 +11,7 @@ import sys
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
-DESCRIPTOR = ROOT / "manyforge_deployment/resources/program_binding_transport.v3.json"
+DESCRIPTOR = ROOT / "manyforge_deployment/resources/program_binding_transport.v4.json"
 FIXTURE_RELATIVE = Path(
     "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
 )
@@ -54,7 +54,6 @@ EXPECTED_ENUMS = {
 }
 EXPECTED_RECORDS = {'binding': ['api_version',
              'program_binding_id',
-             'program_id',
              'program_revision',
              'retained_bundle_id',
              'graph_revision',
@@ -65,8 +64,9 @@ EXPECTED_RECORDS = {'binding': ['api_version',
              'collision_body_bindings',
              'signal_bindings',
              'node_policies',
-             'contact_grasp_bindings',
-             'provenance'],
+             'collision_rule_bodies',
+             'provenance',
+             'collision_rule_spring_sliders'],
  'node_environment': ['catalog_id',
                       'content_version',
                       'catalog_digest',
@@ -114,18 +114,12 @@ EXPECTED_RECORDS = {'binding': ['api_version',
  'provider': ['capability_provider_binding_id',
               'capability_provider_binding_revision'],
  'command_schema': ['command_schema_id', 'command_schema_revision'],
- 'contact': ['contact_policy_id',
-             'contact_policy_revision',
-             'runtime_object_id',
-             'allowed_body_bindings',
-             'max_penetration_m',
-             'terminal_window_start_fraction',
-             'bodies_from_motion_endpoint'],
- 'contact_body': ['body',
+ 'collision_rule_body': ['body',
                   'model_role_id',
                   'model_instance_id',
                   'model_revision',
                   'collision_body_ids'],
+ 'collision_rule_spring_slider': ['body', 'axis', 'stroke_m', 'max_compression_step_m'],
  'provenance': ['binding_compiler_contract_digest',
                 'source_records',
                 'resolved_output_records'],
@@ -140,34 +134,18 @@ EXPECTED_RECORDS = {'binding': ['api_version',
  'pneumatic_io': ['outputs', 'inputs'],
  'pneumatic_output': ['signal', 'open_value', 'close_value'],
  'pneumatic_input': ['input', 'signal'],
- 'contact_release': ['contact_policy_id',
-                     'contact_policy_revision',
-                     'runtime_object_id',
-                     'allowed_body_bindings',
-                     'mode',
-                     'release_evidence_mode',
-                     'enforce_max_start_penetration',
-                     'max_start_penetration_m',
-                     'min_release_progress_m',
-                     'release_tolerance_m',
-                     'require_strictly_decreasing_penetration',
-                     'require_separation_by_end',
-                     'allow_recontact',
-                     'bodies_from_motion_endpoint'],
  'target_reference': ['component_id', 'command_target_id'],
  'frame_reference': ['component_id', 'frame_id'],
  'body_reference': ['component_id', 'collision_body_id'],
  'signal_reference': ['component_id', 'signal_name'],
  'frame_association': ['frame', 'contact_body_role_ids']}
-EXPECTED_OPTIONAL_RECORD_FIELDS = {'recovery_policy': ['intervention_stop_scope'],
- 'target': ['pneumatic_io', 'robot_tcps', 'default_tcp'],
- 'contact': ['bodies_from_motion_endpoint'],
- 'contact_release': ['bodies_from_motion_endpoint']}
+EXPECTED_OPTIONAL_RECORD_FIELDS = {'binding': ['collision_rule_spring_sliders'],
+ 'recovery_policy': ['intervention_stop_scope'],
+ 'target': ['pneumatic_io', 'robot_tcps', 'default_tcp']}
 EXPECTED_KINDS = [
     "model_asset", "runtime_profile", "component_type",
     "control_interface_contract", "controller_topology", "provider_manifest",
-    "command_schema", "capability_definition", "contact_policy",
-    "stop_evidence_policy",
+    "command_schema", "capability_definition", "stop_evidence_policy",
 ]
 EXPECTED_FORMULAS = {
     "collision_body_id": "component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}",
@@ -185,9 +163,9 @@ EXPECTED_INVARIANTS = ['closed_records',
  'direct_reference_correspondence',
  'robot_tcp_entry_frame_correspondence',
  'robot_tcp_sorted_unique',
- 'finite_contact_ranges',
- 'contact_body_model_correspondence',
+ 'collision_rule_body_model_correspondence',
  'generated_collision_body_ids',
+ 'spring_slider_rule_body_correspondence',
  'provenance_kind_and_tuple_order']
 
 TYPE_NAMES = {
@@ -211,9 +189,8 @@ TYPE_NAMES = {
     "control": "ProgramControlBindingRef",
     "provider": "ProgramCapabilityProviderBindingRef",
     "command_schema": "ProgramCommandSchemaRef",
-    "contact": "ProgramContactGraspEnvelopeBinding",
-    "contact_release": "ProgramContactReleaseBinding",
-    "contact_body": "ProgramContactGraspBodyBinding",
+    "collision_rule_body": "ProgramCollisionRuleBodyBinding",
+    "collision_rule_spring_slider": "ProgramCollisionRuleSpringSliderBinding",
     "provenance": "ProgramBindingProvenance",
     "provenance_record": "ProgramBindingProvenanceRecord",
     "target_reference": "ProgramTargetReference",
@@ -228,7 +205,8 @@ FIELD_TYPES = {
     ("binding", "component_role_bindings"): "ProgramComponentRoleBinding[]",
     ("binding", "target_role_bindings"): "ProgramTargetRoleBinding[]",
     ("binding", "node_policies"): "ProgramNodePolicy[]",
-    ("binding", "contact_grasp_bindings"): "ProgramContactGraspBinding[]",
+    ("binding", "collision_rule_bodies"): "ProgramCollisionRuleBodyBinding[]",
+    ("binding", "collision_rule_spring_sliders"): "ProgramCollisionRuleSpringSliderBinding[]",
     ("binding", "provenance"): "ProgramBindingProvenance",
     ("component", "model_role_bindings"): "ProgramModelRoleBinding[]",
     ("target", "signal_role_bindings"): "ProgramSignalRoleBinding[]",
@@ -252,7 +230,6 @@ FIELD_TYPES = {
     ("target", "collision_body_role_bindings"): "ProgramCollisionBodyRoleBinding[]",
     ("target", "capability_bindings"): "ProgramCapabilityBinding[]",
     ("frame", "contact_body_role_ids"): "string[]",
-    ("contact", "bodies_from_motion_endpoint"): "true",
     ("resource", "resource_ids"): "string[]",
     ("resource", "compiled_resource_names"): "string[]",
     ("collision", "compiled_collision_body_names"): "string[]",
@@ -264,28 +241,17 @@ FIELD_TYPES = {
     ("recovery_policy", "allow_intervention"): "boolean",
     ("recovery_policy", "max_retries"): "number",
     ("recovery_policy", "intervention_stop_scope"): "ProgramInterventionStopScope",
-    ("contact", "allowed_body_bindings"): "ProgramContactGraspBodyBinding[]",
-    ("contact", "max_penetration_m"): "number",
-    ("contact", "terminal_window_start_fraction"): "number",
-    ("contact_release", "mode"): "'contact_release'",
-    ("contact_release", "release_evidence_mode"): "'signed_penetration' | 'binary_contact'",
-    ("contact_release", "enforce_max_start_penetration"): "boolean",
-    ("contact_release", "max_start_penetration_m"): "number",
-    ("contact_release", "min_release_progress_m"): "number",
-    ("contact_release", "release_tolerance_m"): "number",
-    ("contact_release", "require_strictly_decreasing_penetration"): "boolean",
-    ("contact_release", "require_separation_by_end"): "boolean",
-    ("contact_release", "allow_recontact"): "boolean",
-    ("contact_release", "allowed_body_bindings"): "ProgramContactGraspBodyBinding[]",
-    ("contact_release", "bodies_from_motion_endpoint"): "true",
-    ("contact_body", "model_role_id"): "string | null",
-    ("contact_body", "collision_body_ids"): "string[]",
+    ("collision_rule_body", "model_role_id"): "string | null",
+    ("collision_rule_body", "collision_body_ids"): "string[]",
+    ("collision_rule_spring_slider", "axis"): "[number, number, number]",
+    ("collision_rule_spring_slider", "stroke_m"): "number",
+    ("collision_rule_spring_slider", "max_compression_step_m"): "number",
     ("provenance", "source_records"): "ProgramBindingProvenanceRecord[]",
     ("provenance", "resolved_output_records"): "ProgramBindingProvenanceRecord[]",
     ("provenance_record", "record_kind"): "CatalogRecordKind",
 }
 
-# Direct reference records are exact closed pairs from the native v3 codec.
+# Direct reference records are exact closed pairs from the native v4 codec.
 FIELD_TYPES.update({
     ("binding", "component_bindings"): "ProgramComponentBinding[]",
     ("binding", "target_bindings"): "ProgramTargetBinding[]",
@@ -310,7 +276,8 @@ FIELD_TYPES.update({
     ("robot_tcp", "contact_body_role_ids"): "string[]",
     ("pneumatic_output", "signal"): "ProgramSignalReference",
     ("pneumatic_input", "signal"): "ProgramSignalReference",
-    ("contact_body", "body"): "ProgramBodyReference",
+    ("collision_rule_body", "body"): "ProgramBodyReference",
+    ("collision_rule_spring_slider", "body"): "ProgramBodyReference",
 })
 
 
@@ -325,9 +292,9 @@ def load_and_validate(path: Path) -> dict[str, Any]:
     }
     if not isinstance(value, dict) or set(value) != expected_root:
         raise ValueError("descriptor root is not the closed v1 record")
-    if value["api_version"] != "manyforge.program_binding_transport_descriptor.v3":
+    if value["api_version"] != "manyforge.program_binding_transport_descriptor.v4":
         raise ValueError("descriptor API version is invalid")
-    if value["binding_api_version"] != "manyforge.program_binding.v3":
+    if value["binding_api_version"] != "manyforge.program_binding.v4":
         raise ValueError("Binding API version is invalid")
     exact = (
         ("limits", EXPECTED_LIMITS),
@@ -341,7 +308,7 @@ def load_and_validate(path: Path) -> dict[str, Any]:
     )
     for name, expected in exact:
         if value[name] != expected:
-            raise ValueError(f"descriptor {name} differ from native v3 contract")
+            raise ValueError(f"descriptor {name} differ from native v4 contract")
     return value
 
 
@@ -357,8 +324,7 @@ def _py_constants(descriptor: dict[str, Any]) -> str:
             for group in (
                 descriptor["catalog_record_kinds"][0:3],
                 descriptor["catalog_record_kinds"][3:6],
-                descriptor["catalog_record_kinds"][6:9],
-                descriptor["catalog_record_kinds"][9:],
+                descriptor["catalog_record_kinds"][6:],
             )
         ],
         "})",
@@ -401,8 +367,7 @@ def _ts_constants(descriptor: dict[str, Any]) -> str:
             for group in (
                 descriptor["catalog_record_kinds"][0:3],
                 descriptor["catalog_record_kinds"][3:6],
-                descriptor["catalog_record_kinds"][6:9],
-                descriptor["catalog_record_kinds"][9:],
+                descriptor["catalog_record_kinds"][6:],
             )
         ],
         "]);",
@@ -447,7 +412,6 @@ def _type_interfaces(descriptor: dict[str, Any]) -> str:
             optional = "?" if field in descriptor["optional_record_fields"].get(record_name, ()) else ""
             sections.append(f"  {field}{optional}: {field_type.format(api_version=api_version)};")
         sections.append("}")
-    sections.append("export type ProgramContactGraspBinding = ProgramContactGraspEnvelopeBinding | ProgramContactReleaseBinding;")
     return "\n".join(sections)
 
 
@@ -475,7 +439,7 @@ def _validate_fixture(source: bytes) -> None:
         raise ValueError("fixture source is not canonical JSON") from error
     if (
         not isinstance(value, dict)
-        or value.get("api_version") != "manyforge.program_binding.v3"
+        or value.get("api_version") != "manyforge.program_binding.v4"
         or not value.get("component_bindings")
         or source
         != json.dumps(

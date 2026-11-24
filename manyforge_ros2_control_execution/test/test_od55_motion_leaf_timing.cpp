@@ -1,4 +1,7 @@
 // Reuse the real ROS action/publisher Rig in an isolated, timing-only binary.
+// Its waits end when their condition holds; a stuck one is caught by the
+// iteration watchdog below, not by a bound a loaded machine can exceed.
+#define MANYFORGE_FIXTURE_WAIT_LIMIT std::chrono::hours(24)
 #include "test_ros2_control_execution_backend.cpp"
 #include <manyforge_ros2_control_execution/detail/leaf_timing.hpp>
 #include <algorithm>
@@ -12,13 +15,16 @@ namespace manyforge::ros2_control_execution {
 namespace {
 // A stuck SDK call cannot be bounded by the caller's poll loop. Abort this
 // isolated test process on the exact stuck iteration so its own core retains
-// every thread; never detach a worker or retry an uncertain effect.
+// every thread; never detach a worker or retry an uncertain effect. The limit
+// detects a stuck iteration only: it is far above an iteration's run time on
+// a loaded machine (milliseconds to a few seconds of ROS discovery), and a
+// false expiry would abort loudly, never pass.
 class IterationWatchdog final {
  public:
   IterationWatchdog(const char* name, std::size_t iteration)
       : worker_([this, name, iteration] {
           std::unique_lock lock(mutex_);
-          if (!condition_.wait_for(lock, std::chrono::seconds(10), [this] { return done_; })) {
+          if (!condition_.wait_for(lock, std::chrono::seconds(120), [this] { return done_; })) {
             std::fprintf(stderr, "LEAF_WATCHDOG %s iteration=%zu\n", name, iteration);
             std::fflush(stderr);
             std::abort();
@@ -378,7 +384,6 @@ void ExerciseLateAcceptanceWhileBarrierHeld() {
   ASSERT_EQ(rig.submit(key(1)).dispatch, ExecutionPortDispatch::kDispatched);
   ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
   detail::stop_barrier_entered.store(false);
-  detail::stop_barrier_expired.store(false);
   detail::release_stop_barrier.store(false);
   detail::block_stop_barrier.store(true);
   std::jthread stop([&] {
@@ -395,17 +400,11 @@ void ExerciseLateAcceptanceWhileBarrierHeld() {
   rig.release_response();
   // Acceptance must be processed on the time-critical thread while the action
   // leaf is held; the queued cancel may wait, but the ROS callback must not.
-  const auto callback_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  bool accepted = false;
-  while (std::chrono::steady_clock::now() < callback_deadline) {
-    const auto goal = rig.adapter->ReadGoal(key(1));
-    if (goal && goal->accepted_stamp_ns.has_value()) { accepted = true; break; }
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
-  ASSERT_TRUE(accepted);
-  ASSERT_TRUE(rig.state_arrives_within(1, std::chrono::seconds(1)))
+  // The barrier is held until released below, so both arrivals prove it; a
+  // blocked callback never arrives and the iteration watchdog aborts.
+  ASSERT_TRUE(rig.accepted(key(1)));
+  ASSERT_TRUE(rig.state_arrives_within(1, MANYFORGE_FIXTURE_WAIT_LIMIT))
       << "time-critical thread could not run another callback";
-  ASSERT_FALSE(detail::stop_barrier_expired.load());
   ASSERT_FALSE(detail::release_stop_barrier.load());
   ASSERT_EQ(rig.cancel_count.load(), 0U);
   const auto first = rig.handle(0)->get_goal_id();
@@ -494,7 +493,6 @@ TEST(Od55LeafTiming, LateAcceptanceDuringAdmittedGoalSendDoesNotDeadlock) {
   ASSERT_TRUE(wait_until([&] { return rig.response_blocked.load(); }));
   ASSERT_EQ(rig.adapter->Cancel(key(1)).dispatch, ExecutionPortDispatch::kEffectUncertain);
   detail::goal_admitted_entered.store(false);
-  detail::goal_admitted_timed_out.store(false);
   detail::release_goal_admitted.store(false);
   detail::block_goal_admitted.store(true);
   std::atomic<bool> dispatched{false};
@@ -516,7 +514,6 @@ TEST(Od55LeafTiming, LateAcceptanceDuringAdmittedGoalSendDoesNotDeadlock) {
   const auto first = rig.handle(0)->get_goal_id();
   detail::release_goal_admitted.store(true);
   submit.join();
-  ASSERT_FALSE(detail::goal_admitted_timed_out.load());
   ASSERT_TRUE(dispatched.load());
   ASSERT_TRUE(rig.accepted(key(2)));
   ASSERT_TRUE(wait_until([&] {

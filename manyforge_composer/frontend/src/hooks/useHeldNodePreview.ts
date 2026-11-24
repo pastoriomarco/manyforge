@@ -187,7 +187,6 @@ export function useHeldNodePreview({
       request_key: newRequestKey(),
       application_start_id: start,
       program_run_id: current.offer.programRunId,
-      program_id: current.run.capture.programId,
       program_revision: current.run.capture.programRevision,
       program_binding_id: current.run.capture.programBindingId,
       node_instance_id: current.offer.nodeInstanceId,

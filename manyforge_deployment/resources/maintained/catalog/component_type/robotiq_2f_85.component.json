@@ -33,6 +33,11 @@
       ],
       "collision_body_roles": [
         {
+          "asset_collision_body_role_id": "default_collision",
+          "collision_body_role_id": "default_collision",
+          "model_role_id": "tool_model"
+        },
+        {
           "asset_collision_body_role_id": "gripper_collision",
           "collision_body_role_id": "gripper_collision",
           "model_role_id": "tool_model"
@@ -54,6 +59,7 @@
           "tcp": true
         }
       ],
+      "grip_body_role_id": "gripper_collision",
       "model_group_roles": [
         {
           "asset_model_group_role_id": "gripper",
@@ -76,7 +82,7 @@
     "model_role_id": "tool_model"
   },
   "component_type_id": "robotiq_2f_85.component",
-  "component_type_revision": "sha256:361aa1bdf73719ba5a9e6d456b670d2c5da3a3870d44f18edb9c0624b5bf7f29",
+  "component_type_revision": "sha256:a32dc5de9ac806ff6245d6a5a14ed11d4916f9faf1177e426286c126f2111a0c",
   "model_mounts": [],
   "model_roles": [
     {

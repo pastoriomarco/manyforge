@@ -109,7 +109,7 @@ struct CollisionComponentModelFrame {
 ///
 /// **What the snapshot does NOT carry:**
 ///   - Per-query robot joint state (that is `CollisionQuery::robot_state`).
-///   - Policy state — allowed pairs, support-contact entries, full-
+///   - Policy state — allowed pairs, contact and release rules, full-
 ///     diagnostic requirements (that is `CollisionPolicySnapshot`).
 ///     The policy resolver derives its allowed-pair lists from the
 ///     active snapshot; the snapshot itself does NOT publish them.

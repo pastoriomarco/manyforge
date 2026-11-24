@@ -47,7 +47,6 @@ using manyforge::core::ProgramCapabilityBindingDTO;
 using manyforge::core::ProgramComponentBindingDTO;
 using manyforge::core::ProgramControlBindingRefDTO;
 using manyforge::core::ProgramFrameBindingDTO;
-using manyforge::core::ProgramId;
 using manyforge::core::ProgramModelRoleBindingDTO;
 using manyforge::core::ProgramResourceRoleBindingDTO;
 using manyforge::core::ProgramRevision;
@@ -238,7 +237,6 @@ struct BindingContext final {
   return ProgramBindingDTO{
       std::string(manyforge::core::kProgramBindingApiVersion),
       ProgramBindingId(std::string(kZeroDigest)),
-      ProgramId("binding_test_program"),
       ProgramRevision(sha256_digest("i6 test program revision")),
       context.bundle->retained_bundle_id(), graph.graph_revision,
       bundle.catalogs.node_environment,
@@ -523,52 +521,14 @@ TEST(ProgramBindingTest, RobotTcpPresenceSurvivesCanonicalSealAndReload) {
   EXPECT_EQ(present_reloaded->value(), present->value());
 }
 
-TEST(ProgramBindingTest, MotionEndpointReleaseBindingRoundTripsExactEnvelope) {
+TEST(ProgramBindingTest, CollisionRuleBodiesRoundTripAndKeepTheirExactScope) {
   ScopedTrustedRoot root;
   const auto context = make_context(root.path());
   auto value = make_binding_value(context);
-  manyforge::core::ContactReleaseEnvelopeDTO release;
-  release.max_start_penetration_m = 0.002;
-  value.contact_grasp_bindings.push_back({
-      manyforge::core::ContactPolicyId("endpoint_release"),
-      manyforge::core::ContactPolicyRevision(std::string(kZeroDigest)),
-      manyforge::core::RuntimeObjectId("selected_object"), {}, release, true});
-  const auto sealed = ProgramBindingConstructionAuthority::seal(value);
-  EXPECT_NE(sealed->canonical_bytes().find("\"mode\":\"contact_release\""),
+  const auto without = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(without->canonical_bytes().find("\"collision_rule_bodies\":[]"),
             std::string::npos);
-  EXPECT_EQ(sealed->canonical_bytes().find("terminal_window_start_fraction"),
-            std::string::npos);
-  const auto loaded = reload_verified_program_binding(
-      sealed->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
-  EXPECT_EQ(loaded->value(), sealed->value());
-  EXPECT_EQ(std::get<manyforge::core::ContactReleaseEnvelopeDTO>(
-                loaded->value().contact_grasp_bindings.front().envelope), release);
-}
 
-TEST(ProgramBindingTest,
-     MotionEndpointContactBindingRoundTripsWithoutExplicitBodies) {
-  ScopedTrustedRoot root;
-  const auto context = make_context(root.path());
-  auto value = make_binding_value(context);
-  value.contact_grasp_bindings.push_back(
-      manyforge::core::ProgramContactGraspBindingDTO{
-          manyforge::core::ContactPolicyId("endpoint_contact"),
-          manyforge::core::ContactPolicyRevision(std::string(kZeroDigest)),
-          manyforge::core::RuntimeObjectId("selected_object"),
-          {},
-          manyforge::core::ContactGraspEnvelopeDTO{0.002, 0.8},
-          true});
-  const auto sealed = ProgramBindingConstructionAuthority::seal(value);
-  EXPECT_NE(
-      sealed->canonical_bytes().find("\"bodies_from_motion_endpoint\":true"),
-      std::string::npos);
-  const auto loaded = reload_verified_program_binding(
-      sealed->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
-  EXPECT_EQ(loaded->value(), sealed->value());
-  value.contact_grasp_bindings.front().bodies_from_motion_endpoint = false;
-  EXPECT_THROW(
-      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
-      ProgramBindingError);
   const auto &body = value.collision_body_bindings.front();
   std::vector<std::string> ids;
   for (std::size_t i = 0U; i < body.compiled_collision_body_names.size(); ++i) {
@@ -576,20 +536,90 @@ TEST(ProgramBindingTest,
         body.reference.component_id, body.model_instance_id,
         body.reference.collision_body_id, i));
   }
-  value.contact_grasp_bindings.front().allowed_body_bindings.push_back(
-      {body.reference, std::nullopt, body.model_instance_id, body.model_revision,
-       std::move(ids)});
-  const auto legacy = ProgramBindingConstructionAuthority::seal(value);
-  EXPECT_EQ(legacy->canonical_bytes().find("bodies_from_motion_endpoint"),
+  value.collision_rule_bodies.push_back(
+      {body.reference, std::nullopt, body.model_instance_id, body.model_revision, ids});
+  const auto sealed = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(sealed->program_binding_id(), without->program_binding_id());
+  const auto loaded = reload_verified_program_binding(
+      sealed->canonical_bytes(), *context.bundle, context.model_map, context.catalog_source());
+  EXPECT_EQ(loaded->value(), sealed->value());
+  ASSERT_EQ(loaded->value().collision_rule_bodies.size(), 1U);
+  EXPECT_EQ(loaded->value().collision_rule_bodies.front().collision_body_ids, ids);
+
+  // A body id outside its generated scope, an empty id list, a body without a
+  // collision-body binding and a repeated body are refused.
+  auto wrong_id = value;
+  wrong_id.collision_rule_bodies.front().collision_body_ids.front() += "x";
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(wrong_id)),
+               ProgramBindingError);
+  auto no_ids = value;
+  no_ids.collision_rule_bodies.front().collision_body_ids.clear();
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(no_ids)),
+               ProgramBindingError);
+  auto unbound = value;
+  unbound.collision_rule_bodies.front().body.collision_body_id =
+      CollisionBodyRoleId("no_such_body");
+  unbound.collision_rule_bodies.front().collision_body_ids = {
+      manyforge::core::make_component_collision_body_id(
+          body.reference.component_id, body.model_instance_id,
+          CollisionBodyRoleId("no_such_body"), 0U)};
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(unbound)),
+               ProgramBindingError);
+  auto repeated = value;
+  repeated.collision_rule_bodies.push_back(repeated.collision_rule_bodies.front());
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(repeated)),
+               ProgramBindingError);
+}
+
+// OD-371: the spring sliders a Program's rules switch on are an optional
+// table (absent when empty); each slider is a collision-rule body with a unit
+// axis, a stroke and a step, and the retained generated tool must hold it.
+TEST(ProgramBindingTest, SpringSlidersAreOptionalRuleBodiesVerifiedInContext) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  auto value = make_binding_value(context);
+  const auto &body = value.collision_body_bindings.front();
+  std::vector<std::string> ids;
+  for (std::size_t i = 0U; i < body.compiled_collision_body_names.size(); ++i) {
+    ids.push_back(manyforge::core::make_component_collision_body_id(
+        body.reference.component_id, body.model_instance_id,
+        body.reference.collision_body_id, i));
+  }
+  value.collision_rule_bodies.push_back(
+      {body.reference, std::nullopt, body.model_instance_id, body.model_revision, ids});
+  const auto without = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_EQ(without->canonical_bytes().find("collision_rule_spring_sliders"), std::string::npos);
+
+  value.collision_rule_spring_sliders.push_back({body.reference, {0.0, 0.0, 1.0}, 0.02, 0.002});
+  const auto sealed = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(sealed->program_binding_id(), without->program_binding_id());
+  EXPECT_NE(sealed->canonical_bytes().find("\"collision_rule_spring_sliders\":[{"),
             std::string::npos);
-  EXPECT_EQ(reload_verified_program_binding(legacy->canonical_bytes(),
-                                            *context.bundle, context.model_map, context.catalog_source())
-                ->value(),
-            legacy->value());
-  value.contact_grasp_bindings.front().bodies_from_motion_endpoint = true;
-  EXPECT_THROW(
-      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
-      ProgramBindingError);
+  const auto intrinsic =
+      ProgramBindingConstructionAuthority::reload_intrinsic(sealed->canonical_bytes());
+  EXPECT_EQ(intrinsic->value(), sealed->value());
+  // The fixture's component is no generated tool: the context refuses the slider.
+  EXPECT_THROW(static_cast<void>(reload_verified_program_binding(
+                   sealed->canonical_bytes(), *context.bundle, context.model_map,
+                   context.catalog_source())),
+               ProgramBindingError);
+
+  auto not_a_rule_body = value;
+  not_a_rule_body.collision_rule_bodies.clear();
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(not_a_rule_body)),
+               ProgramBindingError);
+  auto bent_axis = value;
+  bent_axis.collision_rule_spring_sliders.front().axis = {0.0, 0.5, 0.5};
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(bent_axis)),
+               ProgramBindingError);
+  auto no_step = value;
+  no_step.collision_rule_spring_sliders.front().max_compression_step_m = 0.0;
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(no_step)),
+               ProgramBindingError);
+  auto repeated = value;
+  repeated.collision_rule_spring_sliders.push_back(repeated.collision_rule_spring_sliders.front());
+  EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::seal(repeated)),
+               ProgramBindingError);
 }
 
 TEST(ProgramBindingTest,
@@ -838,8 +868,10 @@ TEST(ProgramBindingTest, ReloadRejectsCanonicalBytesWithAStaleContentIdentity) {
   const auto sealed =
       ProgramBindingConstructionAuthority::seal(make_binding_value(context));
   std::string tampered(sealed->canonical_bytes());
-  const std::string original = "\"program_id\":\"binding_test_program\"";
-  const std::string replacement = "\"program_id\":\"binding_fake_program\"";
+  const std::string original = "\"program_revision\":\"" +
+                               sha256_digest("i6 test program revision") + "\"";
+  const std::string replacement = "\"program_revision\":\"" +
+                                  sha256_digest("i6 fake program revision") + "\"";
   const std::size_t position = tampered.find(original);
   ASSERT_NE(position, std::string::npos);
   tampered.replace(position, original.size(), replacement);
@@ -867,7 +899,7 @@ TEST(ProgramBindingTest, DirectReferencesAreBoundToExactOwnerAndTarget) {
   const auto context = make_context(root.path());
   const auto original = make_binding_value(context);
   const auto sealed = ProgramBindingConstructionAuthority::seal(original);
-  EXPECT_NE(sealed->canonical_bytes().find("manyforge.program_binding.v3"),
+  EXPECT_NE(sealed->canonical_bytes().find("manyforge.program_binding.v4"),
             std::string::npos);
   EXPECT_EQ(sealed->canonical_bytes().find("role_assignment_digest"),
             std::string::npos);
@@ -878,8 +910,8 @@ TEST(ProgramBindingTest, DirectReferencesAreBoundToExactOwnerAndTarget) {
                ProgramBindingError);
   EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::reload_intrinsic(
                    replace_once(std::string(sealed->canonical_bytes()),
-                                "manyforge.program_binding.v3",
-                                "manyforge.program_binding.v2"))),
+                                "manyforge.program_binding.v4",
+                                "manyforge.program_binding.v3"))),
                ProgramBindingError);
   EXPECT_THROW(static_cast<void>(ProgramBindingConstructionAuthority::reload_intrinsic(
                    replace_once(std::string(sealed->canonical_bytes()),

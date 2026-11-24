@@ -68,6 +68,7 @@ def _request(deployment: dict[str, Any] | None = None) -> ActivationPreparationR
         request_key=_KEY, source_document_digest=_DIGEST, scenario_id="cell",
         project_path="/projects/cell.scenario", captured_input_digest=_DIGEST,
         deployment=deployment or {"components": []}, model_source_closure={},
+        scene_mesh_closure={"schema_version": "manyforge.activation_scene_mesh_closure.v1", "meshes": []},
         program=None, expected_admission_generation=7,
     )
 

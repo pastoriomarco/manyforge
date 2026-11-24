@@ -52,7 +52,7 @@ void WriteDeploymentSource(
     const deployment::RevisionVerifiedDeploymentArtifact &deployment) {
   const auto path =
       package_root /
-      (deployment.deployment_artifact_id().value() + ".deployment.json");
+      (deployment.deployment_revision().value().substr(7U) + ".deployment.json");
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);
   if (!stream) {
     throw std::runtime_error(
@@ -67,12 +67,11 @@ void WriteDeploymentSource(
 }
 
 [[nodiscard]] std::string
-ProgramBytes(const deployment::RetainedBundle &bundle,
-             const std::string_view name = "Program Apply fixture") {
+ProgramBytes(const deployment::RetainedBundle &bundle) {
   constexpr std::string_view kZeroDigest =
       "sha256:0000000000000000000000000000000000000000000000000000000000000000";
   deployment::CanonicalValue root(deployment::CanonicalValue::Object{
-      {"api_version", deployment::CanonicalValue("manyforge.program.v3")},
+      {"api_version", deployment::CanonicalValue("manyforge.program.v4")},
       {"catalog",
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"api_version",
@@ -81,8 +80,6 @@ ProgramBytes(const deployment::RetainedBundle &bundle,
             deployment::CanonicalValue(
                 bundle.value().catalogs.node_environment.content_version)},
        })},
-      {"name", deployment::CanonicalValue(std::string(name))},
-      {"program_id", deployment::CanonicalValue("program_apply_fixture")},
       {"program_profile", deployment::CanonicalValue("composable-cell-v1")},
       {"program_revision",
        deployment::CanonicalValue(std::string(kZeroDigest))},
@@ -112,14 +109,12 @@ ProgramBytes(const deployment::RetainedBundle &bundle,
   const auto revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
-                .api_version = "manyforge.program.v3",
+                .api_version = "manyforge.program.v4",
                 .own_field = "program_revision",
             });
   auto members = root.as_object();
   for (auto &[field, value] : members) {
-    if (field == "name") {
-      value = deployment::CanonicalValue(std::string(name));
-    } else if (field == "program_revision") {
+    if (field == "program_revision") {
       value = deployment::CanonicalValue(revision);
     }
   }

@@ -172,6 +172,10 @@ struct RunHoldState final {
   StopEventId frozen_by{0U};
   /// The global rule whose `hold` trip held the run (latest one).
   std::optional<InterruptPolicyId> held_by_rule{};
+  /// Per captured node: 1 + the index of the Program node whose own Stop
+  /// (OD-342) raised its hold, 0 for any other hold or none; cleared by its
+  /// release. Allocated at capture.
+  std::vector<std::uint32_t> held_by_program_node{};
   /// Per captured node: participants of resident operations scoped to the
   /// node whose phase is `kStopping` / `kFailed`. Allocated at capture.
   std::vector<std::uint16_t> stopping{};
@@ -377,6 +381,8 @@ struct StopRequest final {
   std::optional<StopMode> mode{};
   /// S7: the rule that holds the run.
   const InterruptPolicyId* held_by_rule{};
+  /// S1 only: the Program node whose own Stop this is (OD-342).
+  const ProgramNodeInstanceId* held_by_program_node{};
   /// S12: this Stop is the takeover's own forced Stop of the incumbent, so
   /// E13 does not cancel that incumbent's pending and queued candidates.
   bool own_takeover_stop{};

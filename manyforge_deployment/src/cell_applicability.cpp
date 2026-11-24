@@ -337,7 +337,6 @@ private:
 
 struct QualifiedIndexes final {
   std::map<PairKey, const QualifiedRuntimeProfile *> runtime_profiles;
-  std::map<PairKey, const QualifiedContactPolicy *> contact_policies;
   std::map<PairKey, const QualifiedCommandSchema *> command_schemas;
   std::map<PairKey, const QualifiedCapabilityDefinition *>
       capability_definitions;
@@ -346,7 +345,6 @@ struct QualifiedIndexes final {
   std::map<PairKey, const QualifiedProviderManifest *> manifests;
   std::map<PairKey, const QualifiedStopEvidencePolicy *> stop_policies;
   std::set<PairKey> required_runtime_profiles;
-  std::set<PairKey> required_contact_policies;
   std::set<PairKey> required_capability_definitions;
   std::set<PairKey> required_contracts;
   std::set<PairKey> required_topologies;
@@ -358,7 +356,6 @@ struct QualifiedIndexes final {
     const CompositionQualifiedCellIr &composition,
     const RevisionVerifiedDeploymentApplicabilityInputs &deployment_inputs,
     std::span<const QualifiedRuntimeProfile> runtime_profiles,
-    std::span<const QualifiedContactPolicy> contact_policies,
     std::span<const QualifiedCommandSchema> command_schemas,
     std::span<const QualifiedCapabilityDefinition> capability_definitions,
     std::span<const QualifiedControlInterfaceContract> contracts,
@@ -373,13 +370,6 @@ struct QualifiedIndexes final {
                             value.value().runtime_profile_revision);
           },
           "runtime-profile closure"),
-      index_exact_span(
-          contact_policies,
-          [](const auto &value) {
-            return pair_key(value.value().contact_policy_id,
-                            value.value().contact_policy_revision);
-          },
-          "contact-policy closure"),
       index_exact_span(
           command_schemas,
           [](const auto &value) {
@@ -428,7 +418,6 @@ struct QualifiedIndexes final {
       {},
       {},
       {},
-      {},
   };
 
   const auto &graph = composition.graph();
@@ -443,16 +432,7 @@ struct QualifiedIndexes final {
           using Reference = std::remove_cvref_t<decltype(typed_reference)>;
           const PairKey key = pair_key(typed_reference.record_id,
                                        typed_reference.record_revision);
-          if constexpr (std::is_same_v<Reference,
-                                       core::ContactPolicyCatalogRecordRefDTO>) {
-            const auto selected = result.contact_policies.find(key);
-            if (selected == result.contact_policies.end() ||
-                selected->second->reference() != typed_reference) {
-              fail("retained contact-policy reference is absent or differs "
-                   "from the exact qualified referent");
-            }
-            result.required_contact_policies.insert(key);
-          } else if constexpr (
+          if constexpr (
               std::is_same_v<Reference,
                              core::StopEvidencePolicyCatalogRecordRefDTO>) {
             const auto selected = result.stop_policies.find(key);
@@ -523,9 +503,6 @@ struct QualifiedIndexes final {
   require_exact_closure(result.runtime_profiles,
                         result.required_runtime_profiles,
                         "runtime-profile closure");
-  require_exact_closure(result.contact_policies,
-                        result.required_contact_policies,
-                        "contact-policy closure");
   require_exact_closure(result.topologies, result.required_topologies,
                         "controller-topology closure");
   require_exact_closure(result.manifests, result.required_manifests,
@@ -3225,12 +3202,11 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
     std::span<const BuildQualifiedValueSchemaEntry> value_schemas,
     std::span<const QualifiedCommissioningEvidenceRef>
         commissioning_evidence_refs,
-    const QualifiedSelectedSiteOverlay &selected_site_overlay,
-    std::span<const QualifiedContactPolicy> contact_policies) {
+    const QualifiedSelectedSiteOverlay &selected_site_overlay) {
   const QualifiedAssistantSettings assistant_settings =
       qualify_assistant_settings(deployment_inputs.assistant_settings());
   const auto indexes = build_qualified_indexes(
-      composition, deployment_inputs, runtime_profiles, contact_policies,
+      composition, deployment_inputs, runtime_profiles,
       command_schemas, capability_definitions,
       control_interface_contracts, controller_topologies, provider_manifests,
       stop_evidence_policies);
@@ -3306,8 +3282,6 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
       composition, deployment_inputs, selected_overlay, assistant_settings,
       copy_closure_in_key_order<QualifiedRuntimeProfile>(
           indexes.runtime_profiles, indexes.required_runtime_profiles),
-      copy_closure_in_key_order<QualifiedContactPolicy>(
-          indexes.contact_policies, indexes.required_contact_policies),
       copy_index_in_key_order<QualifiedCommandSchema>(indexes.command_schemas),
       copy_closure_in_key_order<QualifiedCapabilityDefinition>(
           indexes.capability_definitions,

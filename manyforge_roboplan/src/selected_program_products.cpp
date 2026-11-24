@@ -37,7 +37,6 @@ core::Result<SelectedProgramProducts> LoadSelectedProgramProducts(
     const deployment::FilesystemVerifiedCatalogArtifactSource catalog(catalog_root);
     if (!model_map)
       return rejected("program_selected_products_unavailable");
-    const auto &id = program->program_id;
     const auto &revision = program->program_revision;
     SelectedProgramProducts products;
     const auto read = [&](const std::filesystem::path &root) {
@@ -47,14 +46,13 @@ core::Result<SelectedProgramProducts> LoadSelectedProgramProducts(
         products.binding = bindings.get_verified(
             program->program_binding_id, bundle, *model_map, catalog);
       if (!products.program)
-        products.program = programs.get_verified(id, revision, bundle);
+        products.program = programs.get_verified(revision, bundle);
     };
     if (!program_artifact_root.empty() && program_artifact_root != package_root)
       read(program_artifact_root);
     if (!products.binding || !products.program)
       read(package_root);
     if (!products.binding || !products.program ||
-        products.binding->value().program_id != id ||
         products.binding->value().program_revision != revision ||
         products.binding->value().node_environment !=
             products.program->value().node_environment)

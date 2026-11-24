@@ -1,17 +1,10 @@
-api_version: manyforge.program.v3
-program_id: pick_and_place_demo
-program_revision: sha256:4272515ba3508830b1c4c229b107791b2160e661a461d303e82090ba84c58d63
+api_version: manyforge.program.v4
+program_revision: sha256:bb829f638d05f3217a1fa15287121652fc20026bc66cc014fe869aa3454ff498
 program_profile: composable-cell-v1
-name: pick_and_place_demo
-description: Pick-and-place demo for the UR5 source model. It preserves the original approach, pick, retreat,
-  drop, detach, and rest motion sequence while keeping the intentionally simulated gripper state as ordinary
-  Program data. Exact scene and attachment revisions now invalidate planning automatically.
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
-  lanes:
-  - manyforge-only
   assistant: forbidden
   requires: []
   tags:

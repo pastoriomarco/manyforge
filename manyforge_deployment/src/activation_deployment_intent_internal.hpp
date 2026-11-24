@@ -17,11 +17,15 @@ namespace manyforge::deployment::detail {
 /// of its model asset (a descriptor TCP, link-backed or offset) or a URDF
 /// link; `pose` is T_parent_tcp in the authoring shape
 /// `{position_m, orientation: {rpy_deg} | {xyzw}}`. The compiler resolves the
-/// parent and converts the pose.
+/// parent and converts the pose. `contact_bodies` are the collision bodies of
+/// the component that a contact rule on this TCP selects (unique, sorted);
+/// absent means the component's default (a gripper's pads, else its fingers;
+/// none for a passive tool).
 struct ActivationCustomTcp final {
   std::string tcp_id;
   std::string parent_frame;
   CanonicalValue pose;
+  std::optional<std::vector<std::string>> contact_bodies{};
 };
 
 struct ActivationDeploymentComponent final {
@@ -64,9 +68,6 @@ struct ActivationInactiveMember final {
 };
 
 struct ActivationDeploymentIntent final {
-  std::string deployment_artifact_id;
-  std::string name;
-  std::optional<std::string> description;
   std::optional<std::string> assistant_profile_id;
   /// Validated `{parent:{component_id, interface}, child:{component_id,
   /// interface}, pose?, primary?}` rows; the compiler maps them to graph
@@ -82,6 +83,10 @@ struct ActivationDeploymentIntent final {
   std::map<std::string, std::string, std::less<>> assistant_model_components{};
   /// The deactivated members, never compiled.
   std::vector<ActivationInactiveMember> inactive_members{};
+  /// The cell's `collision_rules` in the authored shape, release rules with
+  /// every key spelled out. The first rule has no selections; the compiler
+  /// writes the list into the execution runtime unit's configuration.
+  CanonicalValue collision_rules{CanonicalValue::Array{}};
 };
 
 /// Parse one normalized authored Deployment intent and join it exactly to the
@@ -98,7 +103,9 @@ struct ActivationDeploymentIntent final {
 /// may set `active: false` (an arm member is a physical row without `lane`;
 /// an I/O member is `{component_id, component_profile_id, owner, role,
 /// active?}`). Inactive rows are dropped here (their captured sources are
-/// consumed; an inactive arm keeps its URDF as `description`). Typed failures: `deployment_member_owner_missing`,
+/// consumed; an inactive arm keeps its URDF as `description`). The root's
+/// `collision_rules` is required: the cell's rules, the first one without
+/// selections (`decode_collision_rules`, cell rows). Typed failures: `deployment_member_owner_missing`,
 /// `deployment_member_owner_inactive`, `deployment_signal_member_inactive`.
 [[nodiscard]] ActivationDeploymentIntent parse_activation_deployment_intent(
     const CanonicalValue &value,

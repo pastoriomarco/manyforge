@@ -155,6 +155,52 @@ export interface MeasuredRobotPresentation {
   linkTransforms: Record<string, RuntimeLinkTransform>;
   /** Links the measured ghost does not draw (no stream, or no data yet). */
   hiddenLinkNames?: readonly string[];
+  /** Display-only shifts of compressed springs' a sides (OD-358). */
+  springOffsets?: SpringDisplayOffsets;
+}
+
+/**
+ * Where the viewer draws the a side of each compressed spring pair: shifted
+ * by depth x push direction (world frame), the deepest pair per part. Keyed by
+ * compiled link name and by carried scene object id. Display only.
+ */
+export interface SpringDisplayOffsets {
+  links: Readonly<Record<string, SpringDisplayOffset>>;
+  objects: Readonly<Record<string, SpringDisplayOffset>>;
+}
+
+export interface SpringDisplayOffset {
+  offsetM: Vector3Tuple;
+  depthM: number;
+}
+
+/** A world-frame spring offset in the frame of a link with this orientation. */
+export function springOffsetInLink(
+  offsetM: Vector3Tuple,
+  linkOrientation: THREE.Quaternion,
+): Vector3Tuple {
+  const local = new THREE.Vector3(...offsetM)
+    .applyQuaternion(linkOrientation.clone().invert());
+  return [local.x, local.y, local.z];
+}
+
+export function springDisplayOffsets(
+  frame: ExecutionObservationFrame | null,
+): SpringDisplayOffsets | undefined {
+  const rows = frame?.springCompressions ?? [];
+  if (rows.length === 0) return undefined;
+  const links: Record<string, SpringDisplayOffset> = {};
+  const objects: Record<string, SpringDisplayOffset> = {};
+  for (const row of rows) {
+    const [target, key] = row.a.kind === 'component_link'
+      ? [links, row.a.link] : [objects, row.a.sceneResourceId];
+    if ((target[key]?.depthM ?? 0) >= row.depthM) continue;
+    target[key] = {
+      offsetM: row.pushDirection.map((value) => value * row.depthM) as Vector3Tuple,
+      depthM: row.depthM,
+    };
+  }
+  return { links, objects };
 }
 
 export interface MeasuredRobotPresentationReader {
@@ -200,8 +246,11 @@ export interface AttachedObjectPresentation {
   object: LogicalSceneObject;
   attachmentId: string;
   attachmentRevision: string;
-  carrierComponentId: string;
+  /** The holder: the attachment's component and command target. */
+  holderComponentId: string;
   commandTargetId: string;
+  /** The carrier frame's component: the holder's, or (OD-372) a component mounted on its robot. */
+  carrierComponentId: string;
   carrierModelInstanceId: string;
   carrierFrameRoleId: string;
   carrierCompiledFrameName: string;
@@ -448,6 +497,7 @@ export function executionObservationRobotPresentation(
   const compiledPositions = observedTargetPositions(frame.targets, sourceModel);
   if (compiledPositions === null) return null;
   const linkTransforms = measuredLinkTransforms(manifest, compiledPositions);
+  const springOffsets = springDisplayOffsets(frame);
   return linkTransforms === null ? null : {
     objectId: motion.controllableComponentId,
     sourceId: `execution:${motion.commandTargetId}`,
@@ -455,6 +505,7 @@ export function executionObservationRobotPresentation(
     sourceSequence: frame.sourceSequence,
     observedAtNs,
     linkTransforms,
+    ...(springOffsets === undefined ? {} : { springOffsets }),
   };
 }
 
@@ -675,8 +726,6 @@ export function attachedScenePresentation(
       attachment.carried_object_attachment_revision
         !== placement.carried_object_attachment_revision
       || attachment.scene_resource_id !== object.scene_resource_id
-      || attachment.carrier_frame_ref.controllable_component_id
-        !== attachment.controllable_component_id
     ) {
       diagnostics.push(attachmentDiagnostic(
         'attachment_identity_mismatch',
@@ -695,17 +744,21 @@ export function attachedScenePresentation(
     }
     const frameRef = attachment.carrier_frame_ref;
     // The same join as the scene's collision world: the holder's command
-    // target lists the frame by owner, model occurrence and role.
+    // target lists the frame by owner, model occurrence and role; a frame of
+    // a component mounted on the holder's robot (OD-372) is listed by that
+    // component's targets.
+    const ownFrame = frameRef.controllable_component_id === attachment.controllable_component_id;
     const holderTargets = sourceModel.targets.filter((target) => (
-      target.component_id === attachment.controllable_component_id
-      && target.target_id === attachment.command_target_id
+      target.component_id === frameRef.controllable_component_id
+      && (!ownFrame || target.target_id === attachment.command_target_id)
     ));
-    const holderFrames = holderTargets.length !== 1 ? [] : holderTargets[0].frames.filter((frame) => (
+    const holderLinks = new Set(holderTargets.flatMap((target) => target.frames.filter((frame) => (
       frame.frame_role_id === frameRef.frame_role_id
       && frame.model_instance_id === frameRef.model_instance_id
       && frame.source_link_name !== null
-    ));
-    if (holderTargets.length > 1 || holderFrames.length > 1) {
+    )).map((frame) => frame.source_link_name)));
+    const holderFrames = ownFrame && holderTargets.length !== 1 ? [] : [...holderLinks];
+    if ((ownFrame && holderTargets.length > 1) || holderFrames.length > 1) {
       diagnostics.push(attachmentDiagnostic(
         'carrier_frame_ambiguous',
         object.scene_resource_id,
@@ -724,7 +777,7 @@ export function attachedScenePresentation(
     const occurrences = sourceModel.occurrences.filter((candidate) => (
       candidate.model_instance_id === frameRef.model_instance_id
     ));
-    if (occurrences.length !== 1 || occurrences[0].component_id !== attachment.controllable_component_id) {
+    if (occurrences.length !== 1 || occurrences[0].component_id !== frameRef.controllable_component_id) {
       diagnostics.push(attachmentDiagnostic(
         'carrier_model_mismatch',
         object.scene_resource_id,
@@ -733,7 +786,7 @@ export function attachedScenePresentation(
       continue;
     }
     const links = occurrences[0].links.filter((link) => (
-      link.source_link_name === holderFrames[0].source_link_name
+      link.source_link_name === holderFrames[0]
     ));
     if (links.length !== 1 || !viewerLinks.has(links[0].viewer_link_name)) {
       diagnostics.push(attachmentDiagnostic(
@@ -747,8 +800,9 @@ export function attachedScenePresentation(
       object,
       attachmentId: attachment.carried_object_attachment_id,
       attachmentRevision: attachment.carried_object_attachment_revision,
-      carrierComponentId: attachment.controllable_component_id,
+      holderComponentId: attachment.controllable_component_id,
       commandTargetId: attachment.command_target_id,
+      carrierComponentId: frameRef.controllable_component_id,
       carrierModelInstanceId: frameRef.model_instance_id,
       carrierFrameRoleId: frameRef.frame_role_id,
       carrierCompiledFrameName: links[0].viewer_link_name,
@@ -821,7 +875,7 @@ function attachedPoseMeasurement(
   }
   if (
     source.holder === undefined
-    || source.holder.controllable_component_id !== attached.carrierComponentId
+    || source.holder.controllable_component_id !== attached.holderComponentId
     || source.holder.command_target_id !== attached.commandTargetId
   ) return null;
   return {
@@ -1465,7 +1519,7 @@ export function candidateToolPresentation(
     occurrence.component_id === gripper.controllableComponentId
     && instances.has(occurrence.model_instance_id)
   )).flatMap((occurrence) => occurrence.links);
-  const mapped = gripper.touchLinks.map((sourceName) => links.filter(
+  const mapped = gripper.gripBodyLinks.map((sourceName) => links.filter(
     (link) => link.source_link_name === sourceName,
   ));
   if (mapped.length === 0 || mapped.some((matches) => matches.length !== 1)) return null;

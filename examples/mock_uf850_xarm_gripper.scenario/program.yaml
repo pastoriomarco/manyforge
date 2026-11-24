@@ -1,21 +1,17 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "smoke",
       "uf850"
     ]
   },
-  "description": "Smoke Program for a robot added as data: a joint move, gripper open and close, and the move back.",
   "forest": [
     {
       "children": [
@@ -192,7 +188,6 @@
       "parameters": {}
     }
   ],
-  "name": "uf850_smoke",
   "parameters": [
     {
       "constraints": {
@@ -206,7 +201,6 @@
     }
   ],
   "positions": {},
-  "program_id": "uf850_smoke",
   "program_profile": "composable-cell-v1",
   "scene": [],
   "schema_version": "manyforge.composer_authoring_forest.v2"

@@ -3,10 +3,13 @@
 # tool's URDF and SRDF in this folder, then run
 #   scripts/manyforge component check <this folder>
 #   scripts/manyforge component register <this folder>
-# A passive tool (no fingers) keeps model, mount and tcps, deletes roles and
-# gripper, and keeps one lanes row (e.g. `mock:` with no controllers): today
-# only a pneumatic tool may omit lanes.
-api_version: manyforge.component_package.v1
+# A passive tool (no gripper: mount and TCP frames only) keeps model, mount
+# and tcps, deletes roles, gripper and mock_controllers.yaml, and sets
+# `lanes: {}`: it runs no controller, so its components name no lane. A
+# project's own tool without a controller needs no new folder: the shipped
+# Tool model `manyforge.tool` makes it from its parameters, and
+# `manyforge.passive_tool` takes its own URDF (ADDING_A_COMPONENT.md).
+api_version: manyforge.component_package.v2
 kind: tool
 id: __ID__
 version: 1.0.0
@@ -21,17 +24,20 @@ model:
 mount:
   frame: <TODO>                   # the URDF root link, the one on the robot flange
 tcps:                             # the first is the default TCP; each id is its name
-  - {id: tcp, frame: <TODO>}
+  - {id: tcp, frame: <TODO>}      # optional contact_bodies: [<collision body>] names the bodies that may
+                                  # touch under a contact rule (default: gripper_pads, else gripper_fingers)
 roles:
   groups: {gripper: <TODO>}       # the SRDF group of the gripper
   joints: {fingers: [<TODO>]}     # the commanded finger joint, not a mimic follower
-  collision_bodies:
-    gripper_collision: [<TODO>]   # the tool's links
+  collision_bodies:               # names for parts; every link with <collision> is checked,
+                                  # links named in none go to `default_collision`; each named
+                                  # link must have <collision> geometry
+    gripper_collision: [<TODO>]   # the tool's links: name every link with <collision>
 gripper:
   actuation: position_commanded   # or pneumatic: a valve driven by I/O components
   states: {open: open, closed: closed}   # group_states of the gripper group
   attach_frame: <TODO>            # the link a grasped object attaches to
-  touch_links: [<TODO>]           # links that may touch a grasped object
+  grip_body: gripper_collision    # the collision body made of the gripper's own links
   # command_duration_s: 0.8       # pneumatic only: the valve dwell in seconds
 lanes:                            # the Mock lane's simulated fingers
   mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)

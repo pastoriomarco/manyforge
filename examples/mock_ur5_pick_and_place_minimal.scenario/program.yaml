@@ -1,18 +1,15 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [],
     "namespaces": []
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "pick-and-place",
@@ -20,7 +17,6 @@
       "ur5"
     ]
   },
-  "description": "Minimal smoke Program for the ur5-simple-pick-place scenario: one target-scoped source-joint move followed by removal of one declared scene resource.",
   "forest": [
     {
       "children": [
@@ -29,6 +25,10 @@
           "instance_id": "move_to_pick",
           "node_id": "motion.move_to_joint_target",
           "parameters": {
+            "base_frame": {
+              "component_id": "ur5_robot",
+              "frame_id": "base"
+            },
             "execution_timeout_s": 10.0,
             "goal": [
               {
@@ -57,16 +57,12 @@
               }
             ],
             "planning_timeout_s": 2.0,
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
+            },
             "tcp_endpoint": {
               "kind": "current"
-            },
-            "base_frame": {
-              "component_id": "ur5_robot",
-              "frame_id": "base"
-            },
-            "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
             }
           },
           "value_sources": {
@@ -90,7 +86,6 @@
       "parameters": {}
     }
   ],
-  "name": "pick_and_place_minimal",
   "parameters": [
     {
       "constraints": {
@@ -104,7 +99,6 @@
     }
   ],
   "positions": {},
-  "program_id": "pick_and_place_minimal",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

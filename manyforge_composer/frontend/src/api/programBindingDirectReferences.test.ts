@@ -5,8 +5,8 @@ import { parseProgramBindingTransport } from './programBindingTransport.generate
 type Row = Record<string, unknown>;
 const native = nativeFixture as unknown as Row;
 
-// The native v2 fixture must not be converted or rehashed to stand in for v3.
-describe.skipIf(native.api_version !== 'manyforge.program_binding.v3')('native v3 direct references', () => {
+// The native v3 fixture must not be converted or rehashed to stand in for v4.
+describe.skipIf(native.api_version !== 'manyforge.program_binding.v4')('native v4 direct references', () => {
   it.each(['target_bindings', 'frame_bindings', 'collision_body_bindings'])(
     'rejects missing component and extra fields in %s', (collection) => {
       parseProgramBindingTransport(native, 'binding');

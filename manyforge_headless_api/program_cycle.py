@@ -138,12 +138,26 @@ def program_cycle_event_class(
                     "resume_unavailable_reason",
                     "runtime_scale_selector",
                     "runtime_scale_unavailable_reason",
+                    "stopped_by_node_instance_id",
                 )
             )
             for group in selections.get("groups", ())
         )
 
-    return "critical" if groups(previous) != groups(cycle) else "node_progress"
+    def questions(value: dict[str, Any]) -> tuple[Any, ...]:
+        # An operator question asked or answered is operator-facing.
+        controls = value.get("runtime_controls") or {}
+        return tuple(
+            (question.get("offer_id"), question.get("offer_revision"))
+            for question in controls.get("operator_questions") or ()
+            if isinstance(question, dict)
+        )
+
+    return (
+        "critical"
+        if groups(previous) != groups(cycle) or questions(previous) != questions(cycle)
+        else "node_progress"
+    )
 
 
 Revision = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]

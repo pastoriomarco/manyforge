@@ -17,7 +17,7 @@ const pen = {
 
 function document(customTcps?: JsonValue[]): Record<string, JsonValue> {
   return {
-    api_version: 'manyforge.deployment_intent.v2',
+    api_version: 'manyforge.deployment_intent.v3',
     components: [
       { component_id: 'station_io', component_profile_id: 'io_device_v0' },
       {
@@ -34,22 +34,43 @@ const frames = ['base', 'flange', 'tcp'];
 describe('custom TCPs', () => {
   it('reads the component row and its pose', () => {
     expect(customTcpsOf(document([pen]), 'lite6_robot')).toEqual([{
-      tcpId: 'pen', parentFrame: 'flange', positionM: [0, 0, 0.12], rpyDeg: [0, 0, 90], stored: pen,
+      tcpId: 'pen', parentFrame: 'flange', positionM: [0, 0, 0.12], rpyDeg: [0, 0, 90], contactBodies: null,
+      stored: pen,
     }]);
     expect(customTcpsOf(document(), 'lite6_robot')).toEqual([]);
+  });
+
+  it('reads and writes the contact bodies; no key is the default, an empty list is none', () => {
+    const withBodies = { ...pen, contact_bodies: ['gripper_fingers'] };
+    const none = { ...pen, tcp_id: 'bare', contact_bodies: [] };
+    expect(customTcpsOf(document([none, withBodies]), 'lite6_robot').map((tcp) => tcp.contactBodies))
+      .toEqual([[], ['gripper_fingers']]);
+    // A list that is not text does not read; the row is kept untouched.
+    expect(customTcpsOf(document([{ ...pen, contact_bodies: [1] }]), 'lite6_robot')).toEqual([]);
+    const probe: CustomTcp = { tcpId: 'probe', parentFrame: 'tcp', positionM: [0, 0, 0], rpyDeg: [0, 0, 0],
+      contactBodies: ['pads', 'fingers'] };
+    expect(customTcpsEdit(document(), 'lite6_robot', [probe])?.value).toEqual([{
+      tcp_id: 'probe', parent_frame: 'tcp',
+      pose: { position_m: [0, 0, 0], orientation: { rpy_deg: [0, 0, 0] } },
+      contact_bodies: ['fingers', 'pads'],
+    }]);
+    expect(customTcpsEdit(document(), 'lite6_robot', [{ ...probe, contactBodies: [] }])?.value)
+      .toEqual([expect.objectContaining({ contact_bodies: [] })]);
+    expect(customTcpProblem({ ...probe, contactBodies: ['pads', 'pads'] }, [], frames, null))
+      .toBe('Each contact body can be listed once.');
   });
 
   it('offers only the component\'s own frames as parents, never a custom TCP', () => {
     const custom = customTcpsOf(document([pen]), 'lite6_robot');
     // An Applied custom TCP is also a frame of the component: it is still excluded.
     expect(customTcpParentFrames([...frames, 'pen'], custom)).toEqual(['base', 'flange', 'tcp']);
-    const onPen: CustomTcp = { tcpId: 'probe', parentFrame: 'pen', positionM: [0, 0, 0], rpyDeg: [0, 0, 0] };
+    const onPen: CustomTcp = { tcpId: 'probe', parentFrame: 'pen', positionM: [0, 0, 0], rpyDeg: [0, 0, 0], contactBodies: null };
     expect(customTcpProblem(onPen, custom, frames, null)).toBe('Pick the parent from this component\'s frames.');
   });
 
   it('refuses ids that clash with a model frame or another custom TCP', () => {
     const custom = customTcpsOf(document([pen]), 'lite6_robot');
-    const row = (tcpId: string): CustomTcp => ({ tcpId, parentFrame: 'flange', positionM: [0, 0, 0], rpyDeg: [0, 0, 0] });
+    const row = (tcpId: string): CustomTcp => ({ tcpId, parentFrame: 'flange', positionM: [0, 0, 0], rpyDeg: [0, 0, 0], contactBodies: null });
     expect(customTcpProblem(row('flange'), custom, frames, null)).toContain('already a frame');
     expect(customTcpProblem(row('pen'), custom, frames, null)).toContain('already a custom TCP');
     // Editing pen keeps its own id.
@@ -60,7 +81,7 @@ describe('custom TCPs', () => {
   });
 
   it('produces one Draft edit of the component row', () => {
-    const probe: CustomTcp = { tcpId: 'probe', parentFrame: 'tcp', positionM: [0.01, 0, 0.05], rpyDeg: [0, 90, 0] };
+    const probe: CustomTcp = { tcpId: 'probe', parentFrame: 'tcp', positionM: [0.01, 0, 0.05], rpyDeg: [0, 90, 0], contactBodies: null };
     expect(customTcpsEdit(document(), 'lite6_robot', [probe])).toEqual({
       path: ['components', 1, 'custom_tcps'],
       operation: 'set',
@@ -111,7 +132,7 @@ describe('custom TCPs', () => {
     expect(customTcpsEdit(document([pen, unreadable]), 'lite6_robot', [])).toEqual({
       path: ['components', 1, 'custom_tcps'], operation: 'set', value: [unreadable],
     });
-    const probe: CustomTcp = { tcpId: 'probe', parentFrame: 'tcp', positionM: [0, 0, 0.05], rpyDeg: [0, 0, 0] };
+    const probe: CustomTcp = { tcpId: 'probe', parentFrame: 'tcp', positionM: [0, 0, 0.05], rpyDeg: [0, 0, 0], contactBodies: null };
     expect(customTcpsEdit(document([pen, unreadable]), 'lite6_robot', [...stored, probe])?.value).toEqual([
       pen,
       { tcp_id: 'probe', parent_frame: 'tcp', pose: { position_m: [0, 0, 0.05], orientation: { rpy_deg: [0, 0, 0] } } },
@@ -127,7 +148,7 @@ describe('custom TCPs', () => {
     const stored = customTcpsOf(document([pen, quaternion]), 'lite6_robot');
     const deleted = customTcpsEdit(document([pen, quaternion]), 'lite6_robot', stored.filter((row) => row.tcpId !== 'pen'));
     expect(deleted?.value).toEqual([quaternion]);
-    const edited: CustomTcp = { tcpId: 'pen', parentFrame: 'tcp', positionM: [0, 0, 0.2], rpyDeg: [0, 0, 0] };
+    const edited: CustomTcp = { tcpId: 'pen', parentFrame: 'tcp', positionM: [0, 0, 0.2], rpyDeg: [0, 0, 0], contactBodies: null };
     const replaced = customTcpsEdit(document([pen, quaternion]), 'lite6_robot',
       stored.map((row) => (row.tcpId === 'pen' ? edited : row)));
     expect(replaced?.value).toEqual([

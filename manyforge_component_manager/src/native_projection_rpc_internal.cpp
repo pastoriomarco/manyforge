@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
 
 namespace manyforge::component_manager::detail {
@@ -24,13 +25,23 @@ namespace scene = manyforge::scene;
 // Version 4 added the provider-freshness kinds (17), now retired. Both
 // endpoints compile this unit; a mixed-version peer fails closed on magic.
 // Version 5 carries the rebuild maintenance successor's Apply id as a
-// number.
+// number. Version 6 carries a collision policy as its static and touch pair
+// lists only: collision rules belong to one move and never cross this
+// boundary. Version 7 carries the static bodies of the policy instead of its
+// static pairs.
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'P',
-                                              'R', 'P', 'C', '5'};
+                                              'R', 'P', 'C', '7'};
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw std::invalid_argument("native projection RPC codec: " + detail);
+}
+
+// A collection or the encoded packet exceeds its bound: the one request is
+// refused (native_projection_rpc_bound_exceeded), the process keeps running.
+[[noreturn]] void FailBound(const std::string &detail) {
+  throw NativeProjectionRpcBoundExceeded("native projection RPC codec: " +
+                                         detail);
 }
 
 class Writer final {
@@ -70,7 +81,7 @@ public:
 
   void String(const std::string_view value) {
     if (value.size() > std::numeric_limits<std::uint32_t>::max()) {
-      Fail("string exceeds the wire length domain");
+      FailBound("string exceeds the wire length domain");
     }
     U32(static_cast<std::uint32_t>(value.size()));
     RequireSpace(value.size());
@@ -79,7 +90,7 @@ public:
 
   [[nodiscard]] std::string Finish() && {
     if (bytes_.size() > kMaximumNativeProjectionRpcPacketBytes) {
-      Fail("encoded packet exceeds its byte bound");
+      FailBound("encoded packet exceeds its byte bound");
     }
     return std::move(bytes_);
   }
@@ -87,7 +98,7 @@ public:
 private:
   void RequireSpace(const std::size_t additional) const {
     if (additional > kMaximumNativeProjectionRpcPacketBytes - bytes_.size()) {
-      Fail("encoded packet exceeds its byte bound");
+      FailBound("encoded packet exceeds its byte bound");
     }
   }
 
@@ -212,7 +223,7 @@ template <typename Value, typename Encode>
 void WriteVector(Writer &writer, const std::vector<Value> &values,
                  Encode encode) {
   if (values.size() > kMaximumCollectionEntries) {
-    Fail("collection exceeds its entry bound");
+    FailBound("collection exceeds its entry bound");
   }
   writer.U32(static_cast<std::uint32_t>(values.size()));
   for (const auto &value : values) {
@@ -224,7 +235,7 @@ template <typename Value, typename Decode>
 [[nodiscard]] std::vector<Value> ReadVector(Reader &reader, Decode decode) {
   const auto size = static_cast<std::size_t>(reader.U32());
   if (size > kMaximumCollectionEntries) {
-    Fail("collection exceeds its entry bound");
+    FailBound("collection exceeds its entry bound");
   }
   std::vector<Value> result;
   result.reserve(size);
@@ -238,7 +249,7 @@ void WriteError(Writer &writer, const core::ErrorDTO &error) {
   writer.String(error.code);
   writer.String(error.message);
   if (error.details.size() > kMaximumCollectionEntries) {
-    Fail("error detail map exceeds its entry bound");
+    FailBound("error detail map exceeds its entry bound");
   }
   writer.U32(static_cast<std::uint32_t>(error.details.size()));
   for (const auto &[name, value] : error.details) {
@@ -251,7 +262,7 @@ void WriteError(Writer &writer, const core::ErrorDTO &error) {
   core::ErrorDTO result{reader.String(), reader.String(), {}};
   const auto size = static_cast<std::size_t>(reader.U32());
   if (size > kMaximumCollectionEntries) {
-    Fail("error detail map exceeds its entry bound");
+    FailBound("error detail map exceeds its entry bound");
   }
   for (std::size_t index = 0U; index < size; ++index) {
     auto name = reader.String();
@@ -462,6 +473,11 @@ void WriteSceneFrameQuery(Writer &writer,
           WriteStrong(writer, selector.controllable_component_id);
           WriteStrong(writer, selector.command_target_id);
           WriteStrong(writer, selector.frame_role_id);
+          WriteOptional(writer, selector.frame_component_id,
+                        [](Writer &output,
+                           const core::ControllableComponentId &component) {
+                          WriteStrong(output, component);
+                        });
         }
       },
       query.selector);
@@ -480,7 +496,11 @@ ReadSceneFrameQuery(Reader &reader) {
           core::TargetCarrierSceneFrameRefDTO{
               ReadStrong<core::ControllableComponentId>(reader),
               ReadStrong<core::CommandTargetId>(reader),
-              ReadStrong<core::FrameRoleId>(reader)}};
+              ReadStrong<core::FrameRoleId>(reader),
+              ReadOptional<core::ControllableComponentId>(
+                  reader, [](Reader &input) {
+                    return ReadStrong<core::ControllableComponentId>(input);
+                  })}};
     default:
       Fail("scene-frame selector kind is unknown");
     }
@@ -545,67 +565,18 @@ void WriteCollisionPair(Writer &writer, const core::CollisionPairId &pair) {
 
 void WriteCollisionPolicy(Writer &writer,
                           const core::CollisionPolicySnapshot &policy) {
+  if (!policy.contact_rules.empty()) {
+    Fail("a projected collision policy cannot carry collision rules");
+  }
   writer.String(policy.policy_id);
   writer.U64(policy.revision.revision_id);
   writer.String(policy.revision.content_hash);
-  WriteVector(writer, policy.allowed_static_static_pairs,
-              WriteCollisionPair);
+  WriteVector(writer, policy.static_body_ids,
+              [](Writer &output, const core::CollisionBodyId &body) {
+                output.String(body);
+              });
   WriteVector(writer, policy.allowed_touch_link_pairs, WriteCollisionPair);
-  WriteVector(
-      writer, policy.support_contacts,
-      [](Writer &output, const core::SupportContactPolicyEntry &entry) {
-        WriteCollisionPair(output, entry.pair);
-        output.Byte(static_cast<std::uint8_t>(entry.mode));
-        output.Byte(
-            static_cast<std::uint8_t>(entry.release_evidence_mode));
-        output.Boolean(entry.enforce_max_start_penetration);
-        output.Double(entry.max_start_penetration_m);
-        output.Double(entry.release_tolerance_m);
-        output.Double(entry.min_release_progress_m);
-        output.Double(entry.max_contact_penetration_m);
-        output.Boolean(entry.require_separation_by_end);
-        output.Boolean(entry.require_strictly_decreasing_penetration);
-        output.Boolean(entry.allow_recontact);
-      });
-  WriteVector(
-      writer, policy.contact_grasps,
-      [](Writer &output, const core::ContactGraspPolicyEntry &entry) {
-        output.String(entry.policy_id);
-        output.String(entry.selected_object_id);
-        WriteVector(output, entry.allowed_robot_links,
-                    [](Writer &links, const std::string &link) {
-                      links.String(link);
-                    });
-        output.Double(entry.max_penetration_m);
-        output.Double(entry.terminal_window_start_fraction);
-      });
   writer.Boolean(policy.require_full_diagnostics);
-}
-
-[[nodiscard]] core::CollisionContactPolicyMode
-ReadContactPolicyMode(Reader &reader) {
-  switch (reader.Byte()) {
-  case 0U:
-    return core::CollisionContactPolicyMode::kContactRelease;
-  case 1U:
-    return core::CollisionContactPolicyMode::kBoundedPenetration;
-  case 2U:
-    return core::CollisionContactPolicyMode::kContactProcess;
-  default:
-    Fail("collision contact-policy mode is unknown");
-  }
-}
-
-[[nodiscard]] core::ContactReleaseEvidenceMode
-ReadReleaseEvidenceMode(Reader &reader) {
-  switch (reader.Byte()) {
-  case 0U:
-    return core::ContactReleaseEvidenceMode::kSignedPenetration;
-  case 1U:
-    return core::ContactReleaseEvidenceMode::kBinaryContact;
-  default:
-    Fail("contact release-evidence mode is unknown");
-  }
 }
 
 [[nodiscard]] core::CollisionPolicySnapshot
@@ -613,35 +584,10 @@ ReadCollisionPolicy(Reader &reader) {
   core::CollisionPolicySnapshot policy;
   policy.policy_id = reader.String();
   policy.revision = {reader.U64(), reader.String()};
-  policy.allowed_static_static_pairs =
-      ReadVector<core::CollisionPairId>(reader, ReadCollisionPair);
+  policy.static_body_ids = ReadVector<core::CollisionBodyId>(
+      reader, [](Reader &input) { return input.String(); });
   policy.allowed_touch_link_pairs =
       ReadVector<core::CollisionPairId>(reader, ReadCollisionPair);
-  policy.support_contacts = ReadVector<core::SupportContactPolicyEntry>(
-      reader, [](Reader &input) {
-        return core::SupportContactPolicyEntry{
-            ReadCollisionPair(input),
-            ReadContactPolicyMode(input),
-            ReadReleaseEvidenceMode(input),
-            input.Boolean(),
-            input.Double(),
-            input.Double(),
-            input.Double(),
-            input.Double(),
-            input.Boolean(),
-            input.Boolean(),
-            input.Boolean()};
-      });
-  policy.contact_grasps = ReadVector<core::ContactGraspPolicyEntry>(
-      reader, [](Reader &input) {
-        return core::ContactGraspPolicyEntry{
-            input.String(), input.String(),
-            ReadVector<std::string>(input,
-                                    [](Reader &links) {
-                                      return links.String();
-                                    }),
-            input.Double(), input.Double()};
-      });
   policy.require_full_diagnostics = reader.Boolean();
   if (policy.policy_id.empty() || policy.revision.revision_id == 0U ||
       policy.revision.content_hash.empty()) {
@@ -1077,6 +1023,7 @@ enum class RequestKind : std::uint8_t {
   kSceneFrame = 15U,
   kEffectivePolicy = 16U,
   // 17 and 18 retired (provider freshness and commit marker).
+  kCommitPreflight = 19U,
 };
 
 enum class ResponseKind : std::uint8_t {
@@ -1091,7 +1038,27 @@ enum class ResponseKind : std::uint8_t {
   kSceneFrame = 15U,
   kEffectivePolicy = 16U,
   // 17 and 18 retired (provider freshness and commit marker).
+  kCommitPreflight = 19U,
 };
+
+void WriteEffectivePolicyResult(
+    Writer &writer,
+    const std::variant<core::CollisionPolicySnapshot, core::ErrorDTO> &value) {
+  writer.Boolean(std::holds_alternative<core::CollisionPolicySnapshot>(value));
+  if (const auto *policy = std::get_if<core::CollisionPolicySnapshot>(&value)) {
+    WriteCollisionPolicy(writer, *policy);
+  } else {
+    WriteError(writer, std::get<core::ErrorDTO>(value));
+  }
+}
+
+[[nodiscard]] std::variant<core::CollisionPolicySnapshot, core::ErrorDTO>
+ReadEffectivePolicyResult(Reader &reader) {
+  if (reader.Boolean()) {
+    return ReadCollisionPolicy(reader);
+  }
+  return ReadError(reader);
+}
 
 } // namespace
 
@@ -1167,9 +1134,8 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kSceneFrame));
           WriteBinding(writer, value.execution_host_binding);
           WriteSceneFrameQuery(writer, value.query);
-        } else {
-          static_assert(
-              std::is_same_v<T, NativeProjectionEffectivePolicyRequest>);
+        } else if constexpr (std::is_same_v<
+                                 T, NativeProjectionEffectivePolicyRequest>) {
           if (!value.valid()) {
             Fail("cannot encode invalid effective-policy request");
           }
@@ -1179,6 +1145,22 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
           writer.String(scene::EncodeLogicalSceneSnapshot(
               value.logical_scene));
           writer.U64(value.effective_policy_revision_id);
+        } else {
+          static_assert(
+              std::is_same_v<T, NativeProjectionCommitPreflightRequest>);
+          if (!value.valid()) {
+            Fail("cannot encode invalid commit preflight request");
+          }
+          writer.Byte(
+              static_cast<std::uint8_t>(RequestKind::kCommitPreflight));
+          WriteBinding(writer, value.execution_host_binding);
+          WriteProjectionRevision(writer, value.selected_projection_revision);
+          WriteOptional(writer, value.transaction,
+                        [](Writer &out,
+                           const core::SceneTransactionDTO &transaction) {
+                          out.String(
+                              scene::EncodeSceneTransaction(transaction));
+                        });
         }
       },
       request);
@@ -1225,6 +1207,13 @@ DecodeNativeProjectionRpcRequest(const std::string_view bytes) {
       return NativeProjectionEffectivePolicyRequest{
           ReadBinding(reader),
           scene::DecodeLogicalSceneSnapshot(reader.String()), reader.U64()};
+    case RequestKind::kCommitPreflight:
+      return NativeProjectionCommitPreflightRequest{
+          ReadBinding(reader), ReadProjectionRevision(reader),
+          ReadOptional<core::SceneTransactionDTO>(
+              reader, [](Reader &in) {
+                return scene::DecodeSceneTransaction(in.String());
+              })};
     }
     Fail("request kind is unknown");
   }();
@@ -1277,15 +1266,35 @@ EncodeNativeProjectionRpcResponse(const NativeProjectionRpcResponse &response) {
                                  T, core::SceneFrameResolutionReceiptDTO>) {
           writer.Byte(static_cast<std::uint8_t>(ResponseKind::kSceneFrame));
           WriteSceneFrameReceipt(writer, value);
-        } else {
-          static_assert(std::is_same_v<T, core::CollisionPolicySnapshot>);
+        } else if constexpr (std::is_same_v<T,
+                                            core::CollisionPolicySnapshot>) {
           writer.Byte(
               static_cast<std::uint8_t>(ResponseKind::kEffectivePolicy));
           WriteCollisionPolicy(writer, value);
+        } else {
+          static_assert(
+              std::is_same_v<T, NativeProjectionCommitPreflightResult>);
+          writer.Byte(
+              static_cast<std::uint8_t>(ResponseKind::kCommitPreflight));
+          WriteHealth(writer, value.health);
+          WriteOptional(writer, value.effective_policy,
+                        WriteEffectivePolicyResult);
         }
       },
       response);
   return std::move(writer).Finish();
+}
+
+std::string EncodeNativeProjectionRpcResponseOrRefusal(
+    const NativeProjectionRpcResponse &response) {
+  try {
+    return EncodeNativeProjectionRpcResponse(response);
+  } catch (const NativeProjectionRpcBoundExceeded &error) {
+    return EncodeNativeProjectionRpcResponse(NativeProjectionRpcFailure{
+        core::ErrorDTO{std::string(core::error_codes::kNativeProjectionRpcBoundExceeded),
+                       error.what(),
+                       {}}});
+  }
 }
 
 NativeProjectionRpcResponse
@@ -1314,6 +1323,14 @@ DecodeNativeProjectionRpcResponse(const std::string_view bytes) {
       return ReadSceneFrameReceipt(reader);
     case ResponseKind::kEffectivePolicy:
       return ReadCollisionPolicy(reader);
+    case ResponseKind::kCommitPreflight: {
+      auto health = ReadHealth(reader);
+      return NativeProjectionCommitPreflightResult{
+          std::move(health),
+          ReadOptional<
+              std::variant<core::CollisionPolicySnapshot, core::ErrorDTO>>(
+              reader, ReadEffectivePolicyResult)};
+    }
     }
     Fail("response kind is unknown");
   }();

@@ -27,6 +27,7 @@ from manyforge_behavior.recovery import (
 
 RUNTIME_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v4"
 RECOVERY_OFFER_SCHEMA: Final = "manyforge.cycle_recovery_offer.v6"
+OPERATOR_QUESTION_SCHEMA: Final = "manyforge.program_operator_question.v1"
 _MAX_AUDIT: Final = 256
 _MAX_REVISION: Final = 9_007_199_254_740_991
 # One entry per captured Program node, never per request/attempt.
@@ -101,7 +102,6 @@ class ProgramRuntimeControls:
     ) -> None:
         required = {
             "program_run_id",
-            "program_id",
             "program_revision",
             "program_binding_id",
             "retained_bundle_id",
@@ -129,6 +129,8 @@ class ProgramRuntimeControls:
         self._offer_revision = 0
         # The current offer of each held node: (semantic key, offer).
         self._offers: dict[str, tuple[str, dict[str, Any]]] = {}
+        # The current question offer of each asking node: (semantic key, offer).
+        self._question_offers: dict[str, tuple[str, dict[str, Any]]] = {}
         self._lock = RLock()
 
     @property
@@ -550,6 +552,53 @@ class ProgramRuntimeControls:
             self._offers[identity.node_instance_id] = (offer_key, deepcopy(result))
             return deepcopy(result)
 
+    def operator_question_offer(
+        self,
+        *,
+        cycle_generation: int,
+        application_start_id: str,
+        question: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """One open operator question as an offer: answered through the
+        recovery-action command with an option id as the action, fenced by
+        its offer id and revision like a recovery offer."""
+
+        projected = _project_wire_value(question)
+        material = {
+            "cycle_generation": cycle_generation,
+            "program_run_id": self.program_run_id,
+            "application_start_id": application_start_id,
+            "recovery_fences": deepcopy(self._recovery_fences),
+            **projected,
+        }
+        offer_key = _digest("manyforge.program_operator_question.semantic.v1", material)
+        with self._lock:
+            node = projected["node_instance_id"]
+            cached = self._question_offers.get(node)
+            if cached is not None and cached[0] == offer_key:
+                return deepcopy(cached[1])
+            if self._offer_revision >= _MAX_REVISION:
+                raise ProgramRuntimeControlError(
+                    "program_recovery_offer_revision_exhausted",
+                    "recovery-offer revision cannot advance exactly",
+                )
+            self._offer_revision += 1
+            result = {
+                "schema_version": OPERATOR_QUESTION_SCHEMA,
+                "offer_id": _digest(OPERATOR_QUESTION_SCHEMA, material),
+                "offer_revision": self._offer_revision,
+                "program_run_id": self.program_run_id,
+                "node_instance_id": node,
+                "node_attempt_id": projected["node_attempt_id"],
+                "message": projected["message"],
+                "severity": projected["severity"],
+                "options": projected["options"],
+                "hold_motion_group_ids": projected["hold_motion_group_ids"],
+            }
+            # Bounded by the captured nodes: one current question per node.
+            self._question_offers[node] = (offer_key, deepcopy(result))
+            return deepcopy(result)
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -565,6 +614,7 @@ class ProgramRuntimeControls:
 __all__ = [
     "ProgramRuntimeControlError",
     "ProgramRuntimeControls",
+    "OPERATOR_QUESTION_SCHEMA",
     "RECOVERY_OFFER_SCHEMA",
     "RUNTIME_CONTROL_SCHEMA",
     "manual_result_availability",

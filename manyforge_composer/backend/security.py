@@ -35,14 +35,6 @@ class SecurityConfig:
     # Paths outside these roots (after symlink resolution) are rejected.
     allowed_fs_roots: list[str] = field(default_factory=lambda: ["/workspace"])
 
-    # Program-artifact write roots.  ``None`` preserves the historical
-    # behavior of using ``allowed_fs_roots`` for writes; an explicit empty
-    # list is a fail-closed configuration.
-    allowed_program_write_roots: list[str] | None = None
-
-    # Deployment artifacts are separate documents and may have a distinct
-    # workspace. ``None`` preserves the filesystem-root fallback.
-    allowed_deployment_write_roots: list[str] | None = None
 
     @classmethod
     def from_env(cls) -> SecurityConfig:
@@ -55,8 +47,6 @@ class SecurityConfig:
             items = [s.strip() for s in raw.split(",") if s.strip()]
             return items
 
-        program_write_roots = _csv("MANYFORGE_PROGRAM_WRITE_ROOTS")
-        deployment_write_roots = _csv("MANYFORGE_DEPLOYMENT_WRITE_ROOTS")
         return cls(
             cors_origins=_csv("MANYFORGE_CORS_ORIGINS") or ["http://localhost:3000"],
             mcp_allowed_hosts=(
@@ -65,8 +55,6 @@ class SecurityConfig:
                 else ["localhost:*", "127.0.0.1:*", "[::1]:*"]
             ),
             allowed_fs_roots=_csv("MANYFORGE_FS_ROOTS") or ["/workspace"],
-            allowed_program_write_roots=program_write_roots,
-            allowed_deployment_write_roots=deployment_write_roots,
         )
 
 

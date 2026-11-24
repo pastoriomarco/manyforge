@@ -83,16 +83,18 @@ There is one mode, `composer-assistant`:
 | Effect | Tools |
 |---|---|
 | Read | `catalog_read`, `deployment_capabilities_read`, `inspect_isaac_scene`, `program_read`, `scene_inspect`, `skills_read` |
-| Draft edit | `scene_draft_{add_object, update_object, upsert_objects, remove_objects}`, `tree_draft_{insert_node, update_node_params, delete_node, move_node, replace_subtree, change_node_kind, wrap_node, rename_node}`, `program_draft_{upsert,remove}_{parameters,contact_policies}`, `blackboard_draft_{upsert,remove}_{namespaces,keys}` |
+| Draft edit | `scene_draft_{add_object, update_object, upsert_objects, remove_objects}`, `tree_draft_{insert_node, update_node_params, delete_node, move_node, replace_subtree, change_node_kind, wrap_node, rename_node}`, `program_draft_{upsert,remove}_parameters`, `blackboard_draft_{upsert,remove}_{namespaces,keys}` |
 
 `inspect_isaac_scene` is offered only when the Deployment provides the
 simulator capability `simulator.entity_state.set`.
 
-A node's `contact_policy_id` names a Program contact policy
-(`manyforge.contact_policy.v1`); `planning.plan_pick_sequence` needs one with
-mode `contact_grasp`. The assistant declares it with
-`program_draft_upsert_contact_policies`, as the Program contact policy editor
-does; Composer checks it and computes its `version`.
+A motion node's `collision_rules` parameter holds its collision rules
+(clearance, contact or release for the pairs the rule selects; on the pick and
+place sequences each rule names its leg). The assistant writes it like any
+other node parameter, with `tree_draft_insert_node` or
+`tree_draft_update_node_params`, and Composer checks it as it checks the
+collision rules table. The rules are plain values: `collision_rules` takes no
+value source. See [Collision rules](../authoring/COLLISION_RULES.md).
 
 - Draft edits go through Composer's Draft engine under the same revision
   fences as manual edits. The user Applies, or Discards/Reverts, the Draft.
@@ -107,15 +109,14 @@ does; Composer checks it and computes its `version`.
   the Deployment's interrupt rules, all from the request's `selectorFacts`;
   at most 12 names per list),
   an outline of the Program Draft (tree, Program parameters, blackboard
-  keys, scene resources, contact policies as `id: mode` with each zone's
-  body pairs and its maximum penetration or release evidence, open
+  keys, scene resources, open
   diagnostics) and the authorable nodes by
   category as `id: summary` (the first sentence of the catalog description).
   Each part names the tool that gives more: `deployment_capabilities_read`,
   `program_read` (`instance_id` reads one subtree), `catalog_read`.
 - Tool schemas are top-level only. An argument holding a domain value names
   its type (`node`, `wrapper_node`, `replacement_node`, `scene_resource`,
-  `scene_resource_edit`, `parameter_declaration`, `contact_policy`,
+  `scene_resource_edit`, `parameter_declaration`,
   `blackboard_key`, `blackboard_namespace`); `catalog_read` with `types` returns any type's
   shape, and with `include_parameters` an entry's parameters (description,
   required, type) and every `schema_types` definition they use, in the

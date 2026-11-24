@@ -27,7 +27,7 @@ const machine: MachineCatalogEntry = {
 
 function draft(): Record<string, JsonValue> {
   return {
-    api_version: 'manyforge.deployment_intent.v2',
+    api_version: 'manyforge.deployment_intent.v3',
     components: [
       { component_id: 'gripper_io', component_profile_id: 'io_device_v0',
         configuration: { runtime_kind: 'io_provider' } },
@@ -192,7 +192,7 @@ describe('MachineCard', () => {
     const rows = componentManagerRows(draft(), []);
     const page = (id: string) => renderToStaticMarkup(
       <ComponentPlacementEditor row={rows.find((row) => row.componentId === id)!} controller={withReason}
-        profiles={{}} onRemoved={() => undefined} />);
+        profiles={{}} onRemoved={() => undefined} onReplaced={() => undefined} />);
     expect(page('lite6_robot')).not.toContain('Remove from Draft');
     expect(page('gripper_io')).toContain('Remove from Draft');
   });

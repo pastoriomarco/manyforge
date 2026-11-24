@@ -411,8 +411,7 @@ def test_an_update_resolves_the_expected_node_parameters() -> None:
 _ALL_TOOLS = (
     "alarms_read", "blackboard_draft_remove_keys", "blackboard_draft_remove_namespaces",
     "blackboard_draft_upsert_keys", "blackboard_draft_upsert_namespaces", "catalog_read",
-    "program_draft_remove_contact_policies", "program_draft_remove_parameters",
-    "program_draft_upsert_contact_policies", "program_draft_upsert_parameters", "program_read",
+    "program_draft_remove_parameters", "program_draft_upsert_parameters", "program_read",
     "program_validate", "scene_draft_add_object", "scene_draft_remove_objects",
     "scene_draft_update_object", "scene_draft_upsert_objects", "scene_inspect",
     "tree_draft_change_node_kind", "tree_draft_delete_node", "tree_draft_insert_node",

@@ -139,6 +139,8 @@ export function useResetApply({
     scope: ApplyPreview['scope'] | null = null,
     /** Apply the Draft, or Revert to Saved, after the Reset. */
     action: ResetApplyAction = 'apply',
+    /** Deployment only: the rule ids of the Preview's collision rule changes. */
+    confirmedCollisionRuleIds: string[] = [],
   ): Promise<string | null> => {
     if (chain.current !== null) return 'An Apply that Resets the run is in progress.';
     const reason = unavailableReason(document, action);
@@ -180,6 +182,7 @@ export function useResetApply({
       cycleGeneration: cycle.cycleGeneration,
       ...draft,
       scope: document === 'deployment' ? scope : null,
+      ...(document === 'deployment' ? { confirmedCollisionRuleIds } : {}),
     };
     chain.current = plan.correlationId;
     setSequence({ plan, phase: { kind: 'recording' } });
@@ -277,7 +280,7 @@ export function useResetApply({
       // The server Apply (or Revert) runs to its end: its result settles the chain.
       const { deployment: owner } = latest.current;
       const send = plan.action === 'revert' ? owner.revertConfirmedScope : owner.applyConfirmedScope;
-      void send(plan.scope ?? {}).then((result) => {
+      void send(plan.scope ?? {}, plan.confirmedCollisionRuleIds ?? []).then((result) => {
         if (result === null) lost(latest.current.deployment.error);
         else if (result.outcome === 'failed') {
           fail(correlationId, { kind: 'failed', stage: 'apply', unknown: false, apply: null,

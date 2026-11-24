@@ -8,24 +8,25 @@
 
 namespace manyforge::collision {
 
-/// Per-file byte bound for one Program-authored scene mesh read below the
-/// approved scene-asset root. It is the retained planning-model per-resource
+/// Per-file byte bound for one Program-authored scene mesh captured into the
+/// activation raw-artifact store. It is the retained planning-model per-resource
 /// bound (RetainedPlanningModelStage::kHardMaximumResourceBytes); scene meshes
 /// are not admitted above what a retained model resource may carry.
 inline constexpr std::uint64_t kMaximumSceneMeshBytes =
     256ULL * 1024ULL * 1024ULL;
 
-/// Stable refusal reason: a consumer read scene-mesh bytes whose SHA-256
-/// differs from the bytes first pinned for the same URI.
-inline constexpr std::string_view kSceneMeshContentChangedReason =
-    "scene_mesh_content_changed";
+/// Path of one captured scene mesh below the activation (content) root:
+/// `raw-artifacts/sha256/<64 hex>.blob`, the raw-artifact store layout. Empty
+/// when `content_digest` is not an exact `sha256:<64 lowercase hex>` digest.
+[[nodiscard]] std::string scene_mesh_store_path(
+    std::string_view content_digest);
 
 /// True only for a plain relative resource path: no URI scheme, not absolute,
 /// lexically normal, and no empty, `.` or `..` segment.
 [[nodiscard]] bool is_plain_relative_resource_path(
     std::string_view path) noexcept;
 
-/// One regular scene-mesh file opened below the approved scene-asset root.
+/// One regular scene-mesh file opened below the scene content root.
 ///
 /// The object owns the validated file descriptor. Loaders read the file only
 /// through loader_path() (`/proc/self/fd/<fd>`) while this object is alive, so

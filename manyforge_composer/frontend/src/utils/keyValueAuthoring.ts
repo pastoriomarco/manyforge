@@ -78,12 +78,48 @@ export interface KeyValueParameterRule {
   inapplicable?: string;
   /** Why the field is locked: shown as a hint and disabled, its value still stands. */
   locked?: string;
+  /** The field is required in the node's current mode although the catalog marks it optional. */
+  required?: boolean;
+}
+
+// A pose move's settings that apply to one motion_type only (OD-341); the
+// Program validator refuses them in the other mode (program.py).
+const JOINT_ONLY_POSE_PARAMETERS = new Set(['planner']);
+const LINEAR_ONLY_POSE_PARAMETERS = new Set([
+  'max_translation_step_m',
+  'max_rotation_step_rad',
+  'max_angular_speed_rad_s',
+  'max_linear_acceleration_mps2',
+  'max_angular_acceleration_rad_s2',
+  'cartesian_timing',
+]);
+// A linear move holds its line within these; they must be above 0.
+const LINEAR_REQUIRED_POSE_PARAMETERS = new Set(['translation_tol_m', 'rotation_tol_rad']);
+
+/** How a pose move's motion_type decides one of its settings; null when the node has none. */
+function motionTypeParameterRule(
+  entry: CatalogEntry,
+  node: ProgramTreeNode,
+  parameterId: string,
+): KeyValueParameterRule | null {
+  const motionType = entry.parameters.find((parameter) => parameter.id === 'motion_type');
+  if (motionType === undefined) return null;
+  const linear = (node.parameters.motion_type ?? motionType.default) === 'linear';
+  if (linear && JOINT_ONLY_POSE_PARAMETERS.has(parameterId)) {
+    return { inapplicable: 'Planner settings apply only to joint moves; a linear move does not search.' };
+  }
+  if (!linear && LINEAR_ONLY_POSE_PARAMETERS.has(parameterId)) {
+    return { inapplicable: 'This setting applies only to linear moves (motion_type linear).' };
+  }
+  if (linear && LINEAR_REQUIRED_POSE_PARAMETERS.has(parameterId)) return { required: true };
+  return null;
 }
 
 /**
  * The per-parameter rule the editor reads: how a comparison node's `operator`
  * and `tolerance` follow its key's type, how a wait's `timeout_while_held`
- * follows its `timeout_s`, and which motion nodes lock their automatic retry.
+ * follows its `timeout_s`, which motion nodes lock their automatic retry, and
+ * which pose-move settings apply to its motion_type.
  */
 export function keyValueParameterRule(
   entry: CatalogEntry,
@@ -93,6 +129,8 @@ export function keyValueParameterRule(
 ): KeyValueParameterRule {
   const locked = automaticRetryLockReason(node.node_id, node, parameterId);
   if (locked !== null) return { locked };
+  const motionTypeRule = motionTypeParameterRule(entry, node, parameterId);
+  if (motionTypeRule !== null) return motionTypeRule;
   if (keyValueParameter(entry) === null) return {};
   if (parameterId === 'timeout_while_held') {
     return node.parameters.timeout_s === undefined && node.value_sources?.timeout_s === undefined

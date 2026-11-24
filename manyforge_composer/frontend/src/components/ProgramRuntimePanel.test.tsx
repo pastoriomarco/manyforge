@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import type { ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -13,6 +14,7 @@ import type {
   AutomaticRetryAuditEvent,
   TakeoverFallbackAuditEvent,
   CycleRecoveryOffer,
+  ProgramOperatorQuestion,
   ProgramRunStateName,
   RuntimeControlAuditEvent,
   StructuredError,
@@ -26,6 +28,8 @@ import { executionGroupScopes } from '../state/programExecutionGroups';
 import {
   deriveTransportGuidance,
   MotionControlSettings,
+  ProgramKeysPanel,
+  ProgramRunKeyValuesSection,
   ProgramRuntimePanel,
   ProgramTransportControls,
   automaticRetryFailureText,
@@ -35,8 +39,10 @@ import {
   ioSourceUnavailableNodes,
   simulationHeldNodes,
   simulationRefusalAuditText,
+  programOperatorAuditText,
   recoveryClassLabel,
   resetKeptMessage,
+  runKeyValueText,
   selectManualRecoveryTarget,
 } from './ProgramRuntimePanel';
 import { readStyleSource } from '../styles/readStyleSource';
@@ -139,6 +145,7 @@ function ordinaryMotionStopControls(): NonNullable<
     recoveryOffer: ordinaryMotionStopOffer(),
     // An operator Stop is not a failure hold.
     recoveryHolds: [],
+    operatorQuestions: [],
     executionSelections: {
       holdRevision: 1,
       motionHeld: true,
@@ -153,7 +160,9 @@ function ordinaryMotionStopControls(): NonNullable<
           commandTargetId: 'arm',
         },
         runtimeScaleUnavailableReason: null,
-        resourceIds: ['robot.joint_1'] }],
+        resourceIds: ['robot.joint_1'],
+        stoppedBy: null,
+        stoppedByNodeInstanceId: null }],
     },
   } as unknown as NonNullable<ProgramRuntimeController['state']['controls']>;
 }
@@ -232,7 +241,6 @@ function controller(
         scenarioId: 'cell-pick',
         projectPath: '/projects/cell-pick.scenario',
         sourceDocumentDigest: `sha256:${'a'.repeat(64)}`,
-        programId: 'next-pick',
         programRevision: `sha256:${'b'.repeat(64)}`,
         programBindingId: `sha256:${'c'.repeat(64)}`,
         retainedBundleId: `sha256:${'a'.repeat(64)}`,
@@ -247,14 +255,12 @@ function controller(
           applicationStartId: '3f9a00000000002a',
         }],
         program: {
-          api_version: 'manyforge.program.v3',
-          program_id: 'next-pick',
+          api_version: 'manyforge.program.v4',
           program_revision: `sha256:${'b'.repeat(64)}`,
           program_profile: 'composable-cell-v1',
-          name: 'Next pick',
           catalog: {
             api_version: 'manyforge.node_catalog.v3',
-            content_version: '3.0.0',
+            content_version: '4.0.0',
           },
           tree: {
             node_id: 'logic.check_condition',
@@ -264,15 +270,14 @@ function controller(
           },
         },
         programBinding: {
-          api_version: 'manyforge.program_binding.v3',
+          api_version: 'manyforge.program_binding.v4',
           program_binding_id: `sha256:${'c'.repeat(64)}`,
-          program_id: 'next-pick',
           program_revision: `sha256:${'b'.repeat(64)}`,
           retained_bundle_id: `sha256:${'a'.repeat(64)}`,
           graph_revision: `sha256:${'b'.repeat(64)}`,
           node_environment: {
             catalog_id: 'manyforge.default',
-            content_version: '3.0.0',
+            content_version: '4.0.0',
             catalog_digest: `sha256:${'a'.repeat(64)}`,
             environment_digest: `sha256:${'c'.repeat(64)}`,
           },
@@ -282,7 +287,7 @@ function controller(
           collision_body_bindings: [],
           signal_bindings: [],
           node_policies: [],
-          contact_grasp_bindings: [],
+          collision_rule_bodies: [],
           provenance: {
             binding_compiler_contract_digest: `sha256:${'a'.repeat(64)}`,
             source_records: [],
@@ -309,7 +314,6 @@ function controller(
           appliedRecordDigest: `sha256:${'d'.repeat(64)}`,
           scenarioId: 'cell-pick',
           sourceDocumentDigest: `sha256:${'a'.repeat(64)}`,
-          programId: 'pick',
           programRevision: `sha256:${'b'.repeat(64)}`,
           programBindingId: `sha256:${'c'.repeat(64)}`,
           retainedBundleId: `sha256:${'a'.repeat(64)}`,
@@ -363,8 +367,10 @@ function controller(
     resumeHalt: vi.fn(),
     reset: vi.fn(),
     applyRecoveryAction: vi.fn(),
+    answerOperatorQuestion: vi.fn(),
     writeRuntimeBlackboard: vi.fn(),
     persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
+    readRunKeyValues: vi.fn(() => new Promise<never>(() => undefined)),
     stageManualResult: vi.fn(),
     groupRuntimeScales: {},
     setGroupRuntimeScale: vi.fn(),
@@ -378,10 +384,8 @@ describe('Program runtime projection', () => {
     view.state.applied = null;
     view.state.run = null;
     view.state.nonExecutable = {
-      deploymentArtifactId: 'deployment',
       deploymentRevision: `sha256:${'a'.repeat(64)}`,
       executable: false,
-      programId: null,
       programRevision: null,
       origin: {
         kind: 'scenario',
@@ -394,8 +398,9 @@ describe('Program runtime projection', () => {
       affectedNodes: [],
       affectedExecutionGroups: [],
     };
-    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view} />))
-      .toContain('authored-cell · no Program');
+    const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view} />);
+    expect(markup).toContain('<strong>authored-cell</strong>');
+    expect(markup).toContain('no Program');
   });
 
   it('names each automatic retry in the runtime-control events', () => {
@@ -612,7 +617,7 @@ describe('Program runtime projection', () => {
     // The run number in the display form of the current start (D4).
     expect(markup).toContain('3f9a/run1 · revision 4');
     expect(markup).toContain('revision 4');
-    expect(markup).toContain('next-pick');
+    expect(markup).toContain('cell-pick');
     expect(markup).not.toContain('Selection for the next Run');
     expect(markup).toContain('Program in this run');
     expect(markup).toContain('fixed for this run');
@@ -621,7 +626,7 @@ describe('Program runtime projection', () => {
     expect(markup).not.toContain('Execute Applied Program');
     expect(markup).not.toContain('Reset Program cycle');
     // Advanced tools exist only with run controls; no empty section otherwise.
-    expect(markup).not.toContain('Advanced: runtime blackboard');
+    expect(markup).not.toContain('Advanced: runtime-control audit');
     expect(markup).not.toContain('Runtime overrides');
   });
 
@@ -639,10 +644,11 @@ describe('Program runtime projection', () => {
     halted.runnerAllows = vi.fn((kind: string) => kind !== 'program_runtime_blackboard_write');
     halted.runnerRefusal = vi.fn(() => 'program_run_state_halted');
     const markup = renderToStaticMarkup(
-      <ProgramRuntimePanel enabled controller={halted} />,
+      <ProgramKeysPanel enabled controller={halted} />,
     );
-
-    expect(markup).toContain('Advanced: runtime blackboard, stored values and audit');
+    // The key editor lives in the viewer's Keys panel, not in the run details.
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={halted} />))
+      .not.toContain('Write current-run value');
     // Only writable keys with a typed editor; no raw JSON entry remains.
     expect(markup).toContain('<option value="flag">flag · bool</option>');
     expect(markup).toContain('<option value="layer">layer · int64</option>');
@@ -971,6 +977,48 @@ describe('Program runtime projection', () => {
     );
     // Retry lets held motion continue: it needs motion_clear like Run/Resume.
     paused.readiness = { ...paused.readiness!, motion_clear: false };
+    expect(render()).toMatch(/class="transport-group-resume"[^>]*disabled=""[^>]*>Retry<\/button>/);
+  });
+
+  it('shows a cleanly contained collision Stop\'s replan as Retry on its failure hold', () => {
+    // OD-373 (A): the Kernel's replan from the stopped state is the Retry of a
+    // failure hold; an operator Stop's replan stays its Resume.
+    const operatorStop = controller('intervention_required');
+    operatorStop.state.controls = ordinaryMotionStopControls();
+    expect(renderToStaticMarkup(
+      <ProgramTransportControls enabled program={operatorStop} robot={robotController()} />,
+    )).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
+
+    const paused = controller('intervention_required');
+    const controls = ordinaryMotionStopControls();
+    const offer = controls.recoveryOffer!;
+    offer.recoveryClass = 'runtime_collision' as typeof offer.recoveryClass;
+    offer.nodeInstanceId = 'move.1';
+    offer.actions = [{
+      actionId: 'replan_from_stopped_state',
+      requiresConfirmation: false,
+      performsBackendReset: false,
+      enabled: true,
+      disabledReasonCode: null,
+    }, {
+      actionId: 'continue_with_failure',
+      requiresConfirmation: true,
+      performsBackendReset: false,
+      enabled: true,
+      disabledReasonCode: null,
+    }];
+    controls.recoveryHolds = [{ motionGroupIds: ['all'], interventionStopScope: 'all', offer }];
+    paused.state.controls = controls;
+    const render = () => renderToStaticMarkup(
+      <ProgramTransportControls enabled program={paused} robot={robotController()} />,
+    );
+    expect(render()).toMatch(
+      /class="transport-group-resume"(?![^>]*disabled)[^>]*title="Retry move.1 and let all the Program&#x27;s motion continue."[^>]*>Retry<\/button>/,
+    );
+    expect(render()).toContain('>Continue</button>');
+    // The retry limit reached: Retry stays, disabled with its reason.
+    offer.actions[0].enabled = false;
+    offer.actions[0].disabledReasonCode = 'recovery_retry_limit_reached';
     expect(render()).toMatch(/class="transport-group-resume"[^>]*disabled=""[^>]*>Retry<\/button>/);
   });
 
@@ -1509,7 +1557,7 @@ describe('Program runtime projection', () => {
     expect(css).not.toContain('.transport-guidance');
     expect(transport).toMatch(/\.transport-control-layout \{[^}]*display: contents;/s);
     expect(transport).toMatch(
-      /\.transport-motion-panel \{[^}]*border: 1px solid #365563;[^}]*background: rgb\(8 23 32 \/ 94%\);/s,
+      /\.transport-motion-panel \{[^}]*border: 1px solid #365563;[^}]*background: color-mix\(in srgb, #0a1720 72%, transparent\);/s,
     );
     expect(transport).toMatch(
       /\.transport-motion-panel \{[^}]*width: var\(--viewer-transport-motion-panel-width\);/s,
@@ -1524,7 +1572,7 @@ describe('Program runtime projection', () => {
       /\.transport-group-scale \{[^}]*border: 1px solid #405764;[^}]*border-radius: 0\.45rem;/s,
     );
     expect(transport).toMatch(
-      /\.transport-unique-column \{[^}]*border: 1px solid #365563;[^}]*background: rgb\(8 23 32 \/ 94%\);[^}]*margin-left: auto;/s,
+      /\.transport-unique-column \{[^}]*border: 1px solid #365563;[^}]*background: color-mix\(in srgb, #0a1720 72%, transparent\);[^}]*margin-left: auto;/s,
     );
   });
 
@@ -1996,7 +2044,7 @@ describe('Program runtime projection', () => {
     const { createRoot } = await import('react-dom/client');
     const root = createRoot(node('div') as unknown as Element);
     try {
-      await act(() => { root.render(<ProgramRuntimePanel enabled controller={program} />); });
+      await act(() => { root.render(<ProgramKeysPanel enabled controller={program} />); });
       const chooseKey = (key: string) => act(() => {
         const target = { value: key };
         props(control((candidate) => Array.isArray(candidate.children)
@@ -2057,7 +2105,11 @@ it('shows a failed accepted start and native comparison facts while Reset remain
  * last mounted control whose props match; `mounted` says whether one was
  * mounted; `unmount` restores the globals.
  */
-async function mountTransport(program: ProgramRuntimeController, robot = robotController()) {
+async function mountTransport(
+  program: ProgramRuntimeController,
+  robot = robotController(),
+  element: ReactElement = <ProgramTransportControls enabled program={program} robot={robot} />,
+) {
   const created: Record<string, unknown>[] = [];
   const document: Record<string, unknown> = {
     nodeType: 9, activeElement: null, defaultView: {},
@@ -2094,7 +2146,7 @@ async function mountTransport(program: ProgramRuntimeController, robot = robotCo
   const { act } = await import('react');
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(node('div') as unknown as Element);
-  await act(() => { root.render(<ProgramTransportControls enabled program={program} robot={robot} />); });
+  await act(() => { root.render(element); });
   return {
     rerender: async (resetReloadRequest = 0) => { await act(() => { root.render(<ProgramTransportControls enabled program={program} robot={robot} resetReloadRequest={resetReloadRequest} />); }); },
     press: async (match: (props: Props) => boolean) => {
@@ -2809,6 +2861,12 @@ describe('Recovery class label', () => {
     )).toBe('Collision checks stopped');
   });
 
+  it('names a component fault Stop by its reason, not as a collision', () => {
+    // OD-379: the fault Stop keeps the runtime_collision class.
+    expect(recoveryClassLabel(offer('runtime_collision', 'component_fault', 'component_fault')))
+      .toBe('A component fault stopped motion');
+  });
+
   it('keeps the class label for an actual collision and other classes', () => {
     expect(recoveryClassLabel(offer('runtime_collision', 'execution_aborted', 'runtime_collision_fault')))
       .toBe('Runtime collision');
@@ -3257,5 +3315,296 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       await transport.press((p) => p.className === 'transport-group-resume');
       expect(program.resumeMotion).toHaveBeenCalledWith(['all']);
     } finally { await transport.unmount(); }
+  });
+});
+
+describe('Operator questions (OD-342)', () => {
+  function question(patch: Partial<ProgramOperatorQuestion> = {}): ProgramOperatorQuestion {
+    return {
+      schemaVersion: 'manyforge.program_operator_question.v1',
+      offerId: `sha256:${'7'.repeat(64)}`,
+      offerRevision: 3,
+      programRunId: 1,
+      nodeInstanceId: 'ask_bin_full',
+      nodeAttemptId: 41,
+      message: 'Bin is full. Empty it, then choose.',
+      severity: 'warning',
+      options: [
+        { optionId: 'continue', label: 'Bin emptied, continue', result: 'success' },
+        { optionId: 'abort', label: 'Abort this cycle', result: 'failure' },
+      ],
+      holdMotionGroupIds: ['left_arm'],
+      ...patch,
+    };
+  }
+
+  function asking(questions: ProgramOperatorQuestion[]): ProgramRuntimeController {
+    const program = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    controls.operatorQuestions = questions;
+    program.state.controls = controls;
+    return program;
+  }
+
+  it('shows each open question with its message, severity, node, held groups and options', () => {
+    const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={asking([
+      question(),
+      question({
+        offerId: `sha256:${'8'.repeat(64)}`, nodeInstanceId: 'ask_tool', severity: 'fault',
+        message: 'Tool lost.', holdMotionGroupIds: [],
+      }),
+    ])} />);
+    expect(markup).toContain('<p class="inline-message severity-warning">Bin is full. Empty it, then choose.</p>');
+    expect(markup).toContain('<p class="inline-message severity-error">Tool lost.</p>');
+    expect(markup).toContain('Warning · node <code>ask_bin_full</code>');
+    expect(markup).toContain('Fault · node <code>ask_tool</code>');
+    expect(markup).toContain('Holds motion left_arm: stopped until Run, also after the answer.');
+    expect(markup.match(/Holds motion/g)).toHaveLength(1);
+    expect(markup).toMatch(/<button type="button">Bin emptied, continue<\/button>/);
+    expect(markup).toMatch(/<button type="button" class="danger-button"[^>]*>Abort this cycle<\/button>/);
+    expect(markup.match(/>Question<\/h3>/g)).toHaveLength(2);
+  });
+
+  it('raises each open question as a notice answered from its actions', () => {
+    const program = asking([question()]);
+    const notices = deriveTransportGuidance({
+      enabled: true, program, robot: robotController(), motionActive: false, onReviewProgramRecovery: vi.fn(),
+    });
+    const notice = notices.find((row) => row.id === `program.question.${question().offerId}`);
+    expect(notice).toMatchObject({ severity: 'warning', title: 'Question from ask_bin_full' });
+    expect(notice?.message).toContain('Holds motion left_arm until Run.');
+    expect(notice?.actions?.map((action) => action.label)).toEqual(['Bin emptied, continue', 'Abort this cycle']);
+    notice?.actions?.[0].run();
+    expect(program.answerOperatorQuestion).toHaveBeenCalledWith(question(), 'continue');
+  });
+
+  it('disables the options while a control command is pending', () => {
+    const program = asking([question()]);
+    program.state.controlPending = `recovery:${question().offerId}:continue`;
+    const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={program} />);
+    expect(markup).toMatch(/<button type="button" disabled="">Bin emptied, continue…<\/button>/);
+    expect(markup).toMatch(/class="danger-button" disabled=""[^>]*>Abort this cycle<\/button>/);
+  });
+
+  it('disables the options with the Composer refusal, as for Retry', () => {
+    const program = asking([question()]);
+    program.composerRefusalReason = 'Apply or Discard first: unapplied changes in Program.';
+    const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={program} />);
+    expect(markup).toMatch(
+      /<button type="button" disabled="" title="Apply or Discard first: unapplied changes in Program\.">Bin emptied, continue<\/button>/,
+    );
+    expect(markup).toMatch(/class="danger-button" disabled="" title="Apply or Discard first[^"]*">Abort this cycle<\/button>/);
+  });
+
+  it('answers with the option as the action of the question offer', async () => {
+    const asked = question();
+    const program = asking([asked]);
+    const panel = await mountTransport(program, robotController(),
+      <ProgramRuntimePanel enabled controller={program} />);
+    try {
+      await panel.press((props) => props.children === 'Abort this cycle');
+      expect(program.answerOperatorQuestion).toHaveBeenCalledExactlyOnceWith(asked, 'abort');
+      expect(program.applyRecoveryAction).not.toHaveBeenCalled();
+    } finally {
+      await panel.unmount();
+    }
+  });
+
+  it('names what the running Program waits for (OD-354)', () => {
+    const program = controller('running');
+    program.state.applied!.program.tree = {
+      node_id: 'control.parallel', instance_id: 'root', parameters: {}, children: [
+        { node_id: 'logic.wait_for_value', instance_id: 'robot_1_wait_cycle_on', children: [],
+          parameters: { key: 'cell.cycle_on', operator: '==', value: true } },
+        { node_id: 'logic.wait_for_value', instance_id: 'loader_wait_cycle_on', children: [],
+          parameters: { key: 'cell.cycle_on', operator: '==', value: true } },
+      ],
+    };
+    program.state.run!.nodeStatuses = { root: 'running', robot_1_wait_cycle_on: 'running', loader_wait_cycle_on: 'running' };
+    const notices = deriveTransportGuidance({
+      enabled: true, program, robot: robotController(), motionActive: false, onReviewProgramRecovery: vi.fn(),
+    });
+    expect(notices.find((notice) => notice.id === 'program.waiting')).toMatchObject({
+      severity: 'info',
+      title: 'Waiting',
+      pinnedLines: ['cell.cycle_on == true — robot_1_wait_cycle_on, loader_wait_cycle_on'],
+    });
+    program.state.run!.nodeStatuses = { root: 'running', robot_1_wait_cycle_on: 'success', loader_wait_cycle_on: 'success' };
+    expect(deriveTransportGuidance({
+      enabled: true, program, robot: robotController(), motionActive: false, onReviewProgramRecovery: vi.fn(),
+    }).some((notice) => notice.id === 'program.waiting')).toBe(false);
+  });
+
+  it('shows a group a Program node stopped as waiting for Run', () => {
+    const program = asking([]);
+    const group = program.state.controls!.executionSelections.groups[0];
+    group.stoppedBy = 'program';
+    group.stoppedByNodeInstanceId = 'stop_left';
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    expect(markup).toContain('Stopped by Program node stop_left · waits for Run');
+    expect(markup).toContain(`${group.groupId} · by Program`);
+    group.stoppedBy = null;
+    group.stoppedByNodeInstanceId = null;
+    expect(renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    )).not.toContain('Stopped by Program node');
+  });
+
+  it('names the question, answer and group-Stop events in the runtime-control history', () => {
+    expect(programOperatorAuditText({
+      eventRevision: 5,
+      kind: 'program_operator_choice_requested',
+      facts: {
+        node_instance_id: 'ask_bin_full', node_attempt_id: 41, severity: 'warning',
+        message: 'Bin is full.', option_ids: ['continue', 'abort'], hold_motion_group_ids: ['left_arm'],
+      },
+    })).toBe('Question on ask_bin_full (warning): Bin is full. · options continue, abort · holds motion left_arm');
+    expect(programOperatorAuditText({
+      eventRevision: 6,
+      kind: 'program_operator_choice_requested',
+      facts: {
+        node_instance_id: 'ask', node_attempt_id: 1, severity: 'info',
+        message: 'Go?', option_ids: ['yes', 'no'], hold_motion_group_ids: [],
+      },
+    })).toBe('Question on ask (info): Go? · options yes, no');
+    expect(programOperatorAuditText({
+      eventRevision: 7,
+      kind: 'program_operator_choice_answered',
+      facts: {
+        node_instance_id: 'ask_bin_full', node_attempt_id: 41, option_id: 'abort',
+        label: 'Abort this cycle', result: 'failure', request_key: 'ab'.repeat(16), source_label: 'operator_ui',
+      },
+    })).toBe('Answer on ask_bin_full: Abort this cycle (failure)');
+    expect(programOperatorAuditText({
+      eventRevision: 8,
+      kind: 'program_operator_choice_answered',
+      facts: {
+        node_instance_id: 'ask', node_attempt_id: 1, option_id: 'yes',
+        label: 'Yes', result: 'success', request_key: 'cd'.repeat(16), source_label: 'operator_ui',
+      },
+    })).toBe('Answer on ask: Yes');
+    expect(programOperatorAuditText({
+      eventRevision: 9,
+      kind: 'program_motion_groups_stopped',
+      facts: { node_instance_id: 'stop_left', node_attempt_id: 2, group_ids: ['left_arm', 'right_arm'] },
+    })).toBe('Program node stop_left stopped motion left_arm, right_arm · waits for Run');
+    expect(programOperatorAuditText({
+      eventRevision: 10, kind: 'program_node_simulation_not_playing', facts: { node_instance_id: 'move' },
+    })).toBeNull();
+  });
+
+  it('renders the operator events in the runtime-control events list', () => {
+    const program = asking([]);
+    const controls = program.state.controls!;
+    controls.runtimeControls = {
+      audit: [{
+        eventRevision: 1,
+        kind: 'program_motion_groups_stopped',
+        facts: { node_instance_id: 'stop_left', node_attempt_id: 2, group_ids: ['left_arm'] },
+      }],
+    } as unknown as typeof controls.runtimeControls;
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={program} />))
+      .toContain('Program node stop_left stopped motion left_arm · waits for Run');
+  });
+});
+
+
+describe('Program keys: current run values (OD-353)', () => {
+  it('formats each value per type and names a missing or omitted one', () => {
+    expect(runKeyValueText({ key: 'count', type: 'int64', valueState: 'value', value: 2 })).toBe('2');
+    expect(runKeyValueText({
+      key: 'pick', type: 'stored_pose', valueState: 'value',
+      value: {
+        frame_ref: { kind: 'cell' }, position_m: [0.1, 0.2, 0.3],
+        orientation: { xyzw: [0, 0, 0, 1] },
+      },
+    })).toBe('cell · [0.1, 0.2, 0.3] m');
+    expect(runKeyValueText({ key: 'label', type: 'string', valueState: 'no_value' })).toBe('no value');
+    expect(runKeyValueText({ key: 'reply', type: 'model_response', valueState: 'omitted' }))
+      .toBe('too large to show');
+  });
+
+  it('shows the values section in the Keys panel and says when no run is active', () => {
+    const idle = controller('running');
+    idle.state.run = null;
+    const markup = renderToStaticMarkup(<ProgramKeysPanel enabled controller={idle} />);
+    expect(markup).toContain('Key values');
+    expect(markup).toContain('No run is active.');
+    expect(idle.readRunKeyValues).not.toHaveBeenCalled();
+    // The values belong to the Keys panel, not to the run details.
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={controller('running')} />))
+      .not.toContain('Key values');
+  });
+
+  it('reads the run values while mounted and again when the run projection changes', async () => {
+    const created: Record<string, unknown>[] = [];
+    const document: Record<string, unknown> = {
+      nodeType: 9, activeElement: null, defaultView: {},
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      createTextNode: (text: string) => ({ nodeType: 3, nodeValue: text, ownerDocument: document }),
+    };
+    const node = (tag: string): Record<string, unknown> => {
+      const element: Record<string, unknown> = {
+        nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
+        namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, style: {}, options: [],
+        addEventListener: () => undefined, removeEventListener: () => undefined,
+        appendChild: () => undefined, insertBefore: () => undefined, removeChild: () => undefined,
+        setAttribute: () => undefined, removeAttribute: () => undefined,
+      };
+      created.push(element);
+      return element;
+    };
+    document.createElement = node;
+    document.documentElement = node('html');
+    const window = {
+      document, HTMLIFrameElement: class {},
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout,
+    };
+    document.defaultView = window;
+    vi.stubGlobal('window', window);
+    vi.stubGlobal('document', document);
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    const props = (element: Record<string, unknown>) => element[
+      Object.keys(element).find((name) => name.startsWith('__reactProps$'))!] as Record<string, unknown>;
+    const cells = () => created
+      .filter((element) => element.tagName === 'TD')
+      .filter((element) => Object.keys(element).some((name) => name.startsWith('__reactProps$')))
+      .map((element) => props(element).children);
+
+    let value = 2;
+    const read = vi.fn(async (programRunId: number) => ({
+      programRunId, runRevision: 1, nodeStatusRevision: value,
+      keys: [{ key: 'count', type: 'int64', valueState: 'value' as const, value }],
+    }));
+    const { act } = await import('react');
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(node('div') as unknown as Element);
+    try {
+      await act(() => {
+        root.render(<ProgramRunKeyValuesSection runId={7} refreshKey="7:1:2" read={read} />);
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(read.mock.calls[0][0]).toBe(7);
+      expect(cells()).toContain('2');
+
+      // The same projection is not read again; a changed one is.
+      await act(() => {
+        root.render(<ProgramRunKeyValuesSection runId={7} refreshKey="7:1:2" read={read} />);
+      });
+      expect(read).toHaveBeenCalledTimes(1);
+      value = 3;
+      await act(() => {
+        root.render(<ProgramRunKeyValuesSection runId={7} refreshKey="7:1:3" read={read} />);
+      });
+      expect(read).toHaveBeenCalledTimes(2);
+      expect(cells()).toContain('3');
+    } finally {
+      await act(() => { root.unmount(); });
+      vi.unstubAllGlobals();
+    }
   });
 });

@@ -1,0 +1,59 @@
+# An example tool parameter file (manyforge.parametric_tool.v1, kind: tool):
+# a pneumatic gripper with two jaw pairs, an outer pair with pads and an
+# inner pair at 90 degrees, plus a fixed bracket. Each jaw pair is an
+# actuated tool end, one gripper target of the tool (`outer`, `inner`); its
+# valve outputs and sensors are its wiring, the only thing the Deployment
+# holds for it (one `gripper_target_configurations` row with `pneumatic_io`).
+# `scripts/manyforge component export <this file> <folder>` writes its URDF
+# and SRDF.
+# Poses are in the mount frame (the robot flange plane), z out of the flange.
+api_version: manyforge.parametric_tool.v1
+kind: tool
+body:
+  - name: housing
+    pose: {position_m: [0, 0, 0.03]}
+    collision: {box: {size_m: [0.08, 0.08, 0.06]}}
+chains:
+  - attach_to: body
+    pose: {position_m: [0, 0, 0.06]}
+    elements:
+      - jaw_pair:
+          id: outer                    # gripper target `outer`; jaws move along the pair's y
+          positive_jaw:                # the +y jaw at the closed position (pair frame)
+            - name: outer_finger
+              pose: {position_m: [0, 0.006, 0.03]}
+              collision: {box: {size_m: [0.02, 0.008, 0.06]}}
+          pads:                        # the only parts that touch the part
+            positive:
+              - name: outer_pad
+                pose: {position_m: [0, 0.001, 0.05]}
+                collision: {box: {size_m: [0.018, 0.002, 0.018]}}
+          min_aperture_m: 0.0          # pad to pad at full closure
+          max_aperture_m: 0.04
+          closed_aperture_m: 0.02      # the assumed grasp aperture (needed with pads)
+  - attach_to: body
+    pose: {position_m: [0.06, 0, 0.03], orientation: {rpy_deg: [0, 0, 90]}}
+    elements:
+      - jaw_pair:
+          id: inner                    # gripper target `inner`, no pads: the fingers touch
+          positive_jaw:
+            - name: inner_finger
+              pose: {position_m: [0, 0.004, 0.02]}
+              collision: {box: {size_m: [0.01, 0.006, 0.04]}}
+          min_aperture_m: 0.002
+          max_aperture_m: 0.022
+      - fixed:
+          id: bracket                  # a rigid part; no default contact bodies
+          pose: {position_m: [0, -0.02, 0]}
+          parts:
+            - name: bracket_plate
+              collision: {box: {size_m: [0.02, 0.004, 0.03]}}
+tcps:
+  - id: tcp                            # the default TCP, between the outer pads
+    attach_to: outer                   # contact bodies: the pair's pads (default)
+    pose: {position_m: [0, 0, 0.05]}
+  - id: inner_tcp                      # contact bodies: the inner fingers (default)
+    attach_to: inner
+    pose: {position_m: [0, 0, 0.035]}
+mass_kg: 0.6
+center_of_mass_m: [0, 0, 0.04]

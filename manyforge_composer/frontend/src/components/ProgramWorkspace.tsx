@@ -106,7 +106,11 @@ interface ProgramWorkspaceProps {
     title: string;
     readOnlyReason: string | null;
   }) => void;
-
+  /** Incremented by the Program tab's attention badge to open the reference issue list. */
+  attentionOpenRequest?: number;
+  /** A key whose declaration to open (the Keys panel's Edit initial); handled once. */
+  keyDeclarationRequest?: string | null;
+  onKeyDeclarationRequestHandled?: () => void;
 }
 
 export function ProgramWorkspace({
@@ -114,12 +118,16 @@ export function ProgramWorkspace({
   onSelectedNodeIdChange,
   controller,
   referenceValidation = { referenceAttention: null, referenceUnavailable: false, selectorFacts: null },
+  attentionOpenRequest = 0,
+  keyDeclarationRequest = null,
+  onKeyDeclarationRequestHandled,
   runtime,
   manualPreviewController = null,
   heldNodePreview = null,
   onHeldPreviewVisibilityChange,
   catalog,
   environment,
+  sourceModel,
   deploymentWorkspace = null,
   systemSignalsNeedApply = false,
   motionDescriptors = EMPTY_MOTION_DESCRIPTORS,
@@ -262,6 +270,9 @@ export function ProgramWorkspace({
   const authoring = workspace?.draft.authoring ?? null;
   const { referenceAttention, referenceUnavailable } = referenceValidation;
   const [attentionOpen, setAttentionOpen] = useState(false);
+  useEffect(() => {
+    if (attentionOpenRequest > 0) setAttentionOpen(true);
+  }, [attentionOpenRequest]);
   // Keys read by node or global interrupt rules must declare `initial:`.
   const interruptKeyUses = useMemo(() => interruptConditionKeyUses(
     authoring?.forest ?? [], deploymentDraftDocument as Record<string, JsonValue> | null,
@@ -312,6 +323,12 @@ export function ProgramWorkspace({
     setDeclarationSelection(selection);
     onInspectorMinimizedChange?.(false);
   }, [declarationSelection, invalidLocalEdit, onInspectorMinimizedChange]);
+  useEffect(() => {
+    if (keyDeclarationRequest === null) return;
+    setToolView('params');
+    selectDeclaration({ kind: 'key', id: keyDeclarationRequest });
+    onKeyDeclarationRequestHandled?.();
+  }, [keyDeclarationRequest, onKeyDeclarationRequestHandled, selectDeclaration]);
   useEffect(() => {
     onInvalidEditChange?.(invalidLocalEdit);
     return () => onInvalidEditChange?.(false);
@@ -484,16 +501,13 @@ export function ProgramWorkspace({
 
   return (
     <section className="panel program-workspace" aria-label="Program authoring workspace">
-      {/* Presentation 2026-11-10: shown only when there is a reference issue;
-          placement to evaluate before the next release. */}
-      {authoring !== null && (referenceUnavailable || (referenceAttention?.total ?? 0) > 0) && (
+      {/* Opened from the Program tab's attention badge; a popover, so the
+          workspace layout never moves (2026-11-22). */}
+      {authoring !== null && attentionOpen && (
         <div className="program-reference-attention">
-          <button type="button" aria-expanded={attentionOpen}
-            onClick={() => setAttentionOpen((open) => !open)}>
-            Needs attention {referenceAttention === null ? '' : `(${referenceAttention.total})`}
-          </button>
-          {attentionOpen && (
             <div role="region" aria-label="Program references needing attention">
+              <button type="button" className="program-reference-attention-close"
+                aria-label="Close the reference issue list" onClick={() => setAttentionOpen(false)}>×</button>
               {referenceUnavailable && <p>Reference validation is unavailable.</p>}
               {!referenceUnavailable && referenceAttention === null && <p>Checking references…</p>}
               {referenceAttention?.total === 0 && <p>No reference issues.</p>}
@@ -525,7 +539,6 @@ export function ProgramWorkspace({
               )}
               {referenceAttention?.truncated && <p>Showing {referenceAttention.issues.length} of {referenceAttention.total} issues.</p>}
             </div>
-          )}
         </div>
       )}
       <div className="program-workspace-notices">
@@ -782,6 +795,7 @@ export function ProgramWorkspace({
                   deploymentWorkspace={deploymentWorkspace}
                   systemSignalsNeedApply={systemSignalsNeedApply}
                   motionDescriptors={motionDescriptors}
+                  sourceModel={sourceModel.status === 'ready' ? sourceModel.data : null}
                   busy={authoringBusy}
                   onMutate={mutate}
                   onCreateGroup={() => {

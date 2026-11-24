@@ -296,6 +296,101 @@ def _runtime_scale_selector_for_group(
     return selector, None
 
 
+def _halt_phase(state: ProgramRunState) -> str | None:
+    """``halting`` or ``halted`` while a Halt freezes the run, else None."""
+
+    if state in {ProgramRunState.HALTING, ProgramRunState.HALTED}:
+        return state.value
+    return None
+
+
+def _selection_group_state(
+    nodes: Sequence[str],
+    facts: _TickFacts,
+    unavailable: str | None,
+    blocked: Mapping[str, str],
+    halt: str | None = None,
+) -> tuple[str, str | None, list[str], list[str]]:
+    """One motion group's state and release reason from its run's tick
+    facts: the runtime controls' ``groups[].state`` and the
+    ``motion_group_state.<group>`` key (OD-339) both come from here.
+    Also returns the group's held and ordinary-held (stopped) nodes.
+
+    ``halt`` (``_halt_phase``): a Halt freezes every group, whatever its
+    node holds: ``stopping`` while it settles, ``held`` once halted (a
+    group with a faulted Stop stays ``faulted``). Run and Resume stay
+    unavailable (``unavailable`` names why); Execute continues."""
+
+    snapshot = facts.scope
+    held, ready = snapshot.held_nodes, snapshot.ready_nodes
+    selected_held = [node for node in nodes if node in held]
+    selected_ready = [node for node in nodes if node in ready]
+    selected_effectful = [node for node in nodes if node in facts.initial_ready_nodes]
+    selected_ordinary_held = [node for node in selected_held if node not in ready]
+    reason = unavailable
+    if any(node in snapshot.faulted_nodes for node in selected_held) and (
+        halt is not None or reason is None
+    ):
+        state, reason = "faulted", "selected_stop_fault_requires_recovery"
+    elif halt is not None:
+        state = "stopping" if halt == "halting" else "held"
+    elif reason is not None:
+        state = "unavailable"
+    elif any(node in snapshot.stopping_nodes for node in selected_held):
+        state, reason = "stopping", "selected_motion_is_stopping"
+    elif selected_ready:
+        state = (
+            "ready"
+            if len(selected_ready) == len(selected_effectful)
+            and not selected_ordinary_held
+            else "mixed"
+        )
+        # Run and Resume are one release; stopped work in a mixed
+        # group still needs its recovery to be available.
+        reason = next(
+            (blocked[node] for node in selected_held if node in blocked),
+            None,
+        )
+    else:
+        state = (
+            "running"
+            if not selected_held
+            else "held"
+            if len(selected_ordinary_held) == len(nodes)
+            else "mixed"
+        )
+        reason = next(
+            (blocked[node] for node in selected_held if node in blocked),
+            None,
+        )
+        if not selected_held:
+            reason = "selection_not_held"
+    return state, reason, selected_held, selected_ordinary_held
+
+
+def _program_stop_fields(nodes: Sequence[str], facts: _TickFacts) -> dict[str, str | None]:
+    """A group row's ``stopped_by`` and ``stopped_by_node_instance_id``
+    (OD-342), from the Kernel's attribution of held nodes: `program` when
+    the whole group is held and every stopped (not Ready) node of it is held
+    by a Program node's own Stop; it names the first such node's requester
+    (node order)."""
+
+    held, ready = facts.scope.held_nodes, facts.scope.ready_nodes
+    holds = facts.program_holds
+    stopped = [node for node in sorted(nodes) if node not in ready]
+    node = (
+        holds[stopped[0]]
+        if stopped
+        and all(member in held for member in nodes)
+        and all(member in holds for member in stopped)
+        else None
+    )
+    return {
+        "stopped_by": None if node is None else "program",
+        "stopped_by_node_instance_id": node,
+    }
+
+
 def _selection_resource_ids(
     run: ExecutableProgramRun,
     program_binding: Mapping[str, Any],
@@ -372,8 +467,7 @@ class ProgramRunAdmission:
             raise TypeError("program_binding must be one verified mapping")
         binding = dict(self.program_binding)
         if (
-            binding.get("program_id") != self.program.program_id
-            or binding.get("program_revision") != self.program.program_revision
+            binding.get("program_revision") != self.program.program_revision
             or binding.get("program_binding_id") != self.program_binding_id
             or binding.get("retained_bundle_id") != self.retained_bundle_id
             or binding.get("graph_revision") != self.graph_revision
@@ -459,7 +553,6 @@ class ProgramRunAdmission:
             applied_record_digest=self.applied_record_digest,
             scenario_id=self.scenario_id,
             source_document_digest=self.source_document_digest,
-            program_id=self.program.program_id,
             program_revision=self.program.program_revision,
             program_binding_id=self.program_binding_id,
             retained_bundle_id=self.retained_bundle_id,
@@ -670,6 +763,11 @@ class _TickFacts:
     held_task_states: Mapping[str, str] | None
     # ``ExecutableProgramRun.pending_selected_observation``.
     stop_observation_pending: bool
+    # The open operator questions (``ExecutableProgramRun.operator_questions``).
+    operator_questions: tuple[Mapping[str, Any], ...] = ()
+    # ``ExecutableProgramRun.program_holds``: the Kernel's `stopped_by:
+    # program` attribution of held nodes.
+    program_holds: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -742,6 +840,9 @@ class _RunEntry:
     # Commands handed to the run's tick, in posting order (OD-146).
     inbox: deque[RunIntent] = field(default_factory=deque, repr=False)
     tick_facts: _TickFacts | None = None
+    # The (eligible, tick facts) the motion group state keys were last
+    # written from.
+    group_state_inputs: tuple[ProgramRunState, _TickFacts] | None = None
 
 
 class ProgramRunOwner:
@@ -880,6 +981,8 @@ class ProgramRunOwner:
             initial_ready_nodes=run.initial_ready_nodes(),
             held_task_states=held_task_states,
             stop_observation_pending=run.pending_selected_observation(),
+            operator_questions=run.operator_questions(),
+            program_holds=run.program_holds,
         )
 
     def _publish_tick_facts(self, program_run_id: int) -> None:
@@ -887,7 +990,55 @@ class ProgramRunOwner:
             run = self._entry(program_run_id).run
         facts = self._tick_facts(run)
         with self._lock:
-            self._entry(program_run_id).tick_facts = facts
+            entry = self._entry(program_run_id)
+            entry.tick_facts = facts
+        self._publish_motion_group_states(program_run_id)
+
+    def operator_questions(self, program_run_id: int) -> tuple[Mapping[str, Any], ...]:
+        """The run's open operator questions as its tick last published them."""
+
+        with self._lock:
+            facts = self._entry(program_run_id).tick_facts
+        return () if facts is None else facts.operator_questions
+
+    def answer_operator_question(
+        self,
+        program_run_id: int,
+        *,
+        node_instance_id: str,
+        node_attempt_id: int,
+        option_id: str,
+    ) -> Mapping[str, Any]:
+        """On the run's tick: hand the operator's answer to its question.
+
+        No Kernel effect; the node ends on its next tick. Returns the chosen
+        option; a question no longer open is refused
+        (``cycle_recovery_offer_stale``)."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            run = entry.run
+            ended = entry.state in {
+                ProgramRunState.STOPPING,
+                ProgramRunState.FINALIZING,
+                ProgramRunState.STOPPED,
+                ProgramRunState.SUCCEEDED,
+                ProgramRunState.FAILED,
+            }
+        try:
+            if ended:
+                raise ProgramRuntimeError("the Program run is ending")
+            option = run.answer_operator_question(
+                node_instance_id, node_attempt_id, option_id
+            )
+        except ProgramRuntimeError as error:
+            refused = ProgramRunOwnerError(str(error))
+            refused.code = "cycle_recovery_offer_stale"  # type: ignore[attr-defined]
+            raise refused from error
+        with self._lock:
+            entry = self._entry(program_run_id)
+            entry.revision += 1
+        return option
 
     @staticmethod
     def _schedule_program_time(entry: _RunEntry, *, tree_ticks: bool) -> None:
@@ -1187,7 +1338,6 @@ class ProgramRunOwner:
             applied_record_digest=admission.applied_record_digest,
             scenario_id=admission.scenario_id,
             source_document_digest=admission.source_document_digest,
-            program_id=admission.program.program_id,
             program_revision=admission.program.program_revision,
             program_binding_id=admission.program_binding_id,
             retained_bundle_id=admission.retained_bundle_id,
@@ -1240,6 +1390,8 @@ class ProgramRunOwner:
                     entry.mock_held = run.mock_held_nodes()
                     self._runs[admitted_program_run_id] = entry
                     snapshot = self._snapshot(entry)
+                # The motion group state keys start from the run's first facts.
+                self._publish_motion_group_states(admitted_program_run_id)
                 # Recorded, not sent: the first Mock START sends it.
                 self._notify_mock_run_paused(
                     admitted_program_run_id, snapshot.run_revision, False, entry.mock_held
@@ -1539,6 +1691,18 @@ class ProgramRunOwner:
             entry = self._entry(program_run_id)
             entry.revision += 1
             return self._snapshot(entry)
+
+    def read_runtime_blackboard(
+        self, program_run_id: int
+    ) -> tuple[ProgramRunSnapshot, list[dict[str, Any]]]:
+        """The run's projection and its declared keys' current values; a
+        read of the run's value store, no Kernel exchange or tick wait."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            live = self._snapshot(entry)
+            store = entry.run.value_store
+        return live, store.current_values()
 
     def reset_runtime_blackboard(
         self,
@@ -1946,12 +2110,18 @@ class ProgramRunOwner:
         group_id: str | list[str] = "all",
         reason: str | None = None,
         stop_request_key: bytes,
+        stopped_by_node_instance_id: str | None = None,
+        on_accepted: Callable[[int], None] | None = None,
     ) -> ProgramRunSnapshot:
         """Hold a captured selection and contain its work through the Kernel.
 
         The runner's own selection Stops only (simulation not playing, a
-        failure pause), sent by the run's tick; a client's group Stop goes to
-        the Kernel directly.
+        failure pause, a Program node's own Stop), sent by the run's tick; a
+        client's group Stop goes to the Kernel directly.
+        ``stopped_by_node_instance_id`` names the Program node whose own Stop
+        it is (the Kernel's `stopped_by: program`). ``on_accepted`` gets
+        the accepted hold revision, under the owner lock, once the Kernel
+        accepted the Stop.
         """
 
         if reason is not None:
@@ -1968,7 +2138,11 @@ class ProgramRunOwner:
             run = entry.run
         try:
             accepted = self._scope.stop_selection(
-                run.execution_selection_request(group_id, stop_request_key)
+                run.execution_selection_request(
+                    group_id,
+                    stop_request_key,
+                    stopped_by_node_instance_id=stopped_by_node_instance_id,
+                )
             )
         except Exception as exc:
             raise ProgramRunOwnerOutcomeUnknownError(
@@ -1994,6 +2168,8 @@ class ProgramRunOwner:
                 return self._snapshot(entry)
             entry.active_operation_count = None
             entry.revision += 1
+            if on_accepted is not None:
+                on_accepted(accepted["state"]["hold_revision"])
             held = self._note_mock_held(entry)
             held_revision, held_paused = entry.revision, self._mock_paused(entry)
             snapshot = self._snapshot(entry)
@@ -2101,6 +2277,63 @@ class ProgramRunOwner:
                 )
         return tuple(batch), blocked
 
+    def _selection_observation(
+        self, run: ExecutableProgramRun, eligible: bool, facts: _TickFacts
+    ) -> tuple[str | None, dict[str, str]]:
+        """Why the run's selection state is unavailable (None when known),
+        and the stopped nodes whose release is blocked, with the reason."""
+
+        snapshot = facts.scope
+        unavailable = (
+            facts.stop_observation_error if eligible else "program_run_not_running"
+        )
+        blocked: dict[str, str] = {}
+        ordinary_held = snapshot.held_nodes - snapshot.ready_nodes
+        if eligible and ordinary_held:
+            states = facts.held_task_states
+            if states is None:
+                unavailable = "program_selection_observation_unavailable"
+            else:
+                try:
+                    _batch, blocked = self._recovery_candidates(
+                        run,
+                        ordinary_held,
+                        {
+                            node: state
+                            for node, state in states.items()
+                            if node in ordinary_held
+                        },
+                        refresh_assessments=False,
+                    )
+                except Exception:
+                    unavailable = "program_selection_observation_unavailable"
+        return unavailable, blocked
+
+    def _publish_motion_group_states(self, program_run_id: int) -> None:
+        """On the run's tick, after its facts: each motion group's state, as
+        the runtime controls show it, into its ``motion_group_state.<group>``
+        key (OD-339). Recomputed only when the facts or the run's state
+        changed; the store publishes only changed values."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            run, facts, run_state = entry.run, entry.tick_facts, entry.state
+            if facts is None or entry.group_state_inputs == (run_state, facts):
+                return
+            entry.group_state_inputs = (run_state, facts)
+        eligible = run_state in {
+            ProgramRunState.RUNNING,
+            ProgramRunState.INTERVENTION_REQUIRED,
+        }
+        halt = _halt_phase(run_state)
+        unavailable, blocked = self._selection_observation(run, eligible, facts)
+        store = run.value_store
+        for group_id, nodes in run.execution_selections.items():
+            store.write_motion_group_state(
+                group_id,
+                _selection_group_state(nodes, facts, unavailable, blocked, halt)[0],
+            )
+
     def execution_selection_controls(self, program_run_id: int) -> dict[str, Any]:
         return self.read_selection_controls(program_run_id)[1]
 
@@ -2122,81 +2355,18 @@ class ProgramRunOwner:
             }
             facts = entry.tick_facts
             program_binding = entry.program_binding
+            halt = _halt_phase(entry.state)
         snapshot = facts.scope
         selection_release_block_reason = facts.selection_release_block_reason
-        unavailable = (
-            facts.stop_observation_error if eligible else "program_run_not_running"
-        )
-        blocked = {}
-        ordinary_held = snapshot.held_nodes - snapshot.ready_nodes
-        if eligible and ordinary_held:
-            states = facts.held_task_states
-            if states is None:
-                unavailable = "program_selection_observation_unavailable"
-            else:
-                try:
-                    _batch, blocked = self._recovery_candidates(
-                        run,
-                        ordinary_held,
-                        {
-                            node: state
-                            for node, state in states.items()
-                            if node in ordinary_held
-                        },
-                        refresh_assessments=False,
-                    )
-                except Exception:
-                    unavailable = "program_selection_observation_unavailable"
-
-        held = snapshot.held_nodes
-        ready = snapshot.ready_nodes
-        initially_effectful = facts.initial_ready_nodes
-        stopping, faulted = snapshot.stopping_nodes, snapshot.faulted_nodes
+        unavailable, blocked = self._selection_observation(run, eligible, facts)
         groups = []
         for group_id, nodes in run.execution_selections.items():
             scale_selector, scale_reason = _runtime_scale_selector_for_group(
                 run, program_binding, group_id
             )
-            selected_held = [node for node in nodes if node in held]
-            selected_ready = [node for node in nodes if node in ready]
-            selected_effectful = [node for node in nodes if node in initially_effectful]
-            selected_ordinary_held = [
-                node for node in selected_held if node not in ready
-            ]
-            reason = unavailable
-            if reason is not None:
-                state = "unavailable"
-            elif any(node in faulted for node in selected_held):
-                state, reason = "faulted", "selected_stop_fault_requires_recovery"
-            elif any(node in stopping for node in selected_held):
-                state, reason = "stopping", "selected_motion_is_stopping"
-            elif selected_ready:
-                state = (
-                    "ready"
-                    if len(selected_ready) == len(selected_effectful)
-                    and not selected_ordinary_held
-                    else "mixed"
-                )
-                # Run and Resume are one release; stopped work in a mixed
-                # group still needs its recovery to be available.
-                reason = next(
-                    (blocked[node] for node in selected_held if node in blocked),
-                    None,
-                )
-            else:
-                state = (
-                    "running"
-                    if not selected_held
-                    else "held"
-                    if len(selected_ordinary_held) == len(nodes)
-                    else "mixed"
-                )
-                reason = next(
-                    (blocked[node] for node in selected_held if node in blocked),
-                    None,
-                )
-                if not selected_held:
-                    reason = "selection_not_held"
+            state, reason, selected_held, selected_ordinary_held = (
+                _selection_group_state(nodes, facts, unavailable, blocked, halt)
+            )
             # Run and Resume are the same command.
             release_allowed = (
                 eligible
@@ -2213,9 +2383,16 @@ class ProgramRunOwner:
                 {
                     "group_id": group_id,
                     "node_count": len(nodes),
-                    "held_node_count": len(selected_held),
+                    # A halted run holds every node (the Halt's freeze).
+                    "held_node_count": (
+                        len(nodes) if halt == "halted" else len(selected_held)
+                    ),
+                    # During a Halt the stopped work per group is not known;
+                    # the run's own Halt state covers it.
                     "ordinary_held_node_count": (
-                        None if state in {"unavailable", "stopping", "faulted"}
+                        None
+                        if halt is not None
+                        or state in {"unavailable", "stopping", "faulted"}
                         else len(selected_ordinary_held)
                     ),
                     "state": state,
@@ -2229,8 +2406,14 @@ class ProgramRunOwner:
                     "resource_ids": _selection_resource_ids(
                         run, program_binding, group_id
                     ),
+                    # A Program node's own Stop holds the group until Run:
+                    # the Kernel's attribution of the group's held nodes.
+                    **_program_stop_fields(nodes, facts),
                 }
             )
+        held = snapshot.held_nodes
+        initially_effectful = facts.initial_ready_nodes
+        stopping, faulted = snapshot.stopping_nodes, snapshot.faulted_nodes
         # Every effectful node is held by the Kernel in a settled phase:
         # never released (Ready) or stopped with its Stop certified
         # (Held). The Kernel admits a Program operation only for a
@@ -3431,6 +3614,7 @@ class ProgramRunOwner:
             # the run did not change.
             return self.reconcile_halting(program_run_id)
         snapshot = self._advance_once(program_run_id)
+        snapshot = self._stop_motion_for_program_nodes(program_run_id, snapshot)
         snapshot = self._stop_motion_for_simulation(program_run_id, snapshot)
         return self._stop_motion_for_failure_pause(program_run_id, snapshot)
 
@@ -3471,6 +3655,56 @@ class ProgramRunOwner:
             return snapshot
         run.note_simulation_stops(nodes)
         return stopped
+
+    def _stop_motion_for_program_nodes(
+        self, program_run_id: int, snapshot: ProgramRunSnapshot
+    ) -> ProgramRunSnapshot:
+        """A Program node's own motion-group Stop (Ask operator's
+        `hold_motion`, Stop motion groups): the operator's group Stop, sent
+        with the node attempt's own key, again on the next tick until the
+        Kernel accepted it. The request names the node: the Kernel
+        attributes the holds it raises to it (`stopped_by: program`) until
+        their release (Run)."""
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state not in {
+                ProgramRunState.RUNNING,
+                ProgramRunState.INTERVENTION_REQUIRED,
+            }:
+                return snapshot
+            run = entry.run
+        for node_id, attempt_id, groups, key in run.program_stop_requests():
+
+            def accepted(
+                hold_revision: int,
+                node_id: str = node_id,
+                attempt_id: int = attempt_id,
+            ) -> None:
+                # Under the owner lock, memory only.
+                run.note_program_stop_accepted(node_id, attempt_id, hold_revision)
+
+            try:
+                snapshot = self.stop_motion(
+                    program_run_id,
+                    group_id=list(groups),
+                    reason=f"Program node {node_id} stops its motion groups",
+                    stop_request_key=key,
+                    stopped_by_node_instance_id=node_id,
+                    on_accepted=accepted,
+                )
+            except ProgramRunOwnerOutcomeUnknownError:
+                # Not confirmed: sent again with the same key next tick.
+                continue
+        # The accepted Stops' history events, with this tick's.
+        events = run.take_node_history_events()
+        if events:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                if entry.run is run:
+                    entry.pending_node_history_events.extend(events)
+                    entry.revision += 1
+                    snapshot = self._snapshot(entry)
+        return snapshot
 
     def _revision_stop_key(
         self, program_run_id: int, revision: int, slot: str
@@ -3857,7 +4091,6 @@ def build_program_run_admission(
         "applied_record_digest",
         "assistant_projection",
         "assistant_mode",
-        "deployment_artifact_id",
         "deployment_revision",
         "graph_revision",
         "node_environment_digest",
@@ -3866,7 +4099,6 @@ def build_program_run_admission(
         "program_binding",
         "program_frame_facts",
         "program_binding_id",
-        "program_id",
         "program_revision",
         "project_path",
         "retained_bundle_id",
@@ -3879,7 +4111,6 @@ def build_program_run_admission(
         raise ProgramRunOwnerError("Program-run input version is unsupported")
     if set(selection) != expected_fields:
         raise ProgramRunOwnerError("Program-run input has wrong fields")
-    _text(selection.get("deployment_artifact_id"), field="deployment_artifact_id")
     _digest(selection.get("deployment_revision"), field="deployment_revision")
     if selection.get("assistant_mode") not in {
         "required",
@@ -3944,7 +4175,6 @@ def build_program_run_admission(
         selection.get("program_revision"),
         field="program_revision",
     )
-    program_id = _text(selection.get("program_id"), field="program_id")
     try:
         frame_facts = ProgramFrameFacts.from_capture(selection.get("program_frame_facts"), selection)
     except ValueError as error:
@@ -3970,10 +4200,8 @@ def build_program_run_admission(
             "scenario Program catalog contract is unsupported by this runner"
         )
     if (
-        program.program_id != program_id
-        or program.program_revision != program_revision
+        program.program_revision != program_revision
         or binding_value.get("program_binding_id") != program_binding_id
-        or binding_value.get("program_id") != program_id
         or binding_value.get("program_revision") != program_revision
         or binding_value.get("retained_bundle_id") != retained_bundle_id
         or binding_value.get("graph_revision") != graph_revision
@@ -4074,7 +4302,6 @@ def build_applied_program_run_admission(
         "assistant_mode",
         "assistant_projection",
         "baseline_program_binding_id",
-        "deployment_artifact_id",
         "deployment_revision",
         "graph_revision",
         "node_environment_digest",
@@ -4084,7 +4311,6 @@ def build_applied_program_run_admission(
         "program_binding",
         "program_frame_facts",
         "program_binding_id",
-        "program_id",
         "program_revision",
         "project_path",
         "retained_bundle_id",
@@ -4120,7 +4346,6 @@ def build_applied_program_run_admission(
         "applied_record_digest": source["record_digest"],
         "assistant_projection": deepcopy(applied.get("assistant_projection")),
         "assistant_mode": applied["assistant_mode"],
-        "deployment_artifact_id": applied["deployment_artifact_id"],
         "deployment_revision": applied["deployment_revision"],
         "graph_revision": applied["graph_revision"],
         "node_environment_digest": applied["node_environment_digest"],
@@ -4129,7 +4354,6 @@ def build_applied_program_run_admission(
         "program_binding": deepcopy(applied["program_binding"]),
         "program_frame_facts": deepcopy(applied["program_frame_facts"]),
         "program_binding_id": applied["program_binding_id"],
-        "program_id": applied["program_id"],
         "program_revision": applied["program_revision"],
         "retained_bundle_id": applied["retained_bundle_id"],
         "source_document_digest": applied["source_document_digest"],

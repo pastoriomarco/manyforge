@@ -117,13 +117,13 @@ public:
     const auto started = std::chrono::steady_clock::now();
     auto stage = RetainedPlanningModelStage::create_verified(
         *planning_model, config_.execution_run_root);
-    // Scene meshes resolve only below the approved scene-asset root; the
+    // Scene meshes are read only from the scene content root by digest; the
     // retained package root is never a scene-mesh search path.
     auto collision_model =
         collision::ManyForgeCollisionEngine::load_shared_model(
             "manyforge_managed_native_projection", stage.loader_urdf_path(),
             stage.srdf_path(), stage.package_paths(), std::string{},
-            config_.scene_asset_root_fd);
+            config_.scene_content_root_fd);
     std::cerr << "native projection collision model loaded: retained_bundle="
               << candidate.retained_bundle_id.value() << " load_ms="
               << std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -270,6 +270,10 @@ public:
                   resolved.error()};
             }
             return std::move(resolved.value());
+          } else if constexpr (std::is_same_v<
+                                   T, component_manager::detail::
+                                          NativeProjectionCommitPreflightRequest>) {
+            return CommitPreflight(value);
           } else {
             static_assert(
                 std::is_same_v<T, component_manager::detail::
@@ -1260,6 +1264,36 @@ private:
       return *terminal;
     }
     return projection->ProjectionHealth();
+  }
+
+  /// The health exactly as a selected health query, plus the transaction
+  /// candidate's effective policy when that health is at its predecessor.
+  [[nodiscard]] component_manager::detail::NativeProjectionCommitPreflightResult
+  CommitPreflight(
+      const component_manager::detail::NativeProjectionCommitPreflightRequest
+          &request) {
+    Require(request.valid(), "native projection commit preflight is invalid");
+    component_manager::detail::NativeProjectionCommitPreflightResult result{
+        ProjectionHealth(request.execution_host_binding,
+                         request.selected_projection_revision)};
+    if (!request.transaction.has_value() ||
+        !result.health.healthy_for_target(
+            request.transaction->prior_projection_revision)) {
+      return result;
+    }
+    auto policy =
+        IdleHandle(request.execution_host_binding, "policy_projection",
+                   RevisionHandle(request.execution_host_binding,
+                                  request.selected_projection_revision))
+            ->CommitCandidatePolicy(*request.transaction);
+    if (policy.has_value()) {
+      if (policy->ok()) {
+        result.effective_policy = std::move(policy->value());
+      } else {
+        result.effective_policy = policy->error();
+      }
+    }
+    return result;
   }
 
   [[nodiscard]] const core::CapabilityProviderBindingDTO &

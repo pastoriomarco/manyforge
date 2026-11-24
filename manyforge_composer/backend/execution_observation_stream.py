@@ -19,6 +19,18 @@ OBSERVATION_DEMAND_LEASE_SECONDS: Final = 45.0
 MAXIMUM_OBSERVATION_CLIENTS: Final = 16
 _MAXIMUM_SAFE_INTEGER: Final = 9_007_199_254_740_991
 _MAXIMUM_JOINTS: Final = 1_024
+_MAXIMUM_SPRING_COMPRESSIONS: Final = 64
+_OBSERVATION_KEYS: Final = frozenset({
+    "application_start_id",
+    "cell_id",
+    "graph_revision",
+    "measured_targets",
+    "retained_bundle_id",
+    "schema_version",
+    "source_epoch",
+    "source_sequence",
+    "targets",
+})
 
 
 class ExecutionObservationProjectionError(ValueError):
@@ -108,19 +120,9 @@ def project_execution_observation(
             "execution observation response identity is invalid"
         )
     observed = _object(response.get("observation"), "observation")
+    # `spring_compressions` is present only while a spring pair is compressed.
     if (
-        set(observed)
-        != {
-            "application_start_id",
-            "cell_id",
-            "graph_revision",
-            "measured_targets",
-            "retained_bundle_id",
-            "schema_version",
-            "source_epoch",
-            "source_sequence",
-            "targets",
-        }
+        set(observed) - {"spring_compressions"} != _OBSERVATION_KEYS
         or observed.get("schema_version") != "manyforge.execution_observation.v5"
     ):
         raise ExecutionObservationProjectionError(
@@ -141,8 +143,19 @@ def project_execution_observation(
             "observation measured targets must contain 0..64 entries"
         )
     measured_targets = _project_targets(raw_measured)
+    raw_springs = observed.get("spring_compressions", [])
+    if (
+        not isinstance(raw_springs, list)
+        or ("spring_compressions" in observed and not raw_springs)
+        or len(raw_springs) > _MAXIMUM_SPRING_COMPRESSIONS
+    ):
+        raise ExecutionObservationProjectionError(
+            "observation spring compressions must contain "
+            f"1..{_MAXIMUM_SPRING_COMPRESSIONS} entries when present"
+        )
+    spring_compressions = [_project_spring_compression(item) for item in raw_springs]
     received = _safe_integer(received_at_monotonic_us, "received_at_monotonic_us")
-    return {
+    frame = {
         "schema_version": OBSERVATION_FRAME_SCHEMA,
         "application_start_id": _text(
             observed.get("application_start_id"), "observation.application_start_id"
@@ -165,6 +178,56 @@ def project_execution_observation(
         "received_at_monotonic_us": received,
         "targets": targets,
         "measured_targets": measured_targets,
+    }
+    # Render-only (OD-358): each compressed spring pair's side a, depth and
+    # push-back direction; absent when nothing is compressed.
+    if spring_compressions:
+        frame["spring_compressions"] = spring_compressions
+    return frame
+
+
+def _project_spring_compression(raw: Any) -> dict[str, Any]:
+    row = _object(raw, "observation.spring_compression")
+    if set(row) != {"a", "depth_m", "push_direction", "rule_id"}:
+        raise ExecutionObservationProjectionError(
+            "observation spring compression schema is unsupported"
+        )
+    side = _object(row["a"], "spring_compression.a")
+    if side.get("kind") == "component_link" and set(side) == {
+        "kind", "component_id", "link",
+    }:
+        projected_side = {
+            "kind": "component_link",
+            "component_id": _text(side["component_id"], "spring_compression.a.component_id"),
+            "link": _text(side["link"], "spring_compression.a.link"),
+        }
+    elif side.get("kind") == "scene_object" and set(side) == {"kind", "scene_resource_id"}:
+        projected_side = {
+            "kind": "scene_object",
+            "scene_resource_id": _text(
+                side["scene_resource_id"], "spring_compression.a.scene_resource_id"
+            ),
+        }
+    else:
+        raise ExecutionObservationProjectionError(
+            "observation spring compression side is unsupported"
+        )
+    depth = _finite_number(row["depth_m"], "spring_compression.depth_m")
+    direction = row["push_direction"]
+    if depth <= 0.0 or not isinstance(direction, list) or len(direction) != 3:
+        raise ExecutionObservationProjectionError(
+            "observation spring compression needs a positive depth and a 3D direction"
+        )
+    vector = [_finite_number(value, "spring_compression.push_direction") for value in direction]
+    if abs(math.sqrt(sum(value * value for value in vector)) - 1.0) > 1e-6:
+        raise ExecutionObservationProjectionError(
+            "observation spring compression direction must be a unit vector"
+        )
+    return {
+        "rule_id": _text(row["rule_id"], "spring_compression.rule_id"),
+        "a": projected_side,
+        "depth_m": depth,
+        "push_direction": vector,
     }
 
 
@@ -278,6 +341,15 @@ def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
         frame["source_epoch"],
         _targets_signature(frame["targets"]),
         _targets_signature(frame["measured_targets"]),
+        tuple(
+            (
+                row["rule_id"],
+                tuple(sorted(row["a"].items())),
+                row["depth_m"],
+                tuple(row["push_direction"]),
+            )
+            for row in frame.get("spring_compressions", ())
+        ),
     )
 
 

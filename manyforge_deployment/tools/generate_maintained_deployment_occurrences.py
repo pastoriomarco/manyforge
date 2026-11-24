@@ -34,7 +34,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:b37e963e21f9c72c47f713d7bc6b5f24fb680e2126d0f29e4cc4ed86fc9155ba"
+    "sha256:d64c2c161977740644788fb1962c89b00777c38d3a592020fc916c4e7600de21"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -65,8 +65,8 @@ CAPABILITIES: Final = {
         "cell_global",
         "capability_provider_binding",
     ),
-    "execution.interrupt.contact_policy": (
-        "sha256:91fa92a90ddf807623ae9a42a97c37cd4d9628b1961e572b28a928e0da4dd98d",
+    "execution.interrupt.contact_rule": (
+        "sha256:eb10016601843c51b459405b87ec3af2bcd378741fb158f143a66f084f9c2588",
         "cell_global",
         "capability_provider_binding",
     ),
@@ -333,6 +333,10 @@ ARM_CAPABILITIES: Final = tuple(
         }
     )
 )
+# The reserved collision body on the target of every model-bearing type; model
+# preparation binds it to every collision link no other body covers (OD-350).
+DEFAULT_COLLISION_BODY_ROLE_ID: Final = "default_collision"
+
 GRIPPER_CAPABILITIES: Final = tuple(
     sorted(
         {
@@ -575,17 +579,124 @@ def capability_selector(capability_id: str) -> dict[str, str]:
     }
 
 
+def target_collision_body_roles(
+    model_role_id: str, roles: set[str], optional: set[str] = frozenset()
+) -> list[dict[str, Any]]:
+    """Return a target's collision bodies: `roles` and `default_collision`.
+
+    A role in `optional` (OD-352 A1) is marked so: a model without its links
+    leaves it unbound, and it then contributes nothing.
+    """
+
+    return [
+        {
+            "collision_body_role_id": role,
+            "model_role_id": model_role_id,
+            "asset_collision_body_role_id": role,
+            **({"optional": True} if role in optional else {}),
+        }
+        for role in sorted({*roles, DEFAULT_COLLISION_BODY_ROLE_ID})
+    ]
+
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def optional_collision_body_role_ids(family: dict[str, Any]) -> set[str]:
+    """The family's optional collision bodies: its component descriptor's
+    `roles.optional_collision_bodies` (OD-352 A1); none without one."""
+
+    roles = _family_descriptor(family).get("roles") or {}
+    return set(roles.get("optional_collision_bodies") or [])
+
+
+def _family_descriptor(family: dict[str, Any]) -> dict[str, Any]:
+    """The family's component descriptor; empty without one."""
+
+    path = family.get("component_descriptor")
+    if not isinstance(path, str):
+        return {}
+    return read_yaml(
+        _REPOSITORY_ROOT / path, f"{family['model_family_id']} component descriptor"
+    )
+
+
+def tcp_contact_body_role_ids(
+    family: dict[str, Any], collision_roles: set[str], *, gripper: bool
+) -> dict[str, list[str]]:
+    """Each TCP's contact bodies, by TCP id.
+
+    The descriptor's `tcps[].contact_bodies` wins (`[]` is none). Without the
+    key a gripper's TCP takes `gripper_pads` if the family has that body, else
+    `gripper_fingers`, else none; a passive tool's TCP takes none.
+    """
+
+    default = (
+        next(
+            ([role] for role in ("gripper_pads", "gripper_fingers") if role in collision_roles),
+            [],
+        )
+        if gripper
+        else []
+    )
+    explicit = {
+        row["id"]: sorted(row["contact_bodies"])
+        for row in _family_descriptor(family).get("tcps") or []
+        if isinstance(row, dict) and "contact_bodies" in row
+    }
+    for tcp_id, roles in explicit.items():
+        unknown = sorted(set(roles) - collision_roles)
+        if unknown:
+            raise GenerationError(
+                f"{family['model_family_id']} TCP {tcp_id!r} names contact bodies "
+                f"the family does not have: {unknown}"
+            )
+    return {
+        tcp_id: explicit.get(tcp_id, default)
+        for tcp_id in family.get("tcp_frame_role_ids", ["tcp"])
+    }
+
+
+def grip_body_role_id(family: dict[str, Any], collision_roles: set[str]) -> str | None:
+    """A gripper family's grip body: the descriptor's `gripper.grip_body`,
+    else the first of `gripper_collision`, `gripper_pads`, `gripper_fingers`
+    the family has."""
+
+    declared = (_family_descriptor(family).get("gripper") or {}).get("grip_body")
+    if declared is not None:
+        if declared not in collision_roles:
+            raise GenerationError(
+                f"{family['model_family_id']} grip body {declared!r} is no "
+                "collision body of the family"
+            )
+        return declared
+    return next(
+        (
+            role
+            for role in ("gripper_collision", "gripper_pads", "gripper_fingers")
+            if role in collision_roles
+        ),
+        None,
+    )
+
+
 def component_type_document(family: dict[str, Any]) -> dict[str, Any]:
     """Return a component type of one model family.
 
     A family without arm joints is a tool (its `gripper` target
-    only, mounted through its root interface `mount`); a robot without
-    gripper geometry offers its `flange` to one tool.
+    only, mounted through its root interface `mount`); a tool family without
+    a `gripper` group is a passive tool (its frame-only `tool` target); a
+    robot without gripper geometry offers its `flange` to one tool.
     """
 
     family_id = family["model_family_id"]
     semantics = family["semantics"]
     if not source_joint_names(family, "arm_joints"):
+        if not any(
+            row["model_group_role_id"] == "gripper"
+            for row in semantics["model_group_role_bindings"]
+        ):
+            return passive_tool_component_type_document(family)
         return tool_component_type_document(family)
     collision_roles = {
         row["collision_body_role_id"]
@@ -595,15 +706,9 @@ def component_type_document(family: dict[str, Any]) -> dict[str, Any]:
     # A robot whose model carries no gripper geometry mounts its tool as a
     # separate component on `flange`; its `tcp` is then the tool's.
     offers_flange = "gripper_collision" not in collision_roles
-    arm_collision_roles = [
-        {
-            "collision_body_role_id": role,
-            "model_role_id": "arm_model",
-            "asset_collision_body_role_id": role,
-        }
-        for role in ("arm_collision", "tool_collision")
-        if role in collision_roles
-    ]
+    arm_collision_roles = target_collision_body_roles(
+        "arm_model", collision_roles & {"arm_collision", "tool_collision"}
+    )
     value = {
         "api_version": "manyforge.component_type.v1",
         "component_type_id": f"{family_id}.component",
@@ -679,7 +784,9 @@ def tool_component_type_document(family: dict[str, Any]) -> dict[str, Any]:
     One `gripper` target on model role `tool_model`; the component root and
     the `mount` interface are the tool's root frame, the robot flange plane.
     The target exposes each TCP of the family (``tcp_frame_role_ids``, else
-    ``tcp``) under its own name; the first is the default.
+    ``tcp``) under its own name; the first is the default. Each TCP carries
+    its contact bodies (`tcp_contact_body_role_ids`) and the target names the
+    gripper's grip body (`grip_body_role_id`).
     """
 
     family_id = family["model_family_id"]
@@ -689,11 +796,11 @@ def tool_component_type_document(family: dict[str, Any]) -> dict[str, Any]:
         for row in semantics["collision_body_role_bindings"]
     }
     root = semantics["root_frame_role_id"]
-    contact = (
-        {"contact_body_role_ids": ["gripper_fingers"]}
-        if "gripper_fingers" in collision_roles
-        else {}
-    )
+    contact = tcp_contact_body_role_ids(family, collision_roles, gripper=True)
+    grip_body = grip_body_role_id(family, collision_roles)
+    target_bodies = (
+        collision_roles & {"gripper_collision", "gripper_fingers", "gripper_pads"}
+    ) | {role for roles in contact.values() for role in roles}
     value = {
         "api_version": "manyforge.component_type.v1",
         "component_type_id": f"{family_id}.component",
@@ -724,20 +831,15 @@ def tool_component_type_document(family: dict[str, Any]) -> dict[str, Any]:
                         "frame_role_id": role,
                         "model_role_id": "tool_model",
                         "asset_frame_role_id": role,
-                        **contact,
+                        **({"contact_body_role_ids": contact[role]} if contact[role] else {}),
                     }
                     # A registered tool records its TCPs; a maintained one has `tcp`.
                     for role in family.get("tcp_frame_role_ids", ["tcp"])
                 ],
-                "collision_body_roles": [
-                    {
-                        "collision_body_role_id": role,
-                        "model_role_id": "tool_model",
-                        "asset_collision_body_role_id": role,
-                    }
-                    for role in ("gripper_collision", "gripper_fingers")
-                    if role in collision_roles
-                ],
+                "collision_body_roles": target_collision_body_roles(
+                    "tool_model", target_bodies
+                ),
+                **({"grip_body_role_id": grip_body} if grip_body is not None else {}),
                 "capabilities": [
                     capability_selector(capability_id)
                     for capability_id in GRIPPER_CAPABILITIES
@@ -764,6 +866,79 @@ def tool_component_type_document(family: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def passive_tool_component_type_document(family: dict[str, Any]) -> dict[str, Any]:
+    """Return the component type of a passive tool family (OD-336).
+
+    No groups, joints or controller: one frame-only `tool` target that
+    exposes each TCP of the family (``tcp_frame_role_ids``, else ``tcp``)
+    and selects no capability. Its collision bodies are the family's (an
+    optional `tip`, whose links a project model may lack, OD-352 A1) and
+    `default_collision`; a TCP's contact bodies are those its descriptor names
+    (`tcps[].contact_bodies`, e.g. the probe `tip`). The
+    component root and the `mount`
+    interface are the tool's root frame, the robot flange plane, as for a
+    gripper tool. Tagged ``tool`` only: it is no gripper.
+    """
+
+    family_id = family["model_family_id"]
+    semantics = family["semantics"]
+    root = semantics["root_frame_role_id"]
+    collision_roles = {
+        row["collision_body_role_id"]
+        for row in semantics["collision_body_role_bindings"]
+    }
+    tcps = family.get("tcp_frame_role_ids", ["tcp"])
+    # A passive tool's TCP has the contact bodies its descriptor names (a
+    # probe tip: `contact_bodies: [tip]`), else none.
+    contact = tcp_contact_body_role_ids(family, collision_roles, gripper=False)
+    value = {
+        "api_version": "manyforge.component_type.v1",
+        "component_type_id": f"{family_id}.component",
+        "tags": ["tool"],
+        "model_roles": [{"model_role_id": "tool_model", "cardinality": "exactly_one"}],
+        "component_root": {"model_role_id": "tool_model", "frame_role_id": root},
+        "model_mounts": [],
+        "command_targets": [
+            {
+                "command_target_id": "tool",
+                "model_group_roles": [],
+                "resource_roles": [],
+                "frame_roles": [
+                    {
+                        "frame_role_id": role,
+                        "model_role_id": "tool_model",
+                        "asset_frame_role_id": role,
+                        **({"contact_body_role_ids": contact[role]} if contact[role] else {}),
+                    }
+                    for role in tcps
+                ],
+                "collision_body_roles": target_collision_body_roles(
+                    "tool_model",
+                    collision_roles,
+                    optional_collision_body_role_ids(family),
+                ),
+                "capabilities": [],
+            }
+        ],
+        "attachment_interfaces": [
+            {
+                "attachment_interface_id": "mount",
+                "model_role_id": "tool_model",
+                "frame_role_id": root,
+                "accepts_tags": ["articulated-arm"],
+                "max_attachments": 1,
+            }
+        ],
+    }
+    with_tcps(value, family)
+    return revisioned_document(
+        value,
+        domain="catalog-record-revision/component_type",
+        api_version="manyforge.component_type.v1",
+        revision_field="component_type_revision",
+    )
+
+
 def with_tcps(value: dict[str, Any], family: dict[str, Any]) -> None:
     """Tag the TCPs of one component type.
 
@@ -773,7 +948,7 @@ def with_tcps(value: dict[str, Any], family: dict[str, Any]) -> None:
       and its ``tcp`` (when exposed) as TCPs; the default is ``tcp``, else
       ``flange``. With a tool mounted, ``{arm, tcp}`` still resolves to the
       tool's default TCP.
-    - ``gripper`` tags its ``tcp``, its default.
+    - ``gripper`` (and a passive tool's ``tool``) tags its ``tcp``, its default.
     - An asset offset frame role (``pose_in_source_link``) is a TCP of the
       family's first target (``arm`` on a robot, ``gripper`` on a tool).
     - A family that records its TCPs (``tcp_frame_role_ids``, from a component
@@ -1598,7 +1773,7 @@ def catalog_sources(
         ),
         "execution_core": provider_manifest(
             "manyforge.provider.execution_core",
-            ("execution.interrupt.contact_policy", "execution.interrupt.resource_scoped"),
+            ("execution.interrupt.contact_rule", "execution.interrupt.resource_scoped"),
             [],
         ),
         "logical_scene": provider_manifest(

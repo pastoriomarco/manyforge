@@ -29,10 +29,13 @@ from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.model_source_capture import (
     MAX_XML_BYTES,
     capture_deployment_model_sources,
+    capture_program_scene_meshes,
     decode_model_source_artifact,
     encode_model_source_artifact,
+    program_scene_mesh_uris,
 )
 from manyforge_behavior.model_source_preparation import prepare_captured_model_source
+from manyforge_behavior.project_paths import ProjectPathRule
 from manyforge_composer.backend.authoring_forest import derive_candidate
 from manyforge_headless_api.activation_preparer import (
     _model_preparation_profiles,
@@ -55,6 +58,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--ros2-control", action="store_true")
     parser.add_argument("--real-measured", action="store_true")
     parser.add_argument("--tool-split", action="store_true")
+    parser.add_argument("--scene-meshes", action="store_true")
+    parser.add_argument("--export-reload", action="store_true")
     parser.add_argument("--manager-ros-apply-fixture-root", type=Path)
     parser.add_argument("--manager-isaac-apply-fixture-root", type=Path)
     return parser.parse_args()
@@ -76,7 +81,13 @@ def _request(
     program: dict[str, object],
     *,
     source_digest: str | None = None,
+    capability_root: Path | None = None,
+    allowed_roots: list[Path] | None = None,
 ) -> dict[str, object]:
+    workspace = capability_root or scenario_path.parents[1]
+    # Model sources and relative mesh URIs resolve against the Scenario
+    # project folder, inside the workspace (the project path rule).
+    paths = ProjectPathRule(allowed_roots or [workspace])
     member_digests = {
         name: raw_sha256_digest((scenario_path / name).read_bytes())
         for name in (
@@ -102,12 +113,15 @@ def _request(
         "source_document_digest": digest,
         "deployment": document["deployment_draft"],
         "model_source_closure": capture_deployment_model_sources(
-            document["deployment_draft"], project_root=scenario_path
+            document["deployment_draft"], project_root=scenario_path, paths=paths
         ),
         "program": program,
+        "scene_mesh_closure": capture_program_scene_meshes(
+            program, project_folder=scenario_path, paths=paths
+        ),
     }
     request = {
-        "schema_version": "manyforge.activation_preparation_request.v4",
+        "schema_version": "manyforge.activation_preparation_request.v5",
         "runtime_cell_id": "activation_test_runtime",
         **captured,
         "captured_input_digest": raw_sha256_digest(canonical_json_bytes(captured)),
@@ -115,7 +129,7 @@ def _request(
     request["prepared_model_closure"] = _prepare_model_closure(
         deployment=captured["deployment"],
         model_source_closure=captured["model_source_closure"],
-        profiles=_model_preparation_profiles(scenario_path.parents[1]),
+        profiles=_model_preparation_profiles(workspace),
     )
     return request
 
@@ -326,8 +340,9 @@ def _run(
         raise AssertionError("preparer changed the source-document identity")
     if value["captured_input_digest"] != request["captured_input_digest"]:
         raise AssertionError("preparer changed the captured-input identity")
-    if value.get("schema_version") != "manyforge.prepared_activation_input.v7":
-        raise AssertionError("preparer did not return the v7 prepared activation")
+    if value.get("schema_version") != "manyforge.prepared_activation_input.v8":
+        raise AssertionError("preparer did not return the v8 prepared activation")
+    _require_materialized_scene_meshes(activation_root, request, value)
     program_outcome = value.get("program_outcome")
     if (
         not isinstance(program_outcome, dict)
@@ -351,7 +366,7 @@ def _run(
     bundle = payload["retained_bundle"]
     if expected_program_outcome_kind == "no_program":
         assert program_outcome == {"kind": "no_program"}
-        assert value["program_id"] is None and value["program_revision"] is None
+        assert value["program_revision"] is None
         assert payload["program"] is None and payload["program_binding"] is None
         if not request["deployment"]["components"]:
             assert not bundle["cell_graph"]["controllable_components"]
@@ -367,6 +382,195 @@ def _run(
     if publish_canonical_empty:
         _require_canonical_empty_configuration(activation_root, bundle)
     return value
+
+
+def _require_materialized_scene_meshes(
+    activation_root: Path, request: dict[str, object], value: dict[str, object]
+) -> None:
+    """Every Program scene mesh is captured once and stored content-addressed."""
+
+    rows = value["scene_meshes"]
+    assert [row["resource_uri"] for row in rows] == program_scene_mesh_uris(
+        request["program"]
+    ), rows
+    raw_digests = {
+        row["content_digest"] for row in value["activation_payload"]["raw_artifacts"]
+    }
+    for row in rows:
+        assert set(row) == {"byte_size", "content_digest", "resource_uri"}, row
+        assert row["content_digest"] in raw_digests, row
+        blob = (
+            activation_root
+            / "raw-artifacts"
+            / "sha256"
+            / f"{row['content_digest'].removeprefix('sha256:')}.blob"
+        )
+        stored = blob.read_bytes()
+        assert len(stored) == row["byte_size"], row
+        assert raw_sha256_digest(stored) == row["content_digest"], row
+
+
+def _check_scene_meshes(
+    args: argparse.Namespace, request: dict[str, object], temporary: Path
+) -> None:
+    """Scene-mesh capture (OD-335): request v5, the exact closure, store mode."""
+
+    meshes = request["scene_mesh_closure"]["meshes"]
+    if len(meshes) < 2:
+        raise AssertionError("the scene-mesh Scenario must name at least two meshes")
+    accepted = _run(args, request, temporary / "scene-meshes")
+    assert accepted is not None and len(accepted["scene_meshes"]) == len(
+        program_scene_mesh_uris(request["program"])
+    )
+
+    previous = copy.deepcopy(request)
+    previous["schema_version"] = "manyforge.activation_preparation_request.v4"
+    del previous["scene_mesh_closure"]
+    _rehash_request(previous)
+    _run(args, previous, temporary / "scene-meshes-v4",
+         expect_error="unsupported activation preparation request version")
+
+    missing = copy.deepcopy(request)
+    dropped = missing["scene_mesh_closure"]["meshes"].pop(0)
+    _rehash_request(missing)
+    _run(args, missing, temporary / "scene-meshes-missing",
+         expect_error="does not capture the Program's scene mesh "
+         + dropped["resource_uri"])
+
+    extra = copy.deepcopy(request)
+    extra["scene_mesh_closure"]["meshes"].append({
+        "resource_uri": "~extra_unnamed_mesh.obj",
+        **encode_model_source_artifact(
+            b"v 0 0 0\n", media_type="application/octet-stream"
+        ),
+    })
+    _rehash_request(extra)
+    _run(args, extra, temporary / "scene-meshes-extra",
+         expect_error="which the Program does not name")
+
+    forged = copy.deepcopy(request)
+    forged["scene_mesh_closure"]["meshes"][0]["content_digest"] = raw_sha256_digest(
+        b"other mesh bytes"
+    )
+    _rehash_request(forged)
+    _run(args, forged, temporary / "scene-meshes-digest",
+         expect_error="does not match its content digest")
+
+    unsorted = copy.deepcopy(request)
+    unsorted["scene_mesh_closure"]["meshes"].reverse()
+    _rehash_request(unsorted)
+    _run(args, unsorted, temporary / "scene-meshes-unsorted",
+         expect_error="not uniquely sorted by resource_uri")
+
+    # Store mode: one runtime-captured mesh, stored content-addressed.
+    root = temporary / "scene-mesh-store"
+    activation_root = root / "activation"
+    activation_root.mkdir(parents=True)
+    mesh = root / "added.obj"
+    mesh.write_bytes(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+    stored = subprocess.run(
+        [str(args.tool), "--store-scene-mesh", str(mesh),
+         "--activation-root", str(activation_root)],
+        check=False, capture_output=True, text=True,
+    )
+    assert stored.returncode == 0, stored.stderr
+    identity = json.loads(stored.stdout)
+    assert stored.stdout.encode("utf-8") == canonical_json_bytes(identity) + b"\n"
+    assert identity == {
+        "byte_size": len(mesh.read_bytes()),
+        "content_digest": raw_sha256_digest(mesh.read_bytes()),
+    }
+    blob = (
+        activation_root / "raw-artifacts" / "sha256"
+        / f"{identity['content_digest'].removeprefix('sha256:')}.blob"
+    )
+    assert blob.read_bytes() == mesh.read_bytes()
+    empty = root / "empty.obj"
+    empty.write_bytes(b"")
+    for command in (
+        [str(args.tool), "--store-scene-mesh", str(empty),
+         "--activation-root", str(activation_root)],
+        [str(args.tool), "--store-scene-mesh", str(mesh),
+         "--activation-root", str(activation_root),
+         "--input", str(mesh)],
+    ):
+        refused = subprocess.run(command, check=False, capture_output=True, text=True)
+        assert refused.returncode == 2 and refused.stdout == "", refused
+
+
+def _check_export_reload(
+    args: argparse.Namespace,
+    workspace: Path,
+    scenario_path: Path,
+    request: dict[str, object],
+    temporary: Path,
+) -> None:
+    """Export -> reload -> activate: an exported project activates on its own.
+
+    The Scenario's Deployment names package:// model resources and its Program
+    scene meshes; Export copies both into the project, and the reloaded export
+    prepares with the same captured content as the original."""
+
+    from manyforge_composer.backend.scenario_artifacts import (
+        export_scenario_artifact,
+        load_scenario_artifact,
+    )
+
+    roots = [str(workspace), str(temporary / "exports")]
+    (temporary / "exports").mkdir()
+    document, _ = load_scenario_artifact(str(scenario_path), allowed_roots=roots)
+    if not any(
+        component.get("model_source", {}).get("package_roots")
+        for component in document["deployment_draft"]["components"]
+    ):
+        raise AssertionError("the export Scenario must name package model resources")
+    exported = Path(export_scenario_artifact(
+        document, str(temporary / "exports" / scenario_path.name),
+        source_project_path=str(scenario_path), allowed_roots=roots,
+    ))
+    reloaded, _ = load_scenario_artifact(
+        str(exported), allowed_roots=[str(temporary / "exports")])
+    exported_request = _request(
+        exported,
+        {
+            "scenario_id": reloaded["scenario_id"],
+            "deployment_draft": reloaded["deployment_draft"],
+            "program_draft": reloaded["program_draft"],
+        },
+        _program(workspace, reloaded["program_draft"]),
+        capability_root=workspace,
+        allowed_roots=[temporary / "exports"],
+    )
+    original = _run(args, request, temporary / "original")
+    activated = _run(args, exported_request, temporary / "exported")
+    assert original is not None and activated is not None
+
+    def source_content(value: dict[str, object]) -> list[tuple[str, list[str]]]:
+        return [
+            (
+                row["component_id"],
+                sorted(
+                    [artifact["content_digest"]
+                     for artifact in row["entrypoints"].values()]
+                    + [f"{artifact['logical_uri']}={artifact['content_digest']}"
+                       for artifact in row["resources"]]
+                ),
+            )
+            for row in value["model_source_closure"]["components"]
+        ]
+
+    # The same model and mesh bytes reach the activation; only the project
+    # paths differ (assets/models/..., assets/scene/...).
+    assert any(
+        row["resources"] for row in exported_request["model_source_closure"]["components"]
+    )
+    assert source_content(exported_request) == source_content(request)
+    assert {row["content_digest"] for row in activated["scene_meshes"]} == {
+        row["content_digest"] for row in original["scene_meshes"]}
+    assert all(
+        row["resource_uri"].startswith("assets/scene/")
+        for row in activated["scene_meshes"]
+    ), activated["scene_meshes"]
 
 
 def _stored_product(
@@ -479,6 +683,17 @@ def _without_descriptions(rows: list[dict[str, object]]) -> list[dict[str, objec
         assert isinstance(description, str) and "<robot" in description
         assert description.rstrip().endswith("</robot>")
     return [{key: value for key, value in row.items() if key != "description"} for row in rows]
+
+
+def _without_grip_body_links(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Compiled gripper target rows without their grip body links, after
+    checking each row carries a sorted, unique, non-empty list (the compiler
+    reads them from the component type's grip body)."""
+    for row in rows:
+        links = row["grip_body_links"]
+        assert isinstance(links, list) and links
+        assert links == sorted(set(links))
+    return [{key: value for key, value in row.items() if key != "grip_body_links"} for row in rows]
 
 
 def _row(deployment: dict[str, object], component_id: str) -> dict[str, object]:
@@ -771,8 +986,9 @@ def _require_gripper_target_semantics(
     # Each robot's tool owns its gripper row.
     pneumatic = target(request, "lite_gripper")
     position = target(request, "robotiq_2f_85")
-    assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 13
-    assert position["actuation_kind"] == "position_commanded" and len(position) == 13
+    # An authored row has 12 fields; the compiler adds `grip_body_links`.
+    assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 12
+    assert position["actuation_kind"] == "position_commanded" and len(position) == 12
 
     accepted = copy.deepcopy(request)
     _rehash_request(accepted)
@@ -784,12 +1000,12 @@ def _require_gripper_target_semantics(
     (unit,) = units
     assert unit["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
     retained = unit["configuration"]["gripper_target_configurations"]
-    assert retained == [pneumatic, position]
+    assert _without_grip_body_links(retained) == [pneumatic, position]
 
     invalid_rows = []
     foreign_field = copy.deepcopy(request)
     target(foreign_field, "lite_gripper")["foreign_timeout_s"] = 1.0
-    invalid_rows.append(("foreign-fourteenth-field", foreign_field))
+    invalid_rows.append(("foreign-thirteenth-field", foreign_field))
     missing_base = copy.deepcopy(request)
     del target(missing_base, "lite_gripper")["description"]
     invalid_rows.append(("missing-base-field", missing_base))
@@ -856,12 +1072,17 @@ def _check_two_ros_robots(
         for row in configuration["default_fault_stop_profiles"]
     ] == robots
     assert "direct_control_joint_limits" not in configuration
-    # Each component keeps its own authored gripper target rows.
-    assert configuration["gripper_target_configurations"] == sorted(
+    # Each component keeps its own authored gripper target rows; the compiler
+    # adds each row's grip body links from the component type.
+    assert _without_grip_body_links(
+        configuration["gripper_target_configurations"]
+    ) == sorted(
         (row for component in authored
          for row in component.get("gripper_target_configurations", [])),
         key=lambda row: (row["controllable_component_id"], row["command_target_id"]),
     )
+    # The Deployment's collision rules are the unit's, release rows spelled out.
+    assert configuration["collision_rules"][0] == request["deployment"]["collision_rules"][0]
     # Each component keeps its own stream defaults.
     assert configuration["component_streams"] == sorted(
         (row for component in authored for row in component["component_streams"]),
@@ -984,6 +1205,197 @@ def _check_tool_split(
                 "policy": "not_required",
                 "stall_window": {"min_position": 0.0, "max_position": 0.01}}),
             "grasp_confirmation_invalid")
+
+
+def _check_passive_tool(
+    args: argparse.Namespace,
+    workspace: Path,
+    scenario_path: Path,
+    document: dict[str, object],
+    root: Path,
+) -> None:
+    """OD-336: the generic passive tool on the robot's flange, lane-free, from
+    a project's own URDF and mesh without SRDF; and from the shipped
+    placeholder with its SRDF. No Program: the tool has no target to drive."""
+    project = root / "passive-project" / "tool"
+    (project / "meshes").mkdir(parents=True)
+    (project / "meshes" / "body.stl").write_bytes(b"solid body\nendsolid body\n")
+    (project / "body.urdf").write_text(
+        '<robot name="project_tool"><link name="passive_tool_mount"/>'
+        '<joint name="body_fix" type="fixed"><parent link="passive_tool_mount"/>'
+        '<child link="body"/><origin xyz="0 0 0" rpy="0 0 0"/></joint>'
+        '<link name="body"><inertial><origin xyz="0 0 0.05" rpy="0 0 0"/>'
+        '<mass value="0.4"/><inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>'
+        '</inertial><visual><geometry><mesh filename="package://passive_tool/meshes/body.stl"/>'
+        '</geometry></visual><collision><geometry><mesh filename="package://passive_tool/meshes/body.stl"/>'
+        '</geometry></collision></link>'
+        '<joint name="tcp_fix" type="fixed"><parent link="body"/><child link="passive_tool_tcp"/>'
+        '<origin xyz="0 0 0.12" rpy="0 0.5 0"/></joint><link name="passive_tool_tcp"/></robot>',
+        encoding="utf-8")
+    placeholder = workspace / "manyforge_example_models/models/passive_tool"
+    for name, source in (
+        ("passive-tool-urdf-only", {
+            "urdf": {"external_path": str(project / "body.urdf")},
+            "package_roots": {"passive_tool": {"external_path": str(project)}},
+        }),
+        ("passive-tool-placeholder", {
+            "urdf": {"external_path": str(placeholder / "passive_tool.urdf")},
+            "srdf": {"external_path": str(placeholder / "passive_tool.srdf")},
+            "package_roots": {"passive_tool": {"external_path": str(placeholder)}},
+        }),
+    ):
+        variant = copy.deepcopy(document)
+        deployment = variant["deployment_draft"]
+        tool = next(row for row in deployment["components"]
+                    if row["component_id"] == "lite_gripper")
+        tool.clear()
+        tool.update({
+            "component_id": "lite_gripper",
+            "component_profile_id": "manyforge.passive_tool",
+            "frame_prefix": "",
+            "model_source": source,
+            "target_settings": {},
+            "configuration": {"runtime_kind": "ros2_control",
+                              "runtime_configuration": {"component_streams": []}},
+        })
+        # The gripper's exclusions name its own links; the passive tool has none.
+        for attachment in deployment["attachments"]:
+            attachment.pop("collision_exclusions", None)
+        request = _request(scenario_path, variant, _program(workspace, variant["program_draft"]),
+                           allowed_roots=[workspace, root])
+        request["program"] = None
+        _rehash_request(request)
+        prepared = _run(args, request, root / name, expected_program_outcome_kind="no_program")
+        assert prepared is not None
+        graph = prepared["activation_payload"]["retained_bundle"]["cell_graph"]
+        components = {row["controllable_component_id"]: row
+                      for row in graph["controllable_components"]}
+        assert components["lite_gripper"]["component_type_id"] == "passive_tool.component"
+        assert "root_pose_in_cell" not in components["lite_gripper"]
+        # Nothing to drive: no binding, no controller profile, no stream.
+        assert all(row["controllable_component_id"] != "lite_gripper"
+                   for row in graph["control_bindings"])
+        (unit,) = graph["runtime_units"]
+        configuration = unit["configuration"]
+        assert all(row["controllable_component_id"] != "lite_gripper"
+                   for row in configuration["controller_profiles"])
+        assert all(row["controllable_component_id"] != "lite_gripper"
+                   for row in configuration.get("gripper_target_configurations", []))
+
+
+def _check_generated_tool(
+    args: argparse.Namespace,
+    workspace: Path,
+    scenario_path: Path,
+    document: dict[str, object],
+    root: Path,
+) -> None:
+    """OD-352, OD-357: a Tool from its parameters (inline in the row). Its
+    component type is derived at Load, with the `tool` target and one gripper
+    target per jaw pair; the Deployment holds each pair's wiring only, and
+    Load completes its gripper row from the parameters."""
+    parameters = load_strict_json_yaml(
+        workspace / "manyforge_example_models/models/tool/dual_jaw_gripper.tool.yaml")
+
+    def wiring(pair: str, valve: str) -> dict[str, object]:
+        return {
+            "command_target_id": pair,
+            "controllable_component_id": "lite_gripper",
+            "pneumatic_io": {"inputs": {}, "outputs": [{
+                "close_value": True, "open_value": False,
+                "signal": {"controllable_component_id": "gripper_io", "signal_name": valve}}]},
+        }
+
+    variant = copy.deepcopy(document)
+    deployment = variant["deployment_draft"]
+    io = next(row for row in deployment["components"] if row["component_id"] == "gripper_io")
+    signals = io["configuration"]["runtime_configuration"]["io_signals"]
+    valve = next(row for row in signals if row["signal_name"] == "valve")
+    signals.append({**copy.deepcopy(valve), "signal_name": "inner_valve",
+                    "resource_role_id": "inner_valve", "source_id": "gripper_io.inner_valve",
+                    "provider": {**valve["provider"], "channel": "inner_valve"}})
+    tool = next(row for row in deployment["components"]
+                if row["component_id"] == "lite_gripper")
+    tool.clear()
+    tool.update({
+        "component_id": "lite_gripper",
+        "component_profile_id": "manyforge.tool",
+        "frame_prefix": "",
+        "model_source": {"parameters": parameters},
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "ros2_control",
+            "runtime_configuration": {
+                "component_streams": [],
+                "gripper_target_configurations": [
+                    wiring("inner", "inner_valve"), wiring("outer", "valve")],
+            },
+        },
+    })
+    for attachment in deployment["attachments"]:
+        attachment.pop("collision_exclusions", None)
+    request = _request(scenario_path, variant, _program(workspace, variant["program_draft"]),
+                       allowed_roots=[workspace, root])
+    request["program"] = None
+    _rehash_request(request)
+    (captured,) = [row for row in request["model_source_closure"]["components"]
+                   if row["component_id"] == "lite_gripper"]
+    assert [row["command_target_id"]
+            for row in captured["generated_component"]["gripper_targets"]] == [
+                "outer", "inner"]
+    prepared = _run(args, request, root / "generated-tool", expected_program_outcome_kind="no_program")
+    assert prepared is not None
+    bundle = prepared["activation_payload"]["retained_bundle"]
+    graph = bundle["cell_graph"]
+    components = {row["controllable_component_id"]: row
+                  for row in graph["controllable_components"]}
+    type_id = components["lite_gripper"]["component_type_id"]
+    assert type_id.startswith("manyforge.tool."), type_id
+    assert components["lite_gripper"]["default_tcp"] == {
+        "command_target_id": "tool", "frame_role_id": "tcp"}
+    targets = ["inner", "outer"]
+    domains = sorted(row["control_domain_id"] for row in graph["control_domains"]
+                     if row["control_domain_id"].startswith("lite_gripper."))
+    assert domains == [f"lite_gripper.{target}.control" for target in targets]
+    commands = {row["command_target_id"]: row for row in graph["control_bindings"]
+                if row["controllable_component_id"] == "lite_gripper"
+                and row["capability_id"] == "tool.gripper.command"}
+    assert sorted(commands) == targets
+    for target, binding in commands.items():
+        assert binding["control_binding_id"] == (
+            f"lite_gripper.{target}.tool-gripper-command")
+        assert binding["control_domain_id"] == f"lite_gripper.{target}.control"
+        assert binding["resource_bindings"] == [{
+            "resource_role_id": "fingers",
+            "resource_id": f"lite_gripper.{target}.coordinate.000000"}]
+        assert binding["stop_evidence_policy_id"] == (
+            "manyforge.gripper_logical_cancellation")
+    (unit,) = graph["runtime_units"]
+    configuration = unit["configuration"]
+    # Lane-free: no controller profile; one complete row per jaw pair, its
+    # states, frames and motion time from the parameters.
+    assert all(row["controllable_component_id"] != "lite_gripper"
+               for row in configuration["controller_profiles"])
+    rows = {row["command_target_id"]: row for row in configuration["gripper_target_configurations"]
+            if row["controllable_component_id"] == "lite_gripper"}
+    assert sorted(rows) == targets
+    assert (rows["outer"]["open_state_ref"], rows["outer"]["closed_state_ref"]) == ("open", "closed")
+    assert rows["outer"]["attach_frame"] == "tool_outer"
+    assert rows["inner"]["tcp_frame"] == "tool_tcp_inner_tcp"
+    assert rows["outer"]["output_mode"] == "commanded"
+
+    # Load refuses a jaw pair without its wiring.
+    unwired = copy.deepcopy(variant)
+    (row,) = [row for row in unwired["deployment_draft"]["components"]
+              if row["component_id"] == "lite_gripper"]
+    row["configuration"]["runtime_configuration"]["gripper_target_configurations"] = [
+        wiring("outer", "valve")]
+    request = _request(scenario_path, unwired, _program(workspace, unwired["program_draft"]),
+                       allowed_roots=[workspace, root])
+    request["program"] = None
+    _rehash_request(request)
+    _run(args, request, root / "generated-tool-unwired", expected_program_outcome_kind="no_program",
+         expect_error="generated_tool_wiring_missing")
 
 
 def _without_pose_sources(value: dict[str, object], key: str) -> dict[str, object]:
@@ -1136,6 +1548,7 @@ def _check_ros_preparation(
     expected_configuration["gripper_target_configurations"] = sorted(
         tool_configuration["gripper_target_configurations"],
         key=lambda row: (row["controllable_component_id"], row["command_target_id"]))
+    expected_configuration["collision_rules"] = request["deployment"]["collision_rules"]
     expected_configuration["component_streams"] = sorted(
         expected_configuration["component_streams"] + tool_configuration["component_streams"],
         key=lambda row: (row["controllable_component_id"], row["stream_id"]))
@@ -1158,7 +1571,9 @@ def _check_ros_preparation(
     # The omitted Cartesian timing compiles to its schema default.
     expected_configuration["cartesian_timing"] = "constant_speed"
     assert {**runtime["configuration"], "controller_profiles": _without_descriptions(
-        runtime["configuration"]["controller_profiles"])} == expected_configuration
+        runtime["configuration"]["controller_profiles"]),
+        "gripper_target_configurations": _without_grip_body_links(
+            runtime["configuration"]["gripper_target_configurations"])} == expected_configuration
     # The cell-wide `mode` lane flag is deleted.
     assert "mode" not in runtime["configuration"]
     assert [row["component_type_id"] for row in graph["controllable_components"]] == [
@@ -1620,7 +2035,6 @@ def _write_manager_ros_apply_fixture(
         "candidate_retained_bundle_id": bundle["retained_bundle_id"],
         "cell_id": graph["cell_id"],
         "component_id": components[0]["component_id"],
-        "deployment_artifact_id": bundle["deployment_artifact_id"],
         "deployment_revision": bundle["deployment_revision"],
         "prepared_activation_id": prepared["prepared_activation_id"],
         "predecessor_graph_revision": empty["cell_graph"]["graph_revision"],
@@ -1786,7 +2200,7 @@ def _observe_manager_ros() -> int:
             # One request key per request label: 16 bytes as 32 hex (contract 1.4).
             request_key = hashlib.sha256(("empty-ros-one-mock." + args.label + ".gripper").encode("utf-8")).hexdigest()[:32]
             operation = {"request_context": {"request_key": request_key, "source_label": "manager_ros_apply_fixture"},
-                         **{key: manual[key] for key in ("program_id", "program_revision", "program_binding_id")}, "program_run_id": None,
+                         **{key: manual[key] for key in ("program_revision", "program_binding_id")}, "program_run_id": None,
                          "expected_graph_revision": identity["graph_revision"], "expected_retained_bundle_id": identity["retained_bundle_id"], "expected_scene_revision": None,
                          "participants": [{"target": direct["target"], "required_capability_id": target["operation_capability_id"], "action_span": None,
                                            "payload": {"kind": "capability_command", "command_schema_id": direct["command_schema_id"], "command_schema_revision": direct["command_schema_revision"],
@@ -1858,8 +2272,16 @@ def main() -> int:
         if args.ros2_control:
             _check_ros_preparation(args, request, scenario_path, document, temporary)
             return 0
+        if args.scene_meshes:
+            _check_scene_meshes(args, request, temporary)
+            return 0
+        if args.export_reload:
+            _check_export_reload(args, workspace, scenario_path, request, temporary)
+            return 0
         if args.tool_split:
             _check_tool_split(args, workspace, scenario_path, document, request, temporary)
+            _check_passive_tool(args, workspace, scenario_path, document, temporary)
+            _check_generated_tool(args, workspace, scenario_path, document, temporary)
             return 0
         if args.real_measured:
             # The maintained Real scenario mounts Mock's lane-free pneumatic
@@ -2409,7 +2831,7 @@ def main() -> int:
             raise AssertionError("negative matrix needs an authored direct target")
         program["program_revision"] = compute_content_identity(
             program, own_field="program_revision", identity_domain="program-revision",
-            api_version="manyforge.program.v3")
+            api_version="manyforge.program.v4")
         _rehash_request(foreign)
         _run(
             args,

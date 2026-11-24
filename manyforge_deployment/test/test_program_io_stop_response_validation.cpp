@@ -101,9 +101,9 @@ protected:
                std::optional<std::string> success_through = {},
                std::optional<V> condition = {}) {
     auto value = d::parse_strict_json_model_yaml(R"({
-      "api_version":"manyforge.program.v3","program_id":"node_stop_fixture",
+      "api_version":"manyforge.program.v4",
       "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "program_profile":"composable-cell-v1","name":"Node Stop fixture",
+      "program_profile":"composable-cell-v1",
       "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
       "blackboard":{"namespaces":[],"keys":[{"key":"ready","type":"bool","access":"read_write","persistence":"run","initial":false}]},
       "tree":{"node_id":"motion.move_until_signal","instance_id":"move","children":[],
@@ -131,7 +131,7 @@ protected:
     value = d::normalize_program_authoring(value);
     const auto revision = d::detail::compute_content_identity(
         value,
-        {"program-revision", "manyforge.program.v3", "program_revision"});
+        {"program-revision", "manyforge.program.v4", "program_revision"});
     value = replace(value, "program_revision", V(revision));
     d::FilesystemCatalogArtifactStore catalog(package_root);
     return d::verify_program_binding_contract(d::canonical_json(value),

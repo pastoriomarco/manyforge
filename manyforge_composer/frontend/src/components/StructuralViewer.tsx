@@ -23,6 +23,7 @@ import {
 } from '@react-three/drei';
 import * as THREE from 'three';
 import { AuthoringTransformControls } from './AuthoringTransformControls';
+import { AssetErrorBoundary } from './common/AssetErrorBoundary';
 import type { GizmoNoChange } from './AuthoringTransformControls';
 import { GizmoSteps, useGizmoSettings } from './common/GizmoControls';
 import type { GizmoController } from './common/GizmoControls';
@@ -65,11 +66,14 @@ import type {
   CandidateRobotPresentation,
   MeasuredRobotPresentationReader,
   RuntimeScenePresentation,
+  SpringDisplayOffset,
 } from '../state/runtimeScenePresentation';
+import { springOffsetInLink } from '../state/runtimeScenePresentation';
 import type {
   LogicalSceneObject,
   LogicalScenePose,
   LogicalSceneShape,
+  ProgramViewerDefaultView,
   ProgramViewerMetadata,
   QuaternionXyzwTuple,
   SceneUrdfCollision,
@@ -87,6 +91,8 @@ import {
 } from '../utils/structuralTransforms';
 import {
   DEFAULT_VIEWER_CAMERA,
+  frameableContentBounds,
+  framedCameraPresentation,
   parseViewerCameraQuery,
   type ViewerCamera,
 } from '../utils/viewerCamera';
@@ -209,6 +215,8 @@ interface StructuralViewerProps {
   }>;
   onObjectAxesVisibleIdsChange?: (ids: string[]) => void;
   onAxesSizesCommit?: (frameSizeM: number, objectSizeM: number) => void;
+  /** Saves (or clears, with null) the Scenario's default 3D view (OD-355). */
+  onDefaultViewCommit?: (view: ProgramViewerDefaultView | null) => void;
   robotControlSurface?: ReactNode;
   robotControlBlocked?: boolean;
   /** A manual robot move is active: the Robot panel stays open and visible
@@ -217,6 +225,8 @@ interface StructuralViewerProps {
   objectControlSurface?: ReactNode;
   /** Tool & I/O signals; mounted (and polling) only while its panel is open. */
   ioControlSurface?: ReactNode;
+  /** Program keys: current-run and stored values (OD-353 shows current values). */
+  keysControlSurface?: ReactNode;
   transportControls?: ReactNode | ((
     openRobotControls: () => void,
     viewerSettings: { open: () => void; previewLayerActive: boolean },
@@ -268,17 +278,11 @@ export function ViewerSceneEmptyState({
   );
 }
 
-export type ViewerInspectorPanel = 'tools' | 'robot' | 'object' | 'io' | null;
+export type ViewerInspectorPanel = 'tools' | 'robot' | 'object' | 'io' | 'keys' | null;
 
 const READ_ONLY_SCENE_REASON = 'Read-only: the Program Draft cannot be edited now, or this Applied view hides unapplied Draft changes (switch to the Draft Scene).';
 
 const ignoreViewerRaycast: THREE.Object3D['raycast'] = () => undefined;
-
-interface AssetErrorBoundaryProps {
-  resetKey: string;
-  onError: (error: Error) => void;
-  children: ReactNode;
-}
 
 interface ViewerFailureBoundaryProps {
   fallback: ReactNode;
@@ -371,31 +375,6 @@ export class ViewerFailureBoundary extends Component<
 
   render(): ReactNode {
     return this.state.failed ? this.props.fallback : this.props.children;
-  }
-}
-
-class AssetErrorBoundary extends Component<
-  AssetErrorBoundaryProps,
-  { failed: boolean }
-> {
-  state = { failed: false };
-
-  static getDerivedStateFromError(): { failed: boolean } {
-    return { failed: true };
-  }
-
-  componentDidCatch(error: Error): void {
-    this.props.onError(error);
-  }
-
-  componentDidUpdate(previous: AssetErrorBoundaryProps): void {
-    if (previous.resetKey !== this.props.resetKey && this.state.failed) {
-      this.setState({ failed: false });
-    }
-  }
-
-  render(): ReactNode {
-    return this.state.failed ? null : this.props.children;
   }
 }
 
@@ -637,6 +616,12 @@ function SceneObjectMeshAsset({
         const material = source.clone() as THREE.MeshStandardMaterial;
         material.color?.set(presentation.color);
         material.emissive?.set(presentation.emissive);
+        // Same shading as primitive Scene objects. Converted STL files carry no material
+        // (the loader's default is fully metallic) and no normals, so both rendered dark.
+        material.metalness = 0;
+        material.roughness = 1;
+        material.flatShading = !mesh.geometry.hasAttribute('normal');
+        material.needsUpdate = true;
         material.transparent = presentation.transparent || wireframe;
         material.opacity = presentation.opacity;
         material.wireframe = wireframe;
@@ -1125,6 +1110,7 @@ function MeasuredRuntimeModel({
     }
     return result;
   }, [attachedObjects]);
+  const [springGroups] = useState(() => new Map<string, SpringOffsetGroup>());
   useEffect(() => {
     const startedAtMs = materializationStartedAtMs.current;
     if (reported.current || startedAtMs === null) return;
@@ -1133,6 +1119,11 @@ function MeasuredRuntimeModel({
   }, [materializationStartedAtMs, onMaterialized]);
   return (
     <group name={`owner-measured-robot:${presentation.objectId}`}>
+      <SpringDisplayOffsetDriver
+        presentation={presentation}
+        livePresentation={livePresentation}
+        springGroups={springGroups}
+      />
       <MeasuredRobotFrameDriver
         manifestModelKey={manifest.model_key}
         linkGroups={linkGroups}
@@ -1151,6 +1142,7 @@ function MeasuredRuntimeModel({
             link={link}
             initialTransform={transform}
             groupRef={linkGroups.get(link.name)!}
+            springGroups={springGroups}
             attachedObjects={attachedObjectsByLink.get(link.name) ?? []}
             ownerIdentity={ownerIdentity}
             collisionsVisible={collisionsVisible}
@@ -1169,6 +1161,54 @@ function MeasuredRuntimeModel({
       })}
     </group>
   );
+}
+
+/** A display group shifted by a compressed spring, with its link's group. */
+interface SpringOffsetGroup {
+  group: THREE.Group;
+  link: { current: THREE.Group | null };
+  /** `link:<compiled link>` or `object:<scene resource id>`. */
+  key: string;
+}
+
+function springGroupRef(
+  springGroups: Map<string, SpringOffsetGroup>,
+  key: string,
+  link: { current: THREE.Group | null },
+) {
+  return (group: THREE.Group | null) => {
+    if (group === null) springGroups.delete(key);
+    else springGroups.set(key, { group, link, key });
+  };
+}
+
+/**
+ * OD-358: draws the a side of each compressed spring pair shifted back by its
+ * compression, from the presentation the measured robot shows. Display only:
+ * the link's collision shapes and every check keep the overlap model.
+ */
+function SpringDisplayOffsetDriver({
+  presentation,
+  livePresentation,
+  springGroups,
+}: {
+  presentation: NonNullable<RuntimeScenePresentation['measuredRobot']>;
+  livePresentation?: MeasuredRobotPresentationReader;
+  springGroups: ReadonlyMap<string, SpringOffsetGroup>;
+}) {
+  useFrame(() => {
+    const offsets = (livePresentation?.readMeasuredRobotPresentation() ?? presentation).springOffsets;
+    for (const { group, link, key } of springGroups.values()) {
+      const offset: SpringDisplayOffset | undefined = key.startsWith('link:')
+        ? offsets?.links[key.slice(5)] : offsets?.objects[key.slice(7)];
+      if (offset === undefined || link.current === null) {
+        group.position.set(0, 0, 0);
+        continue;
+      }
+      group.position.set(...springOffsetInLink(offset.offsetM, link.current.quaternion));
+    }
+  });
+  return null;
 }
 
 /**
@@ -1416,6 +1456,7 @@ function MeasuredRuntimeLink({
   link,
   initialTransform,
   groupRef,
+  springGroups,
   attachedObjects,
   ownerIdentity,
   collisionsVisible,
@@ -1435,6 +1476,7 @@ function MeasuredRuntimeLink({
     orientation_xyzw: QuaternionXyzwTuple;
   };
   groupRef: { current: THREE.Group | null };
+  springGroups: Map<string, SpringOffsetGroup>;
   attachedObjects: AttachedObjectPresentation[];
   ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   collisionsVisible: boolean;
@@ -1467,13 +1509,16 @@ function MeasuredRuntimeLink({
       onClick={(event) => onSelect(event, link.name)}
     >
       <group>
-        {link.visuals.map((visual) => (
-          <RobotVisual
-            key={`measured-visual:${link.name}:${visual.index}`}
-            visual={visual}
-            onAssetError={onAssetError}
-          />
-        ))}
+        {/* A compressed spring's a side is drawn shifted (OD-358). */}
+        <group ref={springGroupRef(springGroups, `link:${link.name}`, groupRef)}>
+          {link.visuals.map((visual) => (
+            <RobotVisual
+              key={`measured-visual:${link.name}:${visual.index}`}
+              visual={visual}
+              onAssetError={onAssetError}
+            />
+          ))}
+        </group>
         {collisionsVisible && link.collisions.map((collision) => (
           <RobotCollision
             key={`measured-collision:${link.name}:${collision.index}`}
@@ -1485,18 +1530,22 @@ function MeasuredRuntimeLink({
           <axesHelper args={[frameAxesSizeM]} raycast={ignoreViewerRaycast} />
         )}
         {attachedObjects.map((object) => (
-          <AttachedLogicalSceneObject
-            // A carried pose update advances the attachment revision; keep the
-            // mounted object (and its mesh) and update its pose in place.
+          <group
             key={object.attachmentId}
-            presentation={object}
-            selected={selectedSceneResourceId === object.object.scene_resource_id}
-            axesVisible={objectAxesVisibleIds.has(object.object.scene_resource_id)}
-            axesSizeM={objectAxesSizeM}
-            wireframe={wireframe}
-            ownerIdentity={ownerIdentity}
-            onSelect={onSelectSceneResource}
-          />
+            ref={springGroupRef(springGroups, `object:${object.object.scene_resource_id}`, groupRef)}
+          >
+            <AttachedLogicalSceneObject
+              // A carried pose update advances the attachment revision; keep the
+              // mounted object (and its mesh) and update its pose in place.
+              presentation={object}
+              selected={selectedSceneResourceId === object.object.scene_resource_id}
+              axesVisible={objectAxesVisibleIds.has(object.object.scene_resource_id)}
+              axesSizeM={objectAxesSizeM}
+              wireframe={wireframe}
+              ownerIdentity={ownerIdentity}
+              onSelect={onSelectSceneResource}
+            />
+          </group>
         ))}
       </group>
     </group>
@@ -2477,78 +2526,6 @@ interface CameraCommandRequest {
   } | null;
 }
 
-export function framedCameraPresentation(
-  box: THREE.Box3,
-  current: ViewerCamera,
-  verticalFovDegrees: number,
-  aspect: number,
-  margin = 1.25,
-): RetainedCameraPresentation {
-  if (box.isEmpty()) return { camera: current };
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-  const maximumSize = Math.max(size.x, size.y, size.z, 0.01);
-  const verticalDistance = maximumSize
-    / (2 * Math.tan(THREE.MathUtils.degToRad(verticalFovDegrees) / 2));
-  const distance = margin * Math.max(
-    verticalDistance,
-    verticalDistance / Math.max(aspect, Number.EPSILON),
-  );
-  const direction = new THREE.Vector3(...current.position)
-    .sub(new THREE.Vector3(...current.target));
-  if (direction.lengthSq() < Number.EPSILON) {
-    direction
-      .fromArray(DEFAULT_VIEWER_CAMERA.position)
-      .sub(new THREE.Vector3(...DEFAULT_VIEWER_CAMERA.target));
-  }
-  direction.normalize();
-  const position = center.clone().addScaledVector(direction, distance);
-  return {
-    camera: {
-      position: [position.x, position.y, position.z],
-      target: [center.x, center.y, center.z],
-    },
-  };
-}
-
-export function frameableContentBounds(root: THREE.Object3D): THREE.Box3 {
-  const bounds = new THREE.Box3();
-  const objectBounds = new THREE.Box3();
-  root.updateWorldMatrix(true, true);
-
-  const visit = (object: THREE.Object3D): void => {
-    if (
-      !object.visible
-      || (object as THREE.Object3D & { isTransformControls?: boolean })
-        .isTransformControls === true
-      || object.type === 'AxesHelper'
-    ) return;
-    const bounded = object as THREE.Object3D & {
-      boundingBox?: THREE.Box3 | null;
-      computeBoundingBox?: () => void;
-      geometry?: THREE.BufferGeometry;
-    };
-    let localBounds: THREE.Box3 | null | undefined;
-    if (bounded.boundingBox !== undefined) {
-      if (bounded.boundingBox === null) bounded.computeBoundingBox?.();
-      localBounds = bounded.boundingBox;
-    } else if (bounded.geometry !== undefined) {
-      if (bounded.geometry.boundingBox === null) {
-        bounded.geometry.computeBoundingBox();
-      }
-      localBounds = bounded.geometry.boundingBox;
-    }
-    if (localBounds !== null && localBounds !== undefined && !localBounds.isEmpty()) {
-      objectBounds.copy(localBounds).applyMatrix4(object.matrixWorld);
-      bounds.union(objectBounds);
-    }
-    for (const child of object.children) visit(child);
-  };
-
-  visit(root);
-  return bounds;
-}
-
 function clipCameraToBounds(
   camera: THREE.PerspectiveCamera,
   bounds: THREE.Box3,
@@ -3074,10 +3051,16 @@ const ViewerCanvas = memo(function ViewerCanvas({
         request={cameraCommand}
         contentRevision={cameraContentRevision}
         defaultPresentation={{
-          camera: {
-            position: [...DEFAULT_VIEWER_CAMERA.position],
-            target: [...DEFAULT_VIEWER_CAMERA.target],
-          },
+          // The Scenario's default view (OD-355), else the built-in one.
+          camera: viewer?.default_view === undefined
+            ? {
+              position: [...DEFAULT_VIEWER_CAMERA.position],
+              target: [...DEFAULT_VIEWER_CAMERA.target],
+            }
+            : {
+              position: [...viewer.default_view.position_m],
+              target: [...viewer.default_view.target_m],
+            },
         }}
         onPresentation={captureCameraPresentation}
       />
@@ -3281,11 +3264,13 @@ function StructuralViewerContent({
   objectAxesRows = [],
   onObjectAxesVisibleIdsChange,
   onAxesSizesCommit,
+  onDefaultViewCommit,
   robotControlSurface,
   robotControlBlocked = false,
   robotMotionActive = false,
   objectControlSurface,
   ioControlSurface,
+  keysControlSurface,
   transportControls,
   controlPanelSettings,
   programViewerPendingApply,
@@ -3422,6 +3407,12 @@ function StructuralViewerContent({
       target,
     }));
   }, [selectedCameraTarget, setCameraCommand]);
+  // A Scenario's default view (OD-355) is shown when it is loaded or changed.
+  const defaultViewKey = viewer?.default_view === undefined ? null : JSON.stringify(viewer.default_view);
+  useEffect(() => {
+    if (defaultViewKey !== null) issueCameraCommand('reset');
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only a new default view moves the camera
+  }, [defaultViewKey]);
   const pointCloudEnabled = viewerActive
     && pointCloudVisible
     && pointCloudCellId !== undefined;
@@ -3828,6 +3819,15 @@ function StructuralViewerContent({
                 onClick={() => toggleInspectorPanel('io')}
               >Tool &amp; I/O</button>
             )}
+            {keysControlSurface !== undefined && (
+              <button
+                type="button"
+                aria-pressed={inspectorPanel === 'keys'}
+                disabled={robotPanelLocked}
+                title={robotPanelLocked ? robotLockTitle : 'Program keys: current-run and stored values'}
+                onClick={() => toggleInspectorPanel('keys')}
+              >Keys</button>
+            )}
           </div>
         </div>
       </header>
@@ -4027,7 +4027,9 @@ function StructuralViewerContent({
                   ? 'Selected object'
                   : inspectorPanel === 'io'
                     ? 'Tool & I/O'
-                    : 'Viewer settings'}</strong>
+                    : inspectorPanel === 'keys'
+                      ? 'Program keys'
+                      : 'Viewer settings'}</strong>
             {inspectorPanel === 'robot' && robotControlBlocked && (
               <span className="central-inspector-warning" title="The current manual target has no executable preview. Check the Robot panel; this is not a Program fault.">Check preview</span>
             )}
@@ -4073,6 +4075,8 @@ function StructuralViewerContent({
                 )
               ) : inspectorPanel === 'io' ? (
                 ioControlSurface ?? <p className="panel-state">Tool and I/O signals are unavailable.</p>
+              ) : inspectorPanel === 'keys' ? (
+                keysControlSurface ?? <p className="panel-state">Program keys are unavailable.</p>
               ) : inspectorPanel === 'tools' ? (
                 <div ref={viewerSettingsPanel} className="viewer-options-body dpanel">
                   {auxiliaryViewerSourcesActive && (
@@ -4148,6 +4152,34 @@ function StructuralViewerContent({
                   />
                   </section>
                   <ViewerGraphicsSettings rendererKind={rendererKind} />
+                  {onDefaultViewCommit !== undefined && (
+                    <section className="dcard" aria-label="Default view">
+                      <SettingsSubheading title="Default view" scope="program" />
+                      <p className="field-help">
+                        {viewer?.default_view === undefined
+                          ? 'Load and Reset camera use the built-in view.'
+                          : 'Load and Reset camera go to this Scenario\'s saved view.'}
+                      </p>
+                      <div className="dactions">
+                        <button
+                          type="button"
+                          title="Save the current camera position and target as this Scenario's default view (a Program Draft edit)."
+                          onClick={() => {
+                            const { camera } = cameraPresentation.read();
+                            onDefaultViewCommit({
+                              position_m: [camera.position[0], camera.position[1], camera.position[2]],
+                              target_m: [camera.target[0], camera.target[1], camera.target[2]],
+                            });
+                          }}
+                        >Use this view as default</button>
+                        <button
+                          type="button"
+                          disabled={viewer?.default_view === undefined}
+                          onClick={() => onDefaultViewCommit(null)}
+                        >Clear</button>
+                      </div>
+                    </section>
+                  )}
                   <details className="dcard" open>
                     <summary>Frames and joints</summary>
                     <SettingsSubheading title="Size" scope="program" />

@@ -139,6 +139,24 @@ projections; neither is a second logical source of truth. Observed object poses
 are separate measured facts and change the authoritative scene only through a
 configured pose-source policy.
 
+A Scene commit is checked, validated and digested once by the scene owner in
+the Manager. Each native projection then gets one preflight call (its health
+and, unless the change only moves an object, the candidate's effective
+collision policy) and one apply call, and applies the owner's change without
+validating the scene again. The owner records the change before it asks for
+authoring admission. It holds its lock only while it reads or writes its own
+state, never during these calls or the authoring-admission calls, so reads stay
+answered meanwhile and show the previous revision until the commit ends; the
+Apply steps that change the Scene's maintenance state wait for it. A commit
+that finds the Scene changed by another request since it was checked, or
+another commit still in progress, is refused with `stale_revision`; nothing is
+merged.
+
+The scene owner holds the Scene in memory only: nothing of it is written to
+disk, and every Manager start begins with an empty Scene. A commit whose
+resulting scene would encode larger than 384 KiB is refused with
+`scene_too_large` and changes nothing.
+
 Each Apply carries a Scene choice: `initialize` (reset the logical scene and
 seed it from the authored Program/Deployment) or `preserve` (keep it). Load
 and New initialize it; Program and Deployment Apply and Revert preserve it. A failed initialization, or a pose-apply failure after
@@ -240,8 +258,8 @@ functions; external plant safety remains independent.
   waypoint — a swapped-in motion planner does not get to self-certify its
   trajectories as collision-free. Bounded, explicitly-configured contact
   (e.g. a gripper finger touching the object it is about to grasp) is allowed
-  only through a named contact policy — never by relaxing general collision
-  checking. The retained model initializes self-collision pairs before SRDF
+  only through a collision rule that names the two parts — never by relaxing
+  general collision checking. The retained model initializes self-collision pairs before SRDF
   exclusions; prepared queries retain logical-body and selected-group filters,
   including cross-branch mimic dependencies. Cold loading rejects more than
   1024 retained collision geometries before Pinocchio's quadratic index
@@ -279,31 +297,39 @@ Collision protection is dual-layered and configurable:
   dispatched: the planner checks its own paths (edges, start, goal and
   shortcuts, with the clearance below), and pre-dispatch validation checks
   the waypoints of every cached trajectory, of every fresh one whose move has
-  an active contact policy (support contacts or a contact grasp, whose pairs
-  the planner switches off), and of every other fresh one unless the robot's
+  a contact or release rule (the planner switches those pairs off), and of
+  every other fresh one unless the robot's
   Deployment turns `collision_check_fresh_plans` off. A trajectory that fails
   is never sent to the robot.
 - **Runtime monitoring** re-checks the lane-selected authoritative execution
   state periodically during execution and faults on a policy violation.
 
-Pre-dispatch validation and the planner keep a **collision clearance**
-(Deployment `collision_clearance_m`, 0 to 0.05 m; 0.001 m (1 mm) by
-default, which also covers the executed spline's small deviation from the
-planned path; 0 turns it off and only contact is checked). A motion's own
-`clearance_m` (Program motion
-nodes, Robot Control's Advanced settings) replaces it for that move. Robot and carried bodies must stay at
-least that far from every environment body, except where the collision policy
-allows contact: static, touch-link and support-contact pairs and the active
-contact-grasp pairs keep clearance 0, and their contact tolerances apply as
-before. The move's target object gets the clearance unless such a policy
-allows the contact. A move that starts inside the clearance may move away but
-not closer. Runtime monitoring and lookahead use clearance 0: they stop only on
-contact.
+Every checked pair of bodies has one value for a move, set by **collision
+rules** ([Collision rules](../authoring/COLLISION_RULES.md)): a clearance, an
+allowed contact, or a release. Cell rules are in the Deployment
+(`collision_rules`), move rules on the motion node; when the move is admitted
+they are resolved once, against the bodies present at that moment, into one
+table of pairs that the planner, pre-dispatch validation and the runtime checks
+share.
 
-Pre-dispatch validation runs for cached trajectories, for fresh ones with an
-active contact policy and, while the robot's Deployment keeps
+Pre-dispatch validation and the planner keep the **collision clearance** of
+each pair. The Deployment's first rule gives one clearance to every pair of a
+robot or carried body and an environment body (0 to 0.05 m; 0.001 m (1 mm) by
+default, which also covers the executed spline's small deviation from the
+planned path; 0 turns it off and only contact is checked). A motion's own row
+without selections (Program motion nodes, Robot Control's Advanced settings)
+replaces it for that move, and a rule with selections sets the clearance of
+exactly its pairs. Pairs that may touch keep clearance 0: fixed objects
+against each other, a carried object against the bodies its attach node lists
+(`touch_bodies`), and the pairs of the move's contact and release rules. The
+move's target object gets the clearance unless a rule allows the contact. A
+move that starts inside a clearance may move away but not closer. Runtime
+monitoring and lookahead use clearance 0: they stop only on contact.
+
+Pre-dispatch validation runs for cached trajectories, for fresh ones with a
+contact or release rule and, while the robot's Deployment keeps
 `collision_check_fresh_plans` on (the default), for every other fresh plan.
-With it off, a fresh plan without a contact policy stands on the planner's
+With it off, a fresh plan without such a rule stands on the planner's
 check: its validation event reports `collision_evidence=planning`, a
 validated one `pre_dispatch_validation`. A fresh plan that fails is replanned
 within the authoritative-validation attempts, like a refused cached one. It
@@ -322,36 +348,35 @@ parent_link}`, reason `Never`; a link the model lacks is refused). These are
 part of the arm's planning model, so changing them restarts nothing.
 
 Both layers use the same collision authority. Each state query first determines the colliding body-pair
-set. When a policy mode needs signed distance/penetration, that query is run
+set. When a rule needs signed distance/penetration, that query is run
 **only for pairs already reported colliding**, never for every possible pair.
 This selective rule applies at pre-dispatch validation and runtime monitoring;
-the lightweight mode performs no distance query.
+a lightweight release performs no distance query.
 
 General collision checking is never globally relaxed; contact is permitted only
-by an **explicit, named contact policy**. Support/release checking offers three
-modes:
+by a **collision rule on the pair** or by an attachment's `touch_bodies`. The
+contact values are:
 
-- **Precise separation** (`signed_penetration`) tracks penetration only for
-  colliding allowed pairs. It requires allowed starting contact to improve and
-  reach no contact at the end, so sliding without improvement or worsening
+- **Contact** (`contact`) lets the pair touch from `end_from_fraction` of the
+  move on (a gripper finger touching the object it is about to grasp, a probe
+  tip reaching its part). The fraction is 0.8 when the rule gives none; 0 lets
+  the pair touch during the whole move. With
+  `max_penetration_m` every colliding sample must stay within that depth;
+  deeper is refused with `contact_penetration_exceeded`. Contact with anything
+  else still faults.
+- **Precise release** (`release`, `signed_penetration`) tracks penetration only
+  for the rule's colliding pairs. It requires the starting contact to improve
+  and reach no contact at the end, so sliding without improvement or worsening
   penetration is rejected.
-- **Lightweight separation** (`binary_contact`) tracks colliding pair identity
-  and count without distance. No new colliding pair is allowed, the set/count
-  must strictly decrease when progress is required, and the trajectory must end
-  with no contact. It is cheaper but cannot quantify worsening depth inside an
-  unchanged mesh-feature contact.
-- **Bounded penetration** permits any policy-authorized pair whose measured
-  penetration is within its configured limit—including a pair that was not in
-  contact at the first waypoint. Unexpected pairs and over-limit penetration
-  still fail.
+- **Lightweight release** (`release`, `binary_contact`) tracks colliding pair
+  identity and count without distance. No new colliding pair is allowed, the
+  set/count must strictly decrease when progress is required, and the
+  trajectory must end with no contact. It is cheaper but cannot quantify
+  worsening depth inside an unchanged mesh-feature contact.
 
-Other contact policies include:
-
-- **Grasp contact** — a gripper finger may touch the object it is about to
-  grasp, up to a configured penetration bound. Contact with anything else, or
-  beyond the bound, still faults.
-- **Support contact** — a release/place motion follows one of the separation or
-  bounded-penetration modes above.
+A carried object found touching a free Scene object at the start of a move
+gets a strict release by itself, unless a contact or release rule already holds
+that pair.
 
 Every allowed and rejected contact is reported explicitly in diagnostics, so a
 tolerated contact is auditable rather than silent. Beyond the collision
@@ -394,8 +419,8 @@ ManyForge's own validation and collision checks. Adapter details:
   final stretch for `smooth`); a check at the trajectory samples stretches the
   trajectory if a sample still exceeds it. The vendor TCP speed limit is never
   exceeded.
-- **Clearance.** Every planned motion keeps the collision clearance above
-  (1 mm by default); fresh plans get the pre-dispatch waypoint check unless
+- **Clearance.** Every planned motion keeps the collision clearances above
+  (1 mm to the environment by default); fresh plans get the pre-dispatch waypoint check unless
   the Deployment turns `collision_check_fresh_plans` off, as described under
   *Collision validation*.
 
@@ -523,7 +548,12 @@ The **cell latch** is derived, never stored: after a Stop, non-exempt
 components in the cell cause it while in `fault` or `offline` or reporting
 `activity: unknown` (also `stop_unconfirmed` after a Stop that ended
 uncontained); a fault raised while anything executes can also latch
-the cell. A component declaring `sim_reset` is the simulator and is exempt in
+the cell. A component that enters `fault` while an operation executes also
+stops every robot in motion, each with its fault Stop profile: one
+Kernel-internal Stop of kind `component_fault`, whose stopped moves end with
+the typed cause `component_fault` naming the component and need the
+operator (an e-stop `stop`, `offline` and a simulation that is not playing
+only latch or hold). A component declaring `sim_reset` is the simulator and is exempt in
 every state, including `offline` or `fault`. The existing operator-power and
 unavailable-owner-member exemptions also apply. The latch clears by itself
 when its causes are gone; there is no recovery endpoint or acknowledgement.
@@ -780,8 +810,8 @@ correlation layers, all visible through the public execution API:
   execution, stop, collision, and terminal events for that attempt all carry
   it. Generated child moves (e.g. from a pick-plan node) link back to the
   planning node's span.
-- **`contact_policy_id`** — the active contact policy for a contact-tolerant
-  move, present on that move's validation and terminal diagnostics.
+- **`collision_rule_id`** — the collision rule a contact, release or clearance finding
+  belongs to, present on that move's validation and terminal diagnostics.
 
 The kernel stamps these onto every event centrally, so coverage is uniform.
 Composer turns them into an **incident model**: a headline cause selected from
@@ -824,10 +854,12 @@ on the previous run reads it.
 
 Exposed through:
 
-- `GET /api/cycle/status` — cycle state and the one current versioned recovery
-  offer; `POST /api/cycle/recovery-actions` applies an exact offered action.
+- `GET /api/cycle/status` — cycle state and the focused versioned recovery
+  offer; the run's runtime controls carry every held node's offer and every
+  open operator question. `POST /api/cycle/recovery-actions` applies an exact
+  offered action or answers a question (the option id is the action).
 - `GET /api/execution/history` — filterable by run, span, node, move, and
-  contact policy.
+  collision rule.
 - `GET /api/execution/alarms` — current four-state alarm snapshot, manager/
   source reconciliation, and bounded lifecycle history; acknowledgement routes
   are revision/activation fenced.

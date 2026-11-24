@@ -8,6 +8,7 @@ import { effectiveField, useEffectiveValues } from '../hooks/useEffectiveValues'
 import type { EffectiveValues } from '../types/components';
 import { PneumaticIoEditor, pneumaticIoProblem } from './PneumaticIoEditor';
 import { pneumaticGripperDrafts, type PneumaticGripperDraft } from '../utils/pneumaticGripperAuthoring';
+import { generatedToolIds } from '../utils/generatedToolAuthoring';
 import {
   graspConfirmationForm,
   graspConfirmationProblem,
@@ -61,6 +62,9 @@ import {
   type TargetStopChain,
 } from '../utils/interruptAuthoring';
 import { DraftTextarea, DraftTextInput, useDraftInputResetSignal } from './common/DraftInputs';
+import { CollisionRulesTable } from './CollisionRulesTable';
+import { draftCollisionBodies, sourceModelCollisionChoices, type CollisionRuleChoices } from '../utils/collisionRules';
+import type { ComponentProfileFacts } from '../types/componentCatalog';
 import { InterruptConditionEditor } from './InterruptConditionEditor';
 import { StopStagePicker } from './StopStagePicker';
 import { StopFallbackSequence } from './StopFallbackSequence';
@@ -92,6 +96,8 @@ interface DeploymentFocusedEditorProps {
   controller: DeploymentWorkspaceController;
   scope?: FocusedEditorScope;
   sourceModel: StructuralResourceState<SourceModelProjection>;
+  /** Component-type facts by profile id: the collision bodies a cell collision rule can select. */
+  componentProfiles?: Readonly<Record<string, ComponentProfileFacts>>;
   motionDescriptors: ManualControlMotionDescriptor[];
   gripperDescriptors: ManualControlGripperDescriptor[];
   /** Keys a global rule may read: the Program Draft's declared and system keys; null without a Program. */
@@ -110,6 +116,7 @@ interface DeploymentFocusedEditorProps {
 }
 
 const NO_PROGRAM_KEYS: readonly BlackboardKeyDeclaration[] = [];
+const NO_COMPONENT_PROFILES: Readonly<Record<string, ComponentProfileFacts>> = {};
 const NO_STOP_CHAINS: readonly TargetStopChain[] = [];
 
 interface RuntimeConfiguration {
@@ -174,7 +181,6 @@ interface GripperTargetConfigurationDraft {
   graspConfirmation?: JsonValue;
   // Optional override of the component's Stop finish tolerance (position units).
   stopFinishTolerance?: number;
-  touchLinks: string[];
   mountFrame: string;
   attachFrame: string;
   tcpFrame: string;
@@ -194,7 +200,7 @@ function numberValue(value: JsonValue | undefined): number | null {
 function runtimeConfigurations(
   document: Record<string, JsonValue> | null,
 ): RuntimeConfiguration[] {
-  if (document?.api_version === 'manyforge.deployment_intent.v2') {
+  if (document?.api_version === 'manyforge.deployment_intent.v3') {
     const components = document.components;
     if (!Array.isArray(components)) return [];
     return components.flatMap((value, index) => {
@@ -376,7 +382,6 @@ function gripperTargetConfigurations(
       const pneumaticIo = row?.pneumatic_io;
       const graspConfirmation = row?.grasp_confirmation;
       const stopFinishTolerance = row?.stop_finish_tolerance;
-      const touchLinks = row?.touch_links;
       const mountFrame = row?.mount_frame;
       const attachFrame = row?.attach_frame;
       const tcpFrame = row?.tcp_frame;
@@ -395,8 +400,6 @@ function gripperTargetConfigurations(
             || typeof stopFinishTolerance !== 'number'
             || !Number.isFinite(stopFinishTolerance)
             || stopFinishTolerance < 0))
-        || !Array.isArray(touchLinks)
-        || touchLinks.some((item) => typeof item !== 'string')
         || typeof mountFrame !== 'string'
         || typeof attachFrame !== 'string'
         || typeof tcpFrame !== 'string'
@@ -417,7 +420,6 @@ function gripperTargetConfigurations(
         ...(pneumaticIo === undefined ? {} : { pneumaticIo }),
         ...(graspConfirmation === undefined ? {} : { graspConfirmation }),
         ...(stopFinishTolerance === undefined ? {} : { stopFinishTolerance }),
-        touchLinks: touchLinks as string[],
         mountFrame,
         attachFrame,
         tcpFrame,
@@ -443,7 +445,6 @@ function gripperConfigurationValue(
     ...(draft.graspConfirmation === undefined ? {} : { grasp_confirmation: draft.graspConfirmation }),
     ...(draft.actuationKind === 'position_commanded' && draft.stopFinishTolerance !== undefined
       ? { stop_finish_tolerance: draft.stopFinishTolerance } : {}),
-    touch_links: [...draft.touchLinks].sort(),
     mount_frame: draft.mountFrame,
     attach_frame: draft.attachFrame,
     tcp_frame: draft.tcpFrame,
@@ -461,7 +462,7 @@ interface ControlledStopTarget {
 }
 
 function controlledStopTargets(document: Record<string, JsonValue> | null): ControlledStopTarget[] {
-  if (document?.api_version === 'manyforge.deployment_intent.v2') {
+  if (document?.api_version === 'manyforge.deployment_intent.v3') {
     return (Array.isArray(document.components) ? document.components : []).flatMap((componentValue) => {
       const component = objectValue(componentValue);
       const componentId = component?.component_id;
@@ -695,7 +696,7 @@ function FramePrefixDraft({ value, disabled, onCommit }: {
   );
 }
 
-function NumberDraft({
+export function NumberDraft({
   label,
   title,
   value,
@@ -1480,8 +1481,11 @@ function ExecutionHostSection({
   effective: EffectiveValues | null;
 }) {
   const disabled = !controller.mutationAvailable || controller.busy;
+  // A Tool made from parameters is wired on its own Tool editor (OD-357).
+  const generatedTools = generatedToolIds(document);
   const pneumaticRows = pneumaticGripperDrafts(document).filter((row) => (
-    row.actuationKind === 'pneumatic' || row.pneumaticIo !== undefined
+    (row.actuationKind === 'pneumatic' || row.pneumaticIo !== undefined)
+    && !generatedTools.has(row.componentId)
   ));
   return (
     <details className="dcard">
@@ -1538,10 +1542,6 @@ function ExecutionHostSection({
                 )}
                 {runtime.configuration.runtime_kind === 'ros2_control' && (
                   <>
-                    <EffectiveNumberDraft controller={controller} effective={effective}
-                      path={[...prefix, 'collision_clearance_m']} label="Collision clearance"
-                      title="Planned and validated moves keep at least this from obstacles the collision policy does not allow them to touch; 0 turns it off. A motion's own clearance replaces it."
-                      unit="m" min={0} max={0.05} step={0.0001} disabled={disabled} />
                     <EffectiveNumberDraft controller={controller} effective={effective}
                       path={[...prefix, 'collision_check_step_rad']} label="Collision check step"
                       title="Joint-space distance between the configurations the planner collision-checks. A replan after a refusal uses the finer of this and 0.01 rad. A motion's planner block can override it."
@@ -2197,7 +2197,6 @@ function GripperSection({
       || value.commandDurationS < 0
       || (value.actuationKind !== 'pneumatic' && value.commandDurationS === 0)
       || value.commandDurationS > 60
-      || value.touchLinks.length === 0
       || value.mountFrame === ''
       || value.attachFrame === ''
       || value.tcpFrame === ''
@@ -2230,7 +2229,7 @@ function GripperSection({
       const names: Partial<Record<keyof GripperTargetConfigurationDraft, string>> = {
         description: 'description', actuationKind: 'actuation_kind', outputMode: 'output_mode',
         openStateRef: 'open_state_ref', closedStateRef: 'closed_state_ref',
-        commandDurationS: 'command_duration_s', touchLinks: 'touch_links',
+        commandDurationS: 'command_duration_s',
         mountFrame: 'mount_frame', attachFrame: 'attach_frame', tcpFrame: 'tcp_frame',
         auxiliaryFrames: 'auxiliary_frames',
       };
@@ -2241,7 +2240,7 @@ function GripperSection({
   const textProblem = (field: 'description' | 'mountFrame' | 'attachFrame' | 'tcpFrame', value: string) => (
     source === null ? null : validate({ ...source, [field]: value })
   );
-  const listProblem = (field: 'touchLinks' | 'auxiliaryFrames', value: string) => (
+  const listProblem = (field: 'auxiliaryFrames', value: string) => (
     source === null ? null : validate({ ...source, [field]: listValue(value) })
   );
   const durationProblem = (value: string) => {
@@ -2293,6 +2292,7 @@ function GripperSection({
               <span><small>Command capability / schema</small><strong>{descriptor.contracts.operationCapabilityId} · {shortIdentity(descriptor.contracts.commandSchema?.commandSchemaId)}</strong></span>
               <span><small>Presets</small><strong>{descriptor.namedPresets.map((preset) => preset.name).join(', ') || 'not declared'}</strong></span>
               <span><small>Mimic followers</small><strong>{descriptor.mimicFollowers.length}</strong></span>
+              <span><small>Grip body links (component type)</small><strong>{descriptor.gripBodyLinks.join(', ') || 'not declared'}</strong></span>
             </div>
             {source === null ? (
               <p className="muted">This addressed gripper has no Deployment-owned configuration row to edit.</p>
@@ -2372,9 +2372,6 @@ function GripperSection({
                       validate={(value) => textProblem(field, value)}
                       onCommit={(value) => { void commitField(field, value); }} />
                   ))}
-                  <GripperListDraftField label="Touch links" value={source.touchLinks} disabled={disabled}
-                    validate={(value) => listProblem('touchLinks', value)}
-                    onCommit={(value) => { void commitField('touchLinks', listValue(value)); }} />
                   <GripperListDraftField label="Auxiliary frames" value={source.auxiliaryFrames} disabled={disabled}
                     validate={(value) => listProblem('auxiliaryFrames', value)}
                     onCommit={(value) => { void commitField('auxiliaryFrames', listValue(value)); }} />
@@ -2402,6 +2399,7 @@ export function DeploymentFocusedEditor({
   controller,
   scope = 'all',
   sourceModel,
+  componentProfiles = NO_COMPONENT_PROFILES,
   motionDescriptors,
   gripperDescriptors,
   programKeys = NO_PROGRAM_KEYS,
@@ -2436,9 +2434,15 @@ export function DeploymentFocusedEditor({
   const ownMotionDescriptors = useMemo(() => motionDescriptors.filter((descriptor) => (
     componentId === null || descriptor.controllableComponentId === componentId
   )), [componentId, motionDescriptors]);
-  const ownGripperDescriptors = useMemo(() => gripperDescriptors.filter((descriptor) => (
-    componentId === null || descriptor.controllableComponentId === componentId
-  )), [componentId, gripperDescriptors]);
+  // A Tool made from parameters has its gripper rows (its wiring) on its own
+  // Tool editor (OD-357), not here.
+  const ownGripperDescriptors = useMemo(() => {
+    const generatedTools = generatedToolIds(document);
+    return gripperDescriptors.filter((descriptor) => (
+      (componentId === null || descriptor.controllableComponentId === componentId)
+      && !generatedTools.has(descriptor.controllableComponentId)
+    ));
+  }, [componentId, document, gripperDescriptors]);
   const effective = useEffectiveValues(controller);
   const ioRuntimes = useMemo(() => runtimes.filter((runtime) => (
     !runtime.poseSource && !runtime.aiModel && !runtime.sensor && !runtime.assistant)).map((runtime) => ({
@@ -2452,7 +2456,7 @@ export function DeploymentFocusedEditor({
   if (document === null) {
     return <div className="panel-state">Open a Deployment artifact to edit its Draft.</div>;
   }
-  const intent = document.api_version === 'manyforge.deployment_intent.v2';
+  const intent = document.api_version === 'manyforge.deployment_intent.v3';
   const all = scope === 'all';
   const cell = scope === 'all' || scope === 'cell';
   // One component's page shows only the sections that have its rows.
@@ -2501,6 +2505,10 @@ export function DeploymentFocusedEditor({
       )}
       <ComponentStreamsSection controller={controller} scope={scope} />
       {intent && cell && (
+        <CollisionRulesSection controller={controller} document={document} sourceModel={sourceModel}
+          componentProfiles={componentProfiles} />
+      )}
+      {intent && cell && (
         <MotionTakeoverSection controller={controller} document={document} effective={effective} />
       )}
       {intent && cell && (
@@ -2510,6 +2518,56 @@ export function DeploymentFocusedEditor({
           changedOutsideOutputs={changedOutsideOutputs} effective={effective} />
       )}
     </section>
+  );
+}
+
+/**
+ * The cell's collision rules (top-level `collision_rules`): the first rule's
+ * clearance of every robot from the Scene objects, then one row per rule.
+ * Collision bodies are offered from the component catalog (the Draft's
+ * components) and the applied source model; a component neither describes
+ * takes a typed body id. Links and model groups are offered from the applied
+ * source model; a component it does not list takes a typed name.
+ */
+function CollisionRulesSection({ controller, document, sourceModel, componentProfiles }: {
+  controller: DeploymentWorkspaceController;
+  document: Record<string, JsonValue>;
+  sourceModel: StructuralResourceState<SourceModelProjection>;
+  componentProfiles: Readonly<Record<string, ComponentProfileFacts>>;
+}) {
+  // A refusal of a written list shows once, in the yellow Deployment notice row.
+  const disabled = !controller.mutationAvailable || controller.busy;
+  const choices = useMemo<CollisionRuleChoices>(() => {
+    const componentIds = (Array.isArray(document.components) ? document.components : []).flatMap((value) => {
+      const id = objectValue(value)?.component_id;
+      return typeof id === 'string' ? [id] : [];
+    }).sort();
+    const bodies = draftCollisionBodies(document, componentProfiles);
+    const seen = new Set(bodies.map((body) => JSON.stringify([body.component_id, body.collision_body_id])));
+    for (const target of sourceModel.status === 'ready' ? sourceModel.data.targets : []) {
+      for (const body of target.collision_bodies) {
+        const key = JSON.stringify([target.component_id, body.collision_body_role_id]);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        bodies.push({ component_id: target.component_id, collision_body_id: body.collision_body_role_id });
+      }
+    }
+    return {
+      componentIds,
+      bodies,
+      ...sourceModelCollisionChoices(sourceModel.status === 'ready' ? sourceModel.data : null),
+    };
+  }, [componentProfiles, document, sourceModel]);
+  return (
+    <details className="dcard" open>
+      <summary>Collision rules</summary>
+      <div className="deployment-focused-body">
+        <CollisionRulesTable value={document.collision_rules} scope="deployment" choices={choices}
+          disabled={disabled}
+          onCommit={(rows) => { void controller.mutate(['collision_rules'], 'set', rows); }} />
+        <p className="field-help">Outside these rules: pairs the models never check (disabled pairs of a robot model, collision exclusions of an attachment), pairs of fixed Scene objects, and a carried object against the touch bodies of its attach node. A motion node&apos;s own rules replace these values for its pairs.</p>
+      </div>
+    </details>
   );
 }
 

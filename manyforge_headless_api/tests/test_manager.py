@@ -36,21 +36,20 @@ def test_manager_transport_accepts_bounded_cold_apply_timeout(tmp_path: Path) ->
 
 def _prepared_activation() -> dict[str, object]:
     return {
-        "schema_version": "manyforge.prepared_activation_input.v7",
+        "schema_version": "manyforge.prepared_activation_input.v8",
         "origin": {"kind": "scenario", "scenario_id": "scenario.1",
                    "source_document_digest": "sha256:" + "1" * 64,
                    "project_path": "/projects/scenario.1.scenario"},
         "captured_input_digest": "sha256:" + "d" * 64,
-        "deployment_artifact_id": "deployment.1",
         "deployment_revision": "sha256:" + "a" * 64,
         "retained_bundle_id": "sha256:" + "2" * 64,
         "graph_revision": "sha256:" + "3" * 64,
-        "program_id": "program.1",
         "program_revision": "sha256:" + "4" * 64,
         "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
         "node_environment_digest": "sha256:" + "5" * 64,
         "assistant_mode": "optional",
         "prepared_activation_id": "sha256:" + "e" * 64,
+        "scene_meshes": [],
     }
 
 
@@ -59,7 +58,6 @@ def _request() -> ManagerApplyRequest:
         {
             "request_key": _APPLY_KEY,
             "source_label": "test",
-            "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
             "expected_current": {
                 "graph_revision": "graph.1",
@@ -70,7 +68,6 @@ def _request() -> ManagerApplyRequest:
             "expected_admission_generation": 7,
             "candidate_receipt": {
                 "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
-                "deployment_artifact_id": "deployment.1",
                 "deployment_revision": "sha256:" + "a" * 64,
                 "prepared_activation_id": "sha256:" + "e" * 64,
                 "candidate_retained_bundle_id": "bundle.2",
@@ -218,7 +215,6 @@ def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> 
         "api_version",
         "command",
         "candidate_receipt",
-        "deployment_artifact_id",
         "deployment_revision",
         "admission_context",
         "expected_current",
@@ -331,7 +327,6 @@ def _status_response() -> dict[str, object]:
                 field: _prepared_activation()[field]
                 for field in (
                     "captured_input_digest",
-                    "deployment_artifact_id",
                     "deployment_revision",
                     "prepared_activation_id",
                 )
@@ -667,15 +662,12 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
                     "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
                 },
                 "frame_ref": {"kind": "cell_frame", "cell_id": "cell-a"},
-                "support_contacts": [
-                    {"support_object_id": "table.1"},
-                ],
             },
         }
     )
     try:
         response = ManagerCommandClient(tmp_path).commit_scene_transaction(
-            request, trusted_principal_id="operator.7"
+            request, trusted_principal_id="operator.7", mesh_content_digest=None
         )
         assert response["projection_status"] == "committed"
     finally:
@@ -684,7 +676,6 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
     assert not worker.is_alive()
     command = json.loads(received[0])
     assert received[0] == rfc8785.dumps(command)
-    assert b'"release_tolerance_m":0.00001' in received[0]
     assert set(command) == {"api_version", "command", "transaction"}
     assert command["command"] == "scene_commit"
     assert command["transaction"]["attribution"] == {
@@ -692,21 +683,48 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
         "principal_id": "operator.7",
         "transport": "http",
     }
-    assert command["transaction"]["operation"]["support_contacts"] == [
-        {
-            "allow_recontact": False,
-            "enforce_max_start_penetration": True,
-            "max_contact_penetration_m": 0.0,
-            "max_start_penetration_m": 0.0,
-            "min_release_progress_m": 0.0,
-            "mode": "contact_release",
-            "release_evidence_mode": "signed_penetration",
-            "release_tolerance_m": 1e-5,
-            "require_separation_by_end": True,
-            "require_strictly_decreasing_penetration": True,
-            "support_object_id": "table.1",
-        }
-    ]
+    assert "support_contacts" not in command["transaction"]["operation"]
+
+
+def test_scene_body_carries_a_captured_mesh_digest_only_when_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An API scene call's captured mesh digest reaches the Manager (OD-335)."""
+
+    request = _scene_request()
+    request = SceneTransactionRequest.model_validate({
+        **request.model_dump(mode="json"),
+        "operation": {
+            "kind": "add_object",
+            "scene_resource_id": "part.1",
+            "shape": {"type": "mesh", "mesh_resource_uri": "meshes/part.stl",
+                      "mesh_scale": {"x_m": 1.0, "y_m": 1.0, "z_m": 1.0}},
+            "pose": {
+                "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.01},
+                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+            },
+            "frame_ref": {"kind": "cell_frame", "cell_id": "cell-a"},
+        },
+    })
+    client = ManagerCommandClient(tmp_path)
+    commands = []
+
+    def exchange(command):
+        commands.append(command)
+        raise HeadlessApiError("stop", "stop")
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    digest = "sha256:" + "7" * 64
+    for mesh_content_digest in (digest, None):
+        with pytest.raises(HeadlessApiError):
+            client.commit_scene_transaction(
+                request, trusted_principal_id=None, mesh_content_digest=mesh_content_digest)
+    with pytest.raises(HeadlessApiError):
+        client.scene_transaction_status(request)
+    shapes = [command["transaction"]["operation"]["shape"] for command in commands]
+    assert [shape.get("mesh_content_digest") for shape in shapes] == [digest, None, None]
+    assert "mesh_content_digest" in shapes[0]
+    assert all("mesh_content_digest" not in shape for shape in shapes[1:])
 
 
 def test_scene_client_rejects_an_inconsistent_owner_result(
@@ -727,15 +745,13 @@ def test_scene_client_rejects_an_inconsistent_owner_result(
     monkeypatch.setattr(client, "_exchange", lambda _command: valid_failure)
     # Each exchange is its own connection: the echoed identity is not compared.
     assert (
-        client.commit_scene_transaction(_scene_request(), trusted_principal_id=None)
+        client.commit_scene_transaction(_scene_request(), trusted_principal_id=None, mesh_content_digest=None)
         == valid_failure
     )
 
     valid_failure["projection_status"] = "committed"
     with pytest.raises(HeadlessApiError) as captured:
-        client.commit_scene_transaction(
-            _scene_request(), trusted_principal_id=None
-        )
+        client.commit_scene_transaction(_scene_request(), trusted_principal_id=None, mesh_content_digest=None)
     assert captured.value.code == "manager_command_response_invalid"
 
     scene_id = "sha256:" + "d" * 64
@@ -760,14 +776,12 @@ def test_scene_client_rejects_an_inconsistent_owner_result(
     }
     monkeypatch.setattr(client, "_exchange", lambda _command: mismatched_success)
     assert (
-        client.commit_scene_transaction(_scene_request(), trusted_principal_id=None)
+        client.commit_scene_transaction(_scene_request(), trusted_principal_id=None, mesh_content_digest=None)
         == mismatched_success
     )
     mismatched_success["extra"] = None
     with pytest.raises(HeadlessApiError) as captured:
-        client.commit_scene_transaction(
-            _scene_request(), trusted_principal_id=None
-        )
+        client.commit_scene_transaction(_scene_request(), trusted_principal_id=None, mesh_content_digest=None)
     assert captured.value.code == "manager_command_response_invalid"
 
 

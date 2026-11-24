@@ -118,7 +118,7 @@ def test_collision_pair_classification_enum():
         "kSupportContactSeparated",
         "kSupportContactRecontactViolation",
         "kAllowedTouchLink",
-        "kAllowedContactGrasp",
+        "kAllowedContactRule",
         "kDiagnosticIncomplete",
     ):
         assert getattr(e, name) is not None
@@ -200,51 +200,57 @@ def test_collision_pair_result_default_and_round_trip():
     assert r.is_first_failure is True
 
 
-def test_support_contact_policy_entry_round_trip():
-    e = manyforge_core_py.SupportContactPolicyEntry()
-    e.pair = manyforge_core_py.CollisionPairId(
+def test_release_rule_round_trip():
+    rule = manyforge_core_py.CollisionPairContactRule()
+    rule.pair = manyforge_core_py.CollisionPairId(
         body_a="scene/part/shape/0",
         body_b="scene/table/shape/0",
     )
-    e.mode = manyforge_core_py.CollisionContactPolicyMode.kContactRelease
-    e.release_evidence_mode = (
+    rule.rule_id = "lift_from_table"
+    release = manyforge_core_py.CollisionReleaseRule()
+    release.release_evidence_mode = (
         manyforge_core_py.ContactReleaseEvidenceMode.kBinaryContact
     )
-    e.enforce_max_start_penetration = False
-    e.max_start_penetration_m = 0.001
-    e.release_tolerance_m = 0.00001
-    e.min_release_progress_m = 0.0005
-    e.max_contact_penetration_m = 0.0
-    e.require_separation_by_end = False
-    e.require_strictly_decreasing_penetration = True
-    e.allow_recontact = True
+    release.enforce_max_start_penetration = False
+    release.max_start_penetration_m = 0.001
+    release.release_tolerance_m = 0.00001
+    release.min_release_progress_m = 0.0005
+    release.require_separation_by_end = False
+    release.require_strictly_decreasing_penetration = True
+    release.allow_recontact = True
+    rule.value = release
 
-    assert e.pair.body_b == "scene/table/shape/0"
-    assert e.mode == manyforge_core_py.CollisionContactPolicyMode.kContactRelease
+    assert rule.pair.body_b == "scene/table/shape/0"
+    assert rule.rule_id == "lift_from_table"
+    value = rule.value
+    assert isinstance(value, manyforge_core_py.CollisionReleaseRule)
     assert (
-        e.release_evidence_mode
+        value.release_evidence_mode
         == manyforge_core_py.ContactReleaseEvidenceMode.kBinaryContact
     )
-    assert e.enforce_max_start_penetration is False
-    assert e.max_start_penetration_m == 0.001
-    assert e.release_tolerance_m == 0.00001
-    assert e.min_release_progress_m == 0.0005
-    assert e.max_contact_penetration_m == 0.0
-    assert e.require_separation_by_end is False
-    assert e.require_strictly_decreasing_penetration is True
-    assert e.allow_recontact is True
+    assert value.enforce_max_start_penetration is False
+    assert value.max_start_penetration_m == 0.001
+    assert value.release_tolerance_m == 0.00001
+    assert value.min_release_progress_m == 0.0005
+    assert value.require_separation_by_end is False
+    assert value.require_strictly_decreasing_penetration is True
+    assert value.allow_recontact is True
 
 
-def test_bounded_penetration_policy_entry_round_trip():
-    e = manyforge_core_py.SupportContactPolicyEntry()
-    e.mode = manyforge_core_py.CollisionContactPolicyMode.kBoundedPenetration
-    e.max_contact_penetration_m = 0.002
+def test_contact_rule_round_trip():
+    rule = manyforge_core_py.CollisionPairContactRule()
+    assert isinstance(rule.value, manyforge_core_py.CollisionContactRule)
+    assert rule.value.max_penetration_m is None
+    assert rule.value.end_from_fraction == 0.8
 
-    assert (
-        e.mode
-        == manyforge_core_py.CollisionContactPolicyMode.kBoundedPenetration
-    )
-    assert e.max_contact_penetration_m == 0.002
+    contact = manyforge_core_py.CollisionContactRule()
+    contact.max_penetration_m = 0.002
+    contact.end_from_fraction = 0.0
+    rule.value = contact
+
+    assert isinstance(rule.value, manyforge_core_py.CollisionContactRule)
+    assert rule.value.max_penetration_m == 0.002
+    assert rule.value.end_from_fraction == 0.0
 
 
 def test_collision_pair_clearance_round_trip():
@@ -270,41 +276,62 @@ def test_collision_policy_revision_and_snapshot_round_trip():
     snapshot.revision = manyforge_core_py.CollisionPolicyRevision(
         revision_id=12, content_hash="policy-hash"
     )
-    static_pair = manyforge_core_py.CollisionPairId(
-        body_a="scene/a/shape/0", body_b="scene/b/shape/0"
-    )
     touch_pair = manyforge_core_py.CollisionPairId(
         body_a="component/arm/model/arm_model/body/wrist/collision/0",
         body_b="scene/part/shape/0",
     )
-    support = manyforge_core_py.SupportContactPolicyEntry()
-    support.pair = manyforge_core_py.CollisionPairId(
+    release_rule = manyforge_core_py.CollisionPairContactRule()
+    release_rule.pair = manyforge_core_py.CollisionPairId(
         body_a="scene/part/shape/0", body_b="scene/table/shape/0"
     )
-    contact_grasp = manyforge_core_py.ContactGraspPolicyEntry()
-    contact_grasp.policy_id = "contact_grasp/part"
-    contact_grasp.selected_object_id = "part"
-    contact_grasp.allowed_robot_links = ["left_finger", "right_finger"]
-    contact_grasp.max_penetration_m = 0.002
-    contact_grasp.terminal_window_start_fraction = 0.75
-    snapshot.allowed_static_static_pairs = [static_pair]
+    release_rule.rule_id = "lift_from_table"
+    release_rule.value = manyforge_core_py.CollisionReleaseRule()
+    contact = manyforge_core_py.CollisionContactRule()
+    contact.max_penetration_m = 0.002
+    contact.end_from_fraction = 0.75
+    contact_rule = manyforge_core_py.CollisionPairContactRule()
+    contact_rule.pair = manyforge_core_py.CollisionPairId(
+        body_a="component/arm/model/arm_model/body/finger/collision/0",
+        body_b="scene/part/shape/0",
+    )
+    contact_rule.rule_id = "fingers_on_part"
+    contact_rule.value = contact
+    snapshot.static_body_ids = ["scene/a/shape/0", "scene/b/shape/0"]
     snapshot.allowed_touch_link_pairs = [touch_pair]
-    snapshot.support_contacts = [support]
-    snapshot.contact_grasps = [contact_grasp]
+    snapshot.contact_rules = [contact_rule, release_rule]
     snapshot.require_full_diagnostics = False
 
     assert snapshot.policy_id == "pick_with_support"
     assert snapshot.revision.revision_id == 12
     assert snapshot.revision.content_hash == "policy-hash"
-    assert snapshot.allowed_static_static_pairs[0].body_a == "scene/a/shape/0"
+    assert snapshot.static_body_ids == ["scene/a/shape/0", "scene/b/shape/0"]
     assert snapshot.allowed_touch_link_pairs[0].body_a.startswith("component/")
-    assert snapshot.support_contacts[0].pair.body_b == "scene/table/shape/0"
-    assert snapshot.contact_grasps[0].policy_id == "contact_grasp/part"
-    assert snapshot.contact_grasps[0].allowed_robot_links == [
-        "left_finger",
-        "right_finger",
-    ]
+    assert snapshot.contact_rules[0].rule_id == "fingers_on_part"
+    assert snapshot.contact_rules[0].value.end_from_fraction == 0.75
+    assert snapshot.contact_rules[1].pair.body_b == "scene/table/shape/0"
+    assert isinstance(
+        snapshot.contact_rules[1].value, manyforge_core_py.CollisionReleaseRule
+    )
     assert snapshot.require_full_diagnostics is False
+
+
+def test_collision_policy_static_pair_is_one_rule_by_body_class():
+    """Two static bodies are never checked; a static and a moving body are."""
+    snapshot = manyforge_core_py.CollisionPolicySnapshot()
+    base = "component/arm/model/arm_model/body/base/collision/0"
+    wrist = "component/arm/model/arm_model/body/wrist/collision/0"
+    fixed = [f"scene/fixture-{index:03d}/shape/0" for index in range(200)]
+    snapshot.static_body_ids = sorted([base, *fixed])
+
+    def pair(first: str, second: str):
+        low, high = sorted((first, second))
+        return manyforge_core_py.CollisionPairId(body_a=low, body_b=high)
+
+    assert snapshot.static_pair(pair(fixed[0], fixed[199]))
+    assert snapshot.static_pair(pair(base, fixed[57]))
+    assert not snapshot.static_pair(pair(wrist, fixed[0]))
+    assert not snapshot.static_pair(pair(wrist, base))
+    assert not snapshot.static_pair(pair("scene/carried/shape/0", fixed[3]))
 
 
 # ---------------------------------------------------------------------------

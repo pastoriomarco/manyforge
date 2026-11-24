@@ -1,0 +1,45 @@
+{
+  "api_version": "manyforge.model_asset.v1",
+  "collision_body_role_bindings": [
+    {
+      "collision_body_role_id": "default_collision",
+      "source_link_names": [
+        "tool_body"
+      ]
+    }
+  ],
+  "expanded_source": {
+    "artifacts": [
+      {
+        "byte_size": 60,
+        "content_digest": "sha256:a4a590fbe5b270c168d18b240dc2b52b8ea2ee45f24fc879a0d63cfb4ebde0c3",
+        "logical_uri": "asset://tool/model.srdf",
+        "media_type": "application/xml"
+      },
+      {
+        "byte_size": 779,
+        "content_digest": "sha256:76632e89f3b366519434d1ed3c05de80a3184d2d30873708642f9d382b7db011",
+        "logical_uri": "asset://tool/model.urdf",
+        "media_type": "application/xml"
+      }
+    ],
+    "srdf_logical_uri": "asset://tool/model.srdf",
+    "urdf_logical_uri": "asset://tool/model.urdf"
+  },
+  "frame_role_bindings": [
+    {
+      "frame_role_id": "mount",
+      "source_link_name": "tool_mount"
+    },
+    {
+      "frame_role_id": "tcp",
+      "source_link_name": "tool_tcp"
+    }
+  ],
+  "instance_cardinality": "multiple_per_cell",
+  "model_asset_id": "tool",
+  "model_group_role_bindings": [],
+  "model_revision": "sha256:b9cb09dfe640db039ce858fed67cc2cbd260568944d38d7f543bfd731cbea092",
+  "resource_role_bindings": [],
+  "root_frame_role_id": "mount"
+}

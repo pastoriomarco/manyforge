@@ -1,5 +1,7 @@
--- ManyForge UA4 typed named-Apply journal, version 24.
+-- ManyForge UA4 typed named-Apply journal, version 25.
 --
+-- Version 25: no Deployment artifact id; the Deployment revision identifies
+-- the candidate (OD-369).
 -- Version 24: metadata records_lost, set by the record writer when records of
 -- this start were not written.
 --
@@ -28,12 +30,12 @@
 -- with every row it owns. accepted_sequence orders Applies for that choice.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 24;
+PRAGMA user_version = 25;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 24),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 25),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL
@@ -128,7 +130,6 @@ CREATE TABLE IF NOT EXISTS manager_apply_intents (
     candidate_retained_bundle_id TEXT NOT NULL,
     candidate_graph_revision TEXT NOT NULL,
     captured_input_digest TEXT NOT NULL,
-    deployment_artifact_id TEXT NOT NULL,
     deployment_revision TEXT NOT NULL,
     -- NULL exactly for a prepared non-executable Program outcome (H1a).
     program_binding_id TEXT

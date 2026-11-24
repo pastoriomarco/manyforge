@@ -38,7 +38,13 @@ RULES: Final = (
     "object they asked you to remove) are reported in your answer, not fixed. Never delete or "
     "rewrite the operator's nodes to clear diagnostics unless asked.",
     "To make a node the new top of the Program, wrap @root with tree_draft_wrap_node.",
-    "After editing, state in one or two sentences what changed.",
+    "Orientation: orientation.rpy_deg is roll, pitch, yaw in degrees (intrinsic ZYX). To "
+    "turn an existing pose, send rotate_local_rpy_deg (its own axes) or rotate_world_rpy_deg "
+    "(world axes) and let ManyForge compute the result; rpy_delta_deg only adds to each angle "
+    "and is not a rotation. To keep or match an orientation, send orientation_from "
+    "(current_pose or scene_resource); do not copy or convert the rounded angles shown here.",
+    "Write no text between tool calls. After editing, state in one or two sentences what "
+    "changed.",
 )
 
 
@@ -143,38 +149,6 @@ def _scene_line(row: Mapping[str, Any]) -> str:
     return text
 
 
-def _contact_body(selector: Mapping[str, Any]) -> str:
-    """`component/body`, the runtime-object key, or `motion endpoint`."""
-
-    kind = selector.get("kind")
-    if kind == "runtime_object":
-        return str(selector.get("runtime_object_id"))
-    if kind == "component_model_body":
-        body = selector.get("body") or {}
-        if body:
-            return f"{body.get('component_id')}/{body.get('collision_body_id')}"
-        return f"{selector.get('component_role_id')}/{selector.get('collision_body_role_id')}"
-    return "motion endpoint" if kind == "motion_endpoint" else str(kind)
-
-
-def _contact_policy_line(policy: Mapping[str, Any]) -> str:
-    """`- id: mode; zone z: a~b, max penetration 0.002 m` (one line per policy)."""
-
-    parts = [f"- {policy.get('policy_id')}: {policy.get('mode')}"]
-    for zone in policy.get("zones") or []:
-        if not isinstance(zone, dict):
-            continue
-        pairs = [f"{_contact_body(pair.get('body_a') or {})}~{_contact_body(pair.get('body_b') or {})}"
-                 for pair in zone.get("body_pairs") or [] if isinstance(pair, dict)]
-        text = f"zone {zone.get('zone_id')}: {_names(pairs)}"
-        if "max_penetration_m" in zone:
-            text += f", max penetration {_number(zone['max_penetration_m'])} m"
-        if "release_evidence_mode" in zone:
-            text += f", evidence {zone['release_evidence_mode']}"
-        parts.append(text)
-    return "; ".join(parts)
-
-
 def _outline(authoring: Mapping[str, Any], diagnostics: Sequence[Any]) -> list[str]:
     forest = authoring.get("forest") or []
     incomplete: set[int] = set()
@@ -235,11 +209,6 @@ def _outline(authoring: Mapping[str, Any], diagnostics: Sequence[Any]) -> list[s
     if scene:
         out.append("Scene resources:")
         out += [_scene_line(row) for row in scene[:MAXIMUM_SECTION_LINES] if isinstance(row, dict)]
-    policies = authoring.get("contact_policies") or []
-    if policies:
-        out.append("Contact policies:")
-        out += [_contact_policy_line(row) for row in policies[:MAXIMUM_SECTION_LINES]
-                if isinstance(row, dict)]
     if issue_lines:
         out.append("Open Draft diagnostics:")
         out += issue_lines[:MAXIMUM_SECTION_LINES]

@@ -79,8 +79,14 @@ using namespace core;
 using Action = control_msgs::action::FollowJointTrajectory;
 using ServerGoal = rclcpp_action::ServerGoalHandle<Action>;
 
+// Bound of the fixture's condition waits and of the fake server's held
+// responses. The isolated OD-55 timing binary, which includes this file,
+// raises it: there its per-iteration watchdog alone detects a stuck wait.
+#ifndef MANYFORGE_FIXTURE_WAIT_LIMIT
+#define MANYFORGE_FIXTURE_WAIT_LIMIT 3s
+#endif
 bool wait_until(const std::function<bool()> &condition) {
-  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  const auto deadline = std::chrono::steady_clock::now() + MANYFORGE_FIXTURE_WAIT_LIMIT;
   while (std::chrono::steady_clock::now() < deadline) {
     if (condition())
       return true;
@@ -250,7 +256,7 @@ public:
           if (delay_next_response.exchange(false)) {
             std::unique_lock lock(response_mutex_);
             response_blocked = true;
-            response_cv_.wait_for(lock, 3s,
+            response_cv_.wait_for(lock, MANYFORGE_FIXTURE_WAIT_LIMIT,
                                   [this] { return response_released_; });
           }
           return reject_next.exchange(false)
@@ -266,7 +272,7 @@ public:
           if (delay_next_cancel.exchange(false)) {
             std::unique_lock lock(response_mutex_);
             cancel_blocked = true;
-            response_cv_.wait_for(lock, 3s,
+            response_cv_.wait_for(lock, MANYFORGE_FIXTURE_WAIT_LIMIT,
                                   [this] { return response_released_; });
           }
           return reject_cancel.load() ? rclcpp_action::CancelResponse::REJECT

@@ -10,6 +10,7 @@ import {
 import { api } from '../api/client';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type {
+  SaveScenarioDocumentInput,
   ScenarioDocumentEntry,
   ScenarioDocumentIndexResponse,
 } from '../types/api';
@@ -41,6 +42,8 @@ interface ScenarioDocumentCommandsProps {
   controller: ProgramWorkspaceController;
   /** The Deployment Draft differs from its Saved baseline. */
   deploymentDirty?: boolean;
+  /** Something is applied and the Deployment Draft is not it. */
+  deploymentUnapplied?: boolean;
   localInvalidEdit?: boolean;
   /** Robots are moving (Program motion not held, or a manual operation). */
   motionActive?: boolean;
@@ -60,6 +63,9 @@ interface ScenarioDocumentCommandsProps {
   cellComponents?: readonly string[] | null;
 }
 
+/** Save writes the applied state only (OD-365); the server's message. */
+export const SAVE_UNAPPLIED_NOTE = 'Saves the applied state; your unapplied Draft edits are not included. Apply first to save them.';
+
 function scenarioEntryKey(entry: ScenarioDocumentEntry): string {
   return `${entry.sourceKind}:${entry.path ?? entry.scenarioId ?? entry.name}`;
 }
@@ -75,6 +81,7 @@ function ScenarioIconButton({
   operation,
   commands,
   disabledTooltip,
+  note,
   onClick,
   children,
 }: {
@@ -84,17 +91,21 @@ function ScenarioIconButton({
   operation: BusyOperation | null;
   commands: string | readonly string[];
   disabledTooltip?: string;
+  /** Shown with the label while the command is enabled. */
+  note?: string | null;
   onClick: (event: MouseEvent<HTMLButtonElement>) => void;
   children: ReactNode;
 }) {
   const busy = busyLabel(operation, commands, label);
+  const enabledTooltip = note ? `${label}: ${note}` : label;
   return (
     <button
       type="button"
       className="scenario-command"
       aria-label={label}
       aria-busy={busy !== label || undefined}
-      data-tooltip={busy !== label ? busy : disabledTooltip ?? (disabled && reason ? `${label}: ${reason}` : label)}
+      data-tooltip={busy !== label ? busy
+        : disabledTooltip ?? (disabled ? (reason ? `${label}: ${reason}` : label) : enabledTooltip)}
       disabled={disabled}
       onClick={onClick}
     >
@@ -112,6 +123,7 @@ function ScenarioIconButton({
 export function ScenarioDocumentCommands({
   controller,
   deploymentDirty = false,
+  deploymentUnapplied = false,
   localInvalidEdit = false,
   motionActive = false,
   componentActionActive = false,
@@ -160,6 +172,8 @@ export function ScenarioDocumentCommands({
   const [replacementPending, setReplacementPending] = useState(false);
   const replacementInFlight = useRef(false);
   const [confirmation, setConfirmation] = useState<ReplacementConfirmation | null>(null);
+  // The Save waiting for the operator to confirm it leaves unapplied edits out.
+  const [saveConfirmation, setSaveConfirmation] = useState<SaveScenarioDocumentInput | null>(null);
   const replacementMounted = useRef(true);
   useEffect(() => {
     replacementMounted.current = true;
@@ -178,7 +192,6 @@ export function ScenarioDocumentCommands({
   const scenarioDirectoryRef = useRef('');
   const returnFocus = useRef<HTMLElement | null>(null);
   const workspace = state.workspace;
-  const authoring = workspace?.draft.authoring ?? null;
   const busy = replacementPending || state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
   const busyText = busyReason(operation) ?? 'Another operation is in progress.';
@@ -204,6 +217,10 @@ export function ScenarioDocumentCommands({
         : scenarioReplacementUnavailableReason ?? null);
   const newEntryReason = newMotionReason ?? replacementEntryReason;
   const hasUnsavedChanges = workspace?.hasUnsavedChanges === true || deploymentDirty;
+  // Save writes the applied state (OD-365): unapplied edits are left out,
+  // which the operator confirms.
+  const unappliedEdits = workspace?.hasUnappliedChanges === true || deploymentUnapplied;
+  const saveNote = unappliedEdits ? SAVE_UNAPPLIED_NOTE : null;
   const draftDiscarded = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true
     || deploymentDirty;
@@ -307,6 +324,7 @@ export function ScenarioDocumentCommands({
   const closeAction = useCallback(() => {
     if (replacementInFlight.current) return;
     setConfirmation(null);
+    setSaveConfirmation(null);
     setNewError(null);
     setFailedLoadPath(null);
     setAction(null);
@@ -329,8 +347,8 @@ export function ScenarioDocumentCommands({
       setExportParent(null);
       setExportPickerOpen(false);
       setScenarioName(scenarioDocumentPath !== null
-        ? scenarioProjectStem(scenarioDocumentPath) : authoring?.program_id ?? '');
-      setScenarioDescription(scenarioDocument.description ?? authoring?.description ?? '');
+        ? scenarioProjectStem(scenarioDocumentPath) : '');
+      setScenarioDescription(scenarioDocument.description ?? '');
       setSaveDirectory(ownProject !== null ? parentFolder(ownProject) : null);
       if (ownProject === null) {
         void refreshScenarioIndex(scenarioDirectoryRef.current || undefined)
@@ -344,6 +362,16 @@ export function ScenarioDocumentCommands({
   const complete = (operation: () => void) => {
     operation();
     closeAction();
+  };
+  // With unapplied edits Save first asks; the confirmed request carries it.
+  const save = (input: SaveScenarioDocumentInput, acknowledged = false) => {
+    if (unappliedEdits && !acknowledged) {
+      setSaveConfirmation(input);
+      return;
+    }
+    complete(() => saveScenarioDocument(
+      unappliedEdits ? { ...input, confirmUnappliedExcluded: true } : input,
+    ));
   };
 
   // New and Load replace the Scenario through the server's one Apply path:
@@ -441,6 +469,7 @@ export function ScenarioDocumentCommands({
             ?? (readOnly ? 'The Untitled Scenario is read-only. Use Save Scenario as.' : 'Scenario already matches Saved.')}
           disabled={motionReason !== null || projectSaveBlocked || readOnly || (saveTarget !== null && !hasUnsavedChanges)}
           disabledTooltip={readOnly ? undefined : authoringAdmissionBlock ?? undefined}
+          note={saveNote}
           operation={operation}
           commands="save"
           onClick={(event) => {
@@ -448,7 +477,8 @@ export function ScenarioDocumentCommands({
               beginAction('save_as', event);
               return;
             }
-            saveScenarioDocument({ ...saveTarget, confirmOverwrite: false });
+            returnFocus.current = event.currentTarget;
+            save({ ...saveTarget, confirmOverwrite: false });
           }}
         >
           <path d="M3 2.5h8L13.5 5v8.5a.5.5 0 0 1-.5.5H3a.5.5 0 0 1-.5-.5v-10a.5.5 0 0 1 .5-.5z" />
@@ -458,8 +488,9 @@ export function ScenarioDocumentCommands({
           label="Save Scenario as"
           reason={motionReason ?? blockReason}
           disabled={motionReason !== null || blocked}
+          note={saveNote}
           operation={operation}
-          commands={['save_as', 'export']}
+          commands="export"
           onClick={(event) => beginAction('save_as', event)}
         >
           <path d="M3 2.5h6.5L12 5v3" />
@@ -484,7 +515,7 @@ export function ScenarioDocumentCommands({
       </div>
 
       <OverlayPanel
-        open={action !== null && confirmation === null}
+        open={action !== null && confirmation === null && saveConfirmation === null}
         title={action === 'new' ? 'New Scenario' : action === 'save_as' ? 'Save Scenario as' : 'Load Scenario'}
         titleId="scenario-action-dialog-title"
         compact={false}
@@ -577,15 +608,15 @@ export function ScenarioDocumentCommands({
                     className="primary-action"
                     disabled={projectSaveBlocked || saveDirectory === null || nameError !== null
                       || (saveReplacesOther && !confirmOverwrite)}
-                    title={projectSaveReason ?? nameError ?? undefined}
+                    title={projectSaveReason ?? nameError ?? saveNote ?? undefined}
                     onClick={() => {
                       if (saveDirectory === null || nameError !== null) return;
-                      complete(() => saveScenarioDocument({
+                      save({
                         directory: saveDirectory,
                         name: scenarioName,
                         description: scenarioDescription.trim(),
                         confirmOverwrite,
-                      }));
+                      });
                     }}
                   >
                     Save Scenario
@@ -756,6 +787,25 @@ export function ScenarioDocumentCommands({
               onClick={() => {
               if (confirmation !== null) void completeReplacement(confirmation.kind, true);
             }}>{confirmation?.kind === 'new' ? 'Empty the cell and continue' : 'Load Scenario'}</button>
+          </div>
+        </div>
+      </OverlayPanel>
+      <OverlayPanel open={saveConfirmation !== null}
+        title="Save the applied Scenario?"
+        titleId="scenario-save-confirmation-title" kind="dialog" compact
+        onClose={() => setSaveConfirmation(null)}
+        returnFocusRef={returnFocus}>
+        <div className="dialog-copy compact-confirmation">
+          <p>{SAVE_UNAPPLIED_NOTE}</p>
+          <p>The Drafts keep the edits.</p>
+          <div className="dialog-actions">
+            <button type="button" onClick={() => setSaveConfirmation(null)}>Cancel</button>
+            <button type="button" className="primary-action"
+              disabled={projectSaveBlocked}
+              title={projectSaveReason ?? undefined}
+              onClick={() => { if (saveConfirmation !== null) save(saveConfirmation, true); }}>
+              Save applied state
+            </button>
           </div>
         </div>
       </OverlayPanel>

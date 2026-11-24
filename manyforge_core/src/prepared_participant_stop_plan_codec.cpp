@@ -552,7 +552,6 @@ struct BaseWireRows final {
       {"operation_id", CanonicalValue(static_cast<double>(plan.operation_id.value()))},
       {"operation_revision", safe_unsigned(plan.operation_revision.value())},
       {"participant_id", OperationParticipantIdValue(plan.participant_id)},
-      {"program_id", CanonicalValue(plan.program_id.value())},
       {"program_revision", CanonicalValue(plan.program_revision.value())},
       {"program_binding_id", CanonicalValue(plan.program_binding_id.value())},
       {"program_run_id", plan.program_run_id
@@ -608,7 +607,6 @@ void validate_context(const PreparedParticipantStopPlanContextDTO& context) {
       context.participant_id.operation_id.value() > kMaximumSafeUnsignedInteger) {
     fail("participant ID is invalid");
   }
-  require_identifier(context.program_id.value(), "program ID is invalid");
   if (!content_identity::is_sha256_digest(context.program_revision.value())) {
     fail("program revision is invalid");
   }
@@ -640,7 +638,6 @@ void validate_context(const PreparedParticipantStopPlanContextDTO& context) {
   return {plan.operation_id,
           plan.operation_revision,
           plan.participant_id,
-          plan.program_id,
           plan.program_revision,
           plan.program_binding_id,
           plan.program_run_id,
@@ -717,7 +714,6 @@ Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
                                         std::move(context.operation_id),
                                         context.operation_revision,
                                         context.participant_id,
-                                        std::move(context.program_id),
                                         std::move(context.program_revision),
                                         std::move(context.program_binding_id),
                                         std::move(context.program_run_id),

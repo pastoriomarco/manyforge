@@ -207,7 +207,6 @@ template <typename Available, typename Selected, typename Matches>
   return stop_plan.operation_id == participant.operation_id &&
          stop_plan.operation_revision == participant.operation_revision &&
          stop_plan.participant_id == participant.participant_id &&
-         stop_plan.program_id == participant.program_id &&
          stop_plan.program_revision == participant.program_revision &&
          stop_plan.program_binding_id == participant.program_binding_id &&
          stop_plan.program_run_id == participant.program_run_id &&
@@ -237,8 +236,6 @@ std::optional<std::string_view> prepared_participant_backend_binding_field_error
   const auto expected_capability_provider =
       binding.capability_provider_path ? std::optional(provider(*binding.capability_provider_path))
                                        : std::nullopt;
-  if (participant.program_id != binding.program_id)
-    return "prepared_participant_backend_program_id_mismatch";
   if (participant.program_revision != binding.program_revision)
     return "prepared_participant_backend_program_revision_mismatch";
   if (participant.program_binding_id != binding.program_binding_id)

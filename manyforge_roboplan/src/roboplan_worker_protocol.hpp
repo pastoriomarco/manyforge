@@ -11,14 +11,17 @@
 namespace manyforge::roboplan_backend::worker_protocol {
 
 inline constexpr std::uint32_t kFrameMagic = 0x4d465750U;  // MFWP
-inline constexpr std::uint16_t kProtocolVersion = 14U;
+/// v16: scene meshes are read by their captured content digest from the
+/// scene content root (OD-335). v17: the mesh shape carries that digest
+/// (its one carrier); the geometry row no longer does.
+inline constexpr std::uint16_t kProtocolVersion = 17U;
 inline constexpr int kProtocolDescriptor = 3;
-/// Worker-reserved duplicate of the approved scene-asset root directory.
-inline constexpr int kSceneAssetRootDescriptor = 9;
-/// Exact protocol-error detail for a scene mesh whose loaded bytes differ
-/// from the collision model's pinned digest.
-inline constexpr std::string_view kSceneMeshContentChangedDetail =
-    "scene_mesh_content_changed";
+/// Worker-reserved duplicate of the scene content (activation) root directory.
+inline constexpr int kSceneContentRootDescriptor = 9;
+/// Prefix of the protocol-error detail of a worker that could not read a
+/// captured scene mesh (missing blob or bytes differing from the digest).
+inline constexpr std::string_view kSceneMeshUnavailableDetailPrefix =
+    "scene_mesh_unavailable: ";
 
 enum class MessageType : std::uint16_t {
   kInitialize = 1U,
@@ -48,12 +51,14 @@ struct WorkerIkRequestDTO final {
   core::ResolvedFrameDTO tcp_frame;
   core::ControlledStateDTO seed_state;
   double timeout_s{};
-  /// Native body-name pairs (`first < second`) the selected contact policy
-  /// allows; the worker deactivates them for this solve.
+  /// Native body-name pairs (`first < second`) the move's contact rules
+  /// allow; the worker deactivates them for this solve.
   std::vector<std::pair<std::string, std::string>> contact_allowed_pairs{};
   core::PlannerCollisionMode collision_mode{core::PlannerCollisionMode::kEnforced};
   std::optional<std::int64_t> diagnostic_deadline_ns{};
   std::optional<core::TolerancesDTO> diagnostic_tolerances{};
+  /// As RoboPlanCandidateRequestDTO::other_coordinates.
+  RoboPlanOtherCoordinatesDTO other_coordinates{};
 };
 
 [[nodiscard]] std::string encode_initialization(

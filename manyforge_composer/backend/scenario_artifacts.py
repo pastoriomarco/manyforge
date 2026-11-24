@@ -13,8 +13,6 @@ import stat
 from typing import TYPE_CHECKING, Any, NoReturn
 import uuid
 
-from fastapi import HTTPException
-
 from manyforge_behavior.canonical_artifact import (
     MAX_DOCUMENT_BYTES,
     StrictArtifactError,
@@ -30,14 +28,18 @@ from manyforge_behavior.model_source_capture import (
     capture_deployment_model_sources,
     decode_model_source_artifact,
 )
-
+from manyforge_behavior.model_source_capture import (
+    SceneMeshPathError,
+    program_scene_mesh_shapes,
+    read_scene_mesh,
+)
+from manyforge_behavior.project_paths import ProjectPathRule
 from .security import (
     SCENARIO_PROJECT_READ_ONLY_MESSAGE,
     UNTITLED_SCENARIO_PATH,
     inside_untitled_scenario,
     is_path_within_roots,
     normalize_allowed_roots,
-    normalize_existing_file_path,
 )
 from .deployment_intent import (
     DeploymentIntentError,
@@ -123,6 +125,20 @@ class ScenarioArtifactError(RuntimeError):
 
 def _fail(code: str, message: str, *, status_code: int = 400) -> NoReturn:
     raise ScenarioArtifactError(code, message, status_code=status_code)
+
+
+def require_unapplied_edits_excluded(unapplied: bool, confirmed: bool) -> None:
+    """Save writes only what is applied, so every saved Scenario reopens
+    (OD-365): with unapplied Draft edits it needs the caller's explicit
+    confirmation that they are left out."""
+
+    if unapplied and not confirmed:
+        _fail(
+            "scenario_save_unapplied_edits",
+            "Saves the applied state; your unapplied Draft edits are not "
+            "included. Apply first to save them.",
+            status_code=409,
+        )
 
 
 def _roots(values: list[str]) -> list[str]:
@@ -265,6 +281,30 @@ def _validate_saved_status(value: Any, *, source: str) -> dict[str, str]:
     return deepcopy(value)
 
 
+# Fields a Scenario's documents no longer carry: the Scenario has one identity,
+# its project folder name, and one description (OD-369).
+_DROPPED_DOCUMENT_FIELDS = {
+    "program_draft": ("program_id", "name", "description"),
+    "deployment_draft": ("deployment_artifact_id", "name", "description"),
+}
+
+
+def _refuse_dropped_fields(value: dict[str, Any], *, source: str) -> None:
+    found = [
+        f"{SCENARIO_PROJECT_MEMBERS[member]}: {field}"
+        for member, fields in _DROPPED_DOCUMENT_FIELDS.items()
+        if isinstance(value.get(member), dict)
+        for field in fields
+        if field in value[member]
+    ]
+    if found:
+        _fail(
+            "scenario_document_dropped_fields",
+            f"{source}: {', '.join(found)} are no longer part of a Scenario; "
+            "convert it with scripts/convert_scenarios_od369.py",
+        )
+
+
 def validate_scenario_document(
     value: Any,
     *,
@@ -297,6 +337,7 @@ def validate_scenario_document(
             "scenario_artifact_invalid",
             f"{source}: Scenario fields do not match {SCENARIO_API_VERSION}",
         )
+    _refuse_dropped_fields(value, source=source)
     scenario_id = value["scenario_id"]
     name = value["name"]
     description = value["description"]
@@ -476,6 +517,7 @@ def _source_snapshot(
     deployment: dict[str, Any] | None,
     *,
     project_root: Path,
+    roots: list[str],
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Capture the admitted model closure and its small advisory identity table."""
 
@@ -483,10 +525,10 @@ def _source_snapshot(
         return None, None
     try:
         closure = capture_deployment_model_sources(
-            deployment, project_root=project_root
+            deployment, project_root=project_root, paths=ProjectPathRule(roots)
         )
     except ModelSourceCaptureError as error:
-        _fail("scenario_source_invalid", str(error), status_code=409)
+        _fail(error.code or "scenario_source_invalid", str(error), status_code=409)
     entries: list[dict[str, str]] = []
     for component in closure["components"]:
         component_id = component["component_id"]
@@ -644,8 +686,13 @@ def _capture_project(
     raw_path: str,
     *,
     allowed_roots: list[str],
+    read_roots: list[str] | None = None,
 ) -> tuple[dict[str, Any], str, str, bool, list[dict[str, str]]]:
+    """``allowed_roots`` hold the project; its model sources resolve under
+    ``read_roots`` (by default the same folders)."""
+
     roots = _roots(allowed_roots)
+    source_roots = roots if read_roots is None else _roots(read_roots)
     project = _existing_project(raw_path, roots)
     directory_fd = -1
     try:
@@ -730,7 +777,7 @@ def _capture_project(
             or current_digest != manifest["saved_status"]["checked_content_digest"]
         )
         current_snapshot, _ = _source_snapshot(
-            document["deployment_draft"], project_root=project
+            document["deployment_draft"], project_root=project, roots=source_roots
         )
         source_diagnostics = _edited_outside_diagnostics(
             manifest["members"], member_digests
@@ -764,11 +811,15 @@ def capture_scenario_artifact(
     raw_path: str,
     *,
     allowed_roots: list[str],
+    read_roots: list[str] | None = None,
 ) -> tuple[dict[str, Any], str, str]:
-    """Capture one complete fixed-member Scenario project exactly once."""
+    """Capture one complete fixed-member Scenario project exactly once.
+
+    The project lies in ``allowed_roots``; its model sources resolve under
+    ``read_roots`` (by default the same folders)."""
 
     document, source, digest, _, _ = _capture_project(
-        raw_path, allowed_roots=allowed_roots
+        raw_path, allowed_roots=allowed_roots, read_roots=read_roots
     )
     return document, source, digest
 
@@ -893,7 +944,7 @@ def prepare_scenario_artifact(
                 except DeploymentIntentError as error:
                     _fail("scenario_deployment_intent_invalid", str(error))
     source_snapshot, _ = _source_snapshot(
-        prepared_document.get("deployment_draft"), project_root=target
+        prepared_document.get("deployment_draft"), project_root=target, roots=roots
     )
     member_bytes, manifest_raw = _project_payload(
         prepared_document, source_snapshot=source_snapshot
@@ -1106,93 +1157,6 @@ def _write_export_member(root: Path, relative: str, value: bytes) -> None:
         _fail("scenario_export_failed", f"Could not write {relative}: {error}")
 
 
-def _read_export_asset(path: Path, *, roots: list[str]) -> bytes:
-    try:
-        resolved = normalize_existing_file_path(
-            str(path), roots, kind_label="Scenario asset"
-        )
-        if resolved.is_symlink():
-            _fail("scenario_export_asset_invalid", f"Asset is a symlink: {path}")
-        descriptor = os.open(
-            resolved, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
-        )
-        try:
-            before = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or not 0 < before.st_size <= MAX_ARTIFACT_BYTES
-            ):
-                _fail(
-                    "scenario_export_asset_invalid",
-                    f"Asset is not one bounded plain file: {path}",
-                )
-            chunks: list[bytes] = []
-            remaining = before.st_size
-            while remaining:
-                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
-                if not chunk:
-                    _fail("scenario_export_asset_changed", f"Asset changed: {path}")
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            if os.read(descriptor, 1):
-                _fail("scenario_export_asset_changed", f"Asset changed: {path}")
-            after = os.fstat(descriptor)
-            if (
-                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-            ):
-                _fail("scenario_export_asset_changed", f"Asset changed: {path}")
-            return b"".join(chunks)
-        finally:
-            os.close(descriptor)
-    except HTTPException as error:
-        _fail(
-            "scenario_export_asset_invalid",
-            str(error.detail),
-            status_code=error.status_code,
-        )
-    except OSError as error:
-        _fail("scenario_export_asset_invalid", f"Could not read {path}: {error}")
-
-
-def _scene_mesh_shapes(value: Any):
-    if type(value) is dict:
-        if value.get("type") == "mesh" and isinstance(
-            value.get("mesh_resource_uri"), str
-        ):
-            yield value
-        for child in value.values():
-            yield from _scene_mesh_shapes(child)
-    elif type(value) is list:
-        for child in value:
-            yield from _scene_mesh_shapes(child)
-
-
-def _resolve_scene_mesh(
-    uri: str, *, source_project: Path, roots: list[str]
-) -> Path:
-    if not uri or "\x00" in uri or "://" in uri:
-        _fail(
-            "scenario_export_asset_invalid",
-            f"Unsupported scene mesh reference: {uri!r}",
-        )
-    raw = Path(uri)
-    candidates = [raw] if raw.is_absolute() else [source_project / raw]
-    if not raw.is_absolute():
-        candidates.extend(Path(root) / raw for root in roots)
-    for candidate in candidates:
-        try:
-            return normalize_existing_file_path(
-                str(candidate), roots, kind_label="Scenario mesh"
-            )
-        except HTTPException:
-            continue
-    _fail(
-        "scenario_export_asset_invalid",
-        f"Scene mesh does not resolve to an allowed plain file: {uri!r}",
-    )
-
-
 def export_scenario_artifact(
     document: dict[str, Any],
     raw_destination_path: str,
@@ -1223,7 +1187,9 @@ def export_scenario_artifact(
     deployment = prepared.get("deployment_draft")
     closure: dict[str, Any] | None = None
     if deployment is not None:
-        _, closure = _source_snapshot(deployment, project_root=source_project)
+        _, closure = _source_snapshot(
+            deployment, project_root=source_project, roots=roots
+        )
         if closure is None:
             raise AssertionError("Deployment source capture returned no closure")
 
@@ -1285,8 +1251,14 @@ def export_scenario_artifact(
                     _write_export_member(
                         temporary,
                         destination,
+                        # A resource row is its logical URI plus the transfer
+                        # artifact; only the artifact is decoded.
                         decode_model_source_artifact(
-                            resource,
+                            {
+                                key: value
+                                for key, value in resource.items()
+                                if key != "logical_uri"
+                            },
                             maximum_bytes=MAX_ARTIFACT_BYTES,
                             label=resource["logical_uri"],
                         ),
@@ -1297,12 +1269,14 @@ def export_scenario_artifact(
                 component["model_source"] = model_source
 
         scene_assets: dict[tuple[str, str], str] = {}
-        for shape in _scene_mesh_shapes(prepared.get("program_draft")):
+        for shape in program_scene_mesh_shapes(prepared.get("program_draft")):
             uri = shape["mesh_resource_uri"]
-            source = _resolve_scene_mesh(
-                uri, source_project=source_project, roots=roots
-            )
-            value = _read_export_asset(source, roots=roots)
+            try:
+                source, value = read_scene_mesh(
+                    uri, project_folder=source_project, paths=ProjectPathRule(roots)
+                )
+            except SceneMeshPathError as error:
+                _fail("scenario_export_asset_invalid", str(error))
             digest = raw_sha256_digest(value)
             key = (digest, source.name)
             relative = scene_assets.get(key)

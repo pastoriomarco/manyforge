@@ -97,10 +97,6 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "capture": ("GET", "/api/scene/snapshot/render"),
         "status": ("GET", "/api/scene/snapshot/status"),
     },
-    "manyforge_program_save": {
-        "save": ("POST", "/api/program/save"),
-        "save_as": ("POST", "/api/program/save-as"),
-    },
     "manyforge_files": {"browse": ("GET", "/api/files/browse")},
     "manyforge_deployment": {
         "workspace": ("GET", "/api/deployment/workspace"),
@@ -113,8 +109,6 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "preview": ("POST", "/api/deployment/preview"),
         "apply": ("POST", "/api/deployment/apply"),
         "effective": ("GET", "/api/deployment/effective"),
-        "save": ("POST", "/api/deployment/save"),
-        "save_as": ("POST", "/api/deployment/save-as"),
         "discard": ("POST", "/api/deployment/discard"),
         "revert_preview": ("POST", "/api/deployment/revert/preview"),
         "revert": ("POST", "/api/deployment/revert"),
@@ -125,6 +119,8 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
     "manyforge_scenario": {
         "load": ("POST", "/api/scenario/load"),
         "new": ("POST", "/api/scenario/new"),
+        # The one Save of the open Scenario (OD-369).
+        "save": ("POST", "/api/scenario-documents/save"),
         # Where a Load's or New's row (its step and end) is read (OD-214).
         "status": ("GET", "/api/deployment/workspace"),
     },
@@ -447,7 +443,7 @@ class ComposerMcpAdapter:
             for route in app.routes
             if isinstance(route, Route)
         }
-        server = Server("ManyForge", version="0.3.1")
+        server = Server("ManyForge", version="0.4.0")
         contracts = [types.Tool.model_validate(value) for value in tool_contracts(app)]
 
         @server.list_tools()

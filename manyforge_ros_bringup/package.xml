@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>manyforge_ros_bringup</name>
-  <version>0.3.1</version>
+  <version>0.4.0</version>
   <description>ROS 2 bringup helpers for ManyForge integration targets.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>
@@ -14,6 +14,7 @@
   <exec_depend>joint_state_broadcaster</exec_depend>
   <exec_depend>joint_trajectory_controller</exec_depend>
   <exec_depend>launch</exec_depend>
+  <exec_depend>manyforge_io_interfaces</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>parallel_gripper_controller</exec_depend>
   <exec_depend>rclpy</exec_depend>

@@ -55,9 +55,9 @@ void expect_line_valid(const std::string& line) {
   EXPECT_EQ(line.back(), '}');
 }
 
-TEST(KernelFlightRecorderTest, ContactPolicyViolationTypeNameIsStable) {
-  EXPECT_STREQ(kernel_event_type_name(KernelEventType::kContactPolicyViolation),
-               "contact_policy_violation");
+TEST(KernelFlightRecorderTest, ContactRuleViolationTypeNameIsStable) {
+  EXPECT_STREQ(kernel_event_type_name(KernelEventType::kContactRuleViolation),
+               "contact_rule_violation");
 }
 
 TEST(KernelFlightRecorderTest, ParticipantDispatchOutcomeTypeNameIsStable) {

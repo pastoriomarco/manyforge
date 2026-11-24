@@ -37,6 +37,12 @@ struct RetainedComponentSnapshot final {
   std::optional<std::string> member_role{};
   std::vector<std::pair<std::string, std::shared_ptr<AdapterTransportConsumer>>>
       adapter_transport_consumers{};
+  /// The view's gripper target: one snapshot per target of a tool with
+  /// several gripper targets; absent for every other owner.
+  std::optional<core::CommandTargetId> gripper_target{};
+  /// The owner's selected measured lane; a kept view carries it as a fresh
+  /// build sets it (Reset robot position reads it).
+  std::optional<RetainedMeasuredJointStateLane> measured_joint_state_lane{};
 };
 
 struct PendingDiscard final {

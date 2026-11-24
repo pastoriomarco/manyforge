@@ -1,0 +1,144 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md, docs/authoring/IO_BANKS.md):
+# a generic I/O bank of a device such as a PLC, an owner-less model-form I/O
+# device. Real lane: the `ros_io_bank` family reads `/<component_id>/io_bank/state`
+# and writes on `/<component_id>/io_bank/command` (manyforge_io_interfaces);
+# Mock and Isaac lanes: the host's Mock I/O (outputs read back). Inputs I0-I63
+# and outputs Q0-Q63 at their bank index; a site model names its own signals.
+api_version: manyforge.component_package.v2
+kind: io_device
+id: manyforge.io_bank_64x64
+version: 1.0.0
+title: ROS I/O bank, 64 inputs and 64 outputs
+license: Apache-2.0
+signals:
+  - {signal_name: I0, direction: input, value_type: bool, index: 0}
+  - {signal_name: I1, direction: input, value_type: bool, index: 1}
+  - {signal_name: I2, direction: input, value_type: bool, index: 2}
+  - {signal_name: I3, direction: input, value_type: bool, index: 3}
+  - {signal_name: I4, direction: input, value_type: bool, index: 4}
+  - {signal_name: I5, direction: input, value_type: bool, index: 5}
+  - {signal_name: I6, direction: input, value_type: bool, index: 6}
+  - {signal_name: I7, direction: input, value_type: bool, index: 7}
+  - {signal_name: I8, direction: input, value_type: bool, index: 8}
+  - {signal_name: I9, direction: input, value_type: bool, index: 9}
+  - {signal_name: I10, direction: input, value_type: bool, index: 10}
+  - {signal_name: I11, direction: input, value_type: bool, index: 11}
+  - {signal_name: I12, direction: input, value_type: bool, index: 12}
+  - {signal_name: I13, direction: input, value_type: bool, index: 13}
+  - {signal_name: I14, direction: input, value_type: bool, index: 14}
+  - {signal_name: I15, direction: input, value_type: bool, index: 15}
+  - {signal_name: I16, direction: input, value_type: bool, index: 16}
+  - {signal_name: I17, direction: input, value_type: bool, index: 17}
+  - {signal_name: I18, direction: input, value_type: bool, index: 18}
+  - {signal_name: I19, direction: input, value_type: bool, index: 19}
+  - {signal_name: I20, direction: input, value_type: bool, index: 20}
+  - {signal_name: I21, direction: input, value_type: bool, index: 21}
+  - {signal_name: I22, direction: input, value_type: bool, index: 22}
+  - {signal_name: I23, direction: input, value_type: bool, index: 23}
+  - {signal_name: I24, direction: input, value_type: bool, index: 24}
+  - {signal_name: I25, direction: input, value_type: bool, index: 25}
+  - {signal_name: I26, direction: input, value_type: bool, index: 26}
+  - {signal_name: I27, direction: input, value_type: bool, index: 27}
+  - {signal_name: I28, direction: input, value_type: bool, index: 28}
+  - {signal_name: I29, direction: input, value_type: bool, index: 29}
+  - {signal_name: I30, direction: input, value_type: bool, index: 30}
+  - {signal_name: I31, direction: input, value_type: bool, index: 31}
+  - {signal_name: I32, direction: input, value_type: bool, index: 32}
+  - {signal_name: I33, direction: input, value_type: bool, index: 33}
+  - {signal_name: I34, direction: input, value_type: bool, index: 34}
+  - {signal_name: I35, direction: input, value_type: bool, index: 35}
+  - {signal_name: I36, direction: input, value_type: bool, index: 36}
+  - {signal_name: I37, direction: input, value_type: bool, index: 37}
+  - {signal_name: I38, direction: input, value_type: bool, index: 38}
+  - {signal_name: I39, direction: input, value_type: bool, index: 39}
+  - {signal_name: I40, direction: input, value_type: bool, index: 40}
+  - {signal_name: I41, direction: input, value_type: bool, index: 41}
+  - {signal_name: I42, direction: input, value_type: bool, index: 42}
+  - {signal_name: I43, direction: input, value_type: bool, index: 43}
+  - {signal_name: I44, direction: input, value_type: bool, index: 44}
+  - {signal_name: I45, direction: input, value_type: bool, index: 45}
+  - {signal_name: I46, direction: input, value_type: bool, index: 46}
+  - {signal_name: I47, direction: input, value_type: bool, index: 47}
+  - {signal_name: I48, direction: input, value_type: bool, index: 48}
+  - {signal_name: I49, direction: input, value_type: bool, index: 49}
+  - {signal_name: I50, direction: input, value_type: bool, index: 50}
+  - {signal_name: I51, direction: input, value_type: bool, index: 51}
+  - {signal_name: I52, direction: input, value_type: bool, index: 52}
+  - {signal_name: I53, direction: input, value_type: bool, index: 53}
+  - {signal_name: I54, direction: input, value_type: bool, index: 54}
+  - {signal_name: I55, direction: input, value_type: bool, index: 55}
+  - {signal_name: I56, direction: input, value_type: bool, index: 56}
+  - {signal_name: I57, direction: input, value_type: bool, index: 57}
+  - {signal_name: I58, direction: input, value_type: bool, index: 58}
+  - {signal_name: I59, direction: input, value_type: bool, index: 59}
+  - {signal_name: I60, direction: input, value_type: bool, index: 60}
+  - {signal_name: I61, direction: input, value_type: bool, index: 61}
+  - {signal_name: I62, direction: input, value_type: bool, index: 62}
+  - {signal_name: I63, direction: input, value_type: bool, index: 63}
+  - {signal_name: Q0, direction: output, value_type: bool, index: 0}
+  - {signal_name: Q1, direction: output, value_type: bool, index: 1}
+  - {signal_name: Q2, direction: output, value_type: bool, index: 2}
+  - {signal_name: Q3, direction: output, value_type: bool, index: 3}
+  - {signal_name: Q4, direction: output, value_type: bool, index: 4}
+  - {signal_name: Q5, direction: output, value_type: bool, index: 5}
+  - {signal_name: Q6, direction: output, value_type: bool, index: 6}
+  - {signal_name: Q7, direction: output, value_type: bool, index: 7}
+  - {signal_name: Q8, direction: output, value_type: bool, index: 8}
+  - {signal_name: Q9, direction: output, value_type: bool, index: 9}
+  - {signal_name: Q10, direction: output, value_type: bool, index: 10}
+  - {signal_name: Q11, direction: output, value_type: bool, index: 11}
+  - {signal_name: Q12, direction: output, value_type: bool, index: 12}
+  - {signal_name: Q13, direction: output, value_type: bool, index: 13}
+  - {signal_name: Q14, direction: output, value_type: bool, index: 14}
+  - {signal_name: Q15, direction: output, value_type: bool, index: 15}
+  - {signal_name: Q16, direction: output, value_type: bool, index: 16}
+  - {signal_name: Q17, direction: output, value_type: bool, index: 17}
+  - {signal_name: Q18, direction: output, value_type: bool, index: 18}
+  - {signal_name: Q19, direction: output, value_type: bool, index: 19}
+  - {signal_name: Q20, direction: output, value_type: bool, index: 20}
+  - {signal_name: Q21, direction: output, value_type: bool, index: 21}
+  - {signal_name: Q22, direction: output, value_type: bool, index: 22}
+  - {signal_name: Q23, direction: output, value_type: bool, index: 23}
+  - {signal_name: Q24, direction: output, value_type: bool, index: 24}
+  - {signal_name: Q25, direction: output, value_type: bool, index: 25}
+  - {signal_name: Q26, direction: output, value_type: bool, index: 26}
+  - {signal_name: Q27, direction: output, value_type: bool, index: 27}
+  - {signal_name: Q28, direction: output, value_type: bool, index: 28}
+  - {signal_name: Q29, direction: output, value_type: bool, index: 29}
+  - {signal_name: Q30, direction: output, value_type: bool, index: 30}
+  - {signal_name: Q31, direction: output, value_type: bool, index: 31}
+  - {signal_name: Q32, direction: output, value_type: bool, index: 32}
+  - {signal_name: Q33, direction: output, value_type: bool, index: 33}
+  - {signal_name: Q34, direction: output, value_type: bool, index: 34}
+  - {signal_name: Q35, direction: output, value_type: bool, index: 35}
+  - {signal_name: Q36, direction: output, value_type: bool, index: 36}
+  - {signal_name: Q37, direction: output, value_type: bool, index: 37}
+  - {signal_name: Q38, direction: output, value_type: bool, index: 38}
+  - {signal_name: Q39, direction: output, value_type: bool, index: 39}
+  - {signal_name: Q40, direction: output, value_type: bool, index: 40}
+  - {signal_name: Q41, direction: output, value_type: bool, index: 41}
+  - {signal_name: Q42, direction: output, value_type: bool, index: 42}
+  - {signal_name: Q43, direction: output, value_type: bool, index: 43}
+  - {signal_name: Q44, direction: output, value_type: bool, index: 44}
+  - {signal_name: Q45, direction: output, value_type: bool, index: 45}
+  - {signal_name: Q46, direction: output, value_type: bool, index: 46}
+  - {signal_name: Q47, direction: output, value_type: bool, index: 47}
+  - {signal_name: Q48, direction: output, value_type: bool, index: 48}
+  - {signal_name: Q49, direction: output, value_type: bool, index: 49}
+  - {signal_name: Q50, direction: output, value_type: bool, index: 50}
+  - {signal_name: Q51, direction: output, value_type: bool, index: 51}
+  - {signal_name: Q52, direction: output, value_type: bool, index: 52}
+  - {signal_name: Q53, direction: output, value_type: bool, index: 53}
+  - {signal_name: Q54, direction: output, value_type: bool, index: 54}
+  - {signal_name: Q55, direction: output, value_type: bool, index: 55}
+  - {signal_name: Q56, direction: output, value_type: bool, index: 56}
+  - {signal_name: Q57, direction: output, value_type: bool, index: 57}
+  - {signal_name: Q58, direction: output, value_type: bool, index: 58}
+  - {signal_name: Q59, direction: output, value_type: bool, index: 59}
+  - {signal_name: Q60, direction: output, value_type: bool, index: 60}
+  - {signal_name: Q61, direction: output, value_type: bool, index: 61}
+  - {signal_name: Q62, direction: output, value_type: bool, index: 62}
+  - {signal_name: Q63, direction: output, value_type: bool, index: 63}
+lanes:
+  # State and command at 200 Hz. A sample older than ten periods is stale.
+  real: {adapter: ros_io_bank, rate_hz: 200, input_maximum_age_ms: 50}

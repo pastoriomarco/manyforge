@@ -1,21 +1,17 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "lite6",
       "real-robot"
     ]
   },
-  "description": "Motion-free arm-only Program for a Real robot: Run exercises cycle admission and the measured arm state without dispatching a trajectory. Attended motion is prepared and approved separately through Robot Control.",
   "forest": [
     {
       "children": [],
@@ -26,10 +22,8 @@
       }
     }
   ],
-  "name": "lite6_real_arm_observation",
   "parameters": [],
   "positions": {},
-  "program_id": "lite6_real_arm_observation",
   "program_profile": "composable-cell-v1",
   "scene": [],
   "schema_version": "manyforge.composer_authoring_forest.v2"

@@ -28,3 +28,6 @@ manyforge_assistant_bridge/audit.log*
 .manyforge/
 .manyforge-dev/
 .manyforge-diagnostic/
+
+# Project folder of scripts/smoke-new-scenario-api.py (removed after a passing run)
+examples/.smoke-new-scenario-*/

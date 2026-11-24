@@ -45,7 +45,7 @@ def test_saved_empty_authoring_has_independent_saved_and_applied_baselines(tmp_p
     assert not workspace["hasUnsavedChanges"] and not workspace["hasUnappliedChanges"]
     assert not workspace["draft"]["candidateAvailable"]
     edited = session.retained_state()
-    edited["authoring"]["name"] = "Edited, not saved"
+    edited["authoring"]["parameters"][0]["default"] = 0.5  # edited, not saved
     edited["draft_revision"] += 1
     session.install_prepared_replacement(session.prepare_load_replacement(edited, catalog))
     workspace = session.workspace_snapshot(applied_authoring=empty)
@@ -67,7 +67,7 @@ def _program(*, metadata: dict | None = None) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, catalog)
 
@@ -80,7 +80,7 @@ def _program_with_instance_id(instance_id: str) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, catalog)
 
@@ -113,7 +113,7 @@ def _lite6_program_with_literal_tcp_limit(limit_mps: float = 0.14) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, catalog)
 
@@ -148,7 +148,7 @@ def test_prepared_program_replacement_is_deeply_immutable() -> None:
     with pytest.raises(TypeError):
         prepared.authoring["scene"][0]["scene_resource_id"] = "tampered"
     with pytest.raises(TypeError):
-        prepared.saved_document["name"] = "tampered"
+        prepared.saved_document["program_profile"] = "tampered"
 
     session.install_prepared_replacement(prepared)
     assert session.snapshot()["authoring"]["scene"][0]["scene_resource_id"] != (
@@ -173,7 +173,6 @@ def _pick_macro_arguments() -> dict:
         "carrier_frame_ref": _GRIPPER_TCP,
         "touch_bodies": [{"component_id": "lite_gripper", "collision_body_id": "gripper_collision"}],
         "tool_position": {"kind": "linear_m", "value_m": 0.0},
-        "contact_policy_id": "selected_object_grasp",
         "blackboard_namespace_id": "planning",
         "blackboard_key": "planning.pick_plan",
         "instance_prefix": "authored_pick",
@@ -261,141 +260,6 @@ def _node_policy_arguments(
         "recovery_policy": {"allow_intervention": True, "max_retries": 2},
         "operator_stop_policy": "hold",
     }
-
-
-def test_contact_policy_upsert_mints_identity_and_remove_is_atomic() -> None:
-    session = ComposerDraftSession(_pick_program())
-    policy = deepcopy(session.snapshot()["authoring"]["contact_policies"][0])
-    previous_version = policy.pop("version")
-    policy["zones"][0]["max_penetration_m"] = 0.003
-
-    result = _mutate(
-        session,
-        "program_draft_upsert_contact_policies",
-        {"contact_policies": [policy]},
-    )
-
-    stored = session.snapshot()["authoring"]["contact_policies"][0]
-    assert result.details == {
-        "inserted": [],
-        "updated": ["selected_object_grasp"],
-    }
-    assert stored["version"] != previous_version
-    assert stored["version"] == compute_content_identity(
-        stored,
-        own_field="version",
-        identity_domain="catalog-record-revision/contact_policy",
-        api_version="manyforge.contact_policy.v1",
-    )
-
-    removed = _mutate(
-        session,
-        "program_draft_remove_contact_policies",
-        {"contact_policy_ids": ["selected_object_grasp"]},
-    )
-    assert removed.details == {"removed": ["selected_object_grasp"]}
-    assert session.snapshot()["authoring"]["contact_policies"] == []
-
-
-def test_contact_policy_canonicalizes_motion_endpoint_pair_without_body_alias() -> None:
-    session = ComposerDraftSession(_pick_program())
-    policy = deepcopy(session.snapshot()["authoring"]["contact_policies"][0])
-    policy["zones"][0]["body_pairs"] = [{
-        "body_a": {"kind": "runtime_object", "runtime_object_id": "graspable"},
-        "body_b": {"kind": "motion_endpoint"},
-    }]
-
-    _mutate(
-        session,
-        "program_draft_upsert_contact_policies",
-        {"contact_policies": [policy]},
-    )
-
-    stored = session.snapshot()["authoring"]["contact_policies"][0]
-    assert stored["zones"][0]["body_pairs"] == policy["zones"][0]["body_pairs"]
-    assert stored["version"] != policy["version"]
-
-    invalid = deepcopy(stored)
-    invalid["zones"][0]["body_pairs"][0]["body_b"]["frame_role"] = "tcp"
-    before = session.retained_state()
-    with pytest.raises(DraftSessionError):
-        _mutate(
-            session,
-            "program_draft_upsert_contact_policies",
-            {"contact_policies": [invalid]},
-        )
-    assert session.retained_state() == before
-
-
-def _release_policy(policy: dict, **zone: object) -> dict:
-    """The selected grasp policy as a release policy with the given envelope."""
-
-    release = deepcopy(policy)
-    release.pop("version", None)
-    release["mode"] = "contact_release"
-    common = {
-        key: release["zones"][0][key]
-        for key in ("zone_id", "body_pairs", "violation_response")
-    }
-    release["zones"] = [{**common, **zone}]
-    return release
-
-
-def test_contact_policy_accepts_release_envelope_and_refuses_mixed_fields() -> None:
-    session = ComposerDraftSession(_pick_program())
-    grasp = session.snapshot()["authoring"]["contact_policies"][0]
-    signed = _release_policy(
-        grasp,
-        release_evidence_mode="signed_penetration",
-        enforce_max_start_penetration=True,
-        max_start_penetration_m=0.002,
-        min_release_progress_m=0,
-        release_tolerance_m=0.00001,
-        require_strictly_decreasing_penetration=True,
-        require_separation_by_end=True,
-        allow_recontact=False,
-    )
-
-    _mutate(session, "program_draft_upsert_contact_policies", {"contact_policies": [signed]})
-
-    stored = deepcopy(session.snapshot()["authoring"]["contact_policies"][0])
-    stored.pop("version")
-    assert stored == signed
-
-    invalid = [
-        # A release zone never carries the grasp envelope.
-        _release_policy(grasp, release_evidence_mode="signed_penetration", max_penetration_m=0.002),
-        # Binary evidence admits only neutral metric values.
-        _release_policy(grasp, release_evidence_mode="binary_contact", max_start_penetration_m=0.002),
-        _release_policy(grasp, release_evidence_mode="unknown"),
-        _release_policy(grasp, release_evidence_mode="signed_penetration", release_tolerance_m=1001),
-        _release_policy(grasp, release_evidence_mode="signed_penetration", allow_recontact=0),
-        # Malformed discriminators are refusals, never a TypeError.
-        _release_policy(grasp, release_evidence_mode=[]),
-        _release_policy(grasp, release_evidence_mode={}),
-        {**_release_policy(grasp, release_evidence_mode="signed_penetration"), "mode": []},
-        {**_release_policy(grasp, release_evidence_mode="signed_penetration"), "mode": {}},
-    ]
-    before = session.retained_state()
-    for policy in invalid:
-        with pytest.raises(DraftSessionError):
-            _mutate(session, "program_draft_upsert_contact_policies", {"contact_policies": [policy]})
-    assert session.retained_state() == before
-
-    # The grasp envelope keeps its approved bounds: no new upper penetration cap.
-    wide_grasp = deepcopy(grasp)
-    wide_grasp.pop("version", None)
-    wide_grasp["zones"][0]["max_penetration_m"] = 1500.0
-    _mutate(session, "program_draft_upsert_contact_policies", {"contact_policies": [wide_grasp]})
-
-    # Omitted binary metrics are the neutral values.
-    binary = _release_policy(
-        grasp,
-        release_evidence_mode="binary_contact",
-        require_separation_by_end=True,
-        allow_recontact=False,
-    )
-    _mutate(session, "program_draft_upsert_contact_policies", {"contact_policies": [binary]})
 
 
 def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> None:
@@ -537,7 +401,6 @@ def test_place_authoring_macro_expands_the_matching_ordinary_subtree() -> None:
         },
         approach_offset_m=[0.0, 0.0, 0.08],
     )
-    arguments.pop("contact_policy_id")
     arguments.pop("touch_bodies")
 
     result = _mutate(
@@ -642,7 +505,7 @@ def test_store_observed_move_updates_only_selected_node(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     session = ComposerDraftSession(Program.from_dict(document, catalog))
 
@@ -697,60 +560,6 @@ def test_store_observed_pose_replaces_old_goal_source_and_relative_target() -> N
         "kind": "program_parameter",
         "reference": "velocity_scale",
     }
-
-
-def test_support_contact_replacement_is_one_validated_draft_change() -> None:
-    session = ComposerDraftSession(_pick_program())
-    contact = {
-        "support_object_id": "ground",
-        "mode": "contact_release",
-        "release_evidence_mode": "binary_contact",
-        "require_separation_by_end": True,
-        "allow_recontact": False,
-    }
-
-    result = _mutate(
-        session,
-        "program_draft_replace_support_contacts",
-        {
-            "scene_resource_id": "graspable",
-            "support_contacts": [contact],
-        },
-    )
-
-    resource = next(
-        row
-        for row in session.snapshot()["authoring"]["scene"]
-        if row["scene_resource_id"] == "graspable"
-    )
-    assert result.details["support_contact_count"] == 1
-    assert resource["metadata"]["support_contacts"] == [contact]
-
-    invalid = _mutate(
-        session,
-        "program_draft_replace_support_contacts",
-        {
-            "scene_resource_id": "graspable",
-            "support_contacts": [{"support_object_id": "graspable"}],
-        },
-    )
-    assert invalid.snapshot["program"] is None
-    assert any(
-        "cannot name the supported object itself" in row["message"]
-        for row in invalid.snapshot["diagnostics"]
-    )
-
-    _mutate(
-        session,
-        "program_draft_replace_support_contacts",
-        {"scene_resource_id": "graspable", "support_contacts": []},
-    )
-    resource = next(
-        row
-        for row in session.snapshot()["authoring"]["scene"]
-        if row["scene_resource_id"] == "graspable"
-    )
-    assert "metadata" not in resource
 
 
 def test_session_is_an_unsaved_unapplied_in_memory_draft() -> None:
@@ -894,7 +703,7 @@ def test_saved_document_lifecycle_never_deepcopies_program_graph(
     retained_initial = deepcopy(session._saved_document)
 
     def corrupt_prepare(document: dict) -> tuple[Program, Program, object]:
-        document["name"] = "Corrupted callback copy"
+        document["program_profile"] = "Corrupted callback copy"
         raise RuntimeError("preparation failed")
 
     with pytest.raises(RuntimeError, match="preparation failed"):
@@ -1135,8 +944,8 @@ def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:
     authoring = created["draft"]["authoring"]
     assert created["draft"]["program"] is None
     assert created["draft"]["candidateAvailable"] is False
-    assert authoring["program_id"].startswith("program-")
-    assert len(authoring["program_id"]) == len("program-") + 32
+    # The Scenario names the Program (OD-369): the Draft carries no identity of its own.
+    assert not {"program_id", "name", "description"} & set(authoring)
     assert authoring["forest"] == []
     assert "component_roles" not in authoring and "target_roles" not in authoring
     assert {
@@ -1165,7 +974,7 @@ def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:
         applied_revision_reader=lambda: pytest.fail("confirmed replacement"),
         catalog_reader=lambda: catalog,
     )
-    assert second["draft"]["authoring"]["program_id"] != authoring["program_id"]
+    assert second["draft"]["draftId"] != created["draft"]["draftId"]
     assert second["draft"]["program"] is None
     assert second["draft"]["programRevision"] is None
 
@@ -2015,7 +1824,7 @@ def _lite6_document_with(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, catalog)
 
@@ -2216,7 +2025,7 @@ def test_pick_macro_children_inherit_unset_motion_fields() -> None:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     session = ComposerDraftSession(Program.from_dict(document, catalog))
 
@@ -2649,42 +2458,6 @@ def test_every_generated_draft_mutation_has_a_valid_atomic_path() -> None:
         },
     )
     invoke(
-        "program_draft_upsert_contact_policies",
-        {
-            "contact_policies": [
-                {
-                    "api_version": "manyforge.contact_policy.v1",
-                    "policy_id": "scratch_grasp",
-                    "mode": "contact_grasp",
-                    "sensing_mode": "geometry_only",
-                    "default_unmatched_response": "hard_stop",
-                    "zones": [
-                        {
-                            "zone_id": "fingertips",
-                            "body_pairs": [
-                                {
-                                    "body_a": {"kind": "motion_endpoint"},
-                                    "body_b": {
-                                        "kind": "runtime_object",
-                                        "runtime_object_id": "scratch_object",
-                                    },
-                                }
-                            ],
-                            "max_penetration_m": 0.002,
-                            "terminal_window_start_fraction": 0.8,
-                            "violation_response": "hard_stop",
-                        }
-                    ],
-                }
-            ]
-        },
-    )
-
-    invoke(
-        "program_draft_remove_contact_policies",
-        {"contact_policy_ids": ["scratch_grasp"]},
-    )
-    invoke(
         "program_draft_remove_parameters",
         {"parameter_ids": ["scratch_limit"]},
     )
@@ -2999,8 +2772,17 @@ def _rename_fixture_session() -> ComposerDraftSession:
     table = document["scene"][0]
     box = deepcopy(table)
     box["scene_resource_id"] = "box"
-    box["metadata"] = {"support_contacts": [{"support_object_id": "table"}]}
     document["scene"] = [box, table]
+    move = next(
+        node for node in document["tree"]["children"]
+        if node["node_id"] == "motion.move_to_joint_target"
+    )
+    move["parameters"]["collision_rules"] = [{
+        "rule_id": "rest_on_table",
+        "a": [{"kind": "active_tcp_contact_bodies"}],
+        "b": [{"kind": "scene_object", "scene_resource_id": "table"}],
+        "contact": {},
+    }]
     on_table = {
         "frame_ref": {"kind": "scene_resource", "scene_resource_id": "table"},
         "position_m": [0.0, 0.0, 0.1],
@@ -3037,7 +2819,7 @@ def _rename_fixture_session() -> ComposerDraftSession:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return ComposerDraftSession(Program.from_dict(document, catalog))
 
@@ -3055,8 +2837,9 @@ def test_scene_rename_updates_every_reference_in_one_revision() -> None:
     assert session.revision == revision + 1
     authoring = session.snapshot()["authoring"]
     assert [row["scene_resource_id"] for row in authoring["scene"]] == ["a_table", "box"]
-    assert authoring["scene"][1]["metadata"]["support_contacts"] == [
-        {"support_object_id": "a_table"}
+    move = authoring["forest"][0]["children"][0]
+    assert move["parameters"]["collision_rules"][0]["b"] == [
+        {"kind": "scene_object", "scene_resource_id": "a_table"}
     ]
     assert authoring["viewer"]["scene_resource_visibility"] == {"a_table": False, "box": True}
     assert authoring["parameters"][-1]["default"] == "a_table"
@@ -3115,6 +2898,17 @@ def test_scene_rename_renames_deployment_pose_links_and_contact_inputs() -> None
             {"configuration": {"runtime_configuration": {"io_signals": [
                 {"provider": {"profile": "geometric_contact", "target_scene_resource_id": "table"}},
             ]}}},
+            {"component_id": "tool_io", "mock_inputs": [
+                {"signal_name": "TI0", "geometric_contact": {
+                    "robot_component_id": "arm",
+                    "a": [{"kind": "attached_object", "component_id": "arm"}],
+                    "b": [{"kind": "scene_object", "scene_resource_id": "table"},
+                          {"kind": "scene_object", "scene_resource_id": "box"}],
+                }},
+                {"signal_name": "TI1",
+                 "spring_slider": {"component_id": "holder", "element_id": "rod"},
+                 "b": [{"kind": "scene_object", "scene_resource_id": "table"}]},
+            ]},
         ],
     }
 
@@ -3128,5 +2922,43 @@ def test_scene_rename_renames_deployment_pose_links_and_contact_inputs() -> None
     provider = renamed["components"][0]["configuration"]["runtime_configuration"][
         "io_signals"][0]["provider"]
     assert provider["target_scene_resource_id"] == "a_table"
-    assert len(paths) == 3
+    # OD-371 side fix: the Mock inputs' Scene object selections follow too.
+    mock_inputs = renamed["components"][1]["mock_inputs"]
+    assert [row["scene_resource_id"] for row in mock_inputs[0]["geometric_contact"]["b"]] == [
+        "a_table", "box"
+    ]
+    assert mock_inputs[1]["b"] == [{"kind": "scene_object", "scene_resource_id": "a_table"}]
+    assert "components[1].mock_inputs[1].b[0].scene_resource_id" in paths
+    assert len(paths) == 5
     assert document["policies"]["scene_pose_sources"][0]["scene_resource_id"] == "table"
+
+
+def test_component_replace_rewrites_every_program_reference() -> None:
+    """OD-367: Replace tool rewrites every typed reference to the old tool's
+    component id (targets, frames, collision bodies) and lists what they name."""
+
+    import json
+
+    session = ComposerDraftSession(Program(_LITE6_PROGRAM_PATH, build_node_environment().catalog))
+    revision = session.revision
+
+    result = _mutate(
+        session,
+        "program_draft_replace_component",
+        {"component_id": "lite_gripper", "replacement_component_id": "probe"},
+    )
+
+    assert session.revision == revision + 1
+    forest = json.dumps(session.snapshot()["authoring"]["forest"])
+    assert '"component_id": "lite_gripper"' not in forest
+    assert forest.count('"component_id": "probe"') == len(result.details["references"]) == 8
+    assert result.details["used"] == {
+        "collisionBodies": ["gripper_collision"],
+        "commandTargets": ["gripper"],
+        "frames": ["tcp"],
+    }
+    # The robot's references stay.
+    assert '"component_id": "lite6_robot"' in forest
+    # Internal: not offered as a browser or assistant mutation.
+    assert "program_draft_replace_component" not in SUPPORTED_DRAFT_MUTATIONS
+    assert "program_draft_replace_component" not in OPERATOR_DRAFT_MUTATIONS

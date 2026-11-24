@@ -254,6 +254,9 @@ struct RetainedExecutionHostInput final {
       ordinary_motion_jerk{};
   /// Cell-wide render wake shared by independently owned robot channels.
   std::shared_ptr<RetainedObservationWake> observation_wake{};
+  /// The cell's observed-state sources for this robot's Kernel: the other
+  /// components are placed where they are observed. Empty: none.
+  std::shared_ptr<const core::CellModelStateHandle> cell_model_state{};
   /// When set, the Deployment-authored fault Stop profile
   /// below is the motion target's fault profile, read directly (absent means
   /// no fault profile); nothing is derived from the operator profile. Unset

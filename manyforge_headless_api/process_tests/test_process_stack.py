@@ -25,6 +25,14 @@ from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClien
 from manyforge_headless_api.manager import ManagerCommandClient
 from manyforge_headless_api.models import ManagerDeploymentCandidatePreviewRequest, PreparedScenarioOrigin
 from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
+from manyforge_operator.filesystem_roots import (
+    filesystem_roots_value,
+    launch_filesystem_roots,
+    shipped_content_roots,
+)
+
+# ManyForge's own content root: this checkout.
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
 CATALOG = Path("/workspace/manyforge_headless/resources/operator-alarm-catalog.v1.yaml")
@@ -225,7 +233,6 @@ class ProcessStack:
             self.artifact_root,
         ):
             path.mkdir()
-        self.scene_database = root / "logical-scene.sqlite3"
         self.program_cycle_journal = root / "program-cycle.sqlite3"
         self.program_runner_liveness_socket = self.manager_run_root / "program-runner-liveness.sock"
         self.history_directory = root / "history"
@@ -332,8 +339,6 @@ class ProcessStack:
             str(self.execution_state_root),
             "--execution-run-root",
             str(self.execution_run_root),
-            "--logical-scene-database",
-            str(self.scene_database),
             "--application-processes",
             str(application_processes),
             "--reconciliation-period-ms",
@@ -589,8 +594,12 @@ class ProcessStack:
             command.extend(("--program-path", str(self.program_path)))
         environment = os.environ.copy()
         if self.composer_fs_roots is not None:
-            environment["MANYFORGE_FS_ROOTS"] = ",".join(
-                str(path) for path in self.composer_fs_roots
+            # ManyForge's shipped content (examples and their model sources)
+            # is always allowed, as in every launch.
+            environment["MANYFORGE_FS_ROOTS"] = filesystem_roots_value(
+                launch_filesystem_roots(
+                    *self.composer_fs_roots, *shipped_content_roots(_REPOSITORY_ROOT)
+                )
             )
         self.composer = subprocess.Popen(
             command,
@@ -799,7 +808,7 @@ def _assistant_stack(
             # stored values whose summary equals the request exactly.
             scenario_id = startup_scenario or "assistant_native_process_fixture"
             prepared_activation = dict(metadata["prepared_activations"][scenario_id])
-            assert prepared_activation["program_id"] == fixture_program["program_id"]
+            assert prepared_activation["program_revision"] == fixture_program["program_revision"]
             assert prepared_activation["node_environment_digest"] == environment_digest
             origin = PreparedScenarioOrigin.model_validate(prepared_activation["origin"])
             assert origin.scenario_id == scenario_id
@@ -808,7 +817,6 @@ def _assistant_stack(
                 "request_key": _request_key(),
                 "application_start_id": stack.application_start_id,
                 "source_label": "assistant_native_process_test",
-                "deployment_artifact_id": metadata["physical_deployment_artifact_id"],
                 "deployment_revision": metadata["physical_deployment_revision"],
                 "expected_current": {
                     "graph_revision": metadata["predecessor_graph_revision"],
@@ -824,7 +832,6 @@ def _assistant_stack(
             # Headless preview correctly requires a registered preparation.
             preview = ManagerCommandClient(stack.manager_run_root).preview_deployment_candidate(
                 ManagerDeploymentCandidatePreviewRequest.model_validate({
-                    "deployment_artifact_id": apply_body["deployment_artifact_id"],
                     "deployment_revision": apply_body["deployment_revision"],
                     "candidate_retained_bundle_id": prepared_activation["retained_bundle_id"],
                     "candidate_graph_revision": prepared_activation["graph_revision"],
@@ -940,7 +947,6 @@ def _unavailable_candidate_preview(
     # any public Apply can obtain a candidate receipt.
     return ManagerCommandClient(manager_run_root).preview_deployment_candidate(
         ManagerDeploymentCandidatePreviewRequest.model_validate({
-            "deployment_artifact_id": "candidate",
             "deployment_revision": "sha256:" + "a" * 64,
             "candidate_retained_bundle_id": "sha256:" + "b" * 64,
             "candidate_graph_revision": "sha256:" + "c" * 64,
@@ -2006,8 +2012,6 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
     # retention of the real empty model map; this test supplies no sealed DTO.
     authoring = empty_authoring(NodeCatalog(NODE_CATALOG))
     authoring.update({
-        "program_id": "logical_process_program",
-        "name": "Logical process Program",
         # A Scenario's Program states its assistant disposition.
         "compatibility": {"assistant": "forbidden"},
         "forest": [{"node_id": "timer", "instance_id": "logical.wait",
@@ -2020,9 +2024,8 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
             scenario_id=scenario_id, name=scenario_id, description="",
             program_draft=authoring,
             deployment_draft={
-                "api_version": "manyforge.deployment_intent.v2",
-                "deployment_artifact_id": "logical_process_deployment",
-                "name": "Logical process Deployment",
+                "api_version": "manyforge.deployment_intent.v3",
+                "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
                 "attachments": [], "components": [], "policies": {},
             },
             manyforge_version="0.1.0", last_known_status="ready",
@@ -2063,15 +2066,14 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
             assert headless.components() == [], loaded
             applied = composer.program_applied()
             assert applied["scenario_id"] == scenario_id, applied
-            assert applied["program_id"] == authoring["program_id"], applied
             active = headless.manager_status()["status"]["active"]
             assert applied["retained_bundle_id"] == active["retained_bundle_id"], (applied, active)
             selected = headless.program_applied_status()
             assert selected["executable"] is True and selected["non_executable"] is None, selected
-            assert selected["program_id"] == applied["program_id"], selected
+            assert selected["program_revision"] == applied["program_revision"], selected
             assert selected["program_binding_id"] == applied["program_binding_id"], selected
             assert selected["program"] is None, selected
-            assert applied["program"]["api_version"] == "manyforge.program.v3", applied
+            assert applied["program"]["api_version"] == "manyforge.program.v4", applied
             assert "component_roles" not in applied["program"], applied
             assert "target_roles" not in applied["program"], applied
             graph = headless.manager_graph()["cell_graph"]
@@ -2080,7 +2082,7 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
             binding = applied["program_binding"]
             assert binding["program_binding_id"] == applied["program_binding_id"], binding
             assert binding["program_revision"] == applied["program_revision"], binding
-            assert binding["api_version"] == "manyforge.program_binding.v3", binding
+            assert binding["api_version"] == "manyforge.program_binding.v4", binding
             assert binding["component_bindings"] == [], binding
             assert binding["target_bindings"] == [], binding
             stack.wait_authoring_admission(expected_allowed=True)
@@ -2094,7 +2096,6 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
             })
             started = _started_run(*_runner_command_end(headless, reply, timeout_seconds=10.0))
             capture = started["capture"]
-            assert capture["program_id"] == applied["program_id"], started
             assert capture["program_revision"] == applied["program_revision"], started
             assert capture["program_binding_id"] == applied["program_binding_id"], started
             deadline = time.monotonic() + 10.0

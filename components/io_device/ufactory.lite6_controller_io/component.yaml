@@ -4,7 +4,7 @@
 # lanes: the host's Mock I/O (outputs read back). Declared I/O only: the
 # controller accepts writes to missing outputs.
 # Lite 6 control box: CI0-CI7, CO0-CO7.
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: io_device
 id: ufactory.lite6_controller_io
 version: 1.0.0

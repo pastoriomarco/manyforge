@@ -80,6 +80,11 @@
           "asset_collision_body_role_id": "arm_collision",
           "collision_body_role_id": "arm_collision",
           "model_role_id": "arm_model"
+        },
+        {
+          "asset_collision_body_role_id": "default_collision",
+          "collision_body_role_id": "default_collision",
+          "model_role_id": "arm_model"
         }
       ],
       "command_target_id": "arm",
@@ -119,7 +124,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "lite6.component",
-  "component_type_revision": "sha256:23a35c0bafa074d08cdf9d1f177a25dbe319b2efed3456f6fd633838529a1587",
+  "component_type_revision": "sha256:9b976941a2736ad620f80a258e93718c83b5bdc7ac40b3aa64b7cd3ec91d8428",
   "model_mounts": [],
   "model_roles": [
     {

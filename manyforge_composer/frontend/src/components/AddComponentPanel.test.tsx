@@ -5,7 +5,7 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { JsonValue } from '../types/api';
 import type { ComponentCatalog, ComponentCatalogEntry } from '../types/componentCatalog';
 import { reactPropsHost, type MountedProps } from '../test/reactPropsHost';
-import { AddComponentPanel } from './AddComponentPanel';
+import { AddComponentPanel, vendorLabel } from './AddComponentPanel';
 
 const robotRow = {
   component_id: 'lite6_robot',
@@ -29,7 +29,7 @@ const robot: ComponentCatalogEntry = {
   componentProfileId: 'lite6_mock_commanded_v0',
   modelFamilyId: 'lite6',
   tags: ['articulated-arm'],
-  lane: 'manyforge-only',
+  lane: 'mock',
   description: 'Mock Lite6',
   sources: ['examples/mock_lite6_pick_and_place.scenario'],
   components: [robotRow],
@@ -57,7 +57,7 @@ const tool: ComponentCatalogEntry = {
   componentProfileId: 'lite_gripper_v0',
   modelFamilyId: 'lite_gripper',
   tags: ['gripper', 'tool'],
-  lane: 'manyforge-only',
+  lane: 'mock',
   description: 'Lite gripper',
   sources: ['examples/mock_lite6_pick_and_place.scenario'],
   components: [toolRow],
@@ -143,13 +143,11 @@ const catalog: ComponentCatalog = {
 afterEach(() => vi.unstubAllGlobals());
 
 async function mount(components: JsonValue[], {
-  apiVersion = 'manyforge.deployment_intent.v2',
+  apiVersion = 'manyforge.deployment_intent.v3',
   attachments = [] as JsonValue[],
 } = {}) {
   const document = {
     api_version: apiVersion,
-    deployment_artifact_id: 'cell',
-    name: 'Cell',
     components,
     attachments,
     policies: {},
@@ -302,6 +300,17 @@ describe('Add component', () => {
     } finally { await mounted.unmount(); }
   });
 
+  it('proposes a frame prefix for a different model once the cell holds one (OD-349)', async () => {
+    const other = { ...robotRow, component_id: 'uf850_robot', model_source: { urdf: { project_path: 'uf850.urdf' }, package_roots: {} } };
+    const mounted = await mount([other]);
+    try {
+      await mounted.click('Add component');
+      await mounted.pick();
+      expect(mounted.control('Component id for lite6_robot').value).toBe('lite6_robot');
+      expect(mounted.control('New component frame prefix').value).toBe('lite6_robot/');
+    } finally { await mounted.unmount(); }
+  });
+
   it('proposes a free id and a frame prefix for a second copy of the same model', async () => {
     const mounted = await mount([robotRow]);
     try {
@@ -353,7 +362,8 @@ describe('Add component', () => {
       expect(mounted.all((props) => props['aria-label'] === 'New component base x')).toEqual([]);
       await mounted.click('Add to Draft');
       expect(mounted.controller.addComponents).toHaveBeenCalledExactlyOnceWith(
-        [{ ...toolRow, frame_prefix: '' }],
+        // A further model in the cell gets its own frame prefix (OD-349).
+        [{ ...toolRow, frame_prefix: 'lite_gripper/' }],
         [mountRow('lite6_robot', 'lite_gripper')],
       );
       expect(vi.mocked(mounted.controller.addComponents).mock.calls[0][0][0])
@@ -425,7 +435,24 @@ describe('Add component', () => {
     }
   });
 
-  it('refuses a tool when no robot flange is free (one tool per flange)', async () => {
+  it('adds a tool not mounted yet: no attachment row and no root pose (OD-366)', async () => {
+    const mounted = await mount([robotRow]);
+    try {
+      await mounted.click('Add component');
+      await mounted.kind('Tool');
+      await mounted.pick();
+      expect(mounted.find((props) => props.value === '' && props.children === 'Not mounted yet')).toBeDefined();
+      await mounted.type('New tool mount', '');
+      await mounted.click('Add to Draft');
+      const [rows, attachments] = vi.mocked(mounted.controller.addComponents).mock.calls[0];
+      expect(attachments).toEqual([]);
+      expect(rows).toEqual([{ ...toolRow, frame_prefix: 'lite_gripper/' }]);
+      expect(rows[0]).not.toHaveProperty('root_pose_in_cell');
+      expect(mounted.onAdded).toHaveBeenCalledExactlyOnceWith('lite_gripper');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('adds a tool not mounted yet when no robot flange is free (one tool per flange)', async () => {
     const mounted = await mount([robotRow, toolRow], { attachments: [mountRow('lite6_robot', 'lite_gripper')] });
     try {
       await mounted.click('Add component');
@@ -435,8 +462,10 @@ describe('Add component', () => {
       expect(mounted.control('New component frame prefix').value).toBe('lite_gripper_2/');
       expect(mounted.control('New tool mount').value).toBe('');
       await mounted.click('Add to Draft');
-      expect(mounted.controller.addComponents).not.toHaveBeenCalled();
-      expect(alerts(mounted.all).join()).toContain('free flange');
+      const [rows, attachments] = vi.mocked(mounted.controller.addComponents).mock.calls[0];
+      expect(attachments).toEqual([]);
+      expect(rows[0].component_id).toBe('lite_gripper_2');
+      expect(alerts(mounted.all)).toEqual([]);
     } finally { await mounted.unmount(); }
   });
 
@@ -447,5 +476,15 @@ describe('Add component', () => {
       expect(button.disabled).toBe(true);
       expect(String(button.title)).toContain('Scenario Deployment');
     } finally { await mounted.unmount(); }
+  });
+});
+
+describe('vendorLabel', () => {
+  it('names the vendor of a model id prefix, capitalises an unknown one and groups an id without one under Other', () => {
+    expect(vendorLabel('ufactory.lite_gripper')).toBe('UFACTORY');
+    expect(vendorLabel('robotiq.robotiq_2f_140')).toBe('Robotiq');
+    expect(vendorLabel('manyforge.tool')).toBe('ManyForge');
+    expect(vendorLabel('acme.vice')).toBe('Acme');
+    expect(vendorLabel('lite6_mock_commanded_v0')).toBe('Other');
   });
 });

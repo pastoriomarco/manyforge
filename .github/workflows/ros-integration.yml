@@ -1,12 +1,15 @@
 name: ros-integration
 
-# ROS tier (OD-315): nightly (on dev) and on demand. Runs the ROS integration
-# graph (`test-all.sh ros`) and the ros2_control Mock-lane cell (`test-all.sh
-# ros-e2e`) in the reference ROS image that ros-image.yml published for this
-# commit's inputs, pulled by digest. It never builds that image.
+# ROS tier (OD-315): after each successful ros-image.yml run (a release tag
+# push) on the commit that image was built for, and on demand. Runs the ROS
+# integration graph (`test-all.sh ros`) and the ros2_control Mock-lane cell
+# (`test-all.sh ros-e2e`) in the reference ROS image ros-image.yml published for
+# the commit's inputs, pulled by digest. It never builds that image, so it does
+# not run nightly on dev, whose image inputs may have no published image.
 on:
-  schedule:
-    - cron: "0 4 * * *"
+  workflow_run:
+    workflows: [ros-image]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -17,16 +20,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  dev-changed:
-    uses: ./.github/workflows/nightly-dev-changed.yml
-    permissions:
-      contents: read
-      actions: read
-
   ros:
     name: ROS ${{ matrix.suite }} (AMD64 Docker)
-    needs: dev-changed
-    if: needs.dev-changed.outputs.run == 'true'
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:
@@ -42,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+          ref: ${{ github.event.workflow_run.head_sha || '' }}
 
       - name: Free runner disk before image pull
         run: |
@@ -125,12 +121,18 @@ jobs:
           path: ${{ env.CCACHE_HOST_DIR }}
           key: ccache-ros-${{ matrix.suite }}-${{ github.run_id }}
 
+      # upload-artifact refuses a path with `..`: resolve it first.
+      - name: Resolve the Mock-cell evidence folder
+        id: evidence
+        if: ${{ failure() && matrix.suite == 'ros-e2e' }}
+        run: echo "path=$(realpath -m "$BUILD_HOST_DIR/ros-e2e-evidence")" >> "$GITHUB_OUTPUT"
+
       - name: Upload Mock-cell evidence
         if: ${{ failure() && matrix.suite == 'ros-e2e' }}
         uses: actions/upload-artifact@v4
         with:
           name: ros-e2e-evidence
-          path: ${{ env.BUILD_HOST_DIR }}/ros-e2e-evidence
+          path: ${{ steps.evidence.outputs.path }}
           if-no-files-found: ignore
           retention-days: 7
 

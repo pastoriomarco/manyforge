@@ -36,7 +36,7 @@ afterEach(() => vi.unstubAllGlobals());
 async function mount(policies: Record<string, JsonValue>, sceneResourceId = 'cheese') {
   const controller = {
     workspace: { draft: { document: {
-      api_version: 'manyforge.deployment_intent.v2', components: [isaac, camera], policies,
+      api_version: 'manyforge.deployment_intent.v3', components: [isaac, camera], policies,
     } } },
     mutationAvailable: true, busy: false, loading: false,
     mutate: vi.fn().mockResolvedValue({}),

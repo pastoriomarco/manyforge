@@ -538,11 +538,14 @@ enum class SrdfExpansionProvenanceKind : std::uint8_t {
   kChainLink,
   kChainJoint,
   kSubgroup,
+  /// The child link of a joint listed directly in the group, as in MoveIt.
+  kJointChildLink,
 };
 
 /// One node in a compact, bounded SRDF expansion-provenance DAG.
 ///
-/// Direct/chain nodes identify the authored member that contributed a symbol.
+/// Direct/chain nodes identify the authored member that contributed a symbol;
+/// a joint-child-link node names the child link the listed joint brings in.
 /// A subgroup node identifies the authored subgroup inclusion and points to
 /// the child's provenance node. Following `nested_provenance_index` therefore
 /// reconstructs the complete inclusion path without copying path strings

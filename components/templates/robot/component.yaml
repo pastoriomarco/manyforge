@@ -2,7 +2,7 @@
 # Guide: docs/authoring/ADDING_A_COMPONENT.md. Replace every <TODO>,
 # put the URDF, SRDF, meshes/ and licenses/ in this folder, then run
 #   scripts/manyforge component check <this folder>
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: robot
 id: __ID__
 version: 1.0.0
@@ -24,8 +24,10 @@ roles:
     arm: <TODO>                   # SRDF group of the arm joints
   joints:
     arm_joints: [<TODO>]          # commanded arm joints, base to tip
-  collision_bodies:
-    arm_collision: [<TODO>]       # arm links
+  collision_bodies:               # names for parts; every link with <collision> is checked,
+                                  # links named in none go to `default_collision`; each named
+                                  # link must have <collision> geometry
+    arm_collision: [<TODO>]       # arm links: name every link with <collision>
 tcps:                             # the first is the default TCP; each id is its name
   - {id: flange, frame: <TODO>}   # usually the flange link
 limits:
@@ -44,3 +46,4 @@ lanes:
 defaults:
   initial_joint_positions_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # one per arm joint
   maximum_tcp_linear_speed_mps: 0.15
+  controlled_stop_max_deceleration_rad_s2: <TODO per-joint Stop deceleration in rad/s^2, e.g. the vendor MoveIt joint_limits.yaml max_acceleration>

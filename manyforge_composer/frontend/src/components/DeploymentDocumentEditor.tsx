@@ -218,8 +218,7 @@ const PREFERRED_SECTIONS = [
 ] as const;
 
 const IDENTITY_FIELDS = [
-  'api_version', 'name', 'description', 'cell_id',
-  'deployment_artifact_id', 'deployment_revision', 'compatibility',
+  'api_version', 'cell_id', 'deployment_revision', 'compatibility',
 ];
 
 export function DeploymentDocumentEditor({

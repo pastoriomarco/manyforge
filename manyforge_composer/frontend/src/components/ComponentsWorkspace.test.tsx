@@ -61,9 +61,7 @@ function deploymentController(components: JsonValue[], appliedIds: string[]) {
       draft: {
         id: 'draft', revision: 1,
         document: {
-          api_version: 'manyforge.deployment_intent.v2',
-          deployment_artifact_id: 'cell-a',
-          name: 'Cell A',
+          api_version: 'manyforge.deployment_intent.v3',
           components,
           attachments: [],
           policies: {},
@@ -81,6 +79,7 @@ function deploymentController(components: JsonValue[], appliedIds: string[]) {
     mutate: vi.fn().mockResolvedValue({}),
     updateMotionTargetLimit: vi.fn(),
     addComponents: vi.fn(),
+    removeComponent: vi.fn().mockResolvedValue({}),
   } as unknown as DeploymentWorkspaceController;
 }
 
@@ -183,7 +182,7 @@ describe('Components section', () => {
       child: { component_id: 'hand', interface: 'mount' },
     }];
     // The list is one tree (robot, then its tool): open the tool's page.
-    const page = async (facts: Pick<ComponentProfileFacts, 'payload'>) => {
+    const page = async (facts: Pick<ComponentProfileFacts, 'payload' | 'lanes'>) => {
       const { host, find, all } = reactPropsHost();
       const { createRoot } = await import('react-dom/client');
       const root = createRoot(host as unknown as Element);
@@ -211,6 +210,8 @@ describe('Components section', () => {
           title: text(find((candidate) => candidate.id === 'component-page-title').children),
           texts: all((candidate) => candidate.children !== undefined).map((candidate) => text(candidate.children)),
           payload: all((candidate) => candidate['aria-label'] === 'hand payload'),
+          lane: all((candidate) => candidate['aria-label'] === 'hand lane')
+            .map((candidate) => ({ text: text(candidate.children) })),
           controls: all((candidate) => candidate.onClick !== undefined || candidate.onChange !== undefined)
             .map((candidate) => String(candidate['aria-label'] ?? candidate.title ?? '')),
         };
@@ -229,6 +230,18 @@ describe('Components section', () => {
     const none = await page({});
     expect(none.texts).toContain('0 kg (the model defines none)');
     expect(none.texts.some((value) => value.startsWith('Centre of mass'))).toBe(false);
+
+    // OD-336: a passive tool (no lanes) runs on every lane, and its payload is
+    // read from its own URDF at Load.
+    const passive = await page({ lanes: [] });
+    // A text, not a lane select: no control carries the lane label.
+    expect(passive.lane.map((row) => row.text)).toEqual(['Every lane']);
+    expect(passive.controls).not.toContain('hand lane');
+    expect(passive.texts).toContain("From the inertials of this component's URDF (0 kg without one)");
+    expect(passive.texts.some((value) => value.startsWith('A passive tool\'s mass'))).toBe(true);
+    expect(passive.texts).not.toContain('0 kg (the model defines none)');
+    // A tool with lanes keeps its lane choice.
+    expect((await page({ lanes: ['mock'] })).controls).toContain('hand lane');
   });
 
   it('warns on the robot\'s page while its flange tool has no TCP (B-run-1)', () => {
@@ -358,11 +371,10 @@ describe('Components section', () => {
       expect(vi.mocked(controller.mutate).mock.calls.length).toBe(calls);
       expect(find((candidate) => candidate.role === 'alert').children)
         .toBe('Each line must name two links: the tool link, then the parent link.');
-      // Preview shows the per-component impact; Apply goes through the confirmed Apply.
+      // Preview shows the per-component impact; Apply is only the top bar's.
       await act(() => find((candidate) => candidate.type === 'button' && candidate.children === 'Preview').onClick?.());
       expect(controller.previewApply).toHaveBeenCalledOnce();
-      await act(() => find((candidate) => candidate.type === 'button' && candidate.children === 'Apply…').onClick?.());
-      expect(controller.applyDraft).toHaveBeenCalledOnce();
+      expect(controller.applyDraft).not.toHaveBeenCalled();
       // The robot's page: lane among the model's lanes, base pose with orientation, Remove.
       await act(() => find((candidate) => candidate.type === 'button' && candidate.title === 'Applied').onClick?.());
       await act(() => find((candidate) => candidate['aria-label'] === 'robot lane')
@@ -380,11 +392,8 @@ describe('Components section', () => {
       expect(xyzw[3]).toBeCloseTo(Math.SQRT1_2);
       await act(() => find((candidate) => candidate.type === 'button'
         && candidate.children === 'Remove from Draft').onClick?.());
-      // Its attachment row goes first, then the component.
-      expect(vi.mocked(controller.mutate).mock.calls.slice(-2)).toEqual([
-        [['attachments'], 'set', []],
-        [['components', 0], 'remove'],
-      ]);
+      // The component and its attachment rows leave in one Draft edit.
+      expect(controller.removeComponent).toHaveBeenCalledWith('robot');
     } finally { await act(() => root.unmount()); }
   });
 });

@@ -86,7 +86,6 @@ make_binding(CoordinateKind kind, std::string target = "gripper.target",
         RuntimeUnitId("runtime.native"), RuntimeEpoch("runtime-epoch.1")});
   }
   RuntimeParticipantBindingDTO value{
-      ProgramId("program.native"),
       ProgramRevision("program-revision"),
       ProgramBindingId("program-binding"),
       RetainedBundleId("bundle"),
@@ -2657,7 +2656,7 @@ TEST(RetainedGripperRuntimeTest,
       const auto& schema = *value.command_schema;
       OperationIntentDTO intent{
           {TestRequestKey("request.feedback.command"), "alias owner test"},
-          value.program_id, value.program_revision, value.program_binding_id,
+          value.program_revision, value.program_binding_id,
           // Manual work: no Program run claims it, so it names none.
           std::nullopt, value.graph_revision, value.retained_bundle_id,
           std::nullopt,

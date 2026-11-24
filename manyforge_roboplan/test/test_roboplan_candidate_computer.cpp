@@ -2051,5 +2051,232 @@ TEST(RoboPlanCandidateComputerTest,
   EXPECT_LE(peak, limit * (1.0 + 1e-3));
 }
 
+// OD-341: a linear pose goal is the strict line from the request's own start
+// state's TCP pose to the goal, planned as the two-waypoint Cartesian path.
+TEST(RoboPlanCandidateComputerTest,
+     LinearPoseGoalPlansTheStraightLineFromItsStartState) {
+  auto fixture = make_fixture();
+  fixture.start = fixture.goal;  // away from the start's singularity
+  const Eigen::Matrix4d start =
+      fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+  Eigen::Matrix4d end = start;
+  end(0, 3) += 0.02;
+  end(2, 3) -= 0.01;
+  RoboPlanCandidateComputer computer(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  const auto input = request(
+      fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(end), LinearPoseMotionDTO{}}});
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().cartesian_fidelity_metrics.has_value());
+  EXPECT_LE(result.value().cartesian_fidelity_metrics->certified_max_translation_error_m,
+            input.tolerances.translation_tol_m);
+  const auto &milestones = result.value().cartesian_waypoint_times_s;
+  ASSERT_EQ(milestones.size(), 2U);
+  EXPECT_DOUBLE_EQ(milestones.front(), 0.0);
+  EXPECT_DOUBLE_EQ(milestones.back(),
+                   result.value().waypoints.back().time_from_start_s);
+
+  // Every sample stays on the segment start -> end within the tolerance.
+  const Eigen::Vector3d a = start.block<3, 1>(0, 3);
+  const Eigen::Vector3d b = end.block<3, 1>(0, 3);
+  const auto tcp = [&](const std::vector<double> &positions) {
+    const auto q = Eigen::Map<const Eigen::VectorXd>(
+        positions.data(), static_cast<Eigen::Index>(positions.size()));
+    return fixture.scene
+        ->forwardKinematics(fixture.scene->toFullJointPositions("arm", q),
+                            "tool0", "base")
+        .eval();
+  };
+  for (const auto &waypoint : result.value().waypoints) {
+    const Eigen::Vector3d p = tcp(waypoint.positions_rad).block<3, 1>(0, 3);
+    const double s = std::clamp((p - a).dot(b - a) / (b - a).squaredNorm(), 0.0, 1.0);
+    EXPECT_LE((p - (a + s * (b - a))).norm(), input.tolerances.translation_tol_m);
+  }
+  const auto final_tcp = tcp(result.value().waypoints.back().positions_rad);
+  EXPECT_LE((final_tcp.block<3, 1>(0, 3) - b).norm(),
+            input.tolerances.translation_tol_m);
+
+  // The same line authored as a Cartesian path from the same start plans alike.
+  CartesianPathDTO path;
+  path.waypoints = {pose(start), pose(end)};
+  const auto as_path = computer.compute(request(fixture, path));
+  ASSERT_TRUE(as_path.ok()) << as_path.error().message;
+  EXPECT_NEAR(as_path.value().waypoints.back().time_from_start_s,
+              result.value().waypoints.back().time_from_start_s, 1e-6);
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     LinearPoseGoalRefusesAnUnreachableLineWithACartesianErrorNotAJointPlan) {
+  auto fixture = make_fixture();
+  fixture.start = fixture.goal;
+  Eigen::Matrix4d end =
+      fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+  end(0, 3) += 5.0;  // far outside the arm's reach
+  RoboPlanCandidateComputer computer(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  const auto result = computer.compute(request(
+      fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(end), LinearPoseMotionDTO{}}}));
+  ASSERT_FALSE(result.ok());
+  const auto &reason = result.error().details.at("reason");
+  EXPECT_EQ(reason.rfind("cartesian_", 0), 0U) << reason;
+  EXPECT_NE(result.error().code, std::string(kErrorIkFailed));
+}
+
+// A robot moving at constant joint velocity `velocity` (a 0.125 s source
+// prefix from fixture.start), replaced by a linear pose goal whose line runs
+// from the TCP at the divergence point by `offset` (orientation kept).
+[[nodiscard]] RoboPlanCandidateRequestDTO
+moving_linear_request(CandidateFixture &fixture, const Eigen::VectorXd &velocity,
+                      const Eigen::Vector3d &offset) {
+  constexpr double divergence = 0.125;
+  const Eigen::VectorXd seed_positions = fixture.start + divergence * velocity;
+  Eigen::Matrix4d goal =
+      fixture.scene->forwardKinematics(seed_positions, "tool0", "base");
+  goal.block<3, 1>(0, 3) += offset;
+  auto input = request(
+      fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(goal), LinearPoseMotionDTO{}}});
+  input.speed_profile = SpeedProfileDTO{0.5, 0.5, 1.0};
+  const auto zero = Eigen::VectorXd::Zero(velocity.size());
+  const auto prefix_point = [&](double time) {
+    return TrajectoryWaypointDTO{time, values(fixture.start + time * velocity),
+                                 values(velocity), values(zero)};
+  };
+  TrajectoryDTO prefix{fixture.binding.resources,
+                       fixture.binding.compiled_joint_names,
+                       {prefix_point(0.0), prefix_point(divergence / 2.0),
+                        prefix_point(divergence)}};
+  input.start_state.velocities = std::vector<CoordinateVelocityDTO>{};
+  for (double value : values(velocity))
+    input.start_state.velocities->push_back(AngularVelocityDTO{value});
+  input.moving_replacement = MovingReplacementInputDTO{
+      ControllerGoalId{OperationNumber(902U), 1U, 12U},
+      ExecutionBindingEpoch(7U),
+      1.0,
+      std::move(prefix),
+      1.0 + divergence,
+      controlled_state(fixture.binding, seed_positions),
+      input.base_frame,
+      input.tcp_frame,
+      input.speed_profile,
+      input.dynamics_limits,
+      30.0};
+  return input;
+}
+
+// OD-341: a linear move taking over a moving robot is joined seamlessly when
+// its connector is proven within the limits and onto its line.
+TEST(RoboPlanCandidateComputerTest,
+     MovingLinearPoseGoalAlongTheMotionJoinsSeamlesslyOnItsLineWithinLimits) {
+  auto fixture = make_fixture();
+  fixture.start = fixture.goal;  // away from the start's singularity
+  const Eigen::VectorXd velocity =
+      0.05 * Eigen::VectorXd::Ones(fixture.start.size()).normalized();
+  // The line continues the TCP's current direction of travel.
+  const Eigen::Matrix4d here =
+      fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+  const Eigen::Matrix4d ahead = fixture.scene->forwardKinematics(
+      Eigen::VectorXd(fixture.start + 1e-4 * velocity), "tool0", "base");
+  const Eigen::Vector3d travel =
+      (ahead.block<3, 1>(0, 3) - here.block<3, 1>(0, 3)).normalized();
+  const auto input = moving_linear_request(fixture, velocity, 0.03 * travel);
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().runtime_scale_bounds);
+  // The incumbent's prefix is kept unchanged up to the divergence.
+  const auto &prefix = input.moving_replacement->source_prefix_trajectory;
+  EXPECT_EQ(result.value().waypoints.front().positions_rad,
+            prefix.waypoints.front().positions_rad);
+  EXPECT_TRUE(result.value().cartesian_waypoint_times_s.empty());
+  EXPECT_FALSE(result.value().cartesian_fidelity_metrics.has_value());
+
+  // From the divergence on, the TCP stays within the move's tolerances of the
+  // straight segment and ends at the goal.
+  const Eigen::Matrix4d line_start = fixture.scene->forwardKinematics(
+      Eigen::Map<const Eigen::VectorXd>(prefix.waypoints.back().positions_rad.data(),
+                                        static_cast<Eigen::Index>(prefix.waypoints.back().positions_rad.size())),
+      "tool0", "base");
+  const Eigen::Vector3d a = line_start.block<3, 1>(0, 3);
+  const Eigen::Vector3d b = a + 0.03 * travel;
+  const double divergence = prefix.waypoints.back().time_from_start_s;
+  for (double time = divergence;
+       time <= result.value().waypoints.back().time_from_start_s; time += 0.005) {
+    const auto sample = sample_trajectory(result.value(), time);
+    ASSERT_TRUE(sample.ok());
+    const auto q = Eigen::Map<const Eigen::VectorXd>(
+        sample.value().positions_rad.data(),
+        static_cast<Eigen::Index>(sample.value().positions_rad.size()));
+    const Eigen::Vector3d p = fixture.scene
+                                  ->forwardKinematics(
+                                      fixture.scene->toFullJointPositions("arm", q),
+                                      "tool0", "base")
+                                  .block<3, 1>(0, 3);
+    const double s = std::clamp((p - a).dot(b - a) / (b - a).squaredNorm(), 0.0, 1.0);
+    EXPECT_LE((p - (a + s * (b - a))).norm(), input.tolerances.translation_tol_m)
+        << "t=" << time;
+  }
+
+  // The joined motion stays within the model's joint velocity limits.
+  roboplan::JointTrajectory native;
+  native.joint_names = result.value().joint_names;
+  for (const auto &waypoint : result.value().waypoints) {
+    native.times.push_back(waypoint.time_from_start_s);
+    native.positions.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.positions_rad.data(), waypoint.positions_rad.size()));
+    native.velocities.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.velocities_rad_s.data(), waypoint.velocities_rad_s.size()));
+    native.accelerations.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.accelerations_rad_s2.data(), waypoint.accelerations_rad_s2.size()));
+  }
+  const auto model_v = fixture.scene->getVelocityLimitVectors("arm");
+  const auto model_a = fixture.scene->getAccelerationLimitVectors("arm");
+  ASSERT_TRUE(model_v && model_a);
+  const detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "tool0", input.speed_profile, {}};
+  const auto measured = detail::measure_cartesian_joint_dynamics_envelope(
+      contract, native, values(model_v->second), values(model_a->second), {});
+  ASSERT_TRUE(measured.ok());
+  ASSERT_TRUE(measured.value().complete);
+  for (std::size_t i = 0; i < measured.value().joint_derivatives.size(); ++i) {
+    EXPECT_LE(measured.value().joint_derivatives[i].velocity,
+              model_v->second[static_cast<Eigen::Index>(i)] + 1e-9);
+    EXPECT_LE(measured.value().joint_derivatives[i].acceleration,
+              model_a->second[static_cast<Eigen::Index>(i)] + 1e-9);
+  }
+}
+
+// The robot spins its wrist while the line keeps the orientation: the
+// connector's rotation away from the line exceeds the move's rotation
+// tolerance, so the existing refusal returns and the caller stops first.
+TEST(RoboPlanCandidateComputerTest,
+     MovingLinearPoseGoalWhoseConnectorLeavesTheLineIsRefusedForStopFirst) {
+  auto fixture = make_fixture();
+  fixture.start = fixture.goal;
+  Eigen::VectorXd velocity = Eigen::VectorXd::Zero(fixture.start.size());
+  velocity[velocity.size() - 1] = 1.0;  // wrist_3: rotates tool0 about its axis
+  auto input = moving_linear_request(fixture, velocity, Eigen::Vector3d(0.0, 0.0, 0.03));
+  input.tolerances.rotation_tol_rad = 2.0e-3;
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding,
+                                     {0x1234U, 65'536U, 0.01});
+  const auto result = computer.compute(input);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"),
+            "native_moving_cartesian_blend_proof_unavailable")
+      << result.error().message;
+  EXPECT_GT(std::stod(result.error().details.at("max_rotation_error_rad")),
+            input.tolerances.rotation_tol_rad);
+
+  // From rest (the stop-first fallback) the same line plans.
+  auto from_rest = input;
+  from_rest.moving_replacement.reset();
+  from_rest.start_state = input.moving_replacement->suffix_start_state;
+  const auto rest = computer.compute(from_rest);
+  EXPECT_TRUE(rest.ok()) << rest.error().message;
+}
+
 } // namespace
 } // namespace manyforge::roboplan_backend

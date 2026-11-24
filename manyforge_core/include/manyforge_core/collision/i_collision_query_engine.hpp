@@ -1,10 +1,12 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -135,6 +137,12 @@ enum class RuntimeCollisionQueryFailureReason {
   kObservationCapacityExceeded,
   kTimeout,
   kEngineException,
+  /// A selected colliding pair of two meshes needs a depth, and one of them
+  /// is not a closed surface (OD-363).
+  kMeshNotClosed,
+  /// The depth of a selected colliding mesh pair visited more vertices than
+  /// its fixed cap (OD-363).
+  kMeshDepthVertexCapReached,
 };
 
 /// Non-owning pair evidence valid until the next runtime query on the same
@@ -143,6 +151,11 @@ enum class RuntimeCollisionQueryFailureReason {
 struct RuntimeCollisionPairObservation {
   const CollisionPairId* pair = nullptr;
   std::optional<double> signed_clearance_m;
+  /// Unit vector from `pair->body_a` toward `pair->body_b` at the geometry
+  /// pair that gave `signed_clearance_m` (world frame), when the engine
+  /// computes one with the signed distance. Moving body_b along it (or
+  /// body_a against it) by the penetration depth separates the pair.
+  std::optional<std::array<double, 3>> normal_a_to_b;
 };
 
 struct RuntimeCollisionQueryRequest {

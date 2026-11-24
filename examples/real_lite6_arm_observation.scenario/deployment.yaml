@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -51,8 +51,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [],
     "tags": [
       "lite6",
@@ -216,12 +221,7 @@
               "mount_frame": "lite_gripper_mount",
               "open_state_ref": "open",
               "output_mode": "none",
-              "tcp_frame": "link_tcp",
-              "touch_links": [
-                "lite_gripper_base_link",
-                "lite_gripper_left_finger",
-                "lite_gripper_right_finger"
-              ]
+              "tcp_frame": "link_tcp"
             }
           ]
         },
@@ -244,8 +244,5 @@
       "target_settings": {}
     }
   ],
-  "deployment_artifact_id": "lite6_real_arm_observation",
-  "description": "Real Lite 6 machine, arm only (its I/O members deactivated), measured state, using the same robot model as the Mock pick-and-place example. The machine's address is a site fact: device_address_ref lite6_main resolves in the machine site settings (manyforge.site.v1). The gripper is the Mock pneumatic target with no output on Real (display only, no gripper feedback).",
-  "name": "lite6_real_arm_observation",
   "policies": {}
 }

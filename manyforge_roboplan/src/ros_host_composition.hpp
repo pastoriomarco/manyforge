@@ -11,6 +11,7 @@
 #include <stop_token>
 #include "execution_host_scene_bridge.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
+#include <manyforge_core/cell_model_state.hpp>
 #include <manyforge_core/pick_place_planning_owner.hpp>
 #include <manyforge_core/types/validation.hpp>
 #include <manyforge_core/ports/iio_signal_service.hpp>
@@ -191,6 +192,11 @@ struct Composition final : ExecutionProduct {
   // Same qualified physical sources as the cell frame resolver, including
   // numeric channel metadata for authorities that must remain unavailable.
   std::vector<CellFrameStateSource> cell_frame_state_sources;
+  // The observed-state publication of every component of this cell that has
+  // model coordinates (set on the cell root). Installed with the composition:
+  // every robot's collision checks and planner place the other components
+  // where these sources observe them.
+  std::shared_ptr<const core::CellModelStateSources> cell_model_state_sources;
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
   std::shared_ptr<void> pick_place_planning_fixture_lifetime;
 #endif
@@ -249,6 +255,10 @@ struct Composition final : ExecutionProduct {
   [[nodiscard]] core::ResourceAddressedExecutionKernel *
   active_addressed_kernel() const noexcept;
 
+  /// What identifies this view among its cell's: its component and, for a
+  /// gripper view, its gripper target (empty otherwise). A component has one
+  /// view, except a tool with several gripper targets: one view per target.
+  [[nodiscard]] std::pair<core::ControllableComponentId, std::string> owner_key() const;
   [[nodiscard]] const void *component_runtime_identity() const noexcept;
 
   [[nodiscard]] std::vector<core::RuntimeUnitEpochBindingDTO>
@@ -363,6 +373,11 @@ struct ExecutionCompositionAccess final {
 
   // Stable host diagnostic owner; independent of component/rebind lifetime.
   std::shared_ptr<ros2_control_execution::VolatileMotionTrace> motion_trace{};
+  // Stable for the host: every robot's Kernel and planner hold it, and read
+  // through it the installed cell's observed-state sources. replace_current
+  // replaces the list together with the composition.
+  std::shared_ptr<core::CellModelStateHandle> cell_model_state{
+      std::make_shared<core::CellModelStateHandle>()};
   mutable std::shared_mutex mutex;
   Composition *current{};
   // Mutually exclusive with current, changed under this SAME mutex. No
@@ -416,6 +431,17 @@ struct ExecutionCompositionAccess final {
       std::shared_ptr<ExecutionProduct> replacement);
 
 };
+/// The cell's observed-state sources for collision checks and planning, from
+/// the cell's qualified physical sources: every source that has a coordinate
+/// observation, with its component's stream-stale flag from `stream_stale`.
+/// A source without one (a pneumatic gripper: no coordinate observation
+/// exists) is left out, so its coordinates keep the model's value and it
+/// never makes another component's state "absent".
+[[nodiscard]] std::shared_ptr<const core::CellModelStateSources> CellModelStateSourcesOf(
+    std::span<const CellFrameStateSource> sources,
+    const std::function<std::shared_ptr<const core::ComponentStreamStaleFlag>(
+        const core::ControllableComponentId &)> &stream_stale);
+
 /// Every component of `cell` with its adapter, in cell order: each view's
 /// owner (on an arm member's view), its component adapter, then the I/O
 /// provider components of its driver group; members carry owner and role.

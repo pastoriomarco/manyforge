@@ -24,13 +24,11 @@ using namespace manyforge::core;
       std::nullopt,
       std::nullopt,
       JointGoalDTO{{"joint_1"}, {0.25}},
-      std::nullopt,
       {},
       {}};
   return OperationIntentDTO{
       PublicRequestContextDTO{TestRequestKey("request.motion.1"),
                               "test"},
-      ProgramId("program.pick"),
       ProgramRevision("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
       ProgramBindingId("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
       ProgramRunNumber(1U),
@@ -72,22 +70,54 @@ TEST(OperationIntentTest, RejectsDuplicateSourceJointNames) {
   EXPECT_EQ(result.error().details.at("reason"), "motion_payload_invalid");
 }
 
-TEST(OperationIntentTest, MotionClearanceIsOptionalAndBounded) {
-  // A move's own collision clearance, in [0, 0.05] m.
+TEST(OperationIntentTest, LinearPoseGoalNeedsPositiveFiniteLineSettings) {
+  // OD-341: the line settings follow the Cartesian path's bounds.
+  Pose3DTO goal;
+  goal.orientation.w = 1.0;
+  auto operation = valid_motion_operation();
+  auto& motion = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
+  motion.motion = PoseGoalDTO{goal, LinearPoseMotionDTO{}};
+  EXPECT_TRUE(validate_operation_intent(operation).ok());
+  for (const double refused : {0.0, -0.001, std::numeric_limits<double>::quiet_NaN()}) {
+    LinearPoseMotionDTO linear;
+    linear.max_rotation_step_rad = refused;
+    motion.motion = PoseGoalDTO{goal, linear};
+    const auto result = validate_operation_intent(operation);
+    ASSERT_FALSE(result.ok()) << refused;
+    EXPECT_EQ(result.error().details.at("reason"), "motion_payload_invalid");
+  }
+}
+
+TEST(OperationIntentTest, MotionCollisionRulesAreOptionalAndShapeChecked) {
+  // The row without selections: the move's own clearance, in [0, 0.05] m.
   for (const double admitted : {0.0, 0.0005, 0.05}) {
     auto operation = valid_motion_operation();
-    std::get<MotionParticipantIntentDTO>(operation.participants.front().payload).clearance_m =
-        admitted;
+    std::get<MotionParticipantIntentDTO>(operation.participants.front().payload)
+        .collision_rules = {CollisionRuleDTO{"this_move", {}, {}, CollisionClearanceRule{admitted}}};
     EXPECT_TRUE(validate_operation_intent(operation).ok()) << admitted;
   }
   for (const double refused : {-0.001, 0.0501, std::numeric_limits<double>::quiet_NaN()}) {
     auto operation = valid_motion_operation();
-    std::get<MotionParticipantIntentDTO>(operation.participants.front().payload).clearance_m =
-        refused;
+    std::get<MotionParticipantIntentDTO>(operation.participants.front().payload)
+        .collision_rules = {CollisionRuleDTO{"this_move", {}, {}, CollisionClearanceRule{refused}}};
     const auto result = validate_operation_intent(operation);
     ASSERT_FALSE(result.ok()) << refused;
-    EXPECT_EQ(result.error().details.at("reason"), "motion_clearance_invalid");
+    EXPECT_EQ(result.error().details.at("reason"), "collision_rule_value_invalid");
   }
+  // A row with selections names both sides.
+  auto operation = valid_motion_operation();
+  std::get<MotionParticipantIntentDTO>(operation.participants.front().payload).collision_rules = {
+      CollisionRuleDTO{"tip_on_part",
+                       {CollisionRuleActiveTcpContactBodiesSelection{}},
+                       {CollisionRuleSceneObjectSelection{SceneResourceId("part")}},
+                       CollisionContactRule{0.002, 0.8, std::nullopt}}};
+  EXPECT_TRUE(validate_operation_intent(operation).ok());
+  std::get<MotionParticipantIntentDTO>(operation.participants.front().payload)
+      .collision_rules.front()
+      .b.clear();
+  const auto one_sided = validate_operation_intent(operation);
+  ASSERT_FALSE(one_sided.ok());
+  EXPECT_EQ(one_sided.error().details.at("reason"), "collision_rule_selection_invalid");
 }
 
 TEST(OperationIntentTest, AcceptsUnitTaggedPrismaticGripperCommand) {

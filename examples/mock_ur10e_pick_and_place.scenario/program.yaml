@@ -1,14 +1,11 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "optional",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [
       "robotiq_2f_140_gripper"
     ],
@@ -18,7 +15,6 @@
       "ur10e"
     ]
   },
-  "description": "Pick-and-place demo for the source-local UR10e and Robotiq 2F-140 model. It preserves the approach, pick, carried-object, place, detach, retreat, and rest sequence together with the Robotiq finger-joint coordinate semantics.",
   "forest": [
     {
       "children": [
@@ -28,6 +24,7 @@
           "node_id": "gripper.command_position",
           "parameters": {
             "command_duration_s": 1.0,
+            "completion_timeout_s": 15.0,
             "max_effort": {
               "kind": "angular_newton_meter",
               "value_nm": 40.0
@@ -40,8 +37,7 @@
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_140"
             },
-            "wait_for_duration": true,
-            "completion_timeout_s": 15.0
+            "wait_for_duration": true
           }
         },
         {
@@ -152,6 +148,7 @@
           "node_id": "gripper.command_position",
           "parameters": {
             "command_duration_s": 1.0,
+            "completion_timeout_s": 15.0,
             "max_effort": {
               "kind": "angular_newton_meter",
               "value_nm": 40.0
@@ -164,8 +161,7 @@
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_140"
             },
-            "wait_for_duration": true,
-            "completion_timeout_s": 15.0
+            "wait_for_duration": true
           }
         },
         {
@@ -364,6 +360,7 @@
           "node_id": "gripper.command_position",
           "parameters": {
             "command_duration_s": 1.0,
+            "completion_timeout_s": 15.0,
             "max_effort": {
               "kind": "angular_newton_meter",
               "value_nm": 40.0
@@ -376,8 +373,7 @@
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_140"
             },
-            "wait_for_duration": true,
-            "completion_timeout_s": 15.0
+            "wait_for_duration": true
           }
         },
         {
@@ -522,7 +518,6 @@
       "parameters": {}
     }
   ],
-  "name": "pick_and_place_ur10e_robotiq_demo",
   "parameters": [
     {
       "constraints": {
@@ -536,7 +531,6 @@
     }
   ],
   "positions": {},
-  "program_id": "pick_and_place_ur10e_robotiq_demo",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

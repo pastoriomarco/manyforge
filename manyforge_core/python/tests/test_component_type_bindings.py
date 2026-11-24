@@ -14,7 +14,7 @@ CAPABILITY_SCHEMA_REVISION = (
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0"
 )
 COMPONENT_TYPE_SCHEMA_REVISION = (
-    "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde"
+    "sha256:4c1a934edc63d9da5eac2d1aef76d86142fcb797950a12306009e028d551c3fa"
 )
 
 
@@ -148,6 +148,26 @@ def test_component_type_dto_surface_is_typed_read_only_and_uses_closed_union():
         asset_frame_role_id=core.FrameRoleId("tcp"),
     )
     assert legacy_frame.contact_body_role_ids == []
+
+    # OD-371: a generated tool's spring slider body carries its travel.
+    slider = core.ComponentTypeSpringSliderDTO(
+        axis=[0.0, 0.0, 1.0], stroke_m=0.02, trip_depth_m=0.0095,
+        release_depth_m=0.009, max_compression_step_m=0.002,
+    )
+    rod = core.ComponentTypeCollisionBodyRoleDTO(
+        collision_body_role_id=core.CollisionBodyRoleId("holder_rod"),
+        model_role_id=core.ModelRoleId("tool_model"),
+        asset_collision_body_role_id=core.CollisionBodyRoleId("holder_rod"),
+        spring_slider=slider,
+    )
+    assert rod.spring_slider == slider
+    assert list(rod.spring_slider.axis) == [0.0, 0.0, 1.0]
+    assert rod.spring_slider.release_depth_m == 0.009
+    assert core.ComponentTypeCollisionBodyRoleDTO(
+        collision_body_role_id=core.CollisionBodyRoleId("body"),
+        model_role_id=core.ModelRoleId("tool_model"),
+        asset_collision_body_role_id=core.CollisionBodyRoleId("body"),
+    ).spring_slider is None
 
     pose = core.PlacementPoseDTO(
         position_m=[0.0, 0.0, 0.1],

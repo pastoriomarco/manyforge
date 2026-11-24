@@ -37,7 +37,6 @@ py::dict
 DeploymentDraftValue(const deployment::CompiledDeploymentDraft &compiled) {
   py::dict result;
   result["canonical_json"] = compiled.canonical_json;
-  result["deployment_artifact_id"] = compiled.deployment_artifact_id;
   result["deployment_revision"] = compiled.deployment_revision;
   result["graph_revision"] = compiled.graph_revision;
   return result;
@@ -238,6 +237,11 @@ public:
   std::optional<std::pair<std::string, std::string>> ViewerPoseSources() {
     py::gil_scoped_release release;
     return core_->ViewerPoseSources();
+  }
+
+  std::optional<std::string> LogicalSceneActiveProjection() {
+    py::gil_scoped_release release;
+    return core_->LogicalSceneActiveProjection();
   }
 
   std::string NodeEnvironmentProjection() {
@@ -1079,6 +1083,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("mark_manager_status_disconnected",
            &HeadlessApiBridge::MarkManagerStatusDisconnected)
       .def("viewer_pose_sources", &HeadlessApiBridge::ViewerPoseSources)
+      .def("logical_scene_active_projection",
+           &HeadlessApiBridge::LogicalSceneActiveProjection)
       .def("node_environment_projection",
            &HeadlessApiBridge::NodeEnvironmentProjection)
       .def("source_model_projection", &HeadlessApiBridge::SourceModelProjection)

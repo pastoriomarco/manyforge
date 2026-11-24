@@ -157,7 +157,8 @@ export interface ManualControlGripperDescriptor {
     openValue: boolean;
     closeValue: boolean;
   }>;
-  touchLinks: string[];
+  /** Links of the gripper's grip body. */
+  gripBodyLinks: string[];
   mountFrame: string | null;
   attachFrame: string | null;
   tcpFrame: string | null;
@@ -209,7 +210,6 @@ export interface DirectControlMotionStatus {
   operationCapabilityId: string;
   planningCapabilityIds: string[];
   frameRoleIds: string[];
-  programId: string;
   programRevision: string;
   programBindingId: string;
   joints: DirectControlJoint[];
@@ -225,7 +225,6 @@ export interface DirectControlGripperStatus {
   controllableComponentId: string;
   commandTargetId: string;
   operationCapabilityId: string;
-  programId: string;
   programRevision: string;
   programBindingId: string;
   commandSchemaId: string;
@@ -377,7 +376,6 @@ export interface MotionParticipantPayload {
   target_reference: null;
   offset_reference: null;
   motion: DirectControlMotionSpec;
-  contact_policy_id: null;
   per_joint_dynamics_limits: Record<string, {
     max_velocity_rad_s?: number;
     max_acceleration_rad_s2?: number;
@@ -385,8 +383,11 @@ export interface MotionParticipantPayload {
   }>;
   motion_interrupt_scopes: [];
   runtime_object_bindings: [];
-  /** Collision clearance (m) for this move; absent keeps the Deployment's. */
-  clearance_m?: number;
+  /**
+   * The move's collision rules. A manual move sends at most the row without
+   * selections: its clearance (m) replaces the Deployment's for this move.
+   */
+  collision_rules: Array<{ rule_id: string; clearance_m: number }>;
 }
 
 export interface CapabilityCommandParticipantPayload {
@@ -426,7 +427,6 @@ export interface DirectControlOperationIntent {
     request_key: string;
     source_label: 'composer_ui';
   };
-  program_id: string;
   program_revision: string;
   program_binding_id: string;
   expected_graph_revision: string;
@@ -478,7 +478,6 @@ export interface MotionPreviewReceipt {
   intentDigest: string;
   /** The request key as Headless formed it from the sent key (contract 1.4). */
   requestKey: string;
-  programId: string;
   programRevision: string;
   programBindingId: string;
   /** Null for manual work; the Program run for Program work. */
@@ -514,7 +513,6 @@ export interface CapabilityCommandPreviewReceipt {
   intentDigest: string;
   /** The request key as Headless formed it from the sent key (contract 1.4). */
   requestKey: string;
-  programId: string;
   programRevision: string;
   programBindingId: string;
   /** Null for manual work; the Program run for Program work. */

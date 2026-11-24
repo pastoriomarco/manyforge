@@ -472,7 +472,6 @@ describe('addressed Robot Control state', () => {
       throw new Error('expected motion payload');
     }
 
-    expect(intent.program_id).toBe('manyforge.direct_control.motion');
     expect(intent.program_binding_id).toBe('sha256:direct-binding');
     expect(intent.request_context).toEqual({ request_key: 'request-9', source_label: 'composer_ui' });
     expect(participant.target).toEqual({ component_id: 'robot-a', command_target_id: 'arm' });
@@ -539,21 +538,23 @@ describe('addressed Robot Control state', () => {
     }
   });
 
-  it('sends the manual collision clearance only when the operator sets one', () => {
+  it('sends the manual collision clearance as the rule without selections, only when the operator sets one', () => {
     const ready = readyState();
     const plain = buildPreviewIntent({ ...ready, mode: 'joint' }, 'clearance-default').participants[0].payload;
+    expect(plain).toMatchObject({ collision_rules: [] });
     expect(plain).not.toHaveProperty('clearance_m');
+    expect(plain).not.toHaveProperty('contact_policy_id');
     const close = robotControlReducer(ready, { type: 'edit_motion_settings', update: { clearanceM: 0.0005 } });
     for (const mode of ['joint', 'pose_goal', 'move_to', 'cartesian_path'] as const) {
       expect(buildPreviewIntent({ ...close, mode }, `clearance-${mode}`).participants[0].payload)
-        .toMatchObject({ kind: 'motion', clearance_m: 0.0005 });
+        .toMatchObject({ kind: 'motion', collision_rules: [{ rule_id: 'everything', clearance_m: 0.0005 }] });
     }
     const off = robotControlReducer(close, { type: 'edit_motion_settings', update: { clearanceM: 0 } });
     expect(buildPreviewIntent({ ...off, mode: 'joint' }, 'clearance-off').participants[0].payload)
-      .toMatchObject({ clearance_m: 0 });
+      .toMatchObject({ collision_rules: [{ rule_id: 'everything', clearance_m: 0 }] });
     const reset = robotControlReducer(off, { type: 'edit_motion_settings', update: { clearanceM: null } });
     expect(buildPreviewIntent({ ...reset, mode: 'joint' }, 'clearance-reset').participants[0].payload)
-      .not.toHaveProperty('clearance_m');
+      .toMatchObject({ collision_rules: [] });
     for (const value of [-0.001, 0.0501, NaN]) {
       expect(robotControlReducer(close, { type: 'edit_motion_settings', update: { clearanceM: value } })).toBe(close);
     }
@@ -1189,7 +1190,6 @@ describe('addressed Robot Control state', () => {
       throw new Error('expected capability command');
     }
 
-    expect(intent.program_id).toBe('manyforge.direct_control.gripper');
     expect(payload.command_schema_id).toBe('gripper.command_position');
     expect(payload.command_value.position).toEqual({
       kind: 'linear_m',

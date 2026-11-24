@@ -281,7 +281,6 @@ public:
       GraphRevision("graph.candidate"),
       ManagerApplyPreparedActivationDTO{
           ContentDigest(std::string(kDigestOne)),
-          core::DeploymentArtifactId("deployment-artifact-1"),
           core::DeploymentRevision(std::string(kDigestTwo)),
           core::ProgramBindingId(std::string(kDigestThree)),
           ContentDigest(std::string(kDigestTwo)),

@@ -36,10 +36,8 @@ const environment: NodeEnvironmentResponse = {
 
 function workspaceWithDraft(): ProgramWorkspaceResponse {
   const authoring: ProgramAuthoringDocument = {
-    api_version: 'manyforge.program.v3',
-    program_id: 'selection-test',
+    api_version: 'manyforge.program.v4',
     program_profile: 'composable-cell-v1',
-    name: 'Selection test',
     catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '2.4.0' },
     parameters: [],
     blackboard: { namespaces: [], keys: [] },

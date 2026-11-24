@@ -69,14 +69,15 @@ GitHub Actions runs in two tiers. Superseded runs on the same ref are cancelled.
   `nightly-dev-changed`, and skips its jobs unless `dev` was pushed after that
   workflow's previous scheduled run started. A failure is therefore reported
   once, not every night. Manual, tag, push and pull-request runs always run.
-- **ROS tier**, nightly on `dev` and on demand: `ros-integration` runs the
-  ROS integration and ros2_control Mock-lane suites (`test-all.sh ros` and
-  `ros-e2e`) in the reference ROS image published for the commit's image
-  inputs; it never builds that image. `ros-image` builds and publishes that
-  image, `ghcr.io/pastoriomarco/manyforge-ros`, for amd64 and arm64. It is
-  started by hand (`gh workflow run ros-image.yml --ref <ref>`); a run whose
-  image inputs are already published builds nothing, and a run on a `v*` tag
-  also tags the image with the release version.
+- **ROS tier**, after each release image and on demand: `ros-image` builds and
+  publishes the reference ROS image, `ghcr.io/pastoriomarco/manyforge-ros`, for
+  amd64 and arm64, on every `v*` tag push (also tagging it with the release
+  version) and by hand (`gh workflow run ros-image.yml --ref <ref>`); a run
+  whose image inputs are already published builds nothing. When it succeeds,
+  `ros-integration` runs the ROS integration and ros2_control Mock-lane suites
+  (`test-all.sh ros` and `ros-e2e`) in that image on the same commit; it never
+  builds the image and does not run nightly on `dev`. Between releases, run the
+  same suites locally (`local-ci`, below).
 - **`local-ci`** runs every lane, including the ROS integration and e2e
   suites, in the development containers on a self-hosted runner labelled
   `manyforge-local`. It starts on release tags and on demand only, never on
@@ -114,10 +115,11 @@ without explicit authorization.
 3. Check the companion pins: the xArm driver fork commit
    (`XARM_SOURCE_COMMIT` in `Dockerfile.ros-lyrical-full`, the same commit in
    `manyforge_xarm_control/vendor/driver.yaml`) is on the fork's
-   `lyrical-no-gazebo` branch. For `v0.3.1`:
+   `lyrical-no-gazebo` branch. For `v0.4.0`:
    `3654c9afef9c51c3bd6723d65ccecca166bc38b0`.
 4. Run the applicable gates, squash-merge `dev` into `main` and tag
-   `vX.Y.Z` (for this release `v0.3.1`; `v0.3.0` is `main` at `3fc751bc`,
+   `vX.Y.Z` (for this release `v0.4.0`; `v0.3.1` is `main` at `c6a4f93f`,
+   `v0.3.0` is `main` at `3fc751bc`,
    `v0.2.1` is `main` at `34bb5f4a`, `v0.2.0` is `main` at `3cc3e5d5`,
    `v0.1.0` is `main` at `8ae05265`).
 5. Pushing the tag publishes the images; there is no manual image step. The

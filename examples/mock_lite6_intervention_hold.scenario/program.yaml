@@ -1,21 +1,17 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "lite6",
       "r5-live-trial"
     ]
   },
-  "description": "Mock Lite6 per-group failure hold. An unreachable move (1 automatic retry) holds for intervention in arm_group (intervention_stop_scope own_groups). Retry re-runs it; Continue fails the node so the Fallback takes the reachable alternative.",
   "execution_groups": {
     "arm_group": {
       "execution_policy": "independent"
@@ -243,10 +239,8 @@
       "parameters": {}
     }
   ],
-  "name": "mock_lite6_intervention_hold",
   "parameters": [],
   "positions": {},
-  "program_id": "mock_lite6_intervention_hold",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

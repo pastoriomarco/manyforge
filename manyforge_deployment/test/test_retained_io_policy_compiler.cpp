@@ -203,9 +203,9 @@ TEST(RetainedTcpInventoryTest, IncludesRealUnmountedToolWithoutCarryingIt) {
 
 V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
   auto root = parse(
-      R"({"api_version":"manyforge.program.v3","program_id":"global_rule_program",
+      R"({"api_version":"manyforge.program.v4",
     "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "program_profile":"composable-cell-v1","name":"Global rule fixture",
+    "program_profile":"composable-cell-v1",
     "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
     "execution_groups":{"inspect":{"execution_policy":"independent"}},
     "blackboard":{"namespaces":[],"keys":[{"key":"ready","type":"bool","access":"read_write","persistence":"run","initial":false}]},
@@ -226,7 +226,7 @@ V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
   }
   root = d::normalize_program_authoring(root);
   const auto revision = d::detail::compute_content_identity(
-      root, {"program-revision", "manyforge.program.v3", "program_revision"});
+      root, {"program-revision", "manyforge.program.v4", "program_revision"});
   return replace(root, "program_revision", V(revision));
 }
 struct Selected final {
@@ -564,7 +564,7 @@ TEST(RetainedIoPolicyCompilerTest,
   authored = replace(authored, "blackboard", replace(board, "keys", V(keys)));
   authored = replace(authored, "program_revision",
                      V(d::detail::compute_content_identity(
-                         authored, {"program-revision", "manyforge.program.v3",
+                         authored, {"program-revision", "manyforge.program.v4",
                                     "program_revision"})));
   d::FilesystemCatalogArtifactStore catalog(root.path);
   EXPECT_THROW(d::verify_program_binding_contract(d::canonical_json(authored),
@@ -838,7 +838,7 @@ V interrupt_key_program(V authored, std::string type,
   authored = d::normalize_program_authoring(authored);
   return replace(authored, "program_revision",
                  V(d::detail::compute_content_identity(
-                     authored, {"program-revision", "manyforge.program.v3",
+                     authored, {"program-revision", "manyforge.program.v4",
                                 "program_revision"})));
 }
 V initial_key_condition(const V &value) {
@@ -931,6 +931,47 @@ TEST(RetainedIoPolicyCompilerTest,
     }
   }
 }
+// OD-341: a node rule works the same on a linear move; the move's
+// motion_type is the motion payload's, not the rule's.
+TEST(RetainedIoPolicyCompilerTest, NodeRuleOnALinearMoveCompilesLikeAJointMove) {
+  Root root;
+  auto config = configuration(rule());
+  config = replace(config, "interrupt_rules", V(V::Array{}));
+  const auto fixture = arm(root.path, config);
+  for (const std::string node_id : {"motion.move_until_signal", "motion.probe_search"}) {
+    for (const bool linear : {false, true}) {
+      SCOPED_TRACE(node_id + (linear ? " linear" : " joint"));
+      auto authored = program_root(*fixture.bundle, true);
+      auto tree = parse(R"({"node_id":"motion.move_until_signal","instance_id":"move",
+      "execution_groups":["arm_group"],"children":[],
+      "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},"base_frame":{"component_id":"lite6_robot","frame_id":"base"},"tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":0,
+        "activation_mode":"require_inactive_at_arm","on_signal":"success","on_no_signal":"failure",
+        "goal":{"frame_ref":{"kind":"target_frame","frame":{"component_id":"lite6_robot","frame_id":"base"}},
+          "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},
+        "interrupt_condition":{"compare":{"operand":{"key":"ready"},"op":"==","value":false}}}})");
+      tree = replace(tree, "node_id", V(node_id));
+      auto parameters = *tree.find_object_member("parameters");
+      parameters = replace(parameters, "interrupt_condition", initial_key_condition(V(false)));
+      if (linear) {
+        parameters = replace(parameters, "motion_type", V("linear"));
+        parameters = replace(parameters, "max_translation_step_m", V(0.002));
+        parameters = replace(parameters, "cartesian_timing", V("constant_speed"));
+      }
+      tree = replace(tree, "parameters", parameters);
+      authored = replace(authored, "tree", tree);
+      const auto actual = interrupt_key_program(authored, "bool", std::optional<V>(V(false)));
+      const auto selected = select(root.path, *fixture.bundle, true, true, &actual);
+      const auto compiled = d::compile_program_io_conditions(
+          *selected.program, *selected.binding, *fixture.bundle);
+      ASSERT_TRUE(compiled.ok()) << compiled.error().message;
+      ASSERT_EQ(compiled.value().program_node_conditions.size(), 1U);
+      const auto &node_rule = compiled.value().program_node_conditions.front().node_rule;
+      ASSERT_TRUE(node_rule.has_value());
+      EXPECT_EQ(node_rule->stop_mode, c::MotionInterruptStopMode::kSoftOnPath);
+    }
+  }
+}
+
 TEST(RetainedIoPolicyCompilerTest,
      GlobalRuleStateOperandsRefuseWithOrWithoutAnActualProgram) {
   for (const bool actual : {true, false}) {

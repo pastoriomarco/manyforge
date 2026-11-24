@@ -1,8 +1,8 @@
 # Generated extension composition; edit extension entries in their package descriptor.
 api_version: manyforge.node_catalog.v3
-content_version: 3.0.0
+content_version: 4.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:cc7d43f05623ebbb3b1012ca7c0557eceb47bbab38bd6eec3345e1261c032318
+catalog_digest: sha256:8ea501e0503f9dc6ebfe06ee0ad72e647d5afdb38a06608f98bfecba38480fbb
 schema_types:
   tcp_selector:
     type: object
@@ -792,7 +792,8 @@ schema_types:
           type: cylinder
       mesh_resource_uri:
         type: string
-        description: URI of the mesh resource; required for mesh.
+        description: Mesh file path, relative to the Scenario project folder or absolute,
+          inside an allowed folder (no URI scheme); required for mesh.
         required_when:
           type: mesh
         allowed_when:
@@ -936,6 +937,324 @@ schema_types:
       collision_body_id:
         type: string
         description: Collision body identifier within the component.
+  collision_rule_selection:
+    type: object
+    description: Selects the bodies of one side of a collision rule. The kind decides
+      which of the other fields apply.
+    additional_properties: false
+    required:
+    - kind
+    properties:
+      kind:
+        type: enum
+        description: component is every collision body of a component; collision_body
+          is one collision body of a component; link is one link of a component; attached_object
+          is every Scene object a component carries (with collision_body_role_id,
+          only those that collision body carries); scene_objects is every detached
+          Scene object; scene_object is one Scene object; active_tcp_contact_bodies
+          is the contact bodies of the TCP the move uses.
+        values:
+        - component
+        - collision_body
+        - link
+        - attached_object
+        - scene_objects
+        - scene_object
+        - active_tcp_contact_bodies
+      component_id:
+        type: string
+        description: Component for component, collision_body, link and attached_object;
+          not allowed for the other kinds.
+        required_when:
+          kind:
+          - component
+          - collision_body
+          - link
+          - attached_object
+        allowed_when:
+          kind:
+          - component
+          - collision_body
+          - link
+          - attached_object
+      collision_body_id:
+        type: string
+        description: Collision body of the component; required only for kind collision_body.
+        required_when:
+          kind: collision_body
+        allowed_when:
+          kind: collision_body
+      link:
+        type: string
+        description: Link name in the cell model; required only for kind link.
+        required_when:
+          kind: link
+        allowed_when:
+          kind: link
+      collision_body_role_id:
+        type: string
+        description: For kind attached_object, the collision body of the component
+          that carries the objects, for example a generated tool's spring slider;
+          omitted means every object the component carries.
+        allowed_when:
+          kind: attached_object
+      scene_resource_id:
+        type: string
+        description: Scene object by its id, for kind scene_object; give exactly one
+          of this and blackboard_key.
+        semantic_type: scene_resource
+        allowed_when:
+          kind: scene_object
+      blackboard_key:
+        type: string
+        description: Blackboard key that holds the Scene object, for kind scene_object;
+          give exactly one of this and scene_resource_id. Without field the key is
+          of type scene_resource.
+        semantic_type: blackboard_key
+        allowed_when:
+          kind: scene_object
+      field:
+        type: string
+        description: Field of the blackboard key's value that holds the Scene object,
+          for a key with fields such as a planning result; allowed only with blackboard_key.
+        allowed_when:
+          kind: scene_object
+  collision_rule_contact:
+    type: object
+    description: 'Allows the pairs of a collision rule to touch. Both fields are optional:
+      without them the pairs may touch from 0.8 of the move on and the depth is not
+      checked.'
+    additional_properties: false
+    properties:
+      max_penetration_m:
+        type: float
+        description: Deepest penetration allowed, in meters, 0 or more. Omitted means
+          the depth is not checked.
+        constraints:
+          min_inclusive: 0.0
+      end_from_fraction:
+        type: float
+        description: Fraction of the move, 0 to 1, from which the pairs may touch;
+          contact at the start of the move or before this fraction is refused. Omitted
+          means 0.8. 0 means the pairs may touch during the whole move, from its start.
+        constraints:
+          min_inclusive: 0.0
+          max_inclusive: 1.0
+      max_compression_step_m:
+        type: float
+        description: A spring, for example a spring-loaded holder pushed in up to
+          its stroke (max_penetration_m, required with this field). The deepest increase
+          of the penetration between two samples 1 mm of tool travel apart, in meters,
+          above 0; a step or an obstacle on the path is refused. Omitted means no
+          spring.
+        constraints:
+          min_exclusive: 0.0
+  collision_rule_release:
+    type: object
+    description: Lets pairs that touch at the start of the move separate. A pair that
+      starts clear may not come into contact. Every field is optional.
+    additional_properties: false
+    properties:
+      release_evidence_mode:
+        type: enum
+        description: signed_penetration (default) checks the measured depth; binary_contact
+          checks only whether the pair touches and takes no depth settings.
+        values:
+        - signed_penetration
+        - binary_contact
+      enforce_max_start_penetration:
+        type: bool
+        description: Whether the depth at the start is limited by max_start_penetration_m;
+          default true with signed_penetration.
+      max_start_penetration_m:
+        type: float
+        description: Deepest penetration allowed at the start, in meters; default
+          0.
+        constraints:
+          min_inclusive: 0.0
+      min_release_progress_m:
+        type: float
+        description: Smallest total reduction of depth required while the pair has
+          not separated, in meters; default 0.
+        constraints:
+          min_inclusive: 0.0
+      release_tolerance_m:
+        type: float
+        description: How much deeper a sample may be than the one before it, in meters;
+          default 0.00001 with signed_penetration.
+        constraints:
+          min_inclusive: 0.0
+      require_strictly_decreasing_penetration:
+        type: bool
+        description: Whether the depth must keep decreasing; default true with signed_penetration.
+      require_separation_by_end:
+        type: bool
+        description: Whether the pair must be apart at the end of the move; default
+          true.
+      allow_recontact:
+        type: bool
+        description: Whether the pair may touch again after it separated; default
+          false.
+  collision_rule_spring_slider:
+    type: object
+    description: The spring slider of a generated tool that a move switches on.
+    additional_properties: false
+    required:
+    - component_id
+    - element_id
+    properties:
+      component_id:
+        type: string
+        description: The generated tool.
+      element_id:
+        type: string
+        description: The tool's spring slider element.
+  collision_rule:
+    type: object
+    description: 'One collision rule of a move: it holds every pair made of one member
+      of a and one member of b and gives those pairs exactly one value, clearance_m,
+      contact or release. A row without a and b has a clearance only and replaces
+      the clearance of the Deployment''s first rule for this move. A row with spring_slider
+      instead of a switches that slider on: the slider and the objects it carries
+      may press into b up to the slider''s stroke; its contact may hold only end_from_fraction.'
+    additional_properties: false
+    required:
+    - rule_id
+    properties:
+      rule_id:
+        type: string
+        description: Name of the rule, unique among the rules of the node; reported
+          with a refusal.
+      spring_slider:
+        schema_ref: '#/schema_types/collision_rule_spring_slider'
+        description: The spring slider this move switches on, in place of a; its stroke
+          and step come from the slider.
+      a:
+        type: array
+        description: First side of the pairs, 1 to 16 selections; given together with
+          b.
+        min_items: 1
+        max_items: 16
+        items:
+          schema_ref: '#/schema_types/collision_rule_selection'
+      b:
+        type: array
+        description: Second side of the pairs, 1 to 16 selections; given together
+          with a.
+        min_items: 1
+        max_items: 16
+        items:
+          schema_ref: '#/schema_types/collision_rule_selection'
+      clearance_m:
+        type: float
+        description: Distance in meters the pairs keep, 0 to 0.05.
+        constraints:
+          min_inclusive: 0.0
+          max_inclusive: 0.05
+      contact:
+        schema_ref: '#/schema_types/collision_rule_contact'
+        description: The pairs may touch.
+      release:
+        schema_ref: '#/schema_types/collision_rule_release'
+        description: Pairs that touch at the start of the move separate.
+    mutually_exclusive:
+    - - clearance_m
+      - contact
+      - release
+    - - spring_slider
+      - a
+    - - spring_slider
+      - clearance_m
+    - - spring_slider
+      - release
+  sequence_collision_rule:
+    type: object
+    description: 'One collision rule of a pick or place sequence: a collision rule
+      with the leg it applies to.'
+    additional_properties: false
+    required:
+    - rule_id
+    - leg
+    properties:
+      rule_id:
+        type: string
+        description: Name of the rule, unique among the rules of the node; reported
+          with a refusal.
+      leg:
+        type: enum
+        description: Leg of the sequence the rule applies to; the lift of a pick is
+          its retreat leg.
+        values:
+        - approach
+        - descend
+        - retreat
+      spring_slider:
+        schema_ref: '#/schema_types/collision_rule_spring_slider'
+        description: The spring slider this leg switches on, in place of a; its stroke
+          and step come from the slider.
+      a:
+        type: array
+        description: First side of the pairs, 1 to 16 selections; given together with
+          b.
+        min_items: 1
+        max_items: 16
+        items:
+          schema_ref: '#/schema_types/collision_rule_selection'
+      b:
+        type: array
+        description: Second side of the pairs, 1 to 16 selections; given together
+          with a.
+        min_items: 1
+        max_items: 16
+        items:
+          schema_ref: '#/schema_types/collision_rule_selection'
+      clearance_m:
+        type: float
+        description: Distance in meters the pairs keep, 0 to 0.05.
+        constraints:
+          min_inclusive: 0.0
+          max_inclusive: 0.05
+      contact:
+        schema_ref: '#/schema_types/collision_rule_contact'
+        description: The pairs may touch.
+      release:
+        schema_ref: '#/schema_types/collision_rule_release'
+        description: Pairs that touch at the start of the leg separate.
+    mutually_exclusive:
+    - - clearance_m
+      - contact
+      - release
+    - - spring_slider
+      - a
+    - - spring_slider
+      - clearance_m
+    - - spring_slider
+      - release
+  operator_choice_option:
+    type: object
+    description: 'One answer the operator can choose: its id, the button label and
+      whether choosing it makes the node succeed or fail. All three fields are required.'
+    additional_properties: false
+    required:
+    - option_id
+    - label
+    - result
+    properties:
+      option_id:
+        type: string
+        description: Option id, unique in the node, lowercase letters, digits, '_',
+          '.' and '-', starting with a letter; at most 128 bytes. Written to output_key
+          when chosen.
+      label:
+        type: string
+        description: Button text shown to the operator; at most 256 bytes.
+      result:
+        type: enum
+        description: success makes the node succeed when this option is chosen; failure
+          makes it fail.
+        values:
+        - success
+        - failure
 entries:
 - id: sequence
   name: Sequence
@@ -1265,15 +1584,16 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
-  - id: clearance_m
+  - id: collision_rules
     required: false
-    description: Collision clearance in meters for this move, 0 to 0.05. Omitted keeps
-      the Deployment clearance.
+    description: Collision rules for this move, at most 64. Each rule gives its pairs
+      a clearance, lets them touch or lets them separate. Omitted keeps the Deployment's
+      rules.
     schema:
-      type: float
-      constraints:
-        min_inclusive: 0.0
-        max_inclusive: 0.05
+      type: array
+      max_items: 64
+      items:
+        schema_ref: '#/schema_types/collision_rule'
   - id: per_joint_dynamics_limits
     required: false
     description: Per-joint velocity, acceleration and jerk caps keyed by joint name.
@@ -1334,19 +1654,6 @@ entries:
       values:
       - default
       - disable
-  - id: contact_policy_id
-    required: false
-    description: Contact policy that makes planning and validation contact-tolerant
-      for this move. Omit for free-space motion.
-    schema:
-      type: string
-  - id: contact_scene_resource_id
-    required: false
-    description: Scene resource the contact policy applies to. Must be given together
-      with contact_policy_id.
-    schema:
-      type: string
-      semantic_type: scene_resource
   - id: automatic_retries
     required: false
     description: Automatic retries after a planning no-effect or nominal collision
@@ -1424,10 +1731,11 @@ entries:
 - id: motion.move_to_pose
   name: Move to pose
   category: motion
-  description: Moves the robot's TCP to a pose. It plans, validates and executes the
-    motion, and fails when planning, validation or execution fails after any automatic
-    retries. The goal is an absolute pose, or an offset from target_reference when
-    target_mode is relative.
+  description: Moves the robot's TCP to a pose, in joint space or, with motion_type
+    linear, on a straight line. It plans, validates and executes the motion, and fails
+    when planning, validation or execution fails after any automatic retries. The
+    goal is an absolute pose, or an offset from target_reference when target_mode
+    is relative.
   stability: stable
   tags:
   - motion
@@ -1480,11 +1788,76 @@ entries:
     description: Pose whose orientation gives the axes of a relative offset; omitted
       uses the target_reference orientation.
     schema_ref: '#/schema_types/motion_reference'
+  - id: motion_type
+    required: false
+    description: joint (default) plans the move in joint space, so the TCP path between
+      start and goal is not a line; linear moves the TCP on a straight line from where
+      the move starts to the goal, with no deviation and no joint-space fallback.
+    default: joint
+    schema:
+      type: enum
+      values:
+      - joint
+      - linear
   - id: planner
     required: false
-    description: Planner settings for this move; only the fields set here override
-      the Deployment planner.
+    description: Joint moves only. Planner settings for this move; only the fields
+      set here override the Deployment planner.
     schema_ref: '#/schema_types/planner_override'
+  - id: max_translation_step_m
+    required: false
+    description: Linear moves only. Largest translation in meters between planned
+      path samples; default 0.005.
+    default: 0.005
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_rotation_step_rad
+    required: false
+    description: Linear moves only. Largest rotation in radians between planned path
+      samples; default 0.05.
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_angular_speed_rad_s
+    required: false
+    description: Linear moves only. Angular speed limit for the line in rad/s; default
+      0.5.
+    default: 0.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_linear_acceleration_mps2
+    required: false
+    description: Linear moves only. Linear acceleration limit for the line in m/s2;
+      default 0.5.
+    default: 0.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_angular_acceleration_rad_s2
+    required: false
+    description: Linear moves only. Angular acceleration limit for the line in rad/s2;
+      default 2.5.
+    default: 2.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: cartesian_timing
+    required: false
+    description: Linear moves only. constant_speed or time_optimal timing of the line.
+      Omitted uses the Deployment Cartesian timing.
+    schema:
+      type: enum
+      values:
+      - constant_speed
+      - time_optimal
   - id: velocity_scale
     required: false
     description: Velocity scaling factor, above 0 up to 1; default 1.0.
@@ -1511,15 +1884,16 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
-  - id: clearance_m
+  - id: collision_rules
     required: false
-    description: Collision clearance in meters for this move, 0 to 0.05. Omitted keeps
-      the Deployment clearance.
+    description: Collision rules for this move, at most 64. Each rule gives its pairs
+      a clearance, lets them touch or lets them separate. Omitted keeps the Deployment's
+      rules.
     schema:
-      type: float
-      constraints:
-        min_inclusive: 0.0
-        max_inclusive: 0.05
+      type: array
+      max_items: 64
+      items:
+        schema_ref: '#/schema_types/collision_rule'
   - id: per_joint_dynamics_limits
     required: false
     description: Per-joint velocity, acceleration and jerk caps keyed by joint name.
@@ -1580,19 +1954,6 @@ entries:
       values:
       - default
       - disable
-  - id: contact_policy_id
-    required: false
-    description: Contact policy that makes planning and validation contact-tolerant
-      for this move. Omit for free-space motion.
-    schema:
-      type: string
-  - id: contact_scene_resource_id
-    required: false
-    description: Scene resource the contact policy applies to. Must be given together
-      with contact_policy_id.
-    schema:
-      type: string
-      semantic_type: scene_resource
   - id: automatic_retries
     required: false
     description: Automatic retries after a planning no-effect or nominal collision
@@ -1636,6 +1997,12 @@ entries:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
     target_parameter: target
+  - capability_id: planning.motion.cartesian_path
+    scope: target_binding
+    target_parameter: target
+    when:
+      parameter: motion_type
+      equals: linear
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target
@@ -1813,15 +2180,16 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
-  - id: clearance_m
+  - id: collision_rules
     required: false
-    description: Collision clearance in meters for this path, 0 to 0.05. Omitted keeps
-      the Deployment clearance.
+    description: Collision rules for this path, at most 64. Each rule gives its pairs
+      a clearance, lets them touch or lets them separate. Omitted keeps the Deployment's
+      rules.
     schema:
-      type: float
-      constraints:
-        min_inclusive: 0.0
-        max_inclusive: 0.05
+      type: array
+      max_items: 64
+      items:
+        schema_ref: '#/schema_types/collision_rule'
   - id: cartesian_timing
     required: false
     description: constant_speed or time_optimal path timing. Omitted uses the Deployment
@@ -1891,19 +2259,6 @@ entries:
       values:
       - default
       - disable
-  - id: contact_policy_id
-    required: false
-    description: Contact policy that makes planning and validation contact-tolerant
-      for this path. Omit for free-space motion.
-    schema:
-      type: string
-  - id: contact_scene_resource_id
-    required: false
-    description: Scene resource the contact policy applies to. Must be given together
-      with contact_policy_id.
-    schema:
-      type: string
-      semantic_type: scene_resource
   - id: automatic_retries
     required: false
     description: Automatic retries after a planning no-effect or nominal collision
@@ -1981,10 +2336,11 @@ entries:
 - id: motion.move_until_signal
   name: Move until signal
   category: motion
-  description: Moves the robot to a stored pose and stops it early when the interrupt
-    condition trips. A trip gives the node result set by on_signal, and a move that
-    ends without a trip gives on_no_signal. The node fails when the Stop cannot be
-    proven or the signal source is lost.
+  description: Moves the robot to a stored pose, in joint space or, with motion_type
+    linear, on a straight line, and stops it early when the interrupt condition trips.
+    A trip gives the node result set by on_signal, and a move that ends without a
+    trip gives on_no_signal. The node fails when the Stop cannot be proven or the
+    signal source is lost.
   stability: stable
   tags:
   - motion
@@ -2017,11 +2373,76 @@ entries:
     description: Stored pose the move goes to; its frame_ref sets the frame it is
       stated in.
     schema_ref: '#/schema_types/stored_pose'
+  - id: motion_type
+    required: false
+    description: joint (default) plans the move in joint space, so the TCP path between
+      start and goal is not a line; linear moves the TCP on a straight line from where
+      the move starts to the goal, with no deviation and no joint-space fallback.
+    default: joint
+    schema:
+      type: enum
+      values:
+      - joint
+      - linear
   - id: planner
     required: false
-    description: Planner settings for this move; only the fields set here override
-      the Deployment planner.
+    description: Joint moves only. Planner settings for this move; only the fields
+      set here override the Deployment planner.
     schema_ref: '#/schema_types/planner_override'
+  - id: max_translation_step_m
+    required: false
+    description: Linear moves only. Largest translation in meters between planned
+      path samples; default 0.005.
+    default: 0.005
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_rotation_step_rad
+    required: false
+    description: Linear moves only. Largest rotation in radians between planned path
+      samples; default 0.05.
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_angular_speed_rad_s
+    required: false
+    description: Linear moves only. Angular speed limit for the line in rad/s; default
+      0.5.
+    default: 0.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_linear_acceleration_mps2
+    required: false
+    description: Linear moves only. Linear acceleration limit for the line in m/s2;
+      default 0.5.
+    default: 0.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_angular_acceleration_rad_s2
+    required: false
+    description: Linear moves only. Angular acceleration limit for the line in rad/s2;
+      default 2.5.
+    default: 2.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: cartesian_timing
+    required: false
+    description: Linear moves only. constant_speed or time_optimal timing of the line.
+      Omitted uses the Deployment Cartesian timing.
+    schema:
+      type: enum
+      values:
+      - constant_speed
+      - time_optimal
   - id: max_tcp_linear_speed_mps
     required: false
     description: Per-move TCP linear speed cap in m/s; the lower of this and the Deployment
@@ -2030,15 +2451,16 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
-  - id: clearance_m
+  - id: collision_rules
     required: false
-    description: Collision clearance in meters for this move, 0 to 0.05. Omitted keeps
-      the Deployment clearance.
+    description: Collision rules for this move, at most 64. Each rule gives its pairs
+      a clearance, lets them touch or lets them separate. Omitted keeps the Deployment's
+      rules.
     schema:
-      type: float
-      constraints:
-        min_inclusive: 0.0
-        max_inclusive: 0.05
+      type: array
+      max_items: 64
+      items:
+        schema_ref: '#/schema_types/collision_rule'
   - id: velocity_scale
     required: false
     description: Velocity scaling factor, above 0 up to 1; default 1.0.
@@ -2192,6 +2614,12 @@ entries:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
     target_parameter: target
+  - capability_id: planning.motion.cartesian_path
+    scope: target_binding
+    target_parameter: target
+    when:
+      parameter: motion_type
+      equals: linear
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target
@@ -2228,10 +2656,11 @@ entries:
 - id: motion.probe_search
   name: Probe search
   category: motion
-  description: Moves the robot toward a stored pose to find contact and stops it when
-    the interrupt condition trips. It has no automatic retries. A trip gives on_signal,
-    and a move that ends without contact gives on_no_signal, which fails by default;
-    the node also fails when the Stop cannot be proven or the signal source is lost.
+  description: Moves the robot toward a stored pose to find contact, in joint space
+    or, with motion_type linear, on a straight line, and stops it when the interrupt
+    condition trips. It has no automatic retries. A trip gives on_signal, and a move
+    that ends without contact gives on_no_signal, which fails by default; the node
+    also fails when the Stop cannot be proven or the signal source is lost.
   stability: stable
   tags:
   - motion
@@ -2265,11 +2694,76 @@ entries:
     description: Stored pose the probe moves toward; its frame_ref sets the frame
       it is stated in.
     schema_ref: '#/schema_types/stored_pose'
+  - id: motion_type
+    required: false
+    description: joint (default) plans the move in joint space, so the TCP path between
+      start and goal is not a line; linear moves the TCP on a straight line from where
+      the move starts to the goal, with no deviation and no joint-space fallback.
+    default: joint
+    schema:
+      type: enum
+      values:
+      - joint
+      - linear
   - id: planner
     required: false
-    description: Planner settings for this move; only the fields set here override
-      the Deployment planner.
+    description: Joint moves only. Planner settings for this move; only the fields
+      set here override the Deployment planner.
     schema_ref: '#/schema_types/planner_override'
+  - id: max_translation_step_m
+    required: false
+    description: Linear moves only. Largest translation in meters between planned
+      path samples; default 0.005.
+    default: 0.005
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_rotation_step_rad
+    required: false
+    description: Linear moves only. Largest rotation in radians between planned path
+      samples; default 0.05.
+    default: 0.05
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_angular_speed_rad_s
+    required: false
+    description: Linear moves only. Angular speed limit for the line in rad/s; default
+      0.5.
+    default: 0.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_linear_acceleration_mps2
+    required: false
+    description: Linear moves only. Linear acceleration limit for the line in m/s2;
+      default 0.5.
+    default: 0.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: max_angular_acceleration_rad_s2
+    required: false
+    description: Linear moves only. Angular acceleration limit for the line in rad/s2;
+      default 2.5.
+    default: 2.5
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: cartesian_timing
+    required: false
+    description: Linear moves only. constant_speed or time_optimal timing of the line.
+      Omitted uses the Deployment Cartesian timing.
+    schema:
+      type: enum
+      values:
+      - constant_speed
+      - time_optimal
   - id: max_tcp_linear_speed_mps
     required: false
     description: Per-move TCP linear speed cap in m/s; the lower of this and the Deployment
@@ -2278,15 +2772,16 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
-  - id: clearance_m
+  - id: collision_rules
     required: false
-    description: Collision clearance in meters for this move, 0 to 0.05. Omitted keeps
-      the Deployment clearance.
+    description: Collision rules for this move, at most 64. Each rule gives its pairs
+      a clearance, lets them touch or lets them separate. Omitted keeps the Deployment's
+      rules.
     schema:
-      type: float
-      constraints:
-        min_inclusive: 0.0
-        max_inclusive: 0.05
+      type: array
+      max_items: 64
+      items:
+        schema_ref: '#/schema_types/collision_rule'
   - id: velocity_scale
     required: false
     description: Velocity scaling factor, above 0 up to 1; default 1.0.
@@ -2359,17 +2854,6 @@ entries:
       values:
       - default
       - disable
-  - id: contact_policy_id
-    required: true
-    description: Contact policy the probe may make contact under. Required.
-    schema:
-      type: string
-  - id: contact_scene_resource_id
-    required: true
-    description: Scene resource the contact policy applies to. Required.
-    schema:
-      type: string
-      semantic_type: scene_resource
   - id: stop_mode
     required: true
     description: 'Primary Stop mode used when the condition trips: spring_back_hold,
@@ -2439,6 +2923,12 @@ entries:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
     target_parameter: target
+  - capability_id: planning.motion.cartesian_path
+    scope: target_binding
+    target_parameter: target
+    when:
+      parameter: motion_type
+      equals: linear
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target
@@ -2459,7 +2949,7 @@ entries:
     target_parameter: target
   - capability_id: execution.interrupt.resource_scoped
     scope: cell_global
-  - capability_id: execution.interrupt.contact_policy
+  - capability_id: execution.interrupt.contact_rule
     scope: cell_global
   execution:
     blocking: true
@@ -4773,11 +5263,18 @@ entries:
     schema:
       type: string
       semantic_type: blackboard_key
-  - id: contact_policy_id
-    required: true
-    description: Contact-grasp policy for the descend leg. Required.
+  - id: collision_rules
+    required: false
+    description: Collision rules for the legs of the sequence, at most 64. Each rule
+      gives its pairs a clearance, lets them touch or lets them separate. Each rule
+      names its leg. Omitted keeps the Deployment's rules. A pick allows no contact
+      by itself; without a contact rule on the descend leg the gripper may not touch
+      the object.
     schema:
-      type: string
+      type: array
+      max_items: 64
+      items:
+        schema_ref: '#/schema_types/sequence_collision_rule'
   - id: no_feasible_plan_policy
     required: false
     description: pause_for_operator (default) holds the Run when no candidate is feasible.
@@ -4951,6 +5448,16 @@ entries:
     schema:
       type: string
       semantic_type: blackboard_key
+  - id: collision_rules
+    required: false
+    description: Collision rules for the legs of the sequence, at most 64. Each rule
+      gives its pairs a clearance, lets them touch or lets them separate. Each rule
+      names its leg. Omitted keeps the Deployment's rules.
+    schema:
+      type: array
+      max_items: 64
+      items:
+        schema_ref: '#/schema_types/sequence_collision_rule'
   required_capabilities:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
@@ -4996,6 +5503,127 @@ entries:
   runners:
     py_trees:
       implementation_id: planning_plan_place_sequence_v1
+  observability:
+    event_family: manyforge.program.node
+- id: operator.request_choice
+  name: Ask operator
+  category: recovery
+  description: Asks the operator a question and waits until one of its options is
+    chosen, then succeeds or fails as that option says. Only this branch waits; the
+    rest of the tree keeps running. With hold_motion the named motion groups are stopped
+    when the node starts, as by the operator's Stop, and stay stopped after the answer
+    until the operator's Run. There is no timeout; a Program Stop or Reset ends the
+    question as interrupted.
+  stability: stable
+  tags:
+  - operator
+  - recovery
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: message
+    required: true
+    description: Question shown to the operator. Required.
+    schema:
+      type: string
+  - id: severity
+    required: false
+    description: 'How the question is presented: info, warning or fault. Omitted:
+      info.'
+    default: info
+    schema:
+      type: enum
+      values:
+      - info
+      - warning
+      - fault
+  - id: options
+    required: true
+    description: The 2 to 8 answers offered, each with a unique option_id, a label
+      and the node's result when it is chosen. Required; literal only.
+    schema:
+      type: array
+      min_items: 2
+      max_items: 8
+      items:
+        schema_ref: '#/schema_types/operator_choice_option'
+  - id: output_key
+    required: false
+    description: 'Declared string blackboard key that receives the chosen option_id.
+      Omitted: the answer is not stored.'
+    schema:
+      type: string
+      semantic_type: blackboard_key
+  - id: hold_motion
+    required: false
+    description: 'Motion groups stopped when the node starts and kept stopped until
+      the operator''s Run: [all] for every group, or declared execution group ids.
+      Omitted or empty: no motion is stopped. Literal only.'
+    default: []
+    schema:
+      type: array
+      items:
+        type: string
+  required_capabilities: []
+  blackboard:
+    reads: []
+    writes:
+    - key_parameter: output_key
+      value_type: string
+  execution:
+    blocking: true
+    cancellable: true
+    owner_api: orchestration.operator
+  outcomes:
+    success: success_option_chosen
+    failure: failure_option_chosen
+    interrupted: cancelled
+  runners:
+    py_trees:
+      implementation_id: operator_request_choice_v1
+  observability:
+    event_family: manyforge.program.node
+- id: motion.stop_groups
+  name: Stop motion groups
+  category: recovery
+  description: Stops the named motion groups as the operator's Stop does and succeeds
+    once that Stop has completed. The groups stay stopped until the operator's Run.
+    It fails when a stopped node's Stop ended uncontained.
+  stability: stable
+  tags:
+  - motion
+  - stop
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: groups
+    required: true
+    description: Motion groups to stop, [all] for every group, or declared execution
+      group ids. Required; literal only.
+    schema:
+      type: array
+      min_items: 1
+      items:
+        type: string
+  required_capabilities: []
+  execution:
+    blocking: true
+    cancellable: false
+    owner_api: orchestration.selection_stop
+  outcomes:
+    success: groups_stopped
+    failure: stop_failed
+  runners:
+    py_trees:
+      implementation_id: motion_stop_groups_v1
   observability:
     event_family: manyforge.program.node
 - id: recovery.apply_offered_action

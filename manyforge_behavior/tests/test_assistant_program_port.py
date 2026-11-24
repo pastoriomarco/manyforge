@@ -183,7 +183,6 @@ def _context(
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="scenario-1",
         source_document_digest=_DIGEST_A,
-        program_id=program.program_id,
         program_revision=program.program_revision,
         program_binding_id=_DIGEST_B,
         retained_bundle_id=_DIGEST_C,
@@ -191,7 +190,6 @@ def _context(
         node_environment_digest=_DIGEST_E,
         program_binding={
             "program_binding_id": _DIGEST_B,
-            "program_id": program.program_id,
             "program_revision": program.program_revision,
             "retained_bundle_id": _DIGEST_C,
             "graph_revision": _DIGEST_D,
@@ -241,7 +239,6 @@ def _scene_object(
         "collision_shapes": [collision_shape],
         "placement": placement,
         "provider_evidence": None,
-        "support_contacts": [],
     }
 
 

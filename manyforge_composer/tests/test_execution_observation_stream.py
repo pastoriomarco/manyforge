@@ -209,6 +209,46 @@ def test_measured_targets_are_validated_and_publish_measured_only_changes() -> N
         stream.project_execution_observation(response, received_at_monotonic_us=5)
 
 
+def _spring(**change: Any) -> dict[str, Any]:
+    row = {
+        "rule_id": "tube_into_endplate",
+        "a": {"kind": "scene_object", "scene_resource_id": "tube"},
+        "depth_m": 0.002,
+        "push_direction": [0.0, 0.0, 1.0],
+    }
+    row.update(change)
+    return row
+
+
+def test_spring_compressions_are_validated_and_absent_when_none() -> None:
+    response = _status()
+    plain = stream.project_execution_observation(response, received_at_monotonic_us=1)
+    assert "spring_compressions" not in plain
+    link = {"kind": "component_link", "component_id": "tool", "link": "tool__tool_stylus"}
+    response["observation"]["spring_compressions"] = [_spring(), _spring(a=link)]
+    frame = stream.project_execution_observation(response, received_at_monotonic_us=2)
+    assert frame["spring_compressions"] == [_spring(), _spring(a=link)]
+    assert stream._render_signature(frame) != stream._render_signature(plain)
+    deeper = stream.project_execution_observation(
+        {**response, "observation": {**response["observation"],
+                                     "spring_compressions": [_spring(depth_m=0.003)]}},
+        received_at_monotonic_us=3,
+    )
+    assert stream._render_signature(deeper) != stream._render_signature(frame)
+    for bad in (
+        [],
+        [_spring(depth_m=0.0)],
+        [_spring(push_direction=[0.0, 0.0, 2.0])],
+        [_spring(push_direction=[0.0, 1.0])],
+        [_spring(a={"kind": "link", "link": "x"})],
+        [{**_spring(), "extra": 1}],
+        [_spring()] * 65,
+    ):
+        response["observation"]["spring_compressions"] = bad
+        with pytest.raises(stream.ExecutionObservationProjectionError):
+            stream.project_execution_observation(response, received_at_monotonic_us=4)
+
+
 def test_encode_execution_observation_frame_is_one_canonical_payload() -> None:
     frame = stream.project_execution_observation(
         _status(), received_at_monotonic_us=123_456

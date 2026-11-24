@@ -246,7 +246,7 @@ def step_catalog_pin(ctx: Context) -> None:
     binding = json.loads(text)
     computed = compute_content_identity(
         binding, own_field="program_binding_id", identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v3")
+        api_version="manyforge.program_binding.v4")
     repin(ctx, DIGEST.match(binding["program_binding_id"]).group(1),
           DIGEST.match(computed).group(1))
 
@@ -260,7 +260,7 @@ def step_closed_schemas(ctx: Context) -> None:
     # Generated schemas only. Their moved revisions reach the registry and the
     # C++/Python copies through the generic pin propagation after this step.
     # Hand-authored schema revisions are not recomputed here: the Python formula
-    # does not reproduce every stored revision (contact_policy.v1).
+    # does not reproduce every stored revision.
     python("manyforge_deployment/tools/generate_io_provider_configuration_schema.py",
            "--workspace-root", ROOT, check=not ctx.update, ctx=ctx)
 
@@ -299,7 +299,7 @@ def step_node_environment(ctx: Context) -> None:
 def step_program_revisions(ctx: Context) -> None:
     tool = ctx.tool("manyforge_program_revision")
     for path in sorted((ROOT / "examples").glob("*.program.yaml")):
-        if load_data(path.read_bytes()).get("api_version") != "manyforge.program.v3":
+        if load_data(path.read_bytes()).get("api_version") != "manyforge.program.v4":
             continue
         try:
             run(tool, "--check", "--input", path)
@@ -361,8 +361,9 @@ def step_scenario_pins(ctx: Context) -> None:
         if (content_digest != manifest["saved_status"]["checked_content_digest"]
                 and pinned["saved_status"]["last_known_status"] == "ready"):
             pinned["saved_status"]["last_known_status"] = "unknown"
-        pinned["source_snapshot"], _ = sa._source_snapshot(values["deployment_draft"],
-                                                           project_root=project)
+        # The bundled examples' model sources live in the repository.
+        pinned["source_snapshot"], _ = sa._source_snapshot(
+            values["deployment_draft"], project_root=project, roots=[str(ROOT)])
         if pinned != manifest:
             stale.append(project.name)
             if ctx.update:

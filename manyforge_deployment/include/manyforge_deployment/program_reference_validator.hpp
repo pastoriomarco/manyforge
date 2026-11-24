@@ -41,7 +41,7 @@ class ProgramReferenceValidationRefusal final : public std::runtime_error {
   std::vector<ProgramReferenceDiagnostic> diagnostics_;
 };
 
-/// Validate a parsed v3 Program against one immutable verified candidate.
+/// Validate a parsed v4 Program against one immutable verified candidate.
 /// Structural validation and node-catalog validation precede this call.
 /// Candidate/catalog inconsistencies throw; they are not missing-reference
 /// diagnostics. Draft permits absent reference fields; strict input does not.

@@ -32,8 +32,8 @@ enum class ErrorCode {
     kCartesianIncomplete,
     kStartStateMismatch,
     kValidationCollision,
-    kInvalidContactPolicy,
-    kContactPolicyViolation,
+    kInvalidCollisionRule,
+    kContactRuleViolation,
     kValidationDeferred,
     kValidationLimitsViolation,
     kObjectAlreadyExists,
@@ -74,8 +74,8 @@ inline const char* to_string(ErrorCode code) {
         case kCartesianIncomplete: return "cartesian_incomplete";
         case kStartStateMismatch: return "start_state_mismatch";
         case kValidationCollision: return "validation_collision";
-        case kInvalidContactPolicy: return "invalid_contact_policy";
-        case kContactPolicyViolation: return "contact_policy_violation";
+        case kInvalidCollisionRule: return "invalid_collision_rule";
+        case kContactRuleViolation: return "contact_rule_violation";
         case kValidationDeferred: return "validation_deferred";
         case kValidationLimitsViolation: return "validation_limits_violation";
         case kObjectAlreadyExists: return "object_already_exists";
@@ -268,8 +268,8 @@ inline const char* kErrorCartesianIncomplete = "cartesian_incomplete";
 // Validation (pre-execution gate)
 inline const char* kErrorStartStateMismatch = "start_state_mismatch";
 inline const char* kErrorValidationCollision = "validation_collision";
-inline const char* kErrorInvalidContactPolicy = "invalid_contact_policy";
-inline const char* kErrorContactPolicyViolation = "contact_policy_violation";
+inline const char* kErrorInvalidCollisionRule = "invalid_collision_rule";
+inline const char* kErrorContactRuleViolation = "contact_rule_violation";
 inline const char* kErrorValidationDeferred = "validation_deferred";
 inline const char* kErrorValidationLimitsViolation = "validation_limits_violation";
 inline const char* kErrorSceneChangedDuringValidation =

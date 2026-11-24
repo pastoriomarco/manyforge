@@ -26,8 +26,7 @@ const CanonicalValue &member(const CanonicalValue &value,
 void exact_inputs(const ProgramBindingContract &program,
                   const ProgramBinding &binding, const RetainedBundle &bundle) {
   const auto &bound = binding.value();
-  if (bound.program_id != program.value().program_id ||
-      bound.program_revision != program.value().program_revision ||
+  if (bound.program_revision != program.value().program_revision ||
       bound.node_environment != program.value().node_environment ||
       bound.retained_bundle_id != bundle.retained_bundle_id() ||
       bound.graph_revision != bundle.value().cell_graph.graph_revision)

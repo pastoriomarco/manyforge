@@ -2,6 +2,7 @@ import type {
   ComponentCatalog,
   ComponentCatalogEntry,
   ComponentCatalogKind,
+  ComponentCollisionBodyTarget,
   ComponentModelPayload,
   ComponentProfileFacts,
   ComponentTcpTarget,
@@ -98,10 +99,29 @@ function parseTcpTarget(value: unknown, path: string): ComponentTcpTarget {
   };
 }
 
+function parseCollisionBodyTarget(value: unknown, path: string): ComponentCollisionBodyTarget {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['commandTargetId', 'collisionBodyRoleIds', 'tcpContactBodyRoleIds', 'gripBodyRoleId'], path);
+  const contactBodies = objectAt(record.tcpContactBodyRoleIds, `${path}.tcpContactBodyRoleIds`);
+  return {
+    commandTargetId: stringAt(record.commandTargetId, `${path}.commandTargetId`),
+    collisionBodyRoleIds: strings(record.collisionBodyRoleIds, `${path}.collisionBodyRoleIds`),
+    tcpContactBodyRoleIds: Object.fromEntries(Object.entries(contactBodies).map(([frameRoleId, roles]) => (
+      [frameRoleId, strings(roles, `${path}.tcpContactBodyRoleIds.${frameRoleId}`)]
+    ))),
+    gripBodyRoleId: record.gripBodyRoleId === null
+      ? null : stringAt(record.gripBodyRoleId, `${path}.gripBodyRoleId`),
+  };
+}
+
 function parseProfileFacts(value: unknown, path: string): ComponentProfileFacts {
   const record = objectAt(value, path);
-  allowedKeysAt(record, ['tags', 'attachmentInterfaces', 'tcpTargets'], ['payload', 'frameTargets', 'hasMotionTarget', 'lanes'], path);
+  allowedKeysAt(record, ['tags', 'attachmentInterfaces', 'tcpTargets'],
+    ['title', 'payload', 'frameTargets', 'hasMotionTarget', 'lanes', 'collisionBodyTargets'], path);
   return {
+    ...(record.title === undefined || record.title === null ? {} : {
+      title: stringAt(record.title, `${path}.title`),
+    }),
     tags: strings(record.tags, `${path}.tags`),
     attachmentInterfaces: strings(record.attachmentInterfaces, `${path}.attachmentInterfaces`),
     tcpTargets: arrayAt(record.tcpTargets, `${path}.tcpTargets`)
@@ -117,6 +137,10 @@ function parseProfileFacts(value: unknown, path: string): ComponentProfileFacts 
         return { commandTargetId: stringAt(target.commandTargetId, `${targetPath}.commandTargetId`),
           frameRoleIds: strings(target.frameRoleIds, `${targetPath}.frameRoleIds`) };
       }),
+    }),
+    ...(record.collisionBodyTargets === undefined ? {} : {
+      collisionBodyTargets: arrayAt(record.collisionBodyTargets, `${path}.collisionBodyTargets`)
+        .map((target, index) => parseCollisionBodyTarget(target, `${path}.collisionBodyTargets[${index}]`)),
     }),
     ...(record.payload === undefined ? {} : { payload: parsePayload(record.payload, `${path}.payload`) }),
     ...(record.lanes === undefined ? {} : { lanes: strings(record.lanes, `${path}.lanes`) }),

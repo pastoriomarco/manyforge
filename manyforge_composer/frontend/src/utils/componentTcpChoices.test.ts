@@ -28,7 +28,7 @@ function draft(
   attachments: Array<[string, string, string, boolean?]>,
 ): Record<string, JsonValue> {
   return {
-    api_version: 'manyforge.deployment_intent.v2',
+    api_version: 'manyforge.deployment_intent.v3',
     components: components.map(([id, profile, extra]) => ({ component_id: id, component_profile_id: profile, ...extra })),
     attachments: attachments.map(([parent, parentInterface, child, primary]) => ({
       parent: { component_id: parent, interface: parentInterface },

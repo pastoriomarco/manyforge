@@ -58,7 +58,7 @@ constexpr std::string_view kZeroDigest =
 constexpr std::string_view kCapabilitySchemaRevision =
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0";
 constexpr std::string_view kComponentTypeSchemaRevision =
-    "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde";
+    "sha256:4c1a934edc63d9da5eac2d1aef76d86142fcb797950a12306009e028d551c3fa";
 constexpr std::string_view kModelAssetSchemaRevision =
     "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6";
 
@@ -508,6 +508,8 @@ struct TypeSpec final {
   std::string target_resource_source{"arm_joints"};
   std::string target_frame_source{"tcp"};
   std::string target_body_source{"arm_collision"};
+  // The target body is an optional body of its family (OD-352 A1).
+  bool target_body_optional = false;
   std::vector<CommandTargetSpec> command_targets{};
   bool with_interface = false;
   std::string interface_id{"flange"};
@@ -659,15 +661,19 @@ struct QualifiedType final {
                  return frames;
                }())},
               {"collision_body_roles",
-               CanonicalValue(CanonicalValue::Array{
-                   CanonicalValue(CanonicalValue::Object{
-                       {"collision_body_role_id",
-                        CanonicalValue("collision")},
-                       {"model_role_id",
-                        CanonicalValue(spec.target_model_role)},
-                       {"asset_collision_body_role_id",
-                        CanonicalValue(std::string(body_source))},
-                   })})},
+               CanonicalValue(CanonicalValue::Array{[&] {
+                 CanonicalValue::Object body{
+                     {"collision_body_role_id", CanonicalValue("collision")},
+                     {"model_role_id",
+                      CanonicalValue(spec.target_model_role)},
+                     {"asset_collision_body_role_id",
+                      CanonicalValue(std::string(body_source))},
+                 };
+                 if (spec.target_body_optional) {
+                   body.emplace_back("optional", CanonicalValue(true));
+                 }
+                 return CanonicalValue(std::move(body));
+               }()})},
               {"capabilities",
                CanonicalValue(CanonicalValue::Array{
                    CanonicalValue(CanonicalValue::Object{
@@ -2590,6 +2596,91 @@ TEST(CellStructure, ProvesRootMountAndCommandTargetSourceRoles) {
       (void)compose_cell_occurrences(
           bad_mount_graph, mount_sources, mount_types),
       CellCompositionError);
+}
+
+// OD-350: a target body selecting `default_collision` contributes nothing
+// when the model binds no default; any other unbound body role still fails.
+TEST(CellStructure, UnboundDefaultCollisionBodyContributesNothing) {
+  const std::string default_role(core::kDefaultCollisionBodyRoleId);
+  auto covered = qualify_source(AssetSpec{.id = "covered", .with_srdf = true});
+  auto defaulted = qualify_source(
+      AssetSpec{.id = "defaulted",
+                .with_srdf = true,
+                .bodies = {{"arm_collision", {"base_link"}},
+                           {default_role, {"tip_link"}}}});
+  auto type = qualify_type(TypeSpec{.id = "default_type",
+                                    .tags = {},
+                                    .with_target = true,
+                                    .target_body_source = default_role});
+  const auto types = type_values({&type});
+  const auto compose = [&](const QualifiedSource& source) {
+    return compose_cell_occurrences(
+        graph_for({{"model", &source, false}},
+                  {{"component", &type, {{"body", "model"}}, true}}),
+        source_values({&source}), types);
+  };
+
+  const auto unbound = compose(covered);
+  ASSERT_EQ(unbound.targets().size(), 1U);
+  EXPECT_TRUE(unbound.targets()[0].collision_bodies.empty());
+
+  const auto bound = compose(defaulted);
+  ASSERT_EQ(bound.targets().size(), 1U);
+  ASSERT_EQ(bound.targets()[0].collision_bodies.size(), 1U);
+  const auto& body = bound.targets()[0].collision_bodies[0];
+  EXPECT_EQ(body.collision_body_role_id.value(), "collision");
+  EXPECT_EQ(body.compiled_link_names.size(), 1U);
+
+  auto missing = qualify_type(TypeSpec{.id = "missing_body_type",
+                                       .tags = {},
+                                       .with_target = true,
+                                       .target_body_source = "missing_body"});
+  const auto missing_types = type_values({&missing});
+  EXPECT_THROW(
+      (void)compose_cell_occurrences(
+          graph_for({{"model", &covered, false}},
+                    {{"component", &missing, {{"body", "model"}}, true}}),
+          source_values({&covered}), missing_types),
+      CellCompositionError);
+}
+
+// OD-352 A1: a target body the type marks optional (a passive tool's
+// `tip`) contributes nothing when the model binds no such body, and binds as
+// usual when it does; the same body unmarked still fails when unbound.
+TEST(CellStructure, UnboundOptionalCollisionBodyContributesNothing) {
+  auto without_tip = qualify_source(AssetSpec{.id = "no_tip", .with_srdf = true});
+  auto with_tip = qualify_source(
+      AssetSpec{.id = "with_tip",
+                .with_srdf = true,
+                .bodies = {{"arm_collision", {"base_link"}},
+                           {"tip", {"tip_link"}}}});
+  auto optional_type = qualify_type(TypeSpec{.id = "optional_tip_type",
+                                             .tags = {},
+                                             .with_target = true,
+                                             .target_body_source = "tip",
+                                             .target_body_optional = true});
+  const auto compose = [](const QualifiedSource& source,
+                          const QualifiedType& type) {
+    return compose_cell_occurrences(
+        graph_for({{"model", &source, false}},
+                  {{"component", &type, {{"body", "model"}}, true}}),
+        source_values({&source}), type_values({&type}));
+  };
+
+  const auto unbound = compose(without_tip, optional_type);
+  ASSERT_EQ(unbound.targets().size(), 1U);
+  EXPECT_TRUE(unbound.targets()[0].collision_bodies.empty());
+
+  const auto bound = compose(with_tip, optional_type);
+  ASSERT_EQ(bound.targets().size(), 1U);
+  ASSERT_EQ(bound.targets()[0].collision_bodies.size(), 1U);
+  EXPECT_EQ(bound.targets()[0].collision_bodies[0].compiled_link_names.size(), 1U);
+
+  auto required_type = qualify_type(TypeSpec{.id = "required_tip_type",
+                                             .tags = {},
+                                             .with_target = true,
+                                             .target_body_source = "tip"});
+  EXPECT_THROW((void)compose(without_tip, required_type), CellCompositionError);
 }
 
 TEST(CellStructure,

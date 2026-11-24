@@ -68,6 +68,8 @@ export interface PersistentKeyValuesViewProps {
   onReset: (key: string) => Promise<boolean>;
   onClear: () => Promise<boolean>;
   onRefresh: () => void;
+  /** Opens the key's declaration (Program tab), where its initial value is edited. */
+  onEditInitial?: (key: string) => void;
 }
 
 /**
@@ -87,6 +89,7 @@ export function PersistentKeyValuesView({
   onReset,
   onClear,
   onRefresh,
+  onEditInitial,
 }: PersistentKeyValuesViewProps) {
   const busy = runnerBusyReason !== null;
   const busyTitle = runnerBusyReason ?? undefined;
@@ -198,8 +201,17 @@ export function PersistentKeyValuesView({
                     poseIssue: null,
                   })}
                 >
-                  Edit
+                  Edit value
                 </button>
+                {onEditInitial !== undefined && (
+                  <button
+                    type="button"
+                    title="Open the key's declaration in the Program tab: the initial value is part of the Program (Draft, then Apply)."
+                    onClick={() => onEditInitial(row.key)}
+                  >
+                    Edit initial
+                  </button>
+                )}
                 <button
                   type="button"
                   disabled={pending || row.access === 'read' || (!row.stored && liveRun === null)}
@@ -344,6 +356,7 @@ export interface PersistentKeyValuesSectionProps {
   client: ProgramRuntimeController['persistentValues'];
   /** Why value edits wait: another Program command is running (OD-144). */
   runnerBusyReason?: string | null;
+  onEditInitial?: (key: string) => void;
 }
 
 /** Reads and edits the stored values through the Program runner. */
@@ -356,6 +369,7 @@ export function PersistentKeyValuesSection({
   frameProgram,
   client,
   runnerBusyReason = null,
+  onEditInitial,
 }: PersistentKeyValuesSectionProps) {
   const [values, setValues] = useState<PersistentKeyValues | null>(null);
   const [pending, setPending] = useState(false);
@@ -413,6 +427,7 @@ export function PersistentKeyValuesSection({
       pending={pending}
       runnerBusyReason={runnerBusyReason}
       error={error}
+      onEditInitial={onEditInitial}
       onSet={(key, value) => perform(
         () => client.edit(values, key, value),
         'The stored value was refused.',

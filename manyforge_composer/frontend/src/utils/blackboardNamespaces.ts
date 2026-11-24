@@ -5,7 +5,7 @@
  */
 export const NODE_OUTCOME_NAMESPACE = 'node_outcome';
 
-/** A node outcome key's start value: no result yet in this Run. */
+/** A node outcome key's start value: no result yet for the current attempt. */
 export const NODE_OUTCOME_NONE = 'none';
 
 const ENDED_OUTCOMES = ['completed', 'failed', 'preempted', 'superseded', 'refused_by_priority'] as const;
@@ -26,8 +26,22 @@ export const INTERRUPT_STATE_NAMESPACE = 'interrupt_state';
 
 export const INTERRUPT_STATE_VALUES = ['inactive', 'clear', 'tripped'] as const;
 
+/**
+ * The reserved namespace of the motion group state keys
+ * `motion_group_state.<group_id>` (every execution group and `all`):
+ * system-owned, read-only, the group's state in the run's runtime controls.
+ */
+export const MOTION_GROUP_STATE_NAMESPACE = 'motion_group_state';
+
+/** Every value, as the runtime controls' group state (`unavailable` = no current Run). */
+export const MOTION_GROUP_STATE_VALUES = [
+  'ready', 'running', 'stopping', 'held', 'mixed', 'faulted', 'unavailable',
+] as const;
+
 /** The system namespaces: never a user key, namespace or Program parameter name. */
-export const SYSTEM_NAMESPACES: readonly string[] = [NODE_OUTCOME_NAMESPACE, INTERRUPT_STATE_NAMESPACE];
+export const SYSTEM_NAMESPACES: readonly string[] = [
+  NODE_OUTCOME_NAMESPACE, INTERRUPT_STATE_NAMESPACE, MOTION_GROUP_STATE_NAMESPACE,
+];
 
 /** The system namespace a name is or is under, or null. */
 export function systemNamespaceOf(name: string): string | null {
@@ -35,7 +49,7 @@ export function systemNamespaceOf(name: string): string | null {
   return SYSTEM_NAMESPACES.includes(head) ? head : null;
 }
 
-/** True for a system-owned key (`node_outcome.*`, `interrupt_state.*`). */
+/** True for a system-owned key (`node_outcome.*`, `interrupt_state.*`, `motion_group_state.*`). */
 export function isSystemKey(key: string): boolean {
   return key.includes('.') && systemNamespaceOf(key) !== null;
 }
@@ -62,6 +76,7 @@ export function keyNamespace(key: string): string {
 export function namespaceLabel(namespace: string): string {
   if (namespace === NODE_OUTCOME_NAMESPACE) return 'Node outcomes';
   if (namespace === INTERRUPT_STATE_NAMESPACE) return 'Interrupt states';
+  if (namespace === MOTION_GROUP_STATE_NAMESPACE) return 'Motion group states';
   return namespace === '' ? 'No namespace' : namespace;
 }
 
@@ -76,7 +91,7 @@ export function groupByNamespace<T>(
     groups.set(namespace, [...(groups.get(namespace) ?? []), item]);
   }
   const rank = (id: string) => (id === '' ? 0
-    : id === NODE_OUTCOME_NAMESPACE || id === INTERRUPT_STATE_NAMESPACE ? 2 : 1);
+    : SYSTEM_NAMESPACES.includes(id) ? 2 : 1);
   return [...groups.entries()]
     .sort(([left], [right]) => rank(left) - rank(right) || (left < right ? -1 : left > right ? 1 : 0))
     .map(([id, rows]) => ({ id, label: namespaceLabel(id), items: rows }));

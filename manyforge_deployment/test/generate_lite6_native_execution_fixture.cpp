@@ -181,11 +181,9 @@ void write_exact_file(const std::filesystem::path &path,
                CanonicalValue(CanonicalValue::Array{pose, next_pose}));
   }
   CanonicalValue::Object root{
-      {"api_version", CanonicalValue("manyforge.program.v3")},
-      {"program_id", CanonicalValue("i6_native_joint_motion_program")},
+      {"api_version", CanonicalValue("manyforge.program.v4")},
       {"program_revision", CanonicalValue(std::string(kZeroDigest))},
       {"program_profile", CanonicalValue("composable-cell-v1")},
-      {"name", CanonicalValue("I6 addressed native joint motion")},
       {"catalog",
        CanonicalValue(CanonicalValue::Object{
            {"api_version", CanonicalValue("manyforge.node_catalog.v3")},
@@ -230,7 +228,7 @@ void write_exact_file(const std::filesystem::path &path,
   const std::string revision = deployment::detail::compute_content_identity(
       root, deployment::detail::ContentIdentitySpec{
                 .identity_domain = "program-revision",
-                .api_version = "manyforge.program.v3",
+                .api_version = "manyforge.program.v4",
                 .own_field = "program_revision",
             });
   auto members = root.as_object();
@@ -450,7 +448,6 @@ int main(int argc, char **argv) {
         {"scene_revision", scene_revision(empty_scene.revision)},
         {"active_publication_generation",
          CanonicalValue(static_cast<double>(receipt.publication_generation.value()))},
-        {"program_id", CanonicalValue(program->value().program_id.value())},
         {"program_revision", CanonicalValue(program->value().program_revision.value())},
         {"program_binding_id", CanonicalValue(binding->program_binding_id().value())},
         {"controllable_component_ids", CanonicalValue(std::move(component_ids))},

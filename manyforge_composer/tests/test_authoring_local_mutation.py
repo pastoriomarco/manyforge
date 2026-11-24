@@ -1104,7 +1104,7 @@ def test_idle_draft_edit_commits_without_a_cell_claim(tmp_path) -> None:
 
 
 def _set_deployment(deployment, name: str) -> bool:
-    deployment._document = {"name": name}
+    deployment._document = {"label": name}
     deployment._revision += 1
     return True
 
@@ -1945,6 +1945,7 @@ def test_preparation_settles_a_lost_answer_claim_before_it_reads_admission(
         "captured_input_digest": "sha256:" + "2" * 64,
         "deployment": {},
         "model_source_closure": {},
+        "scene_mesh_closure": {},
         "program": None,
         "expected_admission_generation": 7,
         "application_start_id": "3f9a0000000000a1",

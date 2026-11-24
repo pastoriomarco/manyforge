@@ -143,10 +143,10 @@ describe('application and viewport composition', () => {
     expect(transport).not.toContain('transport-guidance');
     expect(styles).toMatch(/\.viewer-transport \{[^}]*padding: 0;[^}]*overflow: visible;/s);
     expect(styles).not.toMatch(/\.viewer-transport \{[^}]*(?:border|background):/s);
-    expect(styles).toMatch(/\.transport-motion-panel \{[^}]*border: 1px solid #365563;[^}]*background: rgb\(8 23 32 \/ 94%\);/s);
+    expect(styles).toMatch(/\.transport-motion-panel \{[^}]*border: 1px solid #365563;[^}]*background: color-mix\(in srgb, #0a1720 72%, transparent\);/s);
     expect(styles).toMatch(/\.transport-group-grid \{[^}]*justify-content: flex-start;[^}]*padding: 0;[^}]*overflow-x: auto;/s);
     expect(styles).toMatch(/\.transport-panel-title \{[^}]*font-size: 0\.96rem;[^}]*line-height: 1\.2rem;/s);
-    expect(styles).toMatch(/\.transport-unique-column \{[^}]*border: 1px solid #365563;[^}]*background: rgb\(8 23 32 \/ 94%\);[^}]*margin-left: auto;/s);
+    expect(styles).toMatch(/\.transport-unique-column \{[^}]*border: 1px solid #365563;[^}]*background: color-mix\(in srgb, #0a1720 72%, transparent\);[^}]*margin-left: auto;/s);
     expect(styles).toContain('--viewer-transport-control-height: 2.85rem;');
     expect(styles).toContain('--viewer-transport-column-width: 7rem;');
     expect(styles).toMatch(/\.viewer-transport button:not\(\.overlay-panel \*\) \{[\s\S]*?height: var\(--viewer-transport-control-height\);[\s\S]*?font-size: 0\.84rem;/);

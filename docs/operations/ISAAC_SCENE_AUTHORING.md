@@ -12,9 +12,11 @@ files from the Program scene as below.
 ## 1. Place the mesh files
 
 Put the mesh files inside the Scenario project (for example under its
-`assets/` folder) or in another folder Composer can read: the repository
-`examples/` tree or a configured project folder (see
-[`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md#project-folders)).
+`assets/` folder) or in another allowed folder: the repository checkout,
+`examples/` or a configured project folder. A `mesh_resource_uri` is relative
+to the Scenario project folder (the `.scenario` folder) or absolute, and must
+stay inside an allowed folder; see
+[Paths inside a project](DEVELOPMENT_WORKBENCH.md#paths-inside-a-project).
 Supported formats are `.obj`, `.stl`, `.ply`, `.glb` and `.gltf`. For a
 planning scene, prefer simple collider geometry over detailed visual meshes:
 collision-check cost grows with triangle count.
@@ -36,7 +38,7 @@ In `program.yaml` an object looks like this (from the bundled example):
   },
   "shape": {
     "type": "mesh",
-    "mesh_resource_uri": "examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj",
+    "mesh_resource_uri": "../isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj",
     "mesh_scale": [1.0, 1.0, 1.0]
   }
 }
@@ -60,8 +62,10 @@ binds this Program and Deployment. Confirm:
 1. **The viewer renders each mesh** at the Isaac pose. A mesh that cannot be
    shown is marked with its status (`missing`, `parse_failed`,
    `unsupported_format`, `outside_allowed_roots`, …).
-1. **A test plan succeeds** through the loaded scene: planning reads the same
-   mesh files, so a successful plan confirms the geometry reaches the planner.
+1. **A test plan succeeds** through the loaded scene: Load stored a copy of
+   each mesh in the activation, and the collision checks and the planner read
+   that copy, so a successful plan confirms the geometry reaches the planner.
+   After editing a mesh file, Load or Apply again to use the new content.
 
 ## 4. Optional: stream object poses from Isaac
 
@@ -149,10 +153,11 @@ controller discovery) see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
-| Mesh file present but Composer shows `missing` | Path mismatch between `mesh_resource_uri` and the file location. | Check the path; repository-relative paths such as `examples/...` and paths inside the Scenario project are accepted. |
+| Mesh file present but Composer shows `missing` | Path mismatch between `mesh_resource_uri` and the file location. | Check the path: it is relative to the Scenario project folder (the `.scenario` folder), or absolute. |
+| Load or Apply refuses with `scene_mesh_unavailable` | A mesh path breaks the rule or names no file; the message names the path and the allowed folders. | Fix the path or move the file into an allowed folder. |
 | Composer shows `parse_failed` | The mesh file is malformed. | Re-export it and check it in a mesh viewer. |
 | Composer shows `unsupported_format` | The file type is not supported (for example `.dae`). | Convert it to `.obj`, `.stl`, `.ply`, `.glb` or `.gltf`. |
-| Composer shows `outside_allowed_roots` | The `mesh_resource_uri` resolves outside the folders Composer can read. | Move the file into the Scenario project, `examples/`, or a configured project folder. |
+| Composer shows `outside_allowed_roots` | The `mesh_resource_uri` resolves outside the allowed folders (also after `..`). | Move the file into the Scenario project, `examples/`, or a configured project folder. |
 | Planner fails on the loaded scene but the viewer looks right | Degenerate geometry (zero-area triangles, self-intersection) or a genuine collision. | Inspect and clean the mesh, then re-export. |
 
 ## See also

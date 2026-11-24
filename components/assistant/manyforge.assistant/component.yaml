@@ -6,7 +6,7 @@
 # (cancelling a running chat request). Like a sensor it has no lane. The
 # Deployment row names the AI model component that serves the chat and the
 # assistant profile (its chat mode); one per cell.
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: assistant
 id: manyforge.assistant
 version: 1.0.0

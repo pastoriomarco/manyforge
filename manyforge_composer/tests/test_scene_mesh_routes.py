@@ -653,8 +653,12 @@ class _SceneClient:
 
 
 class _SceneState:
-    def __init__(self, root: Path, source_uri: str) -> None:
+    def __init__(
+        self, root: Path, source_uri: str, *, project: Path | None = None
+    ) -> None:
         self.allowed_fs_roots = [str(root)]
+        # Relative mesh URIs resolve against the Scenario project folder.
+        self.scenario_project_path = str(project or root)
         self.program_source_path = None
         self.headless_client = _SceneClient(source_uri)
 
@@ -750,7 +754,8 @@ def test_owner_mesh_url_is_content_addressed_and_stable_across_owner_changes(
         ("scale", "scene_mesh_not_owner_authorized"),
         ("stale", "scene_mesh_owner_projection_stale"),
         ("content", "scene_mesh_source_changed"),
-        ("symlink", "scene_mesh_input_invalid"),
+        # The path rule refuses a symlink, so no current reference resolves.
+        ("symlink", "scene_mesh_not_owner_authorized"),
     ],
 )
 def test_owner_mesh_url_refuses_unreferenced_or_changed_source(
@@ -828,17 +833,17 @@ def test_owner_bound_route_rejects_unowned_and_outside_sources(tmp_path: Path) -
     ("source_uri", "expected_status", "error_message"),
     [
         ("examples/part.obj", 200, None),
-        ("outside.obj", 409, "allowed local source"),
+        ("outside.obj", 409, "outside the allowed folders"),
         ("examples/linked.obj", 409, "symlink"),
     ],
 )
-def test_workspace_relative_owner_mesh_preserves_narrow_root_authorization(
+def test_project_relative_owner_mesh_preserves_narrow_root_authorization(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     source_uri: str,
     expected_status: int,
     error_message: str | None,
 ) -> None:
+    # The project folder holds the mesh folder; only examples/ is allowed.
     workspace = tmp_path / "workspace"
     root = workspace / "examples"
     root.mkdir(parents=True)
@@ -846,8 +851,7 @@ def test_workspace_relative_owner_mesh_preserves_narrow_root_authorization(
     outside = workspace / "outside.obj"
     _write_obj(outside)
     (root / "linked.obj").symlink_to(outside)
-    monkeypatch.chdir(workspace)
-    state = _SceneState(root, source_uri)
+    state = _SceneState(root, source_uri, project=workspace)
     app = FastAPI()
     app.include_router(meshes.create_scene_meshes_router(state))  # type: ignore[arg-type]
     client = TestClient(app)
@@ -875,6 +879,40 @@ def test_workspace_relative_owner_mesh_preserves_narrow_root_authorization(
         assert converted.headers["content-type"] == "model/gltf-binary"
         assert converted.content.startswith(b"glTF")
     assert state.allowed_fs_roots == [str(root)]
+
+
+def test_mesh_paths_follow_the_one_rule_without_fallbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A mesh below a second allowed folder, named project-relative and
+    # absolute; no current-directory or allowed-root fallback.
+    examples = tmp_path / "examples"
+    project = examples / "cell.scenario"
+    project.mkdir(parents=True)
+    site = tmp_path / "projects" / "site"
+    (site / "meshes").mkdir(parents=True)
+    _write_obj(site / "meshes" / "x.obj")
+    _write_obj(examples / "fallback.obj")
+    monkeypatch.chdir(examples)
+    params = {"scale_x": 1.0, "scale_y": 2.0, "scale_z": 3.0}
+    for uri in ("../../projects/site/meshes/x.obj", str(site / "meshes" / "x.obj")):
+        state = _SceneState(examples, uri, project=project)
+        state.allowed_fs_roots = [str(examples), str(site)]
+        app = FastAPI()
+        app.include_router(meshes.create_scene_meshes_router(state))  # type: ignore[arg-type]
+        response = TestClient(app).get(
+            "/api/scene/object-meshes/resolve", params={"resource_uri": uri, **params})
+        assert response.status_code == 200, response.text
+    state = _SceneState(examples, "fallback.obj", project=project)
+    app = FastAPI()
+    app.include_router(meshes.create_scene_meshes_router(state))  # type: ignore[arg-type]
+    refused = TestClient(app).get(
+        "/api/scene/object-meshes/resolve", params={"resource_uri": "fallback.obj", **params})
+    assert refused.status_code == 409
+    detail = refused.json()["detail"]
+    assert detail["code"] == "scene_mesh_input_invalid"
+    assert str(project / "fallback.obj") in detail["message"]
+    assert str(examples) in detail["message"]
 
 
 def test_program_draft_mesh_route_is_revision_bound_and_cache_is_scope_separated(

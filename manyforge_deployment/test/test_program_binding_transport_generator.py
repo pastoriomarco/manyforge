@@ -13,7 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = ROOT / "manyforge_deployment/tools/generate_program_binding_transport.py"
 DESCRIPTOR = (
-    ROOT / "manyforge_deployment/resources/program_binding_transport.v3.json"
+    ROOT / "manyforge_deployment/resources/program_binding_transport.v4.json"
 )
 FIXTURE = (
     ROOT
@@ -70,8 +70,8 @@ def test_checked_in_native_binding_fixture_is_exact() -> None:
 @pytest.mark.parametrize(
     "mutation",
     [
-        lambda value: value.update({"api_version": "manyforge.program_binding_transport_descriptor.v2"}),
-        lambda value: value.update({"binding_api_version": "manyforge.program_binding.v2"}),
+        lambda value: value.update({"api_version": "manyforge.program_binding_transport_descriptor.v3"}),
+        lambda value: value.update({"binding_api_version": "manyforge.program_binding.v3"}),
         lambda value: value["limits"].update({"role_rows": 4097}),
         lambda value: value["limits"].update({"node_policy_rows": 99999}),
         lambda value: value["records"]["component"].__setitem__(

@@ -53,4 +53,25 @@ struct RoboPlanSceneInput final {
     const std::vector<RoboPlanJointLimitInput> &joint_limits,
     const std::string &srdf_xml);
 
+/// Removes every collision pair of `scene` in which neither geometry moves
+/// with `group_joint_names` (OD-359): a robot plans and checks only pairs
+/// with at least one of its own bodies (its links, its tools, objects
+/// attached to them). Pairs between other components' bodies and the cell's
+/// fixed objects are governed by those components' own rules and checks.
+/// Uses the collision engine's own-body test. Call after every geometry is
+/// placed; throws std::runtime_error when the scene refuses the change.
+void ignore_pairs_without_group_bodies(
+    roboplan::Scene &scene, const std::vector<std::string> &group_joint_names);
+
+/// Sets the scene's current positions to `base_positions` (one value per
+/// model coordinate) with the named scalar joints at `positions`:
+/// `toFullJointPositions(group, q)` and the planners then see every joint
+/// outside the group there. With no names the scene is at `base_positions`
+/// again, so nothing of an earlier call remains. Throws std::runtime_error
+/// when the counts differ or a name is absent or not a scalar joint.
+void set_scene_joint_positions(roboplan::Scene &scene,
+                               const std::vector<double> &base_positions,
+                               const std::vector<std::string> &joint_names,
+                               const std::vector<double> &positions);
+
 }  // namespace manyforge::roboplan_backend

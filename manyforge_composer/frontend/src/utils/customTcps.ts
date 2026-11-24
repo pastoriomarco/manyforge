@@ -4,15 +4,23 @@ import { draftComponents } from './componentManager';
 
 /**
  * A custom TCP of one component, authored in the Deployment component row
- * (`custom_tcps: [{tcp_id, parent_frame, pose}]`). Its parent is one of the
- * component's own frames, never another custom TCP. Model (URDF/SRDF) and
- * descriptor TCPs are read-only; only these rows are edited in the GUI.
+ * (`custom_tcps: [{tcp_id, parent_frame, pose, contact_bodies?}]`). Its parent
+ * is one of the component's own frames, never another custom TCP. Model
+ * (URDF/SRDF) and descriptor TCPs are read-only; only these rows are edited in
+ * the GUI.
  */
 export interface CustomTcp {
   tcpId: string;
   parentFrame: string;
   positionM: [number, number, number];
   rpyDeg: [number, number, number];
+  /**
+   * Collision bodies of the component that a rule on "the contact bodies of
+   * the move's TCP" selects. Null (no `contact_bodies` key) takes the default:
+   * a gripper's pads, else its fingers; none on a passive tool. An empty list
+   * is none.
+   */
+  contactBodies: string[] | null;
   /** The row as stored in the Draft; an edit of another row writes it back verbatim. */
   stored?: JsonValue;
 }
@@ -34,7 +42,7 @@ function triple(value: JsonValue | undefined): [number, number, number] | null {
 
 /** The component's row index in an intent Draft, or -1. */
 export function componentRowIndex(document: Record<string, JsonValue> | null, componentId: string): number {
-  const rows = document?.api_version === 'manyforge.deployment_intent.v2' ? document.components : null;
+  const rows = document?.api_version === 'manyforge.deployment_intent.v3' ? document.components : null;
   return Array.isArray(rows)
     ? rows.findIndex((row) => record(row)?.component_id === componentId)
     : -1;
@@ -56,8 +64,11 @@ export function customTcpsOf(document: Record<string, JsonValue> | null, compone
     const xyzw = Array.isArray(orientation?.xyzw) && orientation.xyzw.length === 4
       && orientation.xyzw.every((item) => typeof item === 'number' && Number.isFinite(item))
       ? orientation.xyzw as [number, number, number, number] : null;
+    const bodies = tcp?.contact_bodies;
+    const contactBodies = bodies === undefined ? null
+      : Array.isArray(bodies) && bodies.every((item) => typeof item === 'string') ? bodies as string[] : undefined;
     if (typeof tcp?.tcp_id !== 'string' || typeof tcp.parent_frame !== 'string'
-      || position === null || (rpy === null && xyzw === null)) return [];
+      || position === null || (rpy === null && xyzw === null) || contactBodies === undefined) return [];
     const fromQuaternion = xyzw === null ? null : rpyDegreesFromQuaternion({
       x: xyzw[0], y: xyzw[1], z: xyzw[2], w: xyzw[3],
     });
@@ -66,6 +77,7 @@ export function customTcpsOf(document: Record<string, JsonValue> | null, compone
       parentFrame: tcp.parent_frame,
       positionM: [...position],
       rpyDeg: rpy !== null ? [...rpy] : fromQuaternion!,
+      contactBodies: contactBodies === null ? null : [...contactBodies],
       stored: value,
     }];
   });
@@ -99,6 +111,9 @@ export function customTcpProblem(
     return 'Pick the parent from this component\'s frames.';
   }
   if (![...tcp.positionM, ...tcp.rpyDeg].every(Number.isFinite)) return 'Position and orientation must be numbers.';
+  if (tcp.contactBodies !== null && new Set(tcp.contactBodies).size !== tcp.contactBodies.length) {
+    return 'Each contact body can be listed once.';
+  }
   return null;
 }
 
@@ -111,6 +126,7 @@ function rowValue(tcp: CustomTcp): JsonValue {
       position_m: [...tcp.positionM],
       orientation: { rpy_deg: [...tcp.rpyDeg] },
     },
+    ...(tcp.contactBodies === null ? {} : { contact_bodies: [...tcp.contactBodies].sort() }),
   };
 }
 

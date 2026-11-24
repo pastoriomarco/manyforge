@@ -132,6 +132,26 @@ ResourceAddressedExecutionKernel::try_accept_motion_takeover(
                                     {"winner_node_attempt_id",
                                      std::to_string(origin.node_attempt_id.value())}}});
     }
+    // OD-347: a Cartesian path never takes over a robot that is still moving;
+    // its waypoint 0 is the start pose, which a moving robot is not at. It is
+    // refused here, before anything is prepared, stopped or sent, and the
+    // running motion continues. A not-yet-sent incumbent is superseded as for
+    // every move (the robot is at rest).
+    const auto* incumbent_fact =
+        selected_cause_terminal_fact(incumbent->state.participants.front());
+    const bool robot_moving =
+        physical->prepared_dispatch_released && !physical->prepared_engine_no_effect_confirmed &&
+        !(incumbent_fact && incumbent_fact->effect == ParticipantEffectKnowledge::kNoEffect);
+    if (robot_moving && std::holds_alternative<CartesianPathDTO>(
+                            candidate.participants.front().motion_request->motion)) {
+      ErrorDTO refusal{"cartesian_path_moving_takeover_refused",
+                       "a Cartesian path cannot take over a robot that is still moving",
+                       {{"running_operation_id",
+                         std::to_string(incumbent->state.operation_id.value())}}};
+      if (const auto& running = incumbent->state.participants.front().execution_scope)
+        refusal.details.emplace("running_node_instance_id", running->node_instance_id.value());
+      return Outcome::Err(std::move(refusal));
+    }
     // Active TCP: a preempt keeps the running move's TCP
     // and never changes the Active TCP; one resolving to another TCP is
     // refused on every lane, before anything is prepared or sent.

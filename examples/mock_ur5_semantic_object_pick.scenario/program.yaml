@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [
       {
@@ -44,13 +44,6 @@
         "key": "planning.pick_plan",
         "persistence": "run",
         "type": "pick_planning_result"
-      },
-      {
-        "access": "read_write",
-        "description": "Operation-scoped selected-object binding for contact policy resolution.",
-        "key": "selected_object",
-        "persistence": "run",
-        "type": "scene_resource"
       },
       {
         "access": "read_write",
@@ -142,13 +135,10 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "required",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [
       "semantic_shape_inference"
     ],
@@ -157,40 +147,6 @@
       "ur5"
     ]
   },
-  "contact_policies": [
-    {
-      "api_version": "manyforge.contact_policy.v1",
-      "default_unmatched_response": "hard_stop",
-      "mode": "contact_grasp",
-      "policy_id": "selected_object_grasp",
-      "sensing_mode": "geometry_only",
-      "version": "sha256:cdd5cd17bdd43f72582cbc09806d1ebbe2e658b8ad896b3ce040e5a842a79977",
-      "zones": [
-        {
-          "body_pairs": [
-            {
-              "body_a": {
-                "body": {
-                  "collision_body_id": "gripper_collision",
-                  "component_id": "robotiq_2f_85"
-                },
-                "kind": "component_model_body"
-              },
-              "body_b": {
-                "kind": "runtime_object",
-                "runtime_object_id": "selected_object"
-              }
-            }
-          ],
-          "max_penetration_m": 0.002,
-          "terminal_window_start_fraction": 0.8,
-          "violation_response": "hard_stop",
-          "zone_id": "tool_contact"
-        }
-      ]
-    }
-  ],
-  "description": "Semantic object-selection demo. Deterministic nodes build and validate a scene-selection context around one bounded model request. A C++ planning preview supplies portable approach, pick, and retreat poses; the original explicit motion, logical gripper, carried-object, and place sequence remains visible in the Program.",
   "forest": [
     {
       "children": [
@@ -264,7 +220,30 @@
               "component_id": "robotiq_2f_85",
               "frame_id": "tcp"
             },
-            "contact_policy_id": "selected_object_grasp",
+            "collision_rules": [
+              {
+                "a": [
+                  {
+                    "collision_body_id": "gripper_collision",
+                    "component_id": "robotiq_2f_85",
+                    "kind": "collision_body"
+                  }
+                ],
+                "b": [
+                  {
+                    "blackboard_key": "selection.validated",
+                    "field": "selected_object_id",
+                    "kind": "scene_object"
+                  }
+                ],
+                "contact": {
+                  "end_from_fraction": 0.8,
+                  "max_penetration_m": 0.002
+                },
+                "leg": "descend",
+                "rule_id": "selected_object_grasp"
+              }
+            ],
             "motion_options": {
               "approach_velocity_scale": 0.3,
               "descend_velocity_scale": 0.3,
@@ -328,6 +307,7 @@
             "tcp_endpoint": {
               "kind": "current"
             },
+            "tool_completion_timeout_s": 15.0,
             "tool_position": {
               "kind": "named_preset",
               "name": "closed"
@@ -335,8 +315,7 @@
             "tool_target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            },
-            "tool_completion_timeout_s": 15.0
+            }
           },
           "value_sources": {
             "selected_object_id": {
@@ -403,6 +382,7 @@
           "instance_id": "close_gripper",
           "node_id": "gripper.command_position",
           "parameters": {
+            "completion_timeout_s": 15.0,
             "position": {
               "kind": "named_preset",
               "name": "closed"
@@ -410,8 +390,7 @@
             "target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            },
-            "completion_timeout_s": 15.0
+            }
           }
         },
         {
@@ -578,6 +557,7 @@
           "instance_id": "open_gripper",
           "node_id": "gripper.command_position",
           "parameters": {
+            "completion_timeout_s": 15.0,
             "position": {
               "kind": "named_preset",
               "name": "open"
@@ -585,8 +565,7 @@
             "target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            },
-            "completion_timeout_s": 15.0
+            }
           }
         },
         {
@@ -678,9 +657,7 @@
       "parameters": {}
     }
   ],
-  "name": "semantic_shape_pick",
   "positions": {},
-  "program_id": "semantic_shape_pick",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

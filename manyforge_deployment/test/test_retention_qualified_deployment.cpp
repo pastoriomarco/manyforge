@@ -115,11 +115,10 @@ static_assert(
     std::string catalogs = "{\"records\":[]}",
     std::string optional = "") {
   return "{\"api_version\":\"manyforge.deployment.v1\","
-         "\"deployment_artifact_id\":\"deployment\","
          "\"deployment_revision\":\"" +
          std::string(kZeroDigest) +
          "\",\"cell_id\":\"" + std::string(cell_id) +
-         "\",\"name\":\"Retention fixture\","
+         "\","
          "\"catalogs\":" + std::move(catalogs) +
          ",\"graph\":" + std::move(graph) +
          ",\"desired_control_configurations\":" + std::move(desired) +

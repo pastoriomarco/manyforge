@@ -29,8 +29,23 @@ export interface ComponentTcpTarget {
   defaultTcpFrameRoleId: string;
 }
 
+/**
+ * One command target with collision bodies: its collision body ids, the
+ * contact bodies of each of its TCPs, and the gripper's grip body (null on a
+ * target that is not a gripper or names none).
+ */
+export interface ComponentCollisionBodyTarget {
+  commandTargetId: string;
+  collisionBodyRoleIds: string[];
+  /** Keyed by TCP frame role id. */
+  tcpContactBodyRoleIds: Record<string, string[]>;
+  gripBodyRoleId: string | null;
+}
+
 /** Component-type facts of one component profile. */
 export interface ComponentProfileFacts {
+  /** The model's readable title (`component.yaml` `title`); absent when it declares none. */
+  title?: string | null;
   tags: string[];
   /** Attachment interface ids, e.g. a robot's `flange`. */
   attachmentInterfaces: string[];
@@ -38,6 +53,8 @@ export interface ComponentProfileFacts {
   tcpTargets: ComponentTcpTarget[];
   /** Absent when target capability facts are incomplete. */
   hasMotionTarget?: boolean;
+  /** The targets with collision bodies, sorted by id; absent for a model without a component type. */
+  collisionBodyTargets?: ComponentCollisionBodyTarget[];
   /** All declared target frame roles, including frames not tagged as TCPs. */
   frameTargets?: Array<{ commandTargetId: string; frameRoleIds: string[] }>;
   /** Absent: the model defines no payload (0 kg). */
@@ -60,6 +77,7 @@ export interface ComponentCatalogEntry {
   modelFamilyId: string | null;
   /** Component-type tags, matched against Program role requirements. */
   tags: string[];
+  /** The component row's own placement lane; null for a lane-free row. */
   lane: string | null;
   description: string | null;
   sources: string[];

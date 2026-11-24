@@ -82,14 +82,6 @@ describe('AssistantOverlay', () => {
       arguments: { instanceId: 'pick_1' }, result: { kind: 'invalid', message: 'unknown node' },
     })).toBe('Inserted node: pick_1 failed: invalid: unknown node');
     expect(assistantToolCallSummary({
-      toolId: 'program_draft_upsert_contact_policies', status: 'completed', effect: 'composer_draft_mutating',
-      arguments: {}, result: { ids: ['grasp_a', 'grasp_b'] },
-    })).toBe('Created or updated contact policies: grasp_a, grasp_b');
-    expect(assistantToolCallSummary({
-      toolId: 'program_draft_remove_contact_policies', status: 'completed', effect: 'composer_draft_mutating',
-      arguments: {}, result: { ids: ['grasp_a'] },
-    })).toBe('Removed contact policy: grasp_a');
-    expect(assistantToolCallSummary({
       toolId: 'program_validate', status: 'completed', effect: 'read_only', arguments: {},
     })).toBe('Validated the Program Draft');
   });

@@ -45,7 +45,7 @@ struct PoseSourceRetryConfig {
 };
 
 /// Pass-scoped configuration for one CollisionValidationCoordinator
-/// invocation. Coordinators are constructed per-pass so support-contact state
+/// invocation. Coordinators are constructed per-pass so contact state
 /// does not leak across moves.
 struct CollisionValidationPassConfig {
   /// Active collision policy snapshot for simple/legacy call sites.
@@ -77,24 +77,29 @@ struct CollisionValidationPassConfig {
   /// the diagnostic chain. Defaults to kPreExecuteValidation.
   CollisionSurface surface = CollisionSurface::kPreExecutionValidation;
 
-  /// Concrete per-request contact policy. Empty means free-space validation.
-  std::string contact_policy_id;
-
   /// Clearance margins carried by every query of this pass. Null (runtime
   /// lookahead, monitor) means margin 0 for every pair.
   std::shared_ptr<const CollisionClearanceMargins> clearance_margins;
 
   /// Optional plan-global sample fractions for a bounded runtime-lookahead
-  /// prefix. Contact-grasp terminal windows are properties of the accepted
+  /// prefix. The windows of contact rules are properties of the accepted
   /// expanded trajectory; a truncated prefix must never renormalize itself to
   /// [0, 1] and admit contact early. When present, this vector must correspond
   /// one-to-one with the pass trajectory and be strictly increasing in [0, 1].
   std::optional<std::vector<double>> original_trajectory_sample_fractions;
 
+  /// Optional, one per pass sample: the path steps of at most
+  /// kSpringSampleTravelM tool travel since the previous sample, which a
+  /// spring rule's step limit scales with (OD-356); 0 means unknown, the step
+  /// is then not checked at that sample. Absent: the first sample has no
+  /// predecessor and every later sample is one step (pre-dispatch validation
+  /// densifies a move with a spring rule to that spacing).
+  std::optional<std::vector<double>> sample_path_steps;
+
   /// Optional exact prefix state for runtime-lookahead passes. Ordinary
   /// pre-dispatch validation leaves these empty and starts at trajectory
-  /// waypoint zero. Supplying one without the other for a support-contact
-  /// policy is invalid and fails closed in the ordered merger.
+  /// waypoint zero. Supplying one without the other for a policy with tracked
+  /// contact rules is invalid and fails closed in the ordered merger.
   std::optional<SupportContactEvaluationStateMap> entering_support_contact_state;
   std::optional<ContactReleaseEvaluationStateMap> entering_contact_release_state;
 
@@ -105,6 +110,17 @@ struct CollisionValidationPassConfig {
 
   const CollisionPolicySnapshot& effective_policy_snapshot() const {
     return policy_snapshot_ref ? *policy_snapshot_ref : policy_snapshot;
+  }
+
+  /// Path steps before pass sample `index` (see `sample_path_steps`).
+  [[nodiscard]] std::optional<double> path_steps_at(std::size_t index) const {
+    if (sample_path_steps) {
+      if (index >= sample_path_steps->size() || !((*sample_path_steps)[index] > 0.0)) {
+        return std::nullopt;
+      }
+      return (*sample_path_steps)[index];
+    }
+    return index == 0U ? std::nullopt : std::optional<double>(1.0);
   }
 };
 
@@ -143,7 +159,7 @@ struct CollisionValidationDecisionBundle {
 ///     pass so concurrent pose-source applies cannot mutate the world
 ///     under it; the snapshot's revision is the borrowed revision;
 ///   - owns one CollisionPolicyEvaluator instance with trajectory-scoped
-///     support-contact state that evolves across waypoints in trajectory
+///     contact state that evolves across waypoints in trajectory
 ///     order;
 ///   - calls `ICollisionQueryEngine::check(snapshot, query, policy, cancel)`
 ///     per waypoint, so backend choice and engine compare mode remain
@@ -204,7 +220,7 @@ class CollisionValidationCoordinator {
       const CollisionCancellationToken& cancel);
 
   /// Apply policy classification to an already-queried range using the exact
-  /// support-contact state entering that chunk. This never calls the collision
+  /// contact state entering that chunk. This never calls the collision
   /// engine. It reclassifies the already-owned worker-local records so the
   /// complete diagnostic stream remains serial-identical; this policy-only
   /// work stays parallel. Contact-release end constraints are left to the
@@ -230,7 +246,7 @@ class CollisionValidationCoordinator {
       std::size_t end_index,
       const CollisionCancellationToken& cancel);
 
-  /// Classify a single waypoint and update support-contact state.
+  /// Classify a single waypoint and update the contact state.
   CollisionValidationWaypointRecord classify_one(
       const CollisionWorldSnapshot& snapshot,
       ICollisionQueryEngine& engine,
@@ -252,7 +268,7 @@ class CollisionValidationCoordinator {
       std::optional<std::int64_t> time_from_start_ns,
       const CollisionWorldRevision& borrowed_revision);
 
-  void prepare_distance_selection(const CollisionWorldSnapshot& snapshot);
+  void prepare_distance_selection();
 
   void apply_contact_release_constraints(
       const TrajectoryDTO& trajectory,
@@ -262,7 +278,9 @@ class CollisionValidationCoordinator {
       std::optional<std::int64_t>& first_failing_waypoint,
       std::optional<std::int64_t>& first_failing_time_ns) const;
 
-  void apply_contact_grasp_constraints(
+  /// Apply the window and depth of every contact rule with
+  /// an end window to the classified records.
+  void apply_windowed_contact_constraints(
       const TrajectoryDTO& trajectory,
       CollisionValidationDecisionBundle& bundle) const;
 

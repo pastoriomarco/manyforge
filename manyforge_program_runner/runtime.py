@@ -163,7 +163,7 @@ from .runtime_controls import (
     ProgramRuntimeControls,
     manual_result_availability,
 )
-from .diagnostics import ProgramDiagnosticPublisher
+from .diagnostics import ProgramDiagnosticPublisher, ProgramNodeAttemptPublisher
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -736,6 +736,14 @@ class ProgramRuntime:
         self._interventions = ProgramInterventionRegistry(
             maximum_retained_runs=config.maximum_retained_runs
         )
+        # Finished node attempts go to the Historian on the forensic client
+        # (created below; read at send time).
+        self._node_attempts = ProgramNodeAttemptPublisher(
+            lambda batch: (
+                self._diagnostic_client or self._headless
+            ).record_program_node_attempts(batch),
+            self.application_start_id,
+        )
         self._ports = NodeAdapterPorts(
             kernel_operations=self._native.operations,
             kernel_controls=self._native.controls,
@@ -751,6 +759,7 @@ class ProgramRuntime:
             program_run_context=CompositeProgramRunContextPort(*context_members),
             program_interventions=self._interventions,
             persistent_keys=self._persistent_keys,
+            node_attempt_history=self._node_attempts.submit,
         )
         self._owner_availability = self._build_owner_availability()
         self._owner = ProgramRunOwner(
@@ -1040,7 +1049,12 @@ class ProgramRuntime:
             self._diagnostics.submit(record)
 
     def diagnostic_health(self) -> dict[str, Any]:
-        return self._diagnostics.health()
+        # The node-attempt delivery's losses show with the forensic ones.
+        return {
+            **self._diagnostics.health(),
+            "schema_version": "manyforge.program_diagnostic_health.v2",
+            "node_attempts": self._node_attempts.health(),
+        }
 
     def _require_manager_current(self) -> None:
         if self._liveness is None:
@@ -2045,6 +2059,127 @@ class ProgramRuntime:
             )
         return result
 
+    def _operator_questions(
+        self,
+        program_run_id: int | None,
+        *,
+        cycle_generation: int,
+    ) -> list[dict[str, Any]]:
+        """Every open operator question of the run, one offer each, answered
+        like a recovery offer (the option id is the action)."""
+        if program_run_id is None or not self._offer_cycle_current(
+            program_run_id, cycle_generation
+        ):
+            return []
+        controls = self._optional_controls(program_run_id)
+        if controls is None:
+            return []
+        try:
+            questions = self._owner.operator_questions(program_run_id)
+        except ProgramRunOwnerError:
+            return []
+        return [
+            controls.operator_question_offer(
+                cycle_generation=cycle_generation,
+                application_start_id=self.application_start_id,
+                question=question,
+            )
+            for question in questions
+        ]
+
+    def _answer_operator_question(
+        self,
+        request: CycleRecoveryActionRequest,
+        question: Mapping[str, Any],
+        *,
+        program_run_id: int,
+        request_key: bytes,
+        journal: Any,
+        cycle: Any,
+        reject: Callable[[ProgramRunnerError], NoReturn],
+    ) -> dict[str, Any]:
+        """Answer one open operator question: no Kernel effect and no motion
+        (no motion_clear or motion-attention check). The run's tick hands
+        the answer to its node, which ends on its next tick."""
+        option = next(
+            (
+                row
+                for row in question["options"]
+                if row["option_id"] == request.action_id
+            ),
+            None,
+        )
+        if question.get("offer_revision") != request.offer_revision or option is None:
+            reject(
+                ProgramRunnerError(
+                    "cycle_recovery_offer_stale",
+                    "operator question or chosen option is no longer current",
+                )
+            )
+        self._command_accepted("admitting")
+        controls = self._controls(program_run_id)
+        try:
+            controls.require_event_revisions(events=2)
+            self._command_step("recovering")
+            self._host.answer_operator_question(
+                program_run_id,
+                node_instance_id=question["node_instance_id"],
+                node_attempt_id=question["node_attempt_id"],
+                option_id=request.action_id,
+            )
+        except ProgramRunOwnerError as error:
+            reject(
+                ProgramRunnerError(
+                    getattr(error, "code", "cycle_recovery_action_rejected"),
+                    str(error),
+                )
+            )
+        except ProgramRuntimeControlError as error:
+            reject(ProgramRunnerError(error.code, str(error)))
+        except ProgramSchedulingError as error:
+            reject(
+                ProgramRunnerError(
+                    error.code or "program_run_scheduling_failed", str(error)
+                )
+            )
+        controls.audit_value(
+            "program_operator_choice_answered",
+            node_instance_id=question["node_instance_id"],
+            node_attempt_id=question["node_attempt_id"],
+            option_id=option["option_id"],
+            label=option["label"],
+            result=option["result"],
+            request_key=request_key.hex(),
+            source_label=request.source_label,
+        )
+        projected = self._project_run(self._owner.read(program_run_id).to_dict())
+        result = {
+            "schema_version": "manyforge.cycle_recovery_result.v3",
+            "request_key": format_request_key(request_key),
+            "accepted": True,
+            "action_id": request.action_id,
+            "cycle_resumed": False,
+            "result_code": "accepted",
+            "owner_result": {
+                "accepted": True,
+                "action": "operator_choice",
+                "option_id": request.action_id,
+            },
+            "run": projected,
+            "runtime_controls": self.read_runtime_controls(program_run_id),
+            "recovery_offer": self._recovery_offer(
+                program_run_id, cycle_generation=cycle.cycle_generation
+            ),
+        }
+        self._complete_control(
+            journal,
+            request_key,
+            result=result,
+            projected=projected,
+            held_failures=projected.get("operation_failures") or (),
+        )
+        return result
+
     def _offer_cycle_current(self, program_run_id: int, cycle_generation: int) -> bool:
         # A node-level recovery offer is valid only while its owning Program
         # cycle is current and free of unresolved control effects.  Keep this
@@ -2569,7 +2704,7 @@ class ProgramRuntime:
                     committed = self._headless.committed_scenario_activation()
                     if (
                         committed.get("scene_initialization") != "initialize"
-                        or applied_status.get("program_id") is not None
+                        or applied_status.get("program_revision") is not None
                         or committed.get("record_digest") != request.expected_applied_record_digest
                         or applied_status.get("record_digest") != request.expected_applied_record_digest
                     ):
@@ -2799,7 +2934,6 @@ class ProgramRuntime:
             "node_environment_digest": self._environment.environment_digest,
             "owner_id": self.owner_id,
             "program_binding_id": admitted.program_binding_id,
-            "program_id": admitted.program.program_id,
             "program_revision": admitted.program.program_revision,
             "retained_bundle_id": admitted.retained_bundle_id,
             "scenario_id": admitted.scenario_id,
@@ -4223,7 +4357,6 @@ class ProgramRuntime:
                         "schema_version": "manyforge.program_run_execution_capture.v2",
                         "claim_generation": claim["claim_generation"],
                         "program_run_id": program_run_id,
-                        "program_id": scene_context.program_id,
                         "program_revision": scene_context.program_revision,
                         "program_binding_id": scene_context.program_binding_id,
                         "retained_bundle_id": scene_context.retained_bundle_id,
@@ -4277,7 +4410,6 @@ class ProgramRuntime:
                     "applied_record_digest",
                     "scenario_id",
                     "source_document_digest",
-                    "program_id",
                     "program_revision",
                     "program_binding_id",
                     "retained_bundle_id",
@@ -4506,8 +4638,7 @@ class ProgramRuntime:
             raise ProgramRunnerError("program_run_not_found", str(error)) from error
         capture = live.capture
         if (
-            capture.program_id != request.program_id
-            or capture.program_revision != request.program_revision
+            capture.program_revision != request.program_revision
             or capture.program_binding_id != request.program_binding_id
         ):
             raise ProgramRunnerError(
@@ -4530,7 +4661,6 @@ class ProgramRuntime:
             "request_key": format_request_key(request_key),
             "program_run_id": program_run_id,
             "run_revision": live.run_revision,
-            "program_id": capture.program_id,
             "program_revision": capture.program_revision,
             "program_binding_id": capture.program_binding_id,
             "retained_bundle_id": capture.retained_bundle_id,
@@ -4606,13 +4736,16 @@ class ProgramRuntime:
         execution_selections: dict[str, Any],
     ) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.program_runtime_control_projection.v10",
+            "schema_version": "manyforge.program_runtime_control_projection.v11",
             "owner_id": self.owner_id,
             "program_run_id": program_run_id,
             "run_revision": live["run_revision"],
             "runtime_controls": controls.snapshot(),
             "recovery_offer": recovery_offer,
             "recovery_offers": self._recovery_offers(
+                program_run_id, cycle_generation=self._current_cycle_generation()
+            ),
+            "operator_questions": self._operator_questions(
                 program_run_id, cycle_generation=self._current_cycle_generation()
             ),
             "execution_selections": deepcopy(dict(execution_selections)),
@@ -4831,6 +4964,27 @@ class ProgramRuntime:
         if error is not None:
             failure["cause_code"] = getattr(error, "code", type(error).__name__)
         return failure
+
+    def read_runtime_blackboard(self, program_run_id: int) -> dict[str, Any]:
+        """The run's declared keys with their current values (display only)."""
+
+        if self._closed:
+            raise ProgramRunnerError(
+                "program_runner_unavailable", "Program runner is closed"
+            )
+        try:
+            live, keys = self._owner.read_runtime_blackboard(program_run_id)
+        except ProgramRunOwnerError as error:
+            raise ProgramRunnerError("program_run_not_found", str(error)) from error
+        run = live.to_dict()
+        return {
+            "schema_version": "manyforge.program_runtime_blackboard_values.v1",
+            "owner_id": self.owner_id,
+            "program_run_id": program_run_id,
+            "run_revision": run["run_revision"],
+            "node_status_revision": run["node_status_revision"],
+            "keys": keys,
+        }
 
     def write_runtime_blackboard(
         self, program_run_id: int, request: RuntimeBlackboardWriteRequest
@@ -5530,6 +5684,26 @@ class ProgramRuntime:
                     )
                 )
             program_run_id = cycle.program_run_id
+            question = next(
+                (
+                    row
+                    for row in self._operator_questions(
+                        program_run_id, cycle_generation=cycle.cycle_generation
+                    )
+                    if row["offer_id"] == request.offer_id
+                ),
+                None,
+            )
+            if question is not None:
+                return self._answer_operator_question(
+                    request,
+                    question,
+                    program_run_id=program_run_id,
+                    request_key=request_key,
+                    journal=journal,
+                    cycle=cycle,
+                    reject=reject,
+                )
             selection_scope = self._owner.operator_stop_scope(program_run_id)
             # The offer id names one hold: the focused offer or any held node's.
             offer = self._recovery_offer(
@@ -7414,6 +7588,7 @@ class ProgramRuntime:
                 errors.append(error)
         # Waits for the one in-flight delivery (OD-309).
         self._diagnostics.close()
+        self._node_attempts.close()
         if self._diagnostic_http is not None:
             try:
                 self._diagnostic_http.close()

@@ -127,6 +127,26 @@ struct KinematicFramePathDTO final {
   friend bool operator==(const KinematicFramePathDTO&, const KinematicFramePathDTO&) = default;
 };
 
+/// OD-372: true when `robot`'s kinematics places the frame at the end of
+/// `path` as a frame of a component mounted on it: the path passes a mount
+/// on `robot` (directly, or through a tool changer) and no moving joint
+/// follows that mount. A frame on a moving part of the mounted tool (a
+/// gripper jaw) is not placed by the robot; neither is the robot's own frame.
+[[nodiscard]] inline bool mounted_frame_placed_by(const KinematicFramePathDTO& path,
+                                                  const ControllableComponentId& robot) {
+  bool mounted = false;
+  for (const auto& segment : path.segments) {
+    if (const auto* mount = std::get_if<KinematicComponentAttachmentPathSegmentDTO>(&segment)) {
+      mounted = mounted || mount->parent_component_id == robot;
+    } else if (const auto* joint = std::get_if<KinematicModelJointPathSegmentDTO>(&segment);
+               mounted && joint != nullptr &&
+               joint->coordinate_kind != KinematicJointCoordinateKind::kFixed) {
+      return false;
+    }
+  }
+  return mounted;
+}
+
 struct KinematicActiveControlConfigurationExpectationDTO final {
   ControlDomainId control_domain_id;
   ControlDomainRevision control_domain_revision;
@@ -157,7 +177,6 @@ struct KinematicStatePathQueryDTO final {
   KinematicFramePathDTO frame_path;
   std::vector<KinematicActiveControlConfigurationExpectationDTO>
       expected_active_control_configurations;
-  std::int64_t maximum_receiver_time_skew_ns{};
   std::vector<KinematicResourceSourceProjectionDTO> source_projections;
 
   friend bool operator==(const KinematicStatePathQueryDTO&,
@@ -210,10 +229,6 @@ struct KinematicStatePathViewDTO final {
   std::vector<KinematicResourceStateRowDTO> resource_states;
   std::vector<ComponentModelStateViewDTO> model_states;
   std::int64_t evaluated_at_ns{};
-  std::optional<std::int64_t> earliest_received_timestamp_ns;
-  std::optional<std::int64_t> latest_received_timestamp_ns;
-  std::int64_t actual_receiver_time_skew_ns{};
-  std::int64_t accepted_receiver_time_skew_ns{};
   ContentDigest view_digest;
 
   friend bool operator==(const KinematicStatePathViewDTO&,

@@ -32,8 +32,8 @@ describe('probe Stop warning', () => {
       parameters: { target: { component_id: 'robot', command_target_id: 'arm' }, stop_mode: 'soft_on_path' },
     };
     const program: ProgramAuthoringDocument = {
-      api_version: 'manyforge.program.v3', program_id: 'p', program_profile: 'composable-cell-v1',
-      name: 'P', catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+      api_version: 'manyforge.program.v4', program_profile: 'composable-cell-v1',
+      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
       parameters: [],
       blackboard: { namespaces: [], keys: [] },
       schema_version: 'manyforge.composer_authoring_forest.v2', forest: [node], positions: {},

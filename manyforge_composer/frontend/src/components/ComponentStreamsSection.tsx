@@ -119,7 +119,7 @@ function declaredStreams(runtime: Row, componentId: string, links: Row[] = []): 
 
 /** Every Deployment component (intent) or every component id found in unit rows (graph). */
 function componentStreams(document: Row | null): ComponentStreams[] {
-  if (document?.api_version === 'manyforge.deployment_intent.v2') {
+  if (document?.api_version === 'manyforge.deployment_intent.v3') {
     const links = rows(object(document.policies)?.scene_pose_sources);
     return rows(document.components).flatMap((component) => {
       const componentId = component.component_id;

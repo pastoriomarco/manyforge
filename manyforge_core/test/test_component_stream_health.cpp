@@ -253,6 +253,53 @@ TEST_F(ComponentStreamHealthTest, DeploymentOverridesReplaceTheBudget) {
   EXPECT_EQ(Row("map").budget_ns, 100 * kMs);
 }
 
+TEST_F(ComponentStreamHealthTest, TheStaleFlagFollowsTheComponentsFaultStreams) {
+  // Watched before any stream is declared.
+  const auto arm = health_.Watch(ControllableComponentId("arm"));
+  const auto sim = health_.Watch(ControllableComponentId("sim"));
+  EXPECT_FALSE(arm->stale());
+  auto recorder = Declare("arm", Stream("measured_joints", StreamSeverityDTO::kFault));
+  auto warning = Declare("sim", Stream("measured_joints", StreamSeverityDTO::kWarning));
+  // Absent is not stale.
+  Advance(101 * kMs);
+  EXPECT_EQ(Row("arm").state, StreamLivenessStateDTO::kAbsent);
+  EXPECT_FALSE(arm->stale());
+  recorder->Record(1);
+  warning->Record(1);
+  Run();
+  EXPECT_FALSE(arm->stale());
+
+  // The Deployment override is the limit, not the declared 100 ms.
+  ASSERT_TRUE(health_
+                  .SetOverrides({{ControllableComponentId("arm"), "measured_joints", 300 * kMs}})
+                  .ok());
+  Run();
+  Advance(250 * kMs);
+  EXPECT_EQ(Row("arm").state, StreamLivenessStateDTO::kLive);
+  EXPECT_FALSE(arm->stale());
+  // A sample whose stamp does not advance does not keep the stream live.
+  recorder->Record(1);
+  Advance(60 * kMs);
+  EXPECT_EQ(Row("arm").state, StreamLivenessStateDTO::kStale);
+  EXPECT_TRUE(arm->stale());
+  // The same flag for a later watcher.
+  EXPECT_EQ(health_.Watch(ControllableComponentId("arm")), arm);
+  // A stale `warning` stream (a simulator that is not playing) is no fault.
+  EXPECT_EQ(Row("sim").state, StreamLivenessStateDTO::kStale);
+  EXPECT_FALSE(sim->stale());
+
+  // Live again by itself.
+  recorder->Record(2);
+  Run();
+  EXPECT_FALSE(arm->stale());
+  // Stale, then the stream is undeclared: nothing of the component is stale.
+  Advance(301 * kMs);
+  EXPECT_TRUE(arm->stale());
+  recorder.reset();
+  Run();
+  EXPECT_FALSE(arm->stale());
+}
+
 TEST_F(ComponentStreamHealthTest, OneTimerAndNoneWithoutLiveStreams) {
   std::vector<std::unique_ptr<StreamRecorder>> recorders;
   for (int i = 0; i < 20; ++i) {

@@ -1,4 +1,4 @@
-"""Strict v3 Program authoring and bounded tree helpers.
+"""Strict v4 Program authoring and bounded tree helpers.
 
 The loader validates portable authored meaning against one independently
 verified v3 catalog. It does not restore the former v0 singleton schema,
@@ -15,7 +15,7 @@ from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Final, Iterable, Mapping, NoReturn
+from typing import Any, Collection, Final, Iterable, Mapping, NoReturn
 
 from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
@@ -28,6 +28,10 @@ from manyforge_behavior.catalog import (
     EDITED_OUTSIDE_MANYFORGE,
     SEMVER_RE,
     NodeCatalog,
+)
+from manyforge_behavior.collision_rules import (
+    CollisionRuleError,
+    validate_collision_rules,
 )
 from manyforge_behavior.program_frame_facts import ProgramFrameFacts
 from manyforge_behavior.interrupt_condition import (
@@ -74,7 +78,7 @@ _MAX_DOCUMENT_TEXT_CHARS: Final = 8 * 1024 * 1024
 # outside ±(2^53−1) is refused at parse, never rounded later.
 MAX_SAFE_INTEGER_LITERAL: Final = 9_007_199_254_740_991
 _MAX_CANONICAL_BYTES: Final = 96 * 1024 * 1024
-_PROGRAM_API_VERSION: Final = "manyforge.program.v3"
+_PROGRAM_API_VERSION: Final = "manyforge.program.v4"
 _MAX_EXECUTION_GROUPS: Final = 4096
 _MAX_RESOLVED_GROUP_MEMBERSHIPS: Final = _MAX_TREE_NODES
 _MAX_RESOLVED_TARGET_EFFECTS: Final = _MAX_TREE_NODES
@@ -131,7 +135,8 @@ class ProgramFormatUnsupported(ProgramValidationError):
         }
         super().__init__(
             f"Program format {actual_api_version!r} is unsupported; "
-            f"expected {supported_api_version!r}"
+            f"expected {supported_api_version!r}. "
+            "scripts/convert_scenario_od46.py converts an older Scenario."
         )
 
 
@@ -1300,6 +1305,20 @@ MOTION_NODE_IDS: Final = frozenset(
 INTERRUPT_MOTION_NODE_IDS: Final = frozenset(
     {"motion.move_until_signal", "motion.probe_search"}
 )
+# The pose moves: each has a motion_type, joint (default) or linear (OD-341).
+POSE_MOTION_NODE_IDS: Final = frozenset({"motion.move_to_pose"}) | INTERRUPT_MOTION_NODE_IDS
+# Settings that apply to one motion_type of a pose move only.
+_JOINT_ONLY_POSE_PARAMETERS: Final = frozenset({"planner"})
+_LINEAR_ONLY_POSE_PARAMETERS: Final = frozenset(
+    {
+        "max_translation_step_m",
+        "max_rotation_step_rad",
+        "max_angular_speed_rad_s",
+        "max_linear_acceleration_mps2",
+        "max_angular_acceleration_rad_s2",
+        "cartesian_timing",
+    }
+)
 # The core-held `changed_outside` signal of an output with read-back
 # is named by the output's resource role plus this suffix.
 CHANGED_OUTSIDE_SUFFIX: Final = ".changed_outside"
@@ -1316,9 +1335,10 @@ MOCK_SIMULATION_SOURCE_REFUSED: Final = "mock_simulation_value_source_refused"
 
 # System-owned node outcome keys (contract items 42, 46(f), 105): every
 # motion node's outcome lives in `node_outcome.<instance_id>`, declared
-# implicitly, readable like any run key and written only by that node when it
-# ends. The system defines its start value: `none` (no result yet in this Run)
-# at Run start and after Reset; afterwards it keeps the last outcome (43).
+# implicitly, readable like any run key and written only by that node. The
+# system defines its start value: `none` (no result yet in this Run) at Run
+# start, after Reset and whenever the node starts a new attempt; it holds the
+# outcome from the node's end until its next attempt starts.
 NODE_OUTCOME_NODE_IDS: Final = MOTION_NODE_IDS | INTERRUPT_MOTION_NODE_IDS
 NODE_OUTCOME_NAMESPACE: Final = "node_outcome"
 NODE_OUTCOME_NONE: Final = "none"
@@ -1428,6 +1448,87 @@ _INTERRUPT_STATE_REFERENCE_RE: Final = re.compile(
 )
 
 
+# System-owned motion group state keys (OD-339): each motion group of the
+# Program (every authored execution group, and `all`) publishes
+# `motion_group_state.<group_id>`, read-only, declared implicitly like
+# node_outcome. The value is the group's state in the run's runtime controls
+# (`execution_selections.groups[].state`), written by the Program-run owner
+# from the same tick facts. `unavailable` when no Run is current (at Apply,
+# after Reset, once the Run has ended) or its selection state is unknown.
+MOTION_GROUP_STATE_NAMESPACE: Final = "motion_group_state"
+MOTION_GROUP_STATE_UNAVAILABLE: Final = "unavailable"
+MOTION_GROUP_STATE_VALUES: Final = (
+    "ready",
+    "running",
+    "stopping",
+    "held",
+    "mixed",
+    "faulted",
+    MOTION_GROUP_STATE_UNAVAILABLE,
+)
+
+
+def motion_group_state_key(group_id: str) -> str:
+    """The reserved key holding one motion group's state."""
+
+    return f"{MOTION_GROUP_STATE_NAMESPACE}.{group_id}"
+
+
+def is_motion_group_state_key(key: str) -> bool:
+    return key.startswith(f"{MOTION_GROUP_STATE_NAMESPACE}.")
+
+
+def _motion_group_state_declaration(group_id: str) -> BlackboardKeyDeclaration:
+    return BlackboardKeyDeclaration(
+        key=motion_group_state_key(group_id),
+        type="string",
+        access="read",
+        persistence="run",
+        fields=MappingProxyType({}),
+        description=(
+            f"State of motion group {group_id}: "
+            + " | ".join(MOTION_GROUP_STATE_VALUES)
+            + " (ready = waiting for Run, held = stopped)"
+        ),
+        has_initial=True,
+        initial=MOTION_GROUP_STATE_UNAVAILABLE,
+    )
+
+
+def _declare_motion_group_state_keys(
+    keys: dict[str, BlackboardKeyDeclaration], roots: Iterable[Any]
+) -> dict[str, BlackboardKeyDeclaration]:
+    """Add the state key of `all` and of every execution group a node under
+    ``roots`` names. A tolerant pre-scan like ``_declare_node_outcome_keys``:
+    tree validation refuses malformed groups afterwards."""
+
+    group_ids = {"all"}
+    pending = list(roots)
+    seen = 0
+    while pending and seen <= _MAX_TREE_NODES:
+        node = pending.pop()
+        seen += 1
+        if type(node) is not dict:
+            continue
+        groups = node.get("execution_groups")
+        if type(groups) is list:
+            group_ids.update(
+                group
+                for group in groups
+                if type(group) is str
+                and len(group) <= 128
+                and _IDENTIFIER_RE.fullmatch(group) is not None
+                and group != "inherit"
+            )
+        children = node.get("children")
+        if type(children) is list:
+            pending.extend(children)
+    for group_id in group_ids:
+        declaration = _motion_group_state_declaration(group_id)
+        keys[declaration.key] = declaration
+    return dict(sorted(keys.items()))
+
+
 def _interrupt_state_references(value: Any) -> set[str]:
     """Rule ids one unvalidated value names: an exact ``interrupt_state.<id>``
     string (key parameters, condition operands, key value sources) or a
@@ -1511,8 +1612,8 @@ def require_interrupt_state_rules(program: "Program", rule_ids: Iterable[str]) -
 # Every blackboard key an interrupt condition reads (a node rule
 # on move_until_signal / probe_search, or a Deployment global rule) declares
 # `initial:` (presence only; false / 0 are valid). Same reason as the Core.
-# System keys (node_outcome.*, interrupt_state.*) are exempt: the system
-# defines their start value.
+# System keys (node_outcome.*, interrupt_state.*, motion_group_state.*) are
+# exempt: the system defines their start value.
 INTERRUPT_KEY_INITIAL_REQUIRED: Final = "interrupt_key_initial_required"
 
 
@@ -1608,6 +1709,7 @@ _RESERVED_NAMESPACES: Final = MappingProxyType(
     {
         NODE_OUTCOME_NAMESPACE: "node outcome keys",
         INTERRUPT_STATE_NAMESPACE: "interrupt rule state keys",
+        MOTION_GROUP_STATE_NAMESPACE: "motion group state keys",
         ACTIVE_TCP_NAMESPACE: "active TCP keys",
     }
 )
@@ -1667,7 +1769,7 @@ def _node_outcome_declaration(instance_id: str) -> BlackboardKeyDeclaration:
         description=(
             f"Last outcome of motion node {instance_id}: "
             + " | ".join(NODE_OUTCOME_VALUES)
-            + f" ({NODE_OUTCOME_NONE} = no result yet in this Run)"
+            + f" ({NODE_OUTCOME_NONE} = no result yet for the current attempt)"
         ),
         has_initial=True,
         initial=NODE_OUTCOME_NONE,
@@ -2116,7 +2218,6 @@ class _ProgramValidationContext:
     parameters: dict[str, ProgramParameterDeclaration]
     blackboard_namespaces: set[str]
     blackboard_keys: dict[str, BlackboardKeyDeclaration]
-    contact_policy_modes: dict[str, str]
     expressions: ExpressionEnvironment
     direct_references: bool = False
     execution_groups_supported: bool = True
@@ -2131,11 +2232,8 @@ class _ProgramValidationContext:
 _TOP_LEVEL_FIELDS: Final = frozenset(
     {
         "api_version",
-        "program_id",
         "program_revision",
         "program_profile",
-        "name",
-        "description",
         "catalog",
         "compatibility",
         "viewer",
@@ -2144,7 +2242,6 @@ _TOP_LEVEL_FIELDS: Final = frozenset(
         "scene",
         "parameters",
         "blackboard",
-        "contact_policies",
         "execution_groups",
         "tree",
     }
@@ -2186,7 +2283,9 @@ _DYNAMIC_SOURCE_FORBIDDEN_SEMANTICS: Final = frozenset(
 )
 _DYNAMIC_SOURCE_FORBIDDEN_PARAMETERS: Final = frozenset(
     {
-        "contact_policy_id",
+        # Collision rules are literal rows; only a scene_object selection
+        # reads the blackboard, through its own blackboard_key.
+        "collision_rules",
         "tcp_endpoint",
         "model_endpoint_alias",
         "prompt_template_id",
@@ -2216,14 +2315,9 @@ def _validate_compatibility(value: Any, *, path: str) -> None:
     _program_closed(
         row,
         required=frozenset(),
-        optional=frozenset({"lanes", "assistant", "requires", "tags"}),
+        optional=frozenset({"assistant", "requires", "tags"}),
         path=path,
     )
-    if "lanes" in row:
-        lanes = _canonical_identifier_list(row["lanes"], path=f"{path}.lanes")
-        unknown = set(lanes) - {"manyforge-only", "isaac-sim", "real-robot"}
-        if unknown:
-            _program_error(f"{path}.lanes", f"contains unknown lanes {sorted(unknown)}")
     if "assistant" in row and row["assistant"] not in {
         "required",
         "optional",
@@ -2251,6 +2345,7 @@ def _validate_viewer(value: Any, *, path: str) -> None:
                 "scene_resource_axes_visibility",
                 "object_axes_gizmo_size_m",
                 "hidden_execution_groups",
+                "default_view",
             }
         ),
         path=path,
@@ -2294,6 +2389,22 @@ def _validate_viewer(value: Any, *, path: str) -> None:
             and _program_number(row[field_name], path=f"{path}.{field_name}") <= 0.0
         ):
             _program_error(f"{path}.{field_name}", "must be positive")
+    if "default_view" in row:
+        # The Scenario's default 3D view (OD-355): camera position and orbit target.
+        view = _program_mapping(row["default_view"], path=f"{path}.default_view")
+        _program_closed(
+            view,
+            required=frozenset({"position_m", "target_m"}),
+            optional=frozenset(),
+            path=f"{path}.default_view",
+        )
+        for point_name in ("position_m", "target_m"):
+            point_path = f"{path}.default_view.{point_name}"
+            point = view[point_name]
+            if not isinstance(point, list) or len(point) != 3:
+                _program_error(point_path, "must be three numbers")
+            for index, item in enumerate(point):
+                _program_number(item, path=f"{point_path}[{index}]")
 
 
 def _validate_viewer_references(
@@ -2309,7 +2420,7 @@ def _validate_viewer_references(
     if direct_references:
         for field_name in ("frame_role_visibility", "resource_role_visibility"):
             if field_name in row:
-                _program_error(f"{path}.{field_name}", "is unavailable in Program v3")
+                _program_error(f"{path}.{field_name}", "is unavailable in Program v4")
         for field_name in ("scene_resource_axes_visibility", "scene_resource_visibility"):
             for resource in _program_mapping(row.get(field_name, {}), path=f"{path}.{field_name}"):
                 if resource not in scene_resource_ids:
@@ -2555,7 +2666,6 @@ def _validate_scene(
     rows = _program_list(value, path=path)
     scene_ids: list[str] = []
     scene_resource_roles: set[str] = set()
-    support_contact_refs: list[tuple[str, str, str]] = []
     shape_schema = catalog.schema_registry.types["shape"]
     for index, raw in enumerate(rows):
         row_path = f"{path}[{index}]"
@@ -2591,156 +2701,9 @@ def _validate_scene(
         if "metadata" in row:
             metadata = _program_mapping(row["metadata"], path=f"{row_path}.metadata")
             canonical_json_bytes(metadata)
-            if "support_contacts" in metadata:
-                contacts = _program_list(
-                    metadata["support_contacts"],
-                    path=f"{row_path}.metadata.support_contacts",
-                )
-                support_ids: list[str] = []
-                for contact_index, raw_contact in enumerate(contacts):
-                    contact_path = (
-                        f"{row_path}.metadata.support_contacts[{contact_index}]"
-                    )
-                    contact = _program_mapping(raw_contact, path=contact_path)
-                    support_id = _program_identifier(
-                        contact.get("support_object_id"),
-                        path=f"{contact_path}.support_object_id",
-                    )
-                    support_ids.append(support_id)
-                    mode = contact.get("mode", "contact_release")
-                    if mode == "bounded_penetration":
-                        _program_closed(
-                            contact,
-                            required=frozenset({"support_object_id", "mode"}),
-                            optional=frozenset({"max_contact_penetration_m"}),
-                            path=contact_path,
-                        )
-                        if (
-                            "max_contact_penetration_m" in contact
-                            and _program_number(
-                                contact["max_contact_penetration_m"],
-                                path=f"{contact_path}.max_contact_penetration_m",
-                            )
-                            < 0.0
-                        ):
-                            _program_error(
-                                f"{contact_path}.max_contact_penetration_m",
-                                "must be non-negative",
-                            )
-                    elif mode == "contact_process":
-                        _program_closed(
-                            contact,
-                            required=frozenset({"support_object_id", "mode"}),
-                            path=contact_path,
-                        )
-                    elif mode == "contact_release":
-                        _program_closed(
-                            contact,
-                            required=frozenset({"support_object_id"}),
-                            optional=frozenset(
-                                {
-                                    "mode",
-                                    "release_evidence_mode",
-                                    "require_separation_by_end",
-                                    "allow_recontact",
-                                    "enforce_max_start_penetration",
-                                    "max_start_penetration_m",
-                                    "release_tolerance_m",
-                                    "min_release_progress_m",
-                                    "require_strictly_decreasing_penetration",
-                                }
-                            ),
-                            path=contact_path,
-                        )
-                        evidence = contact.get(
-                            "release_evidence_mode", "signed_penetration"
-                        )
-                        if evidence not in {"signed_penetration", "binary_contact"}:
-                            _program_error(
-                                f"{contact_path}.release_evidence_mode",
-                                "must be signed_penetration or binary_contact",
-                            )
-                        for field in (
-                            "require_separation_by_end",
-                            "allow_recontact",
-                            "enforce_max_start_penetration",
-                            "require_strictly_decreasing_penetration",
-                        ):
-                            if field in contact and type(contact[field]) is not bool:
-                                _program_error(
-                                    f"{contact_path}.{field}", "must be a boolean"
-                                )
-                        for field in (
-                            "max_start_penetration_m",
-                            "release_tolerance_m",
-                            "min_release_progress_m",
-                        ):
-                            if (
-                                field in contact
-                                and _program_number(
-                                    contact[field], path=f"{contact_path}.{field}"
-                                )
-                                < 0.0
-                            ):
-                                _program_error(
-                                    f"{contact_path}.{field}",
-                                    "must be non-negative",
-                                )
-                        if evidence == "binary_contact" and (
-                            contact.get("enforce_max_start_penetration", False)
-                            or contact.get("max_start_penetration_m", 0.0) != 0.0
-                            or contact.get("release_tolerance_m", 0.0) != 0.0
-                            or contact.get("min_release_progress_m", 0.0) != 0.0
-                            or contact.get(
-                                "require_strictly_decreasing_penetration", False
-                            )
-                        ):
-                            _program_error(
-                                contact_path,
-                                "binary_contact forbids signed-distance fields",
-                            )
-                    else:
-                        _program_error(
-                            f"{contact_path}.mode", "has an unsupported mode"
-                        )
-                    support_contact_refs.append((scene_id, support_id, contact_path))
-                if support_ids != sorted(set(support_ids)):
-                    _program_error(
-                        f"{row_path}.metadata.support_contacts",
-                        "must be unique and canonical-sorted by support_object_id",
-                    )
     if scene_ids != sorted(scene_ids) or len(scene_ids) != len(set(scene_ids)):
         _program_error(path, "must be unique and canonical-sorted by scene_resource_id")
-    declared_scene_ids = set(scene_ids)
-    supports_by_resource: dict[str, set[str]] = {
-        scene_id: set() for scene_id in scene_ids
-    }
-    for supported_id, support_id, contact_path in support_contact_refs:
-        if support_id == supported_id:
-            _program_error(
-                f"{contact_path}.support_object_id",
-                "cannot name the supported object itself",
-            )
-        if support_id not in declared_scene_ids:
-            _program_error(
-                f"{contact_path}.support_object_id",
-                "does not name a declared Program scene resource",
-            )
-        supports_by_resource[supported_id].add(support_id)
-    pending = set(scene_ids)
-    while pending:
-        removable = {
-            scene_id
-            for scene_id in pending
-            if not (supports_by_resource[scene_id] & pending)
-        }
-        if not removable:
-            _program_error(
-                path,
-                "contains a cyclic support-contact dependency",
-            )
-        pending -= removable
-    return declared_scene_ids, scene_resource_roles
+    return set(scene_ids), scene_resource_roles
 
 
 def _validate_pose_frame_ref(
@@ -3355,296 +3318,6 @@ def motion_tcp_selection(
     return {"tcp_endpoint": dict(value)}
 
 
-def _validate_contact_selector(
-    value: Any,
-    *,
-    path: str,
-    component_roles: Mapping[str, dict[str, Any]],
-    target_roles: Mapping[str, dict[str, Any]],
-    blackboard_keys: Mapping[str, BlackboardKeyDeclaration],
-    direct_references: bool = False,
-) -> tuple[str, str]:
-    row = _program_mapping(value, path=path)
-    kind = row.get("kind")
-    if kind == "motion_endpoint":
-        _program_closed(row, required=frozenset({"kind"}), path=path)
-        return kind, ""
-    if kind == "component_model_body":
-        if direct_references:
-            _program_closed(row, required=frozenset({"kind", "body"}), path=path)
-            _program_direct_reference(
-                row["body"], path=f"{path}.body", member="collision_body_id"
-            )
-            return kind, canonical_json_bytes(row).decode("utf-8")
-        _program_closed(
-            row,
-            required=frozenset({"kind", "component_role_id", "collision_body_role_id"}),
-            optional=frozenset({"model_role_id"}),
-            path=path,
-        )
-        component_role = _program_identifier(
-            row["component_role_id"], path=f"{path}.component_role_id"
-        )
-        if component_role not in component_roles:
-            _program_error(
-                f"{path}.component_role_id",
-                "does not name a declared component role",
-            )
-        collision_body_role = _program_identifier(
-            row["collision_body_role_id"],
-            path=f"{path}.collision_body_role_id",
-        )
-        model_role: str | None = None
-        if "model_role_id" in row:
-            model_role = _program_identifier(
-                row["model_role_id"], path=f"{path}.model_role_id"
-            )
-            required_models = component_roles[component_role].get(
-                "required_model_roles", ()
-            )
-            if required_models and model_role not in required_models:
-                _program_error(
-                    f"{path}.model_role_id",
-                    "is not required by the selected component role",
-                )
-        matching_targets = [
-            target_role
-            for target_role, target in target_roles.items()
-            if target["component_role"] == component_role
-            and collision_body_role in target.get("required_collision_body_roles", ())
-            and (
-                model_role is None
-                or model_role in target.get("required_model_roles", ())
-            )
-        ]
-        if len(matching_targets) != 1:
-            _program_error(
-                path,
-                "must resolve to exactly one declared Program target role",
-            )
-        return kind, canonical_json_bytes(row).decode("utf-8")
-    if kind == "runtime_object":
-        _program_closed(
-            row,
-            required=frozenset({"kind", "runtime_object_id"}),
-            path=path,
-        )
-        runtime_object_id = _program_identifier(
-            row["runtime_object_id"], path=f"{path}.runtime_object_id"
-        )
-        declaration = blackboard_keys.get(runtime_object_id)
-        if declaration is None or declaration.type != "scene_resource":
-            _program_error(
-                f"{path}.runtime_object_id",
-                "must name a declared scene_resource blackboard key",
-            )
-        return kind, runtime_object_id
-    _program_error(f"{path}.kind", "has an unsupported contact body selector")
-
-
-def _validate_contact_policies(
-    value: Any,
-    *,
-    path: str,
-    component_roles: Mapping[str, dict[str, Any]],
-    target_roles: Mapping[str, dict[str, Any]],
-    blackboard_keys: Mapping[str, BlackboardKeyDeclaration],
-    direct_references: bool = False,
-) -> dict[str, str]:
-    rows = _program_list(value, path=path)
-    policy_ids: list[str] = []
-    policy_modes: dict[str, str] = {}
-    for index, raw in enumerate(rows):
-        policy_path = f"{path}[{index}]"
-        policy = _program_mapping(raw, path=policy_path)
-        _program_closed(
-            policy,
-            required=frozenset(
-                {
-                    "api_version",
-                    "policy_id",
-                    "version",
-                    "mode",
-                    "sensing_mode",
-                    "default_unmatched_response",
-                    "zones",
-                }
-            ),
-            path=policy_path,
-        )
-        if policy["api_version"] != "manyforge.contact_policy.v1":
-            _program_error(
-                f"{policy_path}.api_version",
-                "must be manyforge.contact_policy.v1",
-            )
-        policy_id = _program_identifier(
-            policy["policy_id"], path=f"{policy_path}.policy_id"
-        )
-        try:
-            verify_content_identity(
-                policy,
-                own_field="version",
-                identity_domain="catalog-record-revision/contact_policy",
-                api_version="manyforge.contact_policy.v1",
-                label=policy_path,
-            )
-        except StrictArtifactError as exc:
-            _program_error(f"{policy_path}.version", str(exc))
-        if (
-            policy["mode"] not in ("contact_grasp", "contact_release")
-            or policy["sensing_mode"] != "geometry_only"
-            or policy["default_unmatched_response"] != "hard_stop"
-        ):
-            _program_error(
-                policy_path,
-                "is outside the qualified geometry-only contact policy shape",
-            )
-        zones = _program_list(policy["zones"], path=f"{policy_path}.zones")
-        if len(zones) != 1:
-            _program_error(
-                f"{policy_path}.zones",
-                "must contain exactly one zone in the qualified profile",
-            )
-        zone_ids: list[str] = []
-        runtime_objects: set[str] = set()
-        for zone_index, raw_zone in enumerate(zones):
-            zone_path = f"{policy_path}.zones[{zone_index}]"
-            zone = _program_mapping(raw_zone, path=zone_path)
-            release = policy["mode"] == "contact_release"
-            _program_closed(
-                zone,
-                required=frozenset({"zone_id", "body_pairs", "violation_response"})
-                | (frozenset({"release_evidence_mode"}) if release else
-                   frozenset({"max_penetration_m", "terminal_window_start_fraction"})),
-                optional=(frozenset({
-                    "enforce_max_start_penetration", "max_start_penetration_m",
-                    "min_release_progress_m", "release_tolerance_m",
-                    "require_strictly_decreasing_penetration",
-                    "require_separation_by_end", "allow_recontact",
-                }) if release else frozenset()),
-                path=zone_path,
-            )
-            zone_id = _program_identifier(zone["zone_id"], path=f"{zone_path}.zone_id")
-            zone_ids.append(zone_id)
-            if zone["violation_response"] != "hard_stop":
-                _program_error(f"{zone_path}.violation_response", "must be hard_stop")
-            if release:
-                evidence = zone["release_evidence_mode"]
-                if evidence not in ("signed_penetration", "binary_contact"):
-                    _program_error(f"{zone_path}.release_evidence_mode",
-                                   "must be signed_penetration or binary_contact")
-                for field in ("enforce_max_start_penetration",
-                              "require_strictly_decreasing_penetration",
-                              "require_separation_by_end", "allow_recontact"):
-                    if field in zone and type(zone[field]) is not bool:
-                        _program_error(f"{zone_path}.{field}", "must be a boolean")
-                for field in ("max_start_penetration_m", "min_release_progress_m",
-                              "release_tolerance_m"):
-                    if field in zone and not 0 <= _program_number(
-                        zone[field], path=f"{zone_path}.{field}"
-                    ) <= 1000:
-                        _program_error(f"{zone_path}.{field}", "must be in [0, 1000]")
-                if evidence == "binary_contact" and (
-                    zone.get("enforce_max_start_penetration", False)
-                    or zone.get("require_strictly_decreasing_penetration", False)
-                    or any(zone.get(field, 0.0) != 0.0 for field in (
-                        "max_start_penetration_m", "min_release_progress_m",
-                        "release_tolerance_m"))
-                ):
-                    _program_error(zone_path, "binary_contact forbids signed-distance fields")
-            else:
-                if (
-                    _program_number(
-                        zone["max_penetration_m"], path=f"{zone_path}.max_penetration_m"
-                    )
-                    <= 0.0
-                ):
-                    _program_error(f"{zone_path}.max_penetration_m", "must be positive")
-                terminal_fraction = _program_number(
-                    zone["terminal_window_start_fraction"],
-                    path=f"{zone_path}.terminal_window_start_fraction",
-                )
-                if terminal_fraction < 0.0 or terminal_fraction > 1.0:
-                    _program_error(
-                        f"{zone_path}.terminal_window_start_fraction",
-                        "must be in [0, 1]",
-                    )
-            pairs = _program_list(zone["body_pairs"], path=f"{zone_path}.body_pairs")
-            if not pairs:
-                _program_error(f"{zone_path}.body_pairs", "must not be empty")
-            pair_keys: list[tuple[str, str]] = []
-            for pair_index, raw_pair in enumerate(pairs):
-                pair_path = f"{zone_path}.body_pairs[{pair_index}]"
-                pair = _program_mapping(raw_pair, path=pair_path)
-                _program_closed(
-                    pair,
-                    required=frozenset({"body_a", "body_b"}),
-                    path=pair_path,
-                )
-                left = _validate_contact_selector(
-                    pair["body_a"],
-                    path=f"{pair_path}.body_a",
-                    component_roles=component_roles,
-                    target_roles=target_roles,
-                    blackboard_keys=blackboard_keys,
-                    direct_references=direct_references,
-                )
-                right = _validate_contact_selector(
-                    pair["body_b"],
-                    path=f"{pair_path}.body_b",
-                    component_roles=component_roles,
-                    target_roles=target_roles,
-                    blackboard_keys=blackboard_keys,
-                    direct_references=direct_references,
-                )
-                kinds = {left[0], right[0]}
-                if kinds not in (
-                    {"component_model_body", "runtime_object"},
-                    {"motion_endpoint", "runtime_object"},
-                ):
-                    _program_error(
-                        pair_path,
-                        "must join one component body or motion endpoint to one runtime object",
-                    )
-                if "motion_endpoint" in kinds and len(pairs) != 1:
-                    _program_error(
-                        f"{zone_path}.body_pairs",
-                        "motion_endpoint requires exactly one body pair",
-                    )
-                runtime_object = left[1] if left[0] == "runtime_object" else right[1]
-                runtime_objects.add(runtime_object)
-                pair_keys.append(
-                    tuple(
-                        sorted(
-                            (
-                                f"{left[0]}:{left[1]}",
-                                f"{right[0]}:{right[1]}",
-                            )
-                        )
-                    )
-                )
-            if pair_keys != sorted(pair_keys) or len(pair_keys) != len(set(pair_keys)):
-                _program_error(
-                    f"{zone_path}.body_pairs",
-                    "must be duplicate-free and canonical-sorted",
-                )
-        if zone_ids != sorted(zone_ids) or len(zone_ids) != len(set(zone_ids)):
-            _program_error(
-                f"{policy_path}.zones",
-                "must be unique and canonical-sorted by zone_id",
-            )
-        if len(runtime_objects) != 1:
-            _program_error(
-                policy_path,
-                "must use one shared declared runtime-object key",
-            )
-        policy_ids.append(policy_id)
-        policy_modes[policy_id] = policy["mode"]
-    if policy_ids != sorted(policy_ids) or len(policy_ids) != len(set(policy_ids)):
-        _program_error(path, "must be unique and canonical-sorted by policy_id")
-    return policy_modes
-
-
 def _validate_semantic_value(
     schema: CatalogSchema,
     value: Any,
@@ -4035,6 +3708,12 @@ def _validate_catalog_blackboard_bindings(
         for binding in bindings:
             admitted.setdefault(binding.key_parameter, []).append(binding.value_type)
         for key_parameter, value_types in admitted.items():
+            if key_parameter not in parameters and not any(
+                parameter.id == key_parameter and parameter.required
+                for parameter in entry.parameters
+            ):
+                # An optional output key that is not set: nothing is written.
+                continue
             key = parameters.get(key_parameter)
             if type(key) is not str:
                 _program_error(
@@ -4064,6 +3743,12 @@ def _validate_catalog_blackboard_bindings(
                     f"{path}.parameters.{key_parameter}",
                     f"names system-owned interrupt rule state key {key!r}, "
                     "which only its rule publishes",
+                )
+            if direction == "write" and is_motion_group_state_key(key):
+                _program_error(
+                    f"{path}.parameters.{key_parameter}",
+                    f"names system-owned motion group state key {key!r}, "
+                    "which only the Program runner writes",
                 )
             if direction == "write" and declaration.expression is not None:
                 _program_error(
@@ -4376,7 +4061,11 @@ def _validate_on_grasp_lost(
     if key is None:
         return
     key_field = f"{field}.set_key"
-    if is_node_outcome_key(key) or is_interrupt_state_key(key):
+    if (
+        is_node_outcome_key(key)
+        or is_interrupt_state_key(key)
+        or is_motion_group_state_key(key)
+    ):
         _program_error(
             key_field,
             f"names system-owned key {key!r}, which nodes cannot write",
@@ -4396,6 +4085,67 @@ def _validate_on_grasp_lost(
         )
     if declaration.access not in {"write", "read_write"}:
         _program_error(key_field, "does not permit write access")
+
+
+_COLLISION_RULE_SEQUENCE_NODE_IDS: Final = frozenset(
+    {"planning.plan_pick_sequence", "planning.plan_place_sequence"}
+)
+
+
+def _validate_collision_rules(
+    node_id: str,
+    value: Any,
+    *,
+    path: str,
+    context: _ProgramValidationContext,
+) -> None:
+    """Check a motion node's collision rules: the row shape, and that a
+    Scene object named by a blackboard key uses a scene_resource key or a
+    scene_resource field of a structured key."""
+
+    try:
+        validate_collision_rules(
+            value,
+            path=path,
+            move_rules=True,
+            legs=node_id in _COLLISION_RULE_SEQUENCE_NODE_IDS,
+        )
+    except CollisionRuleError as error:
+        _program_error(error.path, f"{error.reason}: {error.message}")
+    for index, row in enumerate(value):
+        for side in ("a", "b"):
+            for selection_index, selection in enumerate(row.get(side, ())):
+                selection_path = f"{path}[{index}].{side}[{selection_index}]"
+                if "blackboard_key" in selection:
+                    declaration = context.blackboard_keys.get(selection["blackboard_key"])
+                    if declaration is None:
+                        _program_error(
+                            f"{selection_path}.blackboard_key",
+                            "must name a declared blackboard key",
+                        )
+                    if "field" in selection:
+                        field_declaration = declaration.fields.get(selection["field"])
+                        if (
+                            field_declaration is None
+                            or field_declaration.type != "scene_resource"
+                        ):
+                            _program_error(
+                                f"{selection_path}.field",
+                                "must name a scene_resource field of the blackboard key",
+                            )
+                    elif declaration.type != "scene_resource":
+                        _program_error(
+                            f"{selection_path}.blackboard_key",
+                            "must name a declared scene_resource blackboard key",
+                        )
+                if (
+                    "scene_resource_id" in selection
+                    and selection["scene_resource_id"] not in context.scene_resource_ids
+                ):
+                    _program_error(
+                        f"{selection_path}.scene_resource_id",
+                        "does not name a declared scene resource",
+                    )
 
 
 def _validate_node_cross_fields(
@@ -4424,6 +4174,28 @@ def _validate_node_cross_fields(
         joints = [item.get("joint_name") for item in goal if type(item) is dict]
         if len(joints) != len(set(joints)):
             _program_error(f"{path}.parameters.goal", "contains duplicate joint names")
+    if node_id in POSE_MOTION_NODE_IDS:
+        motion_type = parameters.get("motion_type", "joint")
+        refused = (
+            _JOINT_ONLY_POSE_PARAMETERS
+            if motion_type == "linear"
+            else _LINEAR_ONLY_POSE_PARAMETERS
+        )
+        for name in sorted(refused & (set(parameters) | sourced)):
+            _program_error(
+                f"{path}.parameters.{name}",
+                f"applies only to {'joint' if motion_type == 'linear' else 'linear'} "
+                f"moves; this move's motion_type is {motion_type}",
+            )
+        if motion_type == "linear":
+            # The line is held within these tolerances; 0 cannot be held.
+            for name in ("translation_tol_m", "rotation_tol_rad"):
+                value = parameters.get(name)
+                if type(value) in {int, float} and not value > 0:
+                    _program_error(
+                        f"{path}.parameters.{name}",
+                        "must be above 0 for a linear move",
+                    )
     if node_id in {"motion.move_to_pose", "motion.follow_cartesian_path"}:
         mode = parameters.get("target_mode", "absolute")
         if (
@@ -4453,20 +4225,13 @@ def _validate_node_cross_fields(
                 "a relative goal is stated in the moving robot's base frame; "
                 "its reference is target_reference",
             )
-    if "contact_policy_id" in parameters:
-        policy_id = _program_identifier(
-            parameters["contact_policy_id"],
-            path=f"{path}.parameters.contact_policy_id",
+    if "collision_rules" in parameters:
+        _validate_collision_rules(
+            node_id,
+            parameters["collision_rules"],
+            path=f"{path}.parameters.collision_rules",
+            context=context,
         )
-        if policy_id not in context.contact_policy_modes:
-            _program_error(
-                f"{path}.parameters.contact_policy_id",
-                "does not name a declared contact policy",
-            )
-        if (node_id == "planning.plan_pick_sequence"
-                and context.contact_policy_modes[policy_id] != "contact_grasp"):
-            _program_error(f"{path}.parameters.contact_policy_id",
-                           "pick requires a contact_grasp policy")
     if node_id in {"logic.check_value", "logic.wait_for_value"}:
         key_type = context.blackboard_keys[parameters["key"]].type
         reason = comparison_supported(
@@ -4516,6 +4281,37 @@ def _validate_node_cross_fields(
             path=f"{path}.parameters.mock_simulation",
             direct_references=context.direct_references,
         )
+    if node_id in _PROGRAM_STOP_GROUP_PARAMETERS:
+        for name in sorted(_LITERAL_ONLY_OPERATOR_PARAMETERS & sourced):
+            _program_error(
+                f"{path}.parameters.{name}",
+                "must be literal: it fixes the question's answers or the stopped groups",
+            )
+    if node_id == "operator.request_choice" and type(parameters.get("options")) is list:
+        seen_options: set[str] = set()
+        for index, option in enumerate(parameters["options"]):
+            if type(option) is not dict:
+                continue
+            option_path = f"{path}.parameters.options[{index}]"
+            option_id = option.get("option_id")
+            if (
+                type(option_id) is not str
+                or len(option_id.encode("utf-8")) > 128
+                or _IDENTIFIER_RE.fullmatch(option_id) is None
+            ):
+                _program_error(
+                    f"{option_path}.option_id",
+                    "must be an identifier (a-z, 0-9, '_', '.', '-'; at most 128 bytes)",
+                )
+            if option_id in seen_options:
+                _program_error(f"{option_path}.option_id", "repeats another option")
+            seen_options.add(option_id)
+            label = option.get("label")
+            if type(label) is not str or not label.strip() or len(label.encode("utf-8")) > 256:
+                _program_error(f"{option_path}.label", "must be non-empty text of at most 256 bytes")
+        message = parameters.get("message")
+        if type(message) is str and (not message.strip() or len(message.encode("utf-8")) > 4_096):
+            _program_error(f"{path}.parameters.message", "must be non-empty text of at most 4096 bytes")
     if node_id == "io.wait_for_input" and (
         "edge" in sourced or parameters.get("edge", "level") != "level"
     ):
@@ -4558,6 +4354,39 @@ def _validate_node_cross_fields(
                 f"{path}.parameters.max_effort",
                 "unit kind does not match the commanded position",
             )
+
+
+# The motion-group list of the Program's own Stop: `[]` (none, Ask operator
+# only), `["all"]`, or declared execution group ids.
+_PROGRAM_STOP_GROUP_PARAMETERS: Final = MappingProxyType(
+    {"operator.request_choice": "hold_motion", "motion.stop_groups": "groups"}
+)
+_LITERAL_ONLY_OPERATOR_PARAMETERS: Final = frozenset({"options", "hold_motion", "groups"})
+
+
+def _validate_program_stop_groups(
+    tree: ProgramTreeNode, declared_groups: Collection[str], *, path: str
+) -> None:
+    """Each Program Stop names `all` alone or declared execution groups."""
+
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        pending.extend(node.children)
+        parameter = _PROGRAM_STOP_GROUP_PARAMETERS.get(node.node_id)
+        if parameter is None:
+            continue
+        groups = node.parameters.get(parameter, [])
+        if type(groups) is not list:
+            continue
+        field = f"{path}.{node.instance_id}.parameters.{parameter}"
+        if len(set(groups)) != len(groups):
+            _program_error(field, "names a motion group twice")
+        if "all" in groups and len(groups) > 1:
+            _program_error(field, "all cannot be combined with other motion groups")
+        for group in groups:
+            if group != "all" and group not in declared_groups:
+                _program_error(field, f"{group!r} is not a declared execution group")
 
 
 def _validate_mock_simulation(
@@ -4914,7 +4743,7 @@ def program_value_declarations(
     """
 
     root = _program_mapping(dict(document), path=source)
-    direct_references = root.get("api_version") == "manyforge.program.v3"
+    direct_references = root.get("api_version") == "manyforge.program.v4"
     if not direct_references and "component_roles" not in root:
         _program_error(f"{source}.component_roles", "is required")
     component_roles = {} if direct_references else _validate_component_roles(
@@ -4950,6 +4779,7 @@ def program_value_declarations(
     if direct_references:
         keys = _declare_active_tcp_selector_keys(keys, roots)
     keys = _declare_node_outcome_keys(keys, roots)
+    keys = _declare_motion_group_state_keys(keys, roots)
     return parameters, _declare_interrupt_state_keys(keys, roots, root.get("blackboard"))
 
 
@@ -5081,7 +4911,7 @@ def _validate_program_document(
     tuple[dict[str, str], ...],
 ]:
     root = _program_mapping(data, path=source)
-    direct_references = api_version == "manyforge.program.v3"
+    direct_references = api_version == "manyforge.program.v4"
     if direct_references:
         require_program_format(root, supported_api_version=api_version)
     root = _select_identity_verified_program_root(
@@ -5095,10 +4925,8 @@ def _validate_program_document(
         required=frozenset(
             {
                 "api_version",
-                "program_id",
                 "program_revision",
                 "program_profile",
-                "name",
                 "catalog",
                 "tree",
             }
@@ -5111,21 +4939,8 @@ def _validate_program_document(
     )
     if root["api_version"] != api_version:
         _program_error(f"{source}.api_version", f"must be {api_version}")
-    _program_identifier(root["program_id"], path=f"{source}.program_id")
     if root["program_profile"] != _PROGRAM_PROFILE:
         _program_error(f"{source}.program_profile", f"must be {_PROGRAM_PROFILE}")
-    _program_text(
-        root["name"],
-        path=f"{source}.name",
-        max_chars=_MAX_DESCRIPTION_CHARS,
-    )
-    if "description" in root:
-        _program_text(
-            root["description"],
-            path=f"{source}.description",
-            allow_empty=True,
-            max_chars=_MAX_DESCRIPTION_CHARS,
-        )
     catalog_ref = _program_mapping(root["catalog"], path=f"{source}.catalog")
     _program_closed(
         catalog_ref,
@@ -5198,20 +5013,15 @@ def _validate_program_document(
         blackboard_keys, [root.get("tree")]
     )
     blackboard_keys = _declare_node_outcome_keys(blackboard_keys, [root.get("tree")])
+    blackboard_keys = _declare_motion_group_state_keys(
+        blackboard_keys, [root.get("tree")]
+    )
     blackboard_keys = _declare_interrupt_state_keys(
         blackboard_keys, [root.get("tree")], root.get("blackboard")
     )
     expressions = ExpressionEnvironment.from_declarations(parameters, blackboard_keys)
     computed_keys = _check_computed_keys(
         blackboard_keys, expressions, path=f"{source}.blackboard.keys"
-    )
-    contact_policy_modes = _validate_contact_policies(
-        root.get("contact_policies", []),
-        path=f"{source}.contact_policies",
-        component_roles=component_roles,
-        target_roles=target_roles,
-        blackboard_keys=blackboard_keys,
-        direct_references=direct_references,
     )
     context = _ProgramValidationContext(
         catalog=catalog,
@@ -5221,10 +5031,9 @@ def _validate_program_document(
         parameters=parameters,
         blackboard_namespaces=namespaces,
         blackboard_keys=blackboard_keys,
-        contact_policy_modes=contact_policy_modes,
         expressions=expressions,
         direct_references=direct_references,
-        execution_groups_supported=api_version in {_PROGRAM_API_VERSION, "manyforge.program.v3"},
+        execution_groups_supported=api_version in {_PROGRAM_API_VERSION, "manyforge.program.v4"},
     )
     tree = _validate_program_tree(
         root["tree"],
@@ -5237,12 +5046,15 @@ def _validate_program_document(
         root.get("execution_groups"),
         path=f"{source}.execution_groups",
     )
-    if execution_group_policies and api_version not in {_PROGRAM_API_VERSION, "manyforge.program.v3"}:
+    if execution_group_policies and api_version not in {_PROGRAM_API_VERSION, "manyforge.program.v4"}:
         _program_error(
             f"{source}.execution_groups",
             "is unavailable in the previous Program contract",
         )
     _validate_execution_group_policies(tree, execution_group_policies)
+    _validate_program_stop_groups(
+        tree, execution_group_policies, path=f"{source}.tree"
+    )
     viewer = root.get("viewer")
     if isinstance(viewer, dict) and "hidden_execution_groups" in viewer:
         declared_groups = set(execution_group_policies) | {"all"}
@@ -5313,7 +5125,7 @@ def _validate_program_document(
 
 
 class Program:
-    """Validated ``manyforge.program.v3`` authoring artifact.
+    """Validated ``manyforge.program.v4`` authoring artifact.
 
     This loader owns no binding, runtime, filesystem discovery, node factory,
     or deployment-capability union. It validates authored meaning against one
@@ -5332,12 +5144,12 @@ class Program:
     ) -> None:
         if skill_catalog is not None:
             raise ProgramValidationError(
-                "v0 skill expansion is unavailable; v3 Programs contain only "
+                "v0 skill expansion is unavailable; v4 Programs contain only "
                 "ordinary active-catalog nodes"
             )
         if deployment_capability_keys is not None:
             raise ProgramValidationError(
-                "deployment-wide capability unions cannot validate a v3 Program"
+                "deployment-wide capability unions cannot validate a v4 Program"
             )
         source_path = Path(path)
         try:
@@ -5365,12 +5177,12 @@ class Program:
     ) -> "Program":
         if skill_catalog is not None:
             raise ProgramValidationError(
-                "v0 skill expansion is unavailable; v3 Programs contain only "
+                "v0 skill expansion is unavailable; v4 Programs contain only "
                 "ordinary active-catalog nodes"
             )
         if deployment_capability_keys is not None:
             raise ProgramValidationError(
-                "deployment-wide capability unions cannot validate a v3 Program"
+                "deployment-wide capability unions cannot validate a v4 Program"
             )
         if type(data) is not dict:
             raise ProgramValidationError("Program root must be a built-in mapping")
@@ -5417,11 +5229,8 @@ class Program:
             raise ProgramValidationError(str(exc)) from exc
         self._data = normalized
         self._catalog = catalog
-        self.program_id = str(normalized["program_id"])
         self.program_revision = str(normalized["program_revision"])
         self.program_profile = str(normalized["program_profile"])
-        self.name = str(normalized["name"])
-        self.description = str(normalized.get("description", ""))
         self.catalog_api_version = str(normalized["catalog"]["api_version"])
         self.catalog_content_version = str(normalized["catalog"]["content_version"])
         # The catalog version the source was saved with (traceability).
@@ -5544,7 +5353,7 @@ class Program:
             path=path,
             scene_resource_ids=self._scene_resource_ids(),
             target_roles=self._data.get("target_roles", {}),
-            direct_references=self._data.get("api_version") == "manyforge.program.v3",
+            direct_references=self._data.get("api_version") == "manyforge.program.v4",
         )
         if declaration.type == "stored_pose":
             _require_allowed_frame(value, declaration.allowed_frames, path=path)
@@ -5558,7 +5367,7 @@ class Program:
             path=path,
             target_roles=self._data.get("target_roles", {}),
             scene_resource_ids=self._scene_resource_ids(),
-            direct_references=self._data.get("api_version") == "manyforge.program.v3",
+            direct_references=self._data.get("api_version") == "manyforge.program.v4",
         )
         self._validate_captured_frame(value, path=path)
 
@@ -5566,7 +5375,7 @@ class Program:
         return {row["scene_resource_id"] for row in self._data.get("scene", [])}
 
     def to_dict(self) -> dict[str, Any]:
-        """Return one detached exact v3 authoring document."""
+        """Return one detached exact v4 authoring document."""
 
         return deepcopy(self._data)
 
@@ -5640,6 +5449,11 @@ __all__ = [
     "INTERRUPT_KEY_INITIAL_REQUIRED",
     "interrupt_state_key",
     "is_interrupt_state_key",
+    "MOTION_GROUP_STATE_NAMESPACE",
+    "MOTION_GROUP_STATE_UNAVAILABLE",
+    "MOTION_GROUP_STATE_VALUES",
+    "is_motion_group_state_key",
+    "motion_group_state_key",
     "NODE_ENDED_OUTCOMES",
     "NODE_OUTCOME_NAMESPACE",
     "NODE_OUTCOME_NODE_IDS",

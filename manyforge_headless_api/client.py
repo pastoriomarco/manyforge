@@ -13,6 +13,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 from websockets.sync.client import ClientConnection, connect as connect_websocket
 
+from .control_protocol import CONTROL_RECEIVED_MONOTONIC_NS_HEADER
 from .identity import format_request_key, http_request_key
 from .internal_http import INTERNAL_HTTP_CLIENT_LIMITS
 from .native import (
@@ -399,6 +400,7 @@ class HeadlessHttpClient:
         params: Sequence[tuple[str, str | int]] = (),
         body: Mapping[str, Any] | None = None,
         timeout_seconds: float | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
         payload, status_code, maximum, _etag = self._request_payload(
             method,
@@ -406,6 +408,7 @@ class HeadlessHttpClient:
             params=params,
             body=body,
             timeout_seconds=timeout_seconds,
+            headers=headers,
         )
         value = self._decode_response(
             payload,
@@ -818,6 +821,9 @@ class HeadlessHttpClient:
     def record_program_diagnostic(self, record: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/program/diagnostics", body=record)
 
+    def record_program_node_attempts(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/program/node-attempts", body=batch)
+
     def lookup_component_frame(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/program/component-frame-lookup", body=body)
 
@@ -919,6 +925,15 @@ class HeadlessHttpClient:
         return self.request(
             "GET",
             f"{self._program_run_path(program_run_id)}/runtime-controls",
+            params=(("application_start_id", application_start_id),),
+        )
+
+    def program_runtime_blackboard_values(
+        self, program_run_id: int, *, application_start_id: str
+    ) -> dict[str, Any]:
+        return self.request(
+            "GET",
+            f"{self._program_run_path(program_run_id)}/blackboard-values",
             params=(("application_start_id", application_start_id),),
         )
 
@@ -1172,10 +1187,28 @@ class HeadlessHttpClient:
 
         return self.request("GET", "/api/control/state")
 
-    def submit_control_command(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Submit one strict public command envelope without adding semantics."""
+    def submit_control_command(
+        self,
+        body: Mapping[str, Any],
+        *,
+        received_monotonic_ns: int | None = None,
+    ) -> dict[str, Any]:
+        """Submit one strict public command envelope without adding semantics.
 
-        return self.request("POST", "/api/control/commands", body=body)
+        ``received_monotonic_ns``: when the caller (Composer, on the same
+        host) received the command; Headless ages its freshness to then.
+        """
+
+        return self.request(
+            "POST",
+            "/api/control/commands",
+            body=body,
+            headers=(
+                None
+                if received_monotonic_ns is None
+                else {CONTROL_RECEIVED_MONOTONIC_NS_HEADER: str(received_monotonic_ns)}
+            ),
+        )
 
     def execute(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/operations", body=body)

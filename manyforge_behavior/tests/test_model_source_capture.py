@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from manyforge_behavior import model_source_capture
+from manyforge_behavior.project_paths import ProjectPathRule
 from manyforge_behavior.model_source_capture import (
     ModelSourceCaptureError,
     capture_deployment_model_sources,
@@ -45,7 +46,7 @@ def test_capture_owns_exact_entrypoints_and_resource_bytes(tmp_path: Path) -> No
     (tmp_path / "package" / "meshes" / "a.stl").write_bytes(mesh)
 
     captured = capture_deployment_model_sources(
-        _deployment(), project_root=tmp_path
+        _deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path])
     )
 
     component = captured["components"][0]
@@ -85,7 +86,7 @@ def test_capture_skips_model_free_components(
         ]
     }
 
-    captured = capture_deployment_model_sources(deployment, project_root=tmp_path)
+    captured = capture_deployment_model_sources(deployment, project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
 
     assert captured["components"] == []
 
@@ -100,7 +101,7 @@ def test_capture_rejects_unregistered_package_resource(tmp_path: Path) -> None:
     (tmp_path / "package").mkdir()
 
     with pytest.raises(ModelSourceCaptureError, match="has no root"):
-        capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+        capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
 
 
 def test_capture_rejects_package_path_traversal(tmp_path: Path) -> None:
@@ -113,7 +114,7 @@ def test_capture_rejects_package_path_traversal(tmp_path: Path) -> None:
     (tmp_path / "package").mkdir()
 
     with pytest.raises(ModelSourceCaptureError, match="unsafe relative path"):
-        capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+        capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
 
 
 def test_capture_rejects_symlinked_entrypoint_parent(tmp_path: Path) -> None:
@@ -128,8 +129,63 @@ def test_capture_rejects_symlinked_entrypoint_parent(tmp_path: Path) -> None:
         "project_path": "alias/model.urdf"
     }
 
-    with pytest.raises(ModelSourceCaptureError, match="could not read robot URDF"):
-        capture_deployment_model_sources(deployment, project_root=tmp_path)
+    with pytest.raises(ModelSourceCaptureError, match="passes through the symlink"):
+        capture_deployment_model_sources(deployment, project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
+
+
+def test_capture_applies_the_project_path_rule_to_every_model_source(
+    tmp_path: Path,
+) -> None:
+    """Model sources follow the same rule as scene meshes (OD-335): relative to
+    the Scenario project folder or absolute, inside an allowed folder."""
+
+    project = tmp_path / "projects" / "cell.scenario"
+    models = tmp_path / "projects" / "models"
+    (models / "package").mkdir(parents=True)
+    project.mkdir()
+    (models / "model.urdf").write_bytes(b'<robot name="r"><link name="a"/></robot>')
+    (models / "model.srdf").write_bytes(b'<robot name="r"/>')
+    deployment = _deployment()
+    deployment["components"][0]["model_source"] = {
+        "urdf": {"project_path": "../models/model.urdf"},
+        "srdf": {"external_path": str(models / "model.srdf")},
+        "package_roots": {"example": {"project_path": "../models/package"}},
+    }
+    inside = ProjectPathRule([tmp_path / "projects"])
+    captured = capture_deployment_model_sources(
+        deployment, project_root=project, paths=inside
+    )
+    assert captured["components"][0]["component_id"] == "robot"
+
+    # The same files outside every allowed folder: each refusal names the
+    # path and the allowed folders.
+    narrow = ProjectPathRule([project])
+    for field, needle in (
+        ("urdf", "robot URDF '../models/model.urdf'"),
+        ("srdf", f"robot SRDF {str(models / 'model.srdf')!r}"),
+        ("package_roots", "robot package root 'example' '../models/package'"),
+    ):
+        refused = {
+            "urdf": {"project_path": "model.urdf"},
+            "srdf": None,
+            "package_roots": {},
+        }
+        (project / "model.urdf").write_bytes(b'<robot name="r"><link name="a"/></robot>')
+        candidate = _deployment()
+        source = candidate["components"][0]["model_source"] = dict(
+            deployment["components"][0]["model_source"]
+        )
+        if field != "urdf":
+            source["urdf"] = refused["urdf"]
+        if field != "srdf":
+            source.pop("srdf")
+        if field != "package_roots":
+            source["package_roots"] = {}
+        with pytest.raises(ModelSourceCaptureError) as error:
+            capture_deployment_model_sources(candidate, project_root=project, paths=narrow)
+        assert needle in str(error.value)
+        assert "outside the allowed folders" in str(error.value)
+        assert f"(allowed folders: {project})" in str(error.value)
 
 
 def test_capture_rejects_a_source_changed_during_its_bounded_read(
@@ -157,7 +213,7 @@ def test_capture_rejects_a_source_changed_during_its_bounded_read(
 
     monkeypatch.setattr(os, "read", read_then_change)
     with pytest.raises(ModelSourceCaptureError, match="changed during capture"):
-        capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+        capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
 
 
 def _counted_memo(monkeypatch: pytest.MonkeyPatch, **bounds: int) -> list[bytes]:
@@ -208,15 +264,15 @@ def test_capture_compresses_each_unchanged_source_once(
     encoded = _counted_memo(monkeypatch)
     _mesh_model(tmp_path, b"solid a\nendsolid a\n")
 
-    first = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    first = capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
     assert len(encoded) == 3  # URDF, SRDF and the mesh
-    second = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    second = capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
 
     assert len(encoded) == 3
     assert second == first
     # A reused value is the caller's own: editing it cannot reach the memo.
     second["components"][0]["resources"][0]["chunks"].clear()
-    third = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    third = capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
     assert third == first and len(encoded) == 3
 
 
@@ -226,12 +282,12 @@ def test_capture_never_reuses_a_changed_or_missing_source(
     encoded = _counted_memo(monkeypatch)
     mesh = _mesh_model(tmp_path, b"solid a\nendsolid a\n")
     before = mesh.stat()
-    capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
 
     # Same size, timestamps restored: only the content identity differs.
     mesh.write_bytes(b"solid b\nendsolid b\n")
     os.utime(mesh, ns=(before.st_atime_ns, before.st_mtime_ns))
-    changed = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    changed = capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
     assert _mesh_bytes(changed) == b"solid b\nendsolid b\n"
     assert encoded[-1] == b"solid b\nendsolid b\n" and len(encoded) == 4
 
@@ -239,13 +295,13 @@ def test_capture_never_reuses_a_changed_or_missing_source(
     replacement = mesh.with_name("a.stl.new")
     replacement.write_bytes(b"solid a\nendsolid a\n")
     os.replace(replacement, mesh)
-    replaced = capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    replaced = capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
     assert _mesh_bytes(replaced) == b"solid a\nendsolid a\n"
     assert len(encoded) == 5
 
     mesh.unlink()
     with pytest.raises(ModelSourceCaptureError, match="could not read package resource"):
-        capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+        capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
 
 
 def test_capture_memo_stays_within_its_bounds(
@@ -254,8 +310,8 @@ def test_capture_memo_stays_within_its_bounds(
     encoded = _counted_memo(monkeypatch, entries=2)
     _mesh_model(tmp_path, b"solid a\nendsolid a\n")
 
-    capture_deployment_model_sources(_deployment(), project_root=tmp_path)
-    capture_deployment_model_sources(_deployment(), project_root=tmp_path)
+    capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
+    capture_deployment_model_sources(_deployment(), project_root=tmp_path, paths=ProjectPathRule([tmp_path]))
 
     # Three sources never fit two entries: the oldest is compressed again.
     assert len(encoded) > 3

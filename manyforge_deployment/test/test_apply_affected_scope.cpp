@@ -107,7 +107,6 @@ Bundle(core::CellGraphDTO graph, core::RetainedCompiledProductsDTO products) {
   return {
       "manyforge.retained_bundle.v1",
       core::RetainedBundleId("bundle"),
-      core::DeploymentArtifactId("deployment"),
       core::DeploymentRevision("deployment-r1"),
       std::move(graph),
       core::RetainedCatalogDTO{

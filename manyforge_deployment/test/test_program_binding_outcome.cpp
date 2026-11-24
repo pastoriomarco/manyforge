@@ -20,8 +20,7 @@ Target(std::string component, std::string target,
           "candidate target unavailable"};
 }
 ProgramNonExecutableOutcomeDTO Outcome() {
-  return {core::ProgramId("pick_and_place"),
-          core::ProgramRevision(std::string(kDigest)),
+  return {core::ProgramRevision(std::string(kDigest)),
           core::RetainedBundleId(std::string(kDigest)),
           core::GraphRevision(std::string(kDigest)),
           {Target("gripper", "jaw",

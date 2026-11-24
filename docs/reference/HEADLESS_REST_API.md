@@ -11,7 +11,9 @@
 
 This is the independent headless projection over Manager, logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the selected addressed execution owner and independent Program runner. Reads return owner-issued facts. Alarm acknowledgement, Manager and Program Apply, execution submission, no-motion preview, Program Run, Stops, and component actions are attributed intents. Generic `/api/control/state` and `/api/control/commands` provide the freshness-aware REST form of the same transport-neutral control ingress used by `/ws/control`; no command is automatically replayed. The API never owns or reduces execution, Program-run, lifecycle, or controller-route state. Preview cannot dispatch, and approval uses the ordinary operation endpoint. An unconfigured or lost Program runner makes Program-owned routes unavailable and is never interpreted as idle; independently owned native operation and Stop routes remain available when their owner is configured. No condition mutation endpoint exists. `/api/health` reports only `headless_projection_ready`; robot readiness has no headless owner and is explicitly unavailable. The alarm page defaults to 32 records and is bounded at 128, history defaults to and is bounded at 32 records, ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, model-attempt audit at 256 KiB, native/HTTP responses at 64 MiB, and private Program-runner responses at 32 MiB. Program diagnostic captures are separately limited to 64 KiB and asynchronously written by the existing Historian. Their producer-clock values, omissions and delivery losses are available through History/debug export and recorder health, not the high-rate control/viewer stream. Skill expansion is effect-free, selects one exact installed NodeEnvironment and requires ordinary Program/Binding validation before any subsequent execution.
 
-The `request_key` of a Scene request (`/api/scene/transactions`) is recognised, and the request sent again is answered with its first result, until the Scene store folds its history into a snapshot; a request sent again after that is treated as a new request.
+The `request_key` of a Scene request (`/api/scene/transactions`) is recognised, and the request sent again is answered with its first result, until the Scene store folds its history into a snapshot. A request sent again after that is treated as a new request, with one exception: an authoring edit (or a Program node's Scene edit) whose admission is still the newest one settled for its owner is refused with `request_result_expired` and changes nothing.
+
+A Scene request that finds the Scene changed by another request since it was checked, or another Scene commit still in progress, is refused with `stale_revision` and has no effect; refresh the Scene and send it again as a new request (a new `request_key`).
 
 A successful Scene commit is answered once Headless's own view of the logical scene shows the committed revision (or a newer one, or another active bundle, graph or scene), so a read after the reply shows the commit; when the Manager stops answering, or Headless shuts down, the success reply is returned at once. This wait has no time limit.
 
@@ -103,6 +105,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/diagnostics` |  | Program Diagnostic |
 | `GET` | `/api/program/diagnostics/health` |  | Program Diagnostic Health |
 | `POST` | `/api/program/model-attempts` |  | Program Model Attempt |
+| `POST` | `/api/program/node-attempts` |  | Program Node Attempts |
 | `GET` | `/api/program/persistent-values` |  | Program Persistent Values |
 | `POST` | `/api/program/persistent-values` |  | Set Program Persistent Value |
 | `POST` | `/api/program/persistent-values/clear` |  | Clear Program Persistent Values |
@@ -113,6 +116,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/program/runs` |  | Program Runs |
 | `POST` | `/api/program/runs` |  | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` |  | Program Run Read |
+| `GET` | `/api/program/runs/{program_run_id}/blackboard-values` |  | Program Runtime Blackboard Values |
 | `POST` | `/api/program/runs/{program_run_id}/blackboard-values` |  | Write Runtime Blackboard |
 | `POST` | `/api/program/runs/{program_run_id}/manual-handover` |  | Program Run Manual Handover |
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` |  | Stage Manual Result |

@@ -112,11 +112,11 @@ def test_scenario_pins_refresh_v3_and_clear_stale_ready(tmp_path, monkeypatch):
     examples.mkdir()
     project = examples / "cell.scenario"
     document = build_scenario_document(
-        scenario_id="cell", name="cell", description="", program_draft={"name": "before"},
+        scenario_id="cell", name="cell", description="", program_draft={"program_profile": "before"},
         deployment_draft=None, manyforge_version="test", last_known_status="ready",
     )
     save_scenario_artifact(document, str(project), allowed_roots=[str(examples)], overwrite=False)
-    (project / "program.yaml").write_text('{"name":"after"}\n')
+    (project / "program.yaml").write_text('{"program_profile":"after"}\n')
     regen.step_scenario_pins(regen.Context(update=True, tools={}))
     manifest = json.loads((project / "scenario.yaml").read_text())
     assert set(manifest["members"]) == {"program.yaml", "deployment.yaml"}
@@ -137,7 +137,7 @@ def test_catalog_pin_reports_a_stale_native_binding_fixture_id(
     catalog = tmp_path / regen.CATALOG_PY
     catalog.parent.mkdir(parents=True)
     catalog.write_text(f'EXPECTED_BUILTIN_CATALOG_DIGEST = (\n    "sha256:{OLD}"\n)\n')
-    binding = {"api_version": "manyforge.program_binding.v3",
+    binding = {"api_version": "manyforge.program_binding.v4",
                "node_environment": {"catalog_digest": f"sha256:{OLD}"},
                "program_binding_id": f"sha256:{'c' * 64}"}
     fixture = tmp_path / regen.NATIVE_BINDING_FIXTURE
@@ -148,6 +148,6 @@ def test_catalog_pin_reports_a_stale_native_binding_fixture_id(
         regen.step_catalog_pin(regen.Context(update=False, tools={}))
     binding["program_binding_id"] = compute_content_identity(
         binding, own_field="program_binding_id", identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v3")
+        api_version="manyforge.program_binding.v4")
     fixture.write_text(json.dumps(binding))
     regen.step_catalog_pin(regen.Context(update=False, tools={}))

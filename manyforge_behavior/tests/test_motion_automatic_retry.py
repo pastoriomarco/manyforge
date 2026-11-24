@@ -163,7 +163,12 @@ class _Hold:
 class _Store:
     def __init__(self, *, refuse: bool = False) -> None:
         self.writes: list[tuple[str, Any, dict[str, Any]]] = []
+        # Each attempt start sets the key to `none` again (OD-342).
+        self.resets: list[tuple[str, dict[str, Any]]] = []
         self._refuse = refuse
+
+    def reset_node_outcome(self, node_instance_id, *, metadata=None) -> None:
+        self.resets.append((f"node_outcome.{node_instance_id}", dict(metadata or {})))
 
     def write_node_outcome(self, node_instance_id, outcome, *, metadata=None) -> None:
         key = f"node_outcome.{node_instance_id}"
@@ -1020,14 +1025,17 @@ def test_the_node_outcome_key_receives_completed_or_failed_once(starts, status, 
     assert store.writes[0][2]["node_attempt_id"] == 1
 
 
-def test_the_node_outcome_keeps_its_value_until_the_node_ends_again() -> None:
+def test_the_node_outcome_is_none_again_when_a_new_attempt_starts() -> None:
     store = _Store()
     port = _MotionPort([_succeeded(), _active(), _failed(_assessment(eligible=False))])
     _time, clock = _clocked()
     adapter = _motion(port, clock, store=store)
     assert _tick(adapter) is _SUCCESS
+    assert [key for key, _meta in store.resets] == ["node_outcome.motion"]
+    assert store.resets[0][1]["node_attempt_id"] == 1
     adapter.stop(_SUCCESS)
-    assert _tick(adapter) is _RUNNING  # Started again: nothing cleared or written.
+    assert _tick(adapter) is _RUNNING  # Started again: `none` until it ends.
+    assert [meta["node_attempt_id"] for _key, meta in store.resets] == [1, 2]
     assert [value for _key, value, _meta in store.writes] == ["completed"]
 
 
@@ -1059,7 +1067,7 @@ def test_program_refuses_a_value_source_on_the_literal_only_motion_settings() ->
             document,
             own_field="program_revision",
             identity_domain="program-revision",
-            api_version="manyforge.program.v3",
+            api_version="manyforge.program.v4",
         )
         with pytest.raises(ProgramValidationError, match=name):
             Program.from_dict(document, catalog)
@@ -2003,12 +2011,12 @@ def test_probe_search_refused_by_its_unavailable_contact_capability_fails() -> N
 
     refusal = KernelOperationAdmissionRejectedError(
         "unsupported_capability",
-        "execution.interrupt.contact_policy has no provider in the Applied cell",
+        "execution.interrupt.contact_rule has no provider in the Applied cell",
     )
     port = _MotionPort([refusal])
     adapter, store, audit = _interrupt_motion(port, "motion.probe_search")
     assert _tick(adapter) is _FAILURE
-    assert "execution.interrupt.contact_policy" in adapter.feedback_message
+    assert "execution.interrupt.contact_rule" in adapter.feedback_message
     assert store.writes[0][1] == "failed"
     assert len(port.starts) == 1 and port.closes == []
     assert audit == []
@@ -2114,6 +2122,29 @@ def test_a_motion_refused_by_a_holding_rule_fails_at_once() -> None:
     assert adapter.failure_reason_code == "rule_holds"
     assert "curtain" in adapter.failure_message
     # No wait and no automatic retry: nothing was admitted.
+    assert len(port.starts) == 1
+    assert adapter.audit_events == []
+
+
+def test_a_cartesian_path_refused_as_a_moving_takeover_fails_at_once() -> None:
+    # OD-347: not a priority refusal, so preempted_result does not apply; the
+    # node fails with the Kernel's code, nothing is retried and the running
+    # motion continues.
+    refusal = KernelOperationAdmissionRejectedError(
+        "cartesian_path_moving_takeover_refused",
+        "a Cartesian path cannot take over a robot that is still moving",
+        {"running_operation_id": "7", "running_node_instance_id": "approach"},
+    )
+    port = _MotionPort([refusal, _succeeded()])
+    _time, clock = _clocked()
+    adapter = _motion(
+        port, clock, node_id="motion.follow_cartesian_path",
+        parameters={"preempted_result": "success"},
+        resolved={"execution_timeout_s": 5.0},
+    )
+
+    assert _tick(adapter) is _FAILURE
+    assert adapter.failure_reason_code == "cartesian_path_moving_takeover_refused"
     assert len(port.starts) == 1
     assert adapter.audit_events == []
 

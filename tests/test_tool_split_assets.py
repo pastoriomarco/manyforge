@@ -40,6 +40,19 @@ def _families() -> dict[str, dict]:
     return {row["model_family_id"]: row for row in _description()["model_families"]}
 
 
+def _collision_links(family: dict) -> set[str]:
+    """The links of a family's URDF that carry `<collision>` geometry."""
+    urdf = ET.parse(ROOT / family["source"]["urdf_path"]).getroot()
+    return {link.get("name") for link in urdf.findall("link")
+            if link.find("collision") is not None}
+
+
+def _uncovered_collision_links(family: dict) -> set[str]:
+    covered = {name for row in family["semantics"]["collision_body_role_bindings"]
+               for name in row["source_link_names"]}
+    return _collision_links(family) - covered
+
+
 def _normalized(element: ET.Element) -> bytes:
     copy = ET.fromstring(ET.tostring(element))
     for node in copy.iter():
@@ -294,15 +307,58 @@ def test_robotiq_2f_85_default_tcp_is_the_mount() -> None:
     assert ur5e["flange"] == "tool0"
 
 
-@pytest.mark.parametrize("family_id", ARMS + TOOLS)
+@pytest.mark.parametrize("family_id", (*ARMS, *TOOLS, "passive_tool"))
 def test_model_asset_catalog_matches_its_family(family_id: str) -> None:
+    # OD-350: preparation adds `default_collision` over the collision links no
+    # declared body covers; curated families cover all, the passive placeholder
+    # leaves `passive_tool_body` to it.
     family = _families()[family_id]
     catalog = json.loads((ROOT / family["catalog_source"]).read_text())
     assert catalog["model_asset_id"] == family_id
-    for field in ("collision_body_role_bindings", "frame_role_bindings",
-                  "instance_cardinality", "model_group_role_bindings",
-                  "resource_role_bindings", "root_frame_role_id"):
+    for field in ("frame_role_bindings", "instance_cardinality",
+                  "model_group_role_bindings", "resource_role_bindings",
+                  "root_frame_role_id"):
         assert catalog[field] == family["semantics"][field], field
+    expected = list(family["semantics"]["collision_body_role_bindings"])
+    uncovered = _uncovered_collision_links(family)
+    if uncovered:
+        expected.append({"collision_body_role_id": "default_collision",
+                         "source_link_names": sorted(uncovered)})
+    key = lambda row: row["collision_body_role_id"]  # noqa: E731
+    assert sorted(catalog["collision_body_role_bindings"], key=key) == sorted(
+        expected, key=key)
+    if family_id == "passive_tool":
+        assert uncovered == {"passive_tool_body"}
+    if family_id == "tool":
+        assert uncovered == {"tool_body"}
+
+
+@pytest.mark.parametrize(
+    "family_id", sorted(set(_families()) - {"passive_tool", "tool"}))
+def test_curated_families_cover_every_collision_link(family_id: str) -> None:
+    # OD-350: a curated model names every collision link in its collision
+    # bodies (the coverage the old Apply refusal enforced); only a
+    # project-supplied model leaves links to `default_collision`.
+    family = _families()[family_id]
+    assert _collision_links(family), family_id
+    assert _uncovered_collision_links(family) == set()
+
+
+@pytest.mark.parametrize("family_id", sorted(_families()))
+def test_every_model_bearing_type_declares_the_default_collision_body(
+    family_id: str,
+) -> None:
+    # OD-350: the single command target of every model-bearing type declares
+    # `default_collision` on its model role, rows ordered by role id.
+    document = _generator().component_type_document(_families()[family_id])
+    (model_role,) = document["model_roles"]
+    (target,) = document["command_targets"]
+    rows = target["collision_body_roles"]
+    assert {"asset_collision_body_role_id": "default_collision",
+            "collision_body_role_id": "default_collision",
+            "model_role_id": model_role["model_role_id"]} in rows
+    roles = [row["collision_body_role_id"] for row in rows]
+    assert roles == sorted(set(roles))
 
 
 def test_standalone_robotiq_fixture_keeps_its_own_catalog() -> None:
@@ -370,8 +426,9 @@ def test_component_types_without_a_tcp_list_are_unchanged(family_id: str) -> Non
 
 def test_a_tool_tcp_list_names_its_tcps_and_default() -> None:
     # A registered tool with `tcps: [cup_center, tip]`: its gripper target
-    # exposes both under their names, both TCPs with the finger contact bodies,
-    # `cup_center` the default; no `tcp` role.
+    # exposes both under their names, both TCPs with the gripper's default
+    # contact bodies (its fingers: the family has no pads), `cup_center` the
+    # default; no `tcp` role. The target names the gripper's grip body.
     generator = _generator()
     family = json.loads(json.dumps(_families()["lite_gripper"]))
     family["model_family_id"] = "cup"
@@ -389,11 +446,63 @@ def test_a_tool_tcp_list_names_its_tcps_and_default() -> None:
         for role in ("cup_center", "tip")
     ]
     assert target["default_tcp_frame_role_id"] == "cup_center"
+    assert target["grip_body_role_id"] == "gripper_collision"
     assert document["component_root"] == {"frame_role_id": "mount",
                                           "model_role_id": "tool_model"}
     family["tcp_frame_role_ids"] = ["tip", "cup_center"]
     (target,) = generator.component_type_document(family)["command_targets"]
     assert target["default_tcp_frame_role_id"] == "tip"
+
+
+def test_a_passive_tool_family_gets_a_frame_only_tool_target() -> None:
+    # OD-336: no gripper group, so no gripper target and no capability; one
+    # `tool` target exposes its TCPs, mounted through `mount` like any tool.
+    generator = _generator()
+    document = generator.component_type_document(_families()["passive_tool"])
+    assert document["tags"] == ["tool"]
+    assert document["component_root"] == {"frame_role_id": "mount",
+                                          "model_role_id": "tool_model"}
+    assert [row["attachment_interface_id"] for row in document["attachment_interfaces"]] == [
+        "mount"]
+    (target,) = document["command_targets"]
+    assert target["command_target_id"] == "tool"
+    assert target["capabilities"] == [] and target["model_group_roles"] == []
+    assert target["resource_roles"] == []
+    # OD-352 A1: the optional `tip` beside `default_collision`. The descriptor's
+    # `tcp` row names the tip as its contact body (`contact_bodies: [tip]`).
+    assert target["collision_body_roles"] == [
+        {"asset_collision_body_role_id": "default_collision",
+         "collision_body_role_id": "default_collision", "model_role_id": "tool_model"},
+        {"asset_collision_body_role_id": "tip", "collision_body_role_id": "tip",
+         "model_role_id": "tool_model", "optional": True},
+    ]
+    assert target["frame_roles"] == [{"asset_frame_role_id": "tcp",
+                                      "contact_body_role_ids": ["tip"],
+                                      "frame_role_id": "tcp",
+                                      "model_role_id": "tool_model", "tcp": True}]
+    assert target["default_tcp_frame_role_id"] == "tcp"
+    assert "grip_body_role_id" not in target
+    # A TCP list names each TCP on the one target, the first the default. A
+    # passive tool's TCP has contact bodies only where its descriptor names
+    # them: `tcp` has the tip, `side` has none.
+    family = json.loads(json.dumps(_families()["passive_tool"]))
+    family["semantics"]["frame_role_bindings"].append(
+        {"frame_role_id": "side", "source_link_name": "passive_tool_tcp"})
+    family["tcp_frame_role_ids"] = ["side", "tcp"]
+    (target,) = generator.component_type_document(family)["command_targets"]
+    assert [row["frame_role_id"] for row in target["frame_roles"]] == ["side", "tcp"]
+    assert [row.get("contact_body_role_ids") for row in target["frame_roles"]] == [
+        None, ["tip"]]
+    assert target["default_tcp_frame_role_id"] == "side"
+    # A family without a descriptor and without a tip body has no contact body
+    # and no optional body.
+    family = json.loads(json.dumps(_families()["passive_tool"]))
+    family["semantics"]["collision_body_role_bindings"] = []
+    del family["component_descriptor"]
+    (target,) = generator.component_type_document(family)["command_targets"]
+    assert [row["collision_body_role_id"] for row in target["collision_body_roles"]] == [
+        "default_collision"]
+    assert "contact_body_role_ids" not in target["frame_roles"][0]
 
 
 def test_a_robot_tcp_list_names_its_tcps_and_default() -> None:

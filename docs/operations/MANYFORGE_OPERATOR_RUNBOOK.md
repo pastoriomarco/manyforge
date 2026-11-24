@@ -379,7 +379,10 @@ Open `http://<advertised-host>:9000/` once `start` or `status` reports
    [Stop, Stop all and Halt](DEVELOPMENT_WORKBENCH.md#stop-stop-all-and-halt).
    These are operational stops; emergency stops belong to the cell's own
    safety system.
-5. **Save Scenario** or **Save Scenario as** to keep your changes. The
+5. **Save Scenario** or **Save Scenario as** to keep your changes. Save
+   writes what is applied, so a saved Scenario always loads again: Apply
+   your edits first. With edits that are not applied, Save asks once and
+   then writes the applied state; the edits stay in the Draft. The
    Untitled Scenario is read-only: **Save Scenario** is disabled for it and
    **Save Scenario as** names and places it, then continues in the saved
    project. Unsaved Untitled changes are lost when Composer restarts.

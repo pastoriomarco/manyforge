@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/types/coordinate_state.hpp>
@@ -25,6 +26,11 @@ inline constexpr std::size_t kMaxComponentTypeTargetCapabilities = 256U;
 inline constexpr std::size_t kMaxComponentTypeCapabilityDependencies = 256U;
 inline constexpr std::uint64_t kMaxComponentTypeAttachmentsPerInterface =
     4096U;
+// Reserved collision-body role on the command target of every model-bearing
+// type, and the asset role bound at model preparation to every collision link
+// no other collision-body binding covers (OD-350).
+inline constexpr std::string_view kDefaultCollisionBodyRoleId =
+    "default_collision";
 
 enum class ComponentTypeModelRoleCardinality : std::uint8_t {
   kExactlyOne = 0,
@@ -147,10 +153,31 @@ struct ComponentTypeFrameRoleDTO {
                          const ComponentTypeFrameRoleDTO&) = default;
 };
 
+// OD-371: the travel of a body that is a generated tool's spring slider.
+// `axis` is the unit rod line in the slider link frame, pointing out of the
+// tool; 0 < release_depth_m < trip_depth_m <= stroke_m.
+struct ComponentTypeSpringSliderDTO {
+  std::array<double, 3> axis{};
+  double stroke_m{};
+  double trip_depth_m{};
+  std::optional<double> release_depth_m{};
+  double max_compression_step_m{};
+
+  friend bool operator==(const ComponentTypeSpringSliderDTO&,
+                         const ComponentTypeSpringSliderDTO&) = default;
+};
+
 struct ComponentTypeCollisionBodyRoleDTO {
   CollisionBodyRoleId collision_body_role_id;
   ModelRoleId model_role_id;
   CollisionBodyRoleId asset_collision_body_role_id;
+  // OD-352 A1: an optional body of its family (a passive tool's `tip`): a
+  // model without its links leaves it unbound, and an unbound optional body
+  // contributes nothing (as an unbound `default_collision`, OD-350).
+  bool optional = false;
+  // OD-371: present when this body is a generated tool's spring slider (only
+  // on the generated tool's `tool` target).
+  std::optional<ComponentTypeSpringSliderDTO> spring_slider{};
 
   friend bool operator==(const ComponentTypeCollisionBodyRoleDTO&,
                          const ComponentTypeCollisionBodyRoleDTO&) = default;
@@ -174,6 +201,9 @@ struct ComponentTypeCommandTargetDTO {
   // The target's default TCP: one of its frame roles tagged `tcp`. Required
   // exactly when the target tags any TCP.
   std::optional<FrameRoleId> default_tcp_frame_role_id{};
+  // A gripper target's grip body: the one of its collision-body roles whose
+  // links are the gripper itself (pose reference, viewer ghost, link checks).
+  std::optional<CollisionBodyRoleId> grip_body_role_id{};
 
   friend bool operator==(const ComponentTypeCommandTargetDTO&,
                          const ComponentTypeCommandTargetDTO&) = default;

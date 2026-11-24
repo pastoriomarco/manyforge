@@ -221,11 +221,11 @@ stop the runtime.
 - **Version:** [VERSION](VERSION) (SemVer). Every package declares the same
   version; `./scripts/ci/verify-version-sync.sh` checks it.
 - **Release notes:** [CHANGELOG.md](CHANGELOG.md). Releases are `vX.Y.Z` tags
-  on `main`: `v0.1.0`, `v0.2.0`, `v0.2.1`, `v0.3.0`, then `v0.3.1`.
+  on `main`: `v0.1.0`, `v0.2.0`, `v0.2.1`, `v0.3.0`, `v0.3.1`, then `v0.4.0`.
 - **Pinned companions:** a release builds the UFACTORY xArm driver from the
   fork `pastoriomarco/xarm_ros2`, branch `lyrical-no-gazebo`, at the commit in
   `Dockerfile.ros-lyrical-full` (`XARM_SOURCE_COMMIT`) and
-  `manyforge_xarm_control/vendor/driver.yaml`; for `v0.3.1` that is
+  `manyforge_xarm_control/vendor/driver.yaml`; for `v0.4.0` that is
   `3654c9afef9c51c3bd6723d65ccecca166bc38b0`. The release procedure is in
   [CONTRIBUTING.md](CONTRIBUTING.md#releases).
 - **Reference image:** each release publishes the workbench's ROS image as

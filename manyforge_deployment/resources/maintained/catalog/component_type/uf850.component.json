@@ -80,6 +80,11 @@
           "asset_collision_body_role_id": "arm_collision",
           "collision_body_role_id": "arm_collision",
           "model_role_id": "arm_model"
+        },
+        {
+          "asset_collision_body_role_id": "default_collision",
+          "collision_body_role_id": "default_collision",
+          "model_role_id": "arm_model"
         }
       ],
       "command_target_id": "arm",
@@ -119,7 +124,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "uf850.component",
-  "component_type_revision": "sha256:29dfe024f1753f956c2c742e4678bf4793ea071a87eb27d39b9631401da2906a",
+  "component_type_revision": "sha256:bcae3279048de2c6f85ce7bce3a3fc3d9713d977957a7951e02d5ccaa02e6d5a",
   "model_mounts": [],
   "model_roles": [
     {

@@ -414,28 +414,6 @@ ApplyStatus(const component_manager::PersistedManagerApplyStatus &value,
   });
 }
 
-std::string_view ContactMode(const core::CollisionContactPolicyMode value) {
-  switch (value) {
-  case core::CollisionContactPolicyMode::kContactRelease:
-    return "contact_release";
-  case core::CollisionContactPolicyMode::kBoundedPenetration:
-    return "bounded_penetration";
-  case core::CollisionContactPolicyMode::kContactProcess:
-    return "contact_process";
-  }
-  return {};
-}
-
-std::string_view ReleaseEvidence(const core::ContactReleaseEvidenceMode value) {
-  switch (value) {
-  case core::ContactReleaseEvidenceMode::kSignedPenetration:
-    return "signed_penetration";
-  case core::ContactReleaseEvidenceMode::kBinaryContact:
-    return "binary_contact";
-  }
-  return {};
-}
-
 CanonicalValue Pair(const core::CollisionPairId &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"body_a", Text(value.body_a, "collision pair body_a")},
@@ -452,49 +430,10 @@ CanonicalValue PairArray(const std::vector<core::CollisionPairId> &values) {
   return CanonicalValue(std::move(result));
 }
 
+// The Scene's policy holds no collision rules: those belong to one move.
 CanonicalValue CollisionPolicy(const core::CollisionPolicySnapshot &value) {
-  CanonicalValue::Array support_contacts;
-  support_contacts.reserve(value.support_contacts.size());
-  for (const auto &contact : value.support_contacts) {
-    support_contacts.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"allow_recontact", CanonicalValue(contact.allow_recontact)},
-        {"enforce_max_start_penetration",
-         CanonicalValue(contact.enforce_max_start_penetration)},
-        {"max_contact_penetration_m",
-         CanonicalValue(contact.max_contact_penetration_m)},
-        {"max_start_penetration_m",
-         CanonicalValue(contact.max_start_penetration_m)},
-        {"min_release_progress_m",
-         CanonicalValue(contact.min_release_progress_m)},
-        {"mode", CanonicalValue(std::string(ContactMode(contact.mode)))},
-        {"pair", Pair(contact.pair)},
-        {"release_evidence_mode", CanonicalValue(std::string(ReleaseEvidence(
-                                      contact.release_evidence_mode)))},
-        {"release_tolerance_m", CanonicalValue(contact.release_tolerance_m)},
-        {"require_separation_by_end",
-         CanonicalValue(contact.require_separation_by_end)},
-        {"require_strictly_decreasing_penetration",
-         CanonicalValue(contact.require_strictly_decreasing_penetration)},
-    }));
-  }
-  CanonicalValue::Array grasps;
-  grasps.reserve(value.contact_grasps.size());
-  for (const auto &grasp : value.contact_grasps) {
-    grasps.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"allowed_robot_links", StringArray(grasp.allowed_robot_links)},
-        {"max_penetration_m", CanonicalValue(grasp.max_penetration_m)},
-        {"policy_id", Text(grasp.policy_id, "contact grasp policy_id")},
-        {"selected_object_id",
-         Text(grasp.selected_object_id, "contact grasp selected_object_id")},
-        {"terminal_window_start_fraction",
-         CanonicalValue(grasp.terminal_window_start_fraction)},
-    }));
-  }
   return CanonicalValue(CanonicalValue::Object{
-      {"allowed_static_static_pairs",
-       PairArray(value.allowed_static_static_pairs)},
       {"allowed_touch_link_pairs", PairArray(value.allowed_touch_link_pairs)},
-      {"contact_grasps", CanonicalValue(std::move(grasps))},
       {"policy_id", Text(value.policy_id, "collision policy_id")},
       {"require_full_diagnostics",
        CanonicalValue(value.require_full_diagnostics)},
@@ -505,29 +444,7 @@ CanonicalValue CollisionPolicy(const core::CollisionPolicySnapshot &value) {
            {"revision_id", Unsigned(value.revision.revision_id,
                                     "collision policy revision_id", true)},
        })},
-      {"support_contacts", CanonicalValue(std::move(support_contacts))},
-  });
-}
-
-CanonicalValue SupportDeclaration(const core::SupportContactDTO &value) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"allow_recontact", CanonicalValue(value.allow_recontact)},
-      {"enforce_max_start_penetration",
-       CanonicalValue(value.enforce_max_start_penetration)},
-      {"max_contact_penetration_m",
-       CanonicalValue(value.max_contact_penetration_m)},
-      {"max_start_penetration_m",
-       CanonicalValue(value.max_start_penetration_m)},
-      {"min_release_progress_m", CanonicalValue(value.min_release_progress_m)},
-      {"mode", CanonicalValue(std::string(ContactMode(value.mode)))},
-      {"release_evidence_mode", CanonicalValue(std::string(ReleaseEvidence(
-                                    value.release_evidence_mode)))},
-      {"release_tolerance_m", CanonicalValue(value.release_tolerance_m)},
-      {"require_separation_by_end",
-       CanonicalValue(value.require_separation_by_end)},
-      {"require_strictly_decreasing_penetration",
-       CanonicalValue(value.require_strictly_decreasing_penetration)},
-      {"support_object_id", CanonicalValue(value.support_object_id)},
+      {"static_body_ids", StringArray(value.static_body_ids)},
   });
 }
 
@@ -632,11 +549,6 @@ CanonicalValue SceneObject(const core::SceneObjectSnapshotDTO &value) {
   for (const auto &shape : value.collision_shapes) {
     shapes.emplace_back(Shape(shape));
   }
-  CanonicalValue::Array support_contacts;
-  support_contacts.reserve(value.support_contacts.size());
-  for (const auto &contact : value.support_contacts) {
-    support_contacts.emplace_back(SupportDeclaration(contact));
-  }
   const auto placement = std::visit(
       [](const auto &entry) -> CanonicalValue {
         using T = std::decay_t<decltype(entry)>;
@@ -666,7 +578,6 @@ CanonicalValue SceneObject(const core::SceneObjectSnapshotDTO &value) {
                                 ? ProviderEvidence(*value.provider_evidence)
                                 : CanonicalValue(nullptr)},
       {"scene_resource_id", CanonicalValue(value.scene_resource_id.value())},
-      {"support_contacts", CanonicalValue(std::move(support_contacts))},
   };
   // Absent at zero, like the logical scene codec.
   if (value.mass_kg > 0.0) {

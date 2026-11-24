@@ -38,6 +38,7 @@ _PREPARED_CLOSURE = {
     "schema_version": "manyforge.activation_prepared_model_closure.v1",
     "components": [],
 }
+_MESHES = {"schema_version": "manyforge.activation_scene_mesh_closure.v1", "meshes": []}
 
 
 def test_activation_request_contains_no_role_assignment() -> None:
@@ -46,7 +47,8 @@ def test_activation_request_contains_no_role_assignment() -> None:
         "source_document_digest": _DIGEST, "scenario_id": "scenario_a",
         "project_path": "/projects/scenario_a.scenario", "captured_input_digest": _DIGEST,
         "deployment": {"component": "robot"}, "model_source_closure": _CLOSURE,
-        "program": {"api_version": "manyforge.program.v3"},
+        "scene_mesh_closure": _MESHES,
+        "program": {"api_version": "manyforge.program.v4"},
         "expected_admission_generation": 1,
     }
     assert "program_role_assignment" not in ActivationPreparationRequest.model_validate(
@@ -122,8 +124,7 @@ def _preparer(tmp_path: Path) -> ActivationPreparer:
 @lru_cache(maxsize=1)
 def _admitted_program() -> dict[str, object]:
     catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
-    context = {"api_version": "manyforge.program.v3", "program_id": "test",
-               "program_profile": "composable-cell-v1", "name": "test",
+    context = {"api_version": "manyforge.program.v4", "program_profile": "composable-cell-v1",
                "catalog": {"api_version": catalog.api_version,
                            "content_version": catalog.content_version}}
     skill = load_skill(default_skills_dir() / "move_to_named_config.skill.yaml")
@@ -134,7 +135,7 @@ def _admitted_program() -> dict[str, object]:
     document = {**context, "tree": expanded["tree"], "program_revision": _DIGEST}
     document["program_revision"] = compute_content_identity(
         document, own_field="program_revision", identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, catalog).to_dict()
 
@@ -143,16 +144,14 @@ def _result(program: object = ...) -> dict[str, object]:
     if program is ...:
         program = copy.deepcopy(_admitted_program())
     identity: dict[str, object] = {
-        "schema_version": "manyforge.prepared_activation_input.v7",
+        "schema_version": "manyforge.prepared_activation_input.v8",
         "origin": {"kind": "scenario", "scenario_id": "scenario_a",
                    "source_document_digest": _DIGEST,
                    "project_path": "/projects/scenario_a.scenario"},
         "captured_input_digest": _DIGEST,
-        "deployment_artifact_id": "cell_a",
         "deployment_revision": _DIGEST,
         "retained_bundle_id": _DIGEST,
         "graph_revision": _DIGEST,
-        "program_id": program["program_id"] if program is not None else None,
         "program_revision": (
             program["program_revision"] if program is not None else None
         ),
@@ -163,6 +162,7 @@ def _result(program: object = ...) -> dict[str, object]:
         ),
         "node_environment_digest": _DIGEST,
         "assistant_mode": "forbidden" if program is not None else "optional",
+        "scene_meshes": [],
         "activation_payload": {
             "program": program,
             "raw_artifacts": [{"bytes": "YQ=="}],
@@ -214,7 +214,7 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
         project_path="/projects/scenario_a.scenario",
         captured_input_digest=_DIGEST,
         deployment={"z": 1, "a": "deployment"},
-        model_source_closure=_CLOSURE,
+        model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
         program=_admitted_program(),
     )
 
@@ -222,7 +222,7 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
     expected.pop("activation_payload")
     assert result == expected
     assert observed["input"] == {
-        "schema_version": "manyforge.activation_preparation_request.v4",
+        "schema_version": "manyforge.activation_preparation_request.v5",
         "runtime_cell_id": "cell_a",
         "source_document_digest": _DIGEST,
         "scenario_id": "scenario_a",
@@ -231,6 +231,7 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
         "deployment": {"a": "deployment", "z": 1},
         "model_source_closure": _CLOSURE,
         "prepared_model_closure": _PREPARED_CLOSURE,
+        "scene_mesh_closure": _MESHES,
         "program": _admitted_program(),
     }
     assert "shell" not in observed["kwargs"]
@@ -239,7 +240,7 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
     retained = preparer.prepared_value(result["prepared_activation_id"])
     assert retained == expected
     assert retained is not None
-    retained["program_id"] = "mutated"
+    retained["program_revision"] = "mutated"
     assert preparer.prepared_value(result["prepared_activation_id"]) == expected
     preparer.release(result["prepared_activation_id"])
     assert preparer.prepared_value(result["prepared_activation_id"]) is None
@@ -263,7 +264,7 @@ def test_preparer_rejects_invalid_program_before_native_subprocess(
         preparer.prepare(
             source_document_digest=_DIGEST, scenario_id="scenario_a",
             project_path="/projects/scenario_a.scenario", captured_input_digest=_DIGEST,
-            deployment={"a": "deployment"}, model_source_closure=_CLOSURE,
+            deployment={"a": "deployment"}, model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
             program=program,
         )
     assert raised.value.code == "activation_preparation_failed"
@@ -295,7 +296,7 @@ def test_preparer_failure_retains_bounded_diagnostic_and_input_identity(
                 project_path="/projects/scenario_a.scenario",
                 captured_input_digest=_DIGEST,
                 deployment={},
-                model_source_closure=_CLOSURE,
+                model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
                 program=None,
             )
     finally:
@@ -335,7 +336,7 @@ def test_typed_preparer_refusal_carries_its_cause_code(
             project_path="/projects/scenario_a.scenario",
             captured_input_digest=_DIGEST,
             deployment={},
-            model_source_closure=_CLOSURE,
+            model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
             program=None,
         )
     assert raised.value.code == "activation_preparation_failed"
@@ -366,7 +367,7 @@ def test_reference_refusal_preserves_bounded_diagnostics(
         preparer.prepare(
             source_document_digest=_DIGEST, scenario_id="scenario_a",
             project_path="/projects/scenario_a.scenario", captured_input_digest=_DIGEST,
-            deployment={}, model_source_closure=_CLOSURE, program=None,
+            deployment={}, model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES, program=None,
         )
     assert raised.value.code == "program_reference_validation_failed"
     assert raised.value.details == {key: refusal[key] for key in
@@ -382,7 +383,7 @@ def test_reference_refusal_rejects_inconsistent_truncation() -> None:
 
 def test_format_refusal_keeps_typed_versions() -> None:
     details = {"actual_api_version": "manyforge.program.v2",
-               "supported_api_version": "manyforge.program.v3"}
+               "supported_api_version": "manyforge.program.v4"}
     assert activation_preparer._format_refusal(json.dumps({
         "code": "program_format_unsupported", "details": details,
     }).encode()) == details
@@ -396,7 +397,7 @@ def test_preparer_propagates_format_refusal(
 ) -> None:
     preparer = _preparer(tmp_path)
     details = {"actual_api_version": "manyforge.program.v2",
-               "supported_api_version": "manyforge.program.v3"}
+               "supported_api_version": "manyforge.program.v4"}
 
     def run(_command, **kwargs):
         kwargs["stdout"].write(json.dumps({
@@ -409,7 +410,7 @@ def test_preparer_propagates_format_refusal(
         preparer.prepare(
             source_document_digest=_DIGEST, scenario_id="scenario_a",
             project_path="/projects/scenario_a.scenario", captured_input_digest=_DIGEST,
-            deployment={}, model_source_closure=_CLOSURE,
+            deployment={}, model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
             program={"api_version": "manyforge.program.v2"},
         )
     assert caught.value.code == "program_format_unsupported"
@@ -432,10 +433,10 @@ def test_native_preparation_request_omits_role_assignment(
         preparer.prepare(
             source_document_digest=_DIGEST, scenario_id="scenario_a",
             project_path="/projects/scenario_a.scenario", captured_input_digest=_DIGEST,
-            deployment={"component": "robot"}, model_source_closure=_CLOSURE,
+            deployment={"component": "robot"}, model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
             program=_admitted_program(),
         )
-    assert captured["schema_version"] == "manyforge.activation_preparation_request.v4"
+    assert captured["schema_version"] == "manyforge.activation_preparation_request.v5"
     assert "program_role_assignment" not in captured
 
 
@@ -633,7 +634,7 @@ def test_reference_candidate_rejects_old_format_before_digest(tmp_path: Path) ->
     assert caught.value.code == "program_format_unsupported"
     assert caught.value.details == {
         "actual_api_version": "manyforge.program.v2",
-        "supported_api_version": "manyforge.program.v3",
+        "supported_api_version": "manyforge.program.v4",
     }
 
 
@@ -650,7 +651,7 @@ def test_preparer_is_capacity_one_and_reports_a_stable_conflict(
                 project_path="/projects/scenario_a.scenario",
                 captured_input_digest=_DIGEST,
                 deployment={"api_version": "manyforge.deployment.v1"},
-                model_source_closure=_CLOSURE,
+                model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
                 program=None,
             )
     finally:
@@ -681,8 +682,8 @@ def test_preparer_rejects_an_oversized_encoded_request_before_spawning(
             scenario_id="scenario_a",
             project_path="/projects/scenario_a.scenario",
             captured_input_digest=_DIGEST,
-            deployment={"api_version": "manyforge.deployment_intent.v2"},
-            model_source_closure=_CLOSURE,
+            deployment={"api_version": "manyforge.deployment_intent.v3"},
+            model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
             program=None,
         )
 
@@ -706,7 +707,7 @@ def test_preparer_rejects_timeout_and_invalid_output(
             project_path="/projects/scenario_a.scenario",
             captured_input_digest=_DIGEST,
             deployment={"api_version": "manyforge.deployment.v1"},
-            model_source_closure=_CLOSURE,
+            model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
             program=None,
         )
     assert raised.value.code == "activation_preparation_timeout"
@@ -723,7 +724,7 @@ def test_preparer_rejects_timeout_and_invalid_output(
             project_path="/projects/scenario_a.scenario",
             captured_input_digest=_DIGEST,
             deployment={"api_version": "manyforge.deployment.v1"},
-            model_source_closure=_CLOSURE,
+            model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
             program=None,
         )
     assert raised.value.code == "activation_preparer_response_invalid"
@@ -746,7 +747,7 @@ def _prepare_with_output(
         project_path="/projects/scenario_a.scenario",
         captured_input_digest=_DIGEST,
         deployment={"api_version": "manyforge.deployment.v1"},
-        model_source_closure=_CLOSURE,
+        model_source_closure=_CLOSURE, scene_mesh_closure=_MESHES,
         program=program,
     )
 
@@ -758,7 +759,7 @@ def _prepare_with_result(
 ) -> dict[str, object]:
     return _prepare_with_output(
         preparer, monkeypatch, _publish(preparer._activation_root, result),
-        _admitted_program() if result["program_id"] is not None else None,
+        _admitted_program() if result["program_revision"] is not None else None,
     )
 
 
@@ -931,7 +932,7 @@ def test_preparer_admits_no_program_without_program_validation(
 ) -> None:
     preparer = _preparer(tmp_path)
     result = _prepare_with_result(preparer, monkeypatch, _result(None))
-    assert result["program_id"] is None
+    assert result["program_revision"] is None
     assert preparer.prepared_value(result["prepared_activation_id"]) == result
 
 
@@ -941,7 +942,7 @@ def _without_tree_with_valid_identity(program: dict[str, object]) -> None:
         program,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
 
 
@@ -951,7 +952,7 @@ def _with_unknown_node_parameter(program: dict[str, object]) -> None:
         program,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
 
 
@@ -961,11 +962,7 @@ def _with_unknown_node_parameter(program: dict[str, object]) -> None:
         (_without_tree_with_valid_identity, "activation_preparer_response_invalid"),
         (_with_unknown_node_parameter, "activation_preparer_response_invalid"),
         (
-            lambda program: program.__setitem__("name", "stale identity"),
-            "activation_preparer_response_invalid",
-        ),
-        (
-            lambda program: program.__setitem__("program_id", "other_program"),
+            lambda program: program["tree"].__setitem__("instance_id", "stale_identity"),
             "activation_preparer_response_invalid",
         ),
     ],
@@ -979,9 +976,7 @@ def test_preparer_refuses_a_program_the_program_validator_refuses(
     result = _result(program)
     if code == "activation_preparer_response_invalid":
         # The receipt names the admitted Program; the payload diverges from it.
-        result = _reidentified(
-            {**result, "program_id": _admitted_program()["program_id"]}
-        )
+        result = _reidentified(result)
 
     with pytest.raises(HeadlessApiError) as raised:
         _prepare_with_result(preparer, monkeypatch, result)

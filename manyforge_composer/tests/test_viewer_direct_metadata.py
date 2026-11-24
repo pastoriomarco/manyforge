@@ -1,4 +1,4 @@
-"""Program v3 viewer presentation uses exact frame and Scene identities."""
+"""Program viewer presentation uses exact frame and Scene identities."""
 
 from copy import deepcopy
 from pathlib import Path
@@ -17,7 +17,7 @@ def _program(viewer):
     document["viewer"] = deepcopy(viewer)
     document["program_revision"] = compute_content_identity(
         document, own_field="program_revision", identity_domain="program-revision",
-        api_version="manyforge.program.v3")
+        api_version="manyforge.program.v4")
     return Program.from_dict(document, NodeCatalog(ROOT / "manyforge_behavior/resources/node_catalog.yaml"))
 
 

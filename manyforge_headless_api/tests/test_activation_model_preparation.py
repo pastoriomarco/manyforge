@@ -34,6 +34,7 @@ _DESCRIPTION = Path(
 _DIGEST = "sha256:" + "1" * 64
 _MOCK_MODEL = "ufactory.lite6"
 _SOURCE_SCHEMA = "manyforge.activation_model_source_closure.v1"
+_MESHES = {"schema_version": "manyforge.activation_scene_mesh_closure.v1", "meshes": []}
 
 
 @pytest.fixture
@@ -207,7 +208,7 @@ def test_mock_robot_plus_io_device_load_prepares_only_the_robot_model(
             project_path="/projects/scenario_a.scenario",
             captured_input_digest=_DIGEST,
             deployment={"components": [_mock_robot(), _io_device()]},
-            model_source_closure=_closure("robot"),
+            model_source_closure=_closure("robot"), scene_mesh_closure=_MESHES,
             program=None,
         )
 
@@ -442,7 +443,7 @@ def test_an_assistant_component_model_is_a_no_model_row(
     (capabilities / _DESCRIPTION).write_text(json.dumps(root), encoding="utf-8")
     (capabilities / descriptor).parent.mkdir(parents=True)
     (capabilities / descriptor).write_text(
-        "api_version: manyforge.component_package.v1\n"
+        "api_version: manyforge.component_package.v2\n"
         "kind: assistant\n"
         "id: manyforge.assistant\n"
         "version: 1.0.0\n"
@@ -480,3 +481,110 @@ def test_an_assistant_component_model_is_a_no_model_row(
             model_source_closure=_closure(),
             profiles=profiles,
         )
+
+
+# --- a project's own passive tool (OD-336) ---------------------------------
+
+
+_PASSIVE_PREFIX = "package://passive_tool/"
+
+
+def _project_passive_tool(project: Path, mesh_uri: str) -> dict[str, object]:
+    """A project's own tool model under the passive family's package prefix:
+    its URDF and mesh in the project folder `tool/`, package `passive_tool`."""
+
+    model = project / "tool"
+    (model / "meshes").mkdir(parents=True)
+    (model / "meshes" / "holder.stl").write_bytes(b"solid holder\nendsolid holder\n")
+    (model / "holder.urdf").write_text(
+        '<robot name="project_tool">'
+        '<link name="passive_tool_mount"/>'
+        '<joint name="body_fix" type="fixed"><parent link="passive_tool_mount"/>'
+        '<child link="holder_body"/><origin xyz="0 0 0" rpy="0 0 0"/></joint>'
+        '<link name="holder_body"><visual><geometry>'
+        f'<mesh filename="{mesh_uri}"/>'
+        '</geometry></visual><collision><geometry>'
+        f'<mesh filename="{mesh_uri}"/>'
+        '</geometry></collision></link>'
+        '<joint name="tcp_fix" type="fixed"><parent link="holder_body"/>'
+        '<child link="passive_tool_tcp"/><origin xyz="0 0 0.2" rpy="0 0 0"/></joint>'
+        '<link name="passive_tool_tcp"/>'
+        "</robot>",
+        encoding="utf-8",
+    )
+    return {
+        "component_id": "holder",
+        "component_profile_id": "manyforge.passive_tool",
+        "model_source": {
+            "urdf": {"project_path": "tool/holder.urdf"},
+            "package_roots": {"passive_tool": {"project_path": "tool"}},
+        },
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "ros2_control",
+            "runtime_configuration": {"component_streams": []},
+        },
+    }
+
+
+def test_a_project_supplied_passive_tool_model_is_prepared(
+    registry: dict[str, object], tmp_path: Path
+) -> None:
+    from manyforge_behavior.model_source_capture import (  # noqa: PLC0415
+        capture_deployment_model_sources,
+        decode_model_source_artifact,
+    )
+    from manyforge_behavior.project_paths import ProjectPathRule  # noqa: PLC0415
+
+    project = tmp_path / "cell.scenario"
+    holder = _project_passive_tool(project, _PASSIVE_PREFIX + "meshes/holder.stl")
+    deployment = {"components": [holder]}
+    profiles = _model_preparation_profiles(_capability_root(tmp_path, registry))
+    assert profiles["manyforge.passive_tool"] == ("passive_tool", _PASSIVE_PREFIX)
+
+    closure = _prepare_model_closure(
+        deployment=deployment,
+        model_source_closure=capture_deployment_model_sources(
+            deployment, project_root=project, paths=ProjectPathRule([tmp_path])
+        ),
+        profiles=profiles,
+    )
+
+    [prepared] = closure["components"]
+    assert prepared["component_id"] == "holder"
+    assert prepared["model_asset_id"] == "passive_tool"
+    assert prepared["accepted_package_uri_prefix"] == _PASSIVE_PREFIX
+    assert set(prepared["prepared_entrypoints"]) == {"urdf"}
+    urdf = decode_model_source_artifact(
+        prepared["prepared_entrypoints"]["urdf"], maximum_bytes=1 << 20, label="urdf"
+    ).decode()
+    # The project's mesh, rewritten into the family's asset; its own TCP.
+    assert 'filename="asset://passive_tool/meshes/holder.stl"' in urdf
+    assert "passive_tool_tcp" in urdf and 'xyz="0 0 0.2"' in urdf
+    assert _PASSIVE_PREFIX not in urdf
+
+
+def test_a_project_mesh_outside_the_passive_prefix_is_refused(
+    registry: dict[str, object], tmp_path: Path
+) -> None:
+    from manyforge_behavior.model_source_capture import (  # noqa: PLC0415
+        capture_deployment_model_sources,
+    )
+    from manyforge_behavior.project_paths import ProjectPathRule  # noqa: PLC0415
+
+    project = tmp_path / "cell.scenario"
+    holder = _project_passive_tool(project, "package://other_tool/meshes/holder.stl")
+    holder["model_source"]["package_roots"]["other_tool"] = {"project_path": "tool"}
+    deployment = {"components": [holder]}
+    profiles = _model_preparation_profiles(_capability_root(tmp_path, registry))
+
+    with pytest.raises(HeadlessApiError) as refused:
+        _prepare_model_closure(
+            deployment=deployment,
+            model_source_closure=capture_deployment_model_sources(
+                deployment, project_root=project, paths=ProjectPathRule([tmp_path])
+            ),
+            profiles=profiles,
+        )
+
+    assert refused.value.code == "activation_model_preparation_failed"

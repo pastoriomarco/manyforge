@@ -14,7 +14,6 @@ namespace manyforge::deployment {
 /// no repository, Manager, Apply, or runtime effects.
 struct CompiledDeploymentDraft final {
   std::string canonical_json;
-  std::string deployment_artifact_id;
   std::string deployment_revision;
   std::string graph_revision;
 };

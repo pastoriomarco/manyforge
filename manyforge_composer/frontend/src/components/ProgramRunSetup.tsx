@@ -147,8 +147,7 @@ export function ProgramRunSetup({
   return (
     <div className="program-run-setup">
       <p>
-        Program <strong>{applied.programId}</strong> in Scenario{' '}
-        <strong>{applied.scenarioId}</strong>
+        Scenario <strong>{applied.scenarioId}</strong>
         <span className="hint"> · revision {applied.programRevision.slice(0, 15)}…</span>
       </p>
       <section className="program-run-setup-robots" aria-label="Robots">

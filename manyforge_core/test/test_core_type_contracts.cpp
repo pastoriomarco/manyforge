@@ -228,9 +228,6 @@ static_assert(std::is_same_v<ModelAssetCatalogRecordRefDTO::RevisionType, ModelR
 static_assert(std::is_same_v<ProviderManifestCatalogRecordRefDTO::IdType, ProviderManifestId>);
 static_assert(
     std::is_same_v<ProviderManifestCatalogRecordRefDTO::RevisionType, ProviderManifestRevision>);
-static_assert(std::is_same_v<ContactPolicyCatalogRecordRefDTO::IdType, ContactPolicyId>);
-static_assert(
-    std::is_same_v<ContactPolicyCatalogRecordRefDTO::RevisionType, ContactPolicyRevision>);
 
 using InvalidModelAssetPair =
     TypedCatalogRecordRefDTO<CatalogRecordKind::kModelAsset, ModelAssetId, RuntimeProfileRevision>;
@@ -313,22 +310,6 @@ TEST(CoreTypeContracts, CatalogReferenceAlternativeFixesIdRevisionPair) {
       ContentAddressedStoreKey{"sha256/model-asset-lite6"},
   };
   EXPECT_FALSE(catalog_record_ref_matches_registry_family(record));
-}
-
-TEST(CoreTypeContracts, ContactPolicyRegistryUsesReferentOwnFieldNames) {
-  const CatalogRecordRefDTO record = ContactPolicyCatalogRecordRefDTO{
-      ContactPolicyId{"support_contact"},
-      ContactPolicyRevision{kDigest},
-      SchemaId{"manyforge.contact_policy.v1"},
-      SchemaRevision{kDigest},
-      ContentDigest{kDigest},
-      ContentAddressedStoreKey{"sha256/contact-policy"},
-  };
-
-  const auto& descriptor = catalog_record_type_descriptor(record);
-  EXPECT_EQ(descriptor.own_id_field, "policy_id");
-  EXPECT_EQ(descriptor.own_revision_field, "version");
-  EXPECT_TRUE(catalog_record_ref_matches_registry_family(record));
 }
 
 TEST(CoreTypeContracts, ProviderManifestRegistryUsesReusableManifestIdentity) {

@@ -2,7 +2,7 @@ import { act } from 'react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import { authoringOperation, type BusyOperation } from '../state/busyOperation';
-import { ScenarioDocumentCommands } from './ScenarioDocumentCommands';
+import { SAVE_UNAPPLIED_NOTE, ScenarioDocumentCommands } from './ScenarioDocumentCommands';
 
 const apiMock = vi.hoisted(() => ({
   scenarioDocuments: { list: vi.fn() }, files: { browse: vi.fn() },
@@ -76,14 +76,14 @@ async function mount(documentUnavailableReason: string | null = null, motionActi
   documentPath = '/projects/current.scenario', readOnly = false, hasChanges = true,
   cellComponents: readonly string[] | null = [], scenarioReplacementUnavailableReason: string | null = null,
   busyOperation: BusyOperation | null = null, authoringAdmissionAllowed: boolean | null = null,
-  stopActive = false) {
+  stopActive = false, unapplied = false) {
   const dom = mountedHost();
   const controller = {
     busyOperation,
     documentUnavailableReason, scenarioReplacementUnavailableReason, state: { status: 'ready',
       pendingAction: busyOperation === null ? null : 'save_scenario_document', error: null, workspace: {
       authoringWorkspace: { revision: 1 }, draft: { authoring: null }, hasUnsavedChanges: hasChanges,
-      hasUnappliedChanges: hasChanges } }, scenarioDocumentPath: documentPath,
+      hasUnappliedChanges: unapplied } }, scenarioDocumentPath: documentPath,
     scenarioDocument: { id: readOnly ? 'Untitled' : 'current', name: 'Current', description: '', readOnly },
     saveScenarioDocument: vi.fn(), exportScenarioDocument: vi.fn(),
     newScenarioDocument: vi.fn(async () => ({})), loadScenarioDocument: vi.fn(async () => ({})),
@@ -335,6 +335,40 @@ it('plain Save writes the open project under its folder name', async () => {
   expect(test.controller.saveScenarioDocument).toHaveBeenCalledExactlyOnceWith({
     directory: '/projects', name: 'Lab_Cell', description: '', confirmOverwrite: false,
   });
+});
+
+// OD-365: Save writes the applied state; unapplied edits are left out on the
+// operator's confirmation, which the request carries.
+it('with unapplied edits Save and Save As show the note and ask before saving the applied state', async () => {
+  const test = await mount(null, false, '/projects/Lab_Cell.scenario', false, true, [], null, null, null, false, true);
+  for (const label of ['Save Scenario', 'Save Scenario as']) {
+    expect(test.find((p) => p['aria-label'] === label)['data-tooltip']).toBe(`${label}: ${SAVE_UNAPPLIED_NOTE}`);
+  }
+  const confirmed = { directory: '/projects', name: 'Lab_Cell', description: '', confirmOverwrite: false,
+    confirmUnappliedExcluded: true };
+  await test.open('Save Scenario');
+  expect(test.controller.saveScenarioDocument).not.toHaveBeenCalled();
+  expect(test.find((p) => p.children === SAVE_UNAPPLIED_NOTE)).toBeDefined();
+  await test.click(test.primary('Save applied state'));
+  expect(test.controller.saveScenarioDocument).toHaveBeenCalledExactlyOnceWith(confirmed);
+
+  await test.open('Save Scenario as');
+  expect(test.primary('Save Scenario').title).toBe(SAVE_UNAPPLIED_NOTE);
+  await test.click(test.primary('Save Scenario'));
+  // Cancel returns to the Save As form without saving.
+  await test.click(test.find((p) => p.children === 'Cancel'));
+  expect(test.controller.saveScenarioDocument).toHaveBeenCalledTimes(1);
+  await test.click(test.primary('Save Scenario'));
+  await test.click(test.primary('Save applied state'));
+  expect(test.controller.saveScenarioDocument).toHaveBeenCalledTimes(2);
+  expect(test.controller.saveScenarioDocument).toHaveBeenLastCalledWith(confirmed);
+});
+
+it('without unapplied edits Save shows no note and saves at once', async () => {
+  const test = await mount(null, false, '/projects/Lab_Cell.scenario');
+  expect(test.find((p) => p['aria-label'] === 'Save Scenario')['data-tooltip']).toBe('Save Scenario');
+  await test.open('Save Scenario');
+  expect(() => test.primary('Save applied state')).toThrow();
 });
 
 it('Available Scenario shows Scenario names and a refused folder by its folder name', async () => {

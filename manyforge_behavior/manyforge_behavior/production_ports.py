@@ -12,13 +12,17 @@ import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
-from heapq import heapify, heappop, heappush
 import json
 import math
 from threading import RLock
 import time
 from typing import Any, Callable, Final, Protocol
 
+from manyforge_behavior.collision_rules import (
+    CollisionRuleError,
+    sent_collision_rules,
+    validate_collision_rules,
+)
 from manyforge_behavior.geometry import (
     normalize_quat,
     rpy_deg_to_xyzw,
@@ -629,21 +633,6 @@ def _scene_shape(value: object, *, field: str) -> dict[str, Any]:
     raise ProductionPortError(f"{field} has an unsupported shape")
 
 
-def _scene_support_contacts(value: object, *, field: str) -> list[dict[str, Any]]:
-    if value is None:
-        return []
-    metadata = _mapping(value, field=field)
-    return [
-        dict(_mapping(contact, field=f"{field}.support_contacts[{index}]"))
-        for index, contact in enumerate(
-            _sequence(
-                metadata.get("support_contacts", ()),
-                field=f"{field}.support_contacts",
-            )
-        )
-    ]
-
-
 def _require_captured_reference(
     binding: Mapping[str, Any], collection: str, reference: Mapping[str, Any], *, field: str,
 ) -> None:
@@ -881,18 +870,10 @@ class _IoWatch:
 
 
 @dataclass(frozen=True, slots=True)
-class _ContactGraspBinding:
-    contact_policy_id: str
-    runtime_object_id: str
-    mode: str
-
-
-@dataclass(frozen=True, slots=True)
 class _BoundContext:
     capture: ProgramRunPortContext
     targets: Mapping[tuple[str, str], _TargetBinding]
     signals: Mapping[tuple[str, str], _SignalBinding]
-    contact_grasps: Mapping[str, _ContactGraspBinding]
 
 
 class _SceneProgramTransport(Protocol):
@@ -923,6 +904,8 @@ class _SceneBoundContext:
     component_models: Mapping[tuple[str, str], tuple[str, str]]
     component_frames: Mapping[tuple[str, str], dict[str, str]]
     targets: Mapping[tuple[str, str], _SceneTargetBinding]
+    # The Program Binding's collision-body roles of each component.
+    component_bodies: Mapping[str, set[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1110,10 +1093,27 @@ def _motion_spec(
     if node_id == "motion.move_to_pose" or node_id in _INTERRUPT_MOTION_NODE_IDS:
         # The interrupt moves are pose goals; their rule is the Core's,
         # lowered from the captured node (never sent as caller scopes).
-        return {
+        motion = {
             "kind": "pose_goal",
             "goal": _pose3(parameters.get("goal"), field="goal"),
         }
+        motion_type = parameters.get("motion_type", "joint")
+        if motion_type == "linear":
+            # A straight line from the planning start state's TCP pose.
+            motion.update(
+                motion_type="linear",
+                max_translation_step_m=parameters["max_translation_step_m"],
+                max_rotation_step_rad=parameters["max_rotation_step_rad"],
+                max_angular_speed_rad_s=parameters["max_angular_speed_rad_s"],
+                max_linear_acceleration_mps2=parameters["max_linear_acceleration_mps2"],
+                max_angular_acceleration_rad_s2=parameters["max_angular_acceleration_rad_s2"],
+            )
+            # Absent means the Deployment's cartesian_timing.
+            if parameters.get("cartesian_timing") is not None:
+                motion["speed_mode"] = parameters["cartesian_timing"]
+        elif motion_type != "joint":
+            raise ProductionPortError("pose motion_type is unsupported")
+        return motion
     if node_id == "motion.follow_cartesian_path":
         path = _sequence(parameters.get("path"), field="path")
         motion: dict[str, Any] = {
@@ -1211,21 +1211,59 @@ def _planner_override(value: Any) -> dict[str, Any]:
     }
 
 
+def _plain_value(value: Any) -> Any:
+    """Resolved inputs are frozen; a plain copy of one JSON value."""
+
+    if isinstance(value, Mapping):
+        return {key: _plain_value(nested) for key, nested in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_plain_value(nested) for nested in value]
+    return value
+
+
+def _collision_rules(
+    parameters: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    *,
+    leg: str | None = None,
+) -> list[dict[str, Any]]:
+    """The node's collision rules as sent with a motion (one leg's rows for a
+    pick or place sequence); a spring slider row takes its numbers from the
+    Program Binding's slider rows."""
+
+    rules = _plain_value(
+        _sequence(parameters.get("collision_rules", ()), field="collision_rules")
+    )
+    spring_sliders = {
+        (row["body"]["component_id"], row["body"]["collision_body_id"]): row
+        for row in _sequence(
+            binding.get("collision_rule_spring_sliders", ()),
+            field="collision_rule_spring_sliders",
+        )
+    }
+    try:
+        validate_collision_rules(
+            rules, path="collision_rules", move_rules=True, legs=leg is not None
+        )
+        return sent_collision_rules(rules, leg=leg, spring_sliders=spring_sliders)
+    except CollisionRuleError as error:
+        raise ProductionPortError(str(error)) from error
+
+
 def program_motion_participant(
     node_id: str,
     parameters: Mapping[str, Any],
     *,
     targets: Mapping[tuple[str, str], _TargetBinding],
-    contact_grasps: Mapping[str, _ContactGraspBinding],
     move_id: str,
     active_tcp: Any = None,
     binding: Mapping[str, Any] | None = None,
 ) -> ProgramMotionParticipant:
     """Translate resolved motion-node inputs into the native motion payload.
 
-    Pure: it reads only the captured Program Binding rows (``targets`` and
-    ``contact_grasps``) and the node's resolved ``parameters``. The binding,
-    robot and capability come from the capture, never from the inputs.
+    Pure: it reads only the captured Program Binding rows (``targets``) and
+    the node's resolved ``parameters``. The binding, robot and capability come
+    from the capture, never from the inputs.
     """
 
     target_ref = _mapping(parameters.get("target"), field="target")
@@ -1286,30 +1324,6 @@ def program_motion_participant(
         raise ProductionPortError(
             "runtime-object motion references require a scene-binding join"
         )
-    contact_policy_id = parameters.get("contact_policy_id")
-    contact_scene_resource_id = parameters.get("contact_scene_resource_id")
-    runtime_object_bindings: list[dict[str, str]] = []
-    if (contact_policy_id is None) != (contact_scene_resource_id is None):
-        raise ProductionPortError(
-            "contact policy and contact scene resource must be supplied together"
-        )
-    elif contact_policy_id is not None:
-        policy_id = _text(contact_policy_id, field="contact_policy_id")
-        scene_resource_id = _text(
-            contact_scene_resource_id, field="contact_scene_resource_id"
-        )
-        try:
-            contact = contact_grasps[policy_id]
-        except KeyError as exc:
-            raise ProductionPortError(
-                "Program Binding has no exact motion contact-grasp policy"
-            ) from exc
-        runtime_object_bindings.append(
-            {
-                "runtime_object_id": contact.runtime_object_id,
-                "scene_resource_id": scene_resource_id,
-            }
-        )
     payload = {
         "kind": "motion",
         "move_id": _text(move_id, field="move_id"),
@@ -1334,7 +1348,9 @@ def program_motion_participant(
         "target_reference": target_reference,
         "offset_reference": offset_reference,
         "motion": _motion_spec(node_id, parameters),
-        "contact_policy_id": contact_policy_id,
+        # The move's collision rules; the row without selections replaces the
+        # Deployment's first rule for this move.
+        "collision_rules": _collision_rules(parameters, binding or {}),
         # Resolved inputs are frozen; the wire needs plain per-joint objects.
         "per_joint_dynamics_limits": {
             joint_name: dict(_mapping(limit, field=f"per_joint_dynamics_limits.{joint_name}"))
@@ -1344,13 +1360,10 @@ def program_motion_participant(
             ).items()
         },
         "motion_interrupt_scopes": [],
-        "runtime_object_bindings": runtime_object_bindings,
+        "runtime_object_bindings": [],
     }
     if goal_frame_reference is not None:
         payload["goal_frame_reference"] = goal_frame_reference
-    # The move's own collision clearance; absent keeps the Deployment's.
-    if parameters.get("clearance_m") is not None:
-        payload["clearance_m"] = parameters["clearance_m"]
     # The move's planner override; absent keeps the Deployment planner block.
     if parameters.get("planner") is not None:
         payload["planner"] = _planner_override(parameters["planner"])
@@ -1446,41 +1459,9 @@ class NativeKernelProgramPort:
                 _text(row.get("direction"), field="direction"),
                 _text(row.get("transition_capability"), field="transition_capability"),
                 _text(row.get("signal_descriptor_digest"), field="signal_descriptor_digest"))
-        contact_grasps: dict[str, _ContactGraspBinding] = {}
-        raw_contact_grasps = binding.get("contact_grasp_bindings", ())
-        if not isinstance(raw_contact_grasps, (list, tuple)):
-            raise ProductionPortError("Program Binding contact-grasp bindings are invalid")
-        for index, raw_contact in enumerate(raw_contact_grasps):
-            contact = _mapping(
-                raw_contact,
-                field=f"contact_grasp_bindings[{index}]",
-            )
-            policy_id = _text(
-                contact.get("contact_policy_id"),
-                field=f"contact_grasp_bindings[{index}].contact_policy_id",
-            )
-            runtime_object_id = _text(
-                contact.get("runtime_object_id"),
-                field=f"contact_grasp_bindings[{index}].runtime_object_id",
-            )
-            if policy_id in contact_grasps:
-                raise ProductionPortError("Program Binding repeats a contact-grasp policy")
-            mode = contact.get("mode", "contact_grasp")
-            if mode not in ("contact_grasp", "contact_release"):
-                raise ProductionPortError("Program Binding contact mode is invalid")
-            contact_grasps[policy_id] = _ContactGraspBinding(
-                policy_id,
-                runtime_object_id,
-                mode,
-            )
         NativeKernelProgramPort._validate_execution_group_policies(context.program)
         _validate_io_signal_nodes(context.program, signals)
-        return _BoundContext(
-            context,
-            targets,
-            signals,
-            contact_grasps,
-        )
+        return _BoundContext(context, targets, signals)
 
     def bind(self, context: ProgramRunPortContext) -> None:
         if not isinstance(context, ProgramRunPortContext):
@@ -1634,7 +1615,6 @@ class NativeKernelProgramPort:
             node_id,
             parameters,
             targets=context.targets,
-            contact_grasps=context.contact_grasps,
             binding=context.capture.program_binding,
             active_tcp=active_tcp,
             move_id=format_request_key(
@@ -1705,7 +1685,6 @@ class NativeKernelProgramPort:
             node_id,
             parameters,
             targets=context.targets,
-            contact_grasps=context.contact_grasps,
             binding=context.capture.program_binding,
             active_tcp=active_tcp,
             # One preview request names one preview: its own key.
@@ -2043,7 +2022,7 @@ class NativeKernelProgramPort:
         phase: str,
         motion: Mapping[str, Any],
         tcp_endpoint: Mapping[str, Any],
-        contact_policy_id: str | None = None,
+        binding: Mapping[str, Any],
         runtime_object_id: str | None = None,
         selected_object_id: str | None = None,
     ) -> dict[str, Any]:
@@ -2098,7 +2077,8 @@ class NativeKernelProgramPort:
             "target_reference": None,
             "offset_reference": None,
             "motion": dict(motion),
-            "contact_policy_id": contact_policy_id,
+            # This leg's rows of the sequence's collision rules.
+            "collision_rules": _collision_rules(parameters, binding, leg=phase),
             "per_joint_dynamics_limits": {},
             "motion_interrupt_scopes": [],
             "runtime_object_bindings": runtime_bindings,
@@ -2150,7 +2130,6 @@ class NativeKernelProgramPort:
                 ),
                 "source_label": "manyforge_behavior",
             },
-            "program_id": context.capture.program_id,
             "program_revision": context.capture.program_revision,
             "program_binding_id": context.capture.program_binding_id,
             "program_run_id": context.capture.program_run_id,
@@ -2200,17 +2179,6 @@ class NativeKernelProgramPort:
             "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
         }
         if kind == "pick":
-            contact_policy_id = _text(
-                parameters.get("contact_policy_id"), field="contact_policy_id"
-            )
-            try:
-                contact = context.contact_grasps[contact_policy_id]
-            except KeyError as exc:
-                raise ProductionPortError(
-                    "Program Binding has no exact pick contact-grasp policy"
-                ) from exc
-            if contact.mode != "contact_grasp":
-                raise ProductionPortError("pick requires a contact-grasp policy")
             approach_motion: Mapping[str, Any] = {
                 "kind": "pose_goal",
                 "goal": identity_pose,
@@ -2223,9 +2191,23 @@ class NativeKernelProgramPort:
                 targets=context.targets,
                 binding=context.capture.program_binding,
             )
+            # A pick offset may name the selected object by its blackboard
+            # key; the descend leg then binds that key to the object.
+            offset_object_keys = {
+                reference["runtime_object_id"]
+                for reference in (
+                    synthesis["pick_offset_reference"],
+                    synthesis["approach_offset_reference"],
+                )
+                if reference is not None and reference["type"] == "runtime_object"
+            }
+            if len(offset_object_keys) > 1:
+                raise ProductionPortError(
+                    "pick offset references name more than one runtime object"
+                )
+            selected_runtime_object_id = next(iter(offset_object_keys), None)
         else:
-            contact_policy_id = None
-            contact = None
+            selected_runtime_object_id = None
             place_pose = _base_framed_pose3(
                 parameters.get("place_pose"),
                 field="place_pose",
@@ -2261,6 +2243,7 @@ class NativeKernelProgramPort:
                 identity=identity,
                 parameters=parameters,
                 tcp_endpoint=tcp_endpoint,
+                binding=context.capture.program_binding,
                 phase="approach",
                 motion=approach_motion,
             ),
@@ -2268,16 +2251,19 @@ class NativeKernelProgramPort:
                 identity=identity,
                 parameters=parameters,
                 tcp_endpoint=tcp_endpoint,
+                binding=context.capture.program_binding,
                 phase="descend",
                 motion=descend_motion,
-                contact_policy_id=contact_policy_id,
-                runtime_object_id=(None if contact is None else contact.runtime_object_id),
-                selected_object_id=(None if contact is None else selected_object_id),
+                runtime_object_id=selected_runtime_object_id,
+                selected_object_id=(
+                    None if selected_runtime_object_id is None else selected_object_id
+                ),
             ),
             "retreat": self._phase_motion_payload(
                 identity=identity,
                 parameters=parameters,
                 tcp_endpoint=tcp_endpoint,
+                binding=context.capture.program_binding,
                 phase="retreat",
                 motion=retreat_motion,
             ),
@@ -2316,7 +2302,8 @@ class NativeKernelProgramPort:
             "retreat_operation": operations["retreat"],
         }
         if kind == "pick":
-            intent["selected_runtime_object_id"] = contact.runtime_object_id
+            if selected_runtime_object_id is not None:
+                intent["selected_runtime_object_id"] = selected_runtime_object_id
             intent["synthesis"] = synthesis
         return kind, selected_object_id, intent
 
@@ -2847,7 +2834,6 @@ class NativeKernelProgramPort:
                 "request_key": format_request_key(request_key),
                 "source_label": "manyforge_behavior",
             },
-            "program_id": context.capture.program_id,
             "program_revision": context.capture.program_revision,
             "program_binding_id": context.capture.program_binding_id,
             "program_run_id": context.capture.program_run_id,
@@ -2958,7 +2944,7 @@ class NativeKernelProgramPort:
         self._require_captured_deployment(context.capture)
         scope = self.scope.execution_scope(task.identity.program_run_id)
         revision = scope.get("hold_revision")
-        if (scope.get("schema_version") != "manyforge.program_execution_scope.v3"
+        if (scope.get("schema_version") != "manyforge.program_execution_scope.v4"
             or scope.get("program_run_id") != task.identity.program_run_id
             or type(revision) is not int or revision < 0):
             raise ProductionPortError("held preparation scope identity is incomplete")
@@ -3226,8 +3212,12 @@ class NativeKernelProgramPort:
                     # Only an operator's (or other non-Program) Stop holds.
                     metadata["authored_failure_policy"] = "pause_for_operator"
                     metadata["authored_failure_policy_parameter"] = "operator_stop_policy"
-                elif assessment.get("recovery_class") == "ordinary_program_stop":
-                    # The Program's own Stop: the node fails with its typed cause.
+                elif assessment.get("recovery_class") in {
+                    "ordinary_program_stop",
+                    "runtime_collision",
+                }:
+                    # The Program's own Stop, or a collision Stop contained
+                    # cleanly (OD-373): the node fails with its typed cause.
                     code, text, cause = self._terminal_error(operation)
                     if code != "operation_failed":
                         reason_code, message, details = code, text, cause
@@ -3800,7 +3790,7 @@ class NativeKernelProgramPort:
         revision = scope.get("hold_revision")
         stopping, faulted = scope.get("stopping_node_indices"), scope.get("faulted_node_indices")
         if (
-            scope.get("schema_version") != "manyforge.program_execution_scope.v3"
+            scope.get("schema_version") != "manyforge.program_execution_scope.v4"
             or scope.get("program_run_id") != program_run_id
             or type(revision) is not int
             or not isinstance(stopping, (list, tuple))
@@ -5914,7 +5904,9 @@ class HeadlessSceneProgramPort:
                 if owner == component and body in component_bodies.get(component, set()):
                     bodies.add(body)
             targets[key] = _SceneTargetBinding(component, command, frames, frozenset(bodies))
-        return _SceneBoundContext(context, component_models, component_frames, targets)
+        return _SceneBoundContext(
+            context, component_models, component_frames, targets, component_bodies
+        )
 
     @staticmethod
     def _target(context: _SceneBoundContext, reference: Mapping[str, Any]) -> _SceneTargetBinding:
@@ -6287,45 +6279,6 @@ class HeadlessSceneProgramPort:
         raise ProductionPortError("scene pose has an unsupported frame")
 
     @staticmethod
-    def _removal_order(objects: Mapping[str, Mapping[str, Any]]) -> tuple[str, ...]:
-        dependent_count = {scene_resource_id: 0 for scene_resource_id in objects}
-        supports_by_object: dict[str, tuple[str, ...]] = {}
-        for scene_resource_id, scene_object in objects.items():
-            supports: list[str] = []
-            for raw_contact in _sequence(
-                scene_object.get("support_contacts", ()),
-                field="support_contacts",
-            ):
-                contact = _mapping(raw_contact, field="support_contact")
-                support_id = _text(contact.get("support_object_id"), field="support_object_id")
-                if support_id not in dependent_count:
-                    raise ProductionPortError(
-                        "logical scene contains an unknown support dependency"
-                    )
-                supports.append(support_id)
-            if len(supports) != len(set(supports)):
-                raise ProductionPortError("logical scene contains a duplicate support dependency")
-            supports_by_object[scene_resource_id] = tuple(supports)
-            for support_id in supports:
-                dependent_count[support_id] += 1
-
-        removable = [
-            scene_resource_id for scene_resource_id, count in dependent_count.items() if count == 0
-        ]
-        heapify(removable)
-        ordered: list[str] = []
-        while removable:
-            scene_resource_id = heappop(removable)
-            ordered.append(scene_resource_id)
-            for support_id in supports_by_object[scene_resource_id]:
-                dependent_count[support_id] -= 1
-                if dependent_count[support_id] == 0:
-                    heappush(removable, support_id)
-        if len(ordered) != len(objects):
-            raise ProductionPortError("logical scene contains a cyclic support dependency")
-        return tuple(ordered)
-
-    @staticmethod
     def _desired_scene_digest(
         context: _SceneBoundContext,
         operations: Sequence[Mapping[str, Any]],
@@ -6380,13 +6333,6 @@ class HeadlessSceneProgramPort:
         if current is None or (
             list(_sequence(current.get("collision_shapes"), field="collision_shapes"))
             != [expected_shape]
-            or list(
-                _sequence(
-                    current.get("support_contacts", ()),
-                    field="support_contacts",
-                )
-            )
-            != operation.get("support_contacts")
             or current.get("provider_evidence") is not None
         ):
             return False
@@ -6513,10 +6459,6 @@ class HeadlessSceneProgramPort:
                         ),
                         "pose": pose,
                         "frame_ref": frame_ref,
-                        "support_contacts": _scene_support_contacts(
-                            row.get("metadata"),
-                            field=f"initial_scene[{index}].metadata",
-                        ),
                     },
                 )
             )
@@ -6536,7 +6478,7 @@ class HeadlessSceneProgramPort:
         """
         context = _SceneBoundContext(
             capture=_SceneApplyCapture(retained_bundle_id, graph_revision),
-            component_models={}, component_frames={}, targets={},
+            component_models={}, component_frames={}, targets={}, component_bodies={},
         )
         view = self._read_view(context)
         refused: list[dict[str, str]] = []
@@ -6605,22 +6547,7 @@ class HeadlessSceneProgramPort:
                 refused.append({"resource_id": resource_id, "code": result["reason"],
                                 "message": result["message"]})
 
-        # A retained carried object may depend on another Scene object.
-        try:
-            removal_order = self._removal_order(view.objects)
-            pending = list(kept)
-            while pending:
-                resource_id = pending.pop()
-                for contact in view.objects.get(resource_id, {}).get("support_contacts", ()):
-                    support_id = contact["support_object_id"]
-                    if support_id not in kept:
-                        kept.add(support_id)
-                        pending.append(support_id)
-        except Exception as error:
-            return {"state": "failed", "reason": "scene_removal_order_invalid",
-                    "message": str(error), "last_observed_remaining": sorted(view.objects),
-                    "refused": refused}
-        for resource_id in removal_order:
+        for resource_id in sorted(view.objects):
             if resource_id in kept:
                 continue
             result = commit({"kind": "remove_object", "scene_resource_id": resource_id}, resource_id)
@@ -6747,7 +6674,7 @@ class HeadlessSceneProgramPort:
             if scene_resource_id in view.objects:
                 replacement["kind"] = "upsert_object"
             commit(replacement, f"upsert:{scene_resource_id}")
-        for scene_resource_id in self._removal_order(view.objects):
+        for scene_resource_id in sorted(view.objects):
             if scene_resource_id in desired_ids:
                 continue
             commit(
@@ -6900,7 +6827,6 @@ class HeadlessSceneProgramPort:
                     "shape": _scene_shape(parameters.get("shape"), field="shape"),
                     "pose": pose,
                     "frame_ref": frame_ref,
-                    "support_contacts": [],
                 }
             elif node_id == "scene.remove_object":
                 operation = {
@@ -6930,6 +6856,12 @@ class HeadlessSceneProgramPort:
                 target = self._target(context, target_ref)
                 if ("carrier_frame" in parameters) == ("carrier_frame_ref" in parameters):
                     raise ProductionPortError("requires exactly one carrier frame selector")
+                # OD-372: the carrier frame and the touch bodies belong to one
+                # component: the target's own, or one mounted on the target's
+                # robot. The Program Binding holds a mounted component's frame
+                # and bodies as plain Program references (Apply checked the
+                # mount); the scene owner's resolver checks that the robot's
+                # kinematics places the frame.
                 if "carrier_frame" in parameters:
                     selector = _mapping(parameters["carrier_frame"], field="carrier_frame")
                     if set(selector) != {"kind"} or selector.get("kind") != "active_tcp":
@@ -6940,20 +6872,26 @@ class HeadlessSceneProgramPort:
                         context.capture.program_binding_id, target_ref), field="resolved carrier frame")
                 else:
                     frame = _mapping(parameters.get("carrier_frame_ref"), field="carrier_frame_ref")
-                    if (frame.get("component_id") != target.controllable_component_id
-                            or frame.get("frame_id") not in target.frames):
-                        raise ProductionPortError("Program Binding has no exact carrier frame")
-                if frame.get("component_id") != target.controllable_component_id:
-                    raise ProductionPortError("carrier frame belongs to another component")
+                carrier = _text(frame.get("component_id"), field="carrier_frame_ref.component_id")
                 frame_role = _text(frame.get("frame_id"), field="carrier_frame_ref.frame_id")
+                own = carrier == target.controllable_component_id
+                if "carrier_frame_ref" in parameters and (
+                    frame_role not in target.frames if own
+                    else (carrier, frame_role) not in context.component_frames
+                ):
+                    raise ProductionPortError("Program Binding has no exact carrier frame")
+                body_roles = (
+                    target.collision_body_roles if own
+                    else context.component_bodies.get(carrier, set())
+                )
                 touch_body_roles = []
                 for value in _sequence(parameters.get("touch_bodies"), field="touch_bodies"):
                     body = _mapping(value, field="touch_body")
-                    if body.get("component_id") != target.controllable_component_id:
+                    if body.get("component_id") != carrier:
                         raise ProductionPortError("touch body belongs to another component")
                     touch_body_roles.append(_text(body.get("collision_body_id"), field="touch_body.collision_body_id"))
                 if len(touch_body_roles) != len(set(touch_body_roles)) or any(
-                    role not in target.collision_body_roles for role in touch_body_roles
+                    role not in body_roles for role in touch_body_roles
                 ):
                     raise ProductionPortError(
                         "touch-body roles are duplicate or absent from the binding"
@@ -6975,6 +6913,7 @@ class HeadlessSceneProgramPort:
                     "command_target_id": target.command_target_id,
                     "frame_role_id": frame_role,
                     "touch_body_roles": sorted(touch_body_roles),
+                    **({} if own else {"carrier_component_id": carrier}),
                     # The owner resolves the carrier against its current
                     # structural attachments and ignores this field.
                     "expected_component_attachment_revisions": [],

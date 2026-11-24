@@ -13,7 +13,7 @@ MODEL_ASSET_SCHEMA_REVISION = (
     "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6"
 )
 COMPONENT_TYPE_SCHEMA_REVISION = (
-    "sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde"
+    "sha256:4c1a934edc63d9da5eac2d1aef76d86142fcb797950a12306009e028d551c3fa"
 )
 ZERO_DIGEST = "sha256:" + ("0" * 64)
 
@@ -308,10 +308,8 @@ def _qualified_component_type():
 def _verified_deployment(source, component_type):
     deployment = {
         "api_version": "manyforge.deployment.v1",
-        "deployment_artifact_id": "python_compiler",
         "deployment_revision": ZERO_DIGEST,
         "cell_id": "python_structure",
-        "name": "Python compiler fixture",
         "catalogs": {"records": []},
         "graph": {
             "runtime_units": [],
@@ -774,6 +772,7 @@ def test_complete_model_source_values_have_python_semantic_parity():
         core.SrdfExpansionProvenanceKind.kChainLink,
         core.SrdfExpansionProvenanceKind.kChainJoint,
         core.SrdfExpansionProvenanceKind.kSubgroup,
+        core.SrdfExpansionProvenanceKind.kJointChildLink,
     }
     subgroup_nodes = [
         node

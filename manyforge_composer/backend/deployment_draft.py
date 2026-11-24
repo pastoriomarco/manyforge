@@ -17,9 +17,11 @@ from manyforge_behavior.canonical_artifact import (
     load_strict_json_yaml_bytes,
 )
 
+from .component_catalog import tool_profile_ids
 from .deployment_intent import (
     DEPLOYMENT_INTENT_API_VERSION,
     DeploymentIntentError,
+    unmounted_component_ids,
     validate_deployment_intent,
 )
 from .authoring_identity import freeze_json, thaw_json
@@ -52,7 +54,6 @@ def _fail(code: str, message: str, *, status_code: int = 400) -> NoReturn:
 class CompiledDeploymentDocument:
     document: dict[str, Any]
     canonical_json: str
-    deployment_artifact_id: str
     deployment_revision: str | None
     graph_revision: str | None
 
@@ -87,7 +88,6 @@ class PreparedDeploymentReplacement:
                 CompiledDeploymentDocument(
                     document=freeze_json(self.compiled.document),
                     canonical_json=self.compiled.canonical_json,
-                    deployment_artifact_id=self.compiled.deployment_artifact_id,
                     deployment_revision=self.compiled.deployment_revision,
                     graph_revision=self.compiled.graph_revision,
                 ),
@@ -149,10 +149,21 @@ def validate_deployment_draft_document(source: str) -> CompiledDeploymentDocumen
             canonical = canonical_json_bytes(document).decode("utf-8")
         except (DeploymentIntentError, StrictArtifactError) as error:
             _fail("deployment_draft_invalid", str(error))
+        # Only a tool may stay unmounted until it is mounted (OD-366).
+        unmounted = set(unmounted_component_ids(document))
+        for row in document["components"]:
+            if (
+                row["component_id"] in unmounted
+                and row["component_profile_id"] not in tool_profile_ids()
+            ):
+                _fail(
+                    "deployment_draft_invalid",
+                    f"<Deployment Draft>: component {row['component_id']} is missing "
+                    "root_pose_in_cell (only a tool may be unmounted)",
+                )
         return CompiledDeploymentDocument(
             document=document,
             canonical_json=canonical,
-            deployment_artifact_id=document["deployment_artifact_id"],
             deployment_revision=None,
             graph_revision=None,
         )
@@ -176,7 +187,6 @@ def compile_deployment_document(source: str) -> CompiledDeploymentDocument:
         _fail("deployment_draft_invalid", str(error))
     expected = {
         "canonical_json",
-        "deployment_artifact_id",
         "deployment_revision",
         "graph_revision",
     }
@@ -211,7 +221,6 @@ def compile_deployment_document(source: str) -> CompiledDeploymentDocument:
             status_code=502,
         )
     identities = (
-        result["deployment_artifact_id"],
         result["deployment_revision"],
         result["graph_revision"],
     )
@@ -224,9 +233,8 @@ def compile_deployment_document(source: str) -> CompiledDeploymentDocument:
     return CompiledDeploymentDocument(
         document=document,
         canonical_json=canonical,
-        deployment_artifact_id=identities[0],
-        deployment_revision=identities[1],
-        graph_revision=identities[2],
+        deployment_revision=identities[0],
+        graph_revision=identities[1],
     )
 
 
@@ -627,8 +635,10 @@ def _rename_scene_resource(
 
     The places are the declared scene-resource fields of the Deployment
     codecs: `policies.scene_pose_sources[].scene_resource_id`, the matching
-    `policies.component_streams` row (`poses/<id>` of a linked pose source)
-    and a `geometric_contact` input's `provider.target_scene_resource_id`.
+    `policies.component_streams` row (`poses/<id>` of a linked pose source),
+    a `geometric_contact` input's `provider.target_scene_resource_id`, and
+    every `scene_object` selection of a geometric-contact input (its
+    provider's `a`/`b`) and of an I/O member's `mock_inputs`.
     Returns the candidate and the changed paths.
     """
 
@@ -661,12 +671,36 @@ def _rename_scene_resource(
             streams.sort(key=lambda row: (
                 str(row.get("controllable_component_id")), str(row.get("stream_id"))
             ))
+
+    def rename_selections(owner: Any, path: str) -> None:
+        for side in ("a", "b"):
+            selections = owner.get(side) if isinstance(owner, dict) else None
+            for index, selection in enumerate(selections if isinstance(selections, list) else []):
+                if (
+                    isinstance(selection, dict)
+                    and selection.get("kind") == "scene_object"
+                    and selection.get("scene_resource_id") == previous
+                ):
+                    selection["scene_resource_id"] = replacement
+                    paths.append(f"{path}.{side}[{index}].scene_resource_id")
+
     graph = candidate.get("graph")
     for collection, rows in (
         ("components", candidate.get("components")),
         ("graph.runtime_units", graph.get("runtime_units") if isinstance(graph, dict) else None),
     ):
         for index, row in enumerate(rows if isinstance(rows, list) else []):
+            mock_inputs = row.get("mock_inputs") if isinstance(row, dict) else None
+            for input_index, mock_input in enumerate(
+                mock_inputs if isinstance(mock_inputs, list) else []
+            ):
+                input_path = f"{collection}[{index}].mock_inputs[{input_index}]"
+                if isinstance(mock_input, dict) and "geometric_contact" in mock_input:
+                    rename_selections(
+                        mock_input["geometric_contact"], f"{input_path}.geometric_contact"
+                    )
+                else:
+                    rename_selections(mock_input, input_path)
             configuration = row.get("configuration") if isinstance(row, dict) else None
             path = f"{collection}[{index}].configuration"
             if isinstance(configuration, dict) and isinstance(
@@ -677,16 +711,125 @@ def _rename_scene_resource(
             signals = configuration.get("io_signals") if isinstance(configuration, dict) else None
             for signal_index, signal in enumerate(signals if isinstance(signals, list) else []):
                 provider = signal.get("provider") if isinstance(signal, dict) else None
-                if (
-                    isinstance(provider, dict)
-                    and provider.get("profile") == "geometric_contact"
-                    and provider.get("target_scene_resource_id") == previous
-                ):
+                if not isinstance(provider, dict) or provider.get("profile") != "geometric_contact":
+                    continue
+                provider_path = f"{path}.io_signals[{signal_index}].provider"
+                if provider.get("target_scene_resource_id") == previous:
                     provider["target_scene_resource_id"] = replacement
-                    paths.append(
-                        f"{path}.io_signals[{signal_index}].provider.target_scene_resource_id"
-                    )
+                    paths.append(f"{provider_path}.target_scene_resource_id")
+                rename_selections(provider, provider_path)
     return candidate, paths
+
+
+# A reference's feature keys beside its component id, and the declaration
+# kind each names (what a replacement tool must declare, OD-367).
+_REFERENCED_FEATURES = {
+    "command_target_id": "commandTargets",
+    "frame_id": "frames",
+    "frame_role_id": "frames",
+    "collision_body_id": "collisionBodies",
+}
+
+
+def referenced_features() -> dict[str, set[str]]:
+    return {kind: set() for kind in sorted(set(_REFERENCED_FEATURES.values()))}
+
+
+def note_referenced_features(reference: Mapping[str, Any], used: dict[str, set[str]]) -> None:
+    """Record the features one rewritten component reference names."""
+
+    for key, kind in _REFERENCED_FEATURES.items():
+        if isinstance(reference.get(key), str):
+            used[kind].add(reference[key])
+
+
+def _replace_tool(
+    document: dict[str, Any], previous: str, replacement: str
+) -> tuple[dict[str, Any], dict[str, set[str]]]:
+    """Replace a mounted tool by another tool of the Draft (OD-367).
+
+    The replacement takes over the old tool's attachment row (parent,
+    interfaces, pose, primary flag and collision exclusions; a mount of its
+    own is dropped, as is a root pose); every component reference to the old
+    id in the remaining rows, the collision rules and the policies
+    (``component_id`` and ``controllable_component_id`` fields, and the
+    ``<id>.`` prefix of a ``source_id``) names the replacement; the old row is
+    removed with its own settings. Returns the candidate and the command
+    targets, frames and collision bodies the rewritten references name.
+    """
+
+    candidate = deepcopy(document)
+    rows = {
+        row.get("component_id"): row
+        for row in candidate.get("components", [])
+        if isinstance(row, dict)
+    }
+
+    def end(row: Any, side: str) -> dict[str, Any]:
+        value = row.get(side) if isinstance(row, dict) else None
+        return value if isinstance(value, dict) else {}
+
+    tools = tool_profile_ids()
+    if (
+        rows.get(previous, {}).get("component_profile_id") not in tools
+        or not any(end(row, "child").get("component_id") == previous
+                   for row in candidate.get("attachments", []))
+    ):
+        _fail(
+            "deployment_tool_replacement_invalid",
+            f"{previous} is not a mounted tool of the Deployment Draft",
+            status_code=409,
+        )
+    if (
+        replacement == previous
+        or rows.get(replacement, {}).get("component_profile_id") not in tools
+        or "owner" in rows[replacement]
+    ):
+        _fail(
+            "deployment_tool_replacement_invalid",
+            f"{replacement} is not another tool of the Deployment Draft",
+            status_code=409,
+        )
+    candidate["components"] = [
+        row for row in candidate["components"]
+        if not (isinstance(row, dict) and row.get("component_id") == previous)
+    ]
+    rows[replacement].pop("root_pose_in_cell", None)
+    attachments = []
+    for row in candidate["attachments"]:
+        if end(row, "child").get("component_id") == replacement:
+            continue  # it moves to the old tool's place
+        for side in ("parent", "child"):
+            if end(row, side).get("component_id") == previous:
+                row[side]["component_id"] = replacement
+        attachments.append(row)
+    candidate["attachments"] = attachments
+
+    used = referenced_features()
+
+    def rewrite(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                rewrite(item)
+            return
+        if not isinstance(value, dict):
+            return
+        named = False
+        for key in ("component_id", "controllable_component_id"):
+            if value.get(key) == previous:
+                value[key] = replacement
+                named = True
+        source = value.get("source_id")
+        if isinstance(source, str) and source.startswith(f"{previous}."):
+            value["source_id"] = replacement + source[len(previous):]
+        if named:
+            note_referenced_features(value, used)
+        for item in value.values():
+            rewrite(item)
+
+    for field in ("components", "collision_rules", "policies"):
+        rewrite(candidate.get(field))
+    return candidate, used
 
 
 def _without_orphaned_members(
@@ -1085,6 +1228,78 @@ class DeploymentDraftSession:
             candidate["attachments"] = [*candidate["attachments"], *deepcopy(list(attachments))]
         return self._compiler(_source(candidate))
 
+    def preview_component_removal(
+        self,
+        component_id: str,
+        *,
+        draft_id: str,
+        expected_revision: int,
+    ) -> CompiledDeploymentDocument:
+        """Drop one component row and every attachment row that names it."""
+
+        with self._lock:
+            self._require_current(draft_id, expected_revision)
+            if self._compiled is None:
+                _fail(
+                    "deployment_draft_unavailable",
+                    "open a Deployment artifact before editing",
+                    status_code=404,
+                )
+            candidate = deepcopy(self._compiled.document)
+            components = [
+                row for row in candidate.get("components", [])
+                if not (isinstance(row, dict) and row.get("component_id") == component_id)
+            ]
+            if len(components) == len(candidate.get("components", [])):
+                _fail(
+                    "component_not_found",
+                    f"the Deployment Draft has no component {component_id!r}",
+                    status_code=404,
+                )
+            candidate["components"] = components
+
+            def names(attachment: Any) -> bool:
+                if not isinstance(attachment, dict):
+                    return False
+                return any(
+                    isinstance(end, dict) and end.get("component_id") == component_id
+                    for end in (attachment.get("parent"), attachment.get("child"))
+                )
+
+            candidate["attachments"] = [
+                row for row in candidate.get("attachments", []) if not names(row)
+            ]
+        return self._compiler(_source(candidate))
+
+    def preview_tool_replacement(
+        self,
+        component_id: str,
+        replacement_component_id: str,
+        *,
+        draft_id: str,
+        expected_revision: int,
+    ) -> tuple[CompiledDeploymentDocument, dict[str, set[str]]]:
+        """Replace a mounted tool by another tool of the Draft (OD-367); also
+        returns the features the rewritten references name."""
+
+        with self._lock:
+            self._require_current(draft_id, expected_revision)
+            if self._compiled is None:
+                _fail(
+                    "deployment_draft_unavailable",
+                    "open a Deployment artifact before editing",
+                    status_code=404,
+                )
+            if self._compiled.document.get("api_version") != DEPLOYMENT_INTENT_API_VERSION:
+                _fail(
+                    "deployment_tool_replacement_invalid",
+                    "Replace tool needs a source-referenced Deployment intent",
+                )
+            candidate, used = _replace_tool(
+                self._compiled.document, component_id, replacement_component_id
+            )
+        return self._compiler(_source(candidate)), used
+
     def preview_controlled_stop_update(
         self,
         profile: dict[str, Any] | None,
@@ -1356,7 +1571,6 @@ class DeploymentDraftSession:
                 else CompiledDeploymentDocument(
                     document=successor_document,
                     canonical_json=prepared.compiled.canonical_json,
-                    deployment_artifact_id=prepared.compiled.deployment_artifact_id,
                     deployment_revision=prepared.compiled.deployment_revision,
                     graph_revision=prepared.compiled.graph_revision,
                 )
@@ -1450,21 +1664,43 @@ class DeploymentDraftSession:
             )
 
     def install_prepared_save(
-        self, prepared: PreparedDeploymentSave, *, saved_path: str
+        self,
+        prepared: PreparedDeploymentSave,
+        *,
+        saved_path: str,
+        saved_document: Mapping[str, Any] | None = None,
+        source_project_root: str | None = None,
     ) -> bool:
         """Adopt one already-written Deployment artifact as the Saved baseline.
 
-        Returns whether the Saved baseline changed. No Draft revision advances,
-        because the Draft content is unchanged; the composite workspace revision
-        still advances whenever the baseline changed.
+        Returns whether the Draft or its Saved baseline changed. A Scenario
+        save into another project folder writes the Deployment with its
+        project-relative sources rebased to that folder: ``saved_document`` is
+        that written content and ``source_project_root`` the saved project
+        folder. Both are adopted, so paths authored afterwards resolve against
+        the saved project, as the written file does. Otherwise the Draft
+        content is unchanged and no Draft revision advances; the composite
+        workspace revision still advances whenever the baseline changed.
         """
 
         if not isinstance(prepared, PreparedDeploymentSave):
             raise TypeError("prepared Deployment save has an invalid type")
+        if (saved_document is None) != (source_project_root is None):
+            raise ValueError("an adopted saved document needs its project folder")
         try:
             resolved = str(Path(saved_path).resolve())
         except (OSError, RuntimeError, ValueError):
             resolved = saved_path
+        adopted = (
+            None
+            if saved_document is None
+            else self._compiler(_source(deepcopy(dict(saved_document))))
+        )
+        root = (
+            None
+            if source_project_root is None
+            else str(Path(source_project_root).resolve())
+        )
         with self._lock:
             self._require_current(prepared.draft_id, prepared.base_revision)
             if self._compiled is None:
@@ -1473,9 +1709,18 @@ class DeploymentDraftSession:
                     "open a Deployment artifact before saving",
                     status_code=404,
                 )
+            changed = False
+            if adopted is not None:
+                if adopted.document != self._compiled.document:
+                    self._compiled = adopted
+                    self._revision += 1
+                    changed = True
+                if root != self._source_project_root:
+                    self._source_project_root = root
+                    changed = True
             document = deepcopy(self._compiled.document)
             if self._saved_path == resolved and self._saved_document == document:
-                return False
+                return changed
             self._saved_path = resolved
             self._saved_document = document
             return True
@@ -1490,11 +1735,6 @@ class DeploymentDraftSession:
                     "id": self._draft_id,
                     "revision": self._revision,
                     "document": document,
-                    "deploymentArtifactId": (
-                        compiled.deployment_artifact_id
-                        if compiled is not None
-                        else None
-                    ),
                     "deploymentRevision": (
                         compiled.deployment_revision if compiled is not None else None
                     ),

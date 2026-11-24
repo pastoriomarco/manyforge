@@ -155,8 +155,7 @@ public:
   virtual ~IProgramSource() = default;
 
   [[nodiscard]] virtual std::shared_ptr<const ProgramBindingContract>
-  get_verified(const core::ProgramId &program_id,
-               const core::ProgramRevision &program_revision,
+  get_verified(const core::ProgramRevision &program_revision,
                const RetainedBundle &retained_bundle) const = 0;
 };
 
@@ -178,8 +177,7 @@ public:
       std::uint64_t maximum_single_program_bytes = kMaxArtifactEncodedBytes);
 
   [[nodiscard]] std::shared_ptr<const ProgramBindingContract>
-  get_verified(const core::ProgramId &program_id,
-               const core::ProgramRevision &program_revision,
+  get_verified(const core::ProgramRevision &program_revision,
                const RetainedBundle &retained_bundle) const override;
 
 private:
@@ -213,8 +211,7 @@ public:
                 const RetainedBundle &retained_bundle) override;
 
   [[nodiscard]] std::shared_ptr<const ProgramBindingContract>
-  get_verified(const core::ProgramId &program_id,
-               const core::ProgramRevision &program_revision,
+  get_verified(const core::ProgramRevision &program_revision,
                const RetainedBundle &retained_bundle) const override;
 
   [[nodiscard]] std::size_t size() const;

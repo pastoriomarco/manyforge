@@ -25,12 +25,16 @@ from typing import Any, Iterator
 # REAL_ROBOT_OPTIONAL_DEFAULTS) are optional in the compiled schema (absent =
 # this default).
 from .robot_defaults import (
+    CELL_DEFAULTS,
     COMPONENT_DEFAULTS,
     REAL_ROBOT_OPTIONAL_DEFAULTS,
     ROBOT_OPTIONAL_DEFAULTS,
     ROBOT_RUNTIME_DEFAULTS,
 )
 
+# CELL_DEFAULTS (same source): per cell. `collision_clearance_m` is the value a
+# new Deployment's first collision rule starts with. The rule is a required
+# row of the document, so it is written when the Deployment is created.
 # COMPONENT_DEFAULTS (same source): per component with its own lifecycle
 # (robots, tools, pose sources, AI models, sensors, the assistant); optional
 # (absent = this default, the host's kDefaultLifecycleBudgetNs). An I/O device
@@ -52,6 +56,15 @@ STOP_RULE_DEFAULTS: dict[str, Any] = {"after_stop": "hold"}
 TAKEOVER_TOTAL_FIELD = "motion_takeover_preparation_budget_s"
 TAKEOVER_PLANNING_FIELD = "motion_takeover_planning_budget_s"
 TAKEOVER_PLANNING_FRACTION = 0.8
+
+
+def default_collision_rules() -> list[dict[str, Any]]:
+    """`collision_rules` of a new Deployment: the first rule alone. It holds
+    every robot x environment pair at the default clearance."""
+
+    return [
+        {"rule_id": "everything", "clearance_m": CELL_DEFAULTS["collision_clearance_m"]}
+    ]
 
 
 def _defaulted(

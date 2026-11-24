@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ManyForge generic passive tool (OD-336): a neutral placeholder. A project
+  replaces this file with its own tool model (see README.md). Links the
+  family binds: passive_tool_mount (the root, on the robot flange),
+  passive_tool_tcp (the default TCP) and the optional passive_tool_tip (the
+  tip, the default TCP's contact body).
+-->
+<robot name="passive_tool">
+  <link name="passive_tool_mount"/>
+  <joint name="passive_tool_body_fix" type="fixed">
+    <parent link="passive_tool_mount"/>
+    <child link="passive_tool_body"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="passive_tool_body">
+    <visual>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.025" length="0.1"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.025" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="passive_tool_tip_fix" type="fixed">
+    <parent link="passive_tool_body"/>
+    <child link="passive_tool_tip"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+  </joint>
+  <link name="passive_tool_tip">
+    <visual>
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+    </visual>
+    <collision>
+      <geometry>
+        <sphere radius="0.005"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="passive_tool_tcp_fix" type="fixed">
+    <parent link="passive_tool_body"/>
+    <child link="passive_tool_tcp"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+  </joint>
+  <link name="passive_tool_tcp"/>
+</robot>

@@ -514,7 +514,7 @@ def test_manual_operation_resident_reads_the_control_state_rows() -> None:
 
 def test_a_program_bound_to_a_component_outside_the_cell_blocks_execute() -> None:
     status = {
-        "program_id": "pick", "executable": False,
+        "program_revision": "sha256:" + "a" * 64, "executable": False,
         "message": "The Program can't run in this Deployment",
         "non_executable": {"unresolved_targets": [
             {"target": {"component_id": "ur5e_robot", "command_target_id": "arm"}}]},
@@ -525,7 +525,7 @@ def test_a_program_bound_to_a_component_outside_the_cell_blocks_execute() -> Non
     assert readiness["blocked_reasons"] == [{
         "code": "program_not_executable",
         "message": "The Program can't run in this Deployment (ur5e_robot / arm)"}]
-    executable = {"program_id": "pick", "executable": True}
+    executable = {"program_revision": "sha256:" + "a" * 64, "executable": True}
     assert _ready(_model())["can_execute"] is True
     assert run_readiness(_model(), _cycle(), manual_operation_in_progress=False,
                          program_status=executable)["can_execute"] is True

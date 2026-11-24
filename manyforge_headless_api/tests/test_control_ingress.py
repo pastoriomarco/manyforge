@@ -186,6 +186,98 @@ def test_forwarded_deadline_preserves_authenticated_issue_time_not_receipt_time(
     )
 
 
+def test_freshness_is_aged_at_receipt_not_after_a_slow_owner_read() -> None:
+    """OD-240: a command received in time is admitted even though the backend
+    validates it after the lifetime; one received too late is refused."""
+
+    clock = _Clock()
+    stamps: list[ExecutionIngressStamp] = []
+    authority = ControlFreshnessAuthority(clock_ns=clock, secret=b"x" * 32)
+
+    def slow_projection() -> int:
+        # The owner read before validation outlasts the whole lifetime.
+        clock.now_ns += 2 * 750_000_000
+        return 7
+
+    def dispatch(request, stamp):
+        stamps.append(stamp)
+        return (
+            ExecutionIngressResult(
+                disposition="received",
+                code="program_run_received",
+                execution_control_revision=7,
+                current_identity=None,
+            ),
+            {"accepted": True},
+        )
+
+    ingress = ExecutionControlIngress(
+        projection=slow_projection,
+        dispatch=dispatch,
+        application_start_id=APPLICATION_START_ID,
+        authority=authority,
+        clock_ns=clock,
+    )
+
+    def command() -> ExecutionCommandRequestDTO:
+        freshness = authority.issue(execution_control_revision=7)
+        return ExecutionCommandRequestDTO.model_validate(
+            {
+                "command_envelope": {
+                    "schema_version": EXECUTION_COMMAND_SCHEMA,
+                    "command_kind": "program_run",
+                    "source_label": "test",
+                    "control_session_number": None,
+                    "client_sequence": None,
+                    "freshness": freshness.model_dump(mode="json"),
+                    "expected_execution_control_revision": 7,
+                },
+                "payload": {},
+            }
+        )
+
+    async def exercise():
+        results: dict[str, Any] = {}
+        # Received by Headless 749 ms after issue.
+        request = command()
+        clock.now_ns += 749_000_000
+        results["in_time"] = await ingress.submit(request, transport_kind="rest")
+        # Received by Composer 700 ms after issue, forwarded and received by
+        # Headless 300 ms later.
+        request = command()
+        forwarded = clock.now_ns + 700_000_000
+        clock.now_ns += 1_000_000_000
+        results["forwarded_in_time"] = await ingress.submit(
+            request, transport_kind="rest", received_monotonic_ns=forwarded
+        )
+        # Received by Headless 751 ms after issue.
+        request = command()
+        clock.now_ns += 751_000_000
+        with pytest.raises(ControlProtocolError) as late:
+            await ingress.submit(request, transport_kind="rest")
+        results["late"] = late.value.code
+        # Received by Composer 751 ms after issue.
+        request = command()
+        forwarded = clock.now_ns + 751_000_000
+        with pytest.raises(ControlProtocolError) as late:
+            await ingress.submit(
+                request, transport_kind="rest", received_monotonic_ns=forwarded
+            )
+        results["forwarded_late"] = late.value.code
+        return results
+
+    try:
+        results = asyncio.run(exercise())
+    finally:
+        ingress.close()
+
+    assert results["in_time"].receipt.disposition == "received"
+    assert results["forwarded_in_time"].receipt.disposition == "received"
+    assert results["late"] == "control_freshness_expired"
+    assert results["forwarded_late"] == "control_freshness_expired"
+    assert len(stamps) == 2
+
+
 def test_stop_is_stamped_at_lane_admission_without_a_program_projection_read() -> None:
     clock = _Clock()
     projection_calls = 0
@@ -560,7 +652,7 @@ def test_idle_manual_gripper_start_during_cell_stop_forwards_exact_native_decisi
     forwarded = submitted[0][0].model_dump(mode="json")
     assert forwarded["participants"] == payload["participants"]
     for key in (
-        "program_id", "program_revision", "program_binding_id", "program_run_id",
+        "program_revision", "program_binding_id", "program_run_id",
         "expected_graph_revision", "expected_retained_bundle_id", "expected_scene_revision",
     ):
         assert forwarded[key] == payload[key]

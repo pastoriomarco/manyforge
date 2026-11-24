@@ -25,6 +25,7 @@ TOOLS = {
     "xarm_gripper": "ufactory.xarm_gripper",
     "robotiq_2f_140": "robotiq.robotiq_2f_140",
     "robotiq_2f_85": "robotiq.robotiq_2f_85",
+    "passive_tool": "manyforge.passive_tool",
 }
 RUNNABLE = tuple(ROBOTS)
 IO = ROOT / "components/io_device/manyforge.mock_pneumatic_gripper_io"
@@ -254,6 +255,9 @@ def test_curated_mock_rows_name_their_adapter_and_controllers() -> None:
     for name in (*ROBOTS, *TOOLS):
         folder = _robot(name)
         data = yaml.safe_load((folder / descriptor.DESCRIPTOR).read_text(encoding="utf-8"))
+        if descriptor.is_passive_tool(data):
+            assert data["lanes"] == {}  # nothing to drive (OD-336)
+            continue
         row = data["lanes"]["mock"]
         assert row["adapter"] == "mock"
         assert ("arrival_tolerance_rad" in row) == (name in ROBOTS)
@@ -354,6 +358,11 @@ def _set(path: str, value):
          "component_joint_count_mismatch", "has 5 values for 6 arm joints"),
         (_set("defaults.maximum_tcp_linear_speed_mps", 0.9), "component_limit_exceeded",
          "0.9 exceeds limits.max_tcp_linear_speed_mps 0.5"),
+        (_set("defaults", None), "component_manifest_invalid", "is missing defaults"),
+        (_set("defaults.controlled_stop_max_deceleration_rad_s2", None),
+         "component_manifest_invalid", "defaults: is missing controlled_stop_max_deceleration_rad_s2"),
+        (_set("defaults.controlled_stop_max_deceleration_rad_s2", 0.0),
+         "component_manifest_invalid", "must be a positive number"),
     ],
 )
 def test_broken_descriptors_give_one_clear_line(
@@ -470,8 +479,16 @@ def test_the_sources_checker_accepts_what_register_writes(tmp_path: Path) -> Non
          "component_manifest_invalid", "lanes.mock: is missing controller"),
         (_set("gripper.command_duration_s", None), "component_manifest_invalid",
          "a pneumatic gripper needs command_duration_s"),
-        (_set("gripper.touch_links", None), "component_manifest_invalid",
-         "gripper: is missing touch_links"),
+        (_set("gripper.grip_body", None), "component_manifest_invalid",
+         "gripper: is missing grip_body"),
+        (_set("gripper.grip_body", "gripper_shell"), "component_manifest_invalid",
+         "gripper.grip_body: 'gripper_shell' is not a roles.collision_bodies role"),
+        (_set("gripper.touch_links", ["lite_gripper_base_link"]), "component_manifest_invalid",
+         "gripper: has unknown"),
+        (_set("tcps.0.contact_bodies", ["gripper_pads"]), "component_manifest_invalid",
+         "tcps[0].contact_bodies: 'gripper_pads' is not a roles.collision_bodies role"),
+        (_set("tcps.0.contact_bodies", "gripper_fingers"), "component_manifest_invalid",
+         "tcps[0].contact_bodies: must be a list of collision body names"),
         (_set("model.srdf", None), "component_manifest_invalid", "model: is missing srdf"),
         (_set("mount.frame", "lite_gripper_mountx"), "component_role_unknown_link",
          "mount.frame: link 'lite_gripper_mountx' is not in lite_gripper.urdf"),
@@ -825,6 +842,196 @@ def test_mounted_tool_scenario_checks_registered_model_source(
     assert any(message in error.message for error in report.errors)
 
 
+# --- the generic passive tool (OD-336) -----------------------------------
+
+
+def test_the_passive_tool_has_mount_and_tcp_only_and_names_no_lane() -> None:
+    report, loaded = descriptor.check(ROOT, _tool("passive_tool"))
+    assert report.errors == []
+    assert descriptor.is_passive_tool(loaded.data)
+    family = _family(ROOT, "passive_tool")
+    semantics = family["semantics"]
+    assert {row["frame_role_id"]: row["source_link_name"]
+            for row in semantics["frame_role_bindings"]} == {
+        "mount": "passive_tool_mount", "tcp": "passive_tool_tcp"}
+    assert semantics["model_group_role_bindings"] == []
+    assert semantics["resource_role_bindings"] == []
+    # The optional tip (OD-352 A1), bound to the placeholder's tip ball.
+    assert semantics["collision_body_role_bindings"] == [
+        {"collision_body_role_id": "tip", "source_link_names": ["passive_tool_tip"]}]
+    assert loaded.data["roles"]["optional_collision_bodies"] == ["tip"]
+    assert semantics["root_frame_role_id"] == "mount"
+    # Its folder is its own package (`model.package_name`).
+    assert family["source"]["accepted_package_uri_prefix"] == "package://passive_tool/"
+    assert family["source"]["resource_root"] == "manyforge_example_models/models/passive_tool"
+    # Nothing to drive: its components name no lane, on every lane.
+    assert descriptor._runtime(loaded.data) == {
+        "modelFamilyId": "passive_tool",
+        "componentProfileId": "manyforge.passive_tool",
+        "lanes": ["lane_free"],
+    }
+
+
+def test_a_model_folder_named_after_its_package_is_that_package(tmp_path: Path) -> None:
+    # `model.package_name: passive_tool` in the folder `passive_tool`: mesh
+    # URIs `package://passive_tool/...` resolve in the folder itself.
+    root = _workspace(tmp_path, "passive_tool")
+    folder = _tool("passive_tool", root)
+    (folder / "meshes").mkdir()
+    (folder / "meshes" / "body.stl").write_bytes(b"solid body\nendsolid body\n")
+    urdf = folder / "passive_tool.urdf"
+    urdf.write_text(urdf.read_text(encoding="utf-8").replace(
+        '<cylinder radius="0.025" length="0.1"/>',
+        '<mesh filename="package://passive_tool/meshes/body.stl"/>', 1), encoding="utf-8")
+    report, _loaded = descriptor.check(root, folder)
+    assert report.errors == []
+    row = descriptor.family_row(root, descriptor.load_descriptor(root, folder, descriptor.Report()))
+    assert row["source"]["accepted_package_uri_prefix"] == "package://passive_tool/"
+    assert row["source"]["resource_root"] == "manyforge_example_models/models/passive_tool"
+    (folder / "meshes" / "body.stl").unlink()
+    assert "component_mesh_unresolved" in _codes(descriptor.check(root, folder)[0])
+
+
+@pytest.mark.parametrize(
+    ("change", "code", "text"),
+    [
+        (_set("lanes", {"mock": {"adapter": "mock", "controller": "c",
+                                 "controllers_file": "passive_tool.srdf"}}),
+         "component_lane_invalid", "a passive tool (no gripper section) runs no controller"),
+        (_set("lanes", None), "component_lane_invalid", "declare `lanes: {}`"),
+        (_set("roles", {"groups": {"tool": "passive_tool"}}),
+         "component_manifest_invalid", "roles.groups: a passive tool"),
+        (_set("roles.optional_collision_bodies", ["pad"]),
+         "component_manifest_invalid", "'pad' is not a roles.collision_bodies role"),
+    ],
+)
+def test_a_passive_tool_has_no_lanes_joints_or_groups(
+    tmp_path: Path, change, code: str, text: str
+) -> None:
+    root = _workspace(tmp_path, "passive_tool")
+    folder = _tool("passive_tool", root)
+    _edit(folder, change)
+    report, _loaded = descriptor.check(root, folder)
+    assert code in _codes(report)
+    assert any(text in error.line() for error in report.errors if error.code == code)
+
+
+def _passive_tool_scenario(tmp_path: Path, lane: str | None = None) -> Path:
+    """lite6_robot (Mock) with the passive tool on its flange, from the
+    project's own URDF and mesh in its folder `tool/` (package `passive_tool`)."""
+    scenario = _scenario(tmp_path / "ws" / "examples", "lite6")
+    model = scenario / "tool"
+    (model / "meshes").mkdir(parents=True)
+    (model / "meshes" / "body.stl").write_bytes(b"solid body\nendsolid body\n")
+    (model / "holder.urdf").write_text(
+        '<robot name="holder"><link name="passive_tool_mount"/>'
+        '<joint name="fix" type="fixed"><parent link="passive_tool_mount"/>'
+        '<child link="holder_body"/></joint><link name="holder_body"><visual><geometry>'
+        '<mesh filename="package://passive_tool/meshes/body.stl"/>'
+        '</geometry></visual></link><joint name="tcp_fix" type="fixed">'
+        '<parent link="holder_body"/><child link="passive_tool_tcp"/>'
+        '<origin xyz="0 0 0.15" rpy="0 0 0"/></joint><link name="passive_tool_tcp"/></robot>',
+        encoding="utf-8",
+    )
+    path = scenario / "deployment.yaml"
+    deployment = yaml.safe_load(path.read_text(encoding="utf-8"))
+    deployment["components"].append({
+        "component_id": "holder",
+        "component_profile_id": "manyforge.passive_tool",
+        **({} if lane is None else {"lane": lane}),
+        "model_source": {
+            "urdf": {"project_path": "tool/holder.urdf"},
+            "package_roots": {"passive_tool": {"project_path": "tool"}},
+        },
+        "configuration": {"runtime_configuration": {"component_streams": []},
+                          "runtime_kind": "ros2_control"},
+        "target_settings": {},
+    })
+    deployment["attachments"] = [{
+        "parent": {"component_id": "lite6_robot", "interface": "flange"},
+        "child": {"component_id": "holder", "interface": "mount"},
+    }]
+    path.write_text(yaml.safe_dump(deployment), encoding="utf-8")
+    return scenario
+
+
+def test_a_passive_tool_component_takes_the_projects_own_model(tmp_path: Path) -> None:
+    root = _workspace(tmp_path, "lite6", "passive_tool")
+    scenario = _passive_tool_scenario(tmp_path)
+    report, _loaded = descriptor.check(root, _tool("passive_tool", root), scenario)
+    assert report.errors == []
+    assert any("mounted and agree" in note for note in report.notes)
+
+
+def _parameter_file_scenario(tmp_path: Path, model_source: dict,
+                             profile: str = "manyforge.tool") -> Path:
+    """The holder scenario with a Tool from parameters (OD-357): the probe's
+    parameters, inline or as a file in the project."""
+    scenario = _passive_tool_scenario(tmp_path)
+    shutil.copy(ROOT / "manyforge_example_models/models/tool/probe.tool.yaml",
+                scenario / "tool" / "probe.tool.yaml")
+    path = scenario / "deployment.yaml"
+    deployment = yaml.safe_load(path.read_text(encoding="utf-8"))
+    deployment["components"][-1]["component_profile_id"] = profile
+    deployment["components"][-1]["model_source"] = model_source
+    path.write_text(yaml.safe_dump(deployment), encoding="utf-8")
+    return scenario
+
+
+def _probe_parameters() -> dict:
+    return yaml.safe_load(
+        (ROOT / "manyforge_example_models/models/tool/probe.tool.yaml").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("model_source", [
+    {"parameters": {"project_path": "tool/probe.tool.yaml"}},
+    {"parameters": _probe_parameters()},
+])
+def test_a_tool_component_takes_its_parameters(tmp_path: Path, model_source: dict) -> None:
+    # OD-357: `model_source.parameters` (a file, or inline) in place of urdf,
+    # srdf and package roots; Load checks its wiring rows.
+    root = _workspace(tmp_path, "lite6", "tool")
+    scenario = _parameter_file_scenario(tmp_path, model_source)
+    report, _loaded = descriptor.check(root, _tool("tool", root), scenario)
+    assert report.errors == []
+
+
+def test_parameters_are_only_for_the_tool_model(tmp_path: Path) -> None:
+    root = _workspace(tmp_path, "lite6", "passive_tool")
+    scenario = _parameter_file_scenario(
+        tmp_path, {"parameters": {"project_path": "tool/probe.tool.yaml"}},
+        profile="manyforge.passive_tool")
+    report, _loaded = descriptor.check(root, _tool("passive_tool", root), scenario)
+    assert any("only for the Tool model" in error.message for error in report.errors)
+
+
+@pytest.mark.parametrize(
+    ("model_source", "text"),
+    [
+        ({"parameters": {"project_path": "tool/probe.tool.yaml"},
+          "package_roots": {}}, "its parameters only"),
+        ({"parameters": {"path": "tool/probe.tool.yaml"}},
+         "neither inline parameters nor a Deployment source reference"),
+        ({"urdf": {"project_path": "tool/holder.urdf"}, "package_roots": {}},
+         "its parameters only"),
+    ],
+)
+def test_a_tool_row_has_the_parameters_alone(
+    tmp_path: Path, model_source: dict, text: str
+) -> None:
+    root = _workspace(tmp_path, "lite6", "tool")
+    scenario = _parameter_file_scenario(tmp_path, model_source)
+    report, _loaded = descriptor.check(root, _tool("tool", root), scenario)
+    assert any(text in error.message for error in report.errors), report.errors
+
+
+def test_a_passive_tool_component_names_no_lane(tmp_path: Path) -> None:
+    root = _workspace(tmp_path, "lite6", "passive_tool")
+    scenario = _passive_tool_scenario(tmp_path, lane="mock")
+    report, _loaded = descriptor.check(root, _tool("passive_tool", root), scenario)
+    assert "component_lane_invalid" in _codes(report)
+
+
 def _second_tool_on_the_same_flange(deployment: dict) -> None:
     second = copy.deepcopy(_tool_component(deployment))
     second["component_id"] = "lite_gripper_b"
@@ -989,6 +1196,7 @@ def test_curated_list() -> None:
         "componentProfileId": "ufactory.lite_gripper",
         "lanes": ["isaac", "lane_free", "mock"],
     }
+    assert entries["manyforge.passive_tool"]["runtime"]["lanes"] == ["lane_free"]
     io = entries["manyforge.mock_pneumatic_gripper_io"]
     assert io["addable"] and io["runtime"] == {"componentProfileId": "io_device_v0"}
     assert [entry["kind"] for entry in listing["components"]] == sorted(
@@ -1050,6 +1258,72 @@ def test_command_line(tmp_path: Path, capsys) -> None:
     assert "nothing written" in capsys.readouterr().out
 
 
+def test_component_export_writes_the_generated_model(tmp_path: Path, capsys) -> None:
+    # OD-352: the same URDF and SRDF bytes Load generates from the file.
+    from manyforge_behavior import parametric_tool  # noqa: PLC0415
+
+    source = ROOT / "manyforge_example_models/models/tool/probe.tool.yaml"
+    out = tmp_path / "generated"
+    assert cli.main(["export", str(source), str(out)]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"wrote: {out / 'tool.urdf'}", f"wrote: {out / 'tool.srdf'}"]
+    expected = parametric_tool.generate(
+        parametric_tool.load_parameters(source.read_bytes(), source=str(source)), {})
+    assert (out / "tool.urdf").read_bytes() == expected.urdf
+    assert (out / "tool.srdf").read_bytes() == expected.srdf
+
+    only = tmp_path / "only"
+    assert cli.main(["export", str(source), str(only), "--format", "srdf"]) == 0
+    assert sorted(path.name for path in only.iterdir()) == ["tool.srdf"]
+    capsys.readouterr()
+
+    usd = tmp_path / "usd"
+    assert cli.main(["export", str(source), str(usd), "--format", "usda"]) == 1
+    assert "[parametric_tool_export_format_unsupported]" in capsys.readouterr().out
+    assert not usd.exists()
+
+    broken = tmp_path / "broken.tool.yaml"
+    broken.write_text(source.read_text(encoding="utf-8").replace(
+        "kind: tool", "kind: gripper"), encoding="utf-8")
+    assert cli.main(["export", str(broken), str(tmp_path / "x")]) == 1
+    assert "[parametric_tool_kind_unsupported]" in capsys.readouterr().out
+
+
+def test_component_export_names_meshes_relative_to_the_output(tmp_path: Path, capsys) -> None:
+    # OD-364: a mesh path may leave the parameter file's folder; the exported
+    # URDF names the mesh where it is, relative to the output folder.
+    source = ROOT / "manyforge_example_models/models/tool/probe.tool.yaml"
+    (tmp_path / "tool").mkdir()
+    (tmp_path / "meshes").mkdir()
+    (tmp_path / "meshes" / "housing.stl").write_bytes(b"solid housing\n")
+    parameters = tmp_path / "tool" / "probe.tool.yaml"
+    parameters.write_text(source.read_text(encoding="utf-8").replace(
+        "body:\n", "body:\n  - {name: shell, visual: {mesh: {path: ../meshes/housing.stl}}, "
+        "collision: {box: {size_m: [0.01, 0.01, 0.01]}}}\n", 1), encoding="utf-8")
+    out = tmp_path / "out" / "generated"
+    assert cli.main(["export", str(parameters), str(out)]) == 0
+    capsys.readouterr()
+    assert b'filename="../../meshes/housing.stl"' in (out / "tool.urdf").read_bytes()
+
+    (tmp_path / "meshes" / "housing.stl").unlink()
+    assert cli.main(["export", str(parameters), str(out)]) == 1
+    assert "[parametric_tool_mesh_unavailable]" in capsys.readouterr().out
+
+
+def test_component_export_writes_a_chained_tool(tmp_path: Path, capsys) -> None:
+    from manyforge_behavior import parametric_tool  # noqa: PLC0415
+
+    source = ROOT / "manyforge_example_models/models/tool/dual_jaw_gripper.tool.yaml"
+    out = tmp_path / "generated"
+    assert cli.main(["export", str(source), str(out)]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"wrote: {out / 'tool.urdf'}", f"wrote: {out / 'tool.srdf'}"]
+    expected = parametric_tool.generate(
+        parametric_tool.load_parameters(source.read_bytes(), source=str(source)), {})
+    assert (out / "tool.urdf").read_bytes() == expected.urdf
+    assert (out / "tool.srdf").read_bytes() == expected.srdf
+
+
 # --- machines and model-form I/O devices (owners and members) ----------
 
 
@@ -1083,17 +1357,71 @@ def test_robot_models_declare_no_io_rows() -> None:
         assert "io" not in data["lanes"]["real"]
 
 
-def test_model_form_io_device_refuses_providers_and_unknown_banks(tmp_path: Path) -> None:
+def test_model_form_io_device_refuses_providers_and_leaves_lane_keys_to_the_family(
+    tmp_path: Path,
+) -> None:
     folder = tmp_path / "io"
     shutil.copytree(ROOT / "components/io_device/ufactory.lite6_tool_io", folder)
     _edit(folder, lambda data: data["signals"][0].update(provider={"profile": "mock"}))
-    _edit(folder, lambda data: data["lanes"]["real"].update(bank="box"))
+    # The family's keys are opaque here (its family checks them at Apply), but scalar.
+    _edit(folder, lambda data: data["lanes"]["real"].update(bank="box", extra={"a": 1}))
     _edit(folder, lambda data: data["lanes"]["real"].update(input_maximum_age_ms=0))
     lines = [error.line() for error in descriptor.check(ROOT, folder)[0].errors]
     assert any("signals[0]: has unknown fields provider" in line for line in lines)
-    assert any("lanes.real.bank: must be one of controller, tool" in line for line in lines)
+    assert not any("lanes.real.bank" in line for line in lines)
+    assert any("lanes.real.extra: must be a scalar" in line for line in lines)
     assert any("lanes.real.input_maximum_age_ms: must be a positive number" in line
                for line in lines)
+
+
+def test_the_shipped_io_bank_model_passes_with_an_index_per_signal() -> None:
+    folder = ROOT / "components/io_device/manyforge.io_bank_64x64"
+    report, loaded = descriptor.check(ROOT, folder)
+    assert report.errors == [] and loaded is not None
+    assert descriptor.is_io_model_form(loaded.data)
+    assert loaded.data["lanes"]["real"] == {
+        "adapter": "ros_io_bank", "rate_hz": 200, "input_maximum_age_ms": 50}
+    for direction, prefix in (("input", "I"), ("output", "Q")):
+        signals = [row for row in loaded.data["signals"] if row["direction"] == direction]
+        assert [(row["signal_name"], row["index"]) for row in signals] == [
+            (f"{prefix}{index}", index) for index in range(64)]
+
+
+def test_a_signal_index_is_optional_whole_and_unique_per_direction(tmp_path: Path) -> None:
+    folder = tmp_path / "io"
+    shutil.copytree(ROOT / "components/io_device/manyforge.io_bank_64x64", folder)
+
+    def edit(data):
+        data["signals"][1]["index"] = 0      # I1 repeats I0's index
+        data["signals"][2]["index"] = -1
+        data["signals"][3]["index"] = 1.5
+        data["signals"][4]["index"] = True
+        del data["signals"][5]["index"]      # optional in the shared format
+        data["signals"][64]["index"] = 0     # Q0: inputs and outputs count apart
+
+    _edit(folder, edit)
+    lines = [error.line() for error in descriptor.check(ROOT, folder)[0].errors]
+    assert any("signals[1].index: 0 is used by another input" in line for line in lines)
+    for index in (2, 3, 4):
+        assert any(f"signals[{index}].index: must be a whole number" in line for line in lines)
+    assert not any("signals[5]" in line or "signals[64]" in line for line in lines)
+    # Provider form has no index.
+    folder = tmp_path / "provider"
+    shutil.copytree(ROOT / "components/io_device/manyforge.mock_pneumatic_gripper_io", folder)
+    _edit(folder, lambda data: data["signals"][0].update(index=0))
+    lines = [error.line() for error in descriptor.check(ROOT, folder)[0].errors]
+    assert any("signals[0]: has unknown fields index" in line for line in lines)
+
+
+def test_a_version_1_descriptor_is_still_read(tmp_path: Path) -> None:
+    folder = tmp_path / "io"
+    shutil.copytree(ROOT / "components/io_device/ufactory.lite6_tool_io", folder)
+    _edit(folder, _set("api_version", "manyforge.component_package.v1"))
+    lines = [error.line() for error in descriptor.check(ROOT, folder)[0].errors]
+    assert not any("api_version" in line for line in lines)
+    _edit(folder, _set("api_version", "manyforge.component_package.v3"))
+    lines = [error.line() for error in descriptor.check(ROOT, folder)[0].errors]
+    assert any("api_version: must be one of" in line for line in lines)
 
 
 def test_machine_members_name_curated_member_models(tmp_path: Path) -> None:

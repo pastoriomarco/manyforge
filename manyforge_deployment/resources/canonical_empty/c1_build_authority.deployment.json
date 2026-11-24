@@ -1,1 +1,18 @@
-{"api_version":"manyforge.deployment.v1","capability_provider_bindings":[],"catalogs":{"records":[]},"cell_id":"c1_build_authority_cell","deployment_artifact_id":"c1_build_authority","deployment_revision":"sha256:7b1480ba7bc20044f194dbbcc48f0f1d08fe16b469a46ca79b7c409419d11f2d","desired_control_configurations":[],"graph":{"component_attachments":[],"control_bindings":[],"control_domains":[],"controllable_components":[],"model_instances":[],"runtime_units":[]},"name":"C1 build authority"}
+{
+  "api_version": "manyforge.deployment.v1",
+  "capability_provider_bindings": [],
+  "catalogs": {
+    "records": []
+  },
+  "cell_id": "c1_build_authority_cell",
+  "deployment_revision": "sha256:2b2ddbd2632ac30ce1ef06b528e84815678c36ff83496feb011d99ea54826f41",
+  "desired_control_configurations": [],
+  "graph": {
+    "component_attachments": [],
+    "control_bindings": [],
+    "control_domains": [],
+    "controllable_components": [],
+    "model_instances": [],
+    "runtime_units": []
+  }
+}

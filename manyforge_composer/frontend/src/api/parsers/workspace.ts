@@ -17,6 +17,7 @@ import type {
   ScenarioDocumentExportResponse,
   ScenarioDocumentIndexResponse,
   ScenarioDocumentSaveResponse,
+  ToolReplacementResponse,
 } from '../../types/api';
 import type { AuthoringWorkspaceContainment, AuthoringWorkspaceIdentity } from '../../types/headless';
 import { parseProgramBindingTransport, ProgramBindingTransportError } from '../programBindingTransport.generated';
@@ -707,7 +708,7 @@ export function parseDeploymentWorkspaceResponse(
   }
   const draftRecord = objectAt(record.draft, `${path}.draft`);
   exactKeysAt(draftRecord, [
-    'id', 'revision', 'document', 'deploymentArtifactId',
+    'id', 'revision', 'document',
     'deploymentRevision', 'graphRevision', 'differsFromSaved',
   ], `${path}.draft`);
   const authoringWorkspace = parseWorkspaceResponseIdentity(record.authoringWorkspace);
@@ -718,10 +719,6 @@ export function parseDeploymentWorkspaceResponse(
   const document = draftRecord.document === null
     ? null
     : jsonRecordAt(draftRecord.document, `${path}.draft.document`);
-  const deploymentArtifactId = nullableStringAt(
-    draftRecord.deploymentArtifactId,
-    `${path}.draft.deploymentArtifactId`,
-  );
   const deploymentRevision = draftRecord.deploymentRevision === null
     ? null
     : digestAt(draftRecord.deploymentRevision, `${path}.draft.deploymentRevision`);
@@ -729,16 +726,13 @@ export function parseDeploymentWorkspaceResponse(
     ? null
     : digestAt(draftRecord.graphRevision, `${path}.draft.graphRevision`);
   const missingDraftIdentities = [
-    deploymentArtifactId,
     deploymentRevision,
     graphRevision,
   ].filter((identity) => identity === null).length;
-  const authoredIntent = document?.api_version === 'manyforge.deployment_intent.v2';
+  const authoredIntent = document?.api_version === 'manyforge.deployment_intent.v3';
   if (
-    (document === null && missingDraftIdentities !== 3)
+    ((document === null || authoredIntent) && missingDraftIdentities !== 2)
     || (document !== null && !authoredIntent && missingDraftIdentities !== 0)
-    || (authoredIntent && (deploymentArtifactId === null
-      || deploymentRevision !== null || graphRevision !== null))
   ) {
     return fail(`${path}.draft`, 'complete identities exactly when a document is loaded');
   }
@@ -746,17 +740,13 @@ export function parseDeploymentWorkspaceResponse(
     // Source-referenced authoring intent has no compiler-issued identities.
     // Those belong to the prepared activation, never to the mutable Draft.
     allowedKeysAt(document,
-      ['api_version', 'deployment_artifact_id', 'name',
-        'components', 'attachments', 'policies'],
-      ['description', 'assistant_profile_id', 'assistant_model_components', 'compatibility'],
+      ['api_version', 'components', 'attachments', 'collision_rules', 'policies'],
+      ['assistant_profile_id', 'assistant_model_components', 'compatibility'],
       `${path}.draft.document`);
-    if (stringAt(document.deployment_artifact_id,
-      `${path}.draft.document.deployment_artifact_id`) !== deploymentArtifactId) {
-      return fail(`${path}.draft`, 'one exact authored Deployment identity');
-    }
-    stringAt(document.name, `${path}.draft.document.name`);
     boundedArrayAt(document.components, `${path}.draft.document.components`, 4096);
     boundedArrayAt(document.attachments, `${path}.draft.document.attachments`, 4096);
+    // The cell's collision rules; the first row is the rule without selections.
+    boundedArrayAt(document.collision_rules, `${path}.draft.document.collision_rules`, 64);
     objectAt(document.policies, `${path}.draft.document.policies`);
   } else if (document !== null) {
     const apiVersion = stringAt(
@@ -769,10 +759,6 @@ export function parseDeploymentWorkspaceResponse(
     objectAt(document.graph, `${path}.draft.document.graph`);
     if (
       apiVersion !== 'manyforge.deployment.v1'
-      || stringAt(
-        document.deployment_artifact_id,
-        `${path}.draft.document.deployment_artifact_id`,
-      ) !== deploymentArtifactId
       || digestAt(
         document.deployment_revision,
         `${path}.draft.document.deployment_revision`,
@@ -863,8 +849,8 @@ export function parseDeploymentWorkspaceResponse(
     const candidatePath = `${path}.${field}[${index}]`;
     const row = objectAt(candidate, candidatePath);
     exactKeysAt(row, [
-      'scenarioId', 'sourceDocumentDigest', 'deploymentArtifactId',
-      'deploymentRevision', 'retainedBundleId', 'programId',
+      'scenarioId', 'sourceDocumentDigest',
+      'deploymentRevision', 'retainedBundleId',
       'programRevision', 'programBindingId', 'description',
     ], candidatePath);
     return {
@@ -872,10 +858,6 @@ export function parseDeploymentWorkspaceResponse(
       sourceDocumentDigest: digestAt(
         row.sourceDocumentDigest,
         `${candidatePath}.sourceDocumentDigest`,
-      ),
-      deploymentArtifactId: stringAt(
-        row.deploymentArtifactId,
-        `${candidatePath}.deploymentArtifactId`,
       ),
       deploymentRevision: digestAt(
         row.deploymentRevision,
@@ -885,7 +867,6 @@ export function parseDeploymentWorkspaceResponse(
         row.retainedBundleId,
         `${candidatePath}.retainedBundleId`,
       ),
-      programId: stringAt(row.programId, `${candidatePath}.programId`),
       programRevision: digestAt(
         row.programRevision,
         `${candidatePath}.programRevision`,
@@ -911,10 +892,7 @@ export function parseDeploymentWorkspaceResponse(
       return fail(`${path}.scenarioCandidates`, 'unique Scenario identities');
     }
     scenarioIds.add(candidate.scenarioId);
-    if (
-      candidate.deploymentArtifactId !== deploymentArtifactId
-      || candidate.deploymentRevision !== deploymentRevision
-    ) {
+    if (candidate.deploymentRevision !== deploymentRevision) {
       return fail(
         `${path}.scenarioCandidates`,
         'only exact matches for the current Deployment Draft',
@@ -949,7 +927,6 @@ export function parseDeploymentWorkspaceResponse(
       id: stringAt(draftRecord.id, `${path}.draft.id`),
       revision: integerAt(draftRecord.revision, `${path}.draft.revision`),
       document,
-      deploymentArtifactId,
       deploymentRevision,
       graphRevision,
       differsFromSaved: booleanAt(
@@ -975,6 +952,41 @@ export function parseDeploymentWorkspaceResponse(
       record.unavailableReasons,
       `${path}.unavailableReasons`,
     ),
+  };
+}
+
+export function parseToolReplacementResponse(value: unknown): ToolReplacementResponse {
+  const path = 'toolReplacement';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['schemaVersion', 'workspace', 'replacement'], path);
+  if (record.schemaVersion !== 'manyforge.composer_tool_replacement.v1') {
+    return fail(`${path}.schemaVersion`, 'the supported tool replacement version');
+  }
+  const replacement = objectAt(record.replacement, `${path}.replacement`);
+  exactKeysAt(replacement, [
+    'componentId', 'replacementComponentId', 'programReferences', 'lacks',
+  ], `${path}.replacement`);
+  const lacks = replacement.lacks === null ? null : objectAt(replacement.lacks, `${path}.replacement.lacks`);
+  if (lacks !== null) {
+    exactKeysAt(lacks, ['commandTargets', 'frames', 'collisionBodies'], `${path}.replacement.lacks`);
+  }
+  return {
+    schemaVersion: 'manyforge.composer_tool_replacement.v1',
+    workspace: parseDeploymentWorkspaceResponse(record.workspace),
+    replacement: {
+      componentId: stringAt(replacement.componentId, `${path}.replacement.componentId`),
+      replacementComponentId: stringAt(
+        replacement.replacementComponentId, `${path}.replacement.replacementComponentId`,
+      ),
+      programReferences: integerAt(
+        replacement.programReferences, `${path}.replacement.programReferences`,
+      ),
+      lacks: lacks === null ? null : {
+        commandTargets: stringArrayAt(lacks.commandTargets, `${path}.replacement.lacks.commandTargets`),
+        frames: stringArrayAt(lacks.frames, `${path}.replacement.lacks.frames`),
+        collisionBodies: stringArrayAt(lacks.collisionBodies, `${path}.replacement.lacks.collisionBodies`),
+      },
+    },
   };
 }
 
@@ -1015,11 +1027,9 @@ export function parseCurrentScenarioResponse(value: unknown): CurrentScenarioRes
   exactKeysAt(current, [
     'scenario_id',
     'source_document_digest',
-    'deployment_artifact_id',
     'deployment_revision',
     'retained_bundle_id',
     'graph_revision',
-    'program_id',
     'program_revision',
     'program_binding_id',
   ], `${path}.current_scenario`);
@@ -1031,10 +1041,6 @@ export function parseCurrentScenarioResponse(value: unknown): CurrentScenarioRes
       sourceDocumentDigest: digestAt(
         current.source_document_digest,
         `${path}.current_scenario.source_document_digest`,
-      ),
-      deploymentArtifactId: stringAt(
-        current.deployment_artifact_id,
-        `${path}.current_scenario.deployment_artifact_id`,
       ),
       deploymentRevision: digestAt(
         current.deployment_revision,
@@ -1048,7 +1054,6 @@ export function parseCurrentScenarioResponse(value: unknown): CurrentScenarioRes
         current.graph_revision,
         `${path}.current_scenario.graph_revision`,
       ),
-      programId: stringAt(current.program_id, `${path}.current_scenario.program_id`),
       programRevision: digestAt(
         current.program_revision,
         `${path}.current_scenario.program_revision`,
@@ -1071,7 +1076,6 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       'assistant_mode',
       'assistant_projection',
       'baseline_program_binding_id',
-      'deployment_artifact_id',
       'deployment_revision',
       'graph_revision',
       'node_environment_digest',
@@ -1081,7 +1085,6 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       'program_binding',
       'program_frame_facts',
       'program_binding_id',
-      'program_id',
       'program_revision',
       'project_path',
       'retained_bundle_id',
@@ -1138,7 +1141,6 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     record.baseline_program_binding_id,
     `${path}.baseline_program_binding_id`,
   );
-  stringAt(record.deployment_artifact_id, `${path}.deployment_artifact_id`);
   digestAt(record.deployment_revision, `${path}.deployment_revision`);
   digestAt(record.preparation_digest, `${path}.preparation_digest`);
   const program = parseProgramDocument(record.program, `${path}.program`);
@@ -1167,7 +1169,6 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     source.semantic_content_digest,
     `${path}.source.semantic_content_digest`,
   );
-  const programId = stringAt(record.program_id, `${path}.program_id`);
   const programRevision = digestAt(
     record.program_revision,
     `${path}.program_revision`,
@@ -1189,9 +1190,7 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     `${path}.node_environment_digest`,
   );
   if (
-    program.program_id !== programId
-    || program.program_revision !== programRevision
-    || programBinding.program_id !== programId
+    program.program_revision !== programRevision
     || programBinding.program_revision !== programRevision
     || programBinding.program_binding_id !== programBindingId
     || programBinding.retained_bundle_id !== retainedBundleId
@@ -1265,7 +1264,6 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       record.source_document_digest,
       `${path}.source_document_digest`,
     ),
-    programId,
     programRevision,
     programBindingId,
     retainedBundleId,

@@ -657,6 +657,54 @@ TEST(CellKinematicIndex, FindFramePathIsNoneOneOrAmbiguous) {
   EXPECT_NE(ambiguous.find_frame_path(paths.front().terminal_frame), nullptr);
 }
 
+// OD-372: a robot's kinematics places a frame of a component mounted on it
+// (directly or through a tool changer) unless a moving joint follows the
+// mount (a gripper jaw); never the robot's own frame or another robot's.
+TEST(CellKinematicIndex, PlacesMountedFrameOnlyRigidlyBelowTheRobot) {
+  const auto joint = [](std::string_view component, c::KinematicJointCoordinateKind kind) {
+    return c::KinematicFramePathSegmentDTO{c::KinematicModelJointPathSegmentDTO{
+        Id(component), Model(std::string(component) + ".model"), c::ModelRevision("1"), 0U, "j",
+        "j", "p", "c", kind, {}}};
+  };
+  const auto mount = [](std::string_view parent, std::string_view child) {
+    return c::KinematicFramePathSegmentDTO{c::KinematicComponentAttachmentPathSegmentDTO{
+        c::ComponentAttachmentId(std::string(child)), Id(parent), Id(child), "mount", "p", "c",
+        c::PlacementPoseDTO{}}};
+  };
+  const auto path = [](std::string_view component, std::string_view link,
+                       std::vector<c::KinematicFramePathSegmentDTO> segments) {
+    return c::KinematicFramePathDTO{
+        c::ResolvedComponentModelFrameDTO{Id(component), Model(std::string(component) + ".model"),
+                                          c::FrameRoleId(std::string(link)), std::string(link),
+                                          c::ModelRevision("1")},
+        std::move(segments)};
+  };
+  using Kind = c::KinematicJointCoordinateKind;
+  const auto rail = joint("base", Kind::kLinear);
+  const auto arm_joint = joint("arm", Kind::kAngular);
+  const std::vector<c::KinematicFramePathDTO> paths{
+      path("tool", "tool/holder_rod",
+           {rail, mount("base", "arm"), arm_joint, mount("arm", "tool"),
+            joint("tool", Kind::kFixed)}),
+      path("tool", "tool/jaw", {rail, mount("base", "arm"), arm_joint, mount("arm", "tool"),
+                                joint("tool", Kind::kLinear)}),
+      path("arm", "arm/flange", {rail, mount("base", "arm"), arm_joint}),
+  };
+  const d::CellKinematicIndex index(Chained(), paths);
+  EXPECT_TRUE(index.places_mounted_frame(Id("arm"), "tool/holder_rod"));
+  EXPECT_FALSE(index.places_mounted_frame(Id("base"), "tool/holder_rod"))
+      << "the arm's joints follow the rail's mount";
+  EXPECT_FALSE(index.places_mounted_frame(Id("arm"), "tool/jaw"));
+  EXPECT_FALSE(index.places_mounted_frame(Id("arm"), "arm/flange"));
+  EXPECT_FALSE(index.places_mounted_frame(Id("tool"), "tool/holder_rod"));
+  EXPECT_FALSE(index.places_mounted_frame(Id("arm"), "absent"));
+  // Through a tool changer.
+  EXPECT_TRUE(c::mounted_frame_placed_by(
+      path("gripper", "gripper/tcp",
+           {arm_joint, mount("arm", "changer"), mount("changer", "gripper")}),
+      Id("arm")));
+}
+
 // -- ancestors_of, default_tcp_of, end_effector_entry and the primary tool ---
 
 // The compiled `default_tcp` of one component row.

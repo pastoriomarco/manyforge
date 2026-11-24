@@ -140,11 +140,14 @@ struct RuntimeUnitDTO {
 /// like a descriptor offset frame: a generated massless link named
 /// `frame_role_id` fixed to `parent_link_name` at `pose_in_parent_link`.
 /// The parent is a source link or a descriptor offset frame, never another
-/// custom TCP.
+/// custom TCP. `contact_body_role_ids` are the collision bodies of its
+/// component that a contact rule on this TCP selects (sorted, unique; empty
+/// means none).
 struct ModelCustomTcpDTO {
   FrameRoleId frame_role_id;
   std::string parent_link_name;
   PlacementPoseDTO pose_in_parent_link;
+  std::vector<CollisionBodyRoleId> contact_body_role_ids{};
 
   friend bool operator==(const ModelCustomTcpDTO&, const ModelCustomTcpDTO&) = default;
 };

@@ -84,6 +84,7 @@ class ManagerPort(Protocol):
         request: SceneTransactionRequest,
         *,
         trusted_principal_id: str | None,
+        mesh_content_digest: str | None,
     ) -> dict[str, Any]: ...
 
     def scene_transaction_status(self, request: SceneTransactionRequest) -> dict[str, Any]: ...
@@ -94,13 +95,22 @@ class ManagerPort(Protocol):
     ) -> dict[str, Any]: ...
 
 
-def _transaction_body(request: SceneTransactionRequest) -> dict[str, Any]:
-    """Wire body; absent optional members stay absent, not null."""
+def _transaction_body(
+    request: SceneTransactionRequest, mesh_content_digest: str | None
+) -> dict[str, Any]:
+    """Wire body; absent optional members stay absent, not null.
+
+    ``mesh_content_digest`` is the captured content of an API scene call's
+    mesh (OD-335); without it the Manager fills the digest from the active
+    Apply's captured meshes.
+    """
 
     transaction = request.model_dump(mode="json")
+    if mesh_content_digest is not None:
+        transaction["operation"]["shape"]["mesh_content_digest"] = mesh_content_digest
     if transaction.get("program_node_evidence") is None:
         transaction.pop("program_node_evidence", None)
-    for optional in ("grasp_lost_bound", "on_grasp_lost", "mass_kg"):
+    for optional in ("grasp_lost_bound", "on_grasp_lost", "mass_kg", "carrier_component_id"):
         if transaction["operation"].get(optional, ...) is None:
             transaction["operation"].pop(optional)
     return transaction
@@ -327,7 +337,6 @@ class ManagerCommandClient:
             {
                 "api_version": MANAGER_COMMAND_VERSION,
                 "command": "deployment_candidate_preview",
-                "deployment_artifact_id": request.deployment_artifact_id,
                 "deployment_revision": request.deployment_revision,
                 "candidate_retained_bundle_id": request.candidate_retained_bundle_id,
                 "candidate_graph_revision": request.candidate_graph_revision,
@@ -347,7 +356,6 @@ class ManagerCommandClient:
                 "command": "apply",
                 "accepted_impact_digest": request.accepted_impact_digest,
                 "candidate_receipt": request.candidate_receipt.model_dump(),
-                "deployment_artifact_id": request.deployment_artifact_id,
                 "deployment_revision": request.deployment_revision,
                 "expected_current": request.expected_current.model_dump(),
                 "reject_if_affected_busy": request.reject_if_affected_busy,
@@ -595,6 +603,7 @@ class ManagerCommandClient:
         request: SceneTransactionRequest,
         *,
         trusted_principal_id: str | None,
+        mesh_content_digest: str | None,
     ) -> dict[str, Any]:
         if trusted_principal_id is not None and (
             not trusted_principal_id
@@ -615,7 +624,7 @@ class ManagerCommandClient:
             "principal_id": trusted_principal_id,
             "transport": "http",
         }
-        transaction = _transaction_body(request)
+        transaction = _transaction_body(request, mesh_content_digest)
         transaction["attribution"] = attribution
         response = self._exchange(
             {
@@ -628,7 +637,7 @@ class ManagerCommandClient:
         return response
 
     def scene_transaction_status(self, request: SceneTransactionRequest) -> dict[str, Any]:
-        transaction = _transaction_body(request)
+        transaction = _transaction_body(request, None)
         # Attribution is not mutation intent. Lookup performs no Scene write.
         transaction["attribution"] = {
             "assurance": "unverified", "principal_id": None, "transport": "http"}

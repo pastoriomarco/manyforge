@@ -29,6 +29,7 @@ from manyforge_behavior.node_availability import (
 from manyforge_behavior.failure_details import (
     FailureRecord,
     failure_origin,
+    failure_wire_fields,
 )
 from manyforge_behavior.node_environment import NodeEnvironment
 from manyforge_behavior.orchestration_ports import (
@@ -52,6 +53,7 @@ from manyforge_behavior.recovery import (
     RecoveryAwareNode,
     recovery_policy_is_actionable,
 )
+from manyforge_behavior.nodes.operator import OperatorRequestChoice
 from manyforge_behavior.nodes.v2_owner import MotionTaskAdapter, OwnerTaskAdapter
 from manyforge_behavior.run_sender import RunSender
 from manyforge_behavior.nodes.stop_policy import (
@@ -80,7 +82,7 @@ class NodeInputProposalError(ValueError):
 # Parameters that name a captured Program Binding row by value. Required
 # capability parameters and declared blackboard-key parameters are read from
 # the catalog entry itself.
-_BINDING_SELECTION_PARAMETERS: Final = frozenset({"contact_policy_id", "tcp_endpoint"})
+_BINDING_SELECTION_PARAMETERS: Final = frozenset({"tcp_endpoint"})
 
 
 def _require_text(value: object, *, field: str, maximum_bytes: int = 512) -> str:
@@ -129,7 +131,6 @@ class ProgramRunCapture:
     applied_record_digest: str
     scenario_id: str
     source_document_digest: str
-    program_id: str
     program_revision: str
     program_binding_id: str
     retained_bundle_id: str
@@ -147,7 +148,6 @@ class ProgramRunCapture:
     def __post_init__(self) -> None:
         require_run_number(self.program_run_id)
         _require_text(self.scenario_id, field="scenario_id", maximum_bytes=128)
-        _require_text(self.program_id, field="program_id")
         for field_name in (
             "applied_record_digest",
             "source_document_digest",
@@ -224,7 +224,6 @@ class ProgramRunCapture:
             "applied_record_digest": self.applied_record_digest,
             "scenario_id": self.scenario_id,
             "source_document_digest": self.source_document_digest,
-            "program_id": self.program_id,
             "program_revision": self.program_revision,
             "program_binding_id": self.program_binding_id,
             "retained_bundle_id": self.retained_bundle_id,
@@ -264,6 +263,155 @@ class ProgramRunAttemptSource:
             node_instance_id=node_id,
             node_attempt_id=next(self._attempts),
         )
+
+
+# The scene-change nodes and the scene operation each one makes (OD-375).
+_SCENE_OPERATIONS: Final = MappingProxyType({
+    "scene.add_object": "add_object",
+    "scene.upsert_object": "upsert_object",
+    "scene.remove_object": "remove_object",
+    "scene.update_object_pose": "update_object_pose",
+    "scene.attach_carried_object": "attach_carried_object",
+    "scene.detach_carried_object": "detach_carried_object_at_current_pose",
+})
+_ATTEMPT_MESSAGE_BYTES: Final = 2048
+
+
+@dataclass(slots=True)
+class _OpenAttempt:
+    identity: NodeAttemptIdentity
+    node_id: str
+    leaf: py_trees.behaviour.Behaviour
+    started_ns: int
+    started_at_wall: str
+    # The failure an operator hold keeps while the leaf runs: its next
+    # attempt (Retry) ends this one as failed.
+    held_failure: "_AttemptError | None" = None
+
+
+# A finished attempt's typed error: code, message and bounded details.
+_AttemptError = tuple[str, str, Mapping[str, Any] | None]
+
+
+def _leaf_failure(leaf: py_trees.behaviour.Behaviour) -> _AttemptError:
+    return (
+        leaf.failure_reason_code or "program_node_failed",
+        leaf.failure_message,
+        leaf.failure_details,
+    )
+
+
+def _attempt_result(
+    leaf: py_trees.behaviour.Behaviour,
+) -> tuple[str, _AttemptError | None]:
+    """The outcome and error of a leaf's attempt that no longer runs."""
+
+    status = leaf.status
+    if status is not py_trees.common.Status.INVALID and getattr(leaf, "preempted", False):
+        # Its literal `preempted_result` went to the tree, success or failure.
+        return "preempted", None
+    if status is py_trees.common.Status.SUCCESS:
+        return "succeeded", None
+    if status is py_trees.common.Status.FAILURE:
+        return "failed", _leaf_failure(leaf)
+    outcome = getattr(leaf, "outcome", None)
+    if outcome == "interrupted":
+        return "interrupted", (leaf.interrupted_reason_code, leaf.interrupted_message, None)
+    if outcome == "failure":  # Its stop was not confirmed.
+        return "failed", _leaf_failure(leaf)
+    return "stopped", None
+
+
+class _NodeAttemptHistory:
+    """Each node attempt of one run, closed exactly once into the history
+    sink (OD-375). Tick thread only.
+
+    It wraps the run's attempt source: ``begin`` opens an attempt. The run
+    closes the open attempts whose leaf no longer runs after each tick, Halt
+    settling and a Stop's settled sent requests (`close_finished`); a node's
+    next attempt closes its previous one; an automatic retry closes the
+    failed one (`close_retried`).
+    """
+
+    def __init__(
+        self,
+        source: ProgramRunAttemptSource,
+        sink: Callable[[Mapping[str, Any]], None],
+    ) -> None:
+        self._source = source
+        self._sink = sink
+        self._leaves: dict[str, tuple[str, py_trees.behaviour.Behaviour]] = {}
+        self._open: dict[str, _OpenAttempt] = {}
+
+    def add_node(
+        self, node_instance_id: str, node_id: str, leaf: py_trees.behaviour.Behaviour
+    ) -> None:
+        self._leaves[node_instance_id] = (node_id, leaf)
+
+    def begin(self, node_instance_id: str) -> NodeAttemptIdentity:
+        previous = self._open.pop(node_instance_id, None)
+        if previous is not None:
+            # Still open (hold release, operator Retry, re-entry): stopped,
+            # unless an operator hold kept its failure.
+            held = previous.held_failure
+            self._close(previous, "stopped" if held is None else "failed", held)
+        identity = self._source.begin(node_instance_id)
+        node_id, leaf = self._leaves[node_instance_id]
+        self._open[node_instance_id] = _OpenAttempt(
+            identity,
+            node_id,
+            leaf,
+            monotonic_ns(),
+            datetime.now(timezone.utc).isoformat(),
+        )
+        return identity
+
+    def close_finished(self) -> None:
+        for node_instance_id, attempt in tuple(self._open.items()):
+            leaf = attempt.leaf
+            if leaf.status is not py_trees.common.Status.RUNNING:
+                del self._open[node_instance_id]
+                self._close(attempt, *_attempt_result(leaf))
+            elif leaf.failure_reason_code and not getattr(leaf, "presented_held", False):
+                attempt.held_failure = _leaf_failure(leaf)
+
+    def close_retried(self, node_instance_id: str, code: str | None, message: str | None) -> None:
+        attempt = self._open.pop(node_instance_id, None)
+        if attempt is not None:
+            self._close(attempt, "failed", (code or "program_node_failed", message or "", None))
+
+    def _close(
+        self, attempt: _OpenAttempt, outcome: str, error: _AttemptError | None
+    ) -> None:
+        identity = attempt.identity
+        operation = _SCENE_OPERATIONS.get(attempt.node_id)
+        inputs = (
+            attempt.leaf.attempt_inputs
+            if operation is not None and attempt.leaf.attempt_identity is identity
+            else None
+        )
+        # Stamped here, at the attempt's end: delivery to History is later.
+        finished_ns = monotonic_ns()
+        self._sink({
+            "program_run_id": identity.program_run_id,
+            "node_instance_id": identity.node_instance_id,
+            "node_id": attempt.node_id,
+            "node_attempt_id": identity.node_attempt_id,
+            "started_at_wall": attempt.started_at_wall,
+            "finished_at_ns": str(finished_ns),
+            "finished_at_wall": datetime.now(timezone.utc).isoformat(),
+            "duration_ms": round((finished_ns - attempt.started_ns) / 1e6, 3),
+            "outcome": outcome,
+            "error": None if error is None else {
+                "code": error[0],
+                "message": error[1].encode("utf-8")[:_ATTEMPT_MESSAGE_BYTES].decode(
+                    "utf-8", errors="ignore"
+                ),
+                "details": failure_wire_fields(error[2], None)["details"],
+            },
+            "scene_operation": operation,
+            "scene_resource_id": None if inputs is None else inputs.get("scene_resource_id"),
+        })
 
 
 def _effectful_targets(
@@ -378,8 +526,6 @@ class ExecutableProgramRun:
             raise TypeError("ports must be one focused owner-port set")
         if program_clock is not None and not isinstance(program_clock, ProgramClock):
             raise TypeError("program_clock must be one ProgramClock")
-        if program.program_id != capture.program_id:
-            raise ProgramRuntimeError("captured Program ID does not match the Program")
         if program.program_revision != capture.program_revision:
             raise ProgramRuntimeError(
                 "captured Program revision does not match the Program"
@@ -456,6 +602,12 @@ class ExecutableProgramRun:
             value_store=self._value_store,
         )
         self._attempt_source = ProgramRunAttemptSource(capture.program_run_id)
+        # Leaves begin their attempts through the history when it records them.
+        self._attempt_history = (
+            None
+            if ports.node_attempt_history is None
+            else _NodeAttemptHistory(self._attempt_source, ports.node_attempt_history)
+        )
         self._ports = ports
         node_children: dict[str, tuple[str, ...]] = {}
 
@@ -472,6 +624,9 @@ class ExecutableProgramRun:
         # The global rule whose `hold` holds this run, from the latest
         # Kernel scope read (None once Resume releases it); the run end names it.
         self._stopped_by_rule_id: str | None = None
+        # Held node -> the Program node whose own Stop holds it (the Kernel
+        # scope's `stopped_by: program`, OD-342), from the latest scope read.
+        self._program_holds: Mapping[str, str] = MappingProxyType({})
         # What blocked a selection release in the latest Kernel scope read
         # (OD-152): the status read shows it without asking the Kernel again.
         self._selection_release_block_reason: str | None = None
@@ -504,6 +659,10 @@ class ExecutableProgramRun:
         )
         # Leaves whose sent request a Forced Program End still awaits.
         self._sender_adapters: list[Any] = []
+        # Leaves that ask for the Program's own motion-group Stop (Ask
+        # operator, Stop motion groups) by node; the questions by node.
+        self._program_stop_adapters: dict[str, Any] = {}
+        self._question_adapters: dict[str, OperatorRequestChoice] = {}
         root = self._build_node(
             program.tree,
             inherited_stop_policy="continue",
@@ -559,7 +718,7 @@ class ExecutableProgramRun:
                 children=children,
                 value_sources=node.value_sources,
                 input_resolver=self._input_resolver,
-                attempt_source=self._attempt_source,
+                attempt_source=self._attempt_history or self._attempt_source,
                 ports=self._ports,
                 operator_stop_state=self._operator_stop_state,
                 operator_stop_hold_scope=hold_scope,
@@ -567,8 +726,15 @@ class ExecutableProgramRun:
                 motion_attention=self._motion_attention,
                 audit_sink=self._record_node_history_event,
                 run_sender=self._sender,
+                execution_selections=self._program.execution_selections,
             ),
         )
+        if self._attempt_history is not None:
+            self._attempt_history.add_node(node.instance_id, node.node_id, built)
+        if callable(getattr(built, "program_stop_request", None)):
+            self._program_stop_adapters[node.instance_id] = built
+        if isinstance(built, OperatorRequestChoice):
+            self._question_adapters[node.instance_id] = built
         if isinstance(built, OwnerTaskAdapter):
             self._task_adapters[node.instance_id] = built
         if callable(getattr(built, "settle_abandoned_request", None)):
@@ -589,6 +755,8 @@ class ExecutableProgramRun:
                 child=built,
                 node_instance_id=node.instance_id,
                 policy=policy,
+                # Its fallback identity keys the hold of the leaf's own
+                # attempt: not another attempt of the history.
                 attempt_source=self._attempt_source,
                 recovery_port=recovery_port,
             )
@@ -631,8 +799,8 @@ class ExecutableProgramRun:
         mints no attempt, ticks nothing and writes no key. A proposal replaces
         the value at its parameter value path and shadows any value source at
         or beneath that path. Proposals cannot select a target, component,
-        capability, contact-grasp binding or blackboard key: those keep the
-        captured meaning. Raises ``NodeInputProposalError`` for a foreign or
+        capability or blackboard key, and of a collision rule they can change
+        only a row's clearance: the rest keeps the captured meaning. Raises ``NodeInputProposalError`` for a foreign or
         invalid proposal; a sourced input that cannot be resolved now raises
         the resolver's own ``ProgramValueError``.
         """
@@ -696,6 +864,14 @@ class ExecutableProgramRun:
                 raise NodeInputProposalError(
                     f"node parameter {root!r} selects captured binding meaning"
                 )
+            # A collision rule's selections name captured collision bodies;
+            # only a row's clearance is a plain value of the move.
+            if root == "collision_rules" and not (
+                len(segments) == 3 and segments[2] == "clearance_m"
+            ):
+                raise NodeInputProposalError(
+                    "only the clearance_m of a collision rule row can be proposed"
+                )
             if any(
                 path_covers(segments, other) or path_covers(other, segments)
                 for _path, other, _value in proposals
@@ -757,6 +933,14 @@ class ExecutableProgramRun:
         a logical preemption), drained with the run's status."""
 
         self._node_history_events.append(dict(event))
+        if (
+            event.get("kind") == "program_node_automatic_retry"
+            and self._attempt_history is not None
+        ):
+            # Emitted before the retry's own attempt begins.
+            self._attempt_history.close_retried(
+                event["node_instance_id"], event["code"], event["message"]
+            )
 
     def take_node_history_events(self) -> tuple[dict[str, Any], ...]:
         """Node history events decided since the last take."""
@@ -790,6 +974,55 @@ class ExecutableProgramRun:
             adapter = self._task_adapters.get(node_id)
             if adapter is not None:
                 adapter.simulation_stop_sent()
+
+    def program_stop_requests(
+        self,
+    ) -> tuple[tuple[str, int, tuple[str, ...], bytes], ...]:
+        """The Program's own motion-group Stops its nodes asked for and the
+        Kernel has not accepted yet: ``(node, attempt, groups, key)``. The
+        run's tick sends them after the tree tick."""
+
+        result = []
+        for node_id, adapter in sorted(self._program_stop_adapters.items()):
+            request = adapter.program_stop_request()
+            if request is not None:
+                result.append((node_id, *request))
+        return tuple(result)
+
+    def note_program_stop_accepted(
+        self, node_instance_id: str, node_attempt_id: int, hold_revision: int
+    ) -> None:
+        """The Kernel accepted that attempt's Stop at ``hold_revision``."""
+
+        adapter = self._program_stop_adapters.get(node_instance_id)
+        if adapter is not None:
+            adapter.note_program_stop_accepted(node_attempt_id, hold_revision)
+
+    def operator_questions(self) -> tuple[Mapping[str, Any], ...]:
+        """The open operator questions, by node. Tick only: the tick
+        publishes them for the other threads."""
+
+        return tuple(
+            question
+            for _node_id, adapter in sorted(self._question_adapters.items())
+            if (question := adapter.question()) is not None
+        )
+
+    def answer_operator_question(
+        self, node_instance_id: str, node_attempt_id: int, option_id: str
+    ) -> Mapping[str, Any]:
+        """Hand the operator's answer to the open question. Tick only.
+
+        Returns the chosen option; raises ``ProgramRuntimeError`` when the
+        question is no longer open or has no such option."""
+
+        adapter = self._question_adapters.get(node_instance_id)
+        if adapter is None:
+            raise ProgramRuntimeError("the operator question is not in this capture")
+        try:
+            return adapter.answer(node_attempt_id, option_id)
+        except ValueError as error:
+            raise ProgramRuntimeError(str(error)) from error
 
     def node_motion_groups(self, node_instance_id: str) -> tuple[str, ...]:
         """The named execution groups containing this node, or ``("all",)``
@@ -852,6 +1085,8 @@ class ExecutableProgramRun:
             # Abandoned (INVALID) attempts close once their Stop settled.
             if adapter.has_pending_drain:
                 adapter.drain_invalidated()
+        if self._attempt_history is not None:
+            self._attempt_history.close_finished()
         status = self._tree.root.status
         self._settle_mock_ends(
             final=status in {py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE}
@@ -925,6 +1160,8 @@ class ExecutableProgramRun:
         states = tuple(
             self.task_control_states(node_ids=node_ids, settle=True).values()
         )
+        if self._attempt_history is not None:
+            self._attempt_history.close_finished()
         return (
             states.count("active"),
             states.count("held"),
@@ -978,7 +1215,7 @@ class ExecutableProgramRun:
     ) -> OperatorMotionStopSnapshot:
         if (
             not isinstance(scope, Mapping)
-            or scope.get("schema_version") != "manyforge.program_execution_scope.v3"
+            or scope.get("schema_version") != "manyforge.program_execution_scope.v4"
             or scope.get("program_run_id") != self._capture.program_run_id
             or type(scope.get("hold_revision")) is not int
             or not 0 <= scope["hold_revision"] <= 2**53 - 1
@@ -990,6 +1227,26 @@ class ExecutableProgramRun:
             if scope.get("stopped_by") == "rule" and isinstance(rule_id, str) and rule_id
             else None
         )
+        pairs = scope.get("program_held_nodes")
+        if not isinstance(pairs, (list, tuple)) or len(pairs) > len(self._scope_node_ids):
+            raise ProgramRuntimeError(
+                "operator Stop projection has invalid Program node holds"
+            )
+        program_holds: dict[str, str] = {}
+        for pair in pairs:
+            if (
+                not isinstance(pair, (list, tuple))
+                or len(pair) != 2
+                or any(
+                    type(index) is not int or not 0 <= index < len(self._scope_node_ids)
+                    for index in pair
+                )
+            ):
+                raise ProgramRuntimeError(
+                    "operator Stop projection has invalid Program node holds"
+                )
+            program_holds[self._scope_node_ids[pair[0]]] = self._scope_node_ids[pair[1]]
+        self._program_holds = MappingProxyType(program_holds)
         release_block_reason = scope.get("selection_release_block_reason")
         if release_block_reason is not None and (
             not isinstance(release_block_reason, str)
@@ -1083,6 +1340,12 @@ class ExecutableProgramRun:
     def selection_release_block_reason(self) -> str | None:
         """The release blocker of the latest Kernel scope read."""
         return self._selection_release_block_reason
+
+    @property
+    def program_holds(self) -> Mapping[str, str]:
+        """Held node -> the Program node whose own Stop holds it, from the
+        latest Kernel scope read (`stopped_by: program`)."""
+        return self._program_holds
 
     @property
     def stopped_by_rule_id(self) -> str | None:
@@ -1216,9 +1479,12 @@ class ExecutableProgramRun:
         request_key: bytes,
         *,
         node_instance_id: str | None = None,
+        stopped_by_node_instance_id: str | None = None,
     ) -> dict[str, Any]:
         """The selection DTO. ``node_instance_id`` (release only)
-        names one captured held node with ``group_ids: []``."""
+        names one captured held node with ``group_ids: []``;
+        ``stopped_by_node_instance_id`` (Stop only) names the Program node
+        whose own Stop it is: the Kernel attributes the holds to it."""
         if not self._scope_captured:
             raise ProgramRuntimeError("Program execution scope is not captured")
         if node_instance_id is not None and (
@@ -1240,6 +1506,10 @@ class ExecutableProgramRun:
         }
         if node_instance_id is not None:
             request["node_instance_id"] = node_instance_id
+        if stopped_by_node_instance_id is not None:
+            if stopped_by_node_instance_id not in self._authored_nodes:
+                raise ProgramRuntimeError("the stopping node is not in this capture")
+            request["stopped_by_node_instance_id"] = stopped_by_node_instance_id
         return request
 
     def node_motion_attention_request(
@@ -1325,7 +1595,12 @@ class ExecutableProgramRun:
         already sent ends with that request's real result. True once no sent
         request is outstanding; the run's tick asks again until then."""
 
-        return all([adapter.settle_abandoned_request() for adapter in self._sender_adapters])
+        settled = all([adapter.settle_abandoned_request() for adapter in self._sender_adapters])
+        if settled and self._attempt_history is not None:
+            # The attempts the Stop ended close here, a sent request's
+            # with its real result.
+            self._attempt_history.close_finished()
+        return settled
 
     def close_sender(self) -> None:
         """Runner shutdown: nothing queued is sent any more."""

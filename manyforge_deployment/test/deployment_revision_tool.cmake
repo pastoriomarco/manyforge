@@ -7,10 +7,8 @@ file(REMOVE_RECURSE "${MANYFORGE_TEST_BINARY_DIR}")
 file(MAKE_DIRECTORY "${MANYFORGE_TEST_BINARY_DIR}")
 set(deployment "${MANYFORGE_TEST_BINARY_DIR}/deployment.yaml")
 file(WRITE "${deployment}" [=[api_version: manyforge.deployment.v1
-deployment_artifact_id: revision_tool_test
 deployment_revision: sha256:0000000000000000000000000000000000000000000000000000000000000000
 cell_id: revision_tool_cell
-name: Revision tool test
 catalogs: {records: []}
 graph:
   runtime_units: []

@@ -170,6 +170,11 @@ export function NoticeRow({
           : () => setExpanded((current) => !current)}
         expandLabel={`${SEVERITY_LABEL[severity].toLowerCase()} details`}
       />
+      {notices.filter((notice) => notice.pinnedLines !== undefined).map((notice) => (
+        <ul key={`${notice.id}:pinned`} className="workbench-notice-lines" aria-label={notice.title}>
+          {notice.pinnedLines!.map((line) => <li key={line}>{line}</li>)}
+        </ul>
+      ))}
       {expanded && (
         <div className="workbench-notice-list">
           {/* Activity still in progress first. */}

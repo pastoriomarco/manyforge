@@ -92,7 +92,6 @@ CLOSED_SCHEMA_RESOURCES = (
 STRONG_STRING_TYPES = (
     "CellId",
     "GraphRevision",
-    "DeploymentArtifactId",
     "DeploymentRevision",
     "SchemaId",
     "SchemaRevision",
@@ -153,8 +152,6 @@ STRONG_STRING_TYPES = (
     "CommissionedStopInterfaceId",
     "CommissionedStopInterfaceRevision",
     "StopInvocationLaneId",
-    "ContactPolicyId",
-    "ContactPolicyRevision",
     "ProviderInstanceId",
     "ProviderManifestId",
     "ProviderManifestRevision",
@@ -177,7 +174,6 @@ STRONG_STRING_TYPES = (
     "CommandSchemaRevision",
     "CommandOptionId",
     "ChannelRoleId",
-    "ProgramId",
     "ProgramRevision",
     "ProgramBindingId",
     "MoveId",
@@ -243,13 +239,6 @@ CATALOG_REF_CASES = (
         "CapabilityDefinitionRevision",
         "kCapabilityDefinition",
         "manyforge.capability_definition.v1",
-    ),
-    (
-        "ContactPolicyCatalogRecordRefDTO",
-        "ContactPolicyId",
-        "ContactPolicyRevision",
-        "kContactPolicy",
-        "manyforge.contact_policy.v1",
     ),
     (
         "StopEvidencePolicyCatalogRecordRefDTO",
@@ -784,7 +773,7 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
         with pytest.raises(TypeError):
             cls()
 
-    assert len(set(STRONG_STRING_TYPES)) == len(STRONG_STRING_TYPES) == 94
+    assert len(set(STRONG_STRING_TYPES)) == len(STRONG_STRING_TYPES) == 90
     assert len({type(value) for value in values}) == len(STRONG_STRING_TYPES)
     assert len(set(values)) == len(STRONG_STRING_TYPES)
     for index, left in enumerate(values):
@@ -855,13 +844,13 @@ def test_catalog_record_ref_union_is_exact_typed_and_read_only(case):
 def test_catalog_record_ref_runtime_union_and_registry_are_closed():
     union_members = typing.get_args(core.CatalogRecordRefDTO)
     assert union_members == tuple(core.CatalogRecordRefTypes)
-    assert len(union_members) == len(CATALOG_REF_CASES) == 10
-    assert len(core.CATALOG_RECORD_TYPE_REGISTRY) == 10
+    assert len(union_members) == len(CATALOG_REF_CASES) == 9
+    assert len(core.CATALOG_RECORD_TYPE_REGISTRY) == 9
     assert (
         len(
             {descriptor.record_kind for descriptor in core.CATALOG_RECORD_TYPE_REGISTRY}
         )
-        == 10
+        == 9
     )
 
     invalid_family = _catalog_ref(
@@ -900,7 +889,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     assert len({row.capability_id for row in registry}) == len(registry)
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
-        "sha256:a8cd4531c38c0e4dafcc44193968bdbc25a4fe9036c711c190b4dcd896701794"
+        "sha256:df3c8b452f834d5b0b5ce01a8217da78d3c682d9bc6fbb02d2e6387cc0b042ab"
     )
     assert core.find_builtin_capability_definition("context.state.current") is None
 
@@ -1780,18 +1769,17 @@ target: 0.5
     registry = core.build_qualified_closed_schema_registry()
     assert isinstance(registry, core.BuildQualifiedClosedSchemaRegistry)
     assert isinstance(registry.catalog_schemas, tuple)
-    assert len(registry.catalog_schemas) == 10
+    assert len(registry.catalog_schemas) == 9
     qualified_entries = [
         entry
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kQualified
     ]
-    assert len(qualified_entries) == 10
+    assert len(qualified_entries) == 9
     assert {entry.record_kind for entry in qualified_entries} == {
         core.CatalogRecordKind.kCapabilityDefinition,
         core.CatalogRecordKind.kCommandSchema,
         core.CatalogRecordKind.kComponentType,
-        core.CatalogRecordKind.kContactPolicy,
         core.CatalogRecordKind.kControlInterfaceContract,
         core.CatalogRecordKind.kControllerTopology,
         core.CatalogRecordKind.kModelAsset,
@@ -1804,7 +1792,6 @@ target: 0.5
         "catalog/manyforge.capability_definition.v1.yaml",
         "catalog/manyforge.command_schema.v1.yaml",
         "catalog/manyforge.component_type.v1.yaml",
-        "catalog/manyforge.contact_policy.v1.yaml",
         "catalog/manyforge.control_interface_contract.v1.yaml",
         "catalog/manyforge.controller_topology.v1.yaml",
         "catalog/manyforge.model_asset.v1.yaml",
@@ -1837,11 +1824,11 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:b37e963e21f9c72c47f713d7bc6b5f24fb680e2126d0f29e4cc4ed86fc9155ba",
+            "sha256:d64c2c161977740644788fb1962c89b00777c38d3a592020fc916c4e7600de21",
         ),
         (
             "manyforge.value_schema.runtime.io_provider_execution.v1",
-            "sha256:500cfe739120003e06057cdf78a94f006eb4fc4ef157a7f55f70ab4d1aa45b1d",
+            "sha256:829e709117459cc5378ec20ceda9e3ea7ac6d1e8dda1d1798f9a1373ef9acc39",
         ),
         (
             "manyforge.value_schema.runtime.pose_source.v2",
@@ -2085,9 +2072,7 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
         "deployment_capabilities_read",
         "history_read",
         "inspect_isaac_scene",
-        "program_draft_remove_contact_policies",
         "program_draft_remove_parameters",
-        "program_draft_upsert_contact_policies",
         "program_draft_upsert_parameters",
         "program_read",
         "program_validate",

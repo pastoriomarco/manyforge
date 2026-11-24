@@ -12,6 +12,20 @@ export interface ExecutionObservationTarget {
   positionsSi: number[];
 }
 
+/**
+ * One compressed spring pair (OD-358): the rule's side a (a component's
+ * compiled link or a carried scene object), the overlap depth and the unit
+ * vector (world frame) that pushes side a out of side b. Render-only.
+ */
+export interface ExecutionObservationSpringCompression {
+  ruleId: string;
+  a:
+    | { kind: 'component_link'; componentId: string; link: string }
+    | { kind: 'scene_object'; sceneResourceId: string };
+  depthM: number;
+  pushDirection: [number, number, number];
+}
+
 export interface ExecutionObservationFrame {
   schemaVersion: 'manyforge.execution_observation_frame.v5';
   applicationStartId: string;
@@ -35,6 +49,8 @@ export interface ExecutionObservationFrame {
    * simulator's own joint states). Never the solid robot's pose source.
    */
   measuredTargets: ExecutionObservationTarget[];
+  /** Compressed spring pairs; absent when none is compressed. */
+  springCompressions?: ExecutionObservationSpringCompression[];
 }
 
 export interface ExecutionObservationReader {

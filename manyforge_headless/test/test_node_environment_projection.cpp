@@ -122,13 +122,15 @@ TEST(NodeEnvironmentProjection,
             std::string::npos);
   EXPECT_NE(bytes.find("\"adapter_build_qualified\":true"), std::string::npos);
   EXPECT_EQ(bytes.find("\"adapter_build_qualified\":false"), std::string::npos);
-  // motion.set_tcp, rules.set_active and io.clear_outside_change (51 nodes);
-  // none has a healthy owner in the empty package.
-  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 51U);
+  // motion.set_tcp, rules.set_active, io.clear_outside_change, Ask operator
+  // and Stop motion groups (53 nodes); only the nodes the Program runner
+  // executes itself (pure ones and the OD-342 pair) have a healthy owner in
+  // the empty package.
+  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 53U);
   EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":false"), 0U);
   EXPECT_NE(bytes.find("\"binding_available\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"owner_health_available\":false"), std::string::npos);
-  EXPECT_EQ(Count(bytes, "\"owner_health_available\":true"), 14U);
+  EXPECT_EQ(Count(bytes, "\"owner_health_available\":true"), 16U);
   EXPECT_EQ(Count(bytes, "\"owner_health_available\":false"), 37U);
   EXPECT_EQ(bytes.find("\"cclc_node_adapter_unavailable_until_i7\""),
             std::string::npos);
@@ -198,6 +200,16 @@ TEST(NodeEnvironmentProjection,
                                       "io.wait_for_input"}));
   EXPECT_EQ(interrupt_ids,
             (std::vector<std::string>{"motion.move_until_signal", "motion.probe_search"}));
+  // OD-342: the Program run owner executes these itself: no separate owner
+  // whose health could be unavailable (the Composer refuses that otherwise).
+  for (const auto &row : member(availability, "implementations").as_array()) {
+    const auto &id = member(row, "node_id").as_string();
+    if (id != "operator.request_choice" && id != "motion.stop_groups") continue;
+    EXPECT_TRUE(member(row, "owner_health_available").as_bool()) << id;
+    EXPECT_EQ(content_identity::canonical_json(member(row, "reason_codes")),
+              "[\"program_binding_unselected\"]")
+        << id;
+  }
 }
 
 TEST(NodeEnvironmentProjection, RejectsATamperedCatalogBeforePublication) {

@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
+from manyforge_behavior.project_paths import ProjectPathRule
 from manyforge_composer.backend import routes_draft
 from manyforge_headless_api.client import HeadlessClientError
 
@@ -59,7 +60,8 @@ def _client(monkeypatch, *, stale=False, mismatch=False):
                 response["program_content_digest"] = "sha256:" + "0" * 64
             return response
     state = SimpleNamespace(authoring_workspace=workspace, deployment_source_project_path="/tmp",
-                            headless_client=Headless(), node_catalog=object())
+                            headless_client=Headless(), node_catalog=object(),
+                            project_paths=ProjectPathRule(["/tmp"]))
     monkeypatch.setattr(routes_draft, "capture_deployment_model_sources", lambda deployment, **_kwargs: _closure(deployment))
     monkeypatch.setattr(routes_draft, "derive_candidate", lambda *_args: (None, []))
     app = FastAPI()

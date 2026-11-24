@@ -1,8 +1,8 @@
 """Reproduces the Isaac-mode Save finding without Isaac, SSH or Docker.
 
-In operator mode the Composer's only write root is the runtime host
-checkout's ``examples/`` (``scripts/dev-workbench.py`` passes
-``/workspace/examples`` as ``MANYFORGE_PROGRAM_WRITE_ROOTS`` and
+In operator mode the Composer writes into the runtime host checkout's
+``examples/`` (``scripts/dev-workbench.py`` lists ``/workspace/examples`` in
+``MANYFORGE_FS_ROOTS`` and
 ``scripts/compose-dev.sh`` mounts the checkout read-write at
 ``/workspace``). The remote source check runs the real collector, which counts
 tracked edits and untracked files under ``examples/``, so any Save there makes

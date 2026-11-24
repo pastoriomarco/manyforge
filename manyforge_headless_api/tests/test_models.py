@@ -13,6 +13,7 @@ from manyforge_headless_api.models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
     CapabilityCommandParticipantRequest,
+    CollisionPolicyRequest,
     ManagerApplyPreparedActivation,
     ManagerApplyRequest,
     ManagerApplyAcknowledgementContext,
@@ -50,7 +51,6 @@ def _key(sequence: int) -> str:
 
 def test_candidate_preview_requires_exact_prepared_activation_identity() -> None:
     body = {
-        "deployment_artifact_id": "deployment.1",
         "deployment_revision": "sha256:" + "a" * 64,
         "candidate_retained_bundle_id": "bundle.2",
         "candidate_graph_revision": "graph.2",
@@ -163,21 +163,20 @@ def _caller() -> dict[str, object]:
 def _prepared_activation() -> dict[str, object]:
     activation = ManagerApplyPreparedActivation.model_validate(
         {
-            "schema_version": "manyforge.prepared_activation_input.v7",
+            "schema_version": "manyforge.prepared_activation_input.v8",
             "origin": {"kind": "scenario", "scenario_id": "scenario.1",
                        "source_document_digest": "sha256:" + "1" * 64,
                        "project_path": "/projects/scenario.1.scenario"},
             "captured_input_digest": "sha256:" + "d" * 64,
-            "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
             "retained_bundle_id": "sha256:" + "2" * 64,
             "graph_revision": "sha256:" + "3" * 64,
-            "program_id": "program.1",
             "program_revision": "sha256:" + "4" * 64,
             "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
             "node_environment_digest": "sha256:" + "5" * 64,
             "assistant_mode": "optional",
             "prepared_activation_id": "sha256:" + "e" * 64,
+            "scene_meshes": [{"byte_size": 3, "content_digest": "sha256:" + "6" * 64, "resource_uri": "meshes/part.stl"}],
         }
     )
     return activation.model_dump(mode="json")
@@ -193,29 +192,47 @@ def _planning_pose(z_m: float = 0.0) -> dict[str, object]:
 def test_no_program_activation_requires_exact_absence() -> None:
     value = {
         **_prepared_activation(),
-        "schema_version": "manyforge.prepared_activation_input.v7",
-        "program_id": None,
+        "schema_version": "manyforge.prepared_activation_input.v8",
         "program_revision": None,
         "program_outcome": {"kind": "no_program"},
+        "scene_meshes": [],
     }
-    assert ManagerApplyPreparedActivation.model_validate(value).program_id is None
+    assert ManagerApplyPreparedActivation.model_validate(value).program_revision is None
     for field, inconsistent in (
         ("schema_version", "manyforge.prepared_activation_input.v4"),
-        ("program_id", "old.program"),
         ("program_revision", "sha256:" + "4" * 64),
         ("program_outcome", {"kind": "no_program", "program_binding_id": "sha256:" + "9" * 64}),
         ("typed_parameter_overrides", {"speed": 0.1}),
         ("assistant_mode", "required"),
+        ("scene_meshes", [{"byte_size": 3, "content_digest": "sha256:" + "6" * 64, "resource_uri": "meshes/part.stl"}]),
     ):
         with pytest.raises(ValidationError):
             ManagerApplyPreparedActivation.model_validate({**value, field: inconsistent})
+
+
+def test_prepared_scene_meshes_are_sorted_unique_rows() -> None:
+    value = _prepared_activation()
+    row = value["scene_meshes"][0]
+    second = {**row, "resource_uri": "meshes/zeta.stl"}
+    assert ManagerApplyPreparedActivation.model_validate(
+        {**value, "scene_meshes": [row, second]}).scene_meshes[1].resource_uri == "meshes/zeta.stl"
+    for bad in (
+        [second, row], [row, row], [{**row, "byte_size": 0}],
+        [{**row, "content_digest": "sha256:short"}], [{**row, "extra": 1}],
+    ):
+        with pytest.raises(ValidationError):
+            ManagerApplyPreparedActivation.model_validate({**value, "scene_meshes": bad})
+    missing = dict(value)
+    del missing["scene_meshes"]
+    with pytest.raises(ValidationError):
+        ManagerApplyPreparedActivation.model_validate(missing)
 
 
 def _planning_motion(
     move_id: str,
     motion: dict[str, object],
     *,
-    contact_policy_id: str | None = None,
+    collision_rules: list[dict[str, object]] | None = None,
     selected_object_id: str | None = None,
 ) -> dict[str, object]:
     return {
@@ -242,7 +259,7 @@ def _planning_motion(
         "target_reference": None,
         "offset_reference": None,
         "motion": motion,
-        "contact_policy_id": contact_policy_id,
+        "collision_rules": list(collision_rules or []),
         "per_joint_dynamics_limits": {},
         "motion_interrupt_scopes": [],
         "runtime_object_bindings": (
@@ -258,13 +275,42 @@ def _planning_motion(
     }
 
 
+def _contact_rule(rule_id: str, scene_resource_id: str) -> dict[str, object]:
+    return {
+        "rule_id": rule_id,
+        "a": [{"kind": "active_tcp_contact_bodies"}],
+        "b": [{"kind": "scene_object", "scene_resource_id": scene_resource_id}],
+        "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8},
+    }
+
+
+_RELEASE = {
+    "release_evidence_mode": "signed_penetration",
+    "enforce_max_start_penetration": True,
+    "max_start_penetration_m": 0.002,
+    "release_tolerance_m": 1e-5,
+    "min_release_progress_m": 0.0,
+    "require_separation_by_end": True,
+    "require_strictly_decreasing_penetration": True,
+    "allow_recontact": False,
+}
+
+
+def _release_rule(rule_id: str, scene_resource_id: str) -> dict[str, object]:
+    return {
+        "rule_id": rule_id,
+        "a": [{"kind": "attached_object", "component_id": "tool"}],
+        "b": [{"kind": "scene_object", "scene_resource_id": scene_resource_id}],
+        "release": dict(_RELEASE),
+    }
+
+
 def _planning_operation(
     label: str, payload: dict[str, object], *, tool: bool = False
 ) -> dict[str, object]:
     # Each phase is its own request: its own key, derived from its label.
     return {
         "request_context": {**_caller(), "request_key": _key(zlib.crc32(label.encode()))},
-        "program_id": "program:test",
         "program_revision": "program-revision:test",
         "program_binding_id": "program-binding:test",
         "program_run_id": 1,
@@ -456,13 +502,18 @@ def _pick_request() -> dict[str, object]:
             _planning_motion(
                 "descend",
                 _cartesian_path(),
-                contact_policy_id="pick.contact",
+                collision_rules=[_contact_rule("pick.contact", "workpiece")],
                 selected_object_id="workpiece",
             ),
         ),
         "tool_operation": _planning_operation("pick.tool", _tool_payload(), tool=True),
         "retreat_operation": _planning_operation(
-            "pick.retreat", _planning_motion("retreat", _cartesian_path())
+            "pick.retreat",
+            _planning_motion(
+                "retreat",
+                _cartesian_path(),
+                collision_rules=[_release_rule("lift.table", "table")],
+            ),
         ),
     }
 
@@ -522,19 +573,58 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
     assert parsed.synthesis.pick_offset_reference.type == "runtime_object"
     assert parsed.synthesis.approach_offset_reference is not None
     assert parsed.synthesis.approach_offset_reference.type == "component_frame"
-    assert parsed.descend_operation.participants[0].payload.contact_policy_id == (
-        "pick.contact"
-    )
+    descend_rules = parsed.descend_operation.participants[0].payload.collision_rules
+    assert [rule.rule_id for rule in descend_rules] == ["pick.contact"]
+    assert descend_rules[0].contact.end_from_fraction == 0.8
+    retreat_rules = parsed.retreat_operation.participants[0].payload.collision_rules
+    assert [rule.rule_id for rule in retreat_rules] == ["lift.table"]
+    assert retreat_rules[0].release.require_separation_by_end is True
 
-    invalid_contact = _pick_request()
-    invalid_contact["retreat_operation"] = _planning_operation(
-        "pick.retreat",
-        _planning_motion(
-            "retreat", _cartesian_path(), contact_policy_id="pick.contact"
-        ),
+    # No rule is required on any leg.
+    without_rules = _pick_request()
+    without_rules["descend_operation"] = _planning_operation(
+        "pick.descend",
+        _planning_motion("descend", _cartesian_path(), selected_object_id="workpiece"),
     )
-    with pytest.raises(ValidationError, match="retreat cannot carry"):
-        PickSequencePlanningRequest.model_validate(invalid_contact)
+    PickSequencePlanningRequest.model_validate(without_rules)
+
+    # The descend leg binds the selected object exactly when the request names
+    # its runtime object (an offset reference then resolves through it).
+    unbound = _pick_request()
+    unbound["descend_operation"] = _planning_operation(
+        "pick.descend", _planning_motion("descend", _cartesian_path())
+    )
+    with pytest.raises(ValidationError, match="pick descend binds exactly"):
+        PickSequencePlanningRequest.model_validate(unbound)
+    del unbound["selected_runtime_object_id"]
+    unbound["synthesis"] = {}
+    parsed_unbound = PickSequencePlanningRequest.model_validate(unbound)
+    assert "selected_runtime_object_id" not in parsed_unbound.model_dump(mode="json")
+    stale_binding = _pick_request()
+    del stale_binding["selected_runtime_object_id"]
+    stale_binding["synthesis"] = {}
+    with pytest.raises(ValidationError, match="pick descend binds exactly"):
+        PickSequencePlanningRequest.model_validate(stale_binding)
+
+    # Legs carry no runtime-object bindings; the selected object is named by
+    # the request.
+    for phase, message in (
+        ("approach", "approach cannot carry"),
+        ("retreat", "retreat cannot carry"),
+    ):
+        bound = _pick_request()
+        payload = _planning_motion(
+            phase,
+            _cartesian_path(),
+            selected_object_id="workpiece",
+        )
+        payload["target_mode"] = "relative"
+        payload["target_reference"] = {
+            "type": "runtime_object", "runtime_object_id": "selected_object",
+        }
+        bound[f"{phase}_operation"] = _planning_operation(f"pick.{phase}", payload)
+        with pytest.raises(ValidationError, match=message):
+            PickSequencePlanningRequest.model_validate(bound)
 
     missing_scene = _pick_request()
     for phase in (
@@ -582,9 +672,20 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
     place["descend_operation"] = _planning_operation(
         "place.descend",
         _planning_motion(
-            "descend", _cartesian_path(), contact_policy_id="pick.contact"
+            "descend",
+            _cartesian_path(),
+            collision_rules=[_contact_rule("place.contact", "table")],
         ),
     )
+    assert PlaceSequencePlanningRequest.model_validate(place).sequence_id == "place.1"
+    bound_payload = _planning_motion(
+        "descend", _cartesian_path(), selected_object_id="workpiece"
+    )
+    bound_payload["target_mode"] = "relative"
+    bound_payload["target_reference"] = {
+        "type": "runtime_object", "runtime_object_id": "selected_object",
+    }
+    place["descend_operation"] = _planning_operation("place.descend", bound_payload)
     with pytest.raises(ValidationError, match="place motion phases"):
         PlaceSequencePlanningRequest.model_validate(place)
 
@@ -679,7 +780,7 @@ def test_pick_motion_phases_compare_the_exact_qualified_tcp(section: str, crosse
         PickSequencePlanningRequest.model_validate(request)
 
 
-def test_motion_payload_accepts_explicit_joint_contact_but_not_spatial_references() -> None:
+def test_motion_payload_accepts_joint_rules_but_not_spatial_references() -> None:
     pose = MotionParticipantRequest.model_validate(
         _planning_motion("pose", {"kind": "pose_goal", "goal": _planning_pose()})
     )
@@ -690,24 +791,38 @@ def test_motion_payload_accepts_explicit_joint_contact_but_not_spatial_reference
     assert path.motion.kind == "cartesian_path"
     joint = _planning_motion(
         "joint", {"kind": "joint_goal", "joint_names": ["joint1"], "positions_rad": [0.0]},
-        contact_policy_id="withdrawal.contact", selected_object_id="probe_block",
+        collision_rules=[{
+            "rule_id": "withdrawal.contact",
+            "a": [{"kind": "active_tcp_contact_bodies"}],
+            "b": [{"kind": "scene_object", "scene_resource_id": "probe_block"}],
+            "release": dict(_RELEASE),
+        }],
     )
     parsed = MotionParticipantRequest.model_validate(joint)
     assert parsed.motion.kind == "joint_goal"
-    assert parsed.contact_policy_id == "withdrawal.contact"
-    assert parsed.runtime_object_bindings[0].runtime_object_id == "selected_object"
-    assert parsed.runtime_object_bindings[0].scene_resource_id == "probe_block"
+    assert parsed.collision_rules[0].rule_id == "withdrawal.contact"
+    assert parsed.collision_rules[0].b[0].scene_resource_id == "probe_block"
+    assert parsed.runtime_object_bindings == []
     for mode in ("absolute", "relative"):
         for field in ("target_reference", "offset_reference"):
             spatial = {**joint, "target_mode": mode, field: {"type": "cell_frame"}}
             with pytest.raises(ValidationError, match="joint_goal cannot carry spatial references"):
                 MotionParticipantRequest.model_validate(spatial)
-    with pytest.raises(ValidationError, match="exactly cover motion references"):
-        MotionParticipantRequest.model_validate({**joint, "contact_policy_id": None})
+    binding = {"runtime_object_id": "selected_object", "scene_resource_id": "probe_block"}
+    referencing = _planning_motion("pose", {"kind": "pose_goal", "goal": _planning_pose()})
+    referencing["target_mode"] = "relative"
+    referencing["target_reference"] = {
+        "type": "runtime_object", "runtime_object_id": "selected_object",
+    }
+    with pytest.raises(ValidationError, match="must cover motion references"):
+        MotionParticipantRequest.model_validate(referencing)
+    MotionParticipantRequest.model_validate(
+        {**referencing, "runtime_object_bindings": [binding]}
+    )
     with pytest.raises(ValidationError, match="unique runtime_object_id"):
-        MotionParticipantRequest.model_validate({
-            **joint, "runtime_object_bindings": joint["runtime_object_bindings"] * 2,
-        })
+        MotionParticipantRequest.model_validate(
+            {**joint, "runtime_object_bindings": [binding, binding]}
+        )
 
 
 @pytest.mark.parametrize(
@@ -781,17 +896,132 @@ def test_absolute_goal_frame_is_one_named_frame_and_absent_means_base(frame) -> 
         )
 
 
-def test_motion_clearance_is_optional_and_bounded() -> None:
-    request = _planning_motion("clear", {"kind": "pose_goal", "goal": _planning_pose()})
-    assert "clearance_m" not in MotionParticipantRequest.model_validate(request).model_dump(
-        mode="json"
+def _motion_with_rules(rules: list[dict[str, object]]) -> dict[str, object]:
+    return _planning_motion(
+        "rules", {"kind": "pose_goal", "goal": _planning_pose()}, collision_rules=rules
     )
+
+
+def test_motion_collision_rules_are_required_and_closed() -> None:
+    request = _motion_with_rules([])
+    assert MotionParticipantRequest.model_validate(request).model_dump(mode="json")[
+        "collision_rules"
+    ] == []
+    missing = dict(request)
+    del missing["collision_rules"]
+    with pytest.raises(ValidationError):
+        MotionParticipantRequest.model_validate(missing)
+    for stale in ("contact_policy_id", "clearance_m"):
+        with pytest.raises(ValidationError):
+            MotionParticipantRequest.model_validate({**request, stale: None})
+
+
+def test_motion_clearance_row_has_no_selections_and_is_bounded() -> None:
     for value in (0.0, 0.0005, 0.05):
-        parsed = MotionParticipantRequest.model_validate({**request, "clearance_m": value})
-        assert parsed.model_dump(mode="json")["clearance_m"] == value
+        row = {"rule_id": "everything_else", "clearance_m": value}
+        wire = MotionParticipantRequest.model_validate(
+            _motion_with_rules([row])
+        ).model_dump(mode="json")
+        # The row without selections is sent without a and b.
+        assert wire["collision_rules"] == [row]
     for value in (-0.001, 0.0501, float("nan")):
         with pytest.raises(ValidationError):
-            MotionParticipantRequest.model_validate({**request, "clearance_m": value})
+            MotionParticipantRequest.model_validate(
+                _motion_with_rules([{"rule_id": "everything_else", "clearance_m": value}])
+            )
+    with pytest.raises(ValidationError, match="at most one row without selections"):
+        MotionParticipantRequest.model_validate(_motion_with_rules([
+            {"rule_id": "one", "clearance_m": 0.001},
+            {"rule_id": "two", "clearance_m": 0.002},
+        ]))
+    with pytest.raises(ValidationError, match="carries a clearance only"):
+        MotionParticipantRequest.model_validate(
+            _motion_with_rules([{"rule_id": "everything_else", "contact": {}}])
+        )
+
+
+def test_motion_collision_rule_values_and_selections_round_trip() -> None:
+    selections = [
+        {"kind": "component", "component_id": "robot"},
+        {"kind": "collision_body", "component_id": "tool", "collision_body_id": "fingers"},
+        {"kind": "link", "component_id": "robot", "link": "link5"},
+        {"kind": "attached_object", "component_id": "tool"},
+        {"kind": "scene_objects"},
+        {"kind": "scene_object", "scene_resource_id": "table"},
+        {"kind": "active_tcp_contact_bodies"},
+    ]
+    rules = [
+        {"rule_id": "wide", "a": selections[:3], "b": selections[4:6], "clearance_m": 0.01},
+        {"rule_id": "touch", "a": [selections[6]], "b": [selections[5]], "contact": {}},
+        {
+            "rule_id": "press",
+            "a": [selections[3]],
+            "b": [selections[5]],
+            "contact": {"max_penetration_m": 0.001},
+        },
+        {
+            "rule_id": "spring",
+            "a": [selections[3]],
+            "b": [selections[4]],
+            "contact": {"max_penetration_m": 0.01, "max_compression_step_m": 0.002},
+        },
+        _contact_rule("tip", "probe_block"),
+        _release_rule("lift", "table"),
+    ]
+    parsed = MotionParticipantRequest.model_validate(_motion_with_rules(rules))
+    # Absent contact keys stay absent: no depth check, the default window.
+    assert parsed.model_dump(mode="json")["collision_rules"] == rules
+    assert parsed.collision_rules[1].contact.max_penetration_m is None
+    assert parsed.collision_rules[1].contact.end_from_fraction is None
+
+
+@pytest.mark.parametrize(("rule", "message"), [
+    ({"rule_id": "r", "a": [{"kind": "scene_objects"}], "clearance_m": 0.001},
+     "both a and b or neither"),
+    ({"rule_id": "r", "a": [], "b": [{"kind": "scene_objects"}], "clearance_m": 0.001},
+     "at least 1 item"),
+    ({"rule_id": "r", "a": [{"kind": "scene_objects"}], "b": [{"kind": "scene_objects"}]},
+     "exactly one of clearance_m, contact, release"),
+    ({"rule_id": "r", "a": [{"kind": "scene_objects"}], "b": [{"kind": "scene_objects"}],
+      "clearance_m": 0.001, "contact": {}},
+     "exactly one of clearance_m, contact, release"),
+    ({"rule_id": "", "clearance_m": 0.001}, "rule_id"),
+    ({"rule_id": "r" * 129, "clearance_m": 0.001}, "rule_id"),
+    ({"rule_id": "r", "a": [{"kind": "model_group", "component_id": "robot", "group": "arm"}],
+      "b": [{"kind": "scene_objects"}], "contact": {}}, "kind"),
+    ({"rule_id": "r", "a": [{"kind": "scene_object", "blackboard_key": "trial.object"}],
+      "b": [{"kind": "scene_objects"}], "contact": {}}, "scene_resource_id"),
+    ({"rule_id": "r", "leg": "descend", "clearance_m": 0.001}, "leg"),
+    ({"rule_id": "r", "a": [{"kind": "scene_objects"}], "b": [{"kind": "scene_objects"}],
+      "contact": {"end_from_fraction": 1.5}}, "end_from_fraction"),
+    ({"rule_id": "r", "a": [{"kind": "scene_objects"}], "b": [{"kind": "scene_objects"}],
+      "contact": {"max_penetration_m": -0.001}}, "max_penetration_m"),
+    ({"rule_id": "r", "a": [{"kind": "scene_objects"}], "b": [{"kind": "scene_objects"}],
+      "contact": {"max_compression_step_m": 0.002}}, "needs max_penetration_m"),
+    ({"rule_id": "r", "a": [{"kind": "scene_objects"}], "b": [{"kind": "scene_objects"}],
+      "contact": {"max_penetration_m": 0.01, "max_compression_step_m": 0}},
+     "max_compression_step_m"),
+    ({"rule_id": "r", "a": [{"kind": "scene_objects"}], "b": [{"kind": "scene_objects"}],
+      "release": {"release_evidence_mode": "signed_penetration"}}, "release"),
+    ({"rule_id": "r", "a": [{"kind": "scene_objects"}], "b": [{"kind": "scene_objects"}],
+      "release": {**_RELEASE, "release_evidence_mode": "binary_contact"}},
+     "neutral for binary_contact"),
+])
+def test_motion_collision_rule_shape_is_refused(
+    rule: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        MotionParticipantRequest.model_validate(_motion_with_rules([rule]))
+
+
+def test_motion_collision_rule_ids_are_unique_and_bounded() -> None:
+    row = _contact_rule("tip", "probe_block")
+    with pytest.raises(ValidationError, match="unique rule_id"):
+        MotionParticipantRequest.model_validate(_motion_with_rules([row, row]))
+    many = [{**row, "rule_id": f"rule_{index}"} for index in range(65)]
+    with pytest.raises(ValidationError):
+        MotionParticipantRequest.model_validate(_motion_with_rules(many))
+    MotionParticipantRequest.model_validate(_motion_with_rules(many[:64]))
 
 
 def test_cartesian_path_speed_mode_optional_and_blend_radii_per_waypoint() -> None:
@@ -820,6 +1050,49 @@ def test_cartesian_path_speed_mode_optional_and_blend_radii_per_waypoint() -> No
     del request["motion"]["blend_radii_m"]
     with pytest.raises(ValidationError):
         MotionParticipantRequest.model_validate(request)
+
+
+def test_linear_pose_goal_carries_its_line_settings_and_joint_stays_two_fields() -> None:
+    # OD-341: a joint pose goal keeps its two-field wire; a linear one carries
+    # motion_type and every line setting, speed_mode optional.
+    joint = _planning_motion("pose", {"kind": "pose_goal", "goal": _planning_pose()})
+    wire = MotionParticipantRequest.model_validate(joint).model_dump(mode="json")
+    assert set(wire["motion"]) == {"kind", "goal"}
+    line = {
+        "max_translation_step_m": 0.005,
+        "max_rotation_step_rad": 0.05,
+        "max_angular_speed_rad_s": 0.5,
+        "max_linear_acceleration_mps2": 0.5,
+        "max_angular_acceleration_rad_s2": 2.5,
+    }
+    linear = _planning_motion(
+        "line",
+        {"kind": "pose_goal", "goal": _planning_pose(), "motion_type": "linear", **line},
+    )
+    wire = MotionParticipantRequest.model_validate(linear).model_dump(mode="json")
+    assert wire["motion"] == {
+        "kind": "pose_goal", "goal": wire["motion"]["goal"], "motion_type": "linear", **line,
+    }
+    linear["motion"]["speed_mode"] = "time_optimal"
+    parsed = MotionParticipantRequest.model_validate(linear)
+    assert parsed.model_dump(mode="json")["motion"]["speed_mode"] == "time_optimal"
+    with pytest.raises(ValidationError, match="require motion_type linear"):
+        MotionParticipantRequest.model_validate(
+            {**joint, "motion": {**joint["motion"], "max_translation_step_m": 0.005}}
+        )
+    missing = {**linear["motion"]}
+    del missing["max_rotation_step_rad"]
+    with pytest.raises(ValidationError, match="requires every line setting"):
+        MotionParticipantRequest.model_validate({**linear, "motion": missing})
+    for value in (0.0, float("nan")):
+        with pytest.raises(ValidationError):
+            MotionParticipantRequest.model_validate(
+                {**linear, "motion": {**linear["motion"], "max_translation_step_m": value}}
+            )
+    with pytest.raises(ValidationError):
+        MotionParticipantRequest.model_validate(
+            {**linear, "motion": {**linear["motion"], "motion_type": "joint"}}
+        )
 
 
 def test_motion_reference_shape_fails_closed_before_native_admission() -> None:
@@ -864,7 +1137,7 @@ def test_motion_reference_shape_fails_closed_before_native_admission() -> None:
         "type": "runtime_object",
         "runtime_object_id": "selected_object",
     }
-    with pytest.raises(ValidationError, match="exactly cover"):
+    with pytest.raises(ValidationError, match="must cover motion references"):
         MotionParticipantRequest.model_validate(stale_runtime_binding)
 
 
@@ -931,7 +1204,6 @@ def test_alarm_activation_and_bulk_cardinality_match_owner_profile() -> None:
 def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
     body = {
         **_caller(),
-        "deployment_artifact_id": "deployment.1",
         "deployment_revision": "sha256:" + "a" * 64,
         "expected_current": {
             "graph_revision": "graph.1",
@@ -942,7 +1214,6 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
         "expected_admission_generation": 7,
         "candidate_receipt": {
             "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
-            "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
             "prepared_activation_id": "sha256:" + "e" * 64,
             "candidate_retained_bundle_id": "bundle.2",
@@ -984,7 +1255,6 @@ def test_direct_empty_scene_preparation_requires_publication_and_no_applied_dige
 def test_apply_requires_one_exact_prepared_activation() -> None:
     body = {
         **_caller(),
-        "deployment_artifact_id": "deployment.1",
         "deployment_revision": "sha256:" + "a" * 64,
         "expected_current": {
             "graph_revision": "graph.1",
@@ -995,7 +1265,6 @@ def test_apply_requires_one_exact_prepared_activation() -> None:
         "expected_admission_generation": 7,
         "candidate_receipt": {
             "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
-            "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
             "prepared_activation_id": "sha256:" + "e" * 64,
             "candidate_retained_bundle_id": "bundle.2",
@@ -1090,7 +1359,7 @@ def test_apply_requires_one_exact_prepared_activation() -> None:
                 **body,
                 "prepared_activation": {
                     **_prepared_activation(),
-                    "deployment_artifact_id": "deployment.2",
+                    "deployment_revision": "sha256:" + "b" * 64,
                 },
             }
         )
@@ -1109,7 +1378,6 @@ def _status_body() -> dict[str, object]:
                 key: prepared[key]
                 for key in (
                     "captured_input_digest",
-                    "deployment_artifact_id",
                     "deployment_revision",
                     "prepared_activation_id",
                 )
@@ -1775,65 +2043,14 @@ def test_scene_transaction_is_strict_and_cannot_assert_attribution() -> None:
         SceneTransactionRequest.model_validate(reset)
 
 
-def test_scene_support_declarations_are_portable_and_mode_normalized() -> None:
+def test_scene_objects_carry_no_support_contacts() -> None:
     body = _scene_transaction()
     body["operation"] = {
         **body["operation"],
-        "support_contacts": [
-            {
-                "support_object_id": "support-b",
-                "mode": "bounded_penetration",
-                "max_contact_penetration_m": 0.002,
-            },
-            {
-                "support_object_id": "support-a",
-                "release_evidence_mode": "binary_contact",
-            },
-        ],
+        "support_contacts": [{"support_object_id": "support-a"}],
     }
-    parsed = SceneTransactionRequest.model_validate(body)
-    contacts = parsed.operation.support_contacts
-    assert [contact.support_object_id for contact in contacts] == [
-        "support-a",
-        "support-b",
-    ]
-    assert contacts[0].enforce_max_start_penetration is False
-    assert contacts[0].release_tolerance_m == 0.0
-    assert contacts[1].require_separation_by_end is False
-    assert contacts[1].max_contact_penetration_m == 0.002
-
-    self_supported = _scene_transaction()
-    self_supported["operation"] = {
-        **self_supported["operation"],
-        "support_contacts": [{"support_object_id": "part.1"}],
-    }
-    with pytest.raises(ValidationError, match="cannot support itself"):
-        SceneTransactionRequest.model_validate(self_supported)
-
-    duplicate = _scene_transaction()
-    duplicate["operation"] = {
-        **duplicate["operation"],
-        "support_contacts": [
-            {"support_object_id": "support-a"},
-            {"support_object_id": "support-a"},
-        ],
-    }
-    with pytest.raises(ValidationError, match="duplicate support"):
-        SceneTransactionRequest.model_validate(duplicate)
-
-    invalid_mode_mix = _scene_transaction()
-    invalid_mode_mix["operation"] = {
-        **invalid_mode_mix["operation"],
-        "support_contacts": [
-            {
-                "support_object_id": "support-a",
-                "mode": "contact_process",
-                "require_separation_by_end": True,
-            }
-        ],
-    }
-    with pytest.raises(ValidationError, match="release-only fields"):
-        SceneTransactionRequest.model_validate(invalid_mode_mix)
+    with pytest.raises(ValidationError):
+        SceneTransactionRequest.model_validate(body)
 
 
 def test_scene_policy_and_attachment_sets_require_canonical_order() -> None:
@@ -1876,12 +2093,12 @@ def test_attach_grasp_lost_bound_is_optional_positive_and_absent_on_the_wire() -
     }
     plain = SceneTransactionRequest.model_validate(body)
     assert plain.operation.grasp_lost_bound is None
-    assert "grasp_lost_bound" not in _transaction_body(plain)["operation"]
+    assert "grasp_lost_bound" not in _transaction_body(plain, None)["operation"]
 
     bound = {"translation_m": 0.03, "rotation_rad": 0.26}
     body["operation"] = {**body["operation"], "grasp_lost_bound": bound}
     bounded = SceneTransactionRequest.model_validate(body)
-    assert _transaction_body(bounded)["operation"]["grasp_lost_bound"] == bound
+    assert _transaction_body(bounded, None)["operation"]["grasp_lost_bound"] == bound
 
     for invalid in (
         {"translation_m": 0.0, "rotation_rad": 0.26},
@@ -1901,12 +2118,12 @@ def test_scene_object_mass_is_optional_positive_and_absent_on_the_wire() -> None
     body = _scene_transaction()
     plain = SceneTransactionRequest.model_validate(body)
     assert plain.operation.mass_kg is None
-    assert "mass_kg" not in _transaction_body(plain)["operation"]
+    assert "mass_kg" not in _transaction_body(plain, None)["operation"]
 
     for kind in ("add_object", "upsert_object"):
         body["operation"] = {**body["operation"], "kind": kind, "mass_kg": 2.5}
         heavy = SceneTransactionRequest.model_validate(body)
-        assert _transaction_body(heavy)["operation"]["mass_kg"] == 2.5
+        assert _transaction_body(heavy, None)["operation"]["mass_kg"] == 2.5
 
     for invalid in (0.0, -1.0, float("inf"), float("nan"), "2.5"):
         body["operation"] = {**body["operation"], "mass_kg": invalid}
@@ -1931,7 +2148,7 @@ def test_attach_on_grasp_lost_is_optional_closed_and_absent_on_the_wire() -> Non
     }
     plain = SceneTransactionRequest.model_validate(body)
     assert plain.operation.on_grasp_lost is None
-    assert "on_grasp_lost" not in _transaction_body(plain)["operation"]
+    assert "on_grasp_lost" not in _transaction_body(plain, None)["operation"]
 
     for response in (
         {"raise_alarm": False, "stop_motion": True, "set_key": "part_lost", "detach": False},
@@ -1939,7 +2156,7 @@ def test_attach_on_grasp_lost_is_optional_closed_and_absent_on_the_wire() -> Non
     ):
         body["operation"] = {**body["operation"], "on_grasp_lost": response}
         model = SceneTransactionRequest.model_validate(body)
-        assert _transaction_body(model)["operation"]["on_grasp_lost"] == response
+        assert _transaction_body(model, None)["operation"]["on_grasp_lost"] == response
 
     for invalid in (
         {"raise_alarm": False, "stop_motion": True, "detach": False},
@@ -1960,7 +2177,6 @@ def test_scene_upsert_and_current_pose_detach_are_closed_typed_operations() -> N
             "kind": "scene_resource",
             "scene_resource_id": "fixture.1",
         },
-        "support_contacts": [],
     }
     parsed_upsert = SceneTransactionRequest.model_validate(upsert)
     assert parsed_upsert.operation.kind == "upsert_object"
@@ -1990,8 +2206,9 @@ def test_scene_upsert_and_current_pose_detach_are_closed_typed_operations() -> N
 def _empty_cell_prepared_activation() -> dict[str, object]:
     """Close/New: an ordinary Scenario preparation of the empty cell."""
 
-    return {**_prepared_activation(), "program_id": None, "program_revision": None,
-            "program_outcome": {"kind": "no_program"}, "assistant_mode": "optional"}
+    return {**_prepared_activation(), "program_revision": None,
+            "program_outcome": {"kind": "no_program"}, "assistant_mode": "optional",
+            "scene_meshes": []}
 
 
 def test_prepared_origins_are_closed_and_preserve_ordinary_identity_bound() -> None:
@@ -2000,6 +2217,7 @@ def test_prepared_origins_are_closed_and_preserve_ordinary_identity_bound() -> N
     assert ManagerApplyPreparedActivation.model_validate(value).origin.scenario_id == "s" * 256
     for bad in (
         {**value, "schema_version": "manyforge.prepared_activation_input.v5"},
+        {**value, "schema_version": "manyforge.prepared_activation_input.v7"},
         {**value, "scenario_id": "fabricated"},
         {**value, "source_document_digest": "sha256:" + "1" * 64},
         {**value, "origin": {**value["origin"], "cell_id": "cell_a"}},
@@ -2352,6 +2570,56 @@ def test_runner_requests_forward_the_formed_key_and_never_a():
             model.model_validate({**_caller(), **fields, "program_run_id": "run.1"})
 
 
+def test_recovery_action_names_an_offered_action_or_an_operator_choice_option():
+    """OD-342: the action is an identifier the runner checks against the
+    offer: a recovery action or the option id answering an operator question."""
+    from manyforge_headless_api.models import CycleRecoveryActionRequest
+
+    body = {
+        **_caller(),
+        "application_start_id": _A,
+        "offer_id": "sha256:" + "0" * 64,
+        "offer_revision": 1,
+    }
+    for action_id in (
+        "retry_runtime_step",
+        "reset_cycle",
+        "continue_with_failure",
+        "continue",
+        "bin.emptied-2",
+        "a" * 128,
+    ):
+        parsed = CycleRecoveryActionRequest.model_validate({**body, "action_id": action_id})
+        assert parsed.action_id == action_id
+    for action_id in (
+        "",
+        "Continue",
+        "2nd_try",
+        "_continue",
+        "bin emptied",
+        "a" * 129,
+        "\u00e9",
+        7,
+        None,
+    ):
+        with pytest.raises(ValidationError):
+            CycleRecoveryActionRequest.model_validate({**body, "action_id": action_id})
+    with pytest.raises(ValidationError):
+        CycleRecoveryActionRequest.model_validate(body)
+
+
+def test_history_filters_by_collision_rule_id():
+    from manyforge_headless_api.history_query import HistorianQueryRequest
+
+    query = HistorianQueryRequest(collision_rule_id="tip_on_part")
+    assert query.native_arguments(now_utc_ns=1)["correlations"] == {
+        "collision_rule_id": "tip_on_part"}
+    # `rule_id` names an interrupt rule in events; it is not a History filter.
+    for stale in ({"rule_id": "tip_on_part"}, {"contact_policy_id": "probe_contact_policy"}):
+        with pytest.raises(ValidationError):
+            HistorianQueryRequest(**stale)
+
+
 def test_history_filters_accept_the_display_and_copy_forms():
     from manyforge_headless_api.history_query import HistorianQueryRequest
 
@@ -2530,3 +2798,33 @@ def test_authoring_transaction_request_has_no_digest_or_transaction_id(old_membe
     assert AuthoringMutationContext.model_validate(body).expected_admission_generation == 7
     with pytest.raises(ValidationError):
         AuthoringMutationContext.model_validate({**body, **old_member})
+
+
+def _collision_policy(**changes) -> dict:
+    body = {
+        "policy_id": "free_space",
+        "revision": {"revision_id": 1, "content_hash": "sha256:" + "a" * 64},
+        "static_body_ids": [],
+        "allowed_touch_link_pairs": [],
+        "require_full_diagnostics": True,
+    }
+    body.update(changes)
+    return body
+
+
+def test_collision_policy_names_static_bodies_not_static_pairs() -> None:
+    bodies = [f"scene/fixed-{index:03d}/shape/0" for index in range(200)]
+    policy = CollisionPolicyRequest.model_validate(
+        _collision_policy(static_body_ids=bodies)
+    )
+    assert policy.static_body_ids == bodies
+    for invalid in (list(reversed(bodies)), [bodies[0], bodies[0]], [""]):
+        with pytest.raises(ValidationError):
+            CollisionPolicyRequest.model_validate(
+                _collision_policy(static_body_ids=invalid)
+            )
+    # The static pair list is gone: one rule by body class.
+    with pytest.raises(ValidationError):
+        CollisionPolicyRequest.model_validate(
+            _collision_policy(allowed_static_static_pairs=[])
+        )

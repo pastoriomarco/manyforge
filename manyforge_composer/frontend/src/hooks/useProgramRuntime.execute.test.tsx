@@ -172,13 +172,14 @@ it('keeps an exact selection refusal visible and projects the next owner snapsho
     allowed: boolean,
     reason: string | null,
   ): ProgramRuntimeControlProjection => ({
-    schemaVersion: 'manyforge.program_runtime_control_projection.v10',
+    schemaVersion: 'manyforge.program_runtime_control_projection.v11',
     ownerId: 'program-runner.development-workbench',
     programRunId: run.capture.programRunId,
     runRevision: run.runRevision,
     runtimeControls: { runtimeControlRevision: 1 } as never,
     recoveryOffer: null,
     recoveryHolds: [],
+    operatorQuestions: [],
     executionSelections: {
       holdRevision: 7,
       motionHeld: true,
@@ -188,7 +189,7 @@ it('keeps an exact selection refusal visible and projects the next owner snapsho
         startAllowed: allowed, startUnavailableReason: reason,
         resumeAllowed: allowed, resumeUnavailableReason: reason,
         runtimeScaleSelector: null, runtimeScaleUnavailableReason: null,
-        resourceIds: [],
+        resourceIds: [], stoppedBy: null, stoppedByNodeInstanceId: null,
       }],
     },
   } as unknown as ProgramRuntimeControlProjection);
@@ -396,16 +397,17 @@ async function mountScaleRows(groupIds: string[]) {
   await test.observe(({ snapshot }) => {
     snapshot.programCycle = { ...snapshot.programCycle, state: 'running',
       programRunId: run.capture.programRunId, runRevision: run.runRevision, run,
-      runtimeControls: { schemaVersion: 'manyforge.program_runtime_control_projection.v10',
+      runtimeControls: { schemaVersion: 'manyforge.program_runtime_control_projection.v11',
         ownerId: 'program-runner.development-workbench',
         programRunId: run.capture.programRunId, runRevision: run.runRevision,
         runtimeControls: { runtimeControlRevision: 1 }, recoveryOffer: null, recoveryHolds: [],
+        operatorQuestions: [],
         executionSelections: { holdRevision: 1, motionHeld: false,
           groups: groupIds.map((groupId) => ({ groupId, nodeCount: 1, heldNodeCount: 0,
             state: 'running', stopAllowed: true, startAllowed: false,
             startUnavailableReason: null, resumeAllowed: false, resumeUnavailableReason: null,
             runtimeScaleSelector: scaleSelector, runtimeScaleUnavailableReason: null,
-            resourceIds: [] })) } } as unknown as ProgramRuntimeControlProjection };
+            resourceIds: [], stoppedBy: null, stoppedByNodeInstanceId: null })) } } as unknown as ProgramRuntimeControlProjection };
   });
   for (const groupId of groupIds) {
     expect(test.runtime.groupRuntimeScales[groupId]).toMatchObject({ draft: 0.5, pending: false });
@@ -584,13 +586,14 @@ it('clears a Run or Resume once the owner applied a newer selection, whatever th
   const test = await mount();
   const run = heldRun();
   const controls = (holdRevision: number, state: string, heldNodeCount: number) => ({
-    schemaVersion: 'manyforge.program_runtime_control_projection.v10',
+    schemaVersion: 'manyforge.program_runtime_control_projection.v11',
     ownerId: 'program-runner.development-workbench',
     programRunId: run.capture.programRunId,
     runRevision: run.runRevision,
     runtimeControls: { runtimeControlRevision: 1 } as never,
     recoveryOffer: null,
     recoveryHolds: [],
+    operatorQuestions: [],
     executionSelections: {
       holdRevision,
       motionHeld: state === 'held',
@@ -599,6 +602,7 @@ it('clears a Run or Resume once the owner applied a newer selection, whatever th
         stopAllowed: state !== 'held', startAllowed: true, startUnavailableReason: null,
         resumeAllowed: state === 'held', resumeUnavailableReason: null,
         runtimeScaleSelector: null, runtimeScaleUnavailableReason: null, resourceIds: [],
+        stoppedBy: null, stoppedByNodeInstanceId: null,
       }],
     },
   }) as unknown as ProgramRuntimeControlProjection;

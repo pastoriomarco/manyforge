@@ -55,7 +55,7 @@ def document(*children: dict, groups="inherit") -> dict:
     result = load_strict_json_yaml(
         ROOT / "examples/pick_and_place_minimal.program.yaml"
     )
-    result["api_version"] = "manyforge.program.v3"
+    result["api_version"] = "manyforge.program.v4"
     result["tree"] = {
         "node_id": "sequence",
         "instance_id": "root",
@@ -299,5 +299,24 @@ def test_viewer_hidden_execution_groups_name_declared_groups_only(
     ):
         invalid = deepcopy(source)
         invalid["viewer"] = {"hidden_execution_groups": hidden}
+        with pytest.raises(ProgramValidationError, match=message):
+            Program.from_dict(identified(invalid), catalog)
+
+
+def test_viewer_default_view_is_two_points(catalog: NodeCatalog) -> None:
+    """OD-355: the Scenario's default 3D view is a camera position and target."""
+    source = document(leaf("arm_a", ["robot_a"]))
+    view = {"position_m": [1.5, -1.2, 1.1], "target_m": [0.2, 0.0, 0.4]}
+    source["viewer"] = {"default_view": view}
+    program = Program.from_dict(identified(source), catalog)
+    assert program.to_dict()["viewer"]["default_view"] == view
+
+    for invalid_view, message in (
+        ({"position_m": [1.0, 2.0], "target_m": [0.0, 0.0, 0.0]}, "three numbers"),
+        ({"position_m": [1.0, 2.0, "x"], "target_m": [0.0, 0.0, 0.0]}, "finite number"),
+        ({"position_m": [1.0, 2.0, 3.0]}, "target_m"),
+    ):
+        invalid = deepcopy(source)
+        invalid["viewer"] = {"default_view": invalid_view}
         with pytest.raises(ProgramValidationError, match=message):
             Program.from_dict(identified(invalid), catalog)

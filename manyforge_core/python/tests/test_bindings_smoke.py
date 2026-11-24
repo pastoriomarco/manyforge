@@ -39,12 +39,12 @@ def test_error_code_enum():
     assert manyforge_core_py.ErrorCode.kInvalidRequest == manyforge_core_py.kInvalidRequest
     assert manyforge_core_py.ErrorCode.kPlanningFailed == manyforge_core_py.kPlanningFailed
     assert (
-        manyforge_core_py.ErrorCode.kInvalidContactPolicy
-        == manyforge_core_py.kInvalidContactPolicy
+        manyforge_core_py.ErrorCode.kInvalidCollisionRule
+        == manyforge_core_py.kInvalidCollisionRule
     )
     assert (
-        manyforge_core_py.ErrorCode.kContactPolicyViolation
-        == manyforge_core_py.kContactPolicyViolation
+        manyforge_core_py.ErrorCode.kContactRuleViolation
+        == manyforge_core_py.kContactRuleViolation
     )
 
 
@@ -158,6 +158,14 @@ def test_pose_goal_dto():
     
     p = manyforge_core_py.PoseGoalDTO(goal_pose)
     assert p.goal.position_m.x_m == 1.0
+    # A joint move by default; a linear one carries its line settings.
+    assert p.linear is None
+    linear = manyforge_core_py.LinearPoseMotionDTO()
+    assert linear.max_translation_step_m == 0.005
+    assert linear.speed_mode is None
+    linear.speed_mode = manyforge_core_py.CartesianSpeedMode.kTimeOptimal
+    p.linear = linear
+    assert p.linear.speed_mode == manyforge_core_py.CartesianSpeedMode.kTimeOptimal
 
 
 def test_robot_state_dto():
@@ -307,6 +315,18 @@ def test_cylinder_shape_dto():
     c = manyforge_core_py.CylinderShapeDTO(0.1, 0.5)
     assert c.radius_m == 0.1
     assert c.height_m == 0.5
+
+
+def test_mesh_shape_dto_carries_content_digest():
+    """MeshShapeDTO carries the captured content digest (OD-335)."""
+    import manyforge_core_py
+
+    scale = manyforge_core_py.Vector3DTO(1.0, 1.0, 1.0)
+    digest = "sha256:" + "a" * 64
+    m = manyforge_core_py.MeshShapeDTO("meshes/part.stl", scale, digest)
+    assert m.resource_uri == "meshes/part.stl"
+    assert m.content_digest == digest
+    assert manyforge_core_py.MeshShapeDTO("meshes/part.stl", scale).content_digest == ""
 
 
 def test_reference_dto():

@@ -162,3 +162,29 @@ def test_startup_load_proceeds_over_an_empty_cell() -> None:
 
     state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=_EmptyHeadless())  # type: ignore[arg-type]
     routes_scenario_documents.require_empty_cell(state)  # no refusal
+
+
+def test_composer_waits_for_the_headless_api_to_listen(monkeypatch) -> None:
+    """OD-332: a refused connection is repeated; any answer ends the wait."""
+    from manyforge_headless_api.client import HeadlessClientError
+
+    replies: list[Any] = [
+        HeadlessClientError("headless_http_unavailable", "connection refused"),
+        HeadlessClientError("headless_http_unavailable", "connection refused"),
+        HeadlessClientError("headless_http_error", "HTTP 503", 503),
+        {"status": "ok"},
+    ]
+
+    class _Starting:
+        def health(self) -> dict[str, Any]:
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(composer_main.time, "sleep", sleeps.append)
+    composer_main._wait_for_headless_listening(_Starting())
+    # The answered HTTP 503 ends the wait: the API listens.
+    assert sleeps == [0.1, 0.1]
+    assert replies == [{"status": "ok"}]

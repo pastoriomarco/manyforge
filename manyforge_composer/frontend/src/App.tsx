@@ -14,7 +14,6 @@ import {
 } from './components/AssistantOverlay';
 import { ComponentsWorkspace } from './components/ComponentsWorkspace';
 import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
-import { deploymentDocumentHeader } from './components/DeploymentDocumentControls';
 import {
   HeadlessRuntimeSurfaces,
   errorAlarms,
@@ -165,8 +164,6 @@ const PROGRAM_ACTION_LABELS: Partial<Record<ProgramWorkspaceActionName, string>>
   load: 'Loading Program',
   load_scenario_document: 'Submitting Scenario Load',
   export_scenario_document: 'Exporting Scenario',
-  save: 'Saving Program',
-  save_as: 'Saving Program as',
   save_scenario_document: 'Saving Scenario',
 };
 
@@ -272,7 +269,7 @@ export default function App() {
     readOnlyReason: string | null;
   }>({ active: false, title: 'Program inspector', readOnlyReason: null });
   const [viewerInspectorPanel, setViewerInspectorPanel] = useState<
-    'tools' | 'robot' | 'object' | 'io' | null
+    'tools' | 'robot' | 'object' | 'io' | 'keys' | null
   >(null);
   const [inspectorHeight, setInspectorHeight] = useState(() => (
     typeof window === 'undefined' ? 720 : Math.max(320, window.innerHeight - 52)
@@ -497,6 +494,24 @@ export default function App() {
     if (draftId) setSelectedProgramNode({ draftId, id });
   }, []);
   const referenceValidation = useReferenceValidation(programController.state.workspace);
+  const [programAttentionRequest, setProgramAttentionRequest] = useState(0);
+  // The Keys panel's Edit initial: open the key's declaration in the Program tab.
+  const [keyDeclarationRequest, setKeyDeclarationRequest] = useState<string | null>(null);
+  const editKeyInitial = useCallback((key: string) => {
+    setKeyDeclarationRequest(key);
+    setActiveWorkspace('program');
+  }, []);
+  const keyDeclarationRequestHandled = useCallback(() => setKeyDeclarationRequest(null), []);
+  // The Program's reference status as a dot on the Program tab, like the
+  // Deployment dot: green when clear, red with the issue count, grey when unknown.
+  const programAttention = useMemo(() => {
+    const { referenceAttention, referenceUnavailable } = referenceValidation;
+    if (referenceUnavailable) return { tone: 'unavailable', count: 0, title: 'Reference validation is unavailable' };
+    const total = referenceAttention?.total ?? 0;
+    return total > 0
+      ? { tone: 'attention', count: total, title: `${total} reference ${total === 1 ? 'issue' : 'issues'} need attention` }
+      : { tone: 'ok', count: 0, title: referenceAttention === null ? 'Checking references' : 'No reference issues' };
+  }, [referenceValidation]);
   // Draft / Saved / Applied of both documents, shown in every workspace.
   const programStates = programDocumentStates(programController.state.workspace);
   // Keys a global interrupt rule may read: the Program Draft's declared and
@@ -1394,6 +1409,7 @@ export default function App() {
       replacementAdmissionAllowed={replacementAdmissionAllowed(
         authoringAdmissionOpen, authoringCause, authoringWorkspace.failedApplyHoldsCell)}
       deploymentDirty={deploymentController.workspace?.draft.differsFromSaved === true}
+      deploymentUnapplied={deploymentUnapplied(deploymentController.workspace)}
       localInvalidEdit={programInvalidEdit}
       motionActive={documentMotionActive}
       newWaitReason={documentNewWaitReason}
@@ -1426,15 +1442,29 @@ export default function App() {
         </div>
         <nav className="workspace-switcher" aria-label="ManyForge sections">
           <DocumentStateLetters states={programStates} owner="Program" side="left" />
-          <button
-            type="button"
-            data-workspace="program"
-            className={activeWorkspace === 'program' ? 'active' : ''}
-            aria-pressed={activeWorkspace === 'program'}
-            onClick={() => setActiveWorkspace('program')}
-          >
-            Program
-          </button>
+          <span className="program-tab">
+            <button
+              type="button"
+              data-workspace="program"
+              className={activeWorkspace === 'program' ? 'active' : ''}
+              aria-pressed={activeWorkspace === 'program'}
+              onClick={() => setActiveWorkspace('program')}
+            >
+              Program
+            </button>
+            <button
+              type="button"
+              className={`program-attention-badge tone-${programAttention.tone}`}
+              title={programAttention.title}
+              aria-label={`Program references: ${programAttention.title}. Open the list.`}
+              onClick={() => {
+                setActiveWorkspace('program');
+                setProgramAttentionRequest((current) => current + 1);
+              }}
+            >
+              {programAttention.count > 0 ? programAttention.count : ''}
+            </button>
+          </span>
           <button
             type="button"
             data-workspace="scene"
@@ -1508,8 +1538,10 @@ export default function App() {
         </nav>
         <DocumentControls
           {...(activeWorkspace === 'deployment' || activeWorkspace === 'components'
-            ? deploymentDocumentHeader(deploymentController)
+            ? { label: 'Deployment document controls' }
             : programDocumentHeader(programController))}
+          scenarioPath={programController.state.workspace?.saved.path
+            ?? deploymentController.workspace?.saved.path ?? null}
           scenarioCommands={scenarioCommands}
           actions={scenarioActions}
         />
@@ -1565,6 +1597,9 @@ export default function App() {
               onSelectedNodeIdChange={selectProgramNode}
               onHeldPreviewVisibilityChange={setHeldPreviewVisible}
               referenceValidation={referenceValidation}
+              attentionOpenRequest={programAttentionRequest}
+              keyDeclarationRequest={keyDeclarationRequest}
+              onKeyDeclarationRequestHandled={keyDeclarationRequestHandled}
               controller={programController}
               runtime={programRuntime}
               manualPreviewController={robotControl}
@@ -1748,6 +1783,7 @@ export default function App() {
                 programController={programController}
                 deploymentController={deploymentController}
                 programRuntime={programRuntime}
+                onEditKeyInitial={editKeyInitial}
                 authoringAdmissionAllowed={authoringAdmissionOpen}
                 robotControl={robotControl}
                 correctionGhost={heldNodePreview.ghost}

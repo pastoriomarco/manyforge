@@ -47,11 +47,11 @@ std::optional<PlannerMotionCapability> motion_capability(
   if (std::holds_alternative<ResolvedJointGoalDTO>(motion)) {
     return PlannerMotionCapability::kJoint;
   }
+  if (cartesian_planned(motion)) {
+    return PlannerMotionCapability::kCartesian;
+  }
   if (std::holds_alternative<PoseGoalDTO>(motion)) {
     return PlannerMotionCapability::kPose;
-  }
-  if (std::holds_alternative<CartesianPathDTO>(motion)) {
-    return PlannerMotionCapability::kCartesian;
   }
   return std::nullopt;
 }

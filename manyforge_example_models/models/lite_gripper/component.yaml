@@ -1,7 +1,7 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
 # `scripts/manyforge component check manyforge_example_models/models/lite_gripper`.
 # Mounts on a robot's `flange` interface as its own component.
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: tool
 id: ufactory.lite_gripper
 version: 1.0.0
@@ -25,7 +25,7 @@ gripper:
   states: {open: open, closed: closed}
   attach_frame: link_tcp
   command_duration_s: 0.8        # the valve dwell in seconds (lane-free profile)
-  touch_links: [lite_gripper_base_link, lite_gripper_left_finger, lite_gripper_right_finger]
+  grip_body: gripper_collision      # the collision body made of the gripper's own links
 lanes:
   mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
     adapter: mock

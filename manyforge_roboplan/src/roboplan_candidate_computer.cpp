@@ -105,7 +105,7 @@ collision_failure_details(const roboplan::Scene &scene,
   const auto &data = scene.getCollisionData();
   const auto pair_count =
       std::min(model.collisionPairs.size(), data.collisionResults.size());
-  // Pairs the request's contact policy deactivated keep stale results.
+  // Pairs the request's contact rules deactivated keep stale results.
   for (std::size_t index = 0U; !start_state && index < pair_count; ++index) {
     if (!data.activeCollisionPairs[index] ||
         !data.collisionResults[index].isCollision()) {
@@ -208,6 +208,14 @@ standard_vector(const Eigen::VectorXd &values) {
   transform(1, 3) = pose.position_m.y_m;
   transform(2, 3) = pose.position_m.z_m;
   return transform;
+}
+
+[[nodiscard]] core::Pose3DTO portable_pose(const Eigen::Matrix4d &pose) {
+  const Eigen::Quaterniond orientation(Eigen::Matrix3d(pose.block<3, 3>(0, 0)));
+  return core::Pose3DTO{
+      core::Vector3DTO{pose(0, 3), pose(1, 3), pose(2, 3)},
+      core::QuaternionDTO{orientation.x(), orientation.y(), orientation.z(),
+                          orientation.w()}};
 }
 
 [[nodiscard]] bool valid_pose(const core::Pose3DTO &pose) noexcept {
@@ -1915,13 +1923,15 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
                       const RoboPlanCandidateRequestDTO &input,
                       const CartesianPlanningControl &control,
                       std::size_t maximum_samples) {
-  // Cartesian positional fidelity alone does not prove the authored joint-space
-  // blend constraint for a new quintic connector. The existing caller owns
-  // approved spring-back fallback for this unqualified constraint.
+  // A Cartesian path never joins a moving robot (OD-347): its waypoint 0 is
+  // the start pose. The Kernel refuses such a takeover at admission; one whose
+  // incumbent was released only after admission reaches here and takes the
+  // caller's stop-first fallback. A linear pose goal is joined below and its
+  // connector is proven against its line (finalize_moving_candidate).
   if (std::holds_alternative<core::CartesianPathDTO>(input.motion))
     return fail<RoboPlanCandidateRequestDTO>(
         ErrorCode::kUnsupportedCapability,
-        "Moving Cartesian connector joint-space blend bounds are not qualified",
+        "A Cartesian path cannot join a moving robot",
         "native_moving_cartesian_blend_proof_unavailable");
   const auto invalid = [] {
     return fail<RoboPlanCandidateRequestDTO>(
@@ -2043,12 +2053,102 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
   return core::Result<RoboPlanCandidateRequestDTO>::Ok(std::move(suffix));
 }
 
+// A moving linear pose goal's connector is proven against its line: every
+// sampled connector pose, plus the motion still possible between samples,
+// lies within the move's translation and rotation tolerances of one pose on
+// the straight segment start -> goal (position interpolated, orientation
+// slerped at the same parameter, as densify_cartesian_path does). Any
+// parameter that meets both tolerances proves the sample, so the translation
+// and the rotation projection are tried. The retained line after the entry is
+// already certified by plan_cartesian_candidate.
+struct LineConnectorProof final {
+  bool within = true;
+  double max_translation_error_m = 0.0;
+  double max_rotation_error_rad = 0.0;
+};
+
+[[nodiscard]] core::Result<LineConnectorProof>
+prove_line_connector(const detail::CartesianTrajectoryContractInput &contract,
+                     const std::shared_ptr<roboplan::Scene> &scene,
+                     const core::TrajectoryDTO &connector,
+                     const core::CartesianPathDTO &line,
+                     const core::TolerancesDTO &tolerances,
+                     const CartesianPlanningControl &control) {
+  auto interpolant = detail::sample_cartesian_interpolant_path(
+      contract, scene, native_trajectory(connector),
+      tolerances.translation_tol_m, tolerances.rotation_tol_rad, control);
+  if (!interpolant.ok())
+    return core::Result<LineConnectorProof>::Err(interpolant.error());
+  const Eigen::Matrix4d start = native_pose(line.waypoints.front());
+  const Eigen::Matrix4d goal = native_pose(line.waypoints.back());
+  const Eigen::Vector3d origin = start.block<3, 1>(0, 3);
+  const Eigen::Vector3d direction = goal.block<3, 1>(0, 3) - origin;
+  const Eigen::Quaterniond start_orientation(
+      Eigen::Matrix3d(start.block<3, 3>(0, 0)));
+  const Eigen::Quaterniond goal_orientation(
+      Eigen::Matrix3d(goal.block<3, 3>(0, 0)));
+  const double length_squared = direction.squaredNorm();
+  const double turn = rotation_distance(start.block<3, 3>(0, 0),
+                                        goal.block<3, 3>(0, 0));
+  const double translation_budget =
+      tolerances.translation_tol_m -
+      interpolant.value().unsampled_translation_bound_m;
+  const double rotation_budget = tolerances.rotation_tol_rad -
+                                 interpolant.value().unsampled_rotation_bound_rad;
+  LineConnectorProof proof;
+  proof.within = finite_positive(translation_budget) &&
+                 finite_positive(rotation_budget);
+  for (const auto &pose : interpolant.value().poses) {
+    const Eigen::Vector3d position = pose.block<3, 1>(0, 3);
+    const Eigen::Matrix3d orientation = pose.block<3, 3>(0, 0);
+    const std::array parameters{
+        length_squared > 0.0
+            ? std::clamp((position - origin).dot(direction) / length_squared,
+                         0.0, 1.0)
+            : 0.0,
+        turn > 0.0 ? std::clamp(rotation_distance(start.block<3, 3>(0, 0),
+                                                  orientation) /
+                                    turn,
+                                0.0, 1.0)
+                   : 0.0};
+    double best_translation = std::numeric_limits<double>::infinity();
+    double best_rotation = std::numeric_limits<double>::infinity();
+    double best_score = std::numeric_limits<double>::infinity();
+    for (const double s : parameters) {
+      const double translation =
+          (position - (origin + s * direction)).norm();
+      const double rotation = rotation_distance(
+          start_orientation.slerp(s, goal_orientation)
+              .normalized()
+              .toRotationMatrix(),
+          orientation);
+      const double score =
+          std::max(translation / tolerances.translation_tol_m,
+                   rotation / tolerances.rotation_tol_rad);
+      if (score < best_score) {
+        best_score = score;
+        best_translation = translation;
+        best_rotation = rotation;
+      }
+    }
+    proof.max_translation_error_m =
+        std::max(proof.max_translation_error_m, best_translation);
+    proof.max_rotation_error_rad =
+        std::max(proof.max_rotation_error_rad, best_rotation);
+    if (!(best_translation <= translation_budget) ||
+        !(best_rotation <= rotation_budget))
+      proof.within = false;
+  }
+  return core::Result<LineConnectorProof>::Ok(proof);
+}
+
 [[nodiscard]] core::Result<core::TrajectoryDTO> finalize_moving_candidate(
     const RoboPlanCandidateBindingDTO &binding,
     const RoboPlanCandidateRequestDTO &input,
     const ResolvedDynamicsCaps &future_caps,
     const std::shared_ptr<roboplan::Scene> &scene, core::TrajectoryDTO suffix,
-    std::size_t maximum_samples, const RoboPlanCandidateControl &control) {
+    std::size_t maximum_samples, const RoboPlanCandidateControl &control,
+    const core::CartesianPathDTO *line = nullptr) {
   const auto &moving = *input.moving_replacement;
   const auto &prefix = moving.source_prefix_trajectory;
   const double divergence = moving.divergence_cursor_s - moving.source_cursor_s;
@@ -2146,6 +2246,9 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       ErrorCode::kPlanningFailed,
       "No qualified moving entry exists before the first successor target",
       "native_moving_connector_unqualified");
+  // A linear connector within its limits that leaves the line: the caller's
+  // existing stop-first fallback then starts the line from rest.
+  std::optional<ErrorDTO> line_refusal;
   for (const double entry : entries) {
     ++measurements.entries;
     measurements.entry_s = entry;
@@ -2243,7 +2346,7 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
           measure_fixed_piece(future_contract, scene, native_trajectory(future),
                               input.tolerances.joint_position_tol_rad,
                               contract_control, measurements,
-                              std::holds_alternative<core::CartesianPathDTO>(input.motion));
+                              core::cartesian_planned(input.motion));
       if (measurements.trace_stages)
         measurements.Record("future_return");
       if (!changed.ok()) {
@@ -2267,6 +2370,35 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
         previous_ratio = ratio;
         duration = next;
         continue;
+      }
+      if (line != nullptr) {
+        // The quintic connector is the two knots from the divergence on.
+        core::TrajectoryDTO connector;
+        connector.resources = composite.value().resources;
+        connector.joint_names = composite.value().joint_names;
+        for (const auto &point : composite.value().waypoints)
+          if (point.time_from_start_s >= divergence &&
+              connector.waypoints.size() < 2U)
+            connector.waypoints.push_back(point);
+        auto proof = prove_line_connector(future_contract, scene, connector,
+                                          *line, input.tolerances,
+                                          contract_control);
+        if (!proof.ok()) {
+          last = proof.error();
+          break;
+        }
+        if (!proof.value().within) {
+          line_refusal = make_error(
+              ErrorCode::kUnsupportedCapability,
+              "Moving linear connector cannot be proven to stay on its line "
+              "within the move's tolerances",
+              "native_moving_cartesian_blend_proof_unavailable",
+              {{"max_translation_error_m",
+                std::to_string(proof.value().max_translation_error_m)},
+               {"max_rotation_error_rad",
+                std::to_string(proof.value().max_rotation_error_rad)}});
+          break;
+        }
       }
       const std::array envelopes{
           core::detail::TrajectoryDynamicsEnvelope{
@@ -2308,7 +2440,8 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       return composite;
     }
   }
-  return core::Result<core::TrajectoryDTO>::Err(std::move(last));
+  return core::Result<core::TrajectoryDTO>::Err(
+      line_refusal ? std::move(*line_refusal) : std::move(last));
 }
 
 } // namespace
@@ -2520,8 +2653,21 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
       return core::Result<core::TrajectoryDTO>::Err(std::move(*error));
     }
 
+    // A linear pose goal (OD-341) is the strict straight line from this
+    // request's own start state's TCP pose to its goal, planned exactly as a
+    // two-waypoint Cartesian path: no deviation, no joint-space fallback.
+    std::optional<core::CartesianPathDTO> linear_path;
+    if (const auto *pose = std::get_if<core::PoseGoalDTO>(&request.motion);
+        pose != nullptr && pose->linear) {
+      linear_path = core::linear_pose_path(
+          portable_pose(planning_scene->forwardKinematics(
+              full_start, core::compiled_frame_name(request.tcp_frame),
+              core::compiled_frame_name(request.base_frame))),
+          *pose);
+    }
     if (const auto *cartesian =
-            std::get_if<core::CartesianPathDTO>(&request.motion)) {
+            linear_path ? &*linear_path
+                        : std::get_if<core::CartesianPathDTO>(&request.motion)) {
       core::TrajectoryRuntimeScaleBoundsDTO scale_bounds;
       std::vector<double> waypoint_times_s;
       core::CartesianFidelityMetricsDTO fidelity_metrics;
@@ -2534,6 +2680,19 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
       auto portable =
           portable_trajectory(trajectory.value(), binding_,
                               config_.maximum_trajectory_samples, scale_bounds);
+      if (portable.ok() && input.moving_replacement) {
+        // Only a linear pose goal reaches here moving (moving_suffix_request).
+        // The joined trajectory starts with the incumbent's prefix, so it
+        // carries no milestones or fidelity certificate of the line itself;
+        // the connector is proven against the line instead.
+        log_moving_phase(input, "connector_begin", whole_started);
+        auto finalized = finalize_moving_candidate(
+            binding_, input, caps.value(), planning_scene,
+            std::move(portable.value()), config_.maximum_trajectory_samples,
+            whole_control, &*linear_path);
+        log_moving_phase(input, "connector_return", whole_started);
+        return finalized;
+      }
       if (portable.ok())
         portable.value().cartesian_waypoint_times_s =
             std::move(waypoint_times_s);

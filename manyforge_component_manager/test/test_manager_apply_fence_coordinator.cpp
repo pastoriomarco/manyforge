@@ -151,7 +151,6 @@ ApplyIntent(const std::uint64_t apply_id = 1U,
       ManagerApplyPreparedActivationDTO{
           core::ContentDigest(
               "sha256:1414141414141414141414141414141414141414141414141414141414141414"),
-          core::DeploymentArtifactId("deployment-artifact-1"),
           core::DeploymentRevision(
               "sha256:1515151515151515151515151515151515151515151515151515151515151515"),
           core::ProgramBindingId(

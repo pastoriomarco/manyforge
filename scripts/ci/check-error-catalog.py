@@ -95,7 +95,6 @@ _CPP_CALLS = (
     "Rejected",
     "reject_owned",
     "reject_state",
-    "RejectSupportContact",
     "failed",
     "Fail",
     "CoreFail",
@@ -346,6 +345,8 @@ _INDIRECT_CODES = {
     "manyforge_headless_api/control_state.py": ("source_recovered",),
     "manyforge_roboplan/src/geometric_contact_input_provider.cpp": (
         "contact_bodies_static",
+        "mesh_depth_vertex_cap_reached",
+        "mesh_not_closed",
     ),
     "manyforge_roboplan/src/retained_gripper_route_publication_owner.cpp": (
         "route_predecessor_gripper_rollback_failed",

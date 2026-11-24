@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -51,8 +51,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [
       "lite_gripper"
     ],
@@ -294,12 +299,7 @@
                   }
                 ]
               },
-              "tcp_frame": "link_tcp",
-              "touch_links": [
-                "lite_gripper_base_link",
-                "lite_gripper_left_finger",
-                "lite_gripper_right_finger"
-              ]
+              "tcp_frame": "link_tcp"
             }
           ]
         },
@@ -322,9 +322,6 @@
       "target_settings": {}
     }
   ],
-  "deployment_artifact_id": "lite6_pneumatic_grasp_confirmed_mock",
-  "description": "Mock pneumatic Lite6 pick and place with grasp confirmation required on the lite_gripper tool. Close succeeds only if the mapped workpiece_grasped input is true when it completes; the Mock I/O device echoes the valve to that input after 100 ms, so this evidence is synthetic, not a physical grasp.",
-  "name": "lite6_pneumatic_grasp_confirmed_mock",
   "policies": {
     "interrupt_rules": [
       {

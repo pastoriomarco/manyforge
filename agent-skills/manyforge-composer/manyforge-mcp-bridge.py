@@ -1,1 +1,0 @@
-../../scripts/manyforge-mcp-bridge.py

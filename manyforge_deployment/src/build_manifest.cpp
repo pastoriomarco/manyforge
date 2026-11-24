@@ -64,7 +64,7 @@ constexpr std::string_view kExecutablePackageIdentityDomain =
 constexpr std::string_view kBuiltinCatalogApiVersion =
     "manyforge.node_catalog.v3";
 constexpr std::string_view kBuiltinCatalogId = "manyforge_builtin";
-constexpr std::string_view kBuiltinCatalogContentVersion = "3.0.0";
+constexpr std::string_view kBuiltinCatalogContentVersion = "4.0.0";
 constexpr std::string_view kPythonSourcePackageFormat =
     "manyforge.python-source-package.v1";
 constexpr std::string_view kCompositionNamingScheme =
@@ -823,9 +823,7 @@ compiler_contract_candidate(std::string_view own_digest) {
                                            "runtime_profile",
                                            "stop_evidence_policy",
                                        }))},
-           {"unqualified_catalog_kinds", CanonicalValue(sorted_text_values({
-                                             "contact_policy",
-                                         }))},
+           {"unqualified_catalog_kinds", CanonicalValue(sorted_text_values({}))},
            {"assistant",
             CanonicalValue(
                 "absent-empty-or-closed-audit-prompt-endpoint-provider-mode-"
@@ -835,7 +833,7 @@ compiler_contract_candidate(std::string_view own_digest) {
                 "closed-stop-stage-parameters-and-commissioned-interfaces;"
                 "other-policy-tables-empty")},
            {"compatibility",
-            CanonicalValue("closed-lane-provides-tags-metadata")},
+            CanonicalValue("closed-provides-tags-metadata")},
            {"i3_retention_subset",
             CanonicalValue(
                 "passive-or-one-bounded-controllable-component-or-exact-"
@@ -1612,7 +1610,9 @@ void require_compiler_contract_nested_shapes(
                        "accepted_deployment_subset"),
         std::string("compiler_contract_manifest.accepted_deployment_subset.") +
             std::string(name),
-        detail::kMaximumCompilerContractRows);
+        detail::kMaximumCompilerContractRows,
+        // Every catalog kind of the accepted subset is qualified today.
+        name == "unqualified_catalog_kinds");
   }
 
   const auto &retained =

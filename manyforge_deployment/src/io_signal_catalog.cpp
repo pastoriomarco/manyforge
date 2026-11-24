@@ -107,6 +107,54 @@ std::string absolute_address(const Object &provider, std::string_view field) {
   return result;
 }
 
+// A geometric-contact selection (OD-356): a collision-rule kind the
+// provider resolves against its collision world; a collision body by its
+// role there too (OD-371).
+std::vector<core::CollisionRuleSelectionDTO> contact_selections(const Object &provider,
+                                                                std::string_view key) {
+  const auto &rows = value<Array>(member(provider, key));
+  if (rows.empty() || rows.size() > core::kMaxCollisionRuleSelections)
+    throw InvalidConfiguration("io_signal_configuration_invalid");
+  std::vector<core::CollisionRuleSelectionDTO> result;
+  for (const auto &row_value : rows) {
+    const auto &row = value<Object>(row_value);
+    const auto kind = text(row, "kind");
+    if (kind == "component") {
+      fields(row, {"kind", "component_id"});
+      result.push_back(core::CollisionRuleComponentSelection{
+          core::ControllableComponentId(text(row, "component_id"))});
+    } else if (kind == "collision_body") {
+      fields(row, {"kind", "component_id", "collision_body_id"});
+      result.push_back(core::CollisionRuleCollisionBodySelection{
+          {core::ControllableComponentId(text(row, "component_id")),
+           core::CollisionBodyRoleId(text(row, "collision_body_id"))}});
+    } else if (kind == "link") {
+      fields(row, {"kind", "component_id", "link"});
+      result.push_back(core::CollisionRuleLinkSelection{
+          core::ControllableComponentId(text(row, "component_id")),
+          text(row, "link", false)});
+    } else if (kind == "attached_object") {
+      // Optionally only the objects carried by one collision body (OD-371).
+      fields(row, {"kind", "component_id"}, {"collision_body_role_id"});
+      core::CollisionRuleAttachedObjectSelection selection{
+          core::ControllableComponentId(text(row, "component_id"))};
+      if (row.contains("collision_body_role_id"))
+        selection.collision_body_role_id = text(row, "collision_body_role_id");
+      result.push_back(std::move(selection));
+    } else if (kind == "scene_objects") {
+      fields(row, {"kind"});
+      result.push_back(core::CollisionRuleSceneObjectsSelection{});
+    } else if (kind == "scene_object") {
+      fields(row, {"kind", "scene_resource_id"});
+      result.push_back(core::CollisionRuleSceneObjectSelection{
+          core::SceneResourceId(text(row, "scene_resource_id", false))});
+    } else {
+      throw InvalidConfiguration("io_signal_provider_unsupported");
+    }
+  }
+  return result;
+}
+
 std::string provider_selector(const Object &provider, std::string_view field) {
   const auto result = text(provider, field, false);
   if (!content_identity::is_utf8_nfc(result))
@@ -393,13 +441,36 @@ ResolveRetainedIoSignalCatalog(
               provider_selector(provider, "interface_name");
           descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
         } else if (address.profile == "geometric_contact") {
-          fields(provider,
-                 {"profile", "ingress_depth", "robot_component_id",
-                  "target_scene_resource_id"});
+          // Either the robot's TCP contact bodies against one Scene object,
+          // or two selections (`a`, `b`), optionally with a trip depth and
+          // a release depth below it.
+          if (provider.contains("a") || provider.contains("b")) {
+            fields(provider, {"profile", "ingress_depth", "robot_component_id", "a", "b"},
+                   {"trip_depth_m", "release_depth_m"});
+            address.contact_a = contact_selections(provider, "a");
+            address.contact_b = contact_selections(provider, "b");
+          } else {
+            fields(provider,
+                   {"profile", "ingress_depth", "robot_component_id",
+                    "target_scene_resource_id"});
+            address.target_scene_resource_id = core::SceneResourceId(
+                provider_selector(provider, "target_scene_resource_id"));
+          }
           address.robot_component_id = core::ControllableComponentId(
               text(provider, "robot_component_id"));
-          address.target_scene_resource_id = core::SceneResourceId(
-              provider_selector(provider, "target_scene_resource_id"));
+          if (provider.contains("trip_depth_m")) {
+            const auto depth = value<double>(member(provider, "trip_depth_m"));
+            if (!std::isfinite(depth) || depth < 0.0 || depth > 1.0)
+              throw InvalidConfiguration("io_signal_configuration_invalid");
+            address.trip_depth_m = depth;
+          }
+          if (provider.contains("release_depth_m")) {
+            const auto release = value<double>(member(provider, "release_depth_m"));
+            if (!address.trip_depth_m || !std::isfinite(release) || release <= 0.0 ||
+                release >= *address.trip_depth_m)
+              throw InvalidConfiguration("io_signal_configuration_invalid");
+            address.release_depth_m = release;
+          }
           if (freshness_mode != "sample_age")
             throw InvalidConfiguration("io_signal_provider_unsupported");
           descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;

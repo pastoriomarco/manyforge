@@ -20,7 +20,7 @@ session.
 | Delayed classification | 500 ms without a confirmed heartbeat |
 | Stale command cutoff | 1,000 ms without a confirmed heartbeat |
 | Dead-peer reclamation | 30,000 ms without a heartbeat echo |
-| Command freshness lifetime | 750 ms, measured by the receiving backend clock |
+| Command freshness lifetime | 750 ms from issue to the moment the backend receives the command, on the backend clock |
 | Maximum connected control clients | 16 |
 | Maximum client-message size | 65,536 bytes |
 | Maximum client-message rate | 64 messages/s per session |

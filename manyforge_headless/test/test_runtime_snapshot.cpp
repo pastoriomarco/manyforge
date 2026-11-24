@@ -587,6 +587,50 @@ TEST(ManagerStatusMirror, ViewerPoseSourcesOnlyWhileAnsweringAndBothCurrent) {
   EXPECT_TRUE(h.mirror.ViewerPoseSources() == expected);
 }
 
+TEST(ManagerStatusMirror, LogicalSceneActiveProjectionFromTheLastValidValue) {
+  Harness h;
+  EXPECT_FALSE(h.mirror.LogicalSceneActiveProjection().has_value());
+  static_cast<void>(h.Apply(StatusSnapshotFrame(1U, 0U, 0U, 0U, 0U)));
+  const auto with_projection = [](CanonicalValue projection) {
+    return WithMember(
+        LogicalScenePayload(kCellId), "access",
+        CanonicalValue(CanonicalValue::Object{
+            {"active_projection", std::move(projection)},
+            {"phase", CanonicalValue("active")},
+        }));
+  };
+  const auto revision = [](const double revision_id) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"graph_revision", CanonicalValue("graph-1")},
+        {"retained_bundle_id", CanonicalValue("bundle-1")},
+        {"scene_revision",
+         CanonicalValue(CanonicalValue::Object{
+             {"content_hash", CanonicalValue("hash")},
+             {"revision_id", CanonicalValue(revision_id)},
+             {"scene_id", CanonicalValue("scene-1")},
+         })},
+    });
+  };
+  // Before the Manager's bootstrap publication: no projection shown.
+  static_cast<void>(h.Apply(StatusSectionFrame(
+      "logical_scene", 1U, with_projection(CanonicalValue(nullptr)), 1U)));
+  EXPECT_FALSE(h.mirror.LogicalSceneActiveProjection().has_value());
+  static_cast<void>(h.Apply(StatusSectionFrame(
+      "logical_scene", 2U, with_projection(revision(3)), 1U)));
+  const auto shown = content_identity::canonical_json(revision(3));
+  EXPECT_EQ(h.mirror.LogicalSceneActiveProjection(), shown);
+
+  // Read whatever the freshness: silence, an invalid value and a lost
+  // connection keep the last valid value.
+  h.now += kSilenceNs + 1;
+  EXPECT_EQ(h.mirror.LogicalSceneActiveProjection(), shown);
+  static_cast<void>(h.Apply(StatusSectionFrame(
+      "logical_scene", 3U, LogicalScenePayload("cell-b"), 1U)));
+  EXPECT_EQ(h.mirror.LogicalSceneActiveProjection(), shown);
+  ASSERT_TRUE(h.mirror.MarkDisconnected());
+  EXPECT_EQ(h.mirror.LogicalSceneActiveProjection(), shown);
+}
+
 TEST(ManagerStatusMirror, ErrorAndInvalidFramesEndTheSubscriptionWithACode) {
   Harness h;
   const auto error_frame = content_identity::canonical_json(StatusEnvelope(

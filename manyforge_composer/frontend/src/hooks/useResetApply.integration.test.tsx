@@ -194,6 +194,7 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
       recoveryHolds: offer === null ? [] : [{
         motionGroupIds: ['all'], interventionStopScope: 'all', offer,
       }],
+      operatorQuestions: [],
       executionSelections: {
         holdRevision: 1,
         motionHeld: groupState === 'held',
@@ -203,7 +204,7 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
           startAllowed: false, startUnavailableReason: null,
           resumeAllowed: true, resumeUnavailableReason: null,
           runtimeScaleSelector: null, runtimeScaleUnavailableReason: null,
-          resourceIds: [],
+          resourceIds: [], stoppedBy: null, stoppedByNodeInstanceId: null,
         }],
       },
     },
@@ -265,8 +266,7 @@ function deploymentWorkspace(environment: Environment): DeploymentWorkspaceRespo
     draft: {
       id: 'deployment-draft-1',
       revision: environment.deploymentRevision,
-      document: { api_version: 'manyforge.deployment_intent.v2' },
-      deploymentArtifactId: 'cell',
+      document: { api_version: 'manyforge.deployment_intent.v3' },
       deploymentRevision: environment.deploymentContent,
       graphRevision: digest('9'),
       differsFromSaved: environment.deploymentContent !== APPLIED_DEPLOYMENT,
@@ -305,10 +305,10 @@ function publication(environment: Environment): PublishedAuthoringWorkspace {
     program: { draft: current.draft, saved: current.saved },
     deployment: {
       draftId: 'deployment-draft-1', draftRevision: environment.deploymentRevision,
-      document: { api_version: 'manyforge.deployment_intent.v2' },
+      document: { api_version: 'manyforge.deployment_intent.v3' },
       savedPath: environment.savedDeployment === undefined ? null : '/cell/cell.deployment.yaml',
       savedDocument: environment.savedDeployment === undefined ? null
-        : { api_version: 'manyforge.deployment_intent.v2', deployment_revision: environment.savedDeployment },
+        : { api_version: 'manyforge.deployment_intent.v3', deployment_revision: environment.savedDeployment },
       differsFromSaved: environment.deploymentContent !== APPLIED_DEPLOYMENT
         || environment.savedDeployment !== undefined,
     },
@@ -532,7 +532,7 @@ describe('Deployment Apply through the server', () => {
     expect(hooks!.deployment.applyPreview).toEqual(preview);
     await act(async () => { await hooks!.deployment.confirmApply(); });
     // The Apply is bound to the Preview the operator saw.
-    expect(apiMock.cellApply.apply).toHaveBeenCalledExactlyOnceWith(preview.scope);
+    expect(apiMock.cellApply.apply).toHaveBeenCalledExactlyOnceWith(preview.scope, []);
     expect(hooks!.deployment.applyPreview).toBeNull();
     expect(hooks!.deployment.feedback).toBe('Applied: arm prepared.');
     // A second confirm without a new Preview sends nothing.
@@ -924,7 +924,7 @@ describe('Apply while a run exists', () => {
       { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] }, 'deployment_apply'));
     await render({ ...edited, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND) });
     await flush();
-    expect(apiMock.cellApply.apply).toHaveBeenCalledExactlyOnceWith(scope);
+    expect(apiMock.cellApply.apply).toHaveBeenCalledExactlyOnceWith(scope, []);
     expect(hooks!.resetApply.sequence?.phase).toEqual({ kind: 'applied', apply: null });
     expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
   });
@@ -1140,7 +1140,7 @@ describe('Apply while a run exists', () => {
     expect(apiMock.cellApply.revert).not.toHaveBeenCalled();
     expect(hooks!.deployment.applyPreviewKind).toBe('revert');
     await act(async () => { await hooks!.deployment.confirmApply(); });
-    expect(apiMock.cellApply.revert).toHaveBeenCalledExactlyOnceWith(preview.scope);
+    expect(apiMock.cellApply.revert).toHaveBeenCalledExactlyOnceWith(preview.scope, []);
     expect(apiMock.cellApply.apply).not.toHaveBeenCalled();
     expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
   });
@@ -1269,7 +1269,7 @@ describe('Revert while a run exists (Reset and Revert)', () => {
     apiMock.cellApply.revert.mockResolvedValue(endedApplyRow({ outcome: 'succeeded', components: [] }, 'deployment_revert'));
     await render({ ...held, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND) });
     await flush();
-    expect(apiMock.cellApply.revert).toHaveBeenCalledExactlyOnceWith(scope);
+    expect(apiMock.cellApply.revert).toHaveBeenCalledExactlyOnceWith(scope, []);
     expect(apiMock.cellApply.apply).not.toHaveBeenCalled();
     expect(hooks!.resetApply.sequence?.phase).toEqual({ kind: 'applied', apply: null });
   });

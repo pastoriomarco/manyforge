@@ -29,7 +29,7 @@ def _geometric_candidate(project: Path) -> Path:
     )
 
     directory = project.parent
-    original, _ = load_scenario_artifact(str(project), allowed_roots=[str(directory)])
+    original, _ = load_scenario_artifact(str(project), allowed_roots=[str(directory), str(REPOSITORY_ROOT)])
     deployment = deepcopy(original["deployment_draft"])
     station = next(row for row in deployment["components"] if row["component_id"] == "station_io")
     signals = station["configuration"]["runtime_configuration"]["io_signals"]
@@ -56,7 +56,7 @@ def _geometric_candidate(project: Path) -> Path:
     target = directory / "geometric-apply" / f"{SCENARIO_ID}.scenario"
     target.parent.mkdir()
     save_scenario_artifact(
-        candidate, str(target), allowed_roots=[str(directory)], overwrite=False,
+        candidate, str(target), allowed_roots=[str(directory), str(REPOSITORY_ROOT)], overwrite=False,
         source_project_path=str(project),
     )
     return target

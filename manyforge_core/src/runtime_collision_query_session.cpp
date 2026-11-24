@@ -8,14 +8,6 @@
 namespace manyforge::core {
 namespace {
 
-bool contact_grasp_policy_valid(const ContactGraspPolicyEntry& policy) noexcept {
-  return !policy.policy_id.empty() && !policy.selected_object_id.empty() &&
-         !policy.allowed_robot_links.empty() && std::isfinite(policy.max_penetration_m) &&
-         policy.max_penetration_m >= 0.0 && std::isfinite(policy.terminal_window_start_fraction) &&
-         policy.terminal_window_start_fraction >= 0.0 &&
-         policy.terminal_window_start_fraction <= 1.0;
-}
-
 RuntimeCollisionTickReason transition_failure_reason(
     ContactReleaseTransitionFailure failure) noexcept {
   switch (failure) {
@@ -23,8 +15,6 @@ RuntimeCollisionTickReason transition_failure_reason(
       return RuntimeCollisionTickReason::kNone;
     case ContactReleaseTransitionFailure::kInvalidPolicy:
       return RuntimeCollisionTickReason::kContactReleasePolicyInvalid;
-    case ContactReleaseTransitionFailure::kContactProcessNotImplemented:
-      return RuntimeCollisionTickReason::kContactReleaseProcessUnsupported;
     case ContactReleaseTransitionFailure::kMissingOrInvalidSignedPenetration:
       return RuntimeCollisionTickReason::kContactReleaseMissingClearance;
     case ContactReleaseTransitionFailure::kNewContactAfterClearStart:
@@ -37,8 +27,10 @@ RuntimeCollisionTickReason transition_failure_reason(
       return RuntimeCollisionTickReason::kContactReleaseRecontactPenetrationExceeded;
     case ContactReleaseTransitionFailure::kPenetrationIncreased:
       return RuntimeCollisionTickReason::kContactReleasePenetrationIncreased;
-    case ContactReleaseTransitionFailure::kContactPenetrationExceedsPolicy:
-      return RuntimeCollisionTickReason::kBoundedContactPenetrationExceeded;
+    case ContactReleaseTransitionFailure::kContactPenetrationExceeded:
+      return RuntimeCollisionTickReason::kContactPenetrationExceeded;
+    case ContactReleaseTransitionFailure::kContactCompressionStepExceeded:
+      return RuntimeCollisionTickReason::kContactCompressionStepExceeded;
   }
   return RuntimeCollisionTickReason::kContactReleasePolicyInvalid;
 }
@@ -65,14 +57,18 @@ const char* runtime_collision_tick_reason_name(RuntimeCollisionTickReason reason
       return "runtime_collision_distance_request_mode_unsupported";
     case RuntimeCollisionTickReason::kRequiredCapabilityUnsupported:
       return "runtime_collision_required_capability_unsupported";
-    case RuntimeCollisionTickReason::kActiveContactPolicyUnknown:
-      return "runtime_contact_grasp_unknown_policy";
-    case RuntimeCollisionTickReason::kActiveContactPolicyInvalid:
-      return "runtime_contact_grasp_invalid_policy";
+    case RuntimeCollisionTickReason::kContactRuleInvalid:
+      return "runtime_contact_rule_invalid";
     case RuntimeCollisionTickReason::kObservedStateShapeMismatch:
       return "runtime_collision_projection_observed_shape_mismatch";
     case RuntimeCollisionTickReason::kObservedStateNotFinite:
       return "runtime_collision_projection_observed_value_not_finite";
+    // That component's stream condition; `peer_component_id` names it. The
+    // Stop is the one of the moving robot's own lost observation.
+    case RuntimeCollisionTickReason::kOtherComponentStateStale:
+      return "component_stream_stale";
+    case RuntimeCollisionTickReason::kOtherComponentStateAbsent:
+      return "component_stream_absent";
     case RuntimeCollisionTickReason::kObservationCapacityExceeded:
       return "runtime_collision_query_observation_capacity_exceeded";
     case RuntimeCollisionTickReason::kEngineInconclusive:
@@ -81,8 +77,6 @@ const char* runtime_collision_tick_reason_name(RuntimeCollisionTickReason reason
       return "runtime_collision_detected";
     case RuntimeCollisionTickReason::kContactReleasePolicyInvalid:
       return "runtime_contact_release_policy_invalid";
-    case RuntimeCollisionTickReason::kContactReleaseProcessUnsupported:
-      return "runtime_contact_process_policy_not_implemented";
     case RuntimeCollisionTickReason::kContactReleaseMissingClearance:
       return "runtime_contact_release_missing_clearance";
     case RuntimeCollisionTickReason::kContactReleaseNewContact:
@@ -95,8 +89,10 @@ const char* runtime_collision_tick_reason_name(RuntimeCollisionTickReason reason
       return "runtime_contact_release_recontact_penetration_exceeds_policy";
     case RuntimeCollisionTickReason::kContactReleasePenetrationIncreased:
       return "runtime_contact_release_penetration_increased";
-    case RuntimeCollisionTickReason::kBoundedContactPenetrationExceeded:
-      return "runtime_bounded_contact_penetration_exceeds_policy";
+    case RuntimeCollisionTickReason::kContactPenetrationExceeded:
+      return "runtime_contact_penetration_exceeded";
+    case RuntimeCollisionTickReason::kContactCompressionStepExceeded:
+      return "runtime_contact_compression_step_exceeded";
   }
   return "runtime_collision_monitor_unknown";
 }
@@ -128,6 +124,10 @@ const char* runtime_collision_query_failure_reason_name(
       return "runtime_query_timeout";
     case RuntimeCollisionQueryFailureReason::kEngineException:
       return "runtime_query_engine_exception";
+    case RuntimeCollisionQueryFailureReason::kMeshNotClosed:
+      return "runtime_query_mesh_not_closed";
+    case RuntimeCollisionQueryFailureReason::kMeshDepthVertexCapReached:
+      return "runtime_query_mesh_depth_vertex_cap_reached";
   }
   return "runtime_query_unknown";
 }
@@ -171,13 +171,11 @@ const char* runtime_collision_engine_status_name(CollisionEngineStatus status) n
 
 RuntimeCollisionQuerySession::RuntimeCollisionQuerySession(
     RuntimeCollisionStateProjection projection, ICollisionWorldSnapshotPublisher& publisher,
-    std::shared_ptr<ICollisionQueryEngine> engine, std::string active_contact_policy_id,
-    std::int64_t query_timeout_ns)
+    std::shared_ptr<ICollisionQueryEngine> engine, std::int64_t query_timeout_ns)
     : projection_(std::move(projection)),
       publisher_(&publisher),
       engine_(std::move(engine)),
       capability_(engine_ ? &engine_->capability() : nullptr),
-      active_contact_policy_id_(std::move(active_contact_policy_id)),
       query_timeout_ns_(query_timeout_ns),
       query_positions_rad_(projection_.template_positions_rad) {}
 
@@ -348,15 +346,6 @@ bool RuntimeCollisionQuerySession::bind_distance_selection(
   }
 
   const std::vector<CollisionPairId>* candidate = &bundle->selected_distance_pairs;
-  if (!active_contact_policy_id_.empty()) {
-    const auto grasp =
-        bundle->contact_grasp_selected_distance_pairs.find(active_contact_policy_id_);
-    if (grasp == bundle->contact_grasp_selected_distance_pairs.end()) {
-      policy_binding_error_ = RuntimeCollisionTickReason::kActiveContactPolicyUnknown;
-      return false;
-    }
-    candidate = &grasp->second;
-  }
 
   if (candidate->size() > capability_->runtime_query_max_collision_pairs) {
     policy_binding_error_ = RuntimeCollisionTickReason::kPolicyCapacityExceeded;
@@ -405,53 +394,38 @@ bool RuntimeCollisionQuerySession::bind_policy(
   }
   const auto& capability = *capability_;
   const auto pair_bound = capability.runtime_query_max_collision_pairs;
+  std::size_t tracked_rule_count = 0U;
+  for (const auto& [pair, rule] : bundle->policy_index->contact_rule_index) {
+    static_cast<void>(pair);
+    if (contact_rule_is_tracked(rule)) {
+      ++tracked_rule_count;
+    }
+  }
   const bool policy_capacity_exceeded =
-      bundle->policy->allowed_static_static_pairs.size() > pair_bound ||
       bundle->policy->allowed_touch_link_pairs.size() > pair_bound ||
-      bundle->policy->support_contacts.size() > pair_bound ||
-      bundle->policy->contact_grasps.size() > pair_bound ||
-      bundle->policy_index->static_static_index.size() > pair_bound ||
+      bundle->policy->contact_rules.size() > pair_bound ||
       bundle->policy_index->touch_link_index.size() > pair_bound ||
-      bundle->policy_index->support_contact_index.size() > pair_bound ||
-      bundle->policy_index->contact_grasp_index.size() > pair_bound ||
-      bundle->policy->support_contacts.size() > release_states_.size();
+      bundle->policy_index->contact_rule_index.size() > pair_bound ||
+      tracked_rule_count > release_states_.size();
   if (policy_capacity_exceeded) {
     policy_binding_error_ = RuntimeCollisionTickReason::kPolicyCapacityExceeded;
     return false;
   }
   const bool index_content_mismatch =
-      bundle->policy_index->static_static_index.size() !=
-          bundle->policy->allowed_static_static_pairs.size() ||
       bundle->policy_index->touch_link_index.size() !=
           bundle->policy->allowed_touch_link_pairs.size() ||
-      bundle->policy_index->support_contact_index.size() !=
-          bundle->policy->support_contacts.size() ||
-      bundle->policy_index->contact_grasp_index.size() != bundle->policy->contact_grasps.size();
+      bundle->policy_index->contact_rule_index.size() !=
+          bundle->policy->contact_rules.size();
   if (index_content_mismatch) {
     policy_binding_error_ = RuntimeCollisionTickReason::kPolicyIndexMismatch;
     return false;
   }
-  const ContactGraspPolicyEntry* candidate_active_contact_policy = nullptr;
-  if (!active_contact_policy_id_.empty()) {
-    const auto active = bundle->policy_index->contact_grasp_index.find(active_contact_policy_id_);
-    if (active == bundle->policy_index->contact_grasp_index.end()) {
-      policy_binding_error_ = RuntimeCollisionTickReason::kActiveContactPolicyUnknown;
-      return false;
-    }
-    if (!contact_grasp_policy_valid(active->second)) {
-      policy_binding_error_ = RuntimeCollisionTickReason::kActiveContactPolicyInvalid;
-      return false;
-    }
-    if (active->second.allowed_robot_links.size() > capability.runtime_query_max_joints) {
-      policy_binding_error_ = RuntimeCollisionTickReason::kPolicyCapacityExceeded;
-      return false;
-    }
-    candidate_active_contact_policy = &active->second;
-  }
-  for (const auto& [pair, policy] : bundle->policy_index->support_contact_index) {
-    (void)pair;
-    if (!support_contact_policy_entry_valid(policy)) {
-      policy_binding_error_ = RuntimeCollisionTickReason::kContactReleasePolicyInvalid;
+  for (const auto& [pair, rule] : bundle->policy_index->contact_rule_index) {
+    static_cast<void>(pair);
+    if (!contact_rule_valid(rule)) {
+      policy_binding_error_ = contact_rule_is_tracked(rule)
+                                  ? RuntimeCollisionTickReason::kContactReleasePolicyInvalid
+                                  : RuntimeCollisionTickReason::kContactRuleInvalid;
       return false;
     }
   }
@@ -464,7 +438,7 @@ bool RuntimeCollisionQuerySession::bind_policy(
   // history before the monitor faults closed.
   //
   // A rule change during execution keeps the observed history of every
-  // support-contact pair whose rule is unchanged; new or changed pairs start
+  // tracked contact-rule pair whose value is unchanged; new or changed pairs start
   // fresh and removed pairs drop out. The previous entries point into the
   // previous bundle, which stays pinned until the copy completes. The
   // start-of-motion contact baseline is not re-counted.
@@ -474,18 +448,20 @@ bool RuntimeCollisionQuerySession::bind_policy(
   bound_bundle_ = bundle;
   bound_policy_ = bound_bundle_->policy.get();
   bound_policy_index_ = bound_bundle_->policy_index.get();
-  active_contact_policy_ = candidate_active_contact_policy;
   release_state_count_ = 0;
-  for (const auto& [pair, policy] : bundle->policy_index->support_contact_index) {
+  for (const auto& [pair, policy] : bundle->policy_index->contact_rule_index) {
+    if (!contact_rule_is_tracked(policy)) {
+      continue;
+    }
     auto& state = release_states_[release_state_count_++];
-    state = ContactReleaseState{&pair, &policy, {}, false, std::nullopt};
+    state = ContactReleaseState{&pair, &policy, {}, false, std::nullopt, std::nullopt};
     const auto previous =
         std::lower_bound(previous_states.begin(), previous_states_end, pair,
                          [](const ContactReleaseState& entry, const CollisionPairId& key) {
                            return *entry.pair < key;
                          });
     if (previous != previous_states_end && *previous->pair == pair &&
-        *previous->policy == policy) {
+        previous->policy->value == policy.value) {
       state.transition_state = previous->transition_state;
       state.observed_in_contact = previous->observed_in_contact;
       state.observed_clearance_m = previous->observed_clearance_m;
@@ -497,7 +473,7 @@ bool RuntimeCollisionQuerySession::bind_policy(
 }
 
 RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::project_observed_state(
-    std::span<const double> observed_positions_rad) noexcept {
+    std::span<const double> observed_positions_rad, const std::int64_t now_ns) noexcept {
   RuntimeCollisionTickOutcome out;
   if (observed_positions_rad.size() != projection_.source_joint_names.size()) {
     out.reason = RuntimeCollisionTickReason::kObservedStateShapeMismatch;
@@ -517,6 +493,15 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::project_observed_state
     for (std::size_t i = 0; i < observed_positions_rad.size(); ++i) {
       query_positions_rad_[projection_.source_to_query_indices[i]] = observed_positions_rad[i];
     }
+  }
+  // The other components of the cell, where they are now.
+  if (const auto unavailable =
+          overlay_cell_model_state(projection_.live_sources, now_ns, query_positions_rad_)) {
+    out.reason = unavailable.verdict == PeerStateVerdict::kStale
+                     ? RuntimeCollisionTickReason::kOtherComponentStateStale
+                     : RuntimeCollisionTickReason::kOtherComponentStateAbsent;
+    out.other_component = &unavailable.source->component_id;
+    return out;
   }
   out.status = RuntimeCollisionTickStatus::kClear;
   out.reason = RuntimeCollisionTickReason::kNone;
@@ -539,9 +524,14 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::classify(
     return out;
   }
   if (query_result.status == RuntimeCollisionQueryStatus::kInconclusive) {
+    // A mesh pair without a depth (OD-363) lacks its metric like any other
+    // incomplete pair, so the rule that needs it is named the same way.
     const bool production_pair_diagnostics_incomplete =
-        query_result.failure_reason ==
-            RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete &&
+        (query_result.failure_reason ==
+             RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete ||
+         query_result.failure_reason == RuntimeCollisionQueryFailureReason::kMeshNotClosed ||
+         query_result.failure_reason ==
+             RuntimeCollisionQueryFailureReason::kMeshDepthVertexCapReached) &&
         query_result.engine_status == CollisionEngineStatus::kDiagnosticIncomplete;
     if (production_pair_diagnostics_incomplete) {
       const auto pair_is_colliding = [&](const CollisionPairId& pair) noexcept {
@@ -569,20 +559,16 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::classify(
         return saw_metric && !saw_invalid_metric;
       };
 
-      // All configured support-contact identities are active allow-list
-      // candidates. Bounded penetration therefore applies when a configured
-      // pair first appears as well as when it was already touching at the
-      // execution baseline.
+      // Every tracked contact-rule pair is an active allow-list candidate.
+      // A whole-move depth limit therefore applies when a pair first appears
+      // as well as when it was already touching at the execution baseline.
       for (std::size_t index = 0; index < release_state_count_; ++index) {
         const auto& state = release_states_[index];
         if (state.pair == nullptr || state.policy == nullptr) {
           continue;
         }
         const auto& policy = *state.policy;
-        const bool metric_required =
-            policy.mode == CollisionContactPolicyMode::kBoundedPenetration ||
-            (policy.mode == CollisionContactPolicyMode::kContactRelease &&
-             policy.release_evidence_mode == ContactReleaseEvidenceMode::kSignedPenetration);
+        const bool metric_required = contact_rule_needs_signed_distance(policy);
         if (!metric_required || !pair_is_colliding(*state.pair) ||
             pair_has_complete_penetration(*state.pair)) {
           continue;
@@ -590,32 +576,31 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::classify(
         out.reason = RuntimeCollisionTickReason::kContactReleaseMissingClearance;
         out.pair = state.pair;
         out.pair_classification = CollisionPairClassification::kDiagnosticIncomplete;
-        out.contact_policy_mode = policy.mode;
-        if (policy.mode == CollisionContactPolicyMode::kContactRelease) {
-          out.release_evidence_mode = policy.release_evidence_mode;
-        } else {
-          out.max_contact_penetration_m = policy.max_contact_penetration_m;
-        }
+        out.contact_rule = &policy;
         out.contact_present = true;
         return out;
       }
 
-      if (active_contact_policy_ != nullptr) {
-        const auto missing_grasp = std::find_if(
-            query_result.collision_pairs.begin(), query_result.collision_pairs.end(),
-            [&](const RuntimeCollisionPairObservation& observation) {
-              return observation.pair != nullptr &&
-                     contact_grasp_pair_matches(*observation.pair, *active_contact_policy_) &&
-                     !pair_has_complete_penetration(*observation.pair);
-            });
-        if (missing_grasp != query_result.collision_pairs.end()) {
-          out.reason = RuntimeCollisionTickReason::kEngineInconclusive;
-          out.pair = missing_grasp->pair;
-          out.pair_classification = CollisionPairClassification::kDiagnosticIncomplete;
-          out.contact_present = true;
-          out.contact_grasp_violation = RuntimeContactGraspViolation::kMissingClearance;
-          return out;
+      // A colliding pair under a contact rule with an end window and a
+      // depth limit needs its depth too.
+      for (const auto& observation : query_result.collision_pairs) {
+        if (observation.pair == nullptr) {
+          continue;
         }
+        const auto rule = bound_policy_index_->contact_rule_index.find(*observation.pair);
+        if (rule == bound_policy_index_->contact_rule_index.end() ||
+            contact_rule_kind(rule->second) != ContactRuleKind::kWindowedContact ||
+            !contact_rule_needs_signed_distance(rule->second) ||
+            pair_has_complete_penetration(*observation.pair)) {
+          continue;
+        }
+        out.reason = RuntimeCollisionTickReason::kEngineInconclusive;
+        out.pair = observation.pair;
+        out.pair_classification = CollisionPairClassification::kDiagnosticIncomplete;
+        out.contact_rule = &rule->second;
+        out.contact_present = true;
+        out.contact_rule_violation = RuntimeContactRuleViolation::kMissingClearance;
+        return out;
       }
     }
     out.reason = RuntimeCollisionTickReason::kEngineInconclusive;
@@ -663,29 +648,38 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::classify(
     if (bound_policy_index_->touch_link_index.find(pair) !=
         bound_policy_index_->touch_link_index.end()) {
       classification = CollisionPairClassification::kAllowedTouchLink;
-    } else if (bound_policy_index_->static_static_index.find(pair) !=
-               bound_policy_index_->static_static_index.end()) {
+    } else if (bound_policy_->static_pair(pair)) {
       classification = CollisionPairClassification::kAllowedStaticStatic;
-    } else if (bound_policy_index_->support_contact_index.find(pair) !=
-               bound_policy_index_->support_contact_index.end()) {
-      classification = CollisionPairClassification::kSupportContactContinued;
-    } else if (active_contact_policy_ != nullptr &&
-               contact_grasp_pair_matches(pair, *active_contact_policy_)) {
-      const auto clearance = observation.signed_clearance_m;
-      if (!clearance.has_value() || !std::isfinite(*clearance) || *clearance > 0.0) {
-        out.status = RuntimeCollisionTickStatus::kInconclusive;
-        out.reason = RuntimeCollisionTickReason::kEngineInconclusive;
-        out.engine_failure_reason = RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete;
-        out.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
-        out.pair = &pair;
-        out.signed_clearance_m = clearance;
-        out.contact_grasp_violation = RuntimeContactGraspViolation::kMissingClearance;
-        return out;
-      }
-      if (std::max(0.0, -*clearance) <= active_contact_policy_->max_penetration_m + 1e-9) {
-        classification = CollisionPairClassification::kAllowedContactGrasp;
+    } else if (const auto rule = bound_policy_index_->contact_rule_index.find(pair);
+               rule != bound_policy_index_->contact_rule_index.end()) {
+      const auto kind = contact_rule_kind(rule->second);
+      if (kind == ContactRuleKind::kRelease || kind == ContactRuleKind::kBoundedContact) {
+        classification = CollisionPairClassification::kSupportContactContinued;
+      } else if (kind == ContactRuleKind::kFreeContact ||
+                 !rule->second.contact()->max_penetration_m) {
+        // Allowed without a depth check. The monitor does not apply the
+        // window of a rule with an end window.
+        classification = CollisionPairClassification::kAllowedContactRule;
       } else {
-        out.contact_grasp_violation = RuntimeContactGraspViolation::kPenetrationExceeded;
+        const auto clearance = observation.signed_clearance_m;
+        if (!clearance.has_value() || !std::isfinite(*clearance) || *clearance > 0.0) {
+          out.status = RuntimeCollisionTickStatus::kInconclusive;
+          out.reason = RuntimeCollisionTickReason::kEngineInconclusive;
+          out.engine_failure_reason = RuntimeCollisionQueryFailureReason::kPairDiagnosticsIncomplete;
+          out.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
+          out.pair = &pair;
+          out.signed_clearance_m = clearance;
+          out.contact_rule = &rule->second;
+          out.contact_rule_violation = RuntimeContactRuleViolation::kMissingClearance;
+          return out;
+        }
+        if (std::max(0.0, -*clearance) <=
+            *rule->second.contact()->max_penetration_m + 1e-9) {
+          classification = CollisionPairClassification::kAllowedContactRule;
+        } else {
+          out.contact_rule = &rule->second;
+          out.contact_rule_violation = RuntimeContactRuleViolation::kPenetrationExceeded;
+        }
       }
     }
 
@@ -714,6 +708,7 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::update_contact_release
   for (std::size_t i = 0; i < release_state_count_; ++i) {
     release_states_[i].observed_in_contact = false;
     release_states_[i].observed_clearance_m.reset();
+    release_states_[i].observed_normal_a_to_b.reset();
   }
 
   auto observe = [&](const RuntimeCollisionPairObservation& observation, bool in_contact) {
@@ -736,6 +731,7 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::update_contact_release
     auto& observed = state_it->observed_clearance_m;
     if (!observed || *observation.signed_clearance_m < *observed) {
       observed = observation.signed_clearance_m;
+      state_it->observed_normal_a_to_b = observation.normal_a_to_b;
     }
   };
 
@@ -750,7 +746,7 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::update_contact_release
     const auto& policy = *state.policy;
     const auto previous_state = state.transition_state;
     const auto transition = advance_contact_release_sample(
-        policy, ContactReleaseSampleEvidence{state.observed_in_contact, state.observed_clearance_m},
+        policy, ContactReleaseSampleEvidence{state.observed_in_contact, state.observed_clearance_m, std::nullopt},
         state.transition_state);
     if (transition.accepted()) {
       continue;
@@ -758,8 +754,6 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::update_contact_release
 
     clear.reason = transition_failure_reason(transition.failure);
     clear.status = transition.failure == ContactReleaseTransitionFailure::kInvalidPolicy ||
-                           transition.failure ==
-                               ContactReleaseTransitionFailure::kContactProcessNotImplemented ||
                            transition.failure ==
                                ContactReleaseTransitionFailure::kMissingOrInvalidSignedPenetration
                        ? RuntimeCollisionTickStatus::kInconclusive
@@ -769,19 +763,13 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::update_contact_release
                                     : CollisionPairClassification::kBlockingCollision;
     clear.pair = state.pair;
     clear.signed_clearance_m = state.observed_clearance_m;
-    clear.contact_policy_mode = policy.mode;
-    if (policy.mode == CollisionContactPolicyMode::kContactRelease) {
-      clear.release_evidence_mode = policy.release_evidence_mode;
-    }
+    clear.contact_rule = &policy;
     clear.contact_present = state.observed_in_contact;
     clear.initial_penetration_m = state.transition_state.initial_depth_m;
     if (previous_state.initialized && previous_state.started_in_contact) {
       clear.previous_penetration_m = previous_state.previous_depth_m;
     }
     clear.current_penetration_m = transition.penetration_depth_m;
-    if (policy.mode == CollisionContactPolicyMode::kBoundedPenetration) {
-      clear.max_contact_penetration_m = policy.max_contact_penetration_m;
-    }
     return clear;
   }
   clear.pair = nullptr;
@@ -789,7 +777,6 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::update_contact_release
   clear.initial_penetration_m.reset();
   clear.previous_penetration_m.reset();
   clear.current_penetration_m.reset();
-  clear.max_contact_penetration_m.reset();
   return clear;
 }
 
@@ -824,8 +811,7 @@ RuntimeContactReleaseStateSnapshot RuntimeCollisionQuerySession::contact_release
     auto& target = snapshot.entries[index];
     target.pair = source.pair;
     target.release_state = source.transition_state;
-    if (source.policy != nullptr &&
-        source.policy->mode == CollisionContactPolicyMode::kBoundedPenetration) {
+    if (source.policy != nullptr && source.policy->release() == nullptr) {
       target.support_state =
           source.transition_state.initialized && source.transition_state.in_contact
               ? SupportContactEvaluationState::kContactActive
@@ -841,9 +827,32 @@ RuntimeContactReleaseStateSnapshot RuntimeCollisionQuerySession::contact_release
   return snapshot;
 }
 
+RuntimeSpringCompressionSnapshot RuntimeCollisionQuerySession::spring_compression_snapshot()
+    const noexcept {
+  RuntimeSpringCompressionSnapshot snapshot;
+  snapshot.binding_owner = bound_bundle_;
+  for (std::size_t index = 0; index < release_state_count_; ++index) {
+    const auto& state = release_states_[index];
+    const auto* contact = state.policy == nullptr ? nullptr : state.policy->contact();
+    if (contact == nullptr || !contact->max_compression_step_m || !state.observed_in_contact ||
+        !state.observed_clearance_m || !(*state.observed_clearance_m < 0.0) ||
+        !state.observed_normal_a_to_b) {
+      continue;
+    }
+    // The normal points from body_a to body_b: side a leaves side b against
+    // it when side a is body_a, along it when side a is body_b.
+    const double sign = state.policy->side_a_is_body_b ? 1.0 : -1.0;
+    const auto& normal = *state.observed_normal_a_to_b;
+    snapshot.entries[snapshot.count++] = RuntimeSpringCompressionEntry{
+        state.policy, -*state.observed_clearance_m,
+        {sign * normal[0], sign * normal[1], sign * normal[2]}};
+  }
+  return snapshot;
+}
+
 RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::tick(
     const RuntimeCollisionQueryBundlePtr& bundle, std::span<const double> observed_positions_rad,
-    std::int64_t state_time_ns) noexcept {
+    std::int64_t state_time_ns, const std::int64_t now_ns) noexcept {
   if (!bundle || !bundle->world) {
     return {};
   }
@@ -863,23 +872,13 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::tick(
     out.reason = policy_binding_error_;
     return out;
   }
-  auto projection = project_observed_state(observed_positions_rad);
+  auto projection = project_observed_state(observed_positions_rad, now_ns);
   if (projection.status == RuntimeCollisionTickStatus::kInconclusive) {
     return projection;
   }
   CollisionDistanceRequestMode distance_request_mode = CollisionDistanceRequestMode::kNone;
   std::span<const CollisionPairId> selected_distance_pairs;
   const std::vector<CollisionPairId>* prepared_selection = &bundle->selected_distance_pairs;
-  if (!active_contact_policy_id_.empty()) {
-    const auto grasp =
-        bundle->contact_grasp_selected_distance_pairs.find(active_contact_policy_id_);
-    if (grasp == bundle->contact_grasp_selected_distance_pairs.end()) {
-      RuntimeCollisionTickOutcome out;
-      out.reason = RuntimeCollisionTickReason::kPolicyIndexMismatch;
-      return out;
-    }
-    prepared_selection = &grasp->second;
-  }
   if (!prepared_selection->empty()) {
     distance_request_mode = CollisionDistanceRequestMode::kSelectedCollidingPairs;
     selected_distance_pairs = *prepared_selection;

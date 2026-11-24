@@ -268,7 +268,6 @@ void WriteHostApplyRequest(Writer &writer, const HostApplyRequest &request) {
   WriteStrongVector(writer, request.removed_domains);
   writer.Boolean(request.program.has_value());
   if (request.program) {
-    WriteStrong(writer, request.program->program_id);
     WriteStrong(writer, request.program->program_revision);
     WriteStrong(writer, request.program->program_binding_id);
   }
@@ -285,11 +284,9 @@ void WriteHostApplyRequest(Writer &writer, const HostApplyRequest &request) {
                            ReadStrongVector<core::ControlDomainId>(reader),
                            std::nullopt};
   if (reader.Boolean()) {
-    auto program_id = ReadStrong<core::ProgramId>(reader);
     auto program_revision = ReadStrong<core::ProgramRevision>(reader);
     request.program = HostApplyProgramSelection{
-        std::move(program_id), std::move(program_revision),
-        ReadStrong<core::ProgramBindingId>(reader)};
+        std::move(program_revision), ReadStrong<core::ProgramBindingId>(reader)};
   }
   return request;
 }

@@ -47,7 +47,7 @@ function workspaceSnapshot(
         authoring: { forest: [] } as unknown as ProgramAuthoringDocument,
         candidateAvailable: true,
         programRevision: `sha256:${'b'.repeat(64)}`,
-        program: { api_version: 'manyforge.program.v3' } as unknown as ProgramDocument,
+        program: { api_version: 'manyforge.program.v4' } as unknown as ProgramDocument,
         diagnostics: [],
         formulaReferences: { computedKeys: {}, nodes: {} },
       },
@@ -497,7 +497,6 @@ describe('authoringWorkspace', () => {
         id: 'deployment-draft.1',
         revision: 1,
         document: null,
-        deploymentArtifactId: 'artifact.1',
         deploymentRevision: 'deployment.1',
         graphRevision: 'graph.1',
         differsFromSaved: false,
@@ -519,8 +518,8 @@ describe('authoringWorkspace', () => {
     expect(mergedDeployment.draft.differsFromSaved).toBe(true);
     expect(mergedDeployment.saved.path).toBe('/workspace/saved.deployment.yaml');
     expect(mergedDeployment.saved.deploymentRevision).toBe('deployment.1');
-    // The compiled artifact identity and Manager truth stay with their owner.
-    expect(mergedDeployment.draft.deploymentArtifactId).toBe('artifact.1');
+    // The compiled identities and Manager truth stay with their owner.
+    expect(mergedDeployment.draft.graphRevision).toBe('graph.1');
     expect(mergedDeployment.managerApplied).toBe(deployment.managerApplied);
   });
 

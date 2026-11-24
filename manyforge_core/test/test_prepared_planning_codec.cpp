@@ -207,6 +207,30 @@ TEST(PreparedPlanningCodecTest, RoundTripsCompletePlanRequestWithoutPrivateHandl
   EXPECT_FALSE(DecodePreparedPlanRequest(overflow).ok());
 }
 
+TEST(PreparedPlanningCodecTest, PoseGoalRoundTripsJointAndLinearMotionTypes) {
+  const Pose3DTO goal{{0.3, 0.0, 0.2}, {0.0, 0.0, 0.0, 1.0}};
+  auto request = testing::make_test_plan_request("pose.joint", PoseGoalDTO{goal});
+  const auto joint = EncodePreparedPlanRequest(request);
+  ASSERT_TRUE(joint.ok()) << joint.error().message;
+  EXPECT_EQ(joint.value().find("linear_pose_goal"), std::string::npos);
+  EXPECT_EQ(DecodePreparedPlanRequest(joint.value()).value().motion, request.motion);
+
+  LinearPoseMotionDTO linear;
+  linear.max_translation_step_m = 0.002;
+  linear.max_angular_speed_rad_s = 0.4;
+  for (const auto mode : {std::optional<CartesianSpeedModeDTO>{},
+                          std::optional{CartesianSpeedModeDTO::kConstantSpeed}}) {
+    linear.speed_mode = mode;
+    request.motion = PoseGoalDTO{goal, linear};
+    const auto encoded = EncodePreparedPlanRequest(request);
+    ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+    const auto decoded = DecodePreparedPlanRequest(encoded.value());
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value().motion, request.motion);
+    EXPECT_EQ(EncodePreparedPlanRequest(decoded.value()).value(), encoded.value());
+  }
+}
+
 TEST(PreparedPlanningCodecTest, RejectsDiagnosticPlanRequests) {
   auto request = testing::make_test_plan_request(
       "diagnostic", ResolvedJointGoalDTO{{ResourceId("resource:joint1"), ResourceId("resource:joint2")},

@@ -259,8 +259,6 @@ TEST(ApplyComponentDelta, EmptyRosHostHasNoFakeComponents) {
       false, false, "resource", false, {});
   const auto &profile = *catalog.ros2_control_execution_runtime_profile;
   detail::ActivationDeploymentIntent intent{};
-  intent.deployment_artifact_id = "empty_ros_compiler_regression";
-  intent.name = "Empty ROS compiler regression";
   intent.attachments = CanonicalValue(CanonicalValue::Array{});
   intent.policies = CanonicalValue(CanonicalValue::Object{});
   const auto authored = detail::compile_activation_deployment(

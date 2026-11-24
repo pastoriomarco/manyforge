@@ -82,7 +82,6 @@ inline void HoldProgramRun(core::ResourceAddressedExecutionKernel &kernel,
   core::ProgramBindingDTO program_binding{
       std::string(core::kProgramBindingApiVersion),
       value.program_binding_id,
-      value.program_id,
       value.program_revision,
       value.retained_bundle_id,
       value.graph_revision,
@@ -96,7 +95,7 @@ inline void HoldProgramRun(core::ResourceAddressedExecutionKernel &kernel,
       HeldProgramRunMotionScope().node_instance_id, "kernel.operation",
       {{target, value.capability_id, true}}});
   require(kernel.register_program_run_capture(core::ProgramRunExecutionCaptureDTO{
-              claim.value().claim_generation, run, value.program_id, value.program_revision,
+              claim.value().claim_generation, run, value.program_revision,
               value.program_binding_id, value.retained_bundle_id, value.graph_revision,
               std::move(table),
               std::make_shared<const core::ProgramBindingDTO>(std::move(program_binding))}),

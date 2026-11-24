@@ -51,7 +51,6 @@ function status(
     sceneInitialization: 'preserve',
     preparedActivation: {
       capturedInputDigest: `sha256:${'6'.repeat(64)}`,
-      deploymentArtifactId: 'deployment-1',
       deploymentRevision: `sha256:${'7'.repeat(64)}`,
       programBindingId: `sha256:${'8'.repeat(64)}`,
       preparedActivationId: `sha256:${'9'.repeat(64)}`,

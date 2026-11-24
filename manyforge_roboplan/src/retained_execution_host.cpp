@@ -643,8 +643,9 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
     const bool compare_frames = true) noexcept {
   const auto &left = primary.value();
   const auto &right = alias.value();
-  // Contact policies belong to the verified Program view, not the physical
-  // owner. Keep them on the alias while matching every physical identity below.
+  // The collision bodies of the Program's rules belong to the verified Program
+  // view, not the physical owner. Keep them on the alias while matching every
+  // physical identity below.
   return left.retained_bundle_id == right.retained_bundle_id &&
          left.graph_revision == right.graph_revision &&
          left.controllable_component_id == right.controllable_component_id &&
@@ -1435,7 +1436,8 @@ create_retained_execution_host_participants(
                                    nullptr,
                                    runtime->planning_scene_synchronizer,
                                    make_runtime_collision_check_scheduler(
-                                       cell_scheduler_config, runtime->scheduler)};
+                                       cell_scheduler_config, runtime->scheduler),
+                                   input.cell_model_state};
   config.kernel.log_label =
       runtime->motion_binding.value().controllable_component_id.value();
   runtime->participant_engine = std::make_shared<core::ExecutionKernel>(
@@ -1804,6 +1806,9 @@ core::Result<void> reseal_retained_execution_host_for_apply(
     return fail("native_product_reseal_fence_changed",
                 "retained native owner lost its exact Apply fence");
   }
+  // The first differing physical fact names the cause in the refusal.
+  const auto physical_difference = retained_product_reseal_physical_owner_difference(
+      runtime.motion_binding, input.motion_binding);
   if (runtime.clock == nullptr || runtime.motion_state_channel == nullptr ||
       runtime.execution == nullptr || !runtime.rebind_motion_route ||
       runtime.participant_engine == nullptr ||
@@ -1812,10 +1817,11 @@ core::Result<void> reseal_retained_execution_host_for_apply(
       input.motion_binding.value().control_path == std::nullopt ||
       input.motion_binding.value().controllable_component_id !=
           runtime.motion_binding.value().controllable_component_id ||
-      !retained_bindings_preserve_physical_owner_after_product_reseal(
-          runtime.motion_binding, input.motion_binding)) {
+      !physical_difference.empty()) {
     return fail("native_product_reseal_physical_identity_changed",
-                "candidate product changes the retained component's physical controller identity");
+                "candidate product changes the retained component's physical controller identity" +
+                    (physical_difference.empty() ? std::string{}
+                                                 : " (" + std::string(physical_difference) + ")"));
   }
 
   const auto motion_status = runtime.participant_engine->get_status();

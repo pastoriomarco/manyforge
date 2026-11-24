@@ -23,6 +23,9 @@ struct CapturedComponentModelSource final {
   CapturedModelSourceArtifact urdf;
   std::optional<CapturedModelSourceArtifact> srdf;
   std::vector<CapturedModelSourceArtifact> resources;
+  /// What a Tool generated from its parameters declares
+  /// beside its model (`generated_component`); absent for every other model.
+  std::optional<CanonicalValue> generated_component{};
 };
 
 /// Decode and verify the exact source closure captured by Composer.

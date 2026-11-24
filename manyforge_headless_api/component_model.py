@@ -446,7 +446,7 @@ def run_cycle_facts(cycle: Mapping[str, Any]) -> RunCycleFacts:
 def program_not_executable(status: Mapping[str, Any] | None) -> BlockedReason | None:
     """The applied Program's binding problem, from applied-Program status."""
 
-    if not status or status.get("program_id") is None or status.get("executable"):
+    if not status or status.get("program_revision") is None or status.get("executable"):
         return None
     outcome = status.get("non_executable") or {}
     targets = ", ".join(

@@ -17,6 +17,15 @@ if str(ROOT) not in sys.path:  # run from the source tree without a colcon build
     sys.path.insert(0, str(ROOT))
 
 from manyforge_ros_bringup.sim_plc import (  # noqa: E402
+    BankCommand,
+    BankCore,
+    OUTPUT_KEEP,
+    bank_command,
+    parse_refused,
+    RESULT_ACCEPTED,
+    RESULT_REFUSED,
+    RESULT_UNSET,
+    bank_topics,
     ConfigError,
     EXIT_CONFIG,
     EXIT_OCCUPIED,
@@ -541,6 +550,8 @@ def _set_param(rclpy, node, device, name, value):
         pv = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=value)
     elif isinstance(value, float):
         pv = ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=value)
+    elif isinstance(value, int):
+        pv = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=value)
     else:
         pv = ParameterValue(type=ParameterType.PARAMETER_STRING, string_value=value)
     future = client.call_async(SetParameters.Request(parameters=[Parameter(name=name, value=pv)]))
@@ -900,3 +911,176 @@ def test_ros_same_fqn_peer_discovered_during_creation_is_not_own():
         node.destroy_node()
         rclpy.shutdown(context=theirs)
         rclpy.shutdown(context=ours)
+
+
+# --------------------------------------------------------------------------- bank mode
+
+
+def test_bank_config_defaults_and_limits():
+    config = parse_config({"mode": "bank"})
+    assert (config.mode, config.rate_hz, config.inputs, config.outputs) == ("bank", 200.0, 64, 64)
+    assert parse_config({"mode": "bank", "rate_hz": 1000, "mirror": False}).rate_hz == 1000.0
+    for bad in ({"mode": "bank", "rate_hz": 1001}, {"mode": "bank", "inputs": 8},
+                {"mode": "bank", "ack_delay_s": 0.1}, {"mode": "other"}):
+        with pytest.raises(ConfigError):
+            parse_config(bad)
+    # Signals mode keeps its own rate limit.
+    with pytest.raises(ConfigError):
+        parse_config({"rate_hz": 200})
+
+
+def test_bank_endpoints_are_fixed_under_the_device():
+    assert bank_topics("plc_io") == ("/plc_io/io_bank/state", "/plc_io/io_bank/command")
+    endpoints = endpoint_names("plc_io", parse_config({"mode": "bank"}))
+    assert (endpoints.ready, endpoints.inputs, endpoints.outputs) == (
+        "/plc_io/io_bank/state", (), ())
+
+
+def _started_bank(**settings):
+    bank = BankCore(mirror=False)
+    for key, value in settings.items():
+        setattr(bank, key, value)
+    first = bank.step()  # the first command read (zeros) is adopted
+    assert (first.cycle, first.applied_seq) == (1, 0)
+    return bank
+
+
+def test_bank_applies_a_new_command_value_first_and_sequence_last():
+    bank = _started_bank()
+    bank.receive(bank_command(1, Q3=True))
+    state = bank.step()
+    assert (state.cycle, state.applied_seq, state.applied_result, state.device_code) == (
+        2, 1, RESULT_ACCEPTED, 0)
+    assert state.outputs[3] is True
+    # The same seq again is not applied again.
+    bank.outputs[3] = False
+    assert bank.step().outputs[3] is False
+
+
+def test_bank_applies_on_and_off_and_keeps_every_other_value():
+    bank = _started_bank()
+    bank.receive(bank_command(1, Q0=True, Q1=True))
+    assert bank.step().outputs[:3] == (True, True, False)
+    values = [OUTPUT_KEEP] * 64
+    values[0], values[2], values[3] = 0, 1, 7  # 7: not 0/1, unchanged
+    bank.receive(BankCommand(2, tuple(values)))
+    state = bank.step()
+    assert state.outputs[:4] == (False, True, True, False)
+    assert (state.applied_seq, state.applied_result, not any(state.refused)) == (
+        2, RESULT_ACCEPTED, True)
+
+
+def test_bank_refuses_per_output():
+    bank = _started_bank()
+    bank.refuse, bank.device_code = parse_refused("2, 5"), 42
+    bank.receive(bank_command(8, Q1=True, Q2=True))
+    state = bank.step()
+    assert (state.applied_seq, state.applied_result, state.device_code) == (8, RESULT_REFUSED, 42)
+    assert [index for index, bit in enumerate(state.refused) if bit] == [2]
+    assert state.outputs[1] is True and state.outputs[2] is False
+    # A new command clears the refusals.
+    bank.receive(bank_command(9, Q1=False))
+    state = bank.step()
+    assert (state.applied_result, state.device_code, any(state.refused)) == (
+        RESULT_ACCEPTED, 0, False)
+    with pytest.raises(ConfigError):
+        parse_refused("64")
+
+
+def test_bank_no_answer_and_late_effect():
+    bank = _started_bank(response="no_answer")
+    bank.receive(bank_command(1, Q0=True))
+    for _ in range(5):
+        assert bank.step().applied_seq == 0
+    bank.response = "accept"
+    bank.apply_delay_cycles = 3
+    states = [bank.step() for _ in range(4)]
+    assert [state.applied_seq for state in states] == [0, 0, 0, 1]
+    assert states[-1].outputs[0] is True
+
+
+def test_bank_frozen_cycle_repeats_and_applies_nothing():
+    bank = _started_bank()
+    bank.frozen = True
+    bank.receive(bank_command(1, Q0=True))
+    assert [bank.step().cycle for _ in range(3)] == [1, 1, 1]
+    assert bank.applied_seq == 0
+    bank.frozen = False
+    assert (bank.step().cycle, bank.applied_seq) == (2, 1)
+
+
+def test_bank_restart_adopts_the_last_command_instead_of_replaying_it():
+    bank = _started_bank()
+    bank.receive(bank_command(5, Q2=True))
+    assert bank.step().outputs[2] is True
+    bank.restart()
+    state = bank.step()
+    # The cycle starts over; the stale command's seq is adopted, not applied.
+    assert (state.cycle, state.applied_seq, state.applied_result) == (1, 5, RESULT_UNSET)
+    assert not any(state.outputs)
+    bank.receive(bank_command(6, Q2=True))
+    assert bank.step().outputs[2] is True
+
+
+def test_bank_mirror_loops_outputs_back_to_inputs():
+    bank = BankCore(mirror=True)
+    bank.step()
+    bank.receive(bank_command(1, Q9=True))
+    state = bank.step()
+    assert state.inputs[9] is True and state.outputs[9] is True
+
+
+class LatestBank:
+    def __init__(self, node, topic):
+        from manyforge_io_interfaces.msg import IoBankState
+
+        self.states = []
+        self.sub = node.create_subscription(IoBankState, topic, self.states.append, 10)
+
+
+def test_bank_process_applies_commands_and_follows_test_switches(ros, tmp_path):
+    pytest.importorskip("manyforge_io_interfaces")
+    from manyforge_io_interfaces.msg import IoBankCommand
+
+    rclpy, node = ros
+    device = f"bank_{os.getpid()}"
+    state_topic, command_topic = bank_topics(device)
+    states = LatestBank(node, state_topic)
+    publisher = node.create_publisher(IoBankCommand, command_topic, 1)
+    proc = _start(tmp_path, device, "mode: bank\nrate_hz: 100\n")
+    try:
+        assert _wait(rclpy, node, lambda: len(states.states) >= 5), proc.stdout.read()
+        cycles = [state.cycle for state in states.states]
+        assert cycles == sorted(cycles)
+        seq = states.states[-1].applied_seq + 1
+        publisher.publish(IoBankCommand(seq=seq, values=list(bank_command(seq, Q5=True).values)))
+        assert _wait(rclpy, node, lambda: states.states[-1].applied_seq == seq)
+        assert states.states[-1].applied_result == RESULT_ACCEPTED
+        assert states.states[-1].outputs[5] is True
+
+        assert _set_param(rclpy, node, device, "bank.refused", "6")
+        assert _set_param(rclpy, node, device, "bank.device_code", 9)
+        publisher.publish(IoBankCommand(
+            seq=seq + 1, values=list(bank_command(seq + 1, Q6=True, Q7=True).values)))
+        assert _wait(rclpy, node, lambda: states.states[-1].applied_seq == seq + 1)
+        assert (states.states[-1].applied_result, states.states[-1].device_code) == (
+            RESULT_REFUSED, 9)
+        assert list(states.states[-1].refused[6:8]) == [True, False]
+        assert states.states[-1].outputs[7]
+
+        assert _set_param(rclpy, node, device, "bank.restart", True)
+        assert _wait(rclpy, node, lambda: states.states[-1].cycle < 20 and
+                     states.states[-1].applied_seq == seq + 1 and
+                     not states.states[-1].outputs[5])
+
+        assert _set_param(rclpy, node, device, "bank.publishing", False)
+        rclpy.spin_once(node, timeout_sec=0.2)
+        count = len(states.states)
+        end = time.monotonic() + 0.5
+        while time.monotonic() < end:
+            rclpy.spin_once(node, timeout_sec=0.05)
+        assert len(states.states) == count
+    finally:
+        _stop_ok(proc)
+        node.destroy_publisher(publisher)
+        node.destroy_subscription(states.sub)

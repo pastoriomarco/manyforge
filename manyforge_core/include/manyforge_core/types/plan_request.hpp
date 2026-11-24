@@ -93,7 +93,6 @@ struct MovingReplacementInputDTO final {
 struct PlanRequestDTO final {
   OperationNumber operation_id;
   OperationParticipantId participant_id;
-  ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
   std::optional<ProgramRunNumber> program_run_id;
@@ -137,7 +136,6 @@ struct PlanRequestDTO final {
   TolerancesDTO tolerances;
   SpeedProfileDTO speed_profile;
   PlannerOverrideDTO planner{};
-  std::optional<std::string> contact_policy_id;
   PerResourceDynamicsLimitsDTO per_resource_dynamics_limits;
   double planning_timeout_s{5.0};
   /// Kernel-owned zero-based attempt ordinal for this logical motion plan.

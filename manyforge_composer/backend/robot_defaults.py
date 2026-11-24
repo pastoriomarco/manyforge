@@ -9,7 +9,6 @@ ROBOT_RUNTIME_DEFAULTS: dict[str, Any] = {
 }
 
 ROBOT_OPTIONAL_DEFAULTS: dict[str, Any] = {
-    "collision_clearance_m": 0.001,
     "collision_check_step_rad": 0.05,
     "collision_check_fresh_plans": True,
     "planner_search": "rrt_connect",
@@ -27,4 +26,8 @@ REAL_ROBOT_OPTIONAL_DEFAULTS: dict[str, Any] = {
 
 COMPONENT_DEFAULTS: dict[str, Any] = {
     "lifecycle_command_timeout_s": 10.0,
+}
+
+CELL_DEFAULTS: dict[str, Any] = {
+    "collision_clearance_m": 0.001,
 }

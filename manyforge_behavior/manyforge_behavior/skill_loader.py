@@ -103,7 +103,7 @@ def _identified_program(value: dict[str, Any]) -> dict[str, Any]:
         value,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return value
 
@@ -210,15 +210,13 @@ class SkillCatalog:
             _require(
                 type(declarations) is dict
                 and not set(declarations)
-                - {"parameters", "blackboard", "scene", "contact_policies"},
+                - {"parameters", "blackboard", "scene"},
                 "invalid skill example declarations",
             )
             host = {
-                "api_version": "manyforge.program.v3",
-                "program_id": "skill_example",
+                "api_version": "manyforge.program.v4",
                 "program_revision": "sha256:" + "0" * 64,
                 "program_profile": "composable-cell-v1",
-                "name": "Skill example",
                 "catalog": {
                     "api_version": catalog.api_version,
                     "content_version": catalog.content_version,

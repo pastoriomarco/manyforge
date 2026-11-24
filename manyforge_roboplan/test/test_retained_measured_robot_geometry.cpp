@@ -113,7 +113,6 @@ private:
         throw std::runtime_error("fixture binding route missing");
       const core::RuntimeEpoch epoch("geometry.test.epoch");
       core::RuntimeParticipantBindingDTO value{
-          core::ProgramId("geometry.test.program"),
           core::ProgramRevision("geometry.test.program.revision"),
           core::ProgramBindingId("geometry.test.program.binding"),
           bundle_->retained_bundle_id(),

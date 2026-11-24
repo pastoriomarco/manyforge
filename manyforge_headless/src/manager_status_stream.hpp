@@ -42,6 +42,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/execution_event_change_signal.hpp>
 #include <manyforge_private_stream/private_stream_server.hpp>
+#include <manyforge_scene/logical_scene_owner.hpp>
 
 #include <array>
 #include <atomic>
@@ -195,10 +196,14 @@ private:
 class ManagerStatusStream final {
 public:
   static constexpr std::size_t kMaximumSubscribers = 4U;
-  /// The largest frame (today's Manager response bound); a connection whose
-  /// send buffer cannot hold it uses its own smaller capacity.
+  /// The largest frame: the largest scene the owner commits plus 16 KiB for
+  /// the section's access part, the frame envelope and the few bytes per
+  /// object the section's encoding can exceed the owner's (at most about
+  /// 2 KiB in all), so a committed scene always fits one `logical_scene`
+  /// section frame. A connection whose send
+  /// buffer cannot hold it uses its own smaller capacity.
   static constexpr std::size_t kMaximumFrameBytes =
-      3U * 128U * 1024U + 16U * 1024U;
+      manyforge::scene::kMaximumLogicalSceneSnapshotBytes + 16U * 1024U;
   /// A reader that accepts no frame for this long is dropped; by then it has
   /// already declared the Manager not answering (its 2 s rule).
   static constexpr std::chrono::milliseconds kSendDeadline{2000};

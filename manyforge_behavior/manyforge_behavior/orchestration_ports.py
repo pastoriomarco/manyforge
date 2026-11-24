@@ -91,7 +91,6 @@ class ProgramRunPortContext:
     applied_record_digest: str
     scenario_id: str
     source_document_digest: str
-    program_id: str
     program_revision: str
     program_binding_id: str
     retained_bundle_id: str
@@ -109,12 +108,10 @@ class ProgramRunPortContext:
         require_run_number(self.program_run_id)
         if self.context_kind not in SCENE_CONTEXT_KINDS:
             raise ValueError("context_kind must be 'run' or 'apply'")
-        for field_name in ("scenario_id", "program_id"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{field_name} must be non-empty text")
-            if len(value.encode("utf-8")) > 512:
-                raise ValueError(f"{field_name} exceeds the client-port bound")
+        if not isinstance(self.scenario_id, str) or not self.scenario_id:
+            raise ValueError("scenario_id must be non-empty text")
+        if len(self.scenario_id.encode("utf-8")) > 512:
+            raise ValueError("scenario_id exceeds the client-port bound")
         for field_name in (
             "applied_record_digest",
             "source_document_digest",
@@ -136,8 +133,7 @@ class ProgramRunPortContext:
             raise TypeError("program_binding must be a mapping")
         binding = dict(self.program_binding)
         if (
-            binding.get("program_id") != self.program_id
-            or binding.get("program_revision") != self.program_revision
+            binding.get("program_revision") != self.program_revision
             or binding.get("program_binding_id") != self.program_binding_id
             or binding.get("retained_bundle_id") != self.retained_bundle_id
             or binding.get("graph_revision") != self.graph_revision
@@ -147,10 +143,7 @@ class ProgramRunPortContext:
         if not isinstance(self.program, Mapping):
             raise TypeError("program must be a mapping")
         program = dict(self.program)
-        if program and (
-            program.get("program_id") != self.program_id
-            or program.get("program_revision") != self.program_revision
-        ):
+        if program and program.get("program_revision") != self.program_revision:
             raise ValueError("Program-run context and Program disagree")
         object.__setattr__(self, "program", _freeze(program))
         if self.assistant_projection is not None and not isinstance(
@@ -936,6 +929,9 @@ class NodeAdapterPorts:
     program_run_context: ProgramRunContextPort | None = None
     program_interventions: ProgramInterventionPort | None = None
     persistent_keys: PersistentKeyRegisterPort | None = None
+    # The facts of each finished node attempt (OD-375), called on the run's
+    # tick: it must not block. None records no attempts.
+    node_attempt_history: Callable[[Mapping[str, Any]], None] | None = None
 
 
 # The Kernel execution states of a failure and of an interruption.

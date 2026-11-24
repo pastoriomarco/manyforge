@@ -40,6 +40,9 @@ from manyforge_headless_api.process_tests.test_process_stack import (
 )
 
 
+# The examples' model sources live in the repository (manyforge_example_models),
+# an allowed folder under the project path rule (OD-335).
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CELL_ID = "dual_robot_wall_cell"
 ADMISSION_FILENAME = f"canonical-empty-admission.{CELL_ID}.json"
 GROUPED_SCENARIO = "mock_dual_arm_shared_group"
@@ -51,6 +54,12 @@ LOAD_HTTP_TIMEOUT_SECONDS = 60.0
 # Near the wall the UR5e start keeps about 9 cm of clearance, while its
 # Program goal reaches about 6 cm through the wall.
 MOVED_UR5E_ROOT_POSITION_M = [-0.2, 0.68, 0.0]
+# With the wall removed, these two goals put both wrists at the same point
+# of the cell, about (0.00, 0.42, 0.40) m: link centre lines 3 mm apart.
+# Each goal is 0.4 m or more from the other robot's all-zero pose and from
+# its initial pose.
+PEER_CLASH_UR5E_GOAL_RAD = [-1.75, -1.34, 1.52, -1.63, -1.85, 0.0]
+PEER_CLASH_LITE6_GOAL_RAD = [1.57, 0.61, 1.83, 0.0, 0.0, 0.0]
 # The gripper component mounted on each arm (its own Mock launch).
 MOUNTED_GRIPPER = {"lite6_robot": "lite_gripper", "ur5e_robot": "robotiq_2f_85"}
 
@@ -294,7 +303,7 @@ def observe_applied_activation_projection(
             assert prior_apply["state"] == "succeeded" and prior_apply["ok"] is True, predecessor
             assert prior_apply["candidate_projection_revision"] == prior_publication["projection_revision"], predecessor
             assert prior_program is not None, predecessor
-            for field in ("deployment_artifact_id", "deployment_revision", "program_binding_id"):
+            for field in ("deployment_revision", "program_binding_id"):
                 assert prior_apply["prepared_activation"][field] == prior_program[field], predecessor
         if prior_publication is not None and prior_publication["transaction"]["kind"] == "named_apply":
             assert prior_order is not None and prior_program is not None, predecessor
@@ -469,10 +478,6 @@ def _load_scenario(
         component_ids = _activate_loaded_components(stack)
         _wait_components_reached_requested_target(stack, component_ids)
         stack.wait_authoring_admission(expected_allowed=True)
-        deployment = composer.request("GET", "/api/deployment/workspace")
-        assert deployment["draft"]["document"]["deployment_artifact_id"] == (
-            "ur5e_lite6_wall"
-        )
         applied = composer.program_applied()
         assert applied["scenario_id"] == scenario_id
         return (
@@ -847,7 +852,6 @@ def test_repeated_project_activation_replaces_one_coherent_publication() -> None
                 stack, GROUPED_SCENARIO, scenario_path=scenario_path
             )
             assert applied["scenario_id"] == GROUPED_SCENARIO
-            assert applied["deployment_artifact_id"] == "ur5e_lite6_wall"
             assert applied["program_binding_id"]
             observed.append(
                 (
@@ -928,7 +932,7 @@ def _write_mixed_variants(
 
     examples = _required_path("MANYFORGE_EXAMPLE_SCENARIO_ROOT")
     source = examples / f"{GROUPED_SCENARIO}.scenario"
-    document, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+    document, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples), str(REPOSITORY_ROOT)])
     variants = stack.root / "mixed-scenarios"
     variants.mkdir()
     paths: dict[str, Path] = {}
@@ -938,7 +942,7 @@ def _write_mixed_variants(
         if kind == "isolation":
             source_project = examples / f"{ISOLATION_SCENARIO}.scenario"
             candidate, _ = load_scenario_artifact(
-                str(source_project), allowed_roots=[str(examples)]
+                str(source_project), allowed_roots=[str(examples), str(REPOSITORY_ROOT)]
             )
         # These variants qualify retention during a same-Scenario reload.
         # Their distinct paths/digests remain real independent source facts.
@@ -1008,6 +1012,22 @@ def _write_mixed_variants(
         elif kind == "move":
             ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
             ur5e["root_pose_in_cell"]["position_m"] = list(MOVED_UR5E_ROOT_POSITION_M)
+        elif kind == "peer_clash":
+            # No wall; the UR5e moves first and stays, then the Lite 6 is sent
+            # to the place the UR5e occupies.
+            program = candidate["program_draft"]
+            program["scene"] = [row for row in program["scene"]
+                                if row["scene_resource_id"] != "separation_wall"]
+            root = program["forest"][0]
+            moves = {child["instance_id"]: child for child in root["children"]}
+            for instance_id, goal in (("ur5e_joint_motion", PEER_CLASH_UR5E_GOAL_RAD),
+                                      ("lite6_joint_motion", PEER_CLASH_LITE6_GOAL_RAD)):
+                for row, position_rad in zip(
+                        moves[instance_id]["parameters"]["goal"], goal, strict=True):
+                    row["position_rad"] = position_rad
+            root["node_id"] = "sequence"
+            root["parameters"] = {}
+            root["children"] = [moves["ur5e_joint_motion"], moves["lite6_joint_motion"]]
         elif kind == "replace":
             ur5e = next(row for row in components if row["component_id"] == "ur5e_robot")
             # Change only B's controller input; A must survive unchanged.
@@ -1027,7 +1047,7 @@ def _write_mixed_variants(
         )
         save_scenario_artifact(
             candidate, str(target),
-            allowed_roots=[str(examples), str(stack.root)],
+            allowed_roots=[str(examples), str(stack.root), str(REPOSITORY_ROOT)],
             overwrite=False, source_project_path=str(source_project),
         )
         paths[kind] = target
@@ -1126,6 +1146,58 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
             evidence = json.dumps(native.read(operation_id), sort_keys=True)
             assert "native_goal_state_collision" in evidence, evidence
             assert "validation_collision" not in evidence, evidence
+
+
+def test_robot_is_refused_a_goal_inside_its_peers_actual_position() -> None:
+    # The UR5e moves its wrist into the shared zone and stays there. The
+    # Lite 6 is then sent to the same place. Its planner must see the UR5e
+    # where it actually is and refuse the goal; it must not plan against the
+    # UR5e's all-zero pose and move into it.
+    with _dual_robot_stack() as stack:
+        paths = _write_mixed_variants(stack, ("peer_clash",))
+        applied, source_document_digest = _load_scenario(
+            stack, GROUPED_SCENARIO, scenario_path=paths["peer_clash"]
+        )
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            started = _start_run(
+                stack,
+                scenario_id=applied["scenario_id"],
+                source_document_digest=source_document_digest,
+                applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(client, started, request_id="dual-robot.peer-clash.motion-start")
+            terminal = _wait_run_state(
+                client,
+                program_run_id,
+                {"succeeded", "failed", "intervention_required", "stopped"},
+            )
+        assert terminal["state"] != "succeeded", terminal
+
+        def accepted(events: list[dict[str, Any]], component_id: str) -> set[int]:
+            return {
+                event["operation_id"]
+                for event in events
+                if event["record_kind"] == "operation_accepted"
+                and _participant_target(event["payload"]["intent"]["participants"][0])
+                == (component_id, "arm")
+            }
+
+        # One UR5e move, which succeeds; four Lite 6 attempts (the node's
+        # three automatic retries), each refused by the planner.
+        events = _native_events_when(
+            stack, lambda events: len(accepted(events, "lite6_robot")) >= 4
+        )
+        assert len(accepted(events, "ur5e_robot")) == 1, events
+        lite6_operations = accepted(events, "lite6_robot")
+        assert len(lite6_operations) == 4, lite6_operations
+        native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+        for operation_id in lite6_operations:
+            evidence = json.dumps(native.read(operation_id), sort_keys=True)
+            assert "native_goal_state_collision" in evidence, evidence
+            # The colliding body is a UR5e link or its gripper, not scenery.
+            assert any(name in evidence for name in ("wrist_", "forearm", "robotiq")), evidence
 
 
 def _kernel_attention_reconciled(
@@ -1955,7 +2027,7 @@ def _assert_stored_authoring_apply_without_linked_children(
         assert connection.execute(
             "SELECT schema_id,schema_version,cell_id FROM apply_journal_metadata WHERE singleton=1"
         ).fetchone() == (
-            "manyforge.internal.component-manager.apply-journal.h1a.v24", 24, stack.cell_id
+            "manyforge.internal.component-manager.apply-journal.h1a.v25", 25, stack.cell_id
         )
         key = (status["apply_id"], status["apply_generation"])
         rows = connection.execute(
@@ -2208,7 +2280,7 @@ def _deployment_apply_retention_case(stack: ProcessStack, kind: str) -> None:
         intent = {
             "application_start_id": stack.application_start_id,
             "request_context": {"request_key": _request_key(), "source_label": "composer_ui"},
-            "program_id": manual["program_id"], "program_revision": manual["program_revision"],
+            "program_revision": manual["program_revision"],
             # Manual work names no Program run (it has none).
             "program_binding_id": manual["program_binding_id"],
             "expected_graph_revision": identity["graph_revision"],

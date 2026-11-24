@@ -84,6 +84,7 @@ struct ComponentStreamHealth::Shared final {
   std::vector<std::weak_ptr<StreamRecorder::Slot>> fresh;
   std::set<ControllableComponentId> dirty;
   std::map<ControllableComponentId, ComponentStreamVerdictDTO> published;
+  std::map<ControllableComponentId, std::shared_ptr<ComponentStreamStaleFlag>> watches;
   std::optional<ScheduleHandle> timer;
   std::int64_t timer_at_ns{};
   bool evaluation_scheduled{};
@@ -143,6 +144,17 @@ struct ComponentStreamHealth::Shared final {
         verdict.fault_loss = Condition(slot, *code);
     }
     return verdict;
+  }
+
+  /// A `fault` stream of the component is stale.
+  [[nodiscard]] bool StaleFaultLocked(const ControllableComponentId& component) const {
+    for (auto it = slots.lower_bound({component, std::string()});
+         it != slots.end() && it->first.first == component; ++it) {
+      if (it->second->state == StreamLivenessStateDTO::kStale &&
+          it->second->effective.severity == StreamSeverityDTO::kFault)
+        return true;
+    }
+    return false;
   }
 
   void MarkStaleLocked(StreamRecorder::Slot& slot) {
@@ -223,6 +235,8 @@ struct ComponentStreamHealth::Shared final {
         self->MarkStaleLocked(*slot);
       }
       for (const auto& component : self->dirty) {
+        if (const auto watch = self->watches.find(component); watch != self->watches.end())
+          watch->second->value.store(self->StaleFaultLocked(component), std::memory_order_release);
         auto verdict = self->VerdictLocked(component);
         const auto published = self->published.find(component);
         const bool changed = published == self->published.end() ? !verdict.empty()
@@ -449,6 +463,17 @@ std::vector<StreamHealthDTO> ComponentStreamHealth::Read(const ControllableCompo
     result.push_back(std::move(row));
   }
   return result;
+}
+
+std::shared_ptr<const ComponentStreamStaleFlag> ComponentStreamHealth::Watch(
+    const ControllableComponentId& component) {
+  std::lock_guard lock(shared_->mutex);
+  auto& flag = shared_->watches[component];
+  if (!flag) {
+    flag = std::make_shared<ComponentStreamStaleFlag>();
+    flag->value.store(shared_->StaleFaultLocked(component), std::memory_order_release);
+  }
+  return flag;
 }
 
 void ComponentStreamHealth::SetLog(std::function<void(const std::string&)> log) {

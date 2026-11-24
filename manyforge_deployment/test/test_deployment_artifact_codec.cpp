@@ -36,9 +36,8 @@ static_assert(
     !std::is_default_constructible_v<RevisionVerifiedDeploymentArtifact>);
 static_assert(
     !std::is_constructible_v<
-        RevisionVerifiedDeploymentArtifact, core::DeploymentArtifactId,
-        core::DeploymentRevision, core::CellId, std::string,
-        std::optional<std::string>, std::vector<core::CatalogRecordRefDTO>,
+        RevisionVerifiedDeploymentArtifact, core::DeploymentRevision,
+        core::CellId, std::vector<core::CatalogRecordRefDTO>,
         GraphRevisionVerifiedCellGraph,
         RevisionVerifiedDeploymentApplicabilityInputs, bool, CanonicalValue>);
 
@@ -83,14 +82,10 @@ control_domain_graph(std::string_view domain_id = "arm_domain") {
 document(std::string graph = empty_graph(), std::string providers = "[]",
          std::string catalogs = "{\"records\":[]}",
          std::string optional_members = "",
-         std::string_view artifact_id = "deployment_a",
-         std::string_view cell_id = "cell_a",
-         std::string_view name = "Cell A") {
+         std::string_view cell_id = "cell_a") {
   return "{\"api_version\":\"manyforge.deployment.v1\","
-         "\"deployment_artifact_id\":\"" +
-         std::string(artifact_id) + "\",\"deployment_revision\":\"" +
+         "\"deployment_revision\":\"" +
          std::string(kZeroDigest) + "\",\"cell_id\":\"" + std::string(cell_id) +
-         "\",\"name\":\"" + std::string(name) +
          "\",\"catalogs\":" + std::move(catalogs) +
          ",\"graph\":" + std::move(graph) +
          ",\"desired_control_configurations\":[],"
@@ -99,22 +94,21 @@ document(std::string graph = empty_graph(), std::string providers = "[]",
 }
 
 [[nodiscard]] std::string aggregate_expanding_yaml_document() {
+  // The catalogs (about 54 KB under the normalized budget) and the graph
+  // (about 89 KB of passive model instances) each stay within the budget;
+  // only together do they exceed it. The envelope has no free text since
+  // OD-369, so the graph supplies the remainder.
   constexpr std::size_t kCatalogRecordCount = 8U;
-  constexpr std::size_t kStoreKeyBytes = 930000U;
-  constexpr std::size_t kDescriptionBytes = 950000U;
+  constexpr std::size_t kStoreKeyBytes = 1045000U;
+  constexpr std::size_t kModelInstanceCount = 200U;
 
   std::string authored;
-  authored.reserve(kCatalogRecordCount * kStoreKeyBytes + kDescriptionBytes +
-                   8192U);
+  authored.reserve(kCatalogRecordCount * kStoreKeyBytes +
+                   kModelInstanceCount * 512U + 8192U);
   authored += "api_version: manyforge.deployment.v1\n"
-              "deployment_artifact_id: deployment_a\n"
               "deployment_revision: ";
   authored += kZeroDigest;
   authored += "\ncell_id: cell_a\n"
-              "name: Cell A\n"
-              "description: '";
-  authored.append(kDescriptionBytes, '\\');
-  authored += "'\n"
               "catalogs:\n"
               "  records:\n";
 
@@ -140,8 +134,25 @@ document(std::string graph = empty_graph(), std::string providers = "[]",
 
   authored += "graph:\n"
               "  runtime_units: []\n"
-              "  model_instances: []\n"
-              "  controllable_components: []\n"
+              "  model_instances:\n";
+  for (std::size_t index = 0U; index < kModelInstanceCount; ++index) {
+    std::string id = std::to_string(index);
+    id.insert(0U, 4U - id.size(), '0');
+    authored += "    - model_instance_id: m";
+    authored += id;
+    authored.append(123U, 'x');
+    authored += "\n"
+                "      model_asset_id: a";
+    authored.append(127U, 'y');
+    authored += "\n"
+                "      model_revision: ";
+    authored += kZeroDigest;
+    authored += "\n"
+                "      root_pose_in_cell:\n"
+                "        position_m: [0, 0, 0]\n"
+                "        orientation_xyzw: [0, 0, 0, 1]\n";
+  }
+  authored += "  controllable_components: []\n"
               "  control_domains: []\n"
               "  control_bindings: []\n"
               "  component_attachments: []\n"
@@ -237,7 +248,7 @@ struct CatalogFixture final {
   std::string_view family;
 };
 
-constexpr std::array<CatalogFixture, 10> kAllCatalogKinds{{
+constexpr std::array<CatalogFixture, 9> kAllCatalogKinds{{
     {"model_asset", "model", "manyforge.model_asset.v1"},
     {"runtime_profile", "runtime", "manyforge.runtime_profile.v1"},
     {"component_type", "component", "manyforge.component_type.v1"},
@@ -248,7 +259,6 @@ constexpr std::array<CatalogFixture, 10> kAllCatalogKinds{{
     {"command_schema", "command", "manyforge.command_schema.v1"},
     {"capability_definition", "capability",
      "manyforge.capability_definition.v1"},
-    {"contact_policy", "contact", "manyforge.contact_policy.v1"},
     {"stop_evidence_policy", "stop", "manyforge.stop_evidence_policy.v2"},
 }};
 
@@ -279,10 +289,7 @@ void expect_verify_error(const CanonicalValue &authored,
 TEST(DeploymentArtifactCodec,
      CanonicalEmptyProducerAndVerifierPreserveOneExactIdentityRoot) {
   const auto produced = produce(document());
-  EXPECT_EQ(produced.deployment_artifact_id().value(), "deployment_a");
   EXPECT_EQ(produced.cell_id().value(), "cell_a");
-  EXPECT_EQ(produced.name(), "Cell A");
-  EXPECT_FALSE(produced.description().has_value());
   EXPECT_TRUE(produced.catalog_records().empty());
   EXPECT_FALSE(produced.assistant_was_present());
   EXPECT_EQ(produced.graph().graph().cell_id.value(), "cell_a");
@@ -318,7 +325,6 @@ TEST(DeploymentArtifactCodec,
 TEST(DeploymentArtifactCodec,
      AuthoringEntrypointComputesAndThenVerifiesOneCanonicalDraft) {
   const auto compiled = compile_deployment_draft(document());
-  EXPECT_EQ(compiled.deployment_artifact_id, "deployment_a");
   EXPECT_TRUE(is_sha256_digest(compiled.deployment_revision));
   EXPECT_TRUE(is_sha256_digest(compiled.graph_revision));
 
@@ -335,14 +341,13 @@ TEST(DeploymentArtifactCodec,
      IdentityUsesTheDomainSeparatedExactDeploymentPreimage) {
   const auto produced =
       produce(document(empty_graph(), "[]", "{\"records\":[]}",
-                       ",\"description\":\"Description\","
-                       "\"assistant\":{}"));
+                       ",\"assistant\":{}"));
   EXPECT_EQ(
       produced.deployment_revision().value(),
       independent_deployment_identity(produced.normalized_authored_root()));
   EXPECT_EQ(produced.deployment_revision().value(),
             "sha256:"
-            "910539f01d02d63e5a0da96c289b2e5cad39b255ea62a57d8e9f67eb81cb80c9");
+            "4f3026507d38a4a90fa356fa932b027afb1ba68457e41c67ebd29884358e1868");
 }
 
 TEST(DeploymentArtifactCodec,
@@ -350,15 +355,13 @@ TEST(DeploymentArtifactCodec,
   const auto detached = [] {
     std::string authored =
         document(empty_graph(), "[]", "{\"records\":[]}",
-                 ",\"description\":\"Detached\",\"external_resources\":[],"
-                 "\"assistant\":{}");
+                 ",\"external_resources\":[],\"assistant\":{}");
     const auto parsed = parse_strict_json_model_yaml(authored);
     return compute_deployment_artifact_revision(
         parsed, std::span<const QualifiedRuntimeProfile>{});
   }();
   const auto copied = detached;
 
-  EXPECT_EQ(detached.description(), std::optional<std::string>("Detached"));
   EXPECT_TRUE(detached.assistant_was_present());
   EXPECT_TRUE(detached.applicability_inputs().external_resources_was_present());
   EXPECT_EQ(&detached.normalized_authored_root(),
@@ -369,9 +372,8 @@ TEST(DeploymentArtifactCodec,
 }
 
 TEST(DeploymentArtifactCodec, PreservesEveryQualifiedOptionalPresenceState) {
-  const std::array<std::string, 9> optional_members{{
+  const std::array<std::string, 7> optional_members{{
       "",
-      ",\"description\":\"Description\"",
       ",\"site_overlay_ref\":null",
       ",\"site_overlay_ref\":{\"site_overlay_id\":\"plant\","
       "\"site_overlay_revision\":\"" +
@@ -381,8 +383,6 @@ TEST(DeploymentArtifactCodec, PreservesEveryQualifiedOptionalPresenceState) {
       ",\"assistant\":{}",
       ",\"site_overlay_ref\":null,\"external_resources\":[],"
       "\"assistant\":{}",
-      ",\"description\":\"Description\",\"site_overlay_ref\":null,"
-      "\"external_resources\":[],\"assistant\":{}",
       ",\"site_overlay_ref\":{\"site_overlay_id\":\"plant\","
       "\"site_overlay_revision\":\"" +
           std::string(kZeroDigest) + "\",\"non_secret_digest\":\"" +
@@ -414,8 +414,8 @@ TEST(DeploymentArtifactCodec, PreservesEveryQualifiedOptionalPresenceState) {
     EXPECT_EQ(verified.applicability_inputs().external_resources_was_present(),
               optional.find("\"external_resources\"") != std::string::npos);
 
-    for (const std::string_view member : {"description", "site_overlay_ref",
-                                          "external_resources", "assistant"}) {
+    for (const std::string_view member :
+         {"site_overlay_ref", "external_resources", "assistant"}) {
       const CanonicalValue *expected =
           authored.root().find_object_member(member);
       const CanonicalValue *actual =
@@ -442,10 +442,10 @@ TEST(DeploymentArtifactCodec, PreservesEveryQualifiedOptionalPresenceState) {
 
 TEST(DeploymentArtifactCodec,
      ClosesTopLevelGraphAndOptionalBlockShapesBeforeIdentity) {
-  const CanonicalValue missing_name =
-      remove_member(parse_strict_json_model_yaml(document()).root(), "name");
-  expect_compute_error(canonical_json(missing_name),
-                       "missing required field 'name'");
+  const CanonicalValue missing_cell =
+      remove_member(parse_strict_json_model_yaml(document()).root(), "cell_id");
+  expect_compute_error(canonical_json(missing_cell),
+                       "missing required field 'cell_id'");
   expect_compute_error(
       document(empty_graph(), "[]", "{\"records\":[]}", ",\"unknown\":{}"),
       "unknown field 'unknown'");
@@ -461,8 +461,8 @@ TEST(DeploymentArtifactCodec,
                "\"extra\":[]}"),
       "unknown field 'extra'");
   expect_compute_error(document(empty_graph(), "[]", "{\"records\":[]}",
-                                ",\"description\":null"),
-                       "$.description: expected string");
+                                ",\"description\":\"Description\""),
+                       "unknown field 'description'");
   expect_compute_error(
       document(empty_graph(), "[]", "{\"records\":[]}", ",\"assistant\":[]"),
       "$.assistant: expected object");
@@ -474,21 +474,21 @@ TEST(DeploymentArtifactCodec,
       "missing required field 'retained_policy_records'");
   const auto compatible =
       produce(document(empty_graph(), "[]", "{\"records\":[]}",
-                       ",\"compatibility\":{\"lane\":\"manyforge-only\","
+                       ",\"compatibility\":{"
                        "\"provides\":[],\"tags\":[\"pick-and-place\"]}"));
   EXPECT_NE(
       compatible.normalized_authored_root().find_object_member("compatibility"),
       nullptr);
   expect_compute_error(document(empty_graph(), "[]", "{\"records\":[]}",
                                 ",\"compatibility\":{}"),
-                       "missing required field 'lane'");
+                       "missing required field 'provides'");
   expect_compute_error(document(empty_graph(), "[]", "{\"records\":[]}",
-                                ",\"compatibility\":{\"lane\":\"cloud\","
+                                ",\"compatibility\":{\"lane\":\"manyforge-only\","
                                 "\"provides\":[],\"tags\":[]}"),
-                       "unsupported runtime lane");
+                       "unknown field 'lane'");
   expect_compute_error(
       document(empty_graph(), "[]", "{\"records\":[]}",
-               ",\"compatibility\":{\"lane\":\"manyforge-only\","
+               ",\"compatibility\":{"
                "\"provides\":[],\"tags\":[\"z\",\"a\"]}"),
       "canonical-sorted");
 }
@@ -537,14 +537,14 @@ TEST(DeploymentArtifactCodec,
 
 TEST(DeploymentArtifactCodec,
      VerifierRejectsStaleDeploymentRevisionAndCrossRootSplices) {
-  const auto first = produce(document(control_domain_graph("domain_a")));
+  const auto first = produce(document(control_domain_graph("domain_a"), "[]",
+                                      "{\"records\":[]}", ",\"assistant\":{}"));
   const auto second = produce(document(control_domain_graph("domain_b"), "[]",
-                                       "{\"records\":[]}", "", "deployment_b",
-                                       "cell_b", "Cell B"));
+                                       "{\"records\":[]}", "", "cell_b"));
 
-  CanonicalValue renamed = replace_member(first.normalized_authored_root(),
-                                          "name", CanonicalValue("Changed"));
-  expect_verify_error(renamed, "deployment_revision does not match");
+  CanonicalValue edited =
+      remove_member(first.normalized_authored_root(), "assistant");
+  expect_verify_error(edited, "deployment_revision does not match");
 
   const CanonicalValue *second_graph =
       second.normalized_authored_root().find_object_member("graph");
@@ -555,9 +555,9 @@ TEST(DeploymentArtifactCodec,
 }
 
 TEST(DeploymentArtifactCodec,
-     RetainsAllTenQualifiedCatalogReferenceVariants) {
-  constexpr std::array<std::size_t, 10> kQualifiedIndices{
-      0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U};
+     RetainsAllNineQualifiedCatalogReferenceVariants) {
+  constexpr std::array<std::size_t, 9> kQualifiedIndices{
+      0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U};
   std::string records;
   for (const std::size_t index : kQualifiedIndices) {
     const auto &row = kAllCatalogKinds[index];

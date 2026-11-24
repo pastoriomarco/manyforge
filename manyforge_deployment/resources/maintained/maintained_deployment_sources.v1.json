@@ -2,6 +2,7 @@
   "api_version": "manyforge.maintained_deployment_sources.v1",
   "component_models": [
     "components/assistant/manyforge.assistant/component.yaml",
+    "components/io_device/manyforge.io_bank_64x64/component.yaml",
     "components/io_device/ufactory.lite6_controller_io/component.yaml",
     "components/io_device/ufactory.lite6_tool_io/component.yaml",
     "components/io_device/ufactory.uf850_controller_io/component.yaml",
@@ -140,6 +141,40 @@
       "component_descriptor": "manyforge_example_models/models/lite_gripper/component.yaml"
     },
     {
+      "catalog_source": "manyforge_deployment/resources/maintained/model_assets/passive_tool.model_asset.json",
+      "model_family_id": "passive_tool",
+      "model_asset_id": "passive_tool",
+      "semantics": {
+        "collision_body_role_bindings": [
+          {
+            "collision_body_role_id": "tip",
+            "source_link_names": [
+              "passive_tool_tip"
+            ]
+          }
+        ],
+        "frame_role_bindings": [
+          {"frame_role_id": "mount", "source_link_name": "passive_tool_mount"},
+          {"frame_role_id": "tcp", "source_link_name": "passive_tool_tcp"}
+        ],
+        "instance_cardinality": "multiple_per_cell",
+        "model_group_role_bindings": [],
+        "resource_role_bindings": [],
+        "root_frame_role_id": "mount"
+      },
+      "source": {
+        "accepted_package_uri_prefix": "package://passive_tool/",
+        "historical_srdf_path": "manyforge_example_models/models/passive_tool/passive_tool.srdf",
+        "historical_urdf_path": "manyforge_example_models/models/passive_tool/passive_tool.urdf",
+        "resource_root": "manyforge_example_models/models/passive_tool",
+        "srdf_path": "manyforge_example_models/models/passive_tool/passive_tool.srdf",
+        "srdf_projection_kind": "identity",
+        "urdf_path": "manyforge_example_models/models/passive_tool/passive_tool.urdf",
+        "urdf_projection_kind": "identity"
+      },
+      "component_descriptor": "manyforge_example_models/models/passive_tool/component.yaml"
+    },
+    {
       "catalog_source": "manyforge_deployment/resources/maintained/model_assets/robotiq_2f_140.model_asset.json",
       "model_family_id": "robotiq_2f_140",
       "model_asset_id": "robotiq_2f_140",
@@ -268,6 +303,33 @@
         "base"
       ],
       "component_descriptor": "manyforge_example_models/models/robotiq_2f_85/component.yaml"
+    },
+    {
+      "catalog_source": "manyforge_deployment/resources/maintained/model_assets/tool.model_asset.json",
+      "model_family_id": "tool",
+      "model_asset_id": "tool",
+      "semantics": {
+        "collision_body_role_bindings": [],
+        "frame_role_bindings": [
+          {"frame_role_id": "mount", "source_link_name": "tool_mount"},
+          {"frame_role_id": "tcp", "source_link_name": "tool_tcp"}
+        ],
+        "instance_cardinality": "multiple_per_cell",
+        "model_group_role_bindings": [],
+        "resource_role_bindings": [],
+        "root_frame_role_id": "mount"
+      },
+      "source": {
+        "accepted_package_uri_prefix": "package://tool/",
+        "historical_srdf_path": "manyforge_example_models/models/tool/tool.srdf",
+        "historical_urdf_path": "manyforge_example_models/models/tool/tool.urdf",
+        "resource_root": "manyforge_example_models/models/tool",
+        "srdf_path": "manyforge_example_models/models/tool/tool.srdf",
+        "srdf_projection_kind": "identity",
+        "urdf_path": "manyforge_example_models/models/tool/tool.urdf",
+        "urdf_projection_kind": "identity"
+      },
+      "component_descriptor": "manyforge_example_models/models/tool/component.yaml"
     },
     {
       "catalog_source": "manyforge_deployment/resources/maintained/model_assets/uf850.model_asset.json",

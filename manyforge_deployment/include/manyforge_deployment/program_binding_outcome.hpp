@@ -61,7 +61,6 @@ struct ProgramBindingUnresolvedTargetDTO final {
 /// candidate cell. The authored Program is preserved unchanged; this value
 /// states why Execute is refused against the captured candidate.
 struct ProgramNonExecutableOutcomeDTO final {
-  core::ProgramId program_id;
   core::ProgramRevision program_revision;
   core::RetainedBundleId retained_bundle_id;
   core::GraphRevision graph_revision;

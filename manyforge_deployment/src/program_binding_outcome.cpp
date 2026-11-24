@@ -65,7 +65,6 @@ OutcomeValue(const ProgramNonExecutableOutcomeDTO &value) {
       {"affected_nodes", CanonicalValue(std::move(nodes))},
       {"api_version", CanonicalValue(std::string(kOutcomeApiVersion))},
       {"graph_revision", CanonicalValue(value.graph_revision.value())},
-      {"program_id", CanonicalValue(value.program_id.value())},
       {"program_revision", CanonicalValue(value.program_revision.value())},
       {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
       {"unresolved_targets", CanonicalValue(std::move(rows))}});
@@ -126,7 +125,7 @@ bool ProgramBindingUnresolvedTargetDTO::valid() const noexcept {
 }
 
 bool ProgramNonExecutableOutcomeDTO::valid() const noexcept {
-  return !program_id.empty() && !program_revision.empty() &&
+  return !program_revision.empty() &&
          !retained_bundle_id.empty() && !graph_revision.empty() &&
          !unresolved_targets.empty() &&
          unresolved_targets.size() <= kMaximumProgramBindingUnresolvedRows &&
@@ -156,12 +155,11 @@ ProgramNonExecutableOutcomeDTO
 DecodeProgramNonExecutableOutcome(const std::string_view encoded) {
   try {
     const auto root = content_identity::parse_canonical_json(encoded);
-    if (!root.is_object() || root.as_object().size() != 8U ||
+    if (!root.is_object() || root.as_object().size() != 7U ||
         Text(root, "api_version") != kOutcomeApiVersion) {
       Fail("Program outcome envelope is not exact");
     }
     ProgramNonExecutableOutcomeDTO value{
-        core::ProgramId(Text(root, "program_id")),
         core::ProgramRevision(Text(root, "program_revision")),
         core::RetainedBundleId(Text(root, "retained_bundle_id")),
         core::GraphRevision(Text(root, "graph_revision")),

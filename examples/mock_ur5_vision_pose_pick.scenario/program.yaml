@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [
       {
@@ -40,13 +40,10 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "required",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [
       "vision_pose_inference"
     ],
@@ -55,7 +52,6 @@
       "vision-pick"
     ]
   },
-  "description": "Preview Program for the typed vision-guided pose dataflow. A model response supplies bounded approach and grasp poses in the target base frame; motion nodes consume those fields directly. It remains intentionally fail-closed when a single-image model invents unreachable metric coordinates rather than grounding them in an authoritative pose source.",
   "forest": [
     {
       "children": [
@@ -85,8 +81,8 @@
               "frame_id": "base"
             },
             "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -111,8 +107,8 @@
               "frame_id": "base"
             },
             "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -132,6 +128,7 @@
           "instance_id": "close_gripper",
           "node_id": "gripper.command_position",
           "parameters": {
+            "completion_timeout_s": 15.0,
             "position": {
               "kind": "named_preset",
               "name": "closed"
@@ -139,8 +136,7 @@
             "target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            },
-            "completion_timeout_s": 15.0
+            }
           }
         },
         {
@@ -167,23 +163,23 @@
               ]
             },
             "offset_reference": {
-              "type": "component_frame",
               "frame": {
                 "component_id": "ur5_robot",
                 "frame_id": "base"
-              }
+              },
+              "type": "component_frame"
+            },
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
             },
             "target_mode": "relative",
             "target_reference": {
-              "type": "component_frame",
               "frame": {
                 "component_id": "robotiq_2f_85",
                 "frame_id": "tcp"
-              }
-            },
-            "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
+              },
+              "type": "component_frame"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -202,11 +198,11 @@
             },
             "goal": {
               "frame_ref": {
-                "kind": "target_frame",
                 "frame": {
                   "component_id": "ur5_robot",
                   "frame_id": "base"
-                }
+                },
+                "kind": "target_frame"
               },
               "orientation": {
                 "rpy_deg": [
@@ -222,8 +218,8 @@
               ]
             },
             "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -236,6 +232,7 @@
           "instance_id": "open_gripper",
           "node_id": "gripper.command_position",
           "parameters": {
+            "completion_timeout_s": 15.0,
             "position": {
               "kind": "named_preset",
               "name": "open"
@@ -243,8 +240,7 @@
             "target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            },
-            "completion_timeout_s": 15.0
+            }
           }
         }
       ],
@@ -253,19 +249,17 @@
       "parameters": {}
     }
   ],
-  "name": "vision_guided_pose_pick",
   "positions": {},
-  "program_id": "vision_guided_pose_pick",
   "program_profile": "composable-cell-v1",
   "scene": [
     {
       "pose": {
         "frame_ref": {
-          "kind": "component_frame",
           "frame": {
             "component_id": "ur5_robot",
             "frame_id": "base"
-          }
+          },
+          "kind": "component_frame"
         },
         "orientation": {
           "rpy_deg": [
@@ -296,11 +290,11 @@
     {
       "pose": {
         "frame_ref": {
-          "kind": "component_frame",
           "frame": {
             "component_id": "ur5_robot",
             "frame_id": "base"
-          }
+          },
+          "kind": "component_frame"
         },
         "orientation": {
           "rpy_deg": [
@@ -331,11 +325,11 @@
     {
       "pose": {
         "frame_ref": {
-          "kind": "component_frame",
           "frame": {
             "component_id": "ur5_robot",
             "frame_id": "base"
-          }
+          },
+          "kind": "component_frame"
         },
         "orientation": {
           "xyzw": [

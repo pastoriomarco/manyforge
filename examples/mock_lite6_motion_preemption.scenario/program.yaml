@@ -1,21 +1,17 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "lite6",
       "r5-live-trial"
     ]
   },
-  "description": "Mock Lite6 motion preemption. A slow priority-10 move is taken over after 1 s by a priority-50 move (expect preempted + smooth takeover or spring-back); then a priority-10 newcomer against a running priority-50 move is refused_by_priority. Both losers return success (preempted_result) so the tree continues to the outcome-key checks.",
   "forest": [
     {
       "children": [
@@ -388,10 +384,8 @@
       "parameters": {}
     }
   ],
-  "name": "mock_lite6_motion_preemption",
   "parameters": [],
   "positions": {},
-  "program_id": "mock_lite6_motion_preemption",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

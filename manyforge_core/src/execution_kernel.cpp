@@ -10,11 +10,14 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <optional>
+#include <string_view>
 #include <map>
 #include <set>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/cache/trajectory_cache_compatibility.hpp>
 #include <manyforge_core/cache/trajectory_cache_intent.hpp>
+#include <manyforge_core/collision/collision_rule_resolver.hpp>
 #include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_core/detail/motion_resume_intent.hpp>
 #include <manyforge_core/execution_admission_support.hpp>
@@ -297,177 +300,89 @@ Result<ControlledStateDTO> controlled_state_for_publication(
   return Result<ControlledStateDTO>::Ok(std::move(state));
 }
 
-[[nodiscard]] const CollisionWorldBody* find_collision_body(
-    const CollisionWorldSnapshot& world, const CollisionBodyId& body_id) noexcept;
-
-[[nodiscard]] std::string resolved_contact_grasp_policy_id(
-    const ExecuteRequestDTO& request, const ProjectionRevisionDTO& projection,
-    const ResolvedContactGraspBindingDTO& binding) {
-  std::string material;
-  const auto append = [&](std::string_view value) {
-    material += std::to_string(value.size());
-    material.push_back(':');
-    material.append(value);
-    material.push_back(';');
-  };
-  append(binding.contact_policy_id.value());
-  append(binding.contact_policy_revision.value());
-  append(request.binding.program_binding_id.value());
-  append(request.binding.program_run_id
-             ? std::to_string(request.binding.program_run_id->value())
-             : std::string{});
-  append(std::to_string(request.binding.operation_id.value()));
-  append(std::to_string(request.binding.participant_id.ordinal));
-  append(binding.runtime_object_id.value());
-  append(binding.selected_object_id.value());
-  append(projection.retained_bundle_id.value());
-  append(projection.graph_revision.value());
-  append(projection.scene_revision.content_hash.value());
-  for (const auto& body_id : binding.allowed_robot_body_ids) {
-    append(body_id);
+/// Resolve the cell rules and the request's rules once against the
+/// inventory's collision world and install the contact and release rules into
+/// its policy. Returns the clearance margins of the same table.
+[[nodiscard]] Result<std::shared_ptr<const CollisionClearanceMargins>> install_contact_rules(
+    const ExecuteRequestDTO& request, const std::vector<CollisionRule>& cell_rules,
+    CollisionWorldLeaseInventory& inventory) {
+  using Margins = Result<std::shared_ptr<const CollisionClearanceMargins>>;
+  if (!inventory.bundle.world || !inventory.bundle.policy.has_value()) {
+    if (request.collision_rules.empty()) {
+      return Margins::Ok(nullptr);
+    }
+    return Margins::Err(ErrorDTO{kErrorInvalidCollisionRule,
+                                 "Collision rules need a retained collision world and policy",
+                                 {{"reason", "collision_rules_world_unavailable"}}});
   }
-  const std::string digest = content_identity::sha256_digest(material);
-  return "contact_grasp.bound." + digest.substr(std::string("sha256:").size());
+  auto resolved = resolve_collision_rules(*inventory.bundle.world, *inventory.bundle.policy,
+                                          cell_rules, request.collision_rules);
+  if (!resolved.ok()) {
+    return Margins::Err(resolved.error());
+  }
+  auto& table = resolved.value();
+  if (table.contact_rules != inventory.bundle.policy->contact_rules) {
+    CollisionPolicySnapshot effective = *inventory.bundle.policy;
+    effective.contact_rules = std::move(table.contact_rules);
+    if (tracked_contact_rule_count(effective) > RuntimeCollisionQuerySession::kMaxSupportContacts) {
+      return Margins::Err(ErrorDTO{
+          kErrorInvalidCollisionRule,
+          "Release and depth-limited whole-move contact rules hold more pairs than the runtime "
+          "monitor tracks",
+          {{"reason", "collision_rules_tracked_pair_capacity_exceeded"},
+           {"tracked_pair_count", std::to_string(tracked_contact_rule_count(effective))},
+           {"capacity", std::to_string(RuntimeCollisionQuerySession::kMaxSupportContacts)}}});
+    }
+    effective.require_full_diagnostics = true;
+    try {
+      effective.revision.content_hash =
+          logical_scene_identity::ComputeCollisionPolicyContentDigest(effective).value();
+    } catch (const std::exception& error) {
+      return Margins::Err(ErrorDTO{
+          kErrorInvariantViolation,
+          "Resolved collision rules could not be identified",
+          {{"reason", "resolved_collision_rules_identity_failed"}, {"exception", error.what()}}});
+    }
+    inventory.bundle.policy = std::move(effective);
+  }
+  return Margins::Ok(std::move(table.clearance_margins));
 }
 
-[[nodiscard]] Result<void> install_resolved_contact_grasp_policy(
-    ExecuteRequestDTO& request, CollisionWorldLeaseInventory& inventory) {
-  if (!request.resolved_contact_grasp.has_value()) {
-    return Result<void>::Ok();
-  }
-  const auto& binding = *request.resolved_contact_grasp;
-  if (request.contact_policy_id != binding.contact_policy_id.value() ||
-      binding.contact_policy_revision.empty() || binding.runtime_object_id.empty() ||
-      binding.selected_object_id.empty() || binding.allowed_robot_body_ids.empty() ||
-      !std::is_sorted(binding.allowed_robot_body_ids.begin(),
-                      binding.allowed_robot_body_ids.end()) ||
-      std::adjacent_find(binding.allowed_robot_body_ids.begin(),
-                         binding.allowed_robot_body_ids.end()) !=
-          binding.allowed_robot_body_ids.end() ||
-      !valid_program_contact_envelope(binding.envelope) || !inventory.logical_scene ||
-      !inventory.bundle.world || !inventory.bundle.policy.has_value()) {
-    return Result<void>::Err(ErrorDTO{kErrorInvalidContactPolicy,
-                                      "Resolved contact-grasp binding is incomplete",
-                                      {{"reason", "resolved_contact_grasp_binding_invalid"}}});
-  }
-  const auto runtime_binding = std::lower_bound(
-      request.runtime_object_bindings.begin(), request.runtime_object_bindings.end(),
-      binding.runtime_object_id, [](const auto& candidate, const RuntimeObjectId& id) {
-        return candidate.runtime_object_id < id;
-      });
-  if (runtime_binding == request.runtime_object_bindings.end() ||
-      runtime_binding->runtime_object_id != binding.runtime_object_id ||
-      runtime_binding->scene_resource_id != binding.selected_object_id) {
-    return Result<void>::Err(ErrorDTO{kErrorInvalidContactPolicy,
-                                      "Resolved contact-grasp object differs from operation intent",
-                                      {{"reason", "contact_grasp_runtime_object_mismatch"}}});
-  }
-  const auto object =
-      std::lower_bound(inventory.logical_scene->objects.begin(),
-                       inventory.logical_scene->objects.end(), binding.selected_object_id,
-                       [](const SceneObjectSnapshotDTO& candidate, const SceneResourceId& id) {
-                         return candidate.scene_resource_id < id;
-                       });
-  if (object == inventory.logical_scene->objects.end() ||
-      object->scene_resource_id != binding.selected_object_id ||
-      !std::holds_alternative<CellFixedSceneObjectPlacementDTO>(object->placement) ||
-      object->collision_shapes.empty()) {
-    return Result<void>::Err(
-        ErrorDTO{kErrorInvalidContactPolicy,
-                 "Contact-grasp selected object is missing, carried, or shapeless",
-                 {{"reason", "contact_grasp_selected_object_not_detached"},
-                  {"selected_object_id", binding.selected_object_id.value()}}});
-  }
-  for (std::size_t shape_index = 0U; shape_index < object->collision_shapes.size(); ++shape_index) {
-    const auto* body =
-        find_collision_body(*inventory.bundle.world,
-                            make_scene_collision_body_id(binding.selected_object_id, shape_index));
-    if (body == nullptr || body->owner_kind != CollisionOwnerKind::kSceneResource ||
-        body->parent_body_id.has_value()) {
-      return Result<void>::Err(
-          ErrorDTO{kErrorInvalidContactPolicy,
-                   "Contact-grasp selected object differs from the retained world",
-                   {{"reason", "contact_grasp_selected_object_projection_mismatch"},
-                    {"selected_object_id", binding.selected_object_id.value()}}});
+/// The id of the request's contact or release rule when it has exactly one.
+[[nodiscard]] std::string single_contact_rule_id(const ExecuteRequestDTO& request) {
+  const CollisionRule* found = nullptr;
+  for (const auto& rule : request.collision_rules) {
+    if (std::holds_alternative<CollisionClearanceRule>(rule.value)) {
+      continue;
     }
-  }
-  std::vector<std::string> allowed_body_ids;
-  allowed_body_ids.reserve(binding.allowed_robot_body_ids.size());
-  for (const auto& body_id : binding.allowed_robot_body_ids) {
-    const auto* body = find_collision_body(*inventory.bundle.world, body_id);
-    if (body == nullptr || body->owner_kind != CollisionOwnerKind::kComponentModelBody) {
-      return Result<void>::Err(ErrorDTO{kErrorInvalidContactPolicy,
-                                        "Contact-grasp robot body differs from the retained world",
-                                        {{"reason", "contact_grasp_robot_body_projection_mismatch"},
-                                         {"collision_body_id", body_id}}});
+    if (found != nullptr) {
+      return {};
     }
-    allowed_body_ids.push_back(body_id);
+    found = &rule;
   }
+  return found != nullptr ? found->rule_id : std::string{};
+}
 
-  const std::string effective_id = resolved_contact_grasp_policy_id(
-      request, inventory.projection_binding.projection_revision, binding);
-  CollisionPolicySnapshot effective = *inventory.bundle.policy;
-  effective.contact_grasps.clear();
-  const auto* grasp = std::get_if<ContactGraspEnvelopeDTO>(&binding.envelope);
-  if (grasp != nullptr) {
-    effective.contact_grasps.push_back(ContactGraspPolicyEntry{
-        effective_id, binding.selected_object_id.value(), std::move(allowed_body_ids),
-        grasp->max_penetration_m, grasp->terminal_window_start_fraction});
-  } else {
-    const auto& release = std::get<ContactReleaseEnvelopeDTO>(binding.envelope);
-    for (const auto& body_id : allowed_body_ids) {
-      for (std::size_t index = 0; index < object->collision_shapes.size(); ++index) {
-        SupportContactPolicyEntry entry;
-        entry.pair = {body_id, make_scene_collision_body_id(binding.selected_object_id, index)};
-        if (entry.pair.body_b < entry.pair.body_a)
-          std::swap(entry.pair.body_a, entry.pair.body_b);
-        entry.release_evidence_mode =
-            release.release_evidence_mode == ContactReleaseEvidenceModeDTO::kSignedPenetration
-                ? ContactReleaseEvidenceMode::kSignedPenetration
-                : ContactReleaseEvidenceMode::kBinaryContact;
-        entry.enforce_max_start_penetration = release.enforce_max_start_penetration;
-        entry.max_start_penetration_m = release.max_start_penetration_m;
-        entry.release_tolerance_m = release.release_tolerance_m;
-        entry.min_release_progress_m = release.min_release_progress_m;
-        entry.require_separation_by_end = release.require_separation_by_end;
-        entry.require_strictly_decreasing_penetration =
-            release.require_strictly_decreasing_penetration;
-        entry.allow_recontact = release.allow_recontact;
-        const auto existing = std::find_if(
-            effective.support_contacts.begin(), effective.support_contacts.end(),
-            [&](const auto& candidate) { return candidate.pair == entry.pair; });
-        if (existing != effective.support_contacts.end()) {
-          if (*existing == entry) continue;
-          return Result<void>::Err(ErrorDTO{kErrorInvalidContactPolicy,
-              "Resolved release conflicts with an existing contact pair",
-              {{"reason", "resolved_contact_release_pair_conflict"}}});
-        }
-        if (effective.support_contacts.size() >= RuntimeCollisionQuerySession::kMaxSupportContacts)
-          return Result<void>::Err(ErrorDTO{kErrorInvalidContactPolicy,
-              "Resolved release exceeds the runtime contact bound",
-              {{"reason", "resolved_contact_release_capacity_exceeded"}}});
-        effective.support_contacts.push_back(std::move(entry));
+/// Whether two requests have the same contact and release rules.
+[[nodiscard]] bool same_contact_rules(const ExecuteRequestDTO& left,
+                                      const ExecuteRequestDTO& right) {
+  const auto contact_rules = [](const ExecuteRequestDTO& request) {
+    std::vector<CollisionRule> rules;
+    for (const auto& rule : request.collision_rules) {
+      if (!std::holds_alternative<CollisionClearanceRule>(rule.value)) {
+        rules.push_back(rule);
       }
     }
-    std::sort(effective.support_contacts.begin(), effective.support_contacts.end(),
-              [](const auto& left, const auto& right) { return left.pair < right.pair; });
-  }
-  effective.require_full_diagnostics = true;
-  try {
-    effective.revision.content_hash =
-        logical_scene_identity::ComputeCollisionPolicyContentDigest(effective).value();
-  } catch (const std::exception& error) {
-    return Result<void>::Err(ErrorDTO{
-        kErrorInvariantViolation,
-        "Resolved contact-grasp policy could not be identified",
-        {{"reason", "resolved_contact_grasp_identity_failed"}, {"exception", error.what()}}});
-  }
-  inventory.bundle.policy = std::move(effective);
-  // This copied request field selects only a grasp overlay. Release uses the
-  // exact support-contact pairs above; authored identity remains in the resolved
-  // binding and original operation intent / prepared contact-policy reference.
-  request.contact_policy_id = grasp != nullptr ? effective_id : std::string{};
-  return Result<void>::Ok();
+    return rules;
+  };
+  return contact_rules(left) == contact_rules(right);
+}
+
+[[nodiscard]] bool has_contact_rules(const ExecuteRequestDTO& request) noexcept {
+  return std::any_of(request.collision_rules.begin(), request.collision_rules.end(),
+                     [](const CollisionRule& rule) {
+                       return !std::holds_alternative<CollisionClearanceRule>(rule.value);
+                     });
 }
 
 [[nodiscard]] const CollisionWorldBody* find_collision_body(
@@ -497,9 +412,8 @@ Result<ControlledStateDTO> controlled_state_for_publication(
     const CollisionPolicySnapshot& policy) {
   std::vector<CollisionPairId> discovered;
   for (const auto& pair : start_pairs) {
-    if (!carried_detached_scene_pair(world, pair) ||
-        std::any_of(policy.support_contacts.begin(), policy.support_contacts.end(),
-                    [&](const SupportContactPolicyEntry& entry) { return entry.pair == pair; })) {
+    // A pair under a contact or release rule keeps its rule.
+    if (!carried_detached_scene_pair(world, pair) || policy.contact_rule_for(pair) != nullptr) {
       continue;
     }
     discovered.push_back(pair);
@@ -533,7 +447,7 @@ Result<ControlledStateDTO> controlled_state_for_publication(
   return dynamic_carried_start_contact_pairs(world, contacts, policy);
 }
 
-// Discovered start contacts become support-contact pairs, which keep margin 0.
+// Discovered start contacts become release-rule pairs, which keep margin 0.
 [[nodiscard]] std::shared_ptr<const CollisionClearanceMargins> without_clearance_pairs(
     const std::shared_ptr<const CollisionClearanceMargins>& margins,
     const std::vector<CollisionPairId>& removed) {
@@ -553,26 +467,24 @@ Result<ControlledStateDTO> controlled_state_for_publication(
     return Result<CollisionPolicySnapshot>::Ok(base);
   }
   CollisionPolicySnapshot overlay = base;
-  if (overlay.support_contacts.size() + discovered.size() >
-      RuntimeCollisionQuerySession::kMaxSupportContacts) {
+  const auto tracked_count = tracked_contact_rule_count(overlay);
+  if (tracked_count + discovered.size() > RuntimeCollisionQuerySession::kMaxSupportContacts) {
     return Result<CollisionPolicySnapshot>::Err(
         ErrorDTO{kErrorValidationCollision,
                  "Dynamic carried-object start contacts exceed the runtime bound",
                  {{"reason", "dynamic_start_contact_capacity_exceeded"},
-                  {"configured_count", std::to_string(overlay.support_contacts.size())},
+                  {"configured_count", std::to_string(tracked_count)},
                   {"discovered_count", std::to_string(discovered.size())}}});
   }
   for (const auto& pair : discovered) {
-    // The defaults intentionally preserve the historical strict release
-    // semantics: touching at start may release monotonically, penetration is
-    // rejected unless an explicit authored policy grants a bounded envelope,
-    // and recontact/final contact remain forbidden.
-    SupportContactPolicyEntry entry;
-    entry.pair = pair;
-    overlay.support_contacts.push_back(std::move(entry));
+    // The default release is strict: touching at the start may release
+    // monotonically, penetration is refused, and recontact and final contact
+    // are forbidden. A release rule on the move grants anything wider.
+    overlay.contact_rules.push_back(CollisionPairContactRule{
+        pair, std::string(kAutomaticStartReleaseRuleId), CollisionReleaseRule{}});
   }
-  std::sort(overlay.support_contacts.begin(), overlay.support_contacts.end(),
-            [](const SupportContactPolicyEntry& left, const SupportContactPolicyEntry& right) {
+  std::sort(overlay.contact_rules.begin(), overlay.contact_rules.end(),
+            [](const CollisionPairContactRule& left, const CollisionPairContactRule& right) {
               return left.pair < right.pair;
             });
   overlay.require_full_diagnostics = true;
@@ -582,8 +494,8 @@ Result<ControlledStateDTO> controlled_state_for_publication(
   } catch (const std::exception& error) {
     return Result<CollisionPolicySnapshot>::Err(ErrorDTO{
         kErrorInvariantViolation,
-        "Dynamic carried-object contact policy could not be identified",
-        {{"reason", "dynamic_start_contact_policy_identity_failed"}, {"exception", error.what()}}});
+        "The automatic start release of the carried object could not be identified",
+        {{"reason", "dynamic_start_contact_rule_identity_failed"}, {"exception", error.what()}}});
   }
   return Result<CollisionPolicySnapshot>::Ok(std::move(overlay));
 }
@@ -753,7 +665,6 @@ std::optional<MotionPathPreview> build_motion_path_preview(
     const CollisionValidationDecisionBundle& bundle,
     const CollisionWorldSnapshot& world, const CollisionPolicySnapshot& policy,
     const std::shared_ptr<const CollisionClearanceMargins>& margins,
-    const std::string& contact_policy_id,
     ICollisionQueryEngine& engine, const CollisionCancellationToken& cancel,
     std::int64_t timeout_ns, bool diagnostic_preview) {
   constexpr std::size_t kSampleLimit = 32U;
@@ -886,12 +797,13 @@ std::optional<MotionPathPreview> build_motion_path_preview(
               record->result.normalized_pairs_classified.end(), [&pair](const CollisionPairResult& item) {
                 return item.pair == pair;
               });
-          const bool stateful = policy_index->support_contact_index.contains(pair) &&
+          const auto ruled = policy_index->contact_rule_index.find(pair);
+          const bool has_rule = ruled != policy_index->contact_rule_index.end();
+          const bool stateful = has_rule && contact_rule_is_tracked(ruled->second) &&
               !policy_index->touch_link_index.contains(pair) &&
-              !policy_index->static_static_index.contains(pair);
-          const auto grasp = policy_index->contact_grasp_index.find(contact_policy_id);
-          const bool grasp_pair = grasp != policy_index->contact_grasp_index.end() &&
-              contact_grasp_pair_matches(pair, grasp->second);
+              !policy.static_pair(pair);
+          const bool grasp_pair = has_rule &&
+              contact_rule_kind(ruled->second) == ContactRuleKind::kWindowedContact;
           if (!(diagnostic_preview && count == 1U && (stateful || grasp_pair)) &&
               (!after_failure || (diagnostic && !stateful &&
                                   !bundle.scene_changed_during_validation &&
@@ -904,7 +816,7 @@ std::optional<MotionPathPreview> build_motion_path_preview(
               disposition = MotionPreviewContactDisposition::kRefused;
             else if (classified->classification == CollisionPairClassification::kAllowedStaticStatic ||
                      classified->classification == CollisionPairClassification::kAllowedTouchLink ||
-                     classified->classification == CollisionPairClassification::kAllowedContactGrasp ||
+                     classified->classification == CollisionPairClassification::kAllowedContactRule ||
                      classified->classification == CollisionPairClassification::kSupportContactStart ||
                      classified->classification == CollisionPairClassification::kSupportContactContinued)
               disposition = MotionPreviewContactDisposition::kAllowed;
@@ -1207,11 +1119,7 @@ ExecutionKernel::ExecutionKernel(std::shared_ptr<IPlannerBackend> planner, Execu
   if (config_.validation_collision_workers < 1 || config_.validation_collision_workers > 64) {
     throw std::invalid_argument("validation_collision_workers must be in [1, 64]");
   }
-  if (!(config_.collision_clearance_m >= 0.0 &&
-        config_.collision_clearance_m <= kMaxCollisionClearanceM)) {
-    throw std::invalid_argument("collision_clearance_m must be in [0, 0.05]");
-  }
-  collision_clearance_m_.store(config_.collision_clearance_m, std::memory_order_release);
+  set_collision_rules(config_.collision_rules);
   collision_check_fresh_plans_.store(config_.collision_check_fresh_plans,
                                      std::memory_order_release);
   if (config_.validation_collision_min_waypoints_for_parallel < 1) {
@@ -1522,29 +1430,26 @@ void ExecutionKernel::dispatch_prepared_event(KernelEvent& event_to_emit) {
 
 void ExecutionKernel::set_active_request_correlation(const ExecuteRequestDTO& request) {
   active_correlation_.set_from_request(request);
-  { runtime_collision_monitor_.set_active_contact_policy_id(request.contact_policy_id); }
+  active_correlation_.set_collision_rule_id(single_contact_rule_id(request));
 }
 
 void ExecutionKernel::clear_active_request_correlation() {
   active_correlation_.clear_all();
-  { runtime_collision_monitor_.clear_active_contact_policy_id(); }
+  active_correlation_.clear_collision_rule_id();
 }
 
 void ExecutionKernel::stamp_active_request_correlation(
     std::map<std::string, std::string>& details) const {
   active_correlation_.stamp_details(details);
-  {
-    const auto contact_policy_id = runtime_collision_monitor_.active_contact_policy_id();
-    if (!contact_policy_id.empty()) {
-      details.emplace("contact_policy_id", contact_policy_id);
-    }
+  if (auto rule_id = active_correlation_.collision_rule_id(); !rule_id.empty()) {
+    details.emplace("collision_rule_id", std::move(rule_id));
   }
 }
 
 void ExecutionKernel::stamp_active_request_correlation(ExecutionSnapshot& snapshot) const {
   active_correlation_.stamp_snapshot(snapshot);
-  if (snapshot.contact_policy_id.empty()) {
-    snapshot.contact_policy_id = runtime_collision_monitor_.active_contact_policy_id();
+  if (snapshot.collision_rule_id.empty()) {
+    snapshot.collision_rule_id = active_correlation_.collision_rule_id();
   }
 }
 
@@ -1725,6 +1630,98 @@ bool ExecutionKernel::wait_for_completion(int64_t timeout_ns) {
   return worker_signals_.wait_for_completion(timeout_ns);
 }
 
+std::vector<SpringCompressionDTO> ExecutionKernel::spring_compressions() const {
+  RuntimeSpringCompressionSnapshot snapshot;
+  {
+    std::lock_guard<std::mutex> lock(spring_compression_mutex_);
+    snapshot = spring_compression_;
+  }
+  return spring_compression_rows(snapshot);
+}
+
+std::vector<SpringCompressionDTO> spring_compression_rows(
+    const RuntimeSpringCompressionSnapshot& snapshot) {
+  std::vector<SpringCompressionDTO> out;
+  if (snapshot.count == 0 || !snapshot.binding_owner || !snapshot.binding_owner->world) {
+    return out;
+  }
+  const auto& bodies = snapshot.binding_owner->world->bodies;
+  const auto append = [&](const std::string& rule_id, const CollisionBodyId& body_id,
+                          const double depth_m, const std::array<double, 3>& push_direction) {
+    const auto body = std::find_if(bodies.begin(), bodies.end(), [&](const auto& candidate) {
+      return candidate.body_id == body_id;
+    });
+    if (body == bodies.end()) {
+      return;
+    }
+    SpringCompressionDTO row;
+    row.rule_id = rule_id;
+    row.depth_m = depth_m;
+    row.push_direction = push_direction;
+    const std::string_view id = body_id;
+    // Body ids: component/<component>/model/..., scene/<resource>/shape/<n>.
+    const auto segment = [&](std::string_view prefix) -> std::optional<std::string> {
+      if (id.substr(0, prefix.size()) != prefix) {
+        return std::nullopt;
+      }
+      const auto rest = id.substr(prefix.size());
+      return std::string(rest.substr(0, rest.find('/')));
+    };
+    if (auto component = segment("component/");
+        component && body->owner_kind == CollisionOwnerKind::kComponentModelBody) {
+      row.a_kind = SpringCompressionDTO::SideKind::kComponentLink;
+      row.a_component_id = std::move(*component);
+      row.a_link = body->frame_id;
+    } else if (auto resource = segment("scene/")) {
+      row.a_kind = SpringCompressionDTO::SideKind::kSceneObject;
+      row.a_scene_resource_id = std::move(*resource);
+    } else {
+      return;
+    }
+    out.push_back(std::move(row));
+  };
+  const auto side_a = [](const CollisionPairContactRule& rule) -> const CollisionBodyId& {
+    return rule.side_a_is_body_b ? rule.pair.body_b : rule.pair.body_a;
+  };
+  // A grouped spring (OD-371) is one spring: its deepest compressed pair
+  // gives the depth and direction of every side-a body of the rule, touching
+  // or not, so the slider and its carried objects shift together.
+  std::vector<const RuntimeSpringCompressionEntry*> groups;
+  out.reserve(snapshot.count);
+  for (std::size_t index = 0; index < snapshot.count; ++index) {
+    const auto& entry = snapshot.entries[index];
+    if (!entry.rule->contact()->spring_group) {
+      append(entry.rule->rule_id, side_a(*entry.rule), entry.depth_m, entry.push_direction_a);
+      continue;
+    }
+    const auto group = std::find_if(groups.begin(), groups.end(), [&](const auto* deepest) {
+      return deepest->rule->rule_id == entry.rule->rule_id;
+    });
+    if (group == groups.end()) {
+      groups.push_back(&entry);
+    } else if (entry.depth_m > (*group)->depth_m) {
+      *group = &entry;
+    }
+  }
+  for (const auto* deepest : groups) {
+    std::vector<CollisionBodyId> side_a_bodies;
+    for (const auto& [pair, rule] : snapshot.binding_owner->policy_index->contact_rule_index) {
+      static_cast<void>(pair);
+      if (rule.rule_id == deepest->rule->rule_id && rule.contact() != nullptr &&
+          rule.contact()->spring_group) {
+        side_a_bodies.push_back(side_a(rule));
+      }
+    }
+    std::sort(side_a_bodies.begin(), side_a_bodies.end());
+    side_a_bodies.erase(std::unique(side_a_bodies.begin(), side_a_bodies.end()),
+                        side_a_bodies.end());
+    for (const auto& body_id : side_a_bodies) {
+      append(deepest->rule->rule_id, body_id, deepest->depth_m, deepest->push_direction_a);
+    }
+  }
+  return out;
+}
+
 RuntimeCollisionProtectionSnapshot ExecutionKernel::runtime_collision_protection_snapshot() const {
   std::lock_guard<std::mutex> lock(runtime_collision_protection_mutex_);
   return runtime_collision_protection_;
@@ -1866,9 +1863,8 @@ ExecutionKernel::CollisionMonitoringStart ExecutionKernel::start_collision_monit
   } else {
     query_session = std::make_shared<RuntimeCollisionQuerySession>(
         std::move(*projection), *resources.snapshot_publisher, resources.runtime_monitor_engine,
-        runtime_collision_monitor_.active_contact_policy_id(),
         static_cast<std::int64_t>(config_.runtime_collision_immediate_query_budget_ns));
-    // A move with an admitted operation-local contact policy keeps it for the
+    // A move with contact or release rules keeps its admitted policy for the
     // whole move, whatever the published policy or world revision; the world
     // still follows the latest publication. Other moves follow the published
     // bundle as before.
@@ -1879,6 +1875,10 @@ ExecutionKernel::CollisionMonitoringStart ExecutionKernel::start_collision_monit
     }
   }
   runtime_collision_query_session_.store(std::move(query_session), std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(spring_compression_mutex_);
+    spring_compression_ = {};
+  }
   std::uint64_t generation = 0;
   {
     std::lock_guard<std::mutex> lock(runtime_collision_protection_mutex_);
@@ -1928,6 +1928,8 @@ void ExecutionKernel::stop_collision_monitoring(RuntimeCollisionMonitorRelease /
         drain_callbacks ? RuntimeCollisionMonitor::StopWait::kLaneAndOwnCallbacks
                         : RuntimeCollisionMonitor::StopWait::kOwnCallbacksBounded);
     runtime_collision_query_session_.store(nullptr, std::memory_order_release);
+    // OD-371: a spring left pressed stays drawn pressed until this robot's
+    // next move starts (which clears it when it arms its monitor).
     if (release_current) {
       clear_runtime_collision_state_projection_unlocked();
       const auto generation = runtime_collision_stop_coverage_.active_generation();
@@ -1976,8 +1978,22 @@ void ExecutionKernel::stop_collision_monitoring(RuntimeCollisionMonitorRelease /
 
 void ExecutionKernel::arm_runtime_collision_lookahead(
     std::uint64_t execution_id, std::uint64_t execution_generation,
-    std::shared_ptr<const TrajectoryDTO> collision_trajectory, const std::string& contact_policy_id,
+    std::shared_ptr<const TrajectoryDTO> collision_trajectory,
     const CollisionWorldLeaseInventory& admission_inventory) {
+  // The other components' sources, as bound for this execution's checks. In
+  // a cell that has such sources the look-ahead never runs without them: a
+  // trajectory that is not on the bound coordinates is refused below.
+  std::vector<BoundCellModelStateSource> live_sources;
+  bool live_sources_unbound = false;
+  if (collision_trajectory) {
+    const auto cell_sources = cell_model_state_sources();
+    std::lock_guard<std::mutex> projection_lock(runtime_collision_state_projection_mutex_);
+    if (runtime_collision_state_projection_ &&
+        runtime_collision_state_projection_->query_joint_names == collision_trajectory->joint_names)
+      live_sources = runtime_collision_state_projection_->live_sources;
+    else
+      live_sources_unbound = cell_sources != nullptr && !cell_sources->empty();
+  }
   bool invalid_authority = false;
   {
     std::lock_guard<std::mutex> lock(runtime_collision_protection_mutex_);
@@ -1996,10 +2012,10 @@ void ExecutionKernel::arm_runtime_collision_lookahead(
     }
     invalid_authority = execution_generation == 0 || !collision_trajectory ||
                         collision_trajectory->waypoints.empty() ||
-                        !admission_inventory.projection_binding.valid();
+                        !admission_inventory.projection_binding.valid() || live_sources_unbound;
     if (!invalid_authority) {
       lookahead->arm(execution_id, execution_generation, std::move(collision_trajectory),
-                     contact_policy_id);
+                     std::move(live_sources));
       return;
     }
   }
@@ -2012,7 +2028,9 @@ void ExecutionKernel::arm_runtime_collision_lookahead(
                        ? "execution_progress_generation_unavailable"
                        : (!collision_trajectory || collision_trajectory->waypoints.empty()
                               ? "runtime_lookahead_trajectory_unavailable"
-                              : "runtime_lookahead_projection_revision_unavailable");
+                              : live_sources_unbound
+                                    ? "runtime_collision_projection_unavailable"
+                                    : "runtime_lookahead_projection_revision_unavailable");
   apply_runtime_collision_lookahead_result(std::move(failure));
 }
 
@@ -2147,7 +2165,7 @@ void ExecutionKernel::emit_runtime_collision_lookahead_evidence(
     details.try_emplace(key, value);
   }
 
-  emit_contact_policy_violation_event(result.execution_id, details);
+  emit_contact_rule_violation_event(result.execution_id, details);
 
   KernelEvent event;
   event.type =
@@ -2178,17 +2196,17 @@ void ExecutionKernel::emit_runtime_collision_lookahead_evidence(
   }
 }
 
-void ExecutionKernel::emit_contact_policy_violation_event(
+void ExecutionKernel::emit_contact_rule_violation_event(
     std::uint64_t execution_id, const std::map<std::string, std::string>& source_details,
     std::optional<std::string_view> response_override) {
-  const auto violation = source_details.find("contact_policy_violation");
+  const auto violation = source_details.find("contact_rule_violation");
   if (violation == source_details.end()) {
     return;
   }
 
-  static constexpr std::array<const char*, 18> kPayloadKeys{"contact_policy_id",
+  static constexpr std::array<const char*, 18> kPayloadKeys{"collision_rule_id",
                                                             "policy_mode",
-                                                            "zone_id",
+                                                            "end_from_fraction",
                                                             "release_evidence_mode",
                                                             "contact_body_a",
                                                             "contact_body_b",
@@ -2199,7 +2217,7 @@ void ExecutionKernel::emit_contact_policy_violation_event(
                                                             "evaluated_distance_pair_count",
                                                             "penetration_depth_m",
                                                             "max_penetration_m",
-                                                            "max_contact_penetration_m",
+                                                            "max_compression_step_m",
                                                             "response",
                                                             "classification",
                                                             "surface",
@@ -2214,7 +2232,7 @@ void ExecutionKernel::emit_contact_policy_violation_event(
     details["response"] = std::string(*response_override);
   }
 
-  emit_event({KernelEventType::kContactPolicyViolation,
+  emit_event({KernelEventType::kContactRuleViolation,
               execution_id,
               clock_.now(),
               {},
@@ -2602,9 +2620,11 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       phase_result.collision_trajectory = prepared_session->replacement_collision_trajectory;
     }
     const TrajectoryDTO missing_curve;
+    const auto cell_sources = cell_model_state_sources();
     auto projection = build_runtime_collision_state_projection(
         trajectory, phase_result.collision_trajectory ? *phase_result.collision_trajectory
-                                                     : missing_curve);
+                                                     : missing_curve,
+        cell_sources.get());
     if (!projection.ok()) {
       emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {},
                   projection.error(), {}});
@@ -2635,7 +2655,7 @@ ExecutionKernel::execute_worker_validate_replan_phase(
                 {{"attempt_index", std::to_string(authoritative_validation_attempt)},
                  {"max_attempts", std::to_string(max_authoritative_validation_attempts)}}});
 
-    // A fresh plan without an active contact policy is collision-checked
+    // A fresh plan without a contact or release rule is collision-checked
     // again only when the Deployment keeps `collision_check_fresh_plans` on.
     val_result = validate_trajectory(
         trajectory, request, scene_snapshot_lease_inventory, nullptr, {},
@@ -2679,7 +2699,7 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     retry_details["next_attempt_index"] = std::to_string(authoritative_validation_attempt + 1);
     retry_details["max_attempts"] = std::to_string(max_authoritative_validation_attempts);
     retry_details["move_id"] = request.move_id;
-    emit_contact_policy_violation_event(exec_id, validation_error.details);
+    emit_contact_rule_violation_event(exec_id, validation_error.details);
     emit_event({KernelEventType::kValidationFailed,
                 exec_id,
                 clock_.now(),
@@ -2834,8 +2854,9 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     publish_execution_snapshot(std::move(retry_validating_snapshot));
   }
   if (val_result.ok()) {
+    const auto cell_sources = cell_model_state_sources();
     auto projection_result = build_runtime_collision_state_projection(
-        trajectory, val_result.value().collision_trajectory);
+        trajectory, val_result.value().collision_trajectory, cell_sources.get());
     if (!projection_result.ok()) {
       val_result = Result<CollisionValidationSuccess>::Err(projection_result.error());
     } else {
@@ -2848,7 +2869,7 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       std::lock_guard lock(prepared_session->mutex);
       prepared_session->conclusive_collision_failure = conclusive_collision_failure;
     }
-    emit_contact_policy_violation_event(exec_id, val_result.error().details);
+    emit_contact_rule_violation_event(exec_id, val_result.error().details);
     emit_event({KernelEventType::kValidationFailed,
                 exec_id,
                 clock_.now(),
@@ -3000,7 +3021,7 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
           ? static_cast<int64_t>(request.timeouts.execution_timeout_s * 1e9)
           : 0;
   auto monitoring = start_collision_monitoring("execute_dispatch", &scene_snapshot_lease_inventory,
-                                               request.resolved_contact_grasp.has_value());
+                                               has_contact_rules(request));
   motion_state.runtime_collision_protection_generation = monitoring.generation;
   if (monitoring.prepare_error) {
     // Never dispatch without a prepared runtime monitor. This is a bug, not an
@@ -3087,8 +3108,7 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
     }
   }
   arm_runtime_collision_lookahead(exec_id, phase_result.execution_handle.execution_generation,
-                                  std::move(collision_trajectory), request.contact_policy_id,
-                                  scene_snapshot_lease_inventory);
+                                  std::move(collision_trajectory), scene_snapshot_lease_inventory);
   return phase_result;
 }
 
@@ -3247,7 +3267,6 @@ ExecutionKernel::assemble_prepared_motion_participant(
           request.binding.operation_id,
           authority.operation_revision,
           request.binding.participant_id,
-          request.binding.program_id,
           request.binding.program_revision,
           request.binding.program_binding_id,
           request.binding.program_run_id,
@@ -3279,21 +3298,10 @@ ExecutionKernel::assemble_prepared_motion_participant(
   std::sort(prepared_scopes.begin(), prepared_scopes.end(),
             [](const auto& lhs, const auto& rhs) { return lhs.scope_id < rhs.scope_id; });
 
-  std::optional<PreparedContactPolicyRefDTO> contact_policy;
-  if (request.resolved_contact_grasp) {
-    // Admission rewrote request.contact_policy_id to the operation-local bound
-    // policy; the resolved grasp must match the policy the owner admitted.
-    if (authority.execution_request.contact_policy_id !=
-        request.resolved_contact_grasp->contact_policy_id.value()) {
-      return reject("prepared_motion_contact_policy_mismatch",
-                    "Resolved contact policy differs from the admitted request");
-    }
-    contact_policy =
-        PreparedContactPolicyRefDTO{request.resolved_contact_grasp->contact_policy_id,
-                                    request.resolved_contact_grasp->contact_policy_revision};
-  } else if (!request.contact_policy_id.empty()) {
-    return reject("prepared_motion_contact_policy_revision_missing",
-                  "Prepared motion cannot self-attest an unversioned contact policy");
+  // The rules the motion was validated under are the rules the owner admitted.
+  if (authority.execution_request.collision_rules != request.collision_rules) {
+    return reject("prepared_motion_collision_rules_mismatch",
+                  "Collision rules differ from the admitted request");
   }
 
   PreparedMotionExecutionDTO payload{
@@ -3304,7 +3312,7 @@ ExecutionKernel::assemble_prepared_motion_participant(
       PreparedMotionPlanningEvidenceDTO{planning_result, plan_request.planning_attempt_index,
                                         plan_request.planner_capability_binding},
       validation_evidence,
-      std::move(contact_policy),
+      request.collision_rules,
       authority.requested_tcp_linear_speed_mps,
       authority.deployment_maximum_tcp_linear_speed_mps,
       std::move(prepared_scopes),
@@ -3333,7 +3341,6 @@ ExecutionKernel::assemble_prepared_motion_participant(
       request.binding.operation_id,
       authority.operation_revision,
       request.binding.participant_id,
-      binding.program_id,
       binding.program_revision,
       binding.program_binding_id,
       request.binding.program_run_id,
@@ -4174,7 +4181,10 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     if (!failed_planning) return phase_failure(original_error, "candidate_compute");
     const auto& result = failed_planning->result;
     const auto reason = original_error.details.find("reason");
+    // A joint pose goal's IK failure previews its collision-disabled IK path;
+    // a linear one is previewed as a Cartesian path below.
     const auto* pose = std::get_if<PoseGoalDTO>(&failed_planning->request.motion);
+    if (pose != nullptr && pose->linear) pose = nullptr;
     if (path_preview != nullptr && replacement == nullptr && remaining > 0 && pose != nullptr &&
         original_error.code == kErrorIkFailed && reason != original_error.details.end() &&
         reason->second == "native_ik_no_solution") {
@@ -4203,7 +4213,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
       state.resources = solved.resources;
       state.joint_names = solved.joint_names;
       state.waypoints.push_back({0.0, solved.positions_rad, {}, {}});
-      auto expanded = collision_projector_.expand_for_collision(state, start_state);
+      auto expanded = expand_for_collision_in_cell(state, start_state);
       const auto& world_policy = projection_inventory.bundle;
       if (!expanded.ok() || !world_policy.world || !world_policy.policy || clock_.now() >= deadline)
         return phase_failure(original_error, "candidate_compute");
@@ -4226,7 +4236,6 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
       cfg.policy_snapshot_ref = std::make_shared<CollisionPolicySnapshot>(*world_policy.policy);
       cfg.policy_index = build_collision_policy_index(*cfg.policy_snapshot_ref);
       cfg.surface = CollisionSurface::kPreExecutionValidation;
-      cfg.contact_policy_id = request.contact_policy_id;
       cfg.clearance_margins = world_policy.clearance_margins;
       cfg.per_state_timeout_ns = std::min<std::int64_t>(
           static_cast<std::int64_t>(config_.validation_collision_query_timeout_ns), deadline - clock_.now());
@@ -4235,8 +4244,8 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
       if (!cancel->is_cancel_requested() && clock_.now() < deadline && !observed.cancelled) {
         *path_preview = build_motion_path_preview(
             state, expanded.value(), request.binding, observed, *world_policy.world,
-            *world_policy.policy, world_policy.clearance_margins, request.contact_policy_id,
-            **engine, *cancel, deadline - clock_.now(), true);
+            *world_policy.policy, world_policy.clearance_margins, **engine, *cancel,
+            deadline - clock_.now(), true);
         if (*path_preview) (*path_preview)->diagnostic_kind = "collision_disabled_ik_pose";
       }
       if (stop_token.stop_requested()) {
@@ -4292,7 +4301,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
       }
       return phase_failure(original_error, "candidate_compute");
     }
-    const bool cartesian = std::holds_alternative<CartesianPathDTO>(failed_planning->request.motion);
+    const bool cartesian = cartesian_planned(failed_planning->request.motion);
     const bool cartesian_failure = cartesian &&
         (original_error.code == kErrorCartesianIncomplete || original_error.code == kErrorIkFailed ||
          original_error.code == kErrorValidationLimitsViolation ||
@@ -4475,9 +4484,10 @@ Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
                   "motion_preview_cancelled");
   }
 
-  auto grasp = install_resolved_contact_grasp_policy(request, projection_inventory);
-  if (!grasp.ok()) {
-    return Result<MotionPreviewResultDTO>::Err(grasp.error());
+  auto rule_margins =
+      install_contact_rules(request, *cell_collision_rules(), projection_inventory);
+  if (!rule_margins.ok()) {
+    return Result<MotionPreviewResultDTO>::Err(rule_margins.error());
   }
   auto dynamic_contacts =
       discover_dynamic_carried_start_contacts(projection_inventory, start_state, 0U);
@@ -4485,7 +4495,8 @@ Result<MotionPreviewResultDTO> ExecutionKernel::preview_motion(
     return Result<MotionPreviewResultDTO>::Err(dynamic_contacts.error());
   }
   request.dynamically_discovered_start_contact_count = dynamic_contacts.value();
-  install_collision_clearance(request, projection_inventory, start_state, 0U);
+  install_collision_clearance(std::move(rule_margins.value()), projection_inventory, start_state,
+                              0U);
 
   std::stop_callback cancellation(stop_token, [this]() { planner_.request_cancel(); });
   const auto planning_start_ns = clock_.now();
@@ -4572,7 +4583,6 @@ Result<std::uint64_t> ExecutionKernel::PrepareMotion(
   const auto& resolved = request.execution_request.binding;
   if (request.operation_revision.value() == 0U || !resolved.operation_id.nonzero() ||
       !resolved.participant_id.nonzero() || !resolved.controller_goal_id.nonzero() ||
-      resolved.program_id != binding.program_id ||
       resolved.program_revision != binding.program_revision ||
       resolved.program_binding_id != binding.program_binding_id ||
       resolved.retained_bundle_id != binding.retained_bundle_id ||
@@ -4742,8 +4752,9 @@ Result<void> ExecutionKernel::compute_spring_motion_replacement(
           request.binding.graph_revision)
     return refuse("spring_return_projection_mismatch");
   if (auto admission = collision_validation_admission_error()) return Result<void>::Err(*admission);
-  auto grasp = install_resolved_contact_grasp_policy(request, inventory);
-  if (!grasp.ok()) return grasp;
+  // Contact and release rules only: this path keeps clearance 0.
+  auto rules = install_contact_rules(request, *cell_collision_rules(), inventory);
+  if (!rules.ok()) return Result<void>::Err(rules.error());
   if (clock_.now() >= session->preparation_deadline_ns || stop_token.stop_requested())
     return refuse("spring_return_preparation_budget_expired");
   std::stop_callback cancellation(stop_token, [this, session] {
@@ -5319,8 +5330,9 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
       return Result<void>::Err(failed("motion_replacement_projection_mismatch"));
     if (auto admission = collision_validation_admission_error(); admission)
       return Result<void>::Err(std::move(*admission));
-    auto grasp = install_resolved_contact_grasp_policy(request, inventory);
-    if (!grasp.ok()) return grasp;
+    // Contact and release rules only: this path keeps clearance 0.
+    auto rules = install_contact_rules(request, *cell_collision_rules(), inventory);
+    if (!rules.ok()) return Result<void>::Err(rules.error());
     std::stop_callback cancellation(stop_token, [this, session]() {
       session->replacement_validation_cancellation->request_cancel("motion_replacement_cancelled");
       planner_.request_cancel();
@@ -5374,15 +5386,16 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
     backend_prepared_at = clock_.now();
     trace_moving_core_phase(&moving, "backend_prepared", start_ns, *backend_prepared_at, trajectory.waypoints.size());
     if (!product.ok()) return Result<void>::Err(product.error());
-    auto projection =
-        build_runtime_collision_state_projection(trajectory, validation.collision_trajectory);
+    const auto cell_sources = cell_model_state_sources();
+    auto projection = build_runtime_collision_state_projection(
+        trajectory, validation.collision_trajectory, cell_sources.get());
     if (!projection.ok()) return Result<void>::Err(projection.error());
     auto correlation = std::make_unique<ExecutionCorrelationTracker>();
     correlation->set_from_request(request);
     auto collision_curve =
         std::make_shared<const TrajectoryDTO>(std::move(validation.collision_trajectory));
     auto arm = RuntimeCollisionLookaheadSession::prepare_arm(
-        session->execution_id, 0U, collision_curve, request.contact_policy_id);
+        session->execution_id, 0U, collision_curve, projection.value().live_sources);
     std::lock_guard lock(session->mutex);
     if (session->cancel_requested || stop_token.stop_requested())
       return Result<void>::Err(failed("motion_replacement_cancelled"));
@@ -5744,24 +5757,11 @@ Result<bool> ExecutionKernel::ProvePreparedMotionReplacement(
     return reject("motion_replacement_runtime_protection_stale");
   {
     std::lock_guard projection_lock(runtime_collision_state_projection_mutex_);
-    const auto& replacement = *pending->replacement_projection;
     if (!runtime_collision_state_projection_ ||
-        runtime_collision_state_projection_->source_joint_names != replacement.source_joint_names ||
-        runtime_collision_state_projection_->query_joint_names != replacement.query_joint_names ||
-        runtime_collision_state_projection_->source_to_query_indices !=
-            replacement.source_to_query_indices ||
-        runtime_collision_state_projection_->template_positions_rad.size() !=
-            replacement.template_positions_rad.size() ||
-        current->request.contact_policy_id != next.request.contact_policy_id)
+        !runtime_collision_projection_continues(*runtime_collision_state_projection_,
+                                                *pending->replacement_projection) ||
+        !same_contact_rules(current->request, next.request))
       return reject("motion_replacement_monitor_context_changed");
-    for (std::size_t index = 0U; index < replacement.template_positions_rad.size(); ++index) {
-      if (std::find(replacement.source_to_query_indices.begin(),
-                    replacement.source_to_query_indices.end(),
-                    index) == replacement.source_to_query_indices.end() &&
-          runtime_collision_state_projection_->template_positions_rad[index] !=
-              replacement.template_positions_rad[index])
-        return reject("motion_replacement_monitor_context_changed");
-    }
   }
   // The source's hazard authority is no longer read here: the Kernel's
   // "decide" step closes it (OD-175 D2, `CloseMotionReplacementHazard`).
@@ -6521,10 +6521,14 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                  {{"reason", "planning_scene_synchronization_raced"}}});
   }
   ExecuteRequestDTO resolved_request(request);
-  auto contact_grasp_binding = cold_reuse ? Result<void>::Ok()
-      : install_resolved_contact_grasp_policy(resolved_request, retained_scene.mutable_inventory());
-  if (!contact_grasp_binding.ok()) {
-    return reject_admission(contact_grasp_binding.error());
+  std::shared_ptr<const CollisionClearanceMargins> rule_margins;
+  if (!cold_reuse) {
+    auto installed = install_contact_rules(resolved_request, *cell_collision_rules(),
+                                           retained_scene.mutable_inventory());
+    if (!installed.ok()) {
+      return reject_admission(installed.error());
+    }
+    rule_margins = std::move(installed.value());
   }
   set_active_request_correlation(resolved_request);
 
@@ -6627,7 +6631,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
         retained_scene.mutable_inventory(), *synced_state, exec_id);
     if (!dynamic_start_contacts.ok()) return reject_admission(dynamic_start_contacts.error());
     resolved_request.dynamically_discovered_start_contact_count = dynamic_start_contacts.value();
-    install_collision_clearance(resolved_request, retained_scene.mutable_inventory(),
+    install_collision_clearance(std::move(rule_margins), retained_scene.mutable_inventory(),
                                 *synced_state, exec_id);
   }
 
@@ -7299,7 +7303,7 @@ AcknowledgeCompletedResultDTO ExecutionKernel::acknowledge_completed(
     // request-correlation stamp.
     active_correlation_.clear_program_run_and_action_span();
   }
-  { runtime_collision_monitor_.clear_active_contact_policy_id(); }
+  active_correlation_.clear_collision_rule_id();
 
   return AcknowledgeCompletedResultDTO{true, std::nullopt};
 }
@@ -7365,7 +7369,7 @@ Result<void> ExecutionKernel::apply_acknowledge_and_continue_locked(const std::s
     // part of this run's incident story and must carry request correlation.
     active_correlation_.clear_program_run_and_action_span();
   }
-  { runtime_collision_monitor_.clear_active_contact_policy_id(); }
+  active_correlation_.clear_collision_rule_id();
   return Result<void>::Ok();
 }
 
@@ -7373,7 +7377,7 @@ namespace {
 
 bool is_retryable_failed_validation_error(const ErrorDTO& error) {
   if (error.code == kErrorSceneChangedDuringValidation || error.code == kErrorValidationCollision ||
-      error.code == kErrorContactPolicyViolation) {
+      error.code == kErrorContactRuleViolation) {
     return true;
   }
   const auto reason_it = error.details.find("reason");
@@ -7455,7 +7459,7 @@ Result<void> ExecutionKernel::apply_retry_after_scene_repair_locked(const std::s
               {{"reason", "failed_validation_retry_acknowledged"}}});
 
   { active_correlation_.clear_program_run_and_action_span(); }
-  { runtime_collision_monitor_.clear_active_contact_policy_id(); }
+  active_correlation_.clear_collision_rule_id();
   return Result<void>::Ok();
 }
 
@@ -8146,7 +8150,7 @@ void ExecutionKernel::emit_runtime_monitor_fault(const CollisionCheckResultDTO& 
   // Contact versus monitor unavailability: the addressed Kernel escalates
   // an active Stop only on contact.
   details["in_collision"] = check.in_collision ? "true" : "false";
-  emit_contact_policy_violation_event(sm_.status().execution_id, details, "preempt_trajectory");
+  emit_contact_rule_violation_event(sm_.status().execution_id, details, "preempt_trajectory");
 
   KernelEvent collision_event;
   collision_event.type = KernelEventType::kCollisionDetected;
@@ -8358,7 +8362,7 @@ Result<void> ExecutionKernel::collision_check_tick() {
   }
 
   const auto outcome = query_session->tick(published_bundle, observed_view.positions_rad(),
-                                           observed_view.source_timestamp_ns());
+                                           observed_view.source_timestamp_ns(), observed_now_ns);
   if (outcome.status == RuntimeCollisionTickStatus::kClear) {
     // OD-217: the deadman's stamp is the time of the data this check
     // verified (the sample's receipt on this clock), never the time the
@@ -8373,6 +8377,12 @@ Result<void> ExecutionKernel::collision_check_tick() {
       // the higher-priority monitor.
       lookahead->request(clock_.now(), std::move(published_bundle),
                          query_session->contact_release_state_snapshot());
+    }
+    // OD-358: the live view's spring compressions. A reader holding the
+    // leaf lock makes this check skip one publication; it never waits.
+    if (std::unique_lock<std::mutex> lock(spring_compression_mutex_, std::try_to_lock);
+        lock.owns_lock()) {
+      spring_compression_ = query_session->spring_compression_snapshot();
     }
     // OD-217: the second stamp, this check's finish time. It only chooses
     // the deadman's reason; staleness is judged on the stamp above alone.
@@ -8392,6 +8402,9 @@ Result<void> ExecutionKernel::collision_check_tick() {
       {"runtime_query_engine_version", query_session->engine_capability().engine_version},
       {"runtime_query_duration_ns", std::to_string(outcome.query_duration_ns)}};
   append_observed_details(monitor_details);
+  if (outcome.other_component != nullptr) {
+    monitor_details["peer_component_id"] = outcome.other_component->value();
+  }
   if (outcome.engine_failure_reason != RuntimeCollisionQueryFailureReason::kNone) {
     monitor_details["runtime_query_failure_reason"] =
         runtime_collision_query_failure_reason_name(outcome.engine_failure_reason);
@@ -8414,13 +8427,17 @@ Result<void> ExecutionKernel::collision_check_tick() {
             ? "blocking_collision"
             : "diagnostic_incomplete";
   }
-  if (outcome.contact_grasp_violation != RuntimeContactGraspViolation::kNone) {
-    monitor_details["collision_result_raw_contact_grasp_policy_id"] =
-        query_session->active_contact_policy_id();
-    monitor_details["collision_result_raw_contact_grasp_violation"] =
-        outcome.contact_grasp_violation == RuntimeContactGraspViolation::kMissingClearance
-            ? "missing_grasp_contact_clearance"
-            : "grasp_contact_penetration_exceeded";
+  const auto* rule = outcome.contact_rule;
+  const auto* rule_contact = rule != nullptr ? rule->contact() : nullptr;
+  const auto* rule_release = rule != nullptr ? rule->release() : nullptr;
+  if (outcome.contact_rule_violation != RuntimeContactRuleViolation::kNone) {
+    if (rule != nullptr) {
+      monitor_details["collision_result_raw_contact_rule_id"] = rule->rule_id;
+    }
+    monitor_details["collision_result_raw_contact_rule_violation"] =
+        outcome.contact_rule_violation == RuntimeContactRuleViolation::kMissingClearance
+            ? reason_codes::kMissingGraspContactClearance
+            : reason_codes::kContactPenetrationExceeded;
   }
   if (outcome.signed_clearance_m) {
     monitor_details["runtime_signed_clearance_m"] = format_double(*outcome.signed_clearance_m);
@@ -8433,14 +8450,15 @@ Result<void> ExecutionKernel::collision_check_tick() {
     monitor_details["contact_release_previous_penetration_m"] =
         format_double(*outcome.previous_penetration_m);
   }
+  // A whole-move contact rule with a depth limit.
+  const bool whole_move_limit = rule_contact != nullptr && rule_contact->whole_move() &&
+                                rule_contact->max_penetration_m.has_value();
   if (outcome.current_penetration_m) {
     const auto current = format_double(*outcome.current_penetration_m);
-    if (outcome.max_contact_penetration_m) {
-      monitor_details["contact_policy_mode"] = "bounded_penetration";
+    if (whole_move_limit) {
       monitor_details["current_penetration_m"] = current;
-      monitor_details["max_contact_penetration_m"] =
-          format_double(*outcome.max_contact_penetration_m);
-      if (outcome.reason == RuntimeCollisionTickReason::kBoundedContactPenetrationExceeded &&
+      monitor_details["max_penetration_m"] = format_double(*rule_contact->max_penetration_m);
+      if (outcome.reason == RuntimeCollisionTickReason::kContactPenetrationExceeded &&
           std::isfinite(*outcome.current_penetration_m)) {
         monitor_details["within_penetration_bound"] = "false";
       }
@@ -8462,32 +8480,20 @@ Result<void> ExecutionKernel::collision_check_tick() {
         return "recontact_penetration_exceeds_policy";
       case RuntimeCollisionTickReason::kContactReleasePenetrationIncreased:
         return "penetration_increased";
-      case RuntimeCollisionTickReason::kBoundedContactPenetrationExceeded:
-        return "contact_penetration_exceeds_policy";
+      case RuntimeCollisionTickReason::kContactPenetrationExceeded:
+        return reason_codes::kContactPenetrationExceeded;
+      case RuntimeCollisionTickReason::kContactCompressionStepExceeded:
+        return reason_codes::kContactCompressionStepExceeded;
       default:
         return nullptr;
     }
   }();
-  if (contact_violation_reason != nullptr && outcome.pair != nullptr &&
-      outcome.contact_policy_mode.has_value()) {
-    const auto& pair = *outcome.pair;
-    monitor_details["contact_policy_violation"] = contact_violation_reason;
-    monitor_details["contact_policy_id"] =
-        policy_snapshot->policy_id.empty()
-            ? "support_contacts@" + std::to_string(policy_snapshot->revision.revision_id)
-            : policy_snapshot->policy_id;
-    monitor_details["policy_mode"] =
-        *outcome.contact_policy_mode == CollisionContactPolicyMode::kBoundedPenetration
-            ? "bounded_penetration"
-            : "contact_release";
-    monitor_details["zone_id"] = "support_pair:" + pair.body_a + "<->" + pair.body_b;
+  const auto stamp_rule_violation = [&](const CollisionPairId& pair) {
+    monitor_details["collision_rule_id"] = rule->rule_id;
+    monitor_details["policy_mode"] = rule_release != nullptr ? "release" : "contact";
     monitor_details["contact_body_a"] = pair.body_a;
     monitor_details["contact_body_b"] = pair.body_b;
     monitor_details["contact_present"] = outcome.contact_present ? "true" : "false";
-    monitor_details["initial_contact_pair_count"] =
-        std::to_string(outcome.initial_contact_pair_count);
-    monitor_details["current_contact_pair_count"] =
-        std::to_string(outcome.current_contact_pair_count);
     monitor_details["distance_request_mode"] =
         collision_distance_request_mode_name(outcome.distance_request_mode);
     monitor_details["evaluated_distance_pair_count"] =
@@ -8497,74 +8503,56 @@ Result<void> ExecutionKernel::collision_check_tick() {
         outcome.pair_classification == CollisionPairClassification::kDiagnosticIncomplete
             ? "diagnostic_incomplete"
             : "blocking_collision";
-    if (*outcome.contact_policy_mode == CollisionContactPolicyMode::kContactRelease &&
-        outcome.release_evidence_mode.has_value()) {
+  };
+  // A tracked pair: a release rule or a whole-move contact rule with a limit.
+  if (contact_violation_reason != nullptr && outcome.pair != nullptr && rule != nullptr &&
+      (rule_release != nullptr || whole_move_limit)) {
+    monitor_details["contact_rule_violation"] = contact_violation_reason;
+    stamp_rule_violation(*outcome.pair);
+    monitor_details["initial_contact_pair_count"] =
+        std::to_string(outcome.initial_contact_pair_count);
+    monitor_details["current_contact_pair_count"] =
+        std::to_string(outcome.current_contact_pair_count);
+    if (rule_release != nullptr) {
       monitor_details["release_evidence_mode"] =
-          *outcome.release_evidence_mode == ContactReleaseEvidenceMode::kBinaryContact
+          rule_release->release_evidence_mode == ContactReleaseEvidenceMode::kBinaryContact
               ? "binary_contact"
               : "signed_penetration";
     }
     if (outcome.contact_present && outcome.current_penetration_m &&
-        (*outcome.contact_policy_mode == CollisionContactPolicyMode::kBoundedPenetration ||
-         outcome.release_evidence_mode == ContactReleaseEvidenceMode::kSignedPenetration)) {
+        (whole_move_limit ||
+         rule_release->release_evidence_mode == ContactReleaseEvidenceMode::kSignedPenetration)) {
       monitor_details["penetration_depth_m"] = format_double(*outcome.current_penetration_m);
     }
-    if (outcome.max_contact_penetration_m) {
-      monitor_details["max_contact_penetration_m"] =
-          format_double(*outcome.max_contact_penetration_m);
-      if (outcome.reason == RuntimeCollisionTickReason::kBoundedContactPenetrationExceeded &&
-          outcome.current_penetration_m.has_value() &&
-          std::isfinite(*outcome.current_penetration_m)) {
-        monitor_details["within_penetration_bound"] = "false";
-      }
+    if (whole_move_limit) {
+      monitor_details["max_penetration_m"] = format_double(*rule_contact->max_penetration_m);
     }
-    if (outcome.reason == RuntimeCollisionTickReason::kContactReleaseInitialPenetrationExceeded) {
-      const auto policy_entry = published_bundle->policy_index->support_contact_index.find(pair);
-      if (policy_entry != published_bundle->policy_index->support_contact_index.end() &&
-          policy_entry->second.enforce_max_start_penetration) {
-        monitor_details["max_penetration_m"] =
-            format_double(policy_entry->second.max_start_penetration_m);
-      }
+    if (outcome.reason == RuntimeCollisionTickReason::kContactReleaseInitialPenetrationExceeded &&
+        rule_release != nullptr && rule_release->enforce_max_start_penetration) {
+      monitor_details["max_penetration_m"] = format_double(rule_release->max_start_penetration_m);
     }
   }
-  if (outcome.contact_grasp_violation != RuntimeContactGraspViolation::kNone &&
-      outcome.pair != nullptr) {
-    const auto active_policy =
-        std::find_if(policy_snapshot->contact_grasps.begin(), policy_snapshot->contact_grasps.end(),
-                     [&](const ContactGraspPolicyEntry& candidate) {
-                       return candidate.policy_id == query_session->active_contact_policy_id();
-                     });
-    if (active_policy != policy_snapshot->contact_grasps.end()) {
-      auto pair = *outcome.pair;
-      if (pair.body_b < pair.body_a) {
-        std::swap(pair.body_a, pair.body_b);
-      }
-      const bool missing_clearance =
-          outcome.contact_grasp_violation == RuntimeContactGraspViolation::kMissingClearance;
-      monitor_details["contact_policy_violation"] =
-          missing_clearance ? reason_codes::kMissingGraspContactClearance
-                            : reason_codes::kGraspContactPenetrationExceeded;
-      monitor_details["contact_policy_id"] = active_policy->policy_id;
-      monitor_details["policy_mode"] = "contact_grasp";
-      monitor_details["zone_id"] = "contact_grasp_pair:" + pair.body_a + "<->" + pair.body_b;
-      monitor_details["contact_body_a"] = pair.body_a;
-      monitor_details["contact_body_b"] = pair.body_b;
-      monitor_details["contact_present"] = outcome.contact_present ? "true" : "false";
-      monitor_details["distance_request_mode"] =
-          collision_distance_request_mode_name(outcome.distance_request_mode);
-      monitor_details["evaluated_distance_pair_count"] =
-          std::to_string(outcome.evaluated_distance_pair_count);
-      monitor_details["max_penetration_m"] = format_double(active_policy->max_penetration_m);
-      monitor_details["response"] = "preempt_trajectory";
-      monitor_details["classification"] =
-          outcome.pair_classification == CollisionPairClassification::kDiagnosticIncomplete
-              ? "diagnostic_incomplete"
-              : "blocking_collision";
-      if (!missing_clearance && outcome.signed_clearance_m.has_value() &&
-          std::isfinite(*outcome.signed_clearance_m) && *outcome.signed_clearance_m <= 0.0) {
-        monitor_details["penetration_depth_m"] =
-            format_double(std::max(0.0, -*outcome.signed_clearance_m));
-      }
+  // A pair under a contact rule with an end window: the monitor checks
+  // its depth only.
+  if (outcome.contact_rule_violation != RuntimeContactRuleViolation::kNone &&
+      outcome.pair != nullptr && rule_contact != nullptr) {
+    auto pair = *outcome.pair;
+    if (pair.body_b < pair.body_a) {
+      std::swap(pair.body_a, pair.body_b);
+    }
+    const bool missing_clearance =
+        outcome.contact_rule_violation == RuntimeContactRuleViolation::kMissingClearance;
+    monitor_details["contact_rule_violation"] =
+        missing_clearance ? reason_codes::kMissingGraspContactClearance
+                          : reason_codes::kContactPenetrationExceeded;
+    stamp_rule_violation(pair);
+    if (rule_contact->max_penetration_m) {
+      monitor_details["max_penetration_m"] = format_double(*rule_contact->max_penetration_m);
+    }
+    if (!missing_clearance && outcome.signed_clearance_m.has_value() &&
+        std::isfinite(*outcome.signed_clearance_m) && *outcome.signed_clearance_m <= 0.0) {
+      monitor_details["penetration_depth_m"] =
+          format_double(std::max(0.0, -*outcome.signed_clearance_m));
     }
   }
   return publish_runtime_monitor_fault(check, std::move(monitor_details));
@@ -8642,21 +8630,29 @@ Result<std::size_t> ExecutionKernel::discover_dynamic_carried_start_contacts(
   return Result<std::size_t>::Ok(discovered.size());
 }
 
-void ExecutionKernel::install_collision_clearance(const ExecuteRequestDTO& request,
-                                                  CollisionWorldLeaseInventory& projection_inventory,
-                                                  const RobotStateDTO& observed_start,
-                                                  const std::uint64_t execution_id) {
+void ExecutionKernel::install_collision_clearance(
+    std::shared_ptr<const CollisionClearanceMargins> margins,
+    CollisionWorldLeaseInventory& projection_inventory, const RobotStateDTO& observed_start,
+    const std::uint64_t execution_id) {
   auto& bundle = projection_inventory.bundle;
   bundle.clearance_margins.reset();
-  if (!bundle.world || !bundle.policy.has_value()) {
+  if (!bundle.world || !bundle.policy.has_value() || !margins) {
     return;
   }
-  // The motion's own clearance replaces the cell clearance for this move.
-  auto margins = build_collision_clearance_margins(
-      *bundle.world, *bundle.policy, request.contact_policy_id,
-      request.clearance_m.value_or(collision_clearance_m_.load(std::memory_order_acquire)));
-  if (!margins) {
-    return;
+  // A start contact discovered after the table was resolved is a release
+  // pair now: it keeps margin 0.
+  if (std::any_of(margins->pairs.begin(), margins->pairs.end(),
+                  [&](const CollisionPairMargin& entry) {
+                    return bundle.policy->contact_rule_for(entry.pair) != nullptr;
+                  })) {
+    auto kept = std::make_shared<CollisionClearanceMargins>(*margins);
+    std::erase_if(kept->pairs, [&](const CollisionPairMargin& entry) {
+      return bundle.policy->contact_rule_for(entry.pair) != nullptr;
+    });
+    if (kept->pairs.empty()) {
+      return;
+    }
+    margins = std::move(kept);
   }
 
   // Start-in-margin release: a pair already within its margin at the start
@@ -8736,7 +8732,6 @@ Result<PlanRequestDTO> ExecutionKernel::make_plan_request(
   PlanRequestDTO plan_request{
       binding.operation_id,
       binding.participant_id,
-      binding.program_id,
       binding.program_revision,
       binding.program_binding_id,
       binding.program_run_id,
@@ -8776,8 +8771,6 @@ Result<PlanRequestDTO> ExecutionKernel::make_plan_request(
       request.tolerances,
       request.speed_profile,
       request.planner,
-      request.contact_policy_id.empty() ? std::nullopt
-                                        : std::optional<std::string>{request.contact_policy_id},
       request.per_resource_dynamics_limits,
       request.timeouts.planning_timeout_s,
       planning_attempt_index,
@@ -8896,6 +8889,29 @@ Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_motion_continuati
                   {"resume_phase", "current_state"},
                   {"exception", reason_codes::kUnknownNonStdException}}});
   }
+}
+
+std::shared_ptr<const CellModelStateSources> ExecutionKernel::cell_model_state_sources() const {
+  return ports_owner_.cell_model_state ? ports_owner_.cell_model_state->Get() : nullptr;
+}
+
+Result<TrajectoryDTO> ExecutionKernel::expand_for_collision_in_cell(
+    const TrajectoryDTO& trajectory, const RobotStateDTO& start_state) {
+  auto expanded = collision_projector_.expand_for_collision(trajectory, start_state);
+  if (!expanded.ok()) {
+    return expanded;
+  }
+  const auto sources = cell_model_state_sources();
+  if (!sources || sources->empty()) {
+    return expanded;
+  }
+  const auto bound =
+      bind_cell_model_state(*sources, expanded.value().joint_names, trajectory.joint_names);
+  if (const auto unavailable = overlay_cell_model_state(bound, clock_.now(), expanded.value())) {
+    return Result<TrajectoryDTO>::Err(
+        peer_state_unavailable_error(unavailable, kErrorValidationCollision));
+  }
+  return expanded;
 }
 
 Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_trajectory(
@@ -9026,15 +9042,15 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   // here: its evidence is the planning-time world and policy, and
   // changes since planning are caught by the runtime collision checks during
   // motion. Only the collision curve for those checks is built. The planner
-  // switches the pairs of an active contact policy off (support contacts and
-  // the move's contact grasp), so such a move is validated as before.
+  // switches the pairs under a contact or release rule off, so a move with
+  // such pairs is validated as before.
   const auto& planned_policy = scene_snapshot_lease_inventory.bundle.policy;
-  const bool contact_policy_active =
-      !request.contact_policy_id.empty() ||
-      (planned_policy ? !planned_policy->support_contacts.empty()
-                      : snapshot && !snapshot->support_contacts.empty());
-  if (collision_checked_by_planning && !contact_policy_active) {
-    auto collision_curve = collision_projector_.expand_for_collision(trajectory, current_state);
+  const bool contact_rules_active =
+      has_contact_rules(request) ||
+      (planned_policy ? !planned_policy->contact_rules.empty()
+                      : snapshot && !snapshot->contact_rules.empty());
+  if (collision_checked_by_planning && !contact_rules_active) {
+    auto collision_curve = expand_for_collision_in_cell(trajectory, current_state);
     if (!collision_curve.ok()) {
       return Result<CollisionValidationSuccess>::Err(std::move(collision_curve.error()));
     }
@@ -9062,8 +9078,38 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   // The clearance covers the executed spline's deviation between them. The
   // projected trajectory is also armed for lookahead and state projection.
   const auto admitted_margins = scene_snapshot_lease_inventory.bundle.clearance_margins;
+  // A spring rule (OD-356) compares consecutive samples: the move is checked,
+  // and armed for the look-ahead, at samples at most 1 mm of tool travel apart.
+  const TrajectoryDTO* checked_trajectory = &trajectory;
+  TrajectoryDTO spring_samples;
+  const bool spring_rules_active =
+      std::any_of(request.collision_rules.begin(), request.collision_rules.end(),
+                  [](const CollisionRule& rule) {
+                    const auto* contact = std::get_if<CollisionContactRule>(&rule.value);
+                    return contact != nullptr && contact->max_compression_step_m.has_value();
+                  }) ||
+      (planned_policy ? collision_policy_has_spring_rule(*planned_policy)
+                      : snapshot && collision_policy_has_spring_rule(*snapshot));
+  if (spring_rules_active) {
+    constexpr std::size_t kMaximumSpringSamples = 100'000U;
+    auto dense = densify_for_spring_contact(
+        trajectory,
+        [&](const RobotStateDTO& state) -> Result<Vector3DTO> {
+          auto pose = kinematics_.forward_kinematics(
+              FkRequestDTO{state, compiled_frame_name(request.binding.tcp_frame),
+                           compiled_frame_name(request.binding.base_frame)});
+          if (!pose.ok()) return Result<Vector3DTO>::Err(pose.error());
+          return Result<Vector3DTO>::Ok(pose.value().position_m);
+        },
+        kSpringSampleTravelM, kMaximumSpringSamples);
+    if (!dense.ok()) {
+      return Result<CollisionValidationSuccess>::Err(std::move(dense.error()));
+    }
+    spring_samples = std::move(dense.value());
+    checked_trajectory = &spring_samples;
+  }
   auto collision_trajectory_result =
-      collision_projector_.expand_for_collision(trajectory, current_state);
+      expand_for_collision_in_cell(*checked_trajectory, current_state);
   if (!collision_trajectory_result.ok()) {
     return Result<CollisionValidationSuccess>::Err(std::move(collision_trajectory_result.error()));
   }
@@ -9086,7 +9132,7 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     std::shared_ptr<const CollisionPolicySnapshot> policy;
     CollisionValidationDecisionBundle bundle;
     ParallelValidationTelemetry telemetry;
-    std::optional<std::map<std::string, std::string>> contact_policy_violation;
+    std::optional<std::map<std::string, std::string>> contact_rule_violation;
   };
 
   auto run_authoritative_validation_once = [&]() -> Result<AuthoritativeValidationAttempt> {
@@ -9125,7 +9171,6 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
       cfg.per_state_timeout_ns = std::min(cfg.per_state_timeout_ns,
                                          std::max<std::int64_t>(1, *diagnostic_deadline_ns - clock_.now()));
     cfg.surface = CollisionSurface::kPreExecutionValidation;
-    cfg.contact_policy_id = request.contact_policy_id;
     cfg.clearance_margins = world_policy_bundle.clearance_margins;
 
     AuthoritativeValidationAttempt attempt;
@@ -9135,8 +9180,8 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
         world_snapshot, validation_engines, validation_trajectory, cancel, cfg,
         diagnostic_deadline_ns);
     attempt.telemetry = collision_validation_worker_pool_->last_telemetry();
-    attempt.contact_policy_violation =
-        contact_policy_violation_details(attempt.bundle, *active_policy, "block_dispatch");
+    attempt.contact_rule_violation =
+        contact_rule_violation_details(attempt.bundle, *active_policy, "block_dispatch");
     return Result<AuthoritativeValidationAttempt>::Ok(std::move(attempt));
   };
 
@@ -9179,9 +9224,9 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
         const auto query_timeout = per_state_timeout_ns > 0 ? per_state_timeout_ns :
             static_cast<std::int64_t>(config_.validation_collision_query_timeout_ns);
         *path_preview = build_motion_path_preview(
-            trajectory, collision_trajectory, request.binding, attempt.bundle, *attempt.world,
+            *checked_trajectory, collision_trajectory, request.binding, attempt.bundle, *attempt.world,
             *attempt.policy, scene_snapshot_lease_inventory.bundle.clearance_margins,
-            request.contact_policy_id, **engine, *cancel,
+            **engine, *cancel,
             diagnostic_deadline_ns ? std::min(query_timeout,
                 std::max<std::int64_t>(1, *diagnostic_deadline_ns - clock_.now())) : query_timeout,
             diagnostic_preview);
@@ -9193,7 +9238,7 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   }
   auto bundle = std::move(attempt.bundle);
   auto telemetry = attempt.telemetry;
-  auto contact_policy_violation = std::move(attempt.contact_policy_violation);
+  auto contact_rule_violation = std::move(attempt.contact_rule_violation);
 
   if (bundle.decision.accepted) {
     return Result<CollisionValidationSuccess>::Ok(CollisionValidationSuccess{
@@ -9234,18 +9279,15 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   if (!telemetry.fallback_reason.empty()) {
     details["parallel_fallback_reason"] = telemetry.fallback_reason;
   }
-  append_collision_failure_diagnostics(details, bundle);
-  if (admitted_margins && details.contains("classification")) {
-    details["collision_clearance_m"] = format_double(admitted_margins->margin_m);
-  }
-  if (contact_policy_violation.has_value()) {
-    contact_policy_violation->emplace("surface", "pre_dispatch_validation");
-    for (auto& [key, value] : *contact_policy_violation) {
+  append_collision_failure_diagnostics(details, bundle, admitted_margins.get());
+  if (contact_rule_violation.has_value()) {
+    contact_rule_violation->emplace("surface", "pre_dispatch_validation");
+    for (auto& [key, value] : *contact_rule_violation) {
       details[key] = std::move(value);
     }
   }
-  const char* rejection_error_code = contact_policy_violation.has_value()
-                                         ? kErrorContactPolicyViolation
+  const char* rejection_error_code = contact_rule_violation.has_value()
+                                         ? kErrorContactRuleViolation
                                          : kErrorValidationCollision;
   if (bundle.cancelled) {
     if (bundle.cancelled_at_waypoint_index) {
@@ -9270,10 +9312,10 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
                  std::move(details)});
   }
   if (config_.enable_collision_diagnostic_compare && collision_diagnostic_comparator_ != nullptr) {
-    append_collision_compare_diagnostics(details, bundle, trajectory,
+    append_collision_compare_diagnostics(details, bundle, *checked_trajectory,
                                          *collision_diagnostic_comparator_);
   }
-  if (conclusive_collision_failure != nullptr && !contact_policy_violation.has_value() &&
+  if (conclusive_collision_failure != nullptr && !contact_rule_violation.has_value() &&
       bundle.decision.action == CollisionDecisionAction::kReject &&
       bundle.decision.first_failing_waypoint.has_value()) {
     const auto failed_waypoint = std::find_if(
@@ -9298,11 +9340,31 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
                std::move(details)});
 }
 
-void ExecutionKernel::set_collision_clearance_m(const double clearance_m) {
-  if (!(clearance_m >= 0.0 && clearance_m <= kMaxCollisionClearanceM)) {
-    throw std::invalid_argument("collision_clearance_m must be in [0, 0.05]");
+void ExecutionKernel::set_collision_rules(std::vector<CollisionRule> rules) {
+  if (const auto violation = collision_rules_shape_violation(rules); !violation.empty()) {
+    throw std::invalid_argument("collision_rules are malformed: " + std::string(violation));
   }
-  collision_clearance_m_.store(clearance_m, std::memory_order_release);
+  if (rules.empty() || rules.front().has_selections()) {
+    throw std::invalid_argument("collision_rules must start with the row without selections");
+  }
+  const auto selects_one_scene_object = [](const std::vector<CollisionRuleSelection>& side) {
+    return std::any_of(side.begin(), side.end(), [](const CollisionRuleSelection& selection) {
+      return std::holds_alternative<CollisionRuleSceneObjectSelection>(selection);
+    });
+  };
+  if (std::any_of(rules.begin(), rules.end(), [&](const CollisionRule& rule) {
+        return selects_one_scene_object(rule.a) || selects_one_scene_object(rule.b);
+      })) {
+    throw std::invalid_argument("cell collision_rules cannot select one Scene object");
+  }
+  auto installed = std::make_shared<const std::vector<CollisionRule>>(std::move(rules));
+  std::lock_guard<std::mutex> lock(collision_rules_mutex_);
+  collision_rules_ = std::move(installed);
+}
+
+std::shared_ptr<const std::vector<CollisionRule>> ExecutionKernel::cell_collision_rules() const {
+  std::lock_guard<std::mutex> lock(collision_rules_mutex_);
+  return collision_rules_;
 }
 
 void ExecutionKernel::set_collision_check_fresh_plans(const bool enabled) noexcept {
@@ -9363,6 +9425,11 @@ std::optional<ErrorDTO> ExecutionKernel::collision_resource_replacement_refusal_
                   "Collision resources cannot change while lookahead work is active");
   }
   return std::nullopt;
+}
+
+std::optional<ErrorDTO> ExecutionKernel::collision_resource_replacement_refusal() {
+  std::lock_guard lifecycle_lock(lifecycle_mutex_);
+  return collision_resource_replacement_refusal_locked();
 }
 
 void ExecutionKernel::set_collision_resources(

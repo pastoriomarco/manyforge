@@ -113,7 +113,7 @@ STRUCTURED_PROGRAM_TYPES = {
 BLACKBOARD_ACCESS = ("read", "write", "read_write")
 BLACKBOARD_PERSISTENCE = ("run", "persistent")
 VALUE_SOURCE_FORBIDDEN_PARAMETER_IDS = {
-    "contact_policy_id",
+    "collision_rules",
     "model_endpoint_alias",
     "prompt_template_id",
 }
@@ -530,7 +530,7 @@ def _orientation_schema() -> dict[str, Any]:
 
 
 def _initial_scene_pose_schema(catalog: NodeCatalog) -> dict[str, Any]:
-    # Program v3: a component frame is a direct {component_id, frame_id}.
+    # A component frame is a direct {component_id, frame_id}.
     frame_ref = {
         "oneOf": [
             _object({"kind": {"const": "cell_frame"}}, required=("kind",)),
@@ -699,107 +699,6 @@ def _blackboard_key_schema(catalog: NodeCatalog) -> dict[str, Any]:
             )
         )
     return {"oneOf": variants}
-
-
-def _contact_policy_schema() -> dict[str, Any]:
-    """A Program contact policy, manyforge.contact_policy.v1 (the qualified
-    geometry-only grasp/release profile). Composer checks the rest (pair
-    rules, canonical order) and computes its version."""
-
-    selector = {
-        "oneOf": [
-            _object(
-                {
-                    "kind": {"const": "component_model_body"},
-                    "body": _object(
-                        {
-                            "component_id": copy.deepcopy(IDENTIFIER),
-                            "collision_body_id": {
-                                "type": "string", "minLength": 1, "maxLength": 128,
-                            },
-                        },
-                        required=("component_id", "collision_body_id"),
-                    ),
-                },
-                required=("kind", "body"),
-            ),
-            _object({"kind": {"const": "motion_endpoint"}}, required=("kind",)),
-            _object(
-                {
-                    "kind": {"const": "runtime_object"},
-                    "runtime_object_id": copy.deepcopy(IDENTIFIER),
-                },
-                required=("kind", "runtime_object_id"),
-            ),
-        ]
-    }
-    pair = _object(
-        {"body_a": copy.deepcopy(selector), "body_b": copy.deepcopy(selector)},
-        required=("body_a", "body_b"),
-    )
-    common = {
-        "zone_id": copy.deepcopy(IDENTIFIER),
-        "body_pairs": _array(pair, minimum=1),
-        "violation_response": {"const": "hard_stop"},
-    }
-    metric = {"type": "number", "minimum": 0, "maximum": 1000}
-    zones = {
-        "contact_grasp": _object(
-            {
-                **copy.deepcopy(common),
-                "max_penetration_m": {"type": "number", "exclusiveMinimum": 0},
-                "terminal_window_start_fraction": {
-                    "type": "number", "minimum": 0, "maximum": 1,
-                },
-            },
-            required=(
-                "zone_id",
-                "body_pairs",
-                "violation_response",
-                "max_penetration_m",
-                "terminal_window_start_fraction",
-            ),
-        ),
-        "contact_release": _object(
-            {
-                **copy.deepcopy(common),
-                "release_evidence_mode": {
-                    "type": "string", "enum": ["signed_penetration", "binary_contact"],
-                },
-                "max_start_penetration_m": copy.deepcopy(metric),
-                "min_release_progress_m": copy.deepcopy(metric),
-                "release_tolerance_m": copy.deepcopy(metric),
-                "enforce_max_start_penetration": {"type": "boolean"},
-                "require_strictly_decreasing_penetration": {"type": "boolean"},
-                "require_separation_by_end": {"type": "boolean"},
-                "allow_recontact": {"type": "boolean"},
-            },
-            required=("zone_id", "body_pairs", "violation_response", "release_evidence_mode"),
-        ),
-    }
-    return {
-        "oneOf": [
-            _object(
-                {
-                    "api_version": {"const": "manyforge.contact_policy.v1"},
-                    "policy_id": copy.deepcopy(IDENTIFIER),
-                    "mode": {"const": mode},
-                    "sensing_mode": {"const": "geometry_only"},
-                    "default_unmatched_response": {"const": "hard_stop"},
-                    "zones": _array(zone, minimum=1, maximum=1),
-                },
-                required=(
-                    "api_version",
-                    "policy_id",
-                    "mode",
-                    "sensing_mode",
-                    "default_unmatched_response",
-                    "zones",
-                ),
-            )
-            for mode, zone in zones.items()
-        ]
-    }
 
 
 _CONST_TYPES ={str: "string", bool: "boolean", int: "integer", float: "number", dict: "object", list: "array"}
@@ -1235,30 +1134,6 @@ def _tools() -> dict[str, _Tool]:
             ),
             {"parameters": "parameter_declaration[]"},
         ),
-        "program_draft_remove_contact_policies": _Tool(
-            "Remove Program contact policies from the Draft.",
-            _object(
-                {"contact_policy_ids": _string_array(minimum=1)},
-                required=("contact_policy_ids",),
-            ),
-        ),
-        "program_draft_upsert_contact_policies": _Tool(
-            "Insert or replace Program contact policies in the Draft (by policy_id). A node's "
-            "contact_policy_id must name a declared policy: planning.plan_pick_sequence needs "
-            "one with mode contact_grasp, so declare it first if program_read shows none. A "
-            "contact_grasp policy has one zone with one body pair joining {kind: "
-            "motion_endpoint} (the moving tool) or a component collision body to {kind: "
-            "runtime_object, runtime_object_id: <key>}, where <key> is a declared "
-            "blackboard key of type scene_resource (declare one with "
-            "blackboard_draft_upsert_keys if needed), plus max_penetration_m (for example "
-            "0.002) and terminal_window_start_fraction (0 to 1, for example 0.8). Composer "
-            "computes the version.",
-            _object(
-                {"contact_policies": _typed_list("contact_policy")},
-                required=("contact_policies",),
-            ),
-            {"contact_policies": "contact_policy[]"},
-        ),
         "blackboard_draft_remove_keys": _Tool(
             "Remove blackboard key declarations from the Draft.",
             _object({"keys": _string_array(minimum=1)}, required=("keys",)),
@@ -1296,7 +1171,6 @@ def _fixed_types(catalog: NodeCatalog) -> dict[str, dict[str, Any]]:
             },
             required=("namespace_id", "owner"),
         ),
-        "contact_policy": _contact_policy_schema(),
         "parameter_declaration": _program_parameter_schema(catalog),
         "scene_resource": _scene_resource_schema(catalog),
         "scene_resource_edit": _scene_resource_schema(catalog, authoring_pose=True),

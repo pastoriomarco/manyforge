@@ -30,7 +30,7 @@ function document(pneumaticIo?: JsonValue): Record<string, JsonValue> {
     ...(pneumaticIo === undefined ? {} : { pneumatic_io: pneumaticIo }),
   };
   return {
-    api_version: 'manyforge.deployment_intent.v2',
+    api_version: 'manyforge.deployment_intent.v3',
     components: [
       { component_id: 'robot', target_settings: {}, configuration: {
         runtime_kind: 'ros2_control', runtime_configuration: { gripper_target_configurations: [gripper] },

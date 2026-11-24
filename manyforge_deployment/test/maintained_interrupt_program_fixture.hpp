@@ -60,8 +60,7 @@ LoadMaintainedInterruptProgram(
     if (!candidate ||
         candidate->value().cell_graph.cell_id !=
             c::CellId("lite6_pick_place_cell") ||
-        candidate->value().deployment_artifact_id.value() !=
-            "lite6_lite_gripper_pick_and_place")
+        candidate->value().cell_graph.controllable_components.empty())
       continue;
     if (bundle)
       throw std::logic_error(
@@ -91,7 +90,6 @@ LoadMaintainedInterruptProgram(
       }
     fields.emplace_back(name, std::move(value));
   };
-  replace("program_id", V("maintained_interrupt_fixture"));
   replace("blackboard", d::parse_strict_json_model_yaml(R"({
     "namespaces":[],"keys":[{"key":"ready","type":"bool",
       "access":"read_write","persistence":"run","initial":false}]})")
@@ -112,8 +110,7 @@ LoadMaintainedInterruptProgram(
                           std::filesystem::copy_options::recursive);
   d::FilesystemProgramRepository programs(program_artifact_root);
   (void)programs.put_if_absent(program, *bundle);
-  const auto read_program = programs.get_verified(
-      program->value().program_id, program->value().program_revision, *bundle);
+  const auto read_program = programs.get_verified(program->value().program_revision, *bundle);
   d::FilesystemProgramBindingRepository bindings(program_artifact_root);
   (void)bindings.put_if_absent(binding, *bundle, *map, artifacts);
   const auto read_binding =

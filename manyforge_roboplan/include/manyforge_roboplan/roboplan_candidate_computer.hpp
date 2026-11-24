@@ -60,6 +60,18 @@ struct RoboPlanPairMarginDTO final {
                          const RoboPlanPairMarginDTO&) = default;
 };
 
+/// Coordinates of the cell model outside the planned group, by compiled joint
+/// name, in SI units: where the other components of the cell were observed
+/// when the request was made. The worker poses its scene with them before it
+/// computes, so start, goal and path checks see those components there.
+struct RoboPlanOtherCoordinatesDTO final {
+  std::vector<std::string> joint_names;
+  std::vector<double> positions;
+
+  friend bool operator==(const RoboPlanOtherCoordinatesDTO&,
+                         const RoboPlanOtherCoordinatesDTO&) = default;
+};
+
 struct RoboPlanCandidateRequestDTO final {
   core::ControllableComponentId controllable_component_id;
   core::CommandTargetId command_target_id;
@@ -83,13 +95,15 @@ struct RoboPlanCandidateRequestDTO final {
   /// pairs not listed keep margin 0. Filled by the process client from the
   /// selected retained projection.
   std::vector<RoboPlanPairMarginDTO> collision_pair_margins{};
-  /// Native body-name pairs (`first < second`) the selected contact policy
-  /// allows for this plan; the worker deactivates them on its scene. Filled
+  /// Native body-name pairs (`first < second`) the move's contact rules with
+  /// an end window allow for this plan; the worker deactivates them on its scene. Filled
   /// by the process client from the selected retained projection.
   std::vector<std::pair<std::string, std::string>> contact_allowed_pairs{};
   core::PlannerCollisionMode collision_mode{core::PlannerCollisionMode::kEnforced};
   std::optional<core::ControlledStateDTO> diagnostic_qualified_target{};
   std::optional<std::int64_t> diagnostic_deadline_ns{};
+  /// Filled by the process client from the cell's observed-state sources.
+  RoboPlanOtherCoordinatesDTO other_coordinates{};
 };
 
 /// Caller-owned bounded-control hooks. The production wrapper supplies these

@@ -3,16 +3,21 @@
 
 #include <manyforge_roboplan/geometric_contact_input_provider.hpp>
 
+#include <manyforge_core/collision/collision_rule_resolver.hpp>
 #include <manyforge_core/execution_collision_support.hpp>
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_core/time/received_sample_age.hpp>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <limits>
 #include <mutex>
 #include <set>
+#include <span>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -50,6 +55,79 @@ std::optional<std::vector<std::string>> query_joint_names(
                         : std::optional<std::vector<std::string>>(
                               std::move(result));
 }
+
+// Two selections in place of the TCP contact bodies (OD-356).
+bool selection_form(const GeometricContactInputBinding &binding) noexcept {
+  return !binding.contact_a.empty() && !binding.contact_b.empty();
+}
+
+// The world's bodies of one collision body (role) of one component,
+// `component/<component>/model/<model>/body/<role>/collision/<index>`;
+// sorted, as the world's bodies are.
+std::vector<core::CollisionBodyId>
+role_body_ids(const core::CollisionWorldSnapshot &world,
+              const core::ControllableComponentId &component_id,
+              std::string_view role_id) {
+  const auto prefix = "component/" + component_id.value() + "/model/";
+  const auto role = "/body/" + std::string(role_id) + "/collision/";
+  std::vector<core::CollisionBodyId> result;
+  for (const auto &body : world.bodies) {
+    if (body.owner_kind != core::CollisionOwnerKind::kComponentModelBody ||
+        !starts_with(body.body_id, prefix))
+      continue;
+    const auto model_end = body.body_id.find('/', prefix.size());
+    if (model_end != std::string::npos &&
+        body.body_id.compare(model_end, role.size(), role) == 0)
+      result.push_back(body.body_id);
+  }
+  return result;
+}
+
+// One side admitted as the collision-rule resolver takes it: a collision
+// body is its bodies, an attached object of one collision body (OD-371) the
+// objects those bodies carry. A role the world has no body of, or a kind the
+// provider does not take: nullopt.
+std::optional<std::vector<core::CollisionRuleSelection>>
+world_selections(const core::CollisionWorldSnapshot &world,
+                 const std::vector<core::CollisionRuleSelectionDTO> &side) {
+  std::vector<core::CollisionRuleSelection> result;
+  result.reserve(side.size());
+  for (const auto &selection : side) {
+    const bool admitted = std::visit(
+        [&](const auto &value) {
+          using Value = std::decay_t<decltype(value)>;
+          if constexpr (std::is_same_v<Value, core::CollisionRuleCollisionBodySelection>) {
+            auto ids = role_body_ids(world, value.body.component_id,
+                                     value.body.collision_body_id.value());
+            if (ids.empty())
+              return false;
+            result.emplace_back(core::CollisionRuleResolvedBodiesSelection{std::move(ids)});
+          } else if constexpr (std::is_same_v<Value,
+                                              core::CollisionRuleAttachedObjectSelection>) {
+            if (!value.collision_body_role_id) {
+              result.emplace_back(value);
+              return true;
+            }
+            auto ids = role_body_ids(world, value.component_id, *value.collision_body_role_id);
+            if (ids.empty())
+              return false;
+            result.emplace_back(
+                core::CollisionRuleResolvedAttachedObjectSelection{std::move(ids)});
+          } else if constexpr (
+              std::is_same_v<Value, core::CollisionRuleActiveTcpContactBodiesSelection> ||
+              std::is_same_v<Value, core::CollisionRuleModelGroupSelection>) {
+            return false;
+          } else {
+            result.emplace_back(value);
+          }
+          return true;
+        },
+        selection);
+    if (!admitted)
+      return std::nullopt;
+  }
+  return result;
+}
 } // namespace
 
 struct GeometricContactInputProvider::State final
@@ -67,6 +145,8 @@ struct GeometricContactInputProvider::State final
     std::vector<core::CollisionPairId> endpoint_pairs;
     std::vector<core::CollisionBodyId> endpoint_bodies;
     core::RuntimeCollisionQueryBundlePtr prepared_bundle;
+    /// The last value published from a query; selects the release depth.
+    bool tripped{};
     // Resume can overlap the previous generation's callback. Keep lifecycle
     // nonblocking: a newer overlapping acquisition becomes unavailable while
     // the older receipt remains fenced by IoSourceIngressSender's generation.
@@ -98,6 +178,22 @@ struct GeometricContactInputProvider::State final
     if (selected.value.collision_engine->prepare_runtime_snapshot(*bundle->world) !=
         core::RuntimeCollisionQueryPrepareStatus::kReady)
       return false;
+    if (selection_form(selected.value)) {
+      // The pairs a collision rule with these selections would hold. An
+      // attached-object selection with nothing carried holds no pair: the
+      // input is then false.
+      const auto a = world_selections(*bundle->world, selected.value.contact_a);
+      const auto b = world_selections(*bundle->world, selected.value.contact_b);
+      if (!a || !b)
+        return false;
+      auto pairs = core::resolve_collision_selection_pairs(*bundle->world, *a, *b);
+      if (!pairs.ok() || pairs.value().size() > capability.runtime_query_max_collision_pairs)
+        return false;
+      selected.endpoint_pairs = std::move(pairs.value());
+      selected.endpoint_bodies.clear();
+      selected.prepared_bundle = bundle;
+      return true;
+    }
 
     std::sort(endpoint_bodies.begin(), endpoint_bodies.end());
     endpoint_bodies.erase(
@@ -180,8 +276,12 @@ struct GeometricContactInputProvider::State final
       std::atomic_flag &active;
       ~QueryLease() { active.clear(std::memory_order_release); }
     } query_lease{selected->query_active};
-    const auto bodies = selected->value.read_contact_bodies();
-    if (!bodies.ok() || bodies.value().empty()) {
+    const bool selections = selection_form(selected->value);
+    const auto bodies = selections
+                            ? core::Result<std::vector<core::CollisionBodyId>>::Ok(
+                                  std::vector<core::CollisionBodyId>{})
+                            : selected->value.read_contact_bodies();
+    if (!bodies.ok() || (!selections && bodies.value().empty())) {
       std::string reason = "active_tcp_contact_bodies_unavailable";
       if (!bodies.ok()) {
         const auto found = bodies.error().details.find("reason");
@@ -246,6 +346,12 @@ struct GeometricContactInputProvider::State final
       ScheduleNext(expected_generation, cadence_anchor, clock.now());
       return;
     }
+    if (selections && selected->endpoint_pairs.empty()) {
+      selected->tripped = false;
+      PublishValue(selected, receipt, false);
+      ScheduleNext(expected_generation, cadence_anchor, clock.now());
+      return;
+    }
 
     for (const auto &body : selected->endpoint_bodies) {
       const auto is_static = selected->value.body_static_wrt_group(*bundle->world, body);
@@ -257,11 +363,16 @@ struct GeometricContactInputProvider::State final
       }
     }
 
+    // A trip depth needs the penetration of the selected colliding pairs.
+    const bool depth = selected->value.trip_depth_m.has_value();
     const auto result = selected->value.collision_engine->check_runtime(
         *bundle->world,
         {selected->positions, state_time,
          selected->value.query_timeout_ns,
-         core::CollisionDistanceRequestMode::kNone, {}});
+         depth ? core::CollisionDistanceRequestMode::kSelectedCollidingPairs
+               : core::CollisionDistanceRequestMode::kNone,
+         depth ? std::span<const core::CollisionPairId>(selected->endpoint_pairs)
+               : std::span<const core::CollisionPairId>{}});
     const auto pair_bound =
         selected->value.collision_engine->capability()
             .runtime_query_max_collision_pairs;
@@ -270,23 +381,62 @@ struct GeometricContactInputProvider::State final
         result.collision_pairs.size() > pair_bound ||
         std::any_of(result.collision_pairs.begin(), result.collision_pairs.end(),
                     [](const auto &entry) { return entry.pair == nullptr; })) {
+      // A trip depth between two meshes has its own reasons (OD-363).
+      PublishUnavailable(
+          selected, receipt,
+          result.failure_reason == core::RuntimeCollisionQueryFailureReason::kMeshNotClosed
+              ? "mesh_not_closed"
+          : result.failure_reason ==
+                  core::RuntimeCollisionQueryFailureReason::kMeshDepthVertexCapReached
+              ? "mesh_depth_vertex_cap_reached"
+              : "collision_query_inconclusive");
+      ScheduleNext(expected_generation, cadence_anchor, clock.now());
+      return;
+    }
+    // Once tripped, the input stays true down to the release depth.
+    const double threshold =
+        depth ? (selected->tripped && selected->value.release_depth_m
+                     ? *selected->value.release_depth_m
+                     : *selected->value.trip_depth_m)
+              : 0.0;
+    bool contact = false;
+    bool depth_missing = false;
+    for (const auto &entry : result.collision_pairs) {
+      if (!std::binary_search(selected->endpoint_pairs.begin(),
+                              selected->endpoint_pairs.end(), *entry.pair))
+        continue;
+      if (!depth) {
+        contact = true;
+        break;
+      }
+      // Tripped while a pair penetrates deeper than the trip depth.
+      if (!entry.signed_clearance_m || !std::isfinite(*entry.signed_clearance_m)) {
+        depth_missing = true;
+        break;
+      }
+      if (-*entry.signed_clearance_m > threshold) {
+        contact = true;
+        break;
+      }
+    }
+    if (depth_missing) {
       PublishUnavailable(selected, receipt, "collision_query_inconclusive");
       ScheduleNext(expected_generation, cadence_anchor, clock.now());
       return;
     }
-    const bool contact = std::any_of(
-        result.collision_pairs.begin(), result.collision_pairs.end(),
-        [&](const auto &entry) {
-          return std::binary_search(selected->endpoint_pairs.begin(),
-                                    selected->endpoint_pairs.end(), *entry.pair);
-        });
+    selected->tripped = contact;
+    PublishValue(selected, receipt, contact);
+    ScheduleNext(expected_generation, cadence_anchor, clock.now());
+  }
+
+  void PublishValue(const std::shared_ptr<RuntimeBinding> &selected,
+                    core::IoSourceIngressAcquisitionReceipt receipt, bool value) {
     std::vector<core::IoSignalUpdateDTO> updates;
     updates.reserve(selected->value.signals.size());
     for (const auto &signal : selected->value.signals)
       updates.push_back({signal.signal_id, core::IoSampleValidity::kValid,
-                         contact, std::nullopt});
-    sender.Receive(std::move(updates), receipt);
-    ScheduleNext(expected_generation, cadence_anchor, clock.now());
+                         value, std::nullopt});
+    sender.Receive(std::move(updates), std::move(receipt));
   }
 
   void ScheduleNext(std::uint64_t expected_generation,
@@ -348,8 +498,15 @@ GeometricContactInputProvider::Create(
       core::Result<std::unique_ptr<GeometricContactInputProvider>>;
   if (!ingress || !clock || binding.source_id.value().empty() ||
       binding.incarnation.empty() || binding.signals.empty() ||
-      !binding.read_contact_bodies || !binding.body_static_wrt_group ||
-      binding.target_scene_resource_id.value().empty() ||
+      !binding.body_static_wrt_group ||
+      (!selection_form(binding) &&
+       (!binding.read_contact_bodies ||
+        binding.target_scene_resource_id.value().empty())) ||
+      (binding.trip_depth_m &&
+       (!std::isfinite(*binding.trip_depth_m) || *binding.trip_depth_m < 0.0)) ||
+      (binding.release_depth_m &&
+       (!binding.trip_depth_m || !(*binding.release_depth_m > 0.0) ||
+        !(*binding.release_depth_m < *binding.trip_depth_m))) ||
       binding.observed_states.empty() || !binding.collision_publisher ||
       !binding.collision_engine || binding.sample_period_ns <= 0 ||
       binding.query_timeout_ns <= 0 ||
@@ -470,7 +627,8 @@ core::Result<void> GeometricContactInputProvider::RebindIngress(
     std::shared_ptr<core::IIoSignalIngress> ingress,
     GeometricContactInputBinding binding, std::uint64_t generation) {
   if (!ingress || generation == 0U || binding.incarnation.empty() ||
-      !binding.read_contact_bodies || !binding.body_static_wrt_group || binding.observed_states.empty() ||
+      (!selection_form(binding) && !binding.read_contact_bodies) ||
+      !binding.body_static_wrt_group || binding.observed_states.empty() ||
       !binding.collision_publisher || !binding.collision_engine)
     return core::Result<void>::Err(unavailable("rebind_invalid"));
   auto joint_names = query_joint_names(binding);
@@ -486,7 +644,11 @@ core::Result<void> GeometricContactInputProvider::RebindIngress(
         binding.source_id != state_->runtime->value.source_id ||
         binding.signals != state_->runtime->value.signals ||
         binding.target_scene_resource_id !=
-            state_->runtime->value.target_scene_resource_id)
+            state_->runtime->value.target_scene_resource_id ||
+        binding.contact_a != state_->runtime->value.contact_a ||
+        binding.contact_b != state_->runtime->value.contact_b ||
+        binding.trip_depth_m != state_->runtime->value.trip_depth_m ||
+        binding.release_depth_m != state_->runtime->value.release_depth_m)
       return core::Result<void>::Err(unavailable("rebind_stale_or_changed"));
     handle = std::exchange(state_->scheduled, std::nullopt);
     enabled = state_->enabled;

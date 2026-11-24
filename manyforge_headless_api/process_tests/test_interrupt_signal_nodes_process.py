@@ -35,6 +35,9 @@ from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.process_tests.test_process_stack import (
     ProcessStack,
     _apply_command,
+    _composer_fence,
+    _composer_snapshot_stream,
+    _matching_composer_snapshot,
     _read_only_tree,
     keep_failure_evidence,
 )
@@ -44,6 +47,7 @@ from manyforge_headless_api.process_tests.test_dual_robot_grouped_execution impo
     _component_states,
     _disable_for_reload,
     _native_events,
+    _reset_cycle,
     _start_motion,
     _start_run,
     _wait_components_reached_requested_target,
@@ -95,13 +99,11 @@ def _write_signal_scenario(directory: Path) -> Path:
 
     examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
     source = examples / f"{TRIAL_SCENARIO}.scenario"
-    trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+    trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples), str(REPOSITORY_ROOT)])
     program = deepcopy(trial["program_draft"])
     (root,) = program["forest"]
     root["children"] = [row for row in root["children"] if row["instance_id"] in KEPT_NODES]
     assert [row["instance_id"] for row in root["children"]] == list(KEPT_NODES), root
-    # probe_no_trip was the contact policy's only user.
-    program.pop("contact_policies", None)
     program["blackboard"] = {"keys": [], "namespaces": []}
     deployment = deepcopy(trial["deployment_draft"])
     deployment["components"] = [
@@ -119,7 +121,7 @@ def _write_signal_scenario(directory: Path) -> Path:
         last_known_status="unknown",
     )
     save_scenario_artifact(
-        scenario, str(target), allowed_roots=[str(directory), str(examples)], overwrite=False,
+        scenario, str(target), allowed_roots=[str(directory), str(examples), str(REPOSITORY_ROOT)], overwrite=False,
         source_project_path=str(source),
     )
     return target
@@ -142,7 +144,7 @@ def _prepare_bootstrap(activation_root: Path) -> None:
     spec.loader.exec_module(workbench)
     examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
     captured, _ = workbench._capture_ros_bootstrap_project(
-        str(examples / f"{BOOTSTRAP_SCENARIO}.scenario"), allowed_root=examples
+        str(examples / f"{BOOTSTRAP_SCENARIO}.scenario"), allowed_roots=[examples]
     )
     activation_root.mkdir()
     ActivationPreparer(
@@ -244,7 +246,7 @@ def _write_runtime_configuration_candidate(directory: Path, project: Path) -> Pa
         save_scenario_artifact,
     )
 
-    source, _ = load_scenario_artifact(str(project), allowed_roots=[str(directory)])
+    source, _ = load_scenario_artifact(str(project), allowed_roots=[str(directory), str(REPOSITORY_ROOT)])
     deployment = deepcopy(source["deployment_draft"])
     lite6 = next(
         row for row in deployment["components"]
@@ -269,7 +271,7 @@ def _write_runtime_configuration_candidate(directory: Path, project: Path) -> Pa
     save_scenario_artifact(
         candidate,
         str(target),
-        allowed_roots=[str(directory)],
+        allowed_roots=[str(directory), str(REPOSITORY_ROOT)],
         overwrite=False,
         source_project_path=str(project),
     )
@@ -438,7 +440,7 @@ def _write_mock_io_scenario(directory: Path) -> Path:
 
     examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
     source = examples / "mock_lite6_io_nodes.scenario"
-    trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+    trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples), str(REPOSITORY_ROOT)])
     program = deepcopy(trial["program_draft"])
     (root,) = program["forest"]
     authored = {row["instance_id"]: deepcopy(row) for row in root["children"]}
@@ -481,7 +483,7 @@ def _write_mock_io_scenario(directory: Path) -> Path:
         last_known_status="unknown",
     )
     save_scenario_artifact(
-        scenario, str(target), allowed_roots=[str(directory), str(examples)],
+        scenario, str(target), allowed_roots=[str(directory), str(examples), str(REPOSITORY_ROOT)],
         overwrite=False, source_project_path=str(source),
     )
     return target
@@ -616,7 +618,7 @@ def _write_retry_scenario(directory: Path) -> Path:
 
     examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
     source = examples / f"{RETRY_SCENARIO}.scenario"
-    trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+    trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples), str(REPOSITORY_ROOT)])
     deployment = deepcopy(trial["deployment_draft"])
     deployment["components"] = [
         row for row in deployment["components"] if row["component_id"] != "plc_io"
@@ -633,7 +635,7 @@ def _write_retry_scenario(directory: Path) -> Path:
         last_known_status="unknown",
     )
     save_scenario_artifact(
-        scenario, str(target), allowed_roots=[str(directory), str(examples)], overwrite=False,
+        scenario, str(target), allowed_roots=[str(directory), str(examples), str(REPOSITORY_ROOT)], overwrite=False,
         source_project_path=str(source),
     )
     return target
@@ -683,7 +685,7 @@ def _status_scenario_writer(source_scenario: str, scenario_id: str, gripper: str
 
         examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
         source = examples / f"{source_scenario}.scenario"
-        trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+        trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples), str(REPOSITORY_ROOT)])
         program = deepcopy(trial["program_draft"])
         (root,) = program["forest"]
         (opened,) = [row for row in root["children"] if row["instance_id"] == command]
@@ -706,7 +708,7 @@ def _status_scenario_writer(source_scenario: str, scenario_id: str, gripper: str
             last_known_status="unknown",
         )
         save_scenario_artifact(
-            scenario, str(target_path), allowed_roots=[str(directory), str(examples)],
+            scenario, str(target_path), allowed_roots=[str(directory), str(examples), str(REPOSITORY_ROOT)],
             overwrite=False, source_project_path=str(source),
         )
         return target_path
@@ -756,3 +758,170 @@ def test_gripper_status_reports_the_command_state_of_a_standalone_gripper(
         statuses = terminal_run["node_statuses"]
         for node in (command, "check_reached", "wait_reached"):
             assert statuses[node] == "success", (node, terminal_run)
+
+
+def _generated_tool_scenario_writer(scenario_id: str):
+    """The Mock Lite 6 pneumatic cell with its gripper replaced by a Tool made
+    from its parameters (inline; two jaw pairs, `outer` and `inner`), each
+    pair wired to its own valve of the Mock I/O device, and a Program that
+    commands each pair."""
+
+    def write(directory: Path) -> Path:
+        import yaml  # noqa: PLC0415
+
+        from manyforge_composer.backend.scenario_artifacts import (
+            build_scenario_document,
+            load_scenario_artifact,
+            save_scenario_artifact,
+        )
+
+        examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
+        source = examples / "mock_lite6_pneumatic_pick_and_place.scenario"
+        trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples), str(REPOSITORY_ROOT)])
+        deployment = deepcopy(trial["deployment_draft"])
+        (io,) = [row for row in deployment["components"] if row["component_id"] == "gripper_io"]
+        signals = io["configuration"]["runtime_configuration"]["io_signals"]
+        (valve,) = [row for row in signals if row["signal_name"] == "valve"]
+        signals.append({**deepcopy(valve), "signal_name": "inner_valve",
+                        "resource_role_id": "inner_valve", "source_id": "gripper_io.inner_valve",
+                        "provider": {**valve["provider"], "channel": "inner_valve"}})
+        (tool,) = [row for row in deployment["components"]
+                   if row["component_id"] == "lite_gripper"]
+
+        def wiring(pair: str, output: str) -> dict[str, Any]:
+            return {
+                "command_target_id": pair,
+                "controllable_component_id": "lite_gripper",
+                "pneumatic_io": {"inputs": {}, "outputs": [{
+                    "close_value": True, "open_value": False,
+                    "signal": {"controllable_component_id": "gripper_io", "signal_name": output}}]},
+            }
+
+        parameters = yaml.safe_load(
+            (REPOSITORY_ROOT / "manyforge_example_models/models/tool/dual_jaw_gripper.tool.yaml")
+            .read_text(encoding="utf-8"))
+        for chain in parameters["chains"]:
+            for element in chain["elements"]:
+                if "jaw_pair" in element:
+                    element["jaw_pair"]["command_duration_s"] = 0.2
+        tool.clear()
+        tool.update({
+            "component_id": "lite_gripper",
+            "component_profile_id": "manyforge.tool",
+            "frame_prefix": "",
+            "model_source": {"parameters": parameters},
+            "target_settings": {},
+            "configuration": {
+                "runtime_kind": "ros2_control",
+                "runtime_configuration": {
+                    "component_streams": [],
+                    "gripper_target_configurations": [
+                        wiring("inner", "inner_valve"), wiring("outer", "valve")],
+                },
+            },
+        })
+        # The replaced gripper's exclusions name its own links.
+        for attachment in deployment["attachments"]:
+            attachment.pop("collision_exclusions", None)
+
+        def command(instance_id: str, pair: str, preset: str) -> dict[str, Any]:
+            return {
+                "children": [], "instance_id": instance_id, "node_id": "gripper.command_position",
+                "parameters": {
+                    "command_duration_s": 0.2,
+                    "position": {"kind": "named_preset", "name": preset},
+                    "target": {"component_id": "lite_gripper", "command_target_id": pair}}}
+
+        program = deepcopy(trial["program_draft"])
+        (root,) = program["forest"]
+        root["children"] = [
+            command("open_outer", "outer", "open"),
+            command("close_inner", "inner", "closed"),
+            command("close_outer", "outer", "closed"),
+            command("open_inner", "inner", "open"),
+        ]
+        target_path = directory / f"{scenario_id}.scenario"
+        scenario = build_scenario_document(
+            scenario_id=scenario_id,
+            name=scenario_id,
+            description="A generated tool with two jaw pairs: command each pair.",
+            program_draft=program,
+            deployment_draft=deployment,
+            manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+            last_known_status="unknown",
+        )
+        save_scenario_artifact(
+            scenario, str(target_path), allowed_roots=[str(directory), str(examples), str(REPOSITORY_ROOT)],
+            overwrite=False, source_project_path=str(source),
+        )
+        return target_path
+
+    return write
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=str(_skip_reason()))
+def test_each_jaw_pair_of_a_generated_tool_is_its_own_gripper_target() -> None:
+    """OD-352 slice 2: one tool component with two gripper targets. The host
+    runs one gripper backend per target, and a Program commands each pair by
+    component and target."""
+
+    scenario_id = "generated_tool_two_jaw_pairs_process"
+    with _signal_stack(_generated_tool_scenario_writer(scenario_id)) as (stack, project):
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            loaded = _apply_command(
+                client, "/api/scenario/load", {"path": str(project)}, timeout_seconds=30.0
+            )
+            assert loaded["end"]["outcome"] == "succeeded", loaded
+            component_ids = _activate_loaded_components(stack)
+            assert "lite_gripper" in component_ids, component_ids
+            stack.wait_authoring_admission(expected_allowed=True)
+            applied = client.program_applied()
+            assert applied["scenario_id"] == scenario_id, applied
+            started = _start_run(
+                stack,
+                scenario_id=scenario_id,
+                source_document_digest=applied["source_document_digest"],
+                applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(client, started, request_id=f"{scenario_id}.motion-start")
+            terminal_run = _wait_run_state(
+                client, program_run_id, {"succeeded", "failed", "stopped"}, timeout_seconds=90.0
+            )
+        assert terminal_run["state"] == "succeeded", terminal_run
+        statuses = terminal_run["node_statuses"]
+        for node in ("open_outer", "close_inner", "close_outer", "open_inner"):
+            assert statuses[node] == "success", (node, terminal_run)
+
+        # OD-357: an Apply that leaves the Tool unchanged keeps it running.
+        with (
+            HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
+            HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
+        ):
+            _reset_cycle(composer, program_run_id)
+            before = _component_states(headless)["lite_gripper"]
+            workspace = composer.request("GET", "/api/deployment/workspace")
+            draft = workspace["draft"]
+            attachments = draft["document"]["attachments"]
+            index = next(i for i, row in enumerate(attachments)
+                         if row["child"]["component_id"] == "lite_gripper")
+            with _composer_snapshot_stream(stack, client_id="generated-tool-keep") as snapshots:
+                program = composer.request("GET", "/api/program/draft")
+                snapshot = _matching_composer_snapshot(snapshots, program)
+                fence = _composer_fence(snapshot, application_start_id=stack.application_start_id,
+                                        request_id="generated-tool-keep.edit")
+                fence.update({"draftId": draft["id"], "expectedDraftRevision": draft["revision"]})
+                composer.request("POST", "/api/deployment/draft/mutations", body={
+                    **fence, "path": ["attachments", index, "collision_exclusions"],
+                    "value": [{"child_link": "tool_body", "parent_link": "link6"}]})
+            preview = composer.request("POST", "/api/deployment/preview", body={})
+            dispositions = {row["component_id"]: row["disposition"] for row in preview["components"]}
+            assert dispositions["lite_gripper"] == "retain", preview
+            applied_result = _apply_command(composer, "/api/deployment/apply",
+                                            {"scope": preview["scope"]}, timeout_seconds=30.0)
+            assert applied_result["end"]["outcome"] == "succeeded", applied_result
+            after = _component_states(headless)["lite_gripper"]
+            assert after["lifecycle"] == before["lifecycle"], (before, after)
+            assert after.get("last_action") == before.get("last_action"), (before, after)
+

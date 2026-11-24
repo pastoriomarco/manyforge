@@ -5,6 +5,7 @@
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/motion_preview.hpp>
 #include <manyforge_core/types/active_control_configuration.hpp>
+#include <manyforge_core/types/collision_rule.hpp>
 #include <manyforge_core/types/operation_intent.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_contract.hpp>
@@ -144,6 +145,13 @@ public:
   [[nodiscard]] core::Result<core::RuntimeParticipantBinding>
   BindCollisionBodyAliases(core::RuntimeParticipantBinding binding) const;
 
+  /// The Deployment's collision rules as the Kernel takes them: every
+  /// `collision_body` selection becomes the ids of that body's collision
+  /// bodies in this product's collision world. The other selections are
+  /// resolved by the Kernel against each move's collision world.
+  [[nodiscard]] core::Result<std::vector<core::CollisionRule>>
+  ResolveCellCollisionRules(const std::vector<core::CollisionRuleDTO> &rules) const;
+
   /// Verified static mount membership and live TCP body projection for I/O.
   [[nodiscard]] std::set<core::ControllableComponentId>
   SelfAndMounted(const core::ControllableComponentId &robot) const;
@@ -151,8 +159,10 @@ public:
   ActiveTcpContactBodies(const core::RuntimeParticipantBinding &robot_binding,
                          const std::optional<ActiveTcp> &active) const;
 
-  /// Resolve the current TCP for a verified bound Scene holder.
-  [[nodiscard]] core::Result<core::FrameRoleId> ResolveAttachActiveTcp(
+  /// Resolve the current TCP for a verified bound Scene holder: a frame of
+  /// the holder, or (OD-372) of a component mounted on the holder's robot
+  /// that the robot's kinematics places.
+  [[nodiscard]] core::Result<core::ProgramFrameReferenceDTO> ResolveAttachActiveTcp(
       const core::ProgramBindingId &binding_id, const core::ProgramTargetReferenceDTO &holder,
       const std::function<std::optional<ActiveTcp>(const core::ControllableComponentId &)> &read) const;
 
@@ -216,8 +226,7 @@ private:
                       const core::ProgramTargetReferenceDTO &)> &default_tcp_of_target,
                   bool joint_goal = false) const;
   [[nodiscard]] std::shared_ptr<const deployment::ProgramBindingContract>
-  LoadProgram(const core::ProgramId &program_id,
-              const core::ProgramRevision &program_revision) const;
+  LoadProgram(const core::ProgramRevision &program_revision) const;
 
   const std::filesystem::path package_root_;
   deployment::FilesystemVerifiedProgramSource programs_;

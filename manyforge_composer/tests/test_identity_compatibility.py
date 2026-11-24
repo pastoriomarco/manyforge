@@ -54,13 +54,13 @@ def test_hand_edited_scenario_member_loads_with_edited_outside_warning(
 
     program_path = target / "program.yaml"
     edited = json.loads(program_path.read_text(encoding="utf-8"))
-    edited["description"] = "Hand-edited description"
+    edited["compatibility"]["tags"] = ["hand-edited"]
     program_path.write_text(json.dumps(edited) + "\n", encoding="utf-8")
     document, _, _, diagnostics = capture_scenario_artifact_with_diagnostics(
         str(target), allowed_roots=[str(tmp_path)]
     )
 
-    assert document["program_draft"]["description"] == "Hand-edited description"
+    assert document["program_draft"]["compatibility"]["tags"] == ["hand-edited"]
     assert diagnostics == [
         {
             "code": "edited_outside_manyforge",
@@ -121,7 +121,7 @@ def test_incompatible_catalog_major_is_kept_and_reported() -> None:
 def test_hand_edited_program_file_loads_with_computed_revision(tmp_path: Path) -> None:
     catalog = build_node_environment().catalog
     document = load_strict_json_yaml(_EXAMPLE)
-    document["name"] = "Edited in a text editor"
+    document["compatibility"]["tags"] = ["edited-in-a-text-editor"]
     document["catalog"]["content_version"] = _older_minor(catalog.content_version)
     path = tmp_path / "edited.program.yaml"
     path.write_text(json.dumps(document), encoding="utf-8")
@@ -133,6 +133,6 @@ def test_hand_edited_program_file_loads_with_computed_revision(tmp_path: Path) -
     assert [row["code"] for row in program.load_diagnostics] == [
         "edited_outside_manyforge"
     ]
-    assert program.name == "Edited in a text editor"
+    assert program.to_dict()["compatibility"]["tags"] == ["edited-in-a-text-editor"]
     assert program.to_dict()["catalog"]["content_version"] == catalog.content_version
     assert program.program_revision != document["program_revision"]

@@ -3754,7 +3754,6 @@ core::Result<core::RuntimeParticipantBinding> producer_gripper_binding() {
   // Reduced linear-gripper form of Core's existing make_binding fixture. The
   // normal Core codec seals it before the real producer consumes it.
   return verify_runtime_participant_binding(RuntimeParticipantBindingDTO{
-      ProgramId("program.ros_pair"),
       ProgramRevision(digest('0')),
       ProgramBindingId(digest('1')),
       RetainedBundleId(digest('6')),

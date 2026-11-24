@@ -1,17 +1,10 @@
-api_version: manyforge.program.v3
-program_id: isaac_lite6_lite_gripper_pick_and_place
-program_revision: sha256:6c3186e9df79d552664cd804b6860bab9ac6402711d40b783fcbc23c2681cc6e
+api_version: manyforge.program.v4
+program_revision: sha256:383d22828ae4546005c3465231782822f60697056aece5c124e8d6304b56f193
 program_profile: composable-cell-v1
-name: isaac_lite6_lite_gripper_pick_and_place
-description: Retained Isaac-compatible Lite6 pick-and-place Program. It preserves the scan poses, exact
-  scene and rest coordinates, linear lite-gripper commands, carried-object transitions, and typed simulator
-  lifecycle. Manager-owned observed-scene latching replaces the retired trajectory-reset node.
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
-  lanes:
-  - isaac-sim
   assistant: forbidden
   requires:
   - lite_gripper

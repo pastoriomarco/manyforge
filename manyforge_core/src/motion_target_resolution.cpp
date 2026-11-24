@@ -34,10 +34,6 @@ Result<ResolvedMotionSpecDTO> resolve_motion_target(
   collect_runtime_object(request.target_reference);
   collect_runtime_object(request.offset_reference);
   collect_runtime_object(request.goal_frame_reference);
-  if (request.resolved_contact_grasp.has_value()) {
-    referenced_runtime_objects.insert(
-        request.resolved_contact_grasp->runtime_object_id);
-  }
   std::set<RuntimeObjectId> bound_runtime_objects;
   for (const auto &binding : request.runtime_object_bindings) {
     if (binding.runtime_object_id.empty() ||
@@ -120,8 +116,9 @@ Result<ResolvedMotionSpecDTO> resolve_motion_target(
       return Result<ResolvedMotionSpecDTO>::Err(frame_in_base.error());
     }
     if (pose_goal != nullptr) {
-      return Result<ResolvedMotionSpecDTO>::Ok(ResolvedMotionSpecDTO{
-          PoseGoalDTO{multiply_poses(frame_in_base.value(), pose_goal->goal)}});
+      PoseGoalDTO resolved = *pose_goal;
+      resolved.goal = multiply_poses(frame_in_base.value(), pose_goal->goal);
+      return Result<ResolvedMotionSpecDTO>::Ok(ResolvedMotionSpecDTO{std::move(resolved)});
     }
     CartesianPathDTO resolved = *path;
     for (auto &waypoint : resolved.waypoints) {
@@ -238,8 +235,10 @@ Result<ResolvedMotionSpecDTO> resolve_motion_target(
   };
 
   if (const auto *pose_goal = std::get_if<PoseGoalDTO>(&request.motion)) {
+    PoseGoalDTO resolved = *pose_goal;
+    resolved.goal = resolve_offset(pose_goal->goal);
     return Result<ResolvedMotionSpecDTO>::Ok(
-        ResolvedMotionSpecDTO{PoseGoalDTO{resolve_offset(pose_goal->goal)}});
+        ResolvedMotionSpecDTO{std::move(resolved)});
   }
   if (const auto *path = std::get_if<CartesianPathDTO>(&request.motion)) {
     CartesianPathDTO resolved = *path;

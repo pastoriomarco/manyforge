@@ -111,8 +111,7 @@ bool ManagerComponentProcessInventoryResultDTO::valid() const noexcept {
 }
 
 bool HostApplyProgramSelection::valid() const noexcept {
-  return !program_id.empty() && !program_revision.empty() &&
-         !program_binding_id.empty();
+  return !program_revision.empty() && !program_binding_id.empty();
 }
 
 bool HostApplyRequest::valid() const noexcept {

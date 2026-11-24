@@ -3,7 +3,7 @@
 # stopped = prepared with the reason, unreachable = offline; Enable plays,
 # Disable pauses, capability sim_reset. It runs on the generic simulator adapter
 # (`simulation_interfaces`); this row holds the Isaac-specific values.
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: simulator
 id: nvidia.isaac_sim
 version: 1.0.0

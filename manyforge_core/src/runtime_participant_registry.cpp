@@ -130,8 +130,7 @@ Result<RuntimeParticipantBinding> RuntimeParticipantRegistry::resolve(
   const RuntimeParticipantBinding* match = nullptr;
   for (const auto& binding : bindings_) {
     const auto& value = binding.value();
-    if (value.program_id != operation.program_id ||
-        value.program_revision != operation.program_revision ||
+    if (value.program_revision != operation.program_revision ||
         value.program_binding_id != operation.program_binding_id ||
         value.retained_bundle_id != operation.expected_retained_bundle_id ||
         value.graph_revision != operation.expected_graph_revision ||
@@ -166,8 +165,7 @@ Result<RuntimeParticipantBinding> RuntimeParticipantRegistry::validate_resolved(
   }
   const auto& participant = operation.participants[participant_index];
   const auto& value = binding.value();
-  if (value.program_id != operation.program_id ||
-      value.program_revision != operation.program_revision ||
+  if (value.program_revision != operation.program_revision ||
       value.program_binding_id != operation.program_binding_id ||
       value.retained_bundle_id != operation.expected_retained_bundle_id ||
       value.graph_revision != operation.expected_graph_revision ||

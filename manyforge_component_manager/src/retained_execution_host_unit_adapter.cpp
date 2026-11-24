@@ -6,6 +6,7 @@
 #include "native_projection_rpc_internal.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
 #include "manyforge_component_manager/execution_host_exit.hpp"
+#include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
 
@@ -88,8 +89,10 @@ constexpr int kChildExecErrorFd = 5;
 constexpr int kChildPackageRootFd = 6;
 constexpr int kChildExecutableFd = 7;
 constexpr int kChildProgramArtifactRootFd = 8;
-constexpr int kChildSceneAssetRootFd = 9;
-constexpr int kChildHighestReservedFd = kChildSceneAssetRootFd;
+// A duplicate of the activation root: scene meshes are read from its
+// raw-artifact store by content digest.
+constexpr int kChildSceneContentRootFd = 9;
+constexpr int kChildHighestReservedFd = kChildSceneContentRootFd;
 constexpr std::size_t kMaximumControlPacketBytes =
     detail::kMaximumManagedRuntimeRpcPacketBytes;
 static_assert(detail::kMaximumNativeProjectionRpcPacketBytes <=
@@ -553,25 +556,25 @@ FenceIdentity(const Request &request) {
 // The management exchanges with the execution host: the projection
 // operations in request order, then the fence, cell-admission, Host Apply,
 // status, process-inspection and liveness-lane exchanges by their names.
-constexpr std::array<std::string_view, 26U> kExchangeKinds{
+constexpr std::array<std::string_view, 27U> kExchangeKinds{
     "projection_prepare", "projection_health", "projection_transaction",
     "projection_rebuild", "projection_bootstrap_rebuild",
     "projection_bootstrap_status", "projection_retain", "projection_release",
     "projection_scene_frame", "projection_effective_policy",
-    "fence_observe_admission", "fence_acquire", "fence_reconcile_attempt",
+    "projection_commit_preflight", "fence_observe_admission", "fence_acquire", "fence_reconcile_attempt",
     "fence_query_status", "fence_release",
     "cell_admission_get", "cell_admission_acquire", "cell_admission_release",
     "cell_admission_recovery_receipt",
     "cell_admission_validate_program_reset_scene", "host_apply", "status",
     "component_process_inspection", "cell_admission_update_readiness",
     "cell_admission_publish_liveness", "manager_liveness_renewal"};
-static_assert(std::variant_size_v<detail::NativeProjectionRpcRequest> == 10U);
-constexpr std::uint8_t kStatusKind = 21U;
+static_assert(std::variant_size_v<detail::NativeProjectionRpcRequest> == 11U);
+constexpr std::uint8_t kStatusKind = 22U;
 static_assert(kExchangeKinds[kStatusKind] == "status");
-constexpr std::uint8_t kInspectionKind = 22U;
+constexpr std::uint8_t kInspectionKind = 23U;
 static_assert(kExchangeKinds[kInspectionKind] ==
               "component_process_inspection");
-constexpr std::uint8_t kLivenessRenewalKind = 25U;
+constexpr std::uint8_t kLivenessRenewalKind = 26U;
 static_assert(kExchangeKinds[kLivenessRenewalKind] ==
               "manager_liveness_renewal");
 
@@ -758,7 +761,7 @@ SameChildProduct(const ExecutionHostUnitAdmission &admission,
                              const int liveness_channel_fd, const int error_fd,
                              const int executable_fd, const int package_root_fd,
                              const int program_artifact_root_fd,
-                             const int scene_asset_root_fd,
+                             const int scene_content_root_fd,
                              char *const argv[]) noexcept {
   if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
     ChildExit(error_fd, errno);
@@ -778,28 +781,28 @@ SameChildProduct(const ExecutionHostUnitAdmission &admission,
       ::fcntl(package_root_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
   const int program_artifact_root_copy = ::fcntl(
       program_artifact_root_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
-  // Absent scene-asset root: FD 9 stays closed (close_range below).
-  const int scene_asset_root_copy =
-      scene_asset_root_fd < 0
+  // No activation root: FD 9 stays closed (close_range below).
+  const int scene_content_root_copy =
+      scene_content_root_fd < 0
           ? -1
-          : ::fcntl(scene_asset_root_fd, F_DUPFD_CLOEXEC,
+          : ::fcntl(scene_content_root_fd, F_DUPFD_CLOEXEC,
                     kChildHighestReservedFd + 1);
   if (channel_copy < 0 || liveness_channel_copy < 0 || error_copy < 0 ||
       executable_copy < 0 || package_root_copy < 0 ||
       program_artifact_root_copy < 0 ||
-      (scene_asset_root_fd >= 0 && scene_asset_root_copy < 0) ||
+      (scene_content_root_fd >= 0 && scene_content_root_copy < 0) ||
       ::dup3(channel_copy, kChildChannelFd, 0) < 0 ||
       ::dup3(liveness_channel_copy, kChildLivenessChannelFd, 0) < 0 ||
       ::dup3(error_copy, kChildExecErrorFd, O_CLOEXEC) < 0 ||
       ::dup3(executable_copy, kChildExecutableFd, O_CLOEXEC) < 0 ||
       ::dup3(package_root_copy, kChildPackageRootFd, 0) < 0 ||
       ::dup3(program_artifact_root_copy, kChildProgramArtifactRootFd, 0) < 0 ||
-      (scene_asset_root_copy >= 0 &&
-       ::dup3(scene_asset_root_copy, kChildSceneAssetRootFd, 0) < 0)) {
+      (scene_content_root_copy >= 0 &&
+       ::dup3(scene_content_root_copy, kChildSceneContentRootFd, 0) < 0)) {
     ChildExit(error_fd, errno);
   }
-  if (scene_asset_root_copy < 0) {
-    static_cast<void>(::close(kChildSceneAssetRootFd));
+  if (scene_content_root_copy < 0) {
+    static_cast<void>(::close(kChildSceneContentRootFd));
   }
 #ifdef SYS_close_range
   const long closed =
@@ -992,7 +995,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
        std::string selected_operating_system,
        std::vector<std::string> selected_launch_environment_contracts,
        std::filesystem::path activation_root,
-       std::filesystem::path scene_asset_root,
        std::optional<std::string> site_settings_document)
       : target_root_path(
             NormalizedPlainDirectory(std::move(trusted_installed_target_root),
@@ -1005,11 +1007,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
                 ? std::filesystem::path{}
                 : NormalizedPlainDirectory(std::move(activation_root),
                                            "candidate retained-package root")),
-        scene_asset_root_path(
-            scene_asset_root.empty()
-                ? std::filesystem::path{}
-                : NormalizedPlainDirectory(std::move(scene_asset_root),
-                                           "scene-asset root")),
         manager_run_root_path(NormalizedPlainDirectory(
             std::move(manager_run_root), "Manager run root")),
         execution_state_root_path(NormalizedPlainDirectory(
@@ -1056,14 +1053,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
                                  activation_root_path);
       activation_root_fd =
           OpenPinnedPackageRoot(activation_root_path);
-    }
-    if (!scene_asset_root_path.empty()) {
-      // Opened once and fixed for this Manager's lifetime; children receive
-      // only this descriptor, never a path they could re-resolve.
-      for (const auto *typed_root : typed_roots) {
-        RequireDisjointDirectories(scene_asset_root_path, *typed_root);
-      }
-      scene_asset_root_fd = OpenPinnedPackageRoot(scene_asset_root_path);
     }
     std::sort(launch_environment_contracts.begin(),
               launch_environment_contracts.end());
@@ -1696,9 +1685,23 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     if (!binding.valid()) {
       Fail("native projection request binding is invalid");
     }
+    // A request beyond a codec bound is refused before it is sent.
+    std::string encoded;
+    try {
+      encoded = detail::EncodeNativeProjectionRpcRequest(request);
+    } catch (const detail::NativeProjectionRpcBoundExceeded &error) {
+      return manyforge::core::Result<Response>::Err(manyforge::core::ErrorDTO{
+          std::string(
+              manyforge::core::error_codes::kNativeProjectionRpcBoundExceeded),
+          error.what(),
+          {}});
+    }
     std::unique_lock lock(mutex);
     const auto child = ProjectionChildLocked(binding);
-    auto response = ExchangeProjection(lock, child, request);
+    auto response = detail::DecodeNativeProjectionRpcResponse(
+        Exchange(lock, child, child->management, encoded,
+                 ProjectionEcho(request),
+                 static_cast<std::uint8_t>(request.index())));
     if (const auto *failure =
             std::get_if<detail::NativeProjectionRpcFailure>(&response)) {
       return manyforge::core::Result<Response>::Err(failure->error);
@@ -2338,9 +2341,11 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     arguments.push_back(bundle.retained_bundle_id().value());
     arguments.emplace_back("--manyforge-managed-graph-revision");
     arguments.push_back(bundle.value().cell_graph.graph_revision.value());
-    if (scene_asset_root_fd) {
-      arguments.emplace_back("--manyforge-managed-scene-asset-root-fd");
-      arguments.push_back(std::to_string(kChildSceneAssetRootFd));
+    // Scene meshes are read by content digest from the activation root's
+    // raw-artifact store; without an activation root they fail closed.
+    if (activation_root_fd) {
+      arguments.emplace_back("--manyforge-managed-scene-content-root-fd");
+      arguments.push_back(std::to_string(kChildSceneContentRootFd));
     }
     if (site_settings_snapshot.has_value()) {
       arguments.emplace_back("--manyforge-managed-site-settings");
@@ -2373,7 +2378,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     if (pid == 0) {
       EnterChild(parent, channels[1].get(), liveness_channels[1].get(),
                  exec_pipe[1].get(), target.get(), selected_package_root_fd,
-                 selected_program_artifact_root_fd, scene_asset_root_fd.get(),
+                 selected_program_artifact_root_fd, activation_root_fd.get(),
                  argv.data());
     }
 
@@ -2744,8 +2749,6 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   UniqueFd package_root_fd;
   std::filesystem::path activation_root_path;
   UniqueFd activation_root_fd;
-  std::filesystem::path scene_asset_root_path;
-  UniqueFd scene_asset_root_fd;
   std::filesystem::path manager_run_root_path;
   std::filesystem::path execution_state_root_path;
   std::filesystem::path execution_run_root_path;
@@ -2814,6 +2817,9 @@ public:
          " is unavailable before the durable transition checkpoint");
   }
 
+  // A transaction that passed CommitPreflight cannot exceed the codec bound
+  // in practice: the preflight already encoded the same transaction. A breach
+  // here therefore stays the existing uncertain-projection failure.
   manyforge::core::ProjectionCommitResultDTO ApplyTransaction(
       const manyforge::core::SceneTransactionDTO &transaction) override {
     auto result = adapter_->ProjectionCall<
@@ -2874,15 +2880,7 @@ public:
         adapter_->ProjectionCall<manyforge::core::ProjectionHealthDTO>(
             binding_,
             detail::NativeProjectionHealthQuery{binding_, selected_revision});
-    RequireHealth(health);
-    if (health.active_projection_revision.has_value() &&
-        (health.active_projection_revision->retained_bundle_id !=
-             selected_revision.retained_bundle_id ||
-         health.active_projection_revision->graph_revision !=
-             selected_revision.graph_revision)) {
-      Fail(
-          "native projection health response names a different retained model");
-    }
+    RequireSelectedHealth(health, selected_revision);
     return health;
   }
 
@@ -2945,6 +2943,49 @@ public:
                 binding_, logical_scene, effective_policy_revision_id});
   }
 
+  // One exchange; the candidate stays here, the host applies the delta.
+  // A refusal of the call itself (a codec bound breach on encode or a typed
+  // host-side failure) is returned as the error.
+  manyforge::core::Result<manyforge::core::SceneCommitPreflightDTO>
+  CommitPreflight(
+      const manyforge::core::ProjectionRevisionDTO &selected_revision,
+      const manyforge::core::SceneTransactionDTO *transaction,
+      const manyforge::core::LogicalSceneSnapshotDTO *) const override {
+    if (!selected_revision.valid()) {
+      Fail("native projection health selector is invalid");
+    }
+    detail::NativeProjectionCommitPreflightRequest request{binding_,
+                                                           selected_revision};
+    if (transaction != nullptr) {
+      request.transaction = *transaction;
+    }
+    auto called = adapter_->ProjectionResultCall<
+        detail::NativeProjectionCommitPreflightResult>(binding_,
+                                                       std::move(request));
+    if (!called.ok()) {
+      return manyforge::core::Result<
+          manyforge::core::SceneCommitPreflightDTO>::Err(called.error());
+    }
+    auto &result = called.value();
+    RequireSelectedHealth(result.health, selected_revision);
+    manyforge::core::SceneCommitPreflightDTO preflight{std::move(result.health),
+                                                       std::nullopt};
+    if (result.effective_policy.has_value()) {
+      using PolicyResult =
+          manyforge::core::Result<manyforge::core::CollisionPolicySnapshot>;
+      auto &policy = *result.effective_policy;
+      preflight.effective_policy =
+          std::holds_alternative<manyforge::core::CollisionPolicySnapshot>(
+              policy)
+              ? PolicyResult::Ok(std::get<manyforge::core::CollisionPolicySnapshot>(
+                    std::move(policy)))
+              : PolicyResult::Err(
+                    std::get<manyforge::core::ErrorDTO>(std::move(policy)));
+    }
+    return manyforge::core::Result<manyforge::core::SceneCommitPreflightDTO>::
+        Ok(std::move(preflight));
+  }
+
 private:
   void RequireBinding(
       const manyforge::core::ProjectionExecutionHostBindingDTO &binding,
@@ -2958,6 +2999,20 @@ private:
   void RequireHealth(
       const manyforge::core::ProjectionHealthDTO &health) const {
     RequireBinding(health.execution_host_binding, "health response");
+  }
+
+  void RequireSelectedHealth(
+      const manyforge::core::ProjectionHealthDTO &health,
+      const manyforge::core::ProjectionRevisionDTO &selected_revision) const {
+    RequireHealth(health);
+    if (health.active_projection_revision.has_value() &&
+        (health.active_projection_revision->retained_bundle_id !=
+             selected_revision.retained_bundle_id ||
+         health.active_projection_revision->graph_revision !=
+             selected_revision.graph_revision)) {
+      Fail(
+          "native projection health response names a different retained model");
+    }
   }
 
   std::shared_ptr<Impl> adapter_;
@@ -3015,7 +3070,6 @@ RetainedExecutionHostUnitAdapter::RetainedExecutionHostUnitAdapter(
         &artifact_source,
     std::string operating_system, std::string launch_environment_contract,
     std::filesystem::path activation_root,
-    std::filesystem::path scene_asset_root,
     std::optional<std::string> site_settings_document,
     std::function<manyforge::core::ActiveBundlePublicationReceiptDTO()>
         active_publication)
@@ -3026,7 +3080,7 @@ RetainedExecutionHostUnitAdapter::RetainedExecutionHostUnitAdapter(
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
-          std::move(activation_root), std::move(scene_asset_root),
+          std::move(activation_root),
           std::move(site_settings_document), std::move(active_publication)) {}
 
 RetainedExecutionHostUnitAdapter::RetainedExecutionHostUnitAdapter(
@@ -3042,7 +3096,6 @@ RetainedExecutionHostUnitAdapter::RetainedExecutionHostUnitAdapter(
     std::string operating_system,
     std::vector<std::string> launch_environment_contracts,
     std::filesystem::path activation_root,
-    std::filesystem::path scene_asset_root,
     std::optional<std::string> site_settings_document,
     std::function<manyforge::core::ActiveBundlePublicationReceiptDTO()>
         active_publication)
@@ -3052,7 +3105,7 @@ RetainedExecutionHostUnitAdapter::RetainedExecutionHostUnitAdapter(
           std::move(manager_run_root), std::move(execution_state_root),
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system), std::move(launch_environment_contracts),
-          std::move(activation_root), std::move(scene_asset_root),
+          std::move(activation_root),
           std::move(site_settings_document))) {
   impl_->active_publication = std::move(active_publication);
 }

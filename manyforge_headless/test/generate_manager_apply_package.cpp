@@ -204,8 +204,6 @@ struct ProgramPublication final {
   options.catalog_content_version =
       physical.bundle->value().catalogs.node_environment.content_version;
   auto authored = deployment::test::make_program_root(options);
-  authored = With(std::move(authored), "program_id", V("program_apply_fixture"));
-  authored = With(std::move(authored), "name", V("Manager Apply fixture"));
   const V target(V::Object{{"component_id", V(std::string(profile.component_id))},
                            {"command_target_id", V(std::string(profile.command_target_id))}});
   V::Object selected_parameters{{"target", target}};
@@ -334,14 +332,10 @@ void WriteMetadata(
       {"admission_filename", V(admission_filename.string())},
       {"cell_id", V(admission.cell_id().value())},
       // Close: the Apply of the empty intent, compiled the normal way.
-      {"close_deployment_artifact_id",
-       V(close.value().deployment_artifact_id.value())},
       {"close_deployment_revision", V(close.value().deployment_revision.value())},
       {"close_retained_bundle_id", V(close.retained_bundle_id().value())},
       {"physical_candidate_retained_bundle_id",
        V(physical.retained_bundle_id().value())},
-      {"physical_deployment_artifact_id",
-       V(physical.value().deployment_artifact_id.value())},
       {"physical_deployment_revision",
        V(physical.value().deployment_revision.value())},
       {"physical_graph_revision",
@@ -351,7 +345,6 @@ void WriteMetadata(
        V(admission.retained_bundle_id().value())},
       {"prepared_activations", std::move(prepared_activations)},
       {"program_binding_id", V(program.binding_id.value())},
-      {"program_id", V("program_apply_fixture")},
       {"program_revision", V(program.program_revision.value())},
   }));
   std::ofstream stream(path, std::ios::binary | std::ios::trunc);

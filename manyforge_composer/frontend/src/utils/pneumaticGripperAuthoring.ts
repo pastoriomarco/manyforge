@@ -20,7 +20,7 @@ function object(value: JsonValue | undefined): Record<string, JsonValue> | null 
 /** Read the authored gripper rows, independently of any Applied descriptor. */
 export function pneumaticGripperDrafts(document: Record<string, JsonValue> | null): PneumaticGripperDraft[] {
   if (document === null) return [];
-  const intent = document.api_version === 'manyforge.deployment_intent.v2';
+  const intent = document.api_version === 'manyforge.deployment_intent.v3';
   const holders = intent ? document.components : object(document.graph)?.runtime_units;
   if (!Array.isArray(holders)) return [];
   return holders.flatMap((holder, index) => {

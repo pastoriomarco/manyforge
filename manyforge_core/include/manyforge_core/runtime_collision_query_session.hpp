@@ -30,25 +30,34 @@ enum class RuntimeCollisionTickReason {
   kPolicyCapacityExceeded,
   kDistanceRequestModeUnsupported,
   kRequiredCapabilityUnsupported,
-  kActiveContactPolicyUnknown,
-  kActiveContactPolicyInvalid,
+  /// A contact rule without tracked state (whole move without a limit, or
+  /// with an end window) holds an invalid value.
+  kContactRuleInvalid,
   kObservedStateShapeMismatch,
   kObservedStateNotFinite,
+  /// Another component of the cell: its observed state is older than its own
+  /// stream limit, or it has published none.
+  kOtherComponentStateStale,
+  kOtherComponentStateAbsent,
   kObservationCapacityExceeded,
   kEngineInconclusive,
   kBlockingCollision,
   kContactReleasePolicyInvalid,
-  kContactReleaseProcessUnsupported,
   kContactReleaseMissingClearance,
   kContactReleaseNewContact,
   kContactReleaseInitialPenetrationExceeded,
   kContactReleaseRecontact,
   kContactReleaseRecontactPenetrationExceeded,
   kContactReleasePenetrationIncreased,
-  kBoundedContactPenetrationExceeded,
+  /// A whole-move contact rule's depth limit was exceeded.
+  kContactPenetrationExceeded,
+  /// A spring's penetration grew by more than its step limit (OD-356).
+  kContactCompressionStepExceeded,
 };
 
-enum class RuntimeContactGraspViolation {
+/// Depth violation of a pair under a contact rule with an end window
+/// (the monitor checks its depth only, not its window).
+enum class RuntimeContactRuleViolation {
   kNone,
   kMissingClearance,
   kPenetrationExceeded,
@@ -76,15 +85,17 @@ struct RuntimeCollisionTickOutcome {
   std::optional<double> initial_penetration_m;
   std::optional<double> previous_penetration_m;
   std::optional<double> current_penetration_m;
-  std::optional<double> max_contact_penetration_m;
-  std::optional<CollisionContactPolicyMode> contact_policy_mode;
-  std::optional<ContactReleaseEvidenceMode> release_evidence_mode;
+  /// The contact or release rule of `pair` when the outcome is about one;
+  /// owned by the bound policy index, like `pair`.
+  const CollisionPairContactRule* contact_rule = nullptr;
   bool contact_present = false;
   std::size_t initial_contact_pair_count = 0;
   std::size_t current_contact_pair_count = 0;
   CollisionDistanceRequestMode distance_request_mode = CollisionDistanceRequestMode::kNone;
   std::size_t evaluated_distance_pair_count = 0;
-  RuntimeContactGraspViolation contact_grasp_violation = RuntimeContactGraspViolation::kNone;
+  RuntimeContactRuleViolation contact_rule_violation = RuntimeContactRuleViolation::kNone;
+  /// Set with kOtherComponentState*: the component, owned by the session.
+  const ControllableComponentId* other_component = nullptr;
 };
 
 struct RuntimeContactReleaseStateEntry {
@@ -102,20 +113,40 @@ struct RuntimeContactReleaseStateSnapshot {
   RuntimeCollisionQueryBundlePtr binding_owner;
 };
 
+/// The compression of one spring pair at the last clear check (OD-358): a
+/// pair under a contact rule with `max_compression_step_m` that overlaps.
+struct RuntimeSpringCompressionEntry {
+  /// Owned by the bound policy index, like the pair.
+  const CollisionPairContactRule* rule = nullptr;
+  double depth_m = 0.0;
+  /// Unit vector (world frame) that moves the rule's side a out of side b.
+  std::array<double, 3> push_direction_a{};
+};
+
+/// Fixed-capacity copy of the spring compressions; `binding_owner` pins the
+/// policy index that owns every `entry.rule`.
+struct RuntimeSpringCompressionSnapshot {
+  std::array<RuntimeSpringCompressionEntry, 64> entries{};
+  std::size_t count = 0;
+  RuntimeCollisionQueryBundlePtr binding_owner;
+};
+
 /// Execution-bound, single-consumer runtime collision query state. Construction
 /// and prepare() are NRT monitor-arm operations. One session remains continuous
 /// across motion-to-controlled-stop protection-owner generations so contact
 /// history is not re-baselined. tick() owns fixed-capacity projection/contact
 /// state and delegates to the engine's dedicated runtime surface; a clean warm
-/// pass creates no framework-owned DTO/map/string storage.
+/// pass creates no framework-owned DTO/map/string storage. Every contact and
+/// release rule of the bound policy is active.
 class RuntimeCollisionQuerySession final {
  public:
+  /// Bound on the tracked contact-rule pairs of one policy: release rules and
+  /// whole-move contact rules with a depth limit.
   static constexpr std::size_t kMaxSupportContacts = 64;
 
   RuntimeCollisionQuerySession(
       RuntimeCollisionStateProjection projection, ICollisionWorldSnapshotPublisher& publisher,
-      std::shared_ptr<ICollisionQueryEngine> engine, std::string active_contact_policy_id,
-      std::int64_t query_timeout_ns);
+      std::shared_ptr<ICollisionQueryEngine> engine, std::int64_t query_timeout_ns);
 
   /// With keep_admitted_policy, the session keeps initial_bundle's policy (the
   /// move's admitted operation-local policy) for its whole life, whatever the
@@ -124,35 +155,40 @@ class RuntimeCollisionQuerySession final {
   [[nodiscard]] std::optional<ErrorDTO> prepare(
       const RuntimeCollisionQueryBundlePtr& initial_bundle,
       bool keep_admitted_policy = false);
+  /// `now_ns`: the caller's receiver-clock time, for the other components'
+  /// observed positions the projection reads at this check.
   [[nodiscard]] RuntimeCollisionTickOutcome tick(const RuntimeCollisionQueryBundlePtr& bundle,
                                                  std::span<const double> observed_positions_rad,
-                                                 std::int64_t state_time_ns) noexcept;
+                                                 std::int64_t state_time_ns,
+                                                 std::int64_t now_ns) noexcept;
   /// Single consumer (the monitor tick).
   [[nodiscard]] RuntimeCollisionQueryBundlePtr acquire_bundle();
   [[nodiscard]] const CollisionEngineCapabilityDescriptor& engine_capability() const noexcept {
     return *capability_;
   }
-  [[nodiscard]] const std::string& active_contact_policy_id() const noexcept {
-    return active_contact_policy_id_;
-  }
   /// Single-consumer snapshot taken immediately after a clear tick. Pair
   /// pointers remain valid because the returned snapshot pins the immutable
   /// runtime bundle that owns the bound policy index.
   [[nodiscard]] RuntimeContactReleaseStateSnapshot contact_release_state_snapshot() const noexcept;
+  /// Single-consumer, after a clear tick: every spring pair that overlaps at
+  /// that check, with its depth and push-back direction. A pair the engine
+  /// gave no normal for is left out.
+  [[nodiscard]] RuntimeSpringCompressionSnapshot spring_compression_snapshot() const noexcept;
 
  private:
   struct ContactReleaseState {
     const CollisionPairId* pair = nullptr;
-    const SupportContactPolicyEntry* policy = nullptr;
+    const CollisionPairContactRule* policy = nullptr;
     ContactReleaseEvaluationState transition_state;
     bool observed_in_contact = false;
     std::optional<double> observed_clearance_m;
+    std::optional<std::array<double, 3>> observed_normal_a_to_b;
   };
 
   bool bind_policy(const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
   bool bind_distance_selection(const RuntimeCollisionQueryBundlePtr& bundle) noexcept;
   RuntimeCollisionTickOutcome project_observed_state(
-      std::span<const double> observed_positions_rad) noexcept;
+      std::span<const double> observed_positions_rad, std::int64_t now_ns) noexcept;
   RuntimeCollisionTickOutcome classify(
       const RuntimeCollisionQueryResultView& query_result) noexcept;
   RuntimeCollisionTickOutcome update_contact_release(
@@ -164,7 +200,6 @@ class RuntimeCollisionQuerySession final {
   ICollisionWorldSnapshotPublisher* publisher_ = nullptr;
   std::shared_ptr<ICollisionQueryEngine> engine_;
   const CollisionEngineCapabilityDescriptor* capability_ = nullptr;
-  std::string active_contact_policy_id_;
   std::int64_t query_timeout_ns_ = 0;
   std::vector<double> query_positions_rad_;
   // Pin the publisher's complete reclamation unit. Keeping only policy/index
@@ -177,7 +212,6 @@ class RuntimeCollisionQuerySession final {
   RuntimeCollisionQueryBundlePtr admitted_policy_bundle_;
   const CollisionPolicySnapshot* bound_policy_ = nullptr;
   const CollisionPolicyIndex* bound_policy_index_ = nullptr;
-  const ContactGraspPolicyEntry* active_contact_policy_ = nullptr;
   std::array<ContactReleaseState, kMaxSupportContacts> release_states_{};
   std::size_t release_state_count_ = 0;
   std::size_t initial_contact_pair_count_ = 0;

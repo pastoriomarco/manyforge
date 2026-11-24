@@ -15,7 +15,7 @@ def test_incomplete_forest_and_raw_integer_kind():
     root = Path(__file__).resolve().parents[2]
     catalog = NodeCatalog(root / "manyforge_behavior/resources/node_catalog.yaml")
     authoring = empty_authoring(catalog)
-    assert authoring["api_version"] == "manyforge.program.v3"
+    assert authoring["api_version"] == "manyforge.program.v4"
     assert authoring["schema_version"] == AUTHORING_FOREST_VERSION
     before = deepcopy(authoring)
     candidate, diagnostics = derive_candidate(authoring, catalog)

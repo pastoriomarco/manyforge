@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
+import fcntl
 from functools import lru_cache
 import json
 import hashlib
@@ -14,7 +16,7 @@ import stat
 import subprocess
 import tempfile
 import threading
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 import rfc8785
 import yaml
@@ -47,16 +49,15 @@ _PREPARED_ACTIVATION_ID = re.compile(r"sha256:([0-9a-f]{64})")
 _RECEIPT_FIELDS = {
     "assistant_mode",
     "captured_input_digest",
-    "deployment_artifact_id",
     "deployment_revision",
     "graph_revision",
     "node_environment_digest",
     "prepared_activation_id",
-    "program_id",
     "program_outcome",
     "program_revision",
     "retained_bundle_id",
     "origin",
+    "scene_meshes",
     "schema_version",
 }
 _EXPECTED_RESULT_FIELDS = _RECEIPT_FIELDS | {"activation_payload"}
@@ -178,13 +179,13 @@ def _require_admitted_program(value: Mapping[str, Any]) -> None:
     Native preparation proves the Program's content identity, envelope, roles,
     tree, key-typed parameters, value sources, expressions and execution
     groups against the retained catalog, but not the remaining node-catalog
-    parameter, Scene, blackboard and contact-policy semantics the Program
+    parameter, Scene, blackboard and collision-rule semantics the Program
     validator owns. The admitted Program is content-addressed, so this one
     check covers every later read of the Applied Program.
     """
 
     program = value["activation_payload"].get("program")
-    if value.get("program_id") is None:
+    if value.get("program_revision") is None:
         if program is not None:
             raise HeadlessApiError(
                 "activation_preparer_response_invalid",
@@ -193,7 +194,6 @@ def _require_admitted_program(value: Mapping[str, Any]) -> None:
         return
     if (
         not isinstance(program, dict)
-        or program.get("program_id") != value.get("program_id")
         or program.get("program_revision") != value.get("program_revision")
     ):
         raise HeadlessApiError(
@@ -272,7 +272,7 @@ def _validate_raw_reference_program(program: Mapping[str, Any], draft: bool) -> 
         from manyforge_behavior.authoring_forest import AuthoringForestError, derive_candidate
 
         try:
-            require_program_format(program, supported_api_version="manyforge.program.v3")
+            require_program_format(program, supported_api_version="manyforge.program.v4")
             derive_candidate(dict(program), _program_catalog())
         except ProgramFormatUnsupported as error:
             raise HeadlessApiError(error.code, str(error), details=error.details) from error
@@ -552,7 +552,7 @@ class ActivationPreparer:
         candidate slot does not hold is refused with ``model_sources_unknown``.
         """
         try:
-            require_program_format(program, supported_api_version="manyforge.program.v3")
+            require_program_format(program, supported_api_version="manyforge.program.v4")
         except ProgramFormatUnsupported as error:
             raise HeadlessApiError(error.code, str(error), details=error.details) from error
         try:
@@ -624,6 +624,113 @@ class ActivationPreparer:
         result["selector_facts"] = selector
         return result
 
+    def _run(
+        self, command: list[str], *, timeout_code: str, timeout_message: str
+    ) -> tuple[int, bytes, str]:
+        """Run the preparer once: (exit status, stdout, stderr text), bounded."""
+
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            try:
+                completed = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    check=False,
+                    timeout=self._timeout_seconds,
+                    close_fds=True,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise HeadlessApiError(timeout_code, timeout_message) from error
+            stdout_size = stdout.tell()
+            stderr_size = stderr.tell()
+            if (
+                stdout_size > _MAXIMUM_COMPILER_OUTPUT_BYTES
+                or stderr_size > _MAXIMUM_COMPILER_ERROR_BYTES
+            ):
+                raise HeadlessApiError(
+                    "activation_preparer_output_oversized",
+                    "Activation preparer output exceeded its bound",
+                )
+            stdout.seek(0)
+            stderr.seek(0)
+            output = stdout.read()
+            detail = stderr.read().decode("utf-8", errors="replace").strip()
+        return completed.returncode, output, detail
+
+    @contextmanager
+    def content_writer_hold(self) -> Iterator[None]:
+        """Shared hold of the activation root's content writer lock.
+
+        The same lock (`ActivationContentWriterLock`,
+        `<activation root>/.activation-content.lock`) a preparation holds
+        from its first content write until a prepared activation names that
+        content. The Manager's content collection takes it exclusively
+        without waiting and defers while any writer holds it, so content
+        stored under this hold stays until the hold ends: a runtime-captured
+        scene mesh is stored and committed to the Scene inside one hold.
+        """
+
+        descriptor = os.open(
+            self._activation_root / ".activation-content.lock",
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o644,
+        )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+            yield
+        finally:
+            os.close(descriptor)
+
+    def store_scene_mesh(self, value: bytes, *, resource_uri: str) -> str:
+        """Store one runtime-captured scene mesh content-addressed (OD-335).
+
+        The preparer's store mode writes the bytes into the activation
+        raw-artifact store under its content writer lock; returns the
+        ``sha256:`` content digest it printed, checked against the bytes.
+        """
+
+        digest = "sha256:" + hashlib.sha256(value).hexdigest()
+        input_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix="scene-mesh-", suffix=".blob", delete=False,
+            ) as input_file:
+                input_file.write(value)
+                input_file.flush()
+                input_path = Path(input_file.name)
+            returncode, output, detail = self._run(
+                [
+                    str(self._executable),
+                    "--store-scene-mesh",
+                    str(input_path),
+                    "--activation-root",
+                    str(self._activation_root),
+                ],
+                timeout_code="scene_mesh_unavailable",
+                timeout_message=f"Storing scene mesh {resource_uri!r} timed out",
+            )
+        finally:
+            if input_path is not None:
+                input_path.unlink(missing_ok=True)
+        if returncode != 0:
+            raise HeadlessApiError(
+                "scene_mesh_unavailable",
+                f"Scene mesh {resource_uri!r} could not be stored",
+                details={"preparer_detail": detail[:4096]},
+            )
+        try:
+            stored = json.loads(output.decode("utf-8", errors="strict"))
+        except (UnicodeError, ValueError):
+            stored = None
+        if stored != {"byte_size": len(value), "content_digest": digest}:
+            raise HeadlessApiError(
+                "activation_preparer_response_invalid",
+                f"Activation preparer stored scene mesh {resource_uri!r} with a "
+                "divergent identity",
+            )
+        return digest
+
     def prepared_value(self, prepared_activation_id: str) -> dict[str, Any] | None:
         """Return the capacity-one immutable activation receipt."""
 
@@ -646,6 +753,7 @@ class ActivationPreparer:
         captured_input_digest: str,
         deployment: Mapping[str, Any],
         model_source_closure: Mapping[str, Any],
+        scene_mesh_closure: Mapping[str, Any],
         program: Mapping[str, Any] | None,
     ) -> dict[str, Any]:
         origin = {"kind": "scenario", "scenario_id": scenario_id,
@@ -658,7 +766,7 @@ class ActivationPreparer:
                 profiles=self._profiles,
             )
             return {
-                "schema_version": "manyforge.activation_preparation_request.v4",
+                "schema_version": "manyforge.activation_preparation_request.v5",
                 "runtime_cell_id": self._runtime_cell_id,
                 "source_document_digest": source_document_digest,
                 "scenario_id": scenario_id,
@@ -667,6 +775,7 @@ class ActivationPreparer:
                 "deployment": dict(deployment),
                 "model_source_closure": dict(model_source_closure),
                 "prepared_model_closure": prepared_model_closure,
+                "scene_mesh_closure": dict(scene_mesh_closure),
                 "program": dict(program) if program is not None else None,
             }
 
@@ -687,11 +796,10 @@ class ActivationPreparer:
             captured_program = request["program"]
             if captured_program is not None:
                 try:
-                    require_program_format(captured_program, supported_api_version="manyforge.program.v3")
+                    require_program_format(captured_program, supported_api_version="manyforge.program.v4")
                 except ProgramFormatUnsupported as error:
                     raise HeadlessApiError(error.code, str(error), details=error.details) from error
             _require_admitted_program({
-                "program_id": captured_program.get("program_id") if captured_program is not None else None,
                 "program_revision": captured_program.get("program_revision") if captured_program is not None else None,
                 "activation_payload": {"program": captured_program},
             })
@@ -721,37 +829,11 @@ class ActivationPreparer:
             ]
             if self._publish_canonical_empty:
                 command.append("--publish-canonical-empty")
-            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-                try:
-                    completed = subprocess.run(
-                        command,
-                        stdin=subprocess.DEVNULL,
-                        stdout=stdout,
-                        stderr=stderr,
-                        check=False,
-                        timeout=self._timeout_seconds,
-                        close_fds=True,
-                    )
-                except subprocess.TimeoutExpired as error:
-                    raise HeadlessApiError(
-                        "activation_preparation_timeout",
-                        "Activation preparation timed out",
-                    ) from error
-                stdout_size = stdout.tell()
-                stderr_size = stderr.tell()
-                if (
-                    stdout_size > _MAXIMUM_COMPILER_OUTPUT_BYTES
-                    or stderr_size > _MAXIMUM_COMPILER_ERROR_BYTES
-                ):
-                    raise HeadlessApiError(
-                        "activation_preparer_output_oversized",
-                        "Activation preparer output exceeded its bound",
-                    )
-                stdout.seek(0)
-                stderr.seek(0)
-                output = stdout.read()
-                detail = stderr.read().decode("utf-8", errors="replace").strip()
-            if completed.returncode != 0:
+            returncode, output, detail = self._run(
+                command, timeout_code="activation_preparation_timeout",
+                timeout_message="Activation preparation timed out",
+            )
+            if returncode != 0:
                 format_refusal = _format_refusal(output)
                 if format_refusal is not None:
                     raise HeadlessApiError(
@@ -792,7 +874,7 @@ class ActivationPreparer:
                 not isinstance(receipt, dict)
                 or set(receipt) != _RECEIPT_FIELDS
                 or receipt.get("schema_version")
-                != "manyforge.prepared_activation_input.v7"
+                != "manyforge.prepared_activation_input.v8"
                 or receipt.get("origin") != origin
                 or receipt.get("captured_input_digest") != captured_input_digest
                 or not isinstance(receipt.get("prepared_activation_id"), str)

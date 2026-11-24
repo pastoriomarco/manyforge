@@ -476,7 +476,6 @@ class _Snapshot:
             "applied_record_digest": _DIGEST_B,
             "scenario_id": "scenario.1",
             "source_document_digest": _DIGEST_A,
-            "program_id": "program.1",
             "program_revision": _DIGEST_A,
             "program_binding_id": _DIGEST_B,
             "retained_bundle_id": _DIGEST_A,
@@ -578,6 +577,10 @@ class _Owner:
     def failure_holds(self, _program_run_id: str):
         return ()
 
+    def operator_questions(self, _program_run_id: str):
+        # The open operator questions the run's tick last published (OD-342).
+        return ()
+
     def hold_motion_groups(self, _program_run_id: str, _node_instance_id: str):
         return ("all",), "all"
 
@@ -651,6 +654,15 @@ class _RuntimeControlOwner(_Owner):
     ) -> _Snapshot:
         self.effects.append(("write", deepcopy(values)))
         return self._advance(program_run_id)
+
+
+class _KeyValuesOwner(_Owner):
+    def read_runtime_blackboard(self, program_run_id: int):
+        if program_run_id not in self.rows:
+            raise ProgramRunOwnerError("Program run does not exist")
+        return self.rows[program_run_id], [
+            {"key": "count", "type": "int64", "value_state": "value", "value": 2},
+        ]
 
 
 class _Host:
@@ -1082,7 +1094,6 @@ def _bypass_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
         "_prepare_run_scene",
         lambda _self, _admission, _run_id, **_kwargs: (
             SimpleNamespace(
-                program_id="cell-pick",
                 program_revision=_DIGEST_A,
                 program_binding_id=_DIGEST_B,
                 retained_bundle_id=_DIGEST_A,
@@ -1122,7 +1133,6 @@ class _PreparedRunAdmission:
         return SimpleNamespace(
             program_run_id=program_run_id,
             context_kind=context_kind,
-            program_id="cell-pick",
             program_revision=_DIGEST_A,
             program_binding_id=_DIGEST_B,
             retained_bundle_id=_DIGEST_A,
@@ -1137,7 +1147,7 @@ def test_empty_scenario_clear_uses_current_apply_and_not_program_binding(monkeyp
 
     class EmptyHeadless(_Headless):
         def program_applied_status(self):
-            return {"program_id": None, "record_digest": _DIGEST_B,
+            return {"program_revision": None, "record_digest": _DIGEST_B,
                     "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B}
 
         def committed_scenario_activation(self):
@@ -1512,7 +1522,6 @@ def _carried_object_loss_runtime(
         run_id: ProgramRuntimeControls(
             {
                 "program_run_id": run_id,
-                "program_id": "program.1",
                 "program_revision": _DIGEST_A,
                 "program_binding_id": _DIGEST_B,
                 "retained_bundle_id": _DIGEST_A,
@@ -1573,7 +1582,7 @@ def _real_persistent_loss_program() -> Program:
         deepcopy(document),
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, catalog)
 
@@ -3185,7 +3194,6 @@ def test_manual_handover_requeries_kernel_and_retains_cleanup_outcome(
                     "request_key": _key("manual.1"),
                     "source_label": "test",
                 },
-                "program_id": "direct",
                 "program_revision": _DIGEST_A,
                 "program_binding_id": _DIGEST_B,
                 # Manual work carries no run number; its parent run is in
@@ -3673,6 +3681,47 @@ def test_cycle_status_projects_pending_acquire_as_starting(tmp_path) -> None:
     runtime.shutdown()
 
 
+def test_key_values_read_projects_the_owner_store_under_the_run_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            application_start_id=_A,
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
+        admission_client=_Admission(),  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
+    )
+    runtime._host.shutdown()  # noqa: SLF001
+    owner = _KeyValuesOwner()
+    runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
+    runtime._host = _Host(owner, owner_id=runtime.owner_id)  # type: ignore[assignment]  # noqa: SLF001
+    runtime.start()
+    program_run_id = runtime.start_run(_start_request())["capture"]["program_run_id"]
+
+    values = runtime.read_runtime_blackboard(program_run_id)
+
+    assert values == {
+        "schema_version": "manyforge.program_runtime_blackboard_values.v1",
+        "owner_id": runtime.owner_id,
+        "program_run_id": program_run_id,
+        "run_revision": 1,
+        "node_status_revision": 1,
+        "keys": [{"key": "count", "type": "int64", "value_state": "value", "value": 2}],
+    }
+    with pytest.raises(ProgramRunnerError) as unknown:
+        runtime.read_runtime_blackboard(program_run_id + 1)
+    assert unknown.value.code == "program_run_not_found"
+
+
 def test_runtime_controls_are_state_conditioned_and_project_current_controls(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -4069,7 +4118,6 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
     if phase_write_failure:
         capture = {
             "program_run_id": 1,
-            "program_id": "program.1",
             "program_revision": _DIGEST_A,
             "program_binding_id": _DIGEST_B,
             "retained_bundle_id": _DIGEST_A,
@@ -4750,7 +4798,6 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
         readiness=NodeExecutionReadiness(program_binding_id=_DIGEST_B,
             binding_by_node={"timer": AvailabilityFact(True)}, owner_by_port=runtime._owner_availability),
         program=SimpleNamespace(
-            program_id="program.1",
             program_revision=_DIGEST_A,
             tree=root,
         ),
@@ -5543,10 +5590,10 @@ def _simulation_lane_context(runtime, binding, *, scenario="isaac-cell", role="a
 
     program = _simulation_lane_program(role) if program is None else deepcopy(program)
     program.setdefault("scene", [])
-    program.update(program_id=binding["program_id"], program_revision=binding["program_revision"])
+    program.update(program_revision=binding["program_revision"])
     return ProgramRunPortContext(program_run_id=51, applied_record_digest=_DIGEST_B,
         scenario_id=scenario, source_document_digest=_DIGEST_A,
-        program_id=binding["program_id"], program_revision=binding["program_revision"],
+        program_revision=binding["program_revision"],
         program_binding_id=binding["program_binding_id"], retained_bundle_id=_DIGEST_A,
         graph_revision=_DIGEST_B, node_environment_digest=runtime._environment.environment_digest,
         program=program, program_binding=binding)
@@ -5959,7 +6006,7 @@ def test_public_node_availability_projects_real_simulator_eligibility_without_ta
                 binding_by_node={row.row.node_id: AvailabilityFact(True) for row in
                     build_executable_node_resolver(runtime._environment).dispositions},  # noqa: SLF001
                 owner_by_port=kwargs["owner_availability"]),
-            program=SimpleNamespace(program_id=binding["program_id"], program_revision=_DIGEST_A,
+            program=SimpleNamespace(program_revision=_DIGEST_A,
                 tree=SimpleNamespace(node_id=node_id, parameters=raw_node["parameters"], children=())))
 
     monkeypatch.setattr("manyforge_program_runner.runtime.build_applied_program_run_admission", admit)
@@ -7259,6 +7306,134 @@ def test_continue_closes_releases_and_fails_the_held_node(monkeypatch, tmp_path)
         # Continue counts no Retry, even with the Retry budget spent.
         assert runtime._controls(1).retry_count("move.2") == 1
         assert not journal.read().reconciliation_required
+    finally:
+        runtime.shutdown()
+
+
+def test_an_operator_question_is_answered_through_the_recovery_action(
+    monkeypatch, tmp_path
+):
+    """OD-342: the question is published with the runtime controls (v11) and
+    answered with its option id as the action; no motion gate, no Resume."""
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    runtime, journal, _admission = _reconcile_runtime(tmp_path, inventory={})
+    owner = _Owner()
+    host = _Host(owner, owner_id=runtime.owner_id)
+    runtime._owner, runtime._host = owner, host
+    runtime.start()
+    runtime.start_run(_start_request())
+    options = (
+        {"option_id": "continue", "label": "Bin emptied, continue", "result": "success"},
+        {"option_id": "abort", "label": "Abort this cycle", "result": "failure"},
+    )
+    open_questions = [
+        {
+            "node_instance_id": "ask_bin_full",
+            "node_attempt_id": 41,
+            "message": "Bin is full. Empty it, then choose.",
+            "severity": "warning",
+            "options": options,
+            "hold_motion_group_ids": ("left_arm",),
+        }
+    ]
+    owner.operator_questions = lambda _run_id: tuple(open_questions)
+    answers: list[tuple[int, dict[str, Any]]] = []
+
+    def answer_operator_question(run_id, **kwargs):
+        answers.append((run_id, kwargs))
+        open_questions.clear()  # The run's tick no longer publishes it.
+        return next(row for row in options if row["option_id"] == kwargs["option_id"])
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("an answer is neither a Resume nor an owner recovery")
+
+    host.answer_operator_question = answer_operator_question
+    host.resume_recovery = forbidden
+    host.retry_failure_pause = forbidden
+    host.continue_failure_pause = forbidden
+    try:
+        projection = runtime.read_runtime_controls(1)
+        assert projection["schema_version"] == (
+            "manyforge.program_runtime_control_projection.v11"
+        )
+        [offer] = projection["operator_questions"]
+        assert offer["schema_version"] == "manyforge.program_operator_question.v1"
+        assert offer["program_run_id"] == 1
+        assert offer["node_instance_id"] == "ask_bin_full"
+        assert offer["node_attempt_id"] == 41
+        assert offer["options"] == [dict(row) for row in options]
+        assert offer["hold_motion_group_ids"] == ["left_arm"]
+
+        def request(name: str, **changes: Any) -> CycleRecoveryActionRequest:
+            return CycleRecoveryActionRequest.model_validate(
+                {
+                    "request_key": _key(name),
+                    "source_label": "test",
+                    "offer_id": offer["offer_id"],
+                    "offer_revision": offer["offer_revision"],
+                    "action_id": "abort",
+                    **changes,
+                }
+            )
+
+        for name, changes in (
+            ("question.stale", {"offer_revision": offer["offer_revision"] + 1}),
+            ("question.unknown", {"action_id": "retry_runtime_step"}),
+        ):
+            with pytest.raises(ProgramRunnerError) as stale:
+                runtime.apply_recovery_action(request(name, **changes))
+            assert stale.value.code == "cycle_recovery_offer_stale"
+        assert answers == []
+
+        # Answering moves nothing: no motion_clear or motion-attention gate.
+        runtime._headless.readiness = {
+            "can_execute": False, "can_resume": False, "motion_clear": False,
+            "blocked_reasons": [{"code": "cell_latched", "message": "robot.1: offline"}],
+        }
+        result = runtime.apply_recovery_action(request("question.answer"))
+        assert answers == [
+            (1, {"node_instance_id": "ask_bin_full", "node_attempt_id": 41,
+                 "option_id": "abort"})
+        ]
+        assert owner.attention_checks == []
+        assert result["schema_version"] == "manyforge.cycle_recovery_result.v3"
+        assert result["request_key"] == _key("question.answer")
+        assert result["accepted"] is True
+        assert result["action_id"] == "abort"
+        assert result["cycle_resumed"] is False
+        assert result["result_code"] == "accepted"
+        assert result["owner_result"] == {
+            "accepted": True, "action": "operator_choice", "option_id": "abort",
+        }
+        assert result["run"]["capture"]["program_run_id"] == 1
+        assert result["runtime_controls"]["schema_version"] == (
+            "manyforge.program_runtime_control_projection.v11"
+        )
+        assert result["runtime_controls"]["operator_questions"] == []
+        assert "recovery_offer" in result
+        audit = runtime._controls(1).snapshot()["audit"][-1]
+        assert {key: value for key, value in audit.items() if key != "event_revision"} == {
+            "kind": "program_operator_choice_answered",
+            "node_instance_id": "ask_bin_full",
+            "node_attempt_id": 41,
+            "option_id": "abort",
+            "label": "Abort this cycle",
+            "result": "failure",
+            "request_key": _key("question.answer"),
+            "source_label": "test",
+        }
+        assert journal.read().state == "running"
+        assert not journal.read().reconciliation_required
+
+        # Answered: the same question is stale.
+        with pytest.raises(ProgramRunnerError) as again:
+            runtime.apply_recovery_action(request("question.again", action_id="continue"))
+        assert again.value.code == "cycle_recovery_offer_stale"
+        assert len(answers) == 1
     finally:
         runtime.shutdown()
 

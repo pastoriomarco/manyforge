@@ -39,9 +39,9 @@ ScalarProgram(const d::RetainedBundle &bundle,
               const std::optional<d::VerifiedRetainedModelMap> &map,
               const d::ICatalogArtifactSource &catalog) {
   auto root = d::parse_strict_json_model_yaml(R"({
-    "api_version":"manyforge.program.v3","program_id":"applied_context_fixture",
+    "api_version":"manyforge.program.v4",
     "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "program_profile":"composable-cell-v1","name":"Applied context fixture",
+    "program_profile":"composable-cell-v1",
     "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
     "blackboard":{"namespaces":[],"keys":[
       {"key":"count","type":"int64","access":"read_write","persistence":"run"},
@@ -56,7 +56,7 @@ ScalarProgram(const d::RetainedBundle &bundle,
               V(bundle.value().catalogs.node_environment.content_version)));
   root = replace(root, "program_revision",
                  V(d::detail::compute_content_identity(
-                     root, {"program-revision", "manyforge.program.v3",
+                     root, {"program-revision", "manyforge.program.v4",
                             "program_revision"})));
   return d::verify_program_binding_contract(d::canonical_json(root), bundle, map, catalog);
 }
@@ -101,7 +101,7 @@ protected:
   // The installed product's Applied Program as the host holds it in memory.
   AppliedProgramOwnerSnapshot Applied() const {
     return {c::ActiveBundlePublicationGeneration(2U),
-            program->value().program_id, program->value().program_revision,
+            program->value().program_revision,
             binding->program_binding_id()};
   }
 
@@ -164,8 +164,7 @@ TEST_F(
   static_cast<void>(bindings.put_if_absent(binding, *bundle, *map, catalog));
   // No Manager store exists: the Apply request's facts alone select the products.
   const std::optional<m::HostApplyProgramSelection> selection{
-      m::HostApplyProgramSelection{program->value().program_id,
-                                   program->value().program_revision,
+      m::HostApplyProgramSelection{program->value().program_revision,
                                    binding->program_binding_id()}};
   const auto loaded =
       LoadSelectedProgramProducts(selection, *bundle, *map, package, {});

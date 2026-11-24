@@ -61,9 +61,8 @@ _PROGRAM_FIXTURE = from_program(
 
 def _deployment_intent() -> dict:
     return {
-        "api_version": "manyforge.deployment_intent.v2",
-        "deployment_artifact_id": "fixture_deployment",
-        "name": "Fixture deployment",
+        "api_version": "manyforge.deployment_intent.v3",
+        "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
         "components": [
             {
                 "component_id": "fixture_robot",
@@ -116,7 +115,33 @@ def test_persisted_document_identity_includes_authorable_metadata() -> None:
     )
 
 
-def test_scenario_save_adopts_both_baselines_and_member_saves_preserve_other_draft(
+def test_capture_refuses_a_project_with_dropped_document_fields(tmp_path: Path) -> None:
+    """OD-369: the Scenario is the one identity; old member identity fields are
+    refused with a typed error that names them and the conversion script."""
+
+    target = Path(
+        save_scenario_artifact(
+            _document("old_cell"),
+            str(tmp_path / "old_cell.scenario"),
+            allowed_roots=[str(tmp_path)],
+            overwrite=False,
+        )
+    )
+    for member, field in (("program.yaml", "program_id"), ("deployment.yaml", "name")):
+        path = target / member
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value[field] = "old_cell"
+        path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+
+    with pytest.raises(ScenarioArtifactError) as error:
+        capture_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+    assert error.value.code == "scenario_document_dropped_fields"
+    assert "program.yaml: program_id" in str(error.value)
+    assert "deployment.yaml: name" in str(error.value)
+    assert "scripts/convert_scenarios_od369.py" in str(error.value)
+
+
+def test_scenario_save_adopts_both_baselines_and_a_resave_keeps_rebased_sources(
     tmp_path: Path,
 ) -> None:
     state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
@@ -152,9 +177,17 @@ def test_scenario_save_adopts_both_baselines_and_member_saves_preserve_other_dra
     assert saved["deployment"]["differsFromSaved"] is False
     assert state.current_drafts_match_remembered_scenario()
 
-    # Two unrelated unsaved edits. Save Program must not persist Deployment.
+    # Save As changes the project location, not the referenced model. A later
+    # Save of both edited Drafts into the copy keeps the same source as well.
+    (tmp_path / "nested").mkdir()
+    copy = tmp_path / "nested" / "saved_copy.scenario"
+    response = client.post("/api/scenario-documents/save", json={
+        **_fence(state), **_save_target(copy),
+        "description": "", "confirmOverwrite": False,
+    })
+    assert response.status_code == 200, response.text
     program_state = state.draft_session.retained_state()
-    program_state["authoring"]["name"] = "Edited Program"
+    program_state["authoring"]["compatibility"]["tags"] = ["edited-program"]
     edited, diagnostics = derive_candidate(program_state["authoring"], state.node_catalog)
     assert edited is not None
     program_state["program"] = edited.to_dict()
@@ -164,50 +197,7 @@ def test_scenario_save_adopts_both_baselines_and_member_saves_preserve_other_dra
         state.draft_session.prepare_load_replacement(program_state, state.node_catalog)
     )
     deployment_state = state.deployment_draft_session.retained_state()
-    deployment_state["document"]["name"] = "Edited Deployment"
-    deployment_state["draft_revision"] += 1
-    state.deployment_draft_session.install_prepared_replacement(
-        state.deployment_draft_session.prepare_load_replacement(deployment_state)
-    )
-
-    def member_fence(*, deployment: bool = False) -> dict:
-        fence = _fence(state)
-        if deployment:
-            fence["draftId"] = fence["deploymentDraftId"]
-            fence["expectedDraftRevision"] = fence["expectedDeploymentDraftRevision"]
-        del fence["deploymentDraftId"], fence["expectedDeploymentDraftRevision"]
-        return fence
-
-    response = client.post("/api/program/save", json=member_fence())
-    assert response.status_code == 200, response.text
-    disk, _ = load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
-    assert disk["program_draft"]["name"] == "Edited Program"
-    assert disk["deployment_draft"]["name"] == "Fixture deployment"
-    saved = state.authoring_workspace.snapshot().as_dict()
-    assert saved["program"]["saved"]["matchesDraft"] is True
-    assert saved["deployment"]["differsFromSaved"] is True
-    assert not state.current_drafts_match_remembered_scenario()
-    response = client.post("/api/deployment/save", json=member_fence(deployment=True))
-    assert response.status_code == 200, response.text
-    disk, _ = load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
-    assert disk["deployment_draft"]["name"] == "Edited Deployment"
-    assert state.current_drafts_match_remembered_scenario()
-    assert state.authoring_workspace.snapshot().deployment["differsFromSaved"] is False
-    assert sorted(path.name for path in target.iterdir()) == [
-        "deployment.yaml", "program.yaml", "scenario.yaml"
-    ]
-
-    # Save As changes the project location, not the referenced model. A later
-    # Deployment-only Save must keep the same source after rebasing as well.
-    (tmp_path / "nested").mkdir()
-    copy = tmp_path / "nested" / "saved_copy.scenario"
-    response = client.post("/api/scenario-documents/save", json={
-        **_fence(state), **_save_target(copy),
-        "description": "", "confirmOverwrite": False,
-    })
-    assert response.status_code == 200, response.text
-    deployment_state = state.deployment_draft_session.retained_state()
-    deployment_state["document"]["name"] = "Edited after Save As"
+    deployment_state["document"]["collision_rules"][0]["clearance_m"] = 0.002
     deployment_state["draft_revision"] += 1
     state.deployment_draft_session.install_prepared_replacement(
         state.deployment_draft_session.prepare_load_replacement(
@@ -215,32 +205,46 @@ def test_scenario_save_adopts_both_baselines_and_member_saves_preserve_other_dra
             source_project_root=state.deployment_draft_session.source_project_root,
         )
     )
-    response = client.post("/api/deployment/save", json=member_fence(deployment=True))
+    assert not state.current_drafts_match_remembered_scenario()
+    response = client.post("/api/scenario-documents/save", json={
+        **_fence(state), **_save_target(copy),
+        "description": "", "confirmOverwrite": True,
+    })
     assert response.status_code == 200, response.text
     disk, _ = load_scenario_artifact(str(copy), allowed_roots=[str(tmp_path)])
+    assert disk["program_draft"]["compatibility"]["tags"] == ["edited-program"]
+    assert disk["deployment_draft"]["collision_rules"][0]["clearance_m"] == 0.002
     reference = disk["deployment_draft"]["components"][0]["model_source"]["urdf"]["project_path"]
     assert (copy / reference).resolve() == tmp_path / "model.urdf"
     assert state.current_drafts_match_remembered_scenario()
+    assert sorted(path.name for path in copy.iterdir()) == [
+        "deployment.yaml", "program.yaml", "scenario.yaml"
+    ]
 
 
-@pytest.mark.parametrize(
-    ("program_unapplied", "deployment_applied", "deployment_matches", "expected"),
-    [
-        (False, 7, True, "ready"),
-        (True, 7, True, "unknown"),
-        (None, 7, True, "unknown"),
-        (False, 7, False, "unknown"),
-        (False, None, True, "unknown"),
-    ],
-)
-def test_scenario_save_records_ready_only_for_the_applied_content(
-    tmp_path: Path,
+def _applied_views(
     monkeypatch: pytest.MonkeyPatch,
     program_unapplied: bool | None,
     deployment_applied: int | None,
     deployment_matches: bool,
-    expected: str,
 ) -> None:
+    """The Applied views at the current identity: Program Draft vs Applied and
+    Deployment Draft vs Manager Applied, decided by run admission."""
+
+    monkeypatch.setattr(routes_scenario_documents, "program_workspace", lambda s: {
+        "hasUnappliedChanges": program_unapplied,
+        "authoringWorkspace": s.authoring_workspace.identity().as_dict(),
+    })
+    monkeypatch.setattr(routes_scenario_documents, "deployment_workspace", lambda s: {
+        "draft": {"document": s.authoring_workspace.snapshot().as_dict()["deployment"]["document"],
+                  "deploymentRevision": None},
+        "managerApplied": {"deploymentRevision": deployment_applied},
+        "runAdmission": {"ready": deployment_matches},
+        "authoringWorkspace": s.authoring_workspace.identity().as_dict(),
+    })
+
+
+def _complete_drafts_state(tmp_path: Path) -> ComposerState:
     state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     authoring = deepcopy(_PROGRAM_FIXTURE)
@@ -254,21 +258,87 @@ def test_scenario_save_records_ready_only_for_the_applied_content(
     state.deployment_draft_session.install_prepared_replacement(
         state.deployment_draft_session.prepare_load_replacement(post["deployment"])
     )
-    # A role assignment makes the saved Scenario complete.
     state.authoring_workspace.remember_project(document=_document())
-    # The Applied views at the current identity: Program Draft vs Applied and
-    # Deployment Draft vs Manager Applied, decided by run admission.
-    monkeypatch.setattr(routes_scenario_documents, "program_workspace", lambda s: {
-        "hasUnappliedChanges": program_unapplied,
-        "authoringWorkspace": s.authoring_workspace.identity().as_dict(),
+    return state
+
+
+@pytest.mark.parametrize(
+    ("program_unapplied", "deployment_unapplied"),
+    [(True, False), (False, True), (True, True)],
+)
+def test_scenario_save_with_unapplied_edits_writes_the_applied_state_on_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    program_unapplied: bool,
+    deployment_unapplied: bool,
+) -> None:
+    """OD-365: Save writes only what is applied, so the saved Scenario reopens;
+    unapplied Draft edits stay in the Draft and need the confirmation."""
+
+    state = _complete_drafts_state(tmp_path)
+    applied_program = deepcopy(_PROGRAM_FIXTURE)
+    applied_program["compatibility"]["tags"] = ["applied-program"]
+    applied_deployment = _deployment_intent()
+    applied_deployment["collision_rules"][0]["clearance_m"] = 0.005
+    monkeypatch.setattr(routes_scenario_documents, "applied_program_authoring",
+                        lambda _state: deepcopy(applied_program))
+    monkeypatch.setattr(routes_scenario_documents, "read_applied_deployment",
+                        lambda _state: (deepcopy(applied_deployment), None, "identity"))
+    _applied_views(monkeypatch, program_unapplied, 7, not deployment_unapplied)
+    draft_program = state.draft_session.retained_state()["authoring"]
+    draft_deployment = state.deployment_draft_session.retained_state()["document"]
+    target = tmp_path / "saved_cell.scenario"
+    client = _scenario_client(state)
+    body = {**_fence(state), **_save_target(target), "description": "", "confirmOverwrite": False}
+
+    refused = client.post("/api/scenario-documents/save", json=body)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "scenario_save_unapplied_edits"
+    assert refused.json()["detail"]["message"] == (
+        "Saves the applied state; your unapplied Draft edits are not included. "
+        "Apply first to save them."
+    )
+    assert not target.exists()
+
+    saved = client.post("/api/scenario-documents/save", json={
+        **body, "confirmUnappliedExcluded": True,
     })
-    monkeypatch.setattr(routes_scenario_documents, "deployment_workspace", lambda s: {
-        "draft": {"document": s.authoring_workspace.snapshot().as_dict()["deployment"]["document"],
-                  "deploymentRevision": None},
-        "managerApplied": {"deploymentRevision": deployment_applied},
-        "runAdmission": {"ready": deployment_matches},
-        "authoringWorkspace": s.authoring_workspace.identity().as_dict(),
-    })
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["last_known_status"] == "ready"
+    disk, _ = load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+    assert disk["saved_status"]["last_known_status"] == "ready"
+    assert disk["program_draft"]["compatibility"]["tags"] == (
+        ["applied-program"] if program_unapplied else draft_program["compatibility"]["tags"]
+    )
+    assert disk["deployment_draft"]["collision_rules"][0]["clearance_m"] == (
+        0.005 if deployment_unapplied else 0.001
+    )
+    # The Drafts keep their edits; what was written is their Saved baseline.
+    current = state.authoring_workspace.snapshot().as_dict()
+    assert current["program"]["authoring"] == draft_program
+    assert current["deployment"]["document"] == draft_deployment
+    assert current["program"]["saved"]["matchesDraft"] is (not program_unapplied)
+    assert current["deployment"]["differsFromSaved"] is deployment_unapplied
+
+
+@pytest.mark.parametrize(
+    ("program_unapplied", "deployment_applied", "expected"),
+    [
+        (False, 7, "ready"),
+        (None, 7, "unknown"),
+        (False, None, "unknown"),
+    ],
+)
+def test_scenario_save_records_ready_only_for_the_applied_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    program_unapplied: bool | None,
+    deployment_applied: int | None,
+    expected: str,
+) -> None:
+    state = _complete_drafts_state(tmp_path)
+    # Without unapplied edits Save writes the Drafts, with no confirmation.
+    _applied_views(monkeypatch, program_unapplied, deployment_applied, True)
     target = tmp_path / "saved_cell.scenario"
     response = _scenario_client(state).post("/api/scenario-documents/save", json={
         **_fence(state), **_save_target(target),
@@ -519,7 +589,7 @@ def test_scenario_discard_commits_every_pending_draft_in_one_scenario_commit(
     prepared: list[tuple[str, str, int]] = []
     monkeypatch.setattr(routes_scenario_documents, "program_workspace",
                         lambda _s: {"hasUnappliedChanges": program_pending})
-    monkeypatch.setattr(routes_scenario_documents, "_deployment_unapplied",
+    monkeypatch.setattr(routes_scenario_documents, "deployment_unapplied",
                         lambda _view: deployment_pending)
     monkeypatch.setattr(routes_scenario_documents, "deployment_workspace", lambda _s: {})
 
@@ -580,7 +650,7 @@ def test_scenario_discard_refuses_a_stale_draft_fence_without_containing(
     state.authoring_admission = admission  # type: ignore[assignment]
     monkeypatch.setattr(routes_scenario_documents, "program_workspace",
                         lambda _s: {"hasUnappliedChanges": True})
-    monkeypatch.setattr(routes_scenario_documents, "_deployment_unapplied",
+    monkeypatch.setattr(routes_scenario_documents, "deployment_unapplied",
                         lambda _view: True)
     monkeypatch.setattr(routes_scenario_documents, "deployment_workspace", lambda _s: {})
 
@@ -675,7 +745,7 @@ def test_listing_reports_history_not_current_content_validation(tmp_path: Path) 
         )
     )
     edited = deepcopy(_document("cell")["program_draft"])
-    edited["description"] = "Edited outside"
+    edited["compatibility"]["tags"] = ["edited-outside"]
     (target / "program.yaml").write_text(json.dumps(edited), encoding="utf-8")
 
     _, changed = discover_scenario_artifacts(
@@ -1028,7 +1098,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             (intent["expected_admission_generation"], acquired_generation)
         )
         candidate = {
-            "schema_version": "manyforge.prepared_activation_input.v7",
+            "schema_version": "manyforge.prepared_activation_input.v8",
             "prepared_activation_id": "prepared-load-test",
             "origin": {
                 "kind": "scenario",
@@ -1037,15 +1107,14 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
                 "project_path": intent["project_path"],
             },
             "captured_input_digest": intent["captured_input_digest"],
-            "deployment_artifact_id": "fixture_deployment",
             "deployment_revision": "deployment-revision",
             "retained_bundle_id": "bundle-load-test",
             "graph_revision": "graph-load-test",
-            "program_id": "program-load-test",
             "program_revision": "program-revision",
             "program_outcome": {"kind": "bound", "program_binding_id": "binding-load-test"},
             "node_environment_digest": "sha256:" + "a" * 64,
             "assistant_mode": "forbidden",
+            "scene_meshes": [],
         }
         if prepare_only:
             # Load is the operator's confirmation: one preparation, no token.
@@ -1155,7 +1224,7 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
     before = state.authoring_workspace.snapshot()
 
     candidate = {
-        "schema_version": "manyforge.prepared_activation_input.v7",
+        "schema_version": "manyforge.prepared_activation_input.v8",
         "prepared_activation_id": "prepared-load-test",
         "origin": {
             "kind": "scenario",
@@ -1164,11 +1233,9 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
             "project_path": str(target),
         },
         "captured_input_digest": "sha256:" + "2" * 64,
-        "deployment_artifact_id": "fixture_deployment",
         "deployment_revision": "deployment-revision",
         "retained_bundle_id": "bundle-load-test",
         "graph_revision": "graph-load-test",
-        "program_id": "program-load-test",
         "program_revision": "program-revision",
         "program_outcome": {
             "kind": "bound",
@@ -1176,6 +1243,7 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
         },
         "node_environment_digest": "sha256:" + "a" * 64,
         "assistant_mode": "forbidden",
+        "scene_meshes": [],
     }
 
     def prepare_or_reject(
@@ -1435,9 +1503,10 @@ def test_scenario_load_partial_contained_install_keeps_the_claim(
 
 
 _UNTITLED_DEPLOYMENT = {
-    "api_version": "manyforge.deployment_intent.v2",
-    "deployment_artifact_id": "empty_scenario", "name": "Empty Deployment",
+    "api_version": "manyforge.deployment_intent.v3",
+    "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
     "components": [], "attachments": [], "policies": {},
+    "compatibility": {"provides": [], "tags": []},
 }
 
 
@@ -1449,11 +1518,10 @@ def test_untitled_scenario_resource_is_the_canonical_empty_project(tmp_path: Pat
     """
 
     authoring = empty_authoring(build_node_environment().catalog)
-    authoring.update(program_id="program-untitled", name="Untitled")
     document = build_scenario_document(
         scenario_id="Untitled", name="Untitled", description="",
         program_draft=authoring, deployment_draft=deepcopy(_UNTITLED_DEPLOYMENT),
-        manyforge_version="0.3.1", last_known_status="incomplete",
+        manyforge_version="0.4.0", last_known_status="incomplete",
     )
     members, manifest = scenario_artifacts._project_payload(document, source_snapshot={
         "schema_version": scenario_artifacts.SCENARIO_SOURCE_SNAPSHOT_VERSION, "entries": [],
@@ -1539,6 +1607,181 @@ def test_new_loads_the_read_only_untitled_scenario_and_save_as_places_it(
     assert {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()} == untitled_files
 
 
+def test_save_as_moves_the_deployment_source_folder_to_the_saved_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New -> Save as into a project folder -> a component whose model source
+    is relative to that project -> Save: the path resolves against the saved
+    project, not the read-only Untitled template (live defect)."""
+
+    state = ComposerState(
+        application_start_id=0x3F9A0000000000A1,
+        allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)],
+    )
+    state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
+    state.headless_client = _ManagerStub()  # type: ignore[assignment]
+    monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: ("bundle", "graph"))
+    monkeypatch.setattr(routes_scenario_documents, "program_workspace",
+                        lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
+
+    def prepare_or_apply(
+        intent, claim, *, apply, prepared=None, prepare_only=False, confirmed=False
+    ):
+        if prepare_only:
+            return {"confirmation_required": False, "prepared_activation": {},
+                    "candidate_preview": {"impact": {"components": []}}}
+        return {"status": "accepted", "apply_id": 1, "apply_generation": 1}
+
+    monkeypatch.setattr(state, "execute_authored_deployment_candidate", prepare_or_apply)
+    client = _scenario_client(state)
+    response, _row = client.command("/api/scenario/new", {"discard_unsaved": True})
+    assert response.status_code == 200, response.text
+    projects = tmp_path / "projects"
+    tool = projects / "tools" / "gripper_body" / "gripper_body.urdf"
+    tool.parent.mkdir(parents=True)
+    tool.write_text('<robot name="gripper_body"><link name="body"/></robot>\n', encoding="utf-8")
+    target = projects / "p05_mock.scenario"
+    saved = client.post("/api/scenario-documents/save", json={
+        **_fence(state), **_save_target(target), "description": "", "confirmOverwrite": False,
+    })
+    assert saved.status_code == 200, saved.text
+    session = state.deployment_draft_session
+    assert session.source_project_root == str(target.resolve())
+
+    # A component authored after the Save as, relative to the saved project.
+    row = {
+        "component_id": "gripper_body",
+        "component_profile_id": "manyforge.passive_tool",
+        "frame_prefix": "",
+        "model_source": {
+            "urdf": {"project_path": "../tools/gripper_body/gripper_body.urdf"},
+            "package_roots": {},
+        },
+        "root_pose_in_cell": {
+            "position_m": [0.0, 0.0, 0.0], "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+        },
+        "target_settings": {},
+        "configuration": {"runtime_kind": "ros2_control",
+                          "runtime_configuration": {"component_streams": []}},
+    }
+    compiled = session.preview_component_addition(
+        [row], [], draft_id=session.draft_id, expected_revision=session.revision)
+    session.commit_compiled(compiled, draft_id=session.draft_id,
+                            expected_revision=session.revision)
+
+    again = client.post("/api/scenario-documents/save", json={
+        **_fence(state), **_save_target(target), "description": "", "confirmOverwrite": True,
+    })
+    assert again.status_code == 200, again.text
+    written, _path, _digest = capture_scenario_artifact(
+        str(target), allowed_roots=[str(tmp_path)])
+    (component,) = written["deployment_draft"]["components"]
+    reference = component["model_source"]["urdf"]["project_path"]
+    assert reference == "../tools/gripper_body/gripper_body.urdf"
+    assert (target / reference).resolve() == tool.resolve()
+    # The Draft still resolves the same file against the saved project.
+    assert session.source_project_root == str(target.resolve())
+    # Apply captures the model sources from the same folder: the tool's URDF.
+    from manyforge_behavior.model_source_capture import decode_model_source_artifact
+    from manyforge_composer.backend import routes_deployment_draft
+
+    closure = routes_deployment_draft._capture_model_sources(
+        state, session.snapshot()["draft"]["document"])
+    (captured_tool,) = closure["components"]
+    assert captured_tool["component_id"] == "gripper_body"
+    urdf = decode_model_source_artifact(
+        captured_tool["entrypoints"]["urdf"], maximum_bytes=1 << 20, label="urdf")
+    assert urdf == tool.read_bytes()
+
+
+def test_save_as_into_another_folder_rebases_program_scene_mesh_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Save as of a Program with relative scene meshes into another folder:
+    the written and adopted Program names the same mesh files from the new
+    project, absolute paths stay, and Apply's capture reads the same bytes."""
+
+    from manyforge_behavior.canonical_artifact import load_strict_json_yaml
+    from manyforge_behavior.model_source_capture import (
+        capture_program_scene_meshes,
+        program_scene_mesh_uris,
+    )
+    from manyforge_behavior.project_paths import ProjectPathRule
+
+    state = ComposerState(
+        application_start_id=0x3F9A0000000000A1,
+        allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)],
+    )
+    state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
+    state.headless_client = _ManagerStub()  # type: ignore[assignment]
+    monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: ("bundle", "graph"))
+    monkeypatch.setattr(routes_scenario_documents, "program_workspace",
+                        lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
+
+    def prepare_or_apply(
+        intent, claim, *, apply, prepared=None, prepare_only=False, confirmed=False
+    ):
+        if prepare_only:
+            return {"confirmation_required": False, "prepared_activation": {},
+                    "candidate_preview": {"impact": {"components": []}}}
+        return {"status": "accepted", "apply_id": 1, "apply_generation": 1}
+
+    monkeypatch.setattr(state, "execute_authored_deployment_candidate", prepare_or_apply)
+    client = _scenario_client(state)
+    response, _row = client.command("/api/scenario/new", {"discard_unsaved": True})
+    assert response.status_code == 200, response.text
+    first = tmp_path / "projects" / "cell_a.scenario"
+    first.parent.mkdir()
+    saved = client.post("/api/scenario-documents/save", json={
+        **_fence(state), **_save_target(first), "description": "", "confirmOverwrite": False,
+    })
+    assert saved.status_code == 200, saved.text
+    (first / "meshes").mkdir()
+    (first / "meshes" / "part.stl").write_bytes(b"solid part\nendsolid part\n")
+    shared = tmp_path / "shared.stl"
+    shared.write_bytes(b"solid shared\nendsolid shared\n")
+
+    # The Program gains two scene meshes: one beside the project, one absolute.
+    example = load_strict_json_yaml(
+        Path(__file__).resolve().parents[2]
+        / "examples/sim_ur10e_pick_and_place.scenario/program.yaml")
+    rows = deepcopy(example["scene"][:2])
+    rows[0]["shape"]["mesh_resource_uri"] = "meshes/part.stl"
+    rows[1]["shape"]["mesh_resource_uri"] = str(shared)
+    retained = state.draft_session.retained_state()
+    authoring = deepcopy(retained["authoring"])
+    authoring["scene"] = rows
+    program, diagnostics = derive_candidate(deepcopy(authoring), state.node_catalog)
+    retained.update(
+        draft_revision=retained["draft_revision"] + 1, authoring=authoring,
+        program=program.to_dict() if program is not None else None,
+        diagnostics=diagnostics,
+    )
+    state.draft_session.install_prepared_replacement(
+        state.draft_session.prepare_load_replacement(retained, state.node_catalog))
+    original = capture_program_scene_meshes(
+        authoring, project_folder=first, paths=ProjectPathRule([str(tmp_path)]))
+    assert len(original["meshes"]) == 2
+
+    second = tmp_path / "elsewhere" / "deeper" / "cell_b.scenario"
+    second.parent.mkdir(parents=True)
+    moved = client.post("/api/scenario-documents/save", json={
+        **_fence(state), **_save_target(second), "description": "", "confirmOverwrite": False,
+    })
+    assert moved.status_code == 200, moved.text
+    written, _path, _digest = capture_scenario_artifact(
+        str(second), allowed_roots=[str(tmp_path)])
+    uris = program_scene_mesh_uris(written["program_draft"])
+    assert str(shared) in uris
+    assert "../../../projects/cell_a.scenario/meshes/part.stl" in uris
+    # The Draft adopted the same rebased content.
+    adopted = state.draft_session.retained_state()["authoring"]
+    assert program_scene_mesh_uris(adopted) == uris
+    # Apply (relative to the saved project) captures the same mesh bytes.
+    captured = state.capture_scene_mesh_closure(
+        written["program_draft"], project_path=str(second.resolve()))
+    assert sorted(row["content_digest"] for row in captured["meshes"]) == sorted(
+        row["content_digest"] for row in original["meshes"])
 
 
 def _sha(character: str) -> str:
@@ -1637,22 +1880,21 @@ class _RunnerKernelCell:
         self.prepared.append(request["scenario_id"])
         program = request["program"] is not None
         self.prepared_activations[request["captured_input_digest"]] = {"prepared_activation": {
-            "schema_version": "manyforge.prepared_activation_input.v7",
+            "schema_version": "manyforge.prepared_activation_input.v8",
             "prepared_activation_id": _sha("1"),
             "origin": {"kind": "scenario", "scenario_id": request["scenario_id"],
                        "source_document_digest": request["source_document_digest"],
                        "project_path": request["project_path"]},
             "captured_input_digest": request["captured_input_digest"],
-            "deployment_artifact_id": "deployment",
             "deployment_revision": _sha("2"),
             "retained_bundle_id": _sha("3"),
             "graph_revision": _sha("4"),
-            "program_id": "program" if program else None,
             "program_revision": _sha("5") if program else None,
             "program_outcome": ({"kind": "bound", "program_binding_id": _sha("6")}
                                 if program else {"kind": "no_program"}),
             "node_environment_digest": _sha("7"),
             "assistant_mode": "forbidden",
+            "scene_meshes": [],
         }}
         return _preparation_reply(request)
 
@@ -1885,12 +2127,12 @@ class _FailedStopKernel:
 
     def read_program_execution_scope(self, program_run_id: int) -> dict:
         return {"ok": True, "scope": {
-            "schema_version": "manyforge.program_execution_scope.v3",
+            "schema_version": "manyforge.program_execution_scope.v4",
             "claim_generation": 1, "program_run_id": program_run_id,
             "hold_revision": 1, "ready_node_indices": [], "held_node_indices": [],
             "stopping_node_indices": [], "faulted_node_indices": [0],
             "selection_release_block_reason": None, "stopped_by": None,
-            "rule_id": None, "frozen": "program_end", "frozen_by": 1,
+            "rule_id": None, "program_held_nodes": [], "frozen": "program_end", "frozen_by": 1,
             "all_groups_held": False}}
 
     def __getattr__(self, name: str):
@@ -2386,7 +2628,7 @@ def test_valid_hand_edit_is_loaded_without_rechecking_during_discovery(tmp_path:
         )
     )
     edited = deepcopy(_document("edited")["program_draft"])
-    edited["description"] = "Edited outside"
+    edited["compatibility"]["tags"] = ["edited-outside"]
     (target / "program.yaml").write_text(json.dumps(edited) + "\n", encoding="utf-8")
 
     loaded, _ = load_scenario_artifact(
@@ -2441,14 +2683,14 @@ def test_saving_unchanged_generated_scenario_reproduces_generator_bytes(
     # Saving an unchanged project reproduces its checked-in bytes.
     examples = Path(__file__).resolve().parents[2] / "examples"
     project = examples / f"{scenario}.scenario"
-    document, path = load_scenario_artifact(
-        str(project), allowed_roots=[str(examples)]
-    )
+    # The examples' model sources live in the checkout, an allowed folder.
+    roots = [str(examples), str(examples.parent)]
+    document, path = load_scenario_artifact(str(project), allowed_roots=roots)
 
     _, target, members, manifest = prepare_scenario_artifact(
         document,
         path,
-        allowed_roots=[str(examples)],
+        allowed_roots=roots,
         source_project_path=path,
     )
 
@@ -2537,6 +2779,132 @@ def test_export_can_be_loaded_from_a_separate_allowed_project_root(
     )
 
 
+def test_export_copies_scene_meshes_under_the_one_path_rule(tmp_path: Path) -> None:
+    """Export resolves meshes like the viewer and Apply (OD-335): project-relative
+    and absolute paths inside a second allowed folder; the exported project
+    captures the same mesh content."""
+
+    from manyforge_behavior.canonical_artifact import load_strict_json_yaml
+    from manyforge_behavior.model_source_capture import (
+        capture_program_scene_meshes,
+        program_scene_mesh_shapes,
+    )
+    from manyforge_behavior.project_paths import ProjectPathRule
+
+    source = Path(__file__).resolve().parents[2] / "examples"
+    examples = tmp_path / "examples"
+    project = examples / "sim_ur10e_pick_and_place.scenario"
+    shutil.copytree(source / project.name, project)
+    shutil.copytree(source / "isaac_manipulator_scene_light/meshes",
+                    examples / "isaac_manipulator_scene_light/meshes")
+    site = tmp_path / "projects" / "site"
+    (site / "meshes").mkdir(parents=True)
+    (site / "meshes" / "x.stl").write_bytes(b"solid x\nendsolid x\n")
+    roots = [str(examples), str(site), str(tmp_path / "out")]
+    (tmp_path / "out").mkdir()
+    # A model source without package resources keeps the fixture small.
+    (examples / "model.urdf").write_text('<robot name="fixture"/>\n', encoding="utf-8")
+    document = build_scenario_document(
+        scenario_id=project.stem, name=project.stem, description="Mesh export fixture",
+        program_draft=load_strict_json_yaml(project / "program.yaml"),
+        deployment_draft=_deployment_intent(), manyforge_version="1.0.0",
+        last_known_status="ready",
+    )
+    shapes = list(program_scene_mesh_shapes(document["program_draft"]))
+    assert len(shapes) >= 2
+    shapes[0]["mesh_resource_uri"] = str(site / "meshes" / "x.stl")
+    shapes[1]["mesh_resource_uri"] = os.path.relpath(site / "meshes" / "x.stl", project)
+    original = capture_program_scene_meshes(
+        document["program_draft"], project_folder=project, paths=ProjectPathRule(roots))
+
+    exported = Path(export_scenario_artifact(
+        document, str(tmp_path / "out" / "sim_ur10e_pick_and_place.scenario"),
+        source_project_path=str(project), allowed_roots=roots,
+    ))
+    reopened, _ = load_scenario_artifact(str(exported), allowed_roots=[str(exported)])
+    copied = capture_program_scene_meshes(
+        reopened["program_draft"], project_folder=exported,
+        paths=ProjectPathRule([str(exported)]))
+    assert all(
+        row["resource_uri"].startswith("assets/scene/") for row in copied["meshes"])
+    assert {row["content_digest"] for row in copied["meshes"]} == {
+        row["content_digest"] for row in original["meshes"]}
+
+    # A mesh outside every allowed folder is refused with its path named.
+    shapes[0]["mesh_resource_uri"] = str(tmp_path / "elsewhere.stl")
+    (tmp_path / "out" / "again").mkdir()
+    with pytest.raises(ScenarioArtifactError) as refused:
+        export_scenario_artifact(
+            document, str(tmp_path / "out" / "again" / "sim_ur10e_pick_and_place.scenario"),
+            source_project_path=str(project), allowed_roots=roots,
+        )
+    assert refused.value.code == "scenario_export_asset_invalid"
+    assert str(tmp_path / "elsewhere.stl") in str(refused.value)
+
+
+def test_export_of_package_model_resources_reloads_to_the_same_activation_input(
+    tmp_path: Path,
+) -> None:
+    """Export copies a Deployment's package:// model resources and the Program's
+    scene meshes; the reloaded export captures exactly the same content."""
+
+    from manyforge_behavior.model_source_capture import (
+        capture_deployment_model_sources,
+    )
+    from manyforge_behavior.model_source_capture import capture_program_scene_meshes
+    from manyforge_behavior.project_paths import ProjectPathRule
+
+    workspace = Path(__file__).resolve().parents[2]
+    project = workspace / "examples" / "sim_ur10e_pick_and_place.scenario"
+    out = tmp_path / "out"
+    out.mkdir()
+    roots = [str(workspace), str(out)]
+    document, _ = load_scenario_artifact(str(project), allowed_roots=roots)
+    assert any(
+        component.get("model_source", {}).get("package_roots")
+        for component in document["deployment_draft"]["components"]
+    )
+
+    exported = Path(export_scenario_artifact(
+        document, str(out / project.name),
+        source_project_path=str(project), allowed_roots=roots,
+    ))
+    reloaded, _ = load_scenario_artifact(str(exported), allowed_roots=[str(out)])
+
+    def content(closure: dict[str, Any]) -> list[tuple[str, list[str]]]:
+        return [
+            (
+                row["component_id"],
+                sorted(
+                    [artifact["content_digest"]
+                     for artifact in row["entrypoints"].values()]
+                    + [f"{artifact['logical_uri']}={artifact['content_digest']}"
+                       for artifact in row["resources"]]
+                ),
+            )
+            for row in closure["components"]
+        ]
+
+    original_sources = capture_deployment_model_sources(
+        document["deployment_draft"], project_root=project,
+        paths=ProjectPathRule(roots))
+    exported_sources = capture_deployment_model_sources(
+        reloaded["deployment_draft"], project_root=exported,
+        paths=ProjectPathRule([str(out)]))
+    assert any(row["resources"] for row in exported_sources["components"])
+    assert content(exported_sources) == content(original_sources)
+
+    original_meshes = capture_program_scene_meshes(
+        document["program_draft"], project_folder=project,
+        paths=ProjectPathRule(roots))
+    exported_meshes = capture_program_scene_meshes(
+        reloaded["program_draft"], project_folder=exported,
+        paths=ProjectPathRule([str(out)]))
+    assert original_meshes["meshes"]
+    assert {row["content_digest"] for row in exported_meshes["meshes"]} == {
+        row["content_digest"] for row in original_meshes["meshes"]}
+
+
 def test_dynamic_index_lists_only_project_documents(tmp_path: Path) -> None:
     save_scenario_artifact(
         _document("saved"),
@@ -2580,21 +2948,20 @@ def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
     current = {"retained_bundle_id": "bundle-current", "graph_revision": "graph-current"}
     source_document_digest = "sha256:" + "1" * 64
     prepared_activation = {
-        "schema_version": "manyforge.prepared_activation_input.v7",
+        "schema_version": "manyforge.prepared_activation_input.v8",
         "prepared_activation_id": "prepared-1",
         "origin": {"kind": "scenario", "scenario_id": "cell",
                    "source_document_digest": source_document_digest,
                    "project_path": "/projects/cell.scenario"},
         "captured_input_digest": "sha256:" + "2" * 64,
-        "deployment_artifact_id": "deployment",
         "deployment_revision": "deployment-revision",
         "retained_bundle_id": "bundle-next",
         "graph_revision": "graph-next",
-        "program_id": "program",
         "program_revision": "program-revision",
         "program_outcome": {"kind": "bound", "program_binding_id": "binding"},
         "node_environment_digest": "sha256:" + "3" * 64,
         "assistant_mode": "forbidden",
+        "scene_meshes": [],
     }
 
     class Headless:
@@ -2635,6 +3002,7 @@ def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
         "captured_input_digest": prepared_activation["captured_input_digest"],
         "deployment": {},
         "model_source_closure": {},
+        "scene_mesh_closure": {},
         "program": None,
         "program_role_assignment": {},
         "expected_manager_current": dict(current),
@@ -2694,6 +3062,7 @@ def test_preparation_admission_refusal_is_marked_only_before_the_claim(
         "captured_input_digest": "sha256:" + "2" * 64,
         "deployment": {},
         "model_source_closure": {},
+        "scene_mesh_closure": {},
         "program": None,
         "program_role_assignment": {},
         "expected_manager_current": {},
@@ -2736,6 +3105,7 @@ def test_other_unclaimed_preparation_failures_stay_unmarked(tmp_path: Path) -> N
                 "captured_input_digest": "sha256:" + "2" * 64,
                 "deployment": {},
                 "model_source_closure": {},
+                "scene_mesh_closure": {},
                 "program": None,
                 "program_role_assignment": {},
                 "expected_admission_generation": 1,
@@ -2957,134 +3327,6 @@ def test_scenario_save_partial_write_is_unverified_with_its_path(
     assert "effect" not in detail
     assert headless.settlements == ["owner_commit"]
     assert state.authoring_admission.mutation_ready is True
-
-
-def _member_save(
-    tmp_path: Path, member: str
-) -> tuple[ComposerState, TestClient, _SettlingHeadless, Path, dict]:
-    """Save one project, then edit one member Draft; return its member Save."""
-
-    state, client, headless = _claimed_scenario_state(tmp_path)
-    target = tmp_path / "project.scenario"
-    assert _save_scenario(client, state, target).status_code == 200
-    headless.settlements.clear()
-    if member == "program":
-        program_state = state.draft_session.retained_state()
-        program_state["authoring"]["name"] = "Edited Program"
-        edited, diagnostics = derive_candidate(
-            program_state["authoring"], state.node_catalog
-        )
-        program_state["program"] = edited.to_dict()
-        program_state["diagnostics"] = diagnostics
-        program_state["draft_revision"] += 1
-        state.draft_session.install_prepared_replacement(
-            state.draft_session.prepare_load_replacement(
-                program_state, state.node_catalog
-            )
-        )
-    else:
-        deployment_state = state.deployment_draft_session.retained_state()
-        deployment_state["document"]["name"] = "Edited Deployment"
-        deployment_state["draft_revision"] += 1
-        state.deployment_draft_session.install_prepared_replacement(
-            state.deployment_draft_session.prepare_load_replacement(
-                deployment_state,
-                source_project_root=state.deployment_draft_session.source_project_root,
-            )
-        )
-    fence = _fence(state)
-    if member == "deployment":
-        fence["draftId"] = fence["deploymentDraftId"]
-        fence["expectedDraftRevision"] = fence["expectedDeploymentDraftRevision"]
-    del fence["deploymentDraftId"], fence["expectedDeploymentDraftRevision"]
-    return state, client, headless, target.resolve(), fence
-
-
-def _member_name(project: Path, member: str) -> str:
-    disk, _ = load_scenario_artifact(str(project), allowed_roots=[str(project.parent)])
-    return disk[f"{member}_draft"]["name"]
-
-
-@pytest.mark.parametrize("member", ["program", "deployment"])
-@pytest.mark.parametrize(
-    "failure", ["readback", "workspace_stale", "workspace_install", "before_write"]
-)
-def test_scenario_member_save_reports_the_effect_it_recorded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, member: str, failure: str,
-) -> None:
-    """(a) readback, (b) workspace commit and (c) pre-write member failures."""
-
-    state, client, headless, project, fence = _member_save(tmp_path, member)
-    original_save = scenario_artifacts.save_scenario_artifact
-    original_capture = scenario_artifacts.capture_scenario_artifact
-    written: list[str] = []
-
-    def save_then(*args, **kwargs) -> str:
-        saved = original_save(*args, **kwargs)
-        written.append(saved)
-        if failure == "workspace_stale":
-            snapshot = state.authoring_workspace.snapshot()
-            facts = snapshot.as_dict()["project"]
-            facts["document_description"] = "concurrent edit"
-            state.authoring_workspace.commit_project(
-                expected_identity=snapshot.identity, facts=facts
-            )
-        return saved
-
-    def capture(*args, **kwargs):
-        if failure == "readback" and written:
-            raise ScenarioArtifactError(
-                "scenario_source_invalid", "model source vanished", status_code=409
-            )
-        return original_capture(*args, **kwargs)
-
-    monkeypatch.setattr(scenario_artifacts, "save_scenario_artifact", save_then)
-    monkeypatch.setattr(scenario_artifacts, "capture_scenario_artifact", capture)
-    if failure == "before_write":
-        # An interrupted earlier save is refused when the project is captured.
-        (project / scenario_artifacts.SCENARIO_SAVE_MARKER).write_text("{}\n")
-    if failure == "workspace_install":
-        def broken_install(*_args, **_kwargs):
-            raise RuntimeError("in-memory install failed")
-
-        session = (
-            state.draft_session if member == "program"
-            else state.deployment_draft_session
-        )
-        monkeypatch.setattr(session, "install_prepared_save", broken_install)
-    before_files = _project_bytes(project)
-
-    response = client.post(f"/api/{member}/save", json=fence)
-
-    detail = response.json()["detail"]
-    if failure == "before_write":
-        assert written == []
-        assert _project_bytes(project) == before_files
-        assert detail["code"] == "scenario_project_save_interrupted"
-        assert detail["effect"] == "none"
-        assert headless.settlements == ["proven_no_effect"]
-        return
-    monkeypatch.undo()
-    expected_name = "Edited Program" if member == "program" else "Edited Deployment"
-    assert _member_name(project, member) == expected_name
-    assert response.status_code == 409, response.text
-    assert detail["code"] == f"{member}_saved_baseline_not_adopted"
-    assert detail["path"] == str(project)
-    assert str(project) in detail["message"]
-    assert "effect" not in detail
-    if failure == "workspace_install":
-        # Contained in-memory install: the claim stays held, never no-effect.
-        assert detail["causeCode"] == "composer_workspace_install_failed"
-        assert headless.settlements == []
-        assert state.authoring_admission.mutation_ready is False
-        return
-    assert headless.settlements == ["owner_commit"]
-    assert state.authoring_admission.mutation_ready is True
-    current = state.authoring_workspace.snapshot().as_dict()
-    if member == "program":
-        assert current["program"]["saved"]["matchesDraft"] is False
-    else:
-        assert current["deployment"]["differsFromSaved"] is True
 
 
 def test_f6b_manager_projection_unavailable_carries_bounded_diagnostics(
@@ -3424,7 +3666,7 @@ def test_grasp_confirmed_example_requires_confirmation_on_its_mounted_tool() -> 
         "controllable_component_id": "gripper_io",
         "signal_name": "workpiece_grasped",
     }
-    # Apart from the policy and its names, the cell is the plain Mock example.
+    # Apart from the policy, the cell is the plain Mock example.
     expected = deepcopy(base["deployment_draft"])
     expected_tool = next(
         item for item in expected["components"] if item["component_id"] == "lite_gripper"
@@ -3432,8 +3674,6 @@ def test_grasp_confirmed_example_requires_confirmation_on_its_mounted_tool() -> 
     expected_tool["configuration"]["runtime_configuration"][
         "gripper_target_configurations"
     ][0]["grasp_confirmation"] = {"policy": "required"}
-    for field in ("deployment_artifact_id", "name", "description"):
-        expected[field] = deployment[field]
     assert deployment == expected
 
     (close,) = _gripper_closes(document["program_draft"]["forest"])

@@ -29,7 +29,6 @@
 #include "manyforge_deployment/closed_schema.hpp"
 #include "manyforge_deployment/command_schema_codec.hpp"
 #include "manyforge_deployment/component_type_codec.hpp"
-#include "manyforge_deployment/contact_policy_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/control_interface_contract_codec.hpp"
 #include "manyforge_deployment/controller_topology_codec.hpp"
@@ -357,7 +356,6 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
   return core::RetainedBundleDTO{
       std::string(core::kRetainedBundleApiVersion),
       core::RetainedBundleId(std::string(retained_bundle_id)),
-      deployment.deployment_artifact_id(),
       deployment.deployment_revision(),
       deployment.graph().graph(),
       core::RetainedCatalogDTO{
@@ -468,8 +466,6 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
       {"api_version",
        CanonicalValue(std::string(core::kRetainedBundleApiVersion))},
       {"retained_bundle_id", CanonicalValue(std::string(retained_bundle_id))},
-      {"deployment_artifact_id",
-       CanonicalValue(deployment.deployment_artifact_id().value())},
       {"deployment_revision",
        CanonicalValue(deployment.deployment_revision().value())},
       {"cell_graph", deployment.graph().normalized_root()},
@@ -1375,16 +1371,6 @@ prepare_planning_collision_product_before_store(
                     .applicability()
                     .stop_evidence_policies(),
                 "Stop-evidence policy");
-          } else if constexpr (std::is_same_v<
-                                   Record,
-                                   core::ContactPolicyCatalogRecordRefDTO>) {
-            const auto requalified = resolve_and_qualify_contact_policy(
-                typed_reference, typed_reference.content_addressed_store_key,
-                catalog_bytes);
-            require_exact_requalified_catalog_record(
-                requalified,
-                qualified.compiler_ir().applicability().contact_policies(),
-                "contact policy");
           } else {
             detail::fail_retained_bundle(
                 "structural retention encountered an unsupported catalog "

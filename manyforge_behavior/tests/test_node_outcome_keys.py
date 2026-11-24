@@ -38,7 +38,7 @@ def _program(document: dict[str, Any]) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, _CATALOG)
 
@@ -164,3 +164,15 @@ def test_a_root_key_named_like_a_system_namespace_is_refused(name) -> None:
     with pytest.raises(ProgramValidationError, match=f"reserved {name} namespace"):
         _program(document)
 
+
+def test_a_new_attempt_sets_the_outcome_key_back_to_none() -> None:
+    program = _program(_document())
+    store = ProgramValueStore(program)
+    store.write_node_outcome("move_to_pick", "failed", metadata={"node_attempt_id": 1})
+    store.reset_node_outcome("move_to_pick", metadata={"node_attempt_id": 2})
+    assert store.read(_KEY) == "none"
+    # Already `none`: nothing changes.
+    store.reset_node_outcome("move_to_pick")
+    assert store.read(_KEY) == "none"
+    with pytest.raises(ProgramValueError, match="undeclared"):
+        store.reset_node_outcome("remove_table")

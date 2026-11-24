@@ -4,6 +4,7 @@
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
 #include <manyforge_roboplan/ros2_control_lane_family.hpp>
 
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -204,6 +205,17 @@ TEST(ComponentAdapterRegistry, LoadsTheMockAndSimulationFamiliesFromTheIndex) {
   ASSERT_NE(simulator, nullptr);
   EXPECT_EQ(simulator->launch_contribution, nullptr);
   EXPECT_EQ(simulator->lane, nullptr);
+}
+
+// Every family this build registers loads from its index, with its library
+// dependencies (message libraries included), as the execution host loads
+// them: a family that can't be loaded is named here, not only as a host exit.
+TEST(ComponentAdapterRegistry, LoadsEveryFamilyOfThisBuild) {
+  ::setenv("AMENT_PREFIX_PATH", MANYFORGE_COMPONENT_ADAPTER_PREFIX, 1);
+  const auto loaded = ComponentAdapterRegistry::LoadInstalled();
+  ASSERT_TRUE(loaded.ok()) << loaded.error().message;
+  EXPECT_EQ(loaded.value().families().size(),
+            std::size_t{MANYFORGE_COMPONENT_ADAPTER_FAMILY_COUNT});
 }
 
 TEST(ComponentAdapterRegistry, ALibraryExportingAnotherFamilyIsRefused) {

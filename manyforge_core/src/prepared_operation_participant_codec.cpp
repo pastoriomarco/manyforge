@@ -3,6 +3,7 @@
 #include <cmath>
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/collision_rule_codec.hpp>
 #include <manyforge_core/prepared_motion_evidence_codec.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
@@ -414,13 +415,8 @@ template <class Id>
        CanonicalValue(value.deployment_maximum_tcp_linear_speed_mps)},
       {"interrupt_scopes", CanonicalValue(std::move(scopes))},
       {"execution_timeout_s", CanonicalValue(value.execution_timeout_s)}};
-  if (value.contact_policy) {
-    fields.emplace_back(
-        "contact_policy",
-        CanonicalValue(CanonicalValue::Object{
-            {"contact_policy_id", CanonicalValue(value.contact_policy->contact_policy_id.value())},
-            {"contact_policy_revision",
-             CanonicalValue(value.contact_policy->contact_policy_revision.value())}}));
+  if (!value.collision_rules.empty()) {
+    fields.emplace_back("collision_rules", CollisionRulesValue(value.collision_rules));
   }
   return CanonicalValue(std::move(fields));
 }
@@ -436,7 +432,6 @@ template <class Id>
       {"operation_id", CanonicalValue(static_cast<double>(value.operation_id.value()))},
       {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
       {"participant_id", OperationParticipantIdValue(value.participant_id)},
-      {"program_id", CanonicalValue(value.program_id.value())},
       {"program_revision", CanonicalValue(value.program_revision.value())},
       {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
       {"program_run_id", value.program_run_id
@@ -742,10 +737,11 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
                             binding.motion_endpoint->frame))
       fail("prepared_motion_endpoint_frame_mismatch");
   }
-  const auto* cartesian_path = std::get_if<CartesianPathDTO>(&motion.plan_request.motion);
+  // A Cartesian path, or a linear pose goal planned as its two-waypoint line.
+  const auto cartesian_waypoints = cartesian_waypoint_count(motion.plan_request.motion);
   if (!motion.trajectory.cartesian_waypoint_times_s.empty()) {
-    if (cartesian_path == nullptr ||
-        cartesian_path->waypoints.size() != motion.trajectory.cartesian_waypoint_times_s.size())
+    if (!cartesian_waypoints ||
+        *cartesian_waypoints != motion.trajectory.cartesian_waypoint_times_s.size())
       fail("prepared_cartesian_waypoint_milestones_mismatch");
   }
   const auto metrics_valid = [](const std::vector<double>& values) {
@@ -761,7 +757,6 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
       motion.move_id.empty() || motion.plan_request.move_id != motion.move_id ||
       motion.plan_request.operation_id != enclosing.operation_id ||
       motion.plan_request.participant_id != enclosing.participant_id ||
-      motion.plan_request.program_id != enclosing.program_id ||
       motion.plan_request.program_revision != enclosing.program_revision ||
       motion.plan_request.program_binding_id != enclosing.program_binding_id ||
       motion.plan_request.program_run_id != enclosing.program_run_id ||
@@ -812,7 +807,7 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
       motion.trajectory.cartesian_fidelity_metrics !=
           trajectory_metrics->cartesian_fidelity_metrics ||
       (trajectory_metrics->cartesian_fidelity_metrics.has_value() &&
-       (cartesian_path == nullptr ||
+       (!cartesian_waypoints ||
         trajectory_metrics->cartesian_fidelity_metrics->requested_translation_tolerance_m !=
             motion.plan_request.tolerances.translation_tol_m ||
         trajectory_metrics->cartesian_fidelity_metrics->requested_rotation_tolerance_rad !=
@@ -907,7 +902,6 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
         scope.stop_plan.operation_id != enclosing.operation_id ||
         scope.stop_plan.operation_revision != enclosing.operation_revision ||
         scope.stop_plan.participant_id != enclosing.participant_id ||
-        scope.stop_plan.program_id != enclosing.program_id ||
         scope.stop_plan.program_revision != enclosing.program_revision ||
         scope.stop_plan.program_binding_id != enclosing.program_binding_id ||
         scope.stop_plan.program_run_id != enclosing.program_run_id)
@@ -941,7 +935,6 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
          static_cast<double>(candidate.program_run_id->value()) > kMaximumSafeInteger))
       fail("program_run_id_invalid");
 
-    candidate.program_id = binding.program_id;
     candidate.program_revision = binding.program_revision;
     candidate.program_binding_id = binding.program_binding_id;
     candidate.retained_bundle_id = binding.retained_bundle_id;
@@ -1019,7 +1012,6 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
         candidate.operation_id,
         candidate.operation_revision,
         candidate.participant_id,
-        candidate.program_id,
         candidate.program_revision,
         candidate.program_binding_id,
         candidate.program_run_id,
@@ -1039,7 +1031,6 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
           fault.operation_id != candidate.operation_id ||
           fault.operation_revision != candidate.operation_revision ||
           fault.participant_id != candidate.participant_id ||
-          fault.program_id != candidate.program_id ||
           fault.program_revision != candidate.program_revision ||
           fault.program_binding_id != candidate.program_binding_id ||
           fault.program_run_id != candidate.program_run_id ||

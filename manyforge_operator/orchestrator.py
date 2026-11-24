@@ -35,6 +35,11 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from .filesystem_roots import (
+    filesystem_roots_value,
+    launch_filesystem_roots,
+    shipped_content_roots,
+)
 from .contracts import (
     ArtifactKind,
     CONFIGURATION_SCHEMA,
@@ -329,10 +334,6 @@ class NativeLauncherConfig:
         return self.current_root / "execution-run"
 
     @property
-    def logical_scene_database(self) -> Path:
-        return self.current_root / "logical-scene.sqlite3"
-
-    @property
     def headless_url(self) -> str:
         return f"http://127.0.0.1:{SERVICE_PORTS['headless']}/"
 
@@ -427,8 +428,6 @@ def native_commands(
                 config.execution_state_root,
                 "--execution-run-root",
                 config.execution_run_root,
-                "--logical-scene-database",
-                config.logical_scene_database,
                 "--program-runner-liveness-socket",
                 program_runner_liveness_socket,
                 "--application-processes",
@@ -542,13 +541,18 @@ def native_commands(
     )
     if config.composer_static_dir is not None:
         composer += ("--static-dir", str(config.composer_static_dir))
+    # Composer and Headless read below the same allowed folders: ManyForge's
+    # own content (examples and their shipped model sources) and this
+    # instance's package and Program workspace (OD-335).
+    filesystem_roots = filesystem_roots_value(
+        launch_filesystem_roots(
+            *shipped_content_roots(config.source_root),
+            config.install_root,
+            config.program_workspace,
+        )
+    )
     composer_environment = {
-        "MANYFORGE_FS_ROOTS": (
-            f"{config.source_root / 'examples'},"
-            f"{config.install_root},{config.program_workspace}"
-        ),
-        "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
-        "MANYFORGE_DEPLOYMENT_WRITE_ROOTS": str(config.program_workspace),
+        "MANYFORGE_FS_ROOTS": filesystem_roots,
         # Composer installation settings are saved data: data/composer/ (F1).
         "MANYFORGE_STATE_DIR": str(config.data_root),
     }
@@ -557,7 +561,11 @@ def native_commands(
         return tuple(_journal_command(config.instance_id, component_id, argv)[0])
 
     return manager, (
-        ApplicationProcess("headless", journaled("headless", headless)),
+        ApplicationProcess(
+            "headless",
+            journaled("headless", headless),
+            {"MANYFORGE_FS_ROOTS": filesystem_roots},
+        ),
         ApplicationProcess("program_runner", journaled("program_runner", program_runner)),
         ApplicationProcess(
             "composer",
@@ -1313,7 +1321,6 @@ class NativeLauncher:
                 "manager_executable": str(self.config.manager_executable),
                 "node_catalog_path": str(self.config.node_catalog_path),
                 "alarm_catalog_path": str(self.config.alarm_catalog_path),
-                "logical_scene_database": str(self.config.logical_scene_database),
                 "historian_directory": str(self.config.historian_directory),
                 "persistent_key_register_directory": str(
                     self.config.persistent_key_register_directory

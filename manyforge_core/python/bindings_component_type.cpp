@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <array>
 #include <cstdint>
 #include <manyforge_core/types/component_type.hpp>
 #include <optional>
@@ -216,19 +217,45 @@ void register_component_type_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
+  py::class_<ComponentTypeSpringSliderDTO>(
+      module, "ComponentTypeSpringSliderDTO", py::is_final())
+      .def(py::init([](std::array<double, 3> axis, double stroke_m,
+                       double trip_depth_m, std::optional<double> release_depth_m,
+                       double max_compression_step_m) {
+             return ComponentTypeSpringSliderDTO{axis, stroke_m, trip_depth_m,
+                                                 release_depth_m,
+                                                 max_compression_step_m};
+           }),
+           py::arg("axis"), py::arg("stroke_m"), py::arg("trip_depth_m"),
+           py::arg("release_depth_m"), py::arg("max_compression_step_m"))
+      .def_readonly("axis", &ComponentTypeSpringSliderDTO::axis)
+      .def_readonly("stroke_m", &ComponentTypeSpringSliderDTO::stroke_m)
+      .def_readonly("trip_depth_m", &ComponentTypeSpringSliderDTO::trip_depth_m)
+      .def_readonly("release_depth_m",
+                    &ComponentTypeSpringSliderDTO::release_depth_m)
+      .def_readonly("max_compression_step_m",
+                    &ComponentTypeSpringSliderDTO::max_compression_step_m)
+      .def(py::self == py::self)
+      .def(py::self != py::self);
+
   py::class_<ComponentTypeCollisionBodyRoleDTO>(
       module, "ComponentTypeCollisionBodyRoleDTO", py::is_final())
       .def(py::init([](
                CollisionBodyRoleId collision_body_role_id,
                ModelRoleId model_role_id,
-               CollisionBodyRoleId asset_collision_body_role_id) {
+               CollisionBodyRoleId asset_collision_body_role_id,
+               bool optional,
+               std::optional<ComponentTypeSpringSliderDTO> spring_slider) {
              return ComponentTypeCollisionBodyRoleDTO{
                  std::move(collision_body_role_id),
                  std::move(model_role_id),
-                 std::move(asset_collision_body_role_id)};
+                 std::move(asset_collision_body_role_id), optional,
+                 std::move(spring_slider)};
            }),
            py::arg("collision_body_role_id"), py::arg("model_role_id"),
-           py::arg("asset_collision_body_role_id"))
+           py::arg("asset_collision_body_role_id"),
+           py::arg("optional") = false,
+           py::arg("spring_slider") = py::none())
       .def_readonly(
           "collision_body_role_id",
           &ComponentTypeCollisionBodyRoleDTO::collision_body_role_id)
@@ -238,6 +265,9 @@ void register_component_type_bindings(py::module_& module) {
           "asset_collision_body_role_id",
           &ComponentTypeCollisionBodyRoleDTO::
               asset_collision_body_role_id)
+      .def_readonly("optional", &ComponentTypeCollisionBodyRoleDTO::optional)
+      .def_readonly("spring_slider",
+                    &ComponentTypeCollisionBodyRoleDTO::spring_slider)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
@@ -271,7 +301,8 @@ void register_component_type_bindings(py::module_& module) {
                std::vector<ComponentTypeCollisionBodyRoleDTO>
                    collision_body_roles,
                std::vector<ComponentTypeCapabilityDTO> capabilities,
-               std::optional<FrameRoleId> default_tcp_frame_role_id) {
+               std::optional<FrameRoleId> default_tcp_frame_role_id,
+               std::optional<CollisionBodyRoleId> grip_body_role_id) {
              return ComponentTypeCommandTargetDTO{
                  std::move(command_target_id),
                  std::move(model_group_roles),
@@ -279,12 +310,14 @@ void register_component_type_bindings(py::module_& module) {
                  std::move(frame_roles),
                  std::move(collision_body_roles),
                  std::move(capabilities),
-                 std::move(default_tcp_frame_role_id)};
+                 std::move(default_tcp_frame_role_id),
+                 std::move(grip_body_role_id)};
            }),
            py::arg("command_target_id"), py::arg("model_group_roles"),
            py::arg("resource_roles"), py::arg("frame_roles"),
            py::arg("collision_body_roles"), py::arg("capabilities"),
-           py::arg("default_tcp_frame_role_id") = std::nullopt)
+           py::arg("default_tcp_frame_role_id") = std::nullopt,
+           py::arg("grip_body_role_id") = std::nullopt)
       .def_readonly("command_target_id",
                     &ComponentTypeCommandTargetDTO::command_target_id)
       .def_readonly("model_group_roles",
@@ -304,6 +337,9 @@ void register_component_type_bindings(py::module_& module) {
       .def_readonly(
           "default_tcp_frame_role_id",
           &ComponentTypeCommandTargetDTO::default_tcp_frame_role_id)
+      .def_readonly(
+          "grip_body_role_id",
+          &ComponentTypeCommandTargetDTO::grip_body_role_id)
       .def(py::self == py::self)
       .def(py::self != py::self);
 

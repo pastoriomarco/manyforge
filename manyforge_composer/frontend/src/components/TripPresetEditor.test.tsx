@@ -52,9 +52,7 @@ const entry = (id: string, name: string): CatalogEntry => ({
 
 const program = {
   api_version: 'manyforge.program.v2',
-  program_id: 'trip_presets',
   program_profile: 'composable-cell-v1',
-  name: 'Trip presets',
   catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.7.0' },
   component_roles: {},
   target_roles: {},

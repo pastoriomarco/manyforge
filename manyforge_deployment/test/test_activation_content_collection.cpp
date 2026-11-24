@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -94,14 +96,22 @@ private:
 }
 
 [[nodiscard]] std::shared_ptr<const ProgramBindingContract>
-make_program(const fs::path &root, const RetainedBundle &bundle, const std::string &name) {
+make_program(const fs::path &root, const RetainedBundle &bundle,
+             const std::string &root_instance_id) {
   ProgramOptions options;
   options.catalog_content_version =
       bundle.value().catalogs.node_environment.content_version;
   auto members = make_program_root(options).as_object();
-  for (auto &[field, value] : members)
-    if (field == "name")
-      value = CanonicalValue(name);
+  // A Program has no name (OD-369): distinct Programs differ in their tree.
+  for (auto &[field, value] : members) {
+    if (field != "tree")
+      continue;
+    auto tree = value.as_object();
+    for (auto &[tree_field, tree_value] : tree)
+      if (tree_field == "instance_id")
+        tree_value = CanonicalValue(root_instance_id);
+    value = CanonicalValue(std::move(tree));
+  }
   // The Program references the bundle's components, so verification takes the
   // bundle's exact model map and catalog artifacts from the same root.
   const auto &products = bundle.value().compiled_products.symbol_role_maps;
@@ -123,7 +133,7 @@ collect_unreferenced_activation_content(const fs::path &root,
                                         const ActiveActivationContent &active) {
   ActivationContentReferences fresh;
   return manyforge::deployment::collect_unreferenced_activation_content(
-      root, active, fresh);
+      root, [&] { return active; }, fresh);
 }
 
 [[nodiscard]] fs::path program_path(const fs::path &root,
@@ -150,7 +160,7 @@ void write_prepared(const fs::path &root, std::string_view name,
 [[nodiscard]] ActiveActivationContent
 active(const RetainedBundle &bundle,
        const ProgramBindingContract *program = nullptr) {
-  ActiveActivationContent result{{bundle.retained_bundle_id()}, {}, {}};
+  ActiveActivationContent result{{bundle.retained_bundle_id()}, {}, {}, {}};
   if (program != nullptr)
     result.program_revision = program->value().program_revision;
   return result;
@@ -200,8 +210,8 @@ TEST(ActivationContentCollectionTest,
       shared.insert(file);
   ASSERT_FALSE(shared.empty()) << "the two bundles must share content";
 
-  const auto program = make_program(root, *fixture->current, "active Program");
-  const auto old_program = make_program(root, *fixture->current, "older Program");
+  const auto program = make_program(root, *fixture->current, "active");
+  const auto old_program = make_program(root, *fixture->current, "older");
   {
     FilesystemProgramRepository programs(root);
     ASSERT_TRUE(programs.put_if_absent(program, *fixture->current));
@@ -243,9 +253,8 @@ TEST(ActivationContentCollectionTest,
   const auto reloaded = FilesystemVerifiedRetainedBundleSource(root).get_verified(
       fixture->current->retained_bundle_id());
   ASSERT_NE(reloaded, nullptr);
-  EXPECT_NE(FilesystemProgramRepository(root).get_verified(
-                program->value().program_id, program->value().program_revision,
-                *reloaded),
+  EXPECT_NE(FilesystemProgramRepository(root).get_verified(program->value().program_revision,
+                                                       *reloaded),
             nullptr);
   EXPECT_EQ(FilesystemVerifiedRetainedBundleSource(root).get_verified(
                 fixture->older->retained_bundle_id()),
@@ -295,7 +304,7 @@ TEST(ActivationContentCollectionTest,
                      fixture->older->retained_bundle_id().value() + "\"}");
   const auto collect = [&](ActivationContentReferences &known) {
     return manyforge::deployment::collect_unreferenced_activation_content(
-        root, roots, known);
+        root, [&] { return roots; }, known);
   };
 
   // The first collection (a start) reads every live document.
@@ -364,7 +373,7 @@ TEST(ActivationContentCollectionTest, LoadsBeyondTheStoreBoundKeepSucceeding) {
   // prepared activation; each successful Apply then collects.
   std::shared_ptr<const ProgramBindingContract> program;
   for (std::size_t load = 0U; load < kLoads; ++load) {
-    program = make_program(root, *bundle, "Program " + std::to_string(load));
+    program = make_program(root, *bundle, "load_" + std::to_string(load));
     const std::string blob = "artifact of Load " + std::to_string(load);
     ASSERT_NO_THROW({
       FilesystemProgramRepository programs(root, kBound);
@@ -392,7 +401,7 @@ TEST(ActivationContentCollectionTest, LoadsBeyondTheStoreBoundKeepSucceeding) {
         FilesystemProgramRepository programs(root, kBound);
         for (std::size_t extra = 0U; extra < kBound; ++extra)
           static_cast<void>(programs.put_if_absent(
-              make_program(root, *bundle, "uncollected " + std::to_string(extra)),
+              make_program(root, *bundle, "uncollected_" + std::to_string(extra)),
               *bundle));
       },
       std::exception);
@@ -425,4 +434,84 @@ TEST(ActivationContentCollectionTest, APreparationInProgressDefersCollection) {
             1U);
 }
 
+TEST(ActivationContentCollectionTest, NamedSceneMeshDigestsStayLive) {
+  ScopedRoot scoped;
+  const auto &root = scoped.path();
+  const auto bundle = materialize_lite6_retained_consumer_fixture(root).bundle;
+  // A scene mesh stored for an object an API scene call added: only the
+  // current logical Scene names it.
+  const std::string mesh = "a scene mesh captured by an API scene call";
+  static_cast<void>(FilesystemRawArtifactStore(root).put_if_absent(mesh));
+  const auto blob = root / "raw-artifacts" / "sha256" /
+                    (hex(sha256_digest(mesh)) + ".blob");
+  auto roots = active(*bundle);
+  roots.scene_mesh_digests.push_back(ContentDigest(sha256_digest(mesh)));
+  const auto kept = collect_unreferenced_activation_content(root, roots);
+  ASSERT_TRUE(kept.collected);
+  EXPECT_EQ(kept.removed_entries, 0U);
+  EXPECT_TRUE(fs::exists(blob));
+  // Once nothing names it, it is removed.
+  EXPECT_EQ(collect_unreferenced_activation_content(root, active(*bundle))
+                .removed_entries,
+            1U);
+  EXPECT_FALSE(fs::exists(blob));
+}
+
 } // namespace
+
+TEST(ActivationContentCollectionTest,
+     LiveContentIsReadOnlyOnceTheWriterLockIsHeldExclusively) {
+  ScopedRoot scoped;
+  const auto &root = scoped.path();
+  const auto bundle = materialize_lite6_retained_consumer_fixture(root).bundle;
+  const auto lock_path = root / ".activation-content.lock";
+  // The logical Scene: what a commit names.
+  std::vector<ContentDigest> scene;
+  const auto live = [&] {
+    // Evaluated only under the collector's exclusive hold: no writer can
+    // hold the lock now, so nothing can be stored and committed unseen.
+    const int probe = ::open(lock_path.c_str(), O_RDWR | O_CLOEXEC);
+    EXPECT_GE(probe, 0);
+    EXPECT_NE(::flock(probe, LOCK_SH | LOCK_NB), 0);
+    ::close(probe);
+    auto roots = active(*bundle);
+    roots.scene_mesh_digests = scene;
+    return roots;
+  };
+  ActivationContentReferences known;
+  const std::string mesh = "a scene mesh an API scene call adds";
+  const auto digest = ContentDigest(sha256_digest(mesh));
+  const auto blob = root / "raw-artifacts" / "sha256" / (hex(digest.value()) + ".blob");
+  {
+    // Headless stores the mesh and commits its object under one shared hold.
+    const ActivationContentWriterLock hold(root);
+    static_cast<void>(FilesystemRawArtifactStore(root).put_if_absent(mesh));
+    // A collection meanwhile defers and reads nothing live.
+    bool evaluated = false;
+    EXPECT_FALSE(manyforge::deployment::collect_unreferenced_activation_content(
+                     root, [&] { evaluated = true; return live(); }, known)
+                     .collected);
+    EXPECT_FALSE(evaluated);
+    scene.push_back(digest);  // The commit names the mesh.
+  }
+  // The next collection reads the Scene after taking the lock: the mesh the
+  // commit named stays.
+  const auto collected =
+      manyforge::deployment::collect_unreferenced_activation_content(root, live, known);
+  ASSERT_TRUE(collected.collected);
+  EXPECT_TRUE(fs::exists(blob));
+  // A scene mesh is never read for references: a second, larger live mesh
+  // adds nothing to what a fresh collection reads.
+  ActivationContentReferences fresh_first;
+  const auto first =
+      manyforge::deployment::collect_unreferenced_activation_content(root, live, fresh_first);
+  const std::string larger(1024U * 1024U, 'm');
+  static_cast<void>(FilesystemRawArtifactStore(root).put_if_absent(larger));
+  scene.push_back(ContentDigest(sha256_digest(larger)));
+  ActivationContentReferences fresh_second;
+  const auto second =
+      manyforge::deployment::collect_unreferenced_activation_content(root, live, fresh_second);
+  ASSERT_TRUE(first.collected && second.collected);
+  EXPECT_EQ(second.read_bytes, first.read_bytes);
+  EXPECT_EQ(second.removed_entries, 0U);
+}

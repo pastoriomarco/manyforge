@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -13,8 +13,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [],
     "tags": [
       "pick-and-place",
@@ -54,18 +59,7 @@
               "mount_frame": "robotiq_2f_85_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "robotiq_85_base_link",
-              "touch_links": [
-                "robotiq_85_base_link",
-                "robotiq_85_left_finger_link",
-                "robotiq_85_left_finger_tip_link",
-                "robotiq_85_left_inner_knuckle_link",
-                "robotiq_85_left_knuckle_link",
-                "robotiq_85_right_finger_link",
-                "robotiq_85_right_finger_tip_link",
-                "robotiq_85_right_inner_knuckle_link",
-                "robotiq_85_right_knuckle_link"
-              ]
+              "tcp_frame": "robotiq_85_base_link"
             }
           ]
         },
@@ -201,8 +195,5 @@
       }
     }
   ],
-  "deployment_artifact_id": "ur5_roboplan_local_pick_place",
-  "description": "Mock deployment for the UR5 pick-and-place demo.",
-  "name": "ur5_roboplan_local_pick_place",
   "policies": {}
 }

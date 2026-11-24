@@ -89,7 +89,7 @@ function snapshotFixture(
         program: (
           programRevision === null
             ? null
-            : { api_version: 'manyforge.program.v3' }
+            : { api_version: 'manyforge.program.v4' }
         ) as unknown as ProgramDocument | null,
         diagnostics: [],
         formulaReferences: { computedKeys: {}, nodes: {} },
@@ -605,8 +605,6 @@ describe('useAuthoringWorkspace', () => {
   });
 
   it.each([
-    'program_saved_baseline_not_adopted',
-    'deployment_saved_baseline_not_adopted',
     'scenario_saved_baseline_not_adopted',
   ])('releases the guard for the definite written-but-not-adopted outcome %s', async (code) => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
@@ -691,8 +689,8 @@ describe('useAuthoringWorkspace', () => {
       schema_version: 'manyforge.current_scenario.v1', ready: true, unavailable_reasons: [],
       current_scenario: {
         scenario_id: 'mock_lite6_motion_preemption', source_document_digest: digest,
-        deployment_artifact_id: 'mock_lite6_motion_preemption', deployment_revision: digest,
-        retained_bundle_id: digest, graph_revision: digest, program_id: 'program',
+        deployment_revision: digest,
+        retained_bundle_id: digest, graph_revision: digest,
         program_revision: digest, program_binding_id: digest,
       },
     }) }));

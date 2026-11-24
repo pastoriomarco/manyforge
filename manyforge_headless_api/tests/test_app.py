@@ -181,7 +181,6 @@ def _program_binding(
     binding["node_environment"][
         "environment_digest"
     ] = build_node_environment().manifest.environment_digest
-    binding["program_id"] = program["program_id"]
     binding["program_revision"] = program["program_revision"]
     binding["retained_bundle_id"] = retained_bundle_id
     binding["graph_revision"] = graph_revision
@@ -189,7 +188,7 @@ def _program_binding(
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v3",
+        api_version="manyforge.program_binding.v4",
     )
     return binding
 
@@ -212,7 +211,6 @@ def _applied_projection(
         "assistant_mode": "forbidden",
         "assistant_projection": None,
         "baseline_program_binding_id": "sha256:" + "3" * 64,
-        "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "1" * 64,
         "graph_revision": binding["graph_revision"],
         "node_environment_digest": binding["node_environment"]["environment_digest"],
@@ -224,7 +222,6 @@ def _applied_projection(
         "program": copy.deepcopy(program),
         "program_binding": binding,
         "program_binding_id": binding["program_binding_id"],
-        "program_id": program["program_id"],
         "program_revision": program["program_revision"],
         "retained_bundle_id": binding["retained_bundle_id"],
         "source_document_digest": source_document_digest,
@@ -263,13 +260,14 @@ def _malform_binding_frame_with_valid_identity(value: dict[str, Any]) -> None:
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v3",
+        api_version="manyforge.program_binding.v4",
     )
     value["program_binding_id"] = binding["program_binding_id"]
 
 
 def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
+    assert _error_status("scene_too_large") == 400
     assert _error_status("full_stack_restart_required") == 409
     assert _error_status("assistant_ai_model_absent") == 503
     assert _error_status("assistant_component_absent") == 409
@@ -367,7 +365,6 @@ def test_full_native_applied_program_projection_is_accepted() -> None:
 
 def _applied_program_status_projection() -> dict[str, Any]:
     return {
-        "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "1" * 64,
         "executable": True,
         "graph_revision": "sha256:" + "9" * 64,
@@ -375,7 +372,6 @@ def _applied_program_status_projection() -> dict[str, Any]:
         "non_executable": None,
         "program": None,
         "program_binding_id": "sha256:" + "0" * 64,
-        "program_id": "program_a",
         "program_revision": "sha256:" + "4" * 64,
         "record_digest": "sha256:" + "5" * 64,
         "retained_bundle_id": "sha256:" + "8" * 64,
@@ -401,7 +397,7 @@ def test_applied_program_status_preserves_deployment_identity() -> None:
 def test_applied_status_accepts_explicit_no_program_and_rejects_mixed_identity() -> None:
     core = FakeCore()
     status = _applied_program_status_projection()
-    status.update(executable=False, program_id=None, program_revision=None,
+    status.update(executable=False, program_revision=None,
                   program_binding_id=None, program=None, non_executable=None,
                   message="No Program is selected")
     core.applied_program_status_projection = status
@@ -416,7 +412,7 @@ def test_applied_status_accepts_explicit_no_program_and_rejects_mixed_identity()
 @pytest.mark.parametrize(
     "malformation",
     [
-        lambda value: value.pop("deployment_artifact_id"),
+        lambda value: value.pop("deployment_revision"),
         lambda value: value.__setitem__("deployment_revision", "not-a-digest"),
         lambda value: value.__setitem__("unexpected", True),
     ],
@@ -441,7 +437,6 @@ def test_applied_program_status_rejects_invalid_deployment_identity(
     [
         lambda value: value.__setitem__("unknown", True),
         lambda value: value.pop("program"),
-        lambda value: value["program"].__setitem__("program_id", "mismatch"),
         lambda value: value["program"].__setitem__(
             "program_revision", "sha256:" + "f" * 64
         ),
@@ -597,6 +592,11 @@ class FakeCore:
         self.node_environment_digest = (
             build_node_environment().manifest.environment_digest
         )
+
+    def logical_scene_active_projection(self) -> dict[str, Any] | None:
+        return self.runtime_snapshot()["sections"]["logical_scene"]["payload"][
+            "access"
+        ]["active_projection"]
 
     def runtime_snapshot(self) -> dict[str, Any]:
         return {
@@ -890,6 +890,7 @@ class FakeManager:
     def __init__(self) -> None:
         self.requests: list[ManagerApplyRequest] = []
         self.scene_requests: list[tuple[SceneTransactionRequest, str | None]] = []
+        self.scene_mesh_digests: list[str | None] = []
         self.scene_pose_requests: list[SceneResourcePoseQuery] = []
         self.apply_observations: list[tuple[str, int]] = []
         self.apply_acknowledgements: list[tuple[str, int]] = []
@@ -922,21 +923,20 @@ class FakeManager:
             "ok": True,
             "phase": "accepted",
             "prepared_activation": {
-                "schema_version": "manyforge.prepared_activation_input.v7",
+                "schema_version": "manyforge.prepared_activation_input.v8",
                 "origin": {"kind": "scenario", "scenario_id": "scenario.1",
                            "source_document_digest": "sha256:" + "1" * 64,
                            "project_path": "/projects/scenario.1.scenario"},
                 "captured_input_digest": "sha256:" + "d" * 64,
-                "deployment_artifact_id": "deployment.1",
                 "deployment_revision": "sha256:" + "b" * 64,
                 "retained_bundle_id": "sha256:" + "2" * 64,
                 "graph_revision": "sha256:" + "3" * 64,
-                "program_id": "program.1",
                 "program_revision": "sha256:" + "4" * 64,
                 "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
                 "node_environment_digest": "sha256:" + "5" * 64,
                 "assistant_mode": "optional",
                 "prepared_activation_id": "sha256:" + "e" * 64,
+                "scene_meshes": [],
             },
             "request_key": "b1" * 16,
             "state": "pending",
@@ -975,8 +975,10 @@ class FakeManager:
         request: SceneTransactionRequest,
         *,
         trusted_principal_id: str | None,
+        mesh_content_digest: str | None,
     ) -> dict[str, Any]:
         self.scene_requests.append((request, trusted_principal_id))
+        self.scene_mesh_digests.append(mesh_content_digest)
         context = request.request_context
         return {
             "api_version": "manyforge.manager_command_response.v3",
@@ -1278,7 +1280,6 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
             "applied_record_digest": "sha256:" + "5" * 64,
             "scenario_id": "cell-pick",
             "source_document_digest": "sha256:" + "6" * 64,
-            "program_id": program["program_id"],
             "program_revision": program["program_revision"],
             "program_binding_id": binding["program_binding_id"],
             "retained_bundle_id": digest_c,
@@ -1438,6 +1439,14 @@ class FakeProgramRunner:
         self.calls.append(("read", program_run_id))
         return self._snapshot()
 
+    def runtime_blackboard_values(self, program_run_id: int) -> dict[str, Any]:
+        self.calls.append(("blackboard_values", program_run_id))
+        return {
+            "schema_version": "manyforge.program_runtime_blackboard_values.v1",
+            "program_run_id": program_run_id,
+            "keys": [{"key": "count", "type": "int64", "value_state": "value", "value": 2}],
+        }
+
     def prepare_manual_handover(
         self, program_run_id: int, body: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1541,7 +1550,6 @@ def _node_availability_fixture(
         "node_environment_digest": environment.manifest.environment_digest,
         "owner_id": "program-runner",
         "program_binding_id": applied["program_binding_id"],
-        "program_id": applied["program_id"],
         "program_revision": applied["program_revision"],
         "retained_bundle_id": applied["retained_bundle_id"],
         "scenario_id": applied["scenario_id"],
@@ -1731,21 +1739,20 @@ class FakeActivationPreparer:
     def prepare(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(copy.deepcopy(kwargs))
         return {
-            "schema_version": "manyforge.prepared_activation_input.v7",
+            "schema_version": "manyforge.prepared_activation_input.v8",
             "origin": {"kind": "scenario", "scenario_id": kwargs["scenario_id"],
                        "source_document_digest": kwargs["source_document_digest"],
                        "project_path": kwargs["project_path"]},
             "captured_input_digest": kwargs["captured_input_digest"],
             "prepared_activation_id": "sha256:" + "6" * 64,
-            "deployment_artifact_id": "cell_a",
             "deployment_revision": "sha256:" + "1" * 64,
             "retained_bundle_id": "sha256:" + "2" * 64,
             "graph_revision": "sha256:" + "3" * 64,
-            "program_id": "program_a",
             "program_revision": "sha256:" + "4" * 64,
             "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "5" * 64},
             "node_environment_digest": "sha256:" + "7" * 64,
             "assistant_mode": "forbidden",
+            "scene_meshes": [],
         }
 
 
@@ -1774,7 +1781,11 @@ def _preparation_request_body(key: str = "a5" * 16) -> dict[str, Any]:
             "schema_version": "manyforge.activation_model_source_closure.v1",
             "components": [],
         },
-        "program": {"api_version": "manyforge.program.v3"},
+        "scene_mesh_closure": {
+            "schema_version": "manyforge.activation_scene_mesh_closure.v1",
+            "meshes": [],
+        },
+        "program": {"api_version": "manyforge.program.v4"},
         "expected_admission_generation": _ADMISSION_GENERATION,
     }
 
@@ -1823,7 +1834,11 @@ def test_activation_preparation_accepts_any_generation_while_idle() -> None:
                 "schema_version": "manyforge.activation_model_source_closure.v1",
                 "components": [],
             },
-            "program": {"api_version": "manyforge.program.v3"},
+            "scene_mesh_closure": {
+                "schema_version": "manyforge.activation_scene_mesh_closure.v1",
+                "meshes": [],
+            },
+            "program": {"api_version": "manyforge.program.v4"},
             }
     ]
 
@@ -1949,7 +1964,11 @@ def test_activation_preparation_refuses_removed_parameter_overrides() -> None:
             "schema_version": "manyforge.activation_model_source_closure.v1",
             "components": [],
         },
-        "program": {"api_version": "manyforge.program.v3"},
+        "scene_mesh_closure": {
+            "schema_version": "manyforge.activation_scene_mesh_closure.v1",
+            "meshes": [],
+        },
+        "program": {"api_version": "manyforge.program.v4"},
         "typed_parameter_overrides": {},
         "expected_admission_generation": _ADMISSION_GENERATION,
     }
@@ -2092,6 +2111,47 @@ def test_authoring_acquire_passes_on_a_lost_kernel_answer(outcome_unknown: bool)
     error = HeadlessHttpClient._error_from_response(response.json(), response.status_code)
     assert error.code == "execution_owner_unavailable"
     assert error.details.get("outcome_unknown") is (True if outcome_unknown else None)
+
+
+def test_section_reads_are_one_native_snapshot_without_the_committed_activation() -> None:
+    core = FakeCore()
+    service = _service(core, FakeManager())
+    snapshot = core.runtime_snapshot()
+    reads: list[None] = []
+
+    def counted() -> dict[str, Any]:
+        reads.append(None)
+        return copy.deepcopy(snapshot)
+
+    def unread() -> dict[str, Any]:
+        raise AssertionError("a section read never reads the committed activation")
+
+    core.runtime_snapshot = counted  # type: ignore[method-assign]
+    core.committed_scenario_activation = unread  # type: ignore[method-assign]
+    assert service.scene() == {
+        "schema_version": "manyforge.scene_projection.v2",
+        "projection_generation": snapshot["projection_generation"],
+        "logical_scene": snapshot["sections"]["logical_scene"],
+        "scene_runtime": snapshot["sections"]["scene_runtime"],
+    }
+    assert len(reads) == 1
+    manager = snapshot["sections"]["manager"]
+    status = service.manager_status()
+    assert status["status"] == manager["payload"]
+    assert status["source"]["projection_generation"] == snapshot["projection_generation"]
+    assert status["source"]["source_content_digest"] == manager.get("source_content_digest")
+    assert len(reads) == 2
+    assert service.manager_graph()["source"] == status["source"]
+    assert service.manager_diff()["source"] == status["source"]
+    assert len(reads) == 4
+    runtime_health = service.health()["components"]["runtime_projection"]
+    assert runtime_health == {"complete": snapshot["complete"], "reasons": snapshot["reasons"]}
+    assert len(reads) == 5
+    core.runtime_snapshot = lambda: {**snapshot, "schema_version": "v0"}  # type: ignore[method-assign]
+    for read in (service.scene, service.manager_status, service.health):
+        with pytest.raises(HeadlessApiError) as refused:
+            read()
+        assert refused.value.code == "headless_runtime_projection_invalid"
 
 
 def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None:
@@ -2614,6 +2674,33 @@ def test_program_started_then_failed_preserves_owner_status_and_details(
         "producer": "program_runner",
         "request_id": response.headers["X-Request-ID"],
     }
+
+
+def test_run_key_values_are_a_read_of_the_current_start_only() -> None:
+    runner = FakeProgramRunner()
+    client = TestClient(
+        create_app(service=_service(FakeCore(), FakeManager(), program_runner=runner))
+    )
+    with client:
+        read = client.get(
+            "/api/program/runs/1/blackboard-values",
+            params={"application_start_id": _APPLICATION_START_ID},
+        )
+        foreign = client.get(
+            "/api/program/runs/1/blackboard-values",
+            params={"application_start_id": "f" * 16},
+        )
+
+    assert read.status_code == 200, read.text
+    assert read.json()["keys"] == [
+        {"key": "count", "type": "int64", "value_state": "value", "value": 2}
+    ]
+    # The reply names a run, so it carries ``A`` and the display form (1.5).
+    assert read.json()["application_start_id"] == _APPLICATION_START_ID
+    assert "display" in read.json()
+    assert foreign.json()["detail"]["code"] == "program_run_not_found"
+    # A read: the runner sees one query and no command.
+    assert runner.calls == [("blackboard_values", 1)]
 
 
 def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
@@ -3225,7 +3312,6 @@ def test_apply_is_forwarded_and_unavailable_owner_error_stays_typed() -> None:
             "/api/manager/apply",
             json={
                 **_caller(),
-                "deployment_artifact_id": "deployment.1",
                 "deployment_revision": "sha256:" + "b" * 64,
                 "expected_current": {
                     "graph_revision": "graph.1",
@@ -3233,26 +3319,24 @@ def test_apply_is_forwarded_and_unavailable_owner_error_stays_typed() -> None:
                 },
                 "reject_if_affected_busy": True,
                 "prepared_activation": {
-                    "schema_version": "manyforge.prepared_activation_input.v7",
+                    "schema_version": "manyforge.prepared_activation_input.v8",
                     "origin": {"kind": "scenario", "scenario_id": "scenario.1",
                                "source_document_digest": "sha256:" + "1" * 64,
                                "project_path": "/projects/scenario.1.scenario"},
                     "captured_input_digest": "sha256:" + "d" * 64,
-                    "deployment_artifact_id": "deployment.1",
                     "deployment_revision": "sha256:" + "b" * 64,
                     "retained_bundle_id": "sha256:" + "2" * 64,
                     "graph_revision": "sha256:" + "3" * 64,
-                    "program_id": "program.1",
                     "program_revision": "sha256:" + "4" * 64,
                     "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64},
                     "node_environment_digest": "sha256:" + "5" * 64,
                     "assistant_mode": "optional",
                     "prepared_activation_id": "sha256:" + "e" * 64,
+                    "scene_meshes": [],
                 },
                 "expected_admission_generation": 7,
                 "candidate_receipt": {
                     "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
-                    "deployment_artifact_id": "deployment.1",
                     "deployment_revision": "sha256:" + "b" * 64,
                     "prepared_activation_id": "sha256:" + "e" * 64,
                     "candidate_retained_bundle_id": "bundle.2",
@@ -3574,7 +3658,7 @@ def test_committed_apply_without_current_scenario_program_does_not_prepare_scene
     if kind == "superseded":
         status["record_digest"] = "sha256:" + "a" * 64
     else:
-        status.update(executable=False, program_id=None, program_revision=None,
+        status.update(executable=False, program_revision=None,
                       program_binding_id=None, program=None, non_executable=None)
     service.notify_committed_apply()
     assert not runner.calls
@@ -3599,7 +3683,7 @@ def test_empty_apply_clear_publishes_one_correlated_transient_result(state):
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     status = core.applied_program_status_projection
-    status.update(executable=False, program_id=None, program_revision=None,
+    status.update(executable=False, program_revision=None,
                   program_binding_id=None, program=None, non_executable=None)
     calls = []
     def clear(body):
@@ -3627,7 +3711,7 @@ def test_empty_apply_old_status_after_headless_restart_does_not_retry():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.applied_program_status_projection.update(
-        executable=False, program_id=None, program_revision=None,
+        executable=False, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
     service.notify_committed_apply()
@@ -3639,7 +3723,7 @@ def test_empty_apply_owner_unavailable_reports_failure_without_submission():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.applied_program_status_projection.update(
-        executable=False, program_id=None, program_revision=None,
+        executable=False, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
     service._empty_scene_applies.add((2, 1))
@@ -3664,7 +3748,7 @@ def test_empty_apply_lost_runner_response_is_unknown_and_not_retried():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.applied_program_status_projection.update(
-        executable=False, program_id=None, program_revision=None,
+        executable=False, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
     service._empty_scene_applies.add((2, 1))
@@ -3685,7 +3769,7 @@ def test_empty_apply_malformed_success_is_unknown():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.applied_program_status_projection.update(
-        executable=False, program_id=None, program_revision=None,
+        executable=False, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
     service._empty_scene_applies.add((2, 1))
@@ -3706,7 +3790,7 @@ def test_new_apply_does_not_mark_an_in_flight_clear_settled():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.applied_program_status_projection.update(
-        executable=False, program_id=None, program_revision=None,
+        executable=False, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
     old_digest = core.committed_activation["record_digest"]
@@ -3744,7 +3828,7 @@ def test_superseded_empty_apply_cannot_cancel_new_scenario_preparation():
     service, core = _scene_completion_service(runner)
     normal_status = copy.deepcopy(core.applied_program_status_projection)
     core.applied_program_status_projection.update(
-        executable=False, program_id=None, program_revision=None,
+        executable=False, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
     service._empty_scene_applies.add((2, 1))
@@ -3869,7 +3953,7 @@ def test_empty_apply_identity_read_failure_ends_it_failed_without_retry():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.applied_program_status_projection.update(
-        executable=False, program_id=None, program_revision=None,
+        executable=False, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
     identity = (2, 1, core.committed_activation["record_digest"])
@@ -3899,7 +3983,7 @@ def test_empty_apply_identity_read_failure_ends_it_failed_without_retry():
 
 def _empty_applied(core: FakeCore) -> None:
     core.applied_program_status_projection.update(
-        executable=False, program_id=None, program_revision=None,
+        executable=False, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
 
@@ -4272,7 +4356,7 @@ def test_scene_pose_error_preserves_structured_owner_details() -> None:
     }
 
 
-def test_scene_support_declaration_crosses_http_without_native_names() -> None:
+def test_scene_object_crosses_http_without_contact_data() -> None:
     client, _core, manager = _client(trusted=True)
     body = _scene_body()
     body["operation"] = {
@@ -4287,13 +4371,6 @@ def test_scene_support_declaration_crosses_http_without_native_names() -> None:
             "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
         },
         "frame_ref": {"kind": "cell_frame", "cell_id": "cell-a"},
-        "support_contacts": [
-            {
-                "support_object_id": "table.1",
-                "mode": "bounded_penetration",
-                "max_contact_penetration_m": 0.002,
-            }
-        ],
     }
     with client:
         response = client.post("/api/scene/transactions", json=body)
@@ -4301,18 +4378,13 @@ def test_scene_support_declaration_crosses_http_without_native_names() -> None:
 
     assert response.status_code == 200
     operation = manager.scene_requests[0][0].operation
-    assert operation.support_contacts[0].support_object_id == "table.1"
-    assert operation.support_contacts[0].max_contact_penetration_m == 0.002
+    assert operation.scene_resource_id == "part.1"
+    # Scene objects carry no contact data: contact is a collision rule of a move.
     assert (
         "support_contacts"
-        in openapi["components"]["schemas"]["AddSceneObjectRequest"]["properties"]
+        not in openapi["components"]["schemas"]["AddSceneObjectRequest"]["properties"]
     )
-    assert (
-        "body_a"
-        not in openapi["components"]["schemas"]["SceneSupportContactRequest"][
-            "properties"
-        ]
-    )
+    assert "SceneSupportContactRequest" not in openapi["components"]["schemas"]
 
 
 def test_request_body_bound_is_enforced_before_model_decode() -> None:
@@ -4556,9 +4628,8 @@ def test_skills_routes_use_exact_selected_environment_and_never_execute():
                 "base_frame": {"component_id": "robot", "frame_id": "base"},
             },
             "program_context": {
-                "api_version": "manyforge.program.v3", "program_id": "skill_host",
-                "program_profile": "composable-cell-v1", "name": "Skill host",
-                "catalog": {"api_version": "manyforge.node_catalog.v3", "content_version": "3.0.0"},
+                "api_version": "manyforge.program.v4", "program_profile": "composable-cell-v1",
+                "catalog": {"api_version": "manyforge.node_catalog.v3", "content_version": "4.0.0"},
             },
         }
         result = client.post("/api/skills/expand", json=body)
@@ -4816,6 +4887,9 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
     # The runtime-override workflow is removed; runtime keys stay writable.
     assert not any("runtime-overrides" in path for path in paths)
     assert "/api/program/runs/{program_run_id}/blackboard-values" in paths
+    assert set(paths["/api/program/runs/{program_run_id}/blackboard-values"]) == {
+        "get", "post",
+    }
     assert {
         "/api/execution/operations/{operation_id}/reset",
         "/api/execution/operations/{operation_id}/acknowledge-completed",
@@ -5063,7 +5137,6 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route(
             "request_key": "a2" * 16,
             "source_label": "operator_ui",
         },
-        "program_id": "manyforge.direct_control.motion",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "b" * 64,
         "program_run_id": None,
@@ -5107,7 +5180,7 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route(
                         "joint_names": ["joint1"],
                         "positions_rad": [0.1],
                     },
-                    "contact_policy_id": None,
+                    "collision_rules": [],
                     "per_joint_dynamics_limits": {},
                     "motion_interrupt_scopes": [],
                     "runtime_object_bindings": [],
@@ -5160,7 +5233,6 @@ def test_manual_cleanup_uses_shared_control_ingress_and_exact_runner(case) -> No
                 "request_key": "a4" * 16,
                 "source_label": "operator_ui",
             },
-            "program_id": "manyforge.direct_control.gripper",
             "program_revision": "sha256:" + "a" * 64,
             "program_binding_id": "sha256:" + "b" * 64,
             "program_run_id": None,
@@ -5231,7 +5303,6 @@ def test_capability_command_preview_is_a_thin_non_effectful_execution_route() ->
             "request_key": "a5" * 16,
             "source_label": "operator_ui",
         },
-        "program_id": "manyforge.direct_control.gripper",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "b" * 64,
         "program_run_id": None,
@@ -6013,7 +6084,7 @@ def test_empty_apply_busy_runner_is_failed_before_effect_not_unknown():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.applied_program_status_projection.update(
-        executable=False, program_id=None, program_revision=None,
+        executable=False, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
     service._empty_scene_applies.add((2, 1))
@@ -6938,7 +7009,11 @@ def _activation_preparation_body() -> dict[str, Any]:
             "schema_version": "manyforge.activation_model_source_closure.v1",
             "components": [],
         },
-        "program": {"api_version": "manyforge.program.v3"},
+        "scene_mesh_closure": {
+            "schema_version": "manyforge.activation_scene_mesh_closure.v1",
+            "meshes": [],
+        },
+        "program": {"api_version": "manyforge.program.v4"},
         "expected_admission_generation": _ADMISSION_GENERATION,
     }
 
@@ -7164,3 +7239,56 @@ def test_stop_all_and_halt_routes_reach_the_kernel_with_no_program(
     ((called, request),) = [row for row in execution.requests if row[0] == kind]
     assert request.request_context.request_key == "c0" + "b4" * 15
     assert [call[0] for call in runner.calls] == []
+
+
+def test_a_control_command_is_aged_at_composers_forwarded_receipt_time() -> None:
+    """OD-240: the freshness age ends at Composer's receipt (its header)."""
+
+    import base64
+
+    from manyforge_headless_api.control_protocol import (
+        CONTROL_FRESHNESS_VALID_FOR_NS,
+        CONTROL_RECEIVED_MONOTONIC_NS_HEADER,
+        EXECUTION_COMMAND_SCHEMA,
+    )
+
+    class Runner(FakeProgramRunner):
+        def cycle_status(self, *, before_command: bool = False) -> dict[str, Any]:
+            status = super().cycle_status(before_command=before_command)
+            status["allowed_commands"].sort(key=lambda row: row["command_kind"])
+            return status
+
+    app = create_app(
+        service=_service(
+            FakeCore(), FakeManager(), FakeExecution(), program_runner=Runner()
+        )
+    )
+    with TestClient(app) as client:
+        freshness = client.get("/api/control/state").json()["freshness"]
+        issued_at_ns = int.from_bytes(
+            base64.urlsafe_b64decode(freshness["context_id"] + "===")[:8], "big"
+        )
+        response = client.post(
+            "/api/control/commands",
+            headers={
+                CONTROL_RECEIVED_MONOTONIC_NS_HEADER: str(
+                    issued_at_ns + CONTROL_FRESHNESS_VALID_FOR_NS + 1
+                )
+            },
+            json={
+                "command_envelope": {
+                    "schema_version": EXECUTION_COMMAND_SCHEMA,
+                    "command_kind": "program_run",
+                    "source_label": "operator_ui",
+                    "control_session_number": None,
+                    "client_sequence": None,
+                    "freshness": freshness,
+                    "expected_execution_control_revision": freshness[
+                        "execution_control_revision"
+                    ],
+                },
+                "payload": _caller(),
+            },
+        )
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "control_freshness_expired"

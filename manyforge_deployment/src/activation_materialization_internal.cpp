@@ -467,7 +467,6 @@ select_catalog_values(const std::vector<Value> &values,
 }
 
 struct ScenarioProduct final {
-  core::DeploymentArtifactId deployment_artifact_id;
   core::DeploymentRevision deployment_revision;
   deployment::ScenarioDeploymentCompatibilityDTO deployment_compatibility;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
@@ -503,15 +502,24 @@ void verify_gripper_resource_semantics(
   if (physical_components == 0U)
     return;
   // A split robot has no gripper (its mounted tool owns it, or it
-  // has none). Every component that owns a gripper target proves its finger
-  // resource.
-  std::set<core::ControllableComponentId> gripper_components;
-  std::set<core::ControllableComponentId> found_components;
+  // has none). Every gripper target (a component may have several) proves
+  // its finger resource.
+  using GripperTarget =
+      std::pair<core::ControllableComponentId, core::CommandTargetId>;
+  std::set<GripperTarget> command_targets;
+  for (const auto &binding : graph.control_bindings)
+    if (binding.capability_id.value() == "tool.gripper.command")
+      command_targets.emplace(binding.controllable_component_id,
+                              binding.command_target_id);
+  std::set<GripperTarget> gripper_targets;
+  std::set<GripperTarget> found_targets;
   for (const auto &binding : model_map.control_bindings()) {
-    if (binding.command_target_id.value() != "gripper") {
+    const GripperTarget target{binding.controllable_component_id,
+                               binding.command_target_id};
+    if (!command_targets.contains(target)) {
       continue;
     }
-    gripper_components.insert(binding.controllable_component_id);
+    gripper_targets.insert(target);
     const auto component = std::find_if(
         graph.controllable_components.begin(),
         graph.controllable_components.end(), [&](const auto &candidate) {
@@ -526,7 +534,7 @@ void verify_gripper_resource_semantics(
       if (resource.resource_role_id.value() != "fingers") {
         continue;
       }
-      found_components.insert(binding.controllable_component_id);
+      found_targets.insert(target);
       if (resource.coordinates.empty() ||
                  resource.component_local_coordinate_kind.has_value() ||
                  resource.coordinates.front().source_joint_name.empty() ||
@@ -537,10 +545,10 @@ void verify_gripper_resource_semantics(
       }
     }
   }
-  if (found_components != gripper_components) {
+  if (found_targets != gripper_targets) {
     throw std::logic_error(
         "maintained deployment lacks one retained gripper resource proof per "
-        "gripper component");
+        "gripper target");
   }
 }
 
@@ -844,7 +852,6 @@ materialize_scenarios(const std::filesystem::path &root,
              .emplace(
                  std::string(scenario.source),
                  ScenarioProduct{
-                     verified.deployment_artifact_id(),
                      verified.deployment_revision(),
                      deployment::scenario_deployment_compatibility(verified),
                      bundle, std::move(model_map), admission_filename,
@@ -1155,7 +1162,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
   // Pose sources and AI models reuse the model-free derived-type pipeline.
   for (auto &prepared : prepare_activation_pose_source_types(
            intent, component_profiles, prepared_models,
-           catalog.capabilities))
+           catalog.capabilities, catalog.component_types))
     io_types.push_back(std::move(prepared));
   for (auto &prepared : prepare_activation_ai_model_types(
            intent, component_profiles, catalog.capabilities))
@@ -1174,6 +1181,19 @@ PreparedActivationMaterialization materialize_prepared_activation(
     io_types.push_back(std::move(prepared));
   const auto assistant_profiles =
       resolve_activation_assistant_profiles(workspace_root, intent, component_profiles);
+  // A tool generated from a parameter file: its derived type joins the
+  // catalog under the id its profile names; the component stays a physical
+  // one (model, targets), so it is no member of `io_types`.
+  for (const auto &prepared :
+       prepare_activation_tool_types(component_profiles, catalog.capabilities)) {
+    const auto &reference = prepared.type.reference();
+    input_source.add(reference.content_addressed_store_key,
+                     reference.content_digest, prepared.catalog_bytes);
+    if (!catalog.records.contains(catalog_key(reference))) {
+      insert_reference(catalog, reference);
+      catalog.component_types.push_back(prepared.type);
+    }
+  }
   for (const auto &prepared : io_types) {
     const auto &reference = prepared.type.reference();
     input_source.add(reference.content_addressed_store_key,
@@ -1251,7 +1271,6 @@ PreparedActivationMaterialization materialize_prepared_activation(
         {core::ContentAddressedStoreKey(key), value.digest, value.bytes});
   }
   return PreparedActivationMaterialization{
-      found->second.deployment_artifact_id,
       found->second.deployment_revision,
       found->second.deployment_compatibility,
       found->second.bundle,

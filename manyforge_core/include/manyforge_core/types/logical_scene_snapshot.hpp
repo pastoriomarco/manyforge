@@ -26,14 +26,14 @@ inline constexpr std::string_view kLogicalSceneIdIdentityDomain = "scene-id";
 inline constexpr std::string_view kLogicalSceneContentIdentityDomain =
     "logical-scene-content";
 inline constexpr std::string_view kCollisionPolicyApiVersion =
-    "manyforge.collision_policy.v1";
+    "manyforge.collision_policy.v3";
 inline constexpr std::string_view kCollisionPolicyContentIdentityDomain =
     "collision-policy-content";
 inline constexpr std::string_view
     kCarriedObjectAttachmentRevisionIdentityDomain =
         "carried-object-attachment-revision";
 inline constexpr std::string_view kCanonicalEmptyCollisionPolicyDigest =
-    "sha256:59e1687796336598d7256d010902f760beb3c238adba73fe3e5ccd6674d797ac";
+    "sha256:651cf849d121bfdf86a7ed24ac2309a853cfdca05f818987f66cabaaab6c59e4";
 
 /// Complete owner input from which the initial logical-scene lineage is
 /// minted after canonical-empty bootstrap acceptance.
@@ -143,9 +143,6 @@ struct SceneObjectSnapshotDTO final {
   std::vector<CollisionShapeDTO> collision_shapes;
   SceneObjectPlacementDTO placement;
   std::optional<SceneObjectProviderEvidenceDTO> provider_evidence;
-  /// Portable authored support relationships retained independently of any
-  /// planner's generated collision-body ids.
-  std::vector<SupportContactDTO> support_contacts{};
   /// Object mass (kg), added to the carrier's controller payload while the
   /// object is attached; 0 when unknown or massless.
   double mass_kg{0.0};
@@ -219,8 +216,11 @@ struct CarriedObjectAttachmentDTO final {
   SceneResourceId scene_resource_id;
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
+  /// A frame of the holder's component or (OD-372) of a component mounted
+  /// on the holder's robot.
   SceneFrameRefDTO carrier_frame_ref;
   Pose3DTO pose_in_carrier_frame;
+  /// Collision-body roles of the carrier frame's component.
   std::vector<CollisionBodyRoleId> touch_body_roles;
   /// Present when the attach request carried a grasp-lost bound.
   std::optional<CarriedObjectGraspLostCheckDTO> grasp_lost_check{};
@@ -315,6 +315,7 @@ namespace logical_scene_detail {
                  PositiveFinite(value.height_m);
         } else {
           return !value.resource_uri.empty() &&
+                 IsExactLowercaseSha256Digest(value.content_digest) &&
                  PositiveFinite(value.scale.x_m) &&
                  PositiveFinite(value.scale.y_m) &&
                  PositiveFinite(value.scale.z_m);
@@ -358,75 +359,21 @@ template <typename T, typename Projection>
     }
     return true;
   };
-  if (!valid_pair_set(policy.allowed_static_static_pairs) ||
+  if (!StrictlyIncreasing(policy.static_body_ids,
+                          [](const CollisionBodyId& id) -> const CollisionBodyId& {
+                            return id;
+                          }) ||
       !valid_pair_set(policy.allowed_touch_link_pairs)) {
     return false;
   }
-  for (std::size_t index = 0U; index < policy.support_contacts.size();
-       ++index) {
-    const auto& contact = policy.support_contacts[index];
-    if (!CanonicalPair(contact.pair) ||
-        (index != 0U &&
-         !(policy.support_contacts[index - 1U].pair < contact.pair))) {
-      return false;
-    }
-  }
-  return StrictlyIncreasing(
-      policy.contact_grasps,
-      [](const ContactGraspPolicyEntry& grasp) -> const std::string& {
-        return grasp.policy_id;
-      });
+  // Collision rules belong to one move: the kernel installs them at admission.
+  // A policy retained in the logical scene never carries any.
+  return policy.contact_rules.empty();
 }
 
 [[nodiscard]] inline bool ValidFrameRef(
     const SceneFrameRefDTO& frame) noexcept {
   return std::visit([](const auto& value) { return value.valid(); }, frame);
-}
-
-[[nodiscard]] inline bool NormalizedSupportContact(
-    const SupportContactDTO& contact) noexcept {
-  const auto nonnegative_finite = [](const double value) {
-    return std::isfinite(value) && value >= 0.0;
-  };
-  if (contact.support_object_id.empty() ||
-      !nonnegative_finite(contact.max_start_penetration_m) ||
-      !nonnegative_finite(contact.release_tolerance_m) ||
-      !nonnegative_finite(contact.min_release_progress_m) ||
-      !nonnegative_finite(contact.max_contact_penetration_m)) {
-    return false;
-  }
-
-  switch (contact.mode) {
-    case CollisionContactPolicyMode::kContactRelease:
-      if (contact.max_contact_penetration_m != 0.0) {
-        return false;
-      }
-      switch (contact.release_evidence_mode) {
-        case ContactReleaseEvidenceMode::kSignedPenetration:
-          return true;
-        case ContactReleaseEvidenceMode::kBinaryContact:
-          return !contact.enforce_max_start_penetration &&
-                 contact.max_start_penetration_m == 0.0 &&
-                 contact.release_tolerance_m == 0.0 &&
-                 contact.min_release_progress_m == 0.0 &&
-                 !contact.require_strictly_decreasing_penetration;
-      }
-      return false;
-    case CollisionContactPolicyMode::kBoundedPenetration:
-    case CollisionContactPolicyMode::kContactProcess:
-      return contact.release_evidence_mode ==
-                 ContactReleaseEvidenceMode::kSignedPenetration &&
-             !contact.enforce_max_start_penetration &&
-             contact.max_start_penetration_m == 0.0 &&
-             contact.release_tolerance_m == 0.0 &&
-             contact.min_release_progress_m == 0.0 &&
-             !contact.require_separation_by_end &&
-             !contact.require_strictly_decreasing_penetration &&
-             !contact.allow_recontact &&
-             (contact.mode == CollisionContactPolicyMode::kBoundedPenetration ||
-              contact.max_contact_penetration_m == 0.0);
-  }
-  return false;
 }
 
 }  // namespace logical_scene_detail
@@ -436,9 +383,9 @@ inline bool IsCanonicalEmptyCollisionPolicy(
   return policy.policy_id == "free_space" &&
          policy.revision.revision_id == 1U &&
          policy.revision.content_hash == kCanonicalEmptyCollisionPolicyDigest &&
-         policy.allowed_static_static_pairs.empty() &&
+         policy.static_body_ids.empty() &&
          policy.allowed_touch_link_pairs.empty() &&
-         policy.support_contacts.empty() && policy.contact_grasps.empty() &&
+         policy.contact_rules.empty() &&
          policy.require_full_diagnostics;
 }
 
@@ -453,14 +400,7 @@ inline bool SceneObjectSnapshotDTO::locally_valid() const noexcept {
       !std::isfinite(mass_kg) || mass_kg < 0.0 ||
       !std::all_of(collision_shapes.begin(), collision_shapes.end(),
                    logical_scene_detail::ValidCollisionShape) ||
-      (provider_evidence.has_value() && !provider_evidence->valid()) ||
-      !logical_scene_detail::StrictlyIncreasing(
-          support_contacts,
-          [](const SupportContactDTO& contact) -> const std::string& {
-            return contact.support_object_id;
-          }) ||
-      !std::all_of(support_contacts.begin(), support_contacts.end(),
-                   logical_scene_detail::NormalizedSupportContact)) {
+      (provider_evidence.has_value() && !provider_evidence->valid())) {
     return false;
   }
   return std::visit(
@@ -491,11 +431,9 @@ inline bool CarriedObjectAttachmentDTO::locally_valid() const noexcept {
           })) {
     return false;
   }
-  const auto* component_frame =
-      std::get_if<ComponentSceneFrameRefDTO>(&carrier_frame_ref);
-  return component_frame != nullptr &&
-         component_frame->controllable_component_id ==
-             controllable_component_id;
+  // The carrier frame is the holder's, or (OD-372) a frame of a component
+  // mounted on the holder's robot; the scene owner checked the mount.
+  return std::holds_alternative<ComponentSceneFrameRefDTO>(carrier_frame_ref);
 }
 
 namespace logical_scene_detail {
@@ -532,35 +470,6 @@ namespace logical_scene_detail {
     }
   }
 
-  for (const auto& object : snapshot.objects) {
-    for (const auto& contact : object.support_contacts) {
-      if (contact.support_object_id == object.scene_resource_id.value()) {
-        return false;
-      }
-      const auto support = std::lower_bound(
-          snapshot.objects.begin(), snapshot.objects.end(),
-          contact.support_object_id,
-          [](const SceneObjectSnapshotDTO& candidate,
-             const std::string& support_id) {
-            return candidate.scene_resource_id.value() < support_id;
-          });
-      if (support == snapshot.objects.end() ||
-          support->scene_resource_id.value() != contact.support_object_id) {
-        return false;
-      }
-      const auto reciprocal = std::lower_bound(
-          support->support_contacts.begin(), support->support_contacts.end(),
-          object.scene_resource_id.value(),
-          [](const SupportContactDTO& candidate,
-             const std::string& support_id) {
-            return candidate.support_object_id < support_id;
-          });
-      if (reciprocal != support->support_contacts.end() &&
-          reciprocal->support_object_id == object.scene_resource_id.value()) {
-        return false;
-      }
-    }
-  }
   for (const auto& attachment : snapshot.carried_object_attachments) {
     if (!attachment.locally_valid()) {
       return false;

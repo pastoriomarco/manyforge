@@ -4,7 +4,7 @@
 # or a model-form io_device. Edit, then run
 #   scripts/manyforge component check <this folder>
 #   scripts/manyforge component register <this folder>
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: machine
 id: __ID__
 version: 1.0.0

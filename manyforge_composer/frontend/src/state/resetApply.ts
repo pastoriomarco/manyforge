@@ -54,6 +54,8 @@ export interface ResetApplyPlan {
   appliedRevision: string | null;
   /** Deployment only: the confirmed Preview's scope, sent with its Apply. */
   scope: Record<string, unknown> | null;
+  /** Deployment only: the confirmed Preview's collision rule changes, sent with its Apply. */
+  confirmedCollisionRuleIds?: string[];
 }
 
 export function resetApplyContext(plan: ResetApplyPlan): ResetApplyContext {

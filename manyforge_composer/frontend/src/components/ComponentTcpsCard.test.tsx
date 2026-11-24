@@ -23,7 +23,7 @@ function controller(customTcps: JsonValue[] = [pen]) {
       draft: {
         id: 'draft', revision: 1,
         document: {
-          api_version: 'manyforge.deployment_intent.v2',
+          api_version: 'manyforge.deployment_intent.v3',
           components: [{ component_id: 'lite6_robot', component_profile_id: 'lite6_mock_commanded_v0',
             custom_tcps: customTcps }],
           attachments: [],
@@ -71,7 +71,7 @@ async function mounted(current: DeploymentWorkspaceController) {
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host.host as unknown as Element);
   await act(() => root.render(<ComponentTcpsCard componentId="lite6_robot" controller={current}
-    frames={frames} gripperFrames={[]} motionDescriptors={descriptors} />));
+    frames={frames} collisionBodies={['gripper_collision', 'gripper_fingers']} gripperFrames={[]} motionDescriptors={descriptors} />));
   return { ...host, root };
 }
 
@@ -82,7 +82,7 @@ const field = (label: string) => (props: MountedProps) => props['aria-label'] ==
 describe('TCPs and frames card', () => {
   it('shows model frames and descriptor TCPs read-only, custom TCPs editable', () => {
     const html = renderToStaticMarkup(<ComponentTcpsCard componentId="lite6_robot" controller={controller()}
-      frames={frames} gripperFrames={[]} motionDescriptors={descriptors} />);
+      frames={frames} collisionBodies={['gripper_collision', 'gripper_fingers']} gripperFrames={[]} motionDescriptors={descriptors} />);
     expect(html).toContain('Applied model · read-only');
     expect(html).toContain('link_tcp · TCP lite_gripper.tcp (default)');
     expect(html).toContain('lite6_robot.pen');
@@ -99,7 +99,7 @@ describe('TCPs and frames card', () => {
     const mountedRow = descriptors[0].tcps[0];
     const elsewhere = { ...mountedRow, mountedHere: false, mountedElsewhere: true, isDefault: false };
     const html = renderToStaticMarkup(<ComponentTcpsCard componentId="lite6_robot" controller={controller()}
-      frames={frames} gripperFrames={[]} motionDescriptors={[
+      frames={frames} collisionBodies={['gripper_collision', 'gripper_fingers']} gripperFrames={[]} motionDescriptors={[
         { ...descriptors[0], tcps: [elsewhere] }, descriptors[0],
       ]} />);
     expect(html).toContain('link_tcp · TCP lite_gripper.tcp (default)');
@@ -125,6 +125,21 @@ describe('TCPs and frames card', () => {
         pen,
         { tcp_id: 'probe', parent_frame: 'tcp',
           pose: { position_m: [0, 0, 0.05], orientation: { rpy_deg: [0, 90, 0] } } },
+      ]);
+    } finally { await act(() => root.unmount()); }
+  });
+
+  it('writes the chosen contact bodies of a custom TCP; Default writes no key', async () => {
+    const current = controller();
+    const { find, root } = await mounted(current);
+    try {
+      await act(() => find(button('Edit custom TCP pen')).onClick?.());
+      expect(find(field('Custom TCP contact bodies')).value).toBe('default');
+      await act(() => find(field('Custom TCP contact bodies')).onChange?.({ target: { value: 'chosen' } }));
+      await act(() => find(field('Custom TCP contact body gripper_fingers')).onChange?.({ target: { checked: true } }));
+      await act(() => find(button('Save to Draft')).onClick?.());
+      expect(current.mutate).toHaveBeenCalledExactlyOnceWith(['components', 0, 'custom_tcps'], 'set', [
+        { ...pen, contact_bodies: ['gripper_fingers'] },
       ]);
     } finally { await act(() => root.unmount()); }
   });
@@ -179,12 +194,12 @@ describe('TCPs and frames card', () => {
     (compiled.workspace!.draft.document as Record<string, JsonValue>).api_version = 'manyforge.deployment.v1';
     for (const current of [removed, compiled]) {
       const html = renderToStaticMarkup(<ComponentTcpsCard componentId="lite6_robot" controller={current}
-        frames={frames} gripperFrames={[]} motionDescriptors={descriptors} />);
+        frames={frames} collisionBodies={['gripper_collision', 'gripper_fingers']} gripperFrames={[]} motionDescriptors={descriptors} />);
       expect(html).toMatch(/<button type="button" disabled="" title="This component has no row in the Deployment Draft[^"]*">Add custom TCP<\/button>/);
     }
     // A compiled Deployment still lists its custom TCPs read-only.
     const compiledHtml = renderToStaticMarkup(<ComponentTcpsCard componentId="lite6_robot" controller={compiled}
-      frames={frames} gripperFrames={[]} motionDescriptors={descriptors} />);
+      frames={frames} collisionBodies={['gripper_collision', 'gripper_fingers']} gripperFrames={[]} motionDescriptors={descriptors} />);
     expect(compiledHtml).toMatch(/disabled="" title="This component has no row[^"]*" aria-label="Edit custom TCP pen"/);
     expect(compiledHtml).toMatch(/disabled="" title="This component has no row[^"]*" aria-label="Delete custom TCP pen"/);
   });

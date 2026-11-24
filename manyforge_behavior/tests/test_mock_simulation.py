@@ -52,41 +52,6 @@ def _row(resource_role: str = "part_present", start: Any = False, change: Any = 
     return row
 
 
-def _contact_policy() -> dict[str, Any]:
-    policy: dict[str, Any] = {
-        "api_version": "manyforge.contact_policy.v1",
-        "default_unmatched_response": "hard_stop",
-        "mode": "contact_grasp",
-        "policy_id": "probe_contact",
-        "sensing_mode": "geometry_only",
-        "version": "sha256:" + "0" * 64,
-        "zones": [
-            {
-                "body_pairs": [
-                    {
-                        "body_a": {
-                            "kind": "component_model_body",
-                            "body": {"component_id": "ur5_robot", "collision_body_id": "arm_collision"},
-                        },
-                        "body_b": {"kind": "runtime_object", "runtime_object_id": "cell.probe"},
-                    }
-                ],
-                "max_penetration_m": 0.002,
-                "terminal_window_start_fraction": 0.8,
-                "violation_response": "hard_stop",
-                "zone_id": "probe_tip",
-            }
-        ],
-    }
-    policy["version"] = compute_content_identity(
-        policy,
-        own_field="version",
-        identity_domain="catalog-record-revision/contact_policy",
-        api_version="manyforge.contact_policy.v1",
-    )
-    return policy
-
-
 def _program(
     node_id: str,
     rows: Any = None,
@@ -107,8 +72,6 @@ def _program(
             {"key": "cell.seen", "type": "bool", "access": "read_write", "persistence": "run"},
         ],
     }
-    if node_id == "motion.probe_search":
-        document["contact_policies"] = [_contact_policy()]
     if node_id in _MOTION:
         parameters: dict[str, Any] = {
             "target": target("ur5_robot", "arm"),
@@ -119,8 +82,15 @@ def _program(
             "interrupt_condition": deepcopy(_CONDITION),
         }
         if node_id == "motion.probe_search":
-            parameters["contact_policy_id"] = "probe_contact"
-            parameters["contact_scene_resource_id"] = "table"
+            parameters["collision_rules"] = [
+                {
+                    "rule_id": "probe_contact",
+                    "a": [{"kind": "collision_body", "component_id": "ur5_robot",
+                           "collision_body_id": "arm_collision"}],
+                    "b": [{"kind": "scene_object", "blackboard_key": "cell.probe"}],
+                    "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8},
+                }
+            ]
     else:
         parameters = {"signal": signal("ur5_robot", "part_present")}
         if node_id == "io.get_input":
@@ -142,7 +112,7 @@ def _program(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, _CATALOG)
 

@@ -4,7 +4,7 @@
 # lanes: the host's Mock I/O (outputs read back). Declared I/O only: the
 # controller accepts writes to missing outputs.
 # The Lite 6 tool board has TO0/TO1 only (measured 2026-11-01).
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: io_device
 id: ufactory.lite6_tool_io
 version: 1.0.0

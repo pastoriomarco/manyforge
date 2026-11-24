@@ -207,9 +207,6 @@ export function ComponentManagerChanges({ controller, rows }: {
   const draft = workspace?.draft ?? null;
   const current = preview !== null && draft !== null
     && preview.draftId === draft.id && preview.draftRevision === draft.revision;
-  const applyReason = deploymentActionUnavailableReason(
-    workspace, 'apply', controller.documentUnavailableReason,
-  );
   const pending = rows.filter((row) => row.change !== 'applied');
 
   const runPreview = async () => {
@@ -242,12 +239,6 @@ export function ComponentManagerChanges({ controller, rows }: {
         <button type="button" disabled={draft?.document == null || controller.busy}
           title={busyReason(controller.busyOperation) ?? undefined}
           onClick={() => { void runPreview(); }}>{busyLabel(controller.busyOperation, 'preview', 'Preview changes')}</button>
-        <button type="button" className="primary-action" disabled={applyReason !== null || controller.busy}
-          title={applyReason ?? busyReason(controller.busyOperation)
-            ?? 'Preview this Draft and confirm its impact; the affected components come back prepared.'}
-          onClick={() => { void controller.applyDraft(); }}>
-          {busyLabel(controller.busyOperation, ['apply_preview', 'apply'], 'Apply…')}
-        </button>
       </div>
       {/* Yellow: a refused Preview or Apply changed nothing. */}
       {error !== null && <p className="inline-message severity-warning" role="alert">{error}</p>}

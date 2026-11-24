@@ -26,6 +26,7 @@ API, `http://127.0.0.1:9020`.
 | Motion refused with `validation_collision` | Stale pose source, scene drift, or genuine collision | See [§Collision rejection](#collision-rejection) below |
 | Motion stopped with **Robot position feedback lost** (`runtime_monitor_observation_lost`) | The robot's measured joint states stopped arriving or became too old during motion, typically because the robot controller faulted or its connection dropped; nothing was detected in contact | Inspect the operation alarm in Runtime and its History entry; check the robot component's state and controller connection, then Recover the component |
 | Motion stopped with **Collision checks stopped** (`runtime_monitor_checks_stopped`) | The robot's collision checks did not run in time during motion, typically because the controller computer was overloaded; nothing was detected in contact, and the robot's position feedback was still arriving | Inspect the operation alarm in Runtime and its History entry; check the load on the controller computer (other programs, a model being served), then Recover |
+| Motion stopped with **A component fault stopped motion** (`component_fault`) | A component (robot, tool or I/O device, e.g. an I/O bank whose stream stopped) entered a fault while motion ran; every moving robot stopped with its fault Stop profile and the cell latched. The details name the component | Inspect the operation alarm in Runtime and its History entry; Recover the named component (the latch clears when every component is healthy and idle), then recover the stopped move as for **Robot position feedback lost** |
 | A **Component fault** alarm is listed (`manyforge.runtime.component_fault`) | A component's state shows a fault; the alarm's headline is the fault's own text. One alarm per component (simulators have none); it is Resolved when the fault ends and stays listed until acknowledged. While the cell is latched it is shown inside the latch item | Read the fault on the component and use the action it names; acknowledging the alarm clears nothing and gates nothing |
 | AI tab disabled or chat request fails | No AI assistant or `ai_model` component, one of them not enabled, a Program run exists, model server down or still loading, wrong model name (HTTP 404), token variable unset, slow model (timeout) | See [§AI assistant](#ai-assistant) below |
 | Isaac robot shows **Simulation not playing**; the run holds with "Waiting for Run on <node>: Simulation not playing" | Simulation paused or stopped, or the workbench can't reach Isaac (DDS) | See [§Simulation not playing](#simulation-not-playing) below |
@@ -76,13 +77,18 @@ so a separate later Run/Resume press is required to plan and move.
 The same code also covers cancellation or an inconclusive fail-closed query;
 use the message and `details` to distinguish them. Collision details include
 the colliding pair and body ids when available. `details.classification:
-clearance` means the trajectory passes closer than the move's collision
-clearance (`collision_clearance_m`) to that pair without touching it
-(`signed_clearance_m`); the planner retries a detour first. A goal (or start)
-inside the clearance is refused by the planner (`planning_failed`,
-`native_goal_state_collision`, `classification: clearance`). For deliberate
-close work, set a smaller `clearance_m` on that motion node or in Robot
-Control's Advanced settings, or lower the Deployment `collision_clearance_m`.
+clearance` means the trajectory passes closer than that pair's clearance
+without touching it (`signed_clearance_m`); `details.collision_rule_id` names the
+collision rule the clearance comes from. The planner retries a detour first.
+A goal (or start) inside the clearance is refused by the planner
+(`planning_failed`, `native_goal_state_collision`, `classification:
+clearance`). For deliberate close work, give that motion node its own
+clearance (the node's **Collision rules**, **Everything else: clearance**)
+or set one in Robot Control's Advanced settings, or lower the clearance of
+the Deployment's first collision rule. A move that must touch an object
+needs a contact rule; one that overlaps deeper than its rule allows is
+refused with `contact_penetration_exceeded`
+([Collision rules](../authoring/COLLISION_RULES.md)).
 
 **Where to look**:
 

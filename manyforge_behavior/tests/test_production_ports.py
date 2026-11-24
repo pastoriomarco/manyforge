@@ -133,7 +133,6 @@ class _Transport:
             "identity": {
                 # The native owner may expose a direct-control status Program;
                 # production Program requests must use their captured context.
-                "program_id": "manyforge.direct_control.motion",
                 "program_revision": _DIGEST_F,
                 "program_binding_id": _DIGEST_F,
                 "graph_revision": _DIGEST_C,
@@ -235,7 +234,7 @@ class _Transport:
         return {
             "ok": True,
             "scope": {
-                "schema_version": "manyforge.program_execution_scope.v3",
+                "schema_version": "manyforge.program_execution_scope.v4",
                 "claim_generation": 1,
                 "program_run_id": program_run_id,
                 "hold_revision": self.hold_revision,
@@ -246,6 +245,7 @@ class _Transport:
                 "selection_release_block_reason": None,
                 "stopped_by": None,
                 "rule_id": None,
+                "program_held_nodes": [],
                 "frozen": "none" if event_id is None else "program_end",
                 "frozen_by": event_id,
                 "all_groups_held": False,
@@ -701,7 +701,6 @@ def _context() -> ProgramRunPortContext:
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="mock_lite6_pick_and_place",
         source_document_digest=_DIGEST_A,
-        program_id="lite6_program",
         program_revision=_DIGEST_A,
         program_binding_id=_DIGEST_A,
         retained_bundle_id=_DIGEST_B,
@@ -709,7 +708,6 @@ def _context() -> ProgramRunPortContext:
         node_environment_digest=_DIGEST_D,
         program_binding={
             "program_binding_id": _DIGEST_A,
-            "program_id": "lite6_program",
             "program_revision": _DIGEST_A,
             "retained_bundle_id": _DIGEST_B,
             "graph_revision": _DIGEST_C,
@@ -734,12 +732,7 @@ def _context() -> ProgramRunPortContext:
             ],
             "collision_body_bindings": [],
             "signal_bindings": [],
-            "contact_grasp_bindings": [
-                {
-                    "contact_policy_id": "pick.contact",
-                    "runtime_object_id": "selected_object",
-                }
-            ],
+            "collision_rule_bodies": [],
         },
     )
 
@@ -748,7 +741,6 @@ def _deferred_policy_context() -> ProgramRunPortContext:
     return replace(
         _context(),
         program={
-            "program_id": "lite6_program",
             "program_revision": _DIGEST_A,
             "execution_groups": {
                 "robot_group": {"execution_policy": "common_start"}
@@ -813,7 +805,6 @@ def _motion_inputs() -> OwnerNodeInputs:
             "planning_timeout_s": 2.0,
             "execution_timeout_s": 10.0,
             "cache_mode": "default",
-            "contact_policy_id": None,
         }
     )
 
@@ -921,7 +912,6 @@ def test_relative_pose_submission_uses_capture_and_preserves_direct_references()
 
     assert started.state is OwnerTaskState.ACTIVE
     request = transport.submissions[0]
-    assert request["program_id"] == "lite6_program"
     assert request["program_binding_id"] == _DIGEST_A
     assert request["expected_scene_revision"] is None
     participant = request["participants"][0]
@@ -1101,30 +1091,200 @@ def test_cartesian_speed_mode_is_sent_only_when_the_node_sets_cartesian_timing(
     assert ("speed_mode" in motion) is (timing is not None)
 
 
-def test_pick_place_cartesian_phases_keep_exact_corners_and_deployment_timing() -> None:
-    motion = NativeKernelProgramPort._cartesian_motion(({"a": 1}, {"b": 2}, {"c": 3}))
-    assert motion["blend_radii_m"] == [0.0, 0.0, 0.0]
-    assert "speed_mode" not in motion
+_LINE = {
+    "max_translation_step_m": 0.002,
+    "max_rotation_step_rad": 0.02,
+    "max_angular_speed_rad_s": 0.4,
+    "max_linear_acceleration_mps2": 0.3,
+    "max_angular_acceleration_rad_s2": 1.0,
+}
 
 
-@pytest.mark.parametrize("clearance_m", [None, 0.0, 0.0005])
-def test_motion_clearance_is_forwarded_only_when_the_node_sets_it(clearance_m) -> None:
-    # A motion node's clearance_m reaches the owner as the
-    # move's own clearance; absent keeps the Deployment clearance.
+@pytest.mark.parametrize("node_id", ["motion.move_to_pose", "motion.move_until_signal"])
+@pytest.mark.parametrize("timing", [None, "time_optimal"])
+def test_linear_pose_move_sends_a_pose_goal_with_its_line_settings(node_id, timing) -> None:
+    # OD-341: the linear pose move stays a pose goal; the planning step
+    # derives the line's start from its own start state.
+    from manyforge_behavior.production_ports import _motion_spec
+
+    parameters = {**_motion_inputs().parameters, "motion_type": "linear", **_LINE}
+    if timing is not None:
+        parameters["cartesian_timing"] = timing
+
+    motion = _motion_spec(node_id, parameters)
+    assert motion == {
+        "kind": "pose_goal",
+        "goal": motion["goal"],
+        "motion_type": "linear",
+        **_LINE,
+        **({} if timing is None else {"speed_mode": timing}),
+    }
+
+
+def test_joint_pose_move_keeps_its_two_field_pose_goal() -> None:
+    from manyforge_behavior.production_ports import _motion_spec
+
+    parameters = {**_motion_inputs().parameters, **_LINE, "cartesian_timing": "time_optimal"}
+    for motion_type in ({}, {"motion_type": "joint"}):
+        motion = _motion_spec("motion.move_to_pose", {**parameters, **motion_type})
+        assert set(motion) == {"kind", "goal"}
+
+
+def test_linear_pose_move_payload_reaches_the_owner() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    parameters = dict(_motion_inputs().parameters)
-    if clearance_m is not None:
-        parameters["clearance_m"] = clearance_m
+    parameters = {**_motion_inputs().parameters, "motion_type": "linear", **_LINE}
 
     port.operations.start(
         "motion.move_to_pose", _identity(), OwnerNodeInputs(parameters=parameters)
     )
 
     payload = transport.submissions[0]["participants"][0]["payload"]
-    assert payload.get("clearance_m") == clearance_m
-    assert ("clearance_m" in payload) is (clearance_m is not None)
+    assert payload["motion"]["motion_type"] == "linear"
+    assert payload["target_mode"] == "relative"
+    assert "planner" not in payload
+
+
+def test_pick_place_cartesian_phases_keep_exact_corners_and_deployment_timing() -> None:
+    motion = NativeKernelProgramPort._cartesian_motion(({"a": 1}, {"b": 2}, {"c": 3}))
+    assert motion["blend_radii_m"] == [0.0, 0.0, 0.0]
+    assert "speed_mode" not in motion
+
+
+_TIP_ON_PART = {
+    "a": [{"kind": "active_tcp_contact_bodies"}],
+    "b": [{"kind": "scene_object", "scene_resource_id": "part.7"}],
+}
+_RELEASE_SENT = {
+    "release_evidence_mode": "signed_penetration",
+    "enforce_max_start_penetration": True,
+    "max_start_penetration_m": 0.0,
+    "min_release_progress_m": 0.0,
+    "release_tolerance_m": 1e-5,
+    "require_strictly_decreasing_penetration": True,
+    "require_separation_by_end": True,
+    "allow_recontact": False,
+}
+
+
+@pytest.mark.parametrize(
+    "authored,sent",
+    [
+        (None, []),
+        ([{"rule_id": "everything_else", "clearance_m": 0.0}],
+         [{"rule_id": "everything_else", "clearance_m": 0.0}]),
+        ([{"rule_id": "tip", **_TIP_ON_PART,
+           "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8}}],
+         [{"rule_id": "tip", **_TIP_ON_PART,
+           "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8}}]),
+        ([{"rule_id": "tip", **_TIP_ON_PART, "contact": {}}],
+         [{"rule_id": "tip", **_TIP_ON_PART, "contact": {}}]),
+        ([{"rule_id": "leave", **_TIP_ON_PART, "release": {}}],
+         [{"rule_id": "leave", **_TIP_ON_PART, "release": _RELEASE_SENT}]),
+        ([{"rule_id": "leave", **_TIP_ON_PART,
+           "release": {"release_evidence_mode": "binary_contact"}}],
+         [{"rule_id": "leave", **_TIP_ON_PART, "release": {
+             **_RELEASE_SENT, "release_evidence_mode": "binary_contact",
+             "enforce_max_start_penetration": False, "release_tolerance_m": 0.0,
+             "require_strictly_decreasing_penetration": False}}]),
+    ],
+)
+def test_motion_sends_its_collision_rules(authored, sent) -> None:
+    # The node's rules reach the owner with every release spelled out; a node
+    # without rules sends an empty list and keeps the Deployment's rules.
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    if authored is not None:
+        parameters["collision_rules"] = authored
+
+    port.operations.start(
+        "motion.move_to_pose", _identity(), OwnerNodeInputs(parameters=parameters)
+    )
+
+    payload = transport.submissions[0]["participants"][0]["payload"]
+    assert payload["collision_rules"] == sent
+    assert payload["runtime_object_bindings"] == []
+    assert "contact_policy_id" not in payload
+    assert "clearance_m" not in payload
+
+
+def test_motion_refuses_malformed_collision_rules_before_submission() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    parameters["collision_rules"] = [
+        {"rule_id": "tip", **_TIP_ON_PART, "contact": {}, "clearance_m": 0.001}
+    ]
+
+    with pytest.raises(ProductionPortError, match="exactly one of clearance_m"):
+        port.operations.start(
+            "motion.move_to_pose", _identity(), OwnerNodeInputs(parameters=parameters)
+        )
+    assert transport.submissions == []
+
+
+def test_motion_spells_out_a_spring_slider_rule_from_the_binding() -> None:
+    # OD-371: the slider and the objects it carries press in as one spring;
+    # stroke, step and axis come from the Program Binding's slider row.
+    context = _context()
+    context = replace(context, program_binding={
+        **context.program_binding,
+        "collision_rule_spring_sliders": [{
+            "body": {"component_id": "tool.1", "collision_body_id": "holder_rod"},
+            "axis": [0.0, 0.0, 1.0], "stroke_m": 0.02, "max_compression_step_m": 0.002,
+        }],
+    })
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(context)
+    parameters = dict(_motion_inputs().parameters)
+    parameters["collision_rules"] = [{
+        "rule_id": "press",
+        "spring_slider": {"component_id": "tool.1", "element_id": "holder_rod"},
+        "b": [{"kind": "scene_object", "scene_resource_id": "part.7"}],
+        "contact": {"end_from_fraction": 0},
+    }]
+
+    port.operations.start(
+        "motion.move_to_pose", _identity(), OwnerNodeInputs(parameters=parameters)
+    )
+
+    [rule] = transport.submissions[0]["participants"][0]["payload"]["collision_rules"]
+    assert rule["a"] == [
+        {"kind": "collision_body", "component_id": "tool.1", "collision_body_id": "holder_rod"},
+        {"kind": "attached_object", "component_id": "tool.1",
+         "collision_body_role_id": "holder_rod"},
+    ]
+    assert rule["contact"] == {
+        "end_from_fraction": 0.0, "max_penetration_m": 0.02, "max_compression_step_m": 0.002,
+        "spring_group": {"component_id": "tool.1", "element_id": "holder_rod",
+                         "axis": [0.0, 0.0, 1.0]},
+    }
+    from manyforge_headless_api.models import CollisionRuleRequest
+
+    assert CollisionRuleRequest.model_validate(rule).model_dump(mode="json") == rule
+
+
+def test_motion_refuses_a_spring_slider_the_binding_does_not_hold() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    parameters["collision_rules"] = [{
+        "rule_id": "press",
+        "spring_slider": {"component_id": "tool.1", "element_id": "holder_rod"},
+        "b": [{"kind": "scene_objects"}],
+    }]
+
+    with pytest.raises(ProductionPortError, match="no spring slider"):
+        port.operations.start(
+            "motion.move_to_pose", _identity(), OwnerNodeInputs(parameters=parameters)
+        )
+    assert transport.submissions == []
 
 
 def test_reference_names_another_robot_frame_or_the_cell_by_binding_identity() -> None:
@@ -2210,7 +2370,7 @@ def _preset_transport(transport=None, *, kind="angular_rad"):
         "command_kind": "gripper_position", "command_duration_s": 0.8,
         "description": "Fixture model-backed position gripper.",
         "mount_frame": "gripper_mount", "attach_frame": "gripper_tcp", "tcp_frame": "gripper_tcp",
-        "touch_links": ["finger_link"], "auxiliary_frames": [], "mimic_followers": [],
+        "grip_body_links": ["finger_link"], "auxiliary_frames": [], "mimic_followers": [],
         "source_coordinate_name": "finger_joint", "source_group_name": "finger_group",
         "state_authority_id": None, "state_authority_class": None,
         "control_interface_contract_id": None, "transport_kind": "resolved_binding",
@@ -2313,7 +2473,7 @@ def test_named_gripper_alias_refuses_old_or_incomplete_v5_descriptor(case):
         for field in ("actuation_kind", "output_mode", "description", "command_duration_s",
                       "open_state_ref", "closed_state_ref", "mount_frame", "attach_frame", "tcp_frame"):
             descriptor[field] = None
-        descriptor["touch_links"] = []
+        descriptor["grip_body_links"] = []
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
     parameters = dict(_gripper_inputs().parameters)
@@ -2883,10 +3043,62 @@ def _pick_inputs(*, policy: str = "pause_for_operator") -> OwnerNodeInputs:
             "tool_command_duration_s": 0.5,
             "tool_completion_timeout_s": 30.0,
             "output_key": "pick_plan",
-            "contact_policy_id": "pick.contact",
+            "collision_rules": [
+                {
+                    "rule_id": "grasp",
+                    "leg": "descend",
+                    "a": [{"kind": "active_tcp_contact_bodies"}],
+                    "b": [{"kind": "scene_object", "scene_resource_id": "graspable"}],
+                    "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8},
+                },
+                {
+                    "rule_id": "lift",
+                    "leg": "retreat",
+                    "a": [{"kind": "attached_object", "component_id": "tool.1"}],
+                    "b": [{"kind": "scene_object", "scene_resource_id": "table"}],
+                    "release": {"release_evidence_mode": "binary_contact"},
+                },
+            ],
             "no_feasible_plan_policy": policy,
         }
     )
+
+
+def test_pick_offset_object_key_is_bound_to_the_selected_object_on_descend() -> None:
+    transport = _PickPlaceTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_pick_inputs().parameters)
+    synthesis = dict(parameters["synthesis"])
+    synthesis["pick_offset_reference"] = {
+        "type": "runtime_object", "runtime_object_id": "selected_object",
+    }
+    parameters["synthesis"] = synthesis
+
+    _plan(
+        port, "planning.plan_pick_sequence", _identity("plan-pick-object-offset"),
+        OwnerNodeInputs(parameters=parameters),
+    )
+
+    intent = transport.pick_requests[-1]
+    assert intent["selected_runtime_object_id"] == "selected_object"
+    assert intent["descend_operation"]["participants"][0]["payload"]["runtime_object_bindings"] == [
+        {"runtime_object_id": "selected_object", "scene_resource_id": "graspable"}
+    ]
+    for phase in ("approach", "retreat"):
+        payload = intent[f"{phase}_operation"]["participants"][0]["payload"]
+        assert payload["runtime_object_bindings"] == []
+
+    synthesis["approach_offset_reference"] = {
+        "type": "runtime_object", "runtime_object_id": "another_object",
+    }
+    requests = len(transport.pick_requests)
+    with pytest.raises(ProductionPortError, match="more than one runtime object"):
+        _plan(
+            port, "planning.plan_pick_sequence", _identity("plan-pick-two-objects"),
+            OwnerNodeInputs(parameters=parameters),
+        )
+    assert len(transport.pick_requests) == requests
 
 
 def test_pick_offsets_accept_cell_and_other_robot_frames_like_motion_references() -> None:
@@ -3072,22 +3284,33 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
         "tool_position": {"kind": "linear_m", "value_m": 0.0},
     }
     intent = transport.pick_requests[0]
-    assert intent["selected_runtime_object_id"] == "selected_object"
+    # No pick offset names the object by a blackboard key.
+    assert "selected_runtime_object_id" not in intent
     assert intent["synthesis"]["base_tool_orientation_rpy_deg"] == [
         180.0,
         0.0,
         0.0,
     ]
     assert intent["synthesis"]["maximum_candidate_count"] == 4096
-    assert intent["descend_operation"]["participants"][0]["payload"]["runtime_object_bindings"] == [
+    # Each leg carries its own rows of the sequence's collision rules.
+    legs = {
+        phase: intent[f"{phase}_operation"]["participants"][0]["payload"]
+        for phase in ("approach", "descend", "retreat")
+    }
+    assert legs["approach"]["collision_rules"] == []
+    assert legs["descend"]["collision_rules"] == [
         {
-            "runtime_object_id": "selected_object",
-            "scene_resource_id": "graspable",
+            "rule_id": "grasp",
+            "a": [{"kind": "active_tcp_contact_bodies"}],
+            "b": [{"kind": "scene_object", "scene_resource_id": "graspable"}],
+            "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8},
         }
     ]
-    assert (
-        intent["approach_operation"]["participants"][0]["payload"]["runtime_object_bindings"] == []
+    assert [row["rule_id"] for row in legs["retreat"]["collision_rules"]] == ["lift"]
+    assert legs["retreat"]["collision_rules"][0]["release"]["release_evidence_mode"] == (
+        "binary_contact"
     )
+    assert all(leg["runtime_object_bindings"] == [] for leg in legs.values())
     assert (
         intent["tool_operation"]["participants"][0]["payload"]["command_schema_revision"]
         == _DIGEST_E
@@ -3244,6 +3467,48 @@ def test_native_motion_program_stop_fails_with_its_cause_and_never_holds(
     port.unbind(1)
 
 
+def test_native_motion_clean_collision_stop_fails_with_its_collision_cause() -> None:
+    """OD-373 (A): a collision Stop contained cleanly ends the move Stopped.
+    It is no operator hold: the node fails with the typed collision cause, so
+    its recovery_policy and failure branch apply as before."""
+
+    transport = _Transport()
+    port = _motion_test_port(transport)
+    port.bind(_context())
+    started = port.operations.start("motion.move_to_pose", _identity("motion"), _motion_inputs())
+    operation = transport.operations[started.task_id]
+    operation.update(
+        {
+            "state": "stopped",
+            "stop_event_id": 11,
+            "participants": [
+                {
+                    "state": "stopped",
+                    "terminal_error": {
+                        "code": "execution_aborted",
+                        "message": "Runtime collision containment stopped the operation",
+                        "details": {"reason": "runtime_collision_fault"},
+                    },
+                }
+            ],
+        }
+    )
+    transport.operation_recovery = lambda _operation_id: {
+        "ok": True,
+        "operation_revision": operation["operation_revision"],
+        "participants": [{"operation_participant_id": "participant.1"}],
+        "recovery_assessment": {"recovery_class": "runtime_collision"},
+        "stop_event_id": 11,
+    }
+    observed = port.operations.observe(started.task_id)
+    assert observed.state is OwnerTaskState.INTERRUPTED
+    assert "authored_failure_policy" not in observed.metadata
+    assert observed.reason_code == "execution_aborted"
+    assert observed.details is not None
+    assert observed.details["reason"] == "runtime_collision_fault"
+    port.unbind(1)
+
+
 def test_accepted_native_motion_recovery_releases_the_obsolete_task() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -3309,7 +3574,7 @@ def test_place_intent_preserves_authored_pose_and_has_no_grasp_exception() -> No
     port.bind(_context())
     parameters = dict(_pick_inputs().parameters)
     parameters.pop("synthesis")
-    parameters.pop("contact_policy_id")
+    parameters.pop("collision_rules")
     parameters.pop("no_feasible_plan_policy")
     parameters.pop("output_key")
     parameters.update(
@@ -3336,7 +3601,7 @@ def test_place_intent_preserves_authored_pose_and_has_no_grasp_exception() -> No
     assert approach["motion"]["goal"]["position_m"]["z_m"] == pytest.approx(0.28)
     for phase in ("approach", "descend", "retreat"):
         payload = intent[f"{phase}_operation"]["participants"][0]["payload"]
-        assert payload["contact_policy_id"] is None
+        assert payload["collision_rules"] == []
         assert payload["runtime_object_bindings"] == []
 
 
@@ -3408,7 +3673,6 @@ def _scene_context() -> ProgramRunPortContext:
         applied_record_digest=value.applied_record_digest,
         scenario_id=value.scenario_id,
         source_document_digest=value.source_document_digest,
-        program_id=value.program_id,
         program_revision=value.program_revision,
         program_binding_id=value.program_binding_id,
         retained_bundle_id=value.retained_bundle_id,
@@ -3418,11 +3682,7 @@ def _scene_context() -> ProgramRunPortContext:
     )
 
 
-def _fixed_scene_object(
-    scene_resource_id: str,
-    *,
-    support_object_id: str | None = None,
-) -> dict[str, Any]:
+def _fixed_scene_object(scene_resource_id: str) -> dict[str, Any]:
     return {
         "scene_resource_id": scene_resource_id,
         "collision_shapes": [
@@ -3440,9 +3700,6 @@ def _fixed_scene_object(
             },
         },
         "provider_evidence": None,
-        "support_contacts": (
-            [] if support_object_id is None else [{"support_object_id": support_object_id}]
-        ),
     }
 
 
@@ -3461,7 +3718,7 @@ class _SceneTransport:
         self.attachments: list[dict[str, Any]] = []
         if populated:
             self.objects = {
-                "old-part": _fixed_scene_object("old-part", support_object_id="old-support"),
+                "old-part": _fixed_scene_object("old-part"),
                 "old-support": _fixed_scene_object("old-support"),
             }
             self.objects["old-part"]["placement"] = {
@@ -3588,7 +3845,6 @@ class _SceneTransport:
                     },
                 },
                 "provider_evidence": None,
-                "support_contacts": deepcopy(operation["support_contacts"]),
             }
             assert frame_ref["kind"] in {"cell_frame", "component_frame"}
             self.objects[operation["scene_resource_id"]] = scene_object
@@ -4190,7 +4446,7 @@ def test_empty_apply_foreign_receipt_is_unknown(refused):
     assert len(transport.submissions) == 1
 
 
-def test_empty_apply_refused_detach_keeps_part_and_its_support() -> None:
+def test_empty_apply_refused_detach_keeps_the_part() -> None:
     class RefusedDetach(_SceneTransport):
         def commit_scene_transaction(self, body):
             if body["operation"]["kind"] == "detach_carried_object":
@@ -4209,10 +4465,12 @@ def test_empty_apply_refused_detach_keeps_part_and_its_support() -> None:
         is_current=lambda: True,
     )
     assert result["state"] == "partial"
-    assert result["last_observed_remaining"] == ["old-part", "old-support"]
+    assert result["last_observed_remaining"] == ["old-part"]
     assert result["refused"] == [{"resource_id": "old-part", "code": "missing_reference",
                                    "message": "carrier unavailable"}]
-    assert len(transport.submissions) == 1
+    assert [request["operation"]["kind"] for request in transport.submissions] == [
+        "detach_carried_object", "remove_object",
+    ]
 
 
 def test_scene_initialization_adds_pick_resources_last() -> None:
@@ -4241,23 +4499,11 @@ def test_scene_initialization_adds_pick_resources_last() -> None:
     assert sorted(transport.objects) == ["graspable", "table"]
 
 
-def test_scene_initialization_forwards_authored_support_contact_policy() -> None:
+def test_scene_initialization_sends_no_contact_settings() -> None:
     transport = _SceneTransport()
     port = _scene_port(transport)
     scene = _authored_scene()
-    support_contact = {
-        "support_object_id": "table",
-        "mode": "contact_release",
-        "release_evidence_mode": "binary_contact",
-        "enforce_max_start_penetration": False,
-        "max_start_penetration_m": 0.0,
-        "release_tolerance_m": 0.0,
-        "min_release_progress_m": 0.0,
-        "require_separation_by_end": True,
-        "require_strictly_decreasing_penetration": False,
-        "allow_recontact": False,
-    }
-    scene[0]["metadata"] = {"support_contacts": [support_contact]}
+    scene[0]["metadata"] = {"display_hint": "retained"}
 
     port.prepare_initial_scene(_scene_context(), scene)
 
@@ -4270,8 +4516,10 @@ def test_scene_initialization_forwards_authored_support_contact_policy() -> None
         "table",
         "graspable",
     ]
-    assert add_operations[1]["support_contacts"] == [support_contact]
-    assert transport.objects["graspable"]["support_contacts"] == [support_contact]
+    assert all(
+        set(operation) == {"kind", "scene_resource_id", "shape", "pose", "frame_ref"}
+        for operation in add_operations
+    )
 
 
 def test_scene_initialization_retries_no_effect_admission_race_with_new_identity() -> None:
@@ -4622,7 +4870,6 @@ def test_three_production_context_ports_rollback_as_one_before_dispatch() -> Non
         applied_record_digest=base.applied_record_digest,
         scenario_id=base.scenario_id,
         source_document_digest=base.source_document_digest,
-        program_id=base.program_id,
         program_revision=base.program_revision,
         program_binding_id=base.program_binding_id,
         retained_bundle_id=base.retained_bundle_id,
@@ -4630,7 +4877,6 @@ def test_three_production_context_ports_rollback_as_one_before_dispatch() -> Non
         node_environment_digest=base.node_environment_digest,
         program_binding=base.program_binding,
         program={
-            "program_id": base.program_id,
             "program_revision": base.program_revision,
             "blackboard": {"namespaces": [], "keys": []},
             "tree": {
@@ -5064,7 +5310,7 @@ def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> Non
 
 def _joint_inputs() -> OwnerNodeInputs:
     parameters = dict(_motion_inputs().parameters)
-    for name in ("target_reference", "offset_reference", "contact_policy_id"):
+    for name in ("target_reference", "offset_reference"):
         parameters.pop(name)
     parameters.update(
         target_mode="absolute",
@@ -5077,11 +5323,18 @@ def _joint_inputs() -> OwnerNodeInputs:
     return OwnerNodeInputs(parameters=parameters)
 
 
+_PROBE_CONTACT_RULE = {
+    "rule_id": "tip_on_part",
+    "a": [{"kind": "active_tcp_contact_bodies"}],
+    "b": [{"kind": "scene_object", "scene_resource_id": "part.7"}],
+    "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8},
+}
+
+
 def _contact_pose_inputs() -> OwnerNodeInputs:
     parameters = dict(_absolute_inputs("motion.move_to_pose", [_BASE]).parameters)
     parameters.update(
-        contact_policy_id="pick.contact",
-        contact_scene_resource_id="part.7",
+        collision_rules=[_PROBE_CONTACT_RULE],
         max_tcp_linear_speed_mps=0.2,
         planner={"search": "rrt", "max_nodes": None},
         cache_mode="disable",
@@ -5139,7 +5392,6 @@ def test_node_preview_uses_the_execution_motion_builder_exactly(variant) -> None
         node_id,
         inputs.parameters,
         targets=bound.targets,
-        contact_grasps=bound.contact_grasps,
         binding=bound.capture.program_binding,
         move_id=executed_payload["move_id"],
     )
@@ -5222,7 +5474,7 @@ def _interrupt_inputs(node_id: str) -> OwnerNodeInputs:
     parameters = {
         key: value
         for key, value in _absolute_inputs("motion.move_to_pose", [_BASE]).parameters.items()
-        if key not in {"target_mode", "target_reference", "offset_reference", "contact_policy_id"}
+        if key not in {"target_mode", "target_reference", "offset_reference"}
     }
     parameters.update(
         stop_mode="soft_on_path",
@@ -5235,9 +5487,8 @@ def _interrupt_inputs(node_id: str) -> OwnerNodeInputs:
         on_signal="success",
     )
     if node_id == "motion.probe_search":
-        # The same explicit contact-object selection as the plain motion nodes.
-        parameters["contact_policy_id"] = "pick.contact"
-        parameters["contact_scene_resource_id"] = "part.7"
+        # The same collision rules as the plain motion nodes.
+        parameters["collision_rules"] = [_PROBE_CONTACT_RULE]
     return OwnerNodeInputs(parameters=parameters)
 
 
@@ -5266,44 +5517,25 @@ def test_interrupt_move_submits_the_ordinary_motion_with_its_node_context(node_i
     assert "goal_frame_reference" not in payload
     for field in ("interrupt_condition", "stop_mode", "on_signal", "priority"):
         assert field not in repr(payload)
-    if node_id == "motion.probe_search":
-        # The Program contact grasp selects its object like any motion node.
-        assert payload["contact_policy_id"] == "pick.contact"
-        assert payload["runtime_object_bindings"] == [
-            {"runtime_object_id": "selected_object", "scene_resource_id": "part.7"}
-        ]
-    else:
-        assert payload["contact_policy_id"] is None
-        assert payload["runtime_object_bindings"] == []
+    # A probe's contact rule travels like any motion node's.
+    assert payload["collision_rules"] == (
+        [_PROBE_CONTACT_RULE] if node_id == "motion.probe_search" else []
+    )
+    assert payload["runtime_object_bindings"] == []
 
 
-@pytest.mark.parametrize("missing", ["contact_policy_id", "contact_scene_resource_id"])
-def test_probe_search_requires_its_contact_policy_and_object_together(missing) -> None:
+def test_probe_search_needs_no_collision_rule() -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
     parameters = dict(_interrupt_inputs("motion.probe_search").parameters)
-    parameters.pop(missing)
+    parameters.pop("collision_rules")
 
-    with pytest.raises(ProductionPortError, match="must be supplied together"):
-        port.operations.start(
-            "motion.probe_search", _identity("probe"), OwnerNodeInputs(parameters=parameters)
-        )
-    assert transport.submissions == []
+    port.operations.start(
+        "motion.probe_search", _identity("probe"), OwnerNodeInputs(parameters=parameters)
+    )
 
-
-def test_probe_search_policy_without_a_program_grasp_is_refused() -> None:
-    transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_context())
-    parameters = dict(_interrupt_inputs("motion.probe_search").parameters)
-    parameters["contact_policy_id"] = "probe.unbound"
-
-    with pytest.raises(ProductionPortError, match="no exact motion contact-grasp policy"):
-        port.operations.start(
-            "motion.probe_search", _identity("probe"), OwnerNodeInputs(parameters=parameters)
-        )
-    assert transport.submissions == []
+    assert transport.submissions[0]["participants"][0]["payload"]["collision_rules"] == []
 
 
 @pytest.mark.parametrize("node_id", ["motion.move_until_signal", "motion.probe_search"])
@@ -5500,7 +5732,7 @@ class _HeldPreparationTransport(_Transport):
 
     def read_program_execution_scope(self, run_id):
         return {"ok":True,"scope":{
-            "schema_version":"manyforge.program_execution_scope.v3", "program_run_id":run_id,
+            "schema_version":"manyforge.program_execution_scope.v4", "program_run_id":run_id,
             "claim_generation":1,"frozen":"none","frozen_by":None,"all_groups_held":False,
             "hold_revision":self.hold_revision,"held_node_indices":[0] if self.held else [],
             "ready_node_indices":[],"stopping_node_indices":[],"faulted_node_indices":[],
@@ -5543,7 +5775,7 @@ def _prepared_held_behavior():
     from manyforge_behavior.nodes.v2_owner import GripperCommandAdapter
     from manyforge_behavior.program_clock import ProgramClock
     transport = _HeldPreparationTransport()
-    context = replace(_context(), program={"program_id":"lite6_program","program_revision":_DIGEST_A,
+    context = replace(_context(), program={"program_revision":_DIGEST_A,
         "tree":{"instance_id":"command","node_id":"gripper.command_position","parameters":{},"children":[]}})
     port = NativeKernelProgramPort(KernelClient(transport)); port.bind(context)
     now = [100.0]; clock = ProgramClock(lambda: now[0])
@@ -6417,7 +6649,7 @@ def test_pick_place_phase_motion_preserves_qualified_tcp_endpoint() -> None:
                     'frame': frame('tool.1', 'tcp')}
     payload = NativeKernelProgramPort._phase_motion_payload(
         identity=_identity('pick-endpoint'), parameters=parameters,
-        phase='approach', tcp_endpoint=tcp_endpoint, motion={
+        phase='approach', tcp_endpoint=tcp_endpoint, binding={}, motion={
             'kind': 'pose_goal',
             'goal': {
                 'position_m': {'x_m': 0.0, 'y_m': 0.0, 'z_m': 0.1},
@@ -6434,32 +6666,30 @@ def test_pick_place_phase_motion_preserves_qualified_tcp_endpoint() -> None:
     assert "tcp_frame_role_id" not in wire
 
 
-@pytest.mark.parametrize('missing', [None, 'contact_policy_id', 'contact_scene_resource_id'])
-def test_joint_goal_uses_the_common_exact_contact_binding_before_strict_ingress(missing) -> None:
+def test_joint_goal_sends_a_release_rule_for_the_selected_tcp() -> None:
+    rule = {
+        'rule_id': 'withdraw',
+        'a': [{'kind': 'active_tcp_contact_bodies'}],
+        'b': [{'kind': 'scene_object', 'scene_resource_id': 'part.7'}],
+        'release': {'max_start_penetration_m': 0.002},
+    }
     parameters = dict(_motion_inputs().parameters)
     parameters.update(
         target_mode='absolute', target_reference=None, offset_reference=None,
         tcp_endpoint={'kind': 'entry', 'target': target('tool.1', 'gripper.command'), 'frame': frame('tool.1', 'tcp')},
         goal=[{'joint_name': 'joint1', 'position_rad': 0.0}],
-        contact_policy_id='pick.contact', contact_scene_resource_id='part.7',
+        collision_rules=[rule],
     )
-    if missing is not None:
-        parameters.pop(missing)
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
-    if missing is not None:
-        with pytest.raises(ProductionPortError, match='supplied together'):
-            port.operations.start('motion.move_to_joint_target', _identity('withdraw'), OwnerNodeInputs(parameters))
-        assert transport.submissions == []
-        return
     port.operations.start('motion.move_to_joint_target', _identity('withdraw'), OwnerNodeInputs(parameters))
     payload = transport.submissions[0]['participants'][0]['payload']
     assert payload['motion']['kind'] == 'joint_goal'
-    assert payload['contact_policy_id'] == 'pick.contact'
-    assert payload['runtime_object_bindings'] == [
-        {'runtime_object_id': 'selected_object', 'scene_resource_id': 'part.7'},
+    assert payload['collision_rules'] == [
+        {**rule, 'release': {**_RELEASE_SENT, 'max_start_penetration_m': 0.002}}
     ]
+    assert payload['runtime_object_bindings'] == []
     from manyforge_headless_api.models import MotionParticipantRequest
 
     parsed = MotionParticipantRequest.model_validate(payload)
@@ -6467,6 +6697,7 @@ def test_joint_goal_uses_the_common_exact_contact_binding_before_strict_ingress(
         'kind': 'entry', 'target': target('tool.1', 'gripper.command'),
         'frame': frame('tool.1', 'tcp'),
     }
+    assert [row.rule_id for row in parsed.collision_rules] == ['withdraw']
 
 
 def _thawed(value: Any) -> Any:
@@ -6612,50 +6843,6 @@ def test_gripper_status_read_carries_typed_grasp_evidence(confirmed):
         parameters={"target": target("tool.1", "gripper.command"), "expected_state": "reached"}))
     assert result.succeeded
     assert result.metadata["grasp_confirmed"] is confirmed
-
-
-def _release_bound_context():
-    context = _context()
-    binding = _thawed(context.program_binding)
-    binding["contact_grasp_bindings"][0]["mode"] = "contact_release"
-    return replace(context, program_binding=binding)
-
-
-def test_contact_release_motion_lowers_only_its_exact_policy_and_object():
-    transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_release_bound_context())
-    parameters = dict(_motion_inputs().parameters)
-    parameters.update(
-        target_mode="absolute", target_reference=None, offset_reference=None,
-        tcp_endpoint={"kind": "entry", "target": target("tool.1", "gripper.command"), "frame": frame("tool.1", "tcp")},
-        goal=[{"joint_name": "joint1", "position_rad": 0.0}],
-        contact_policy_id="pick.contact", contact_scene_resource_id="part.7",
-    )
-    port.operations.start(
-        "motion.move_to_joint_target", _identity("release"), OwnerNodeInputs(parameters)
-    )
-    payload = transport.submissions[0]["participants"][0]["payload"]
-    assert payload["motion"]["kind"] == "joint_goal"
-    assert payload["tcp_endpoint"] == {"kind": "entry",
-        "target": target("tool.1", "gripper.command"), "frame": frame("tool.1", "tcp")}
-    assert payload["contact_policy_id"] == "pick.contact"
-    assert payload["runtime_object_bindings"] == [
-        {"runtime_object_id": "selected_object", "scene_resource_id": "part.7"},
-    ]
-    from manyforge_headless_api.models import MotionParticipantRequest
-
-    assert MotionParticipantRequest.model_validate(payload).contact_policy_id == "pick.contact"
-
-
-def test_contact_release_binding_cannot_be_used_for_pick_synthesis():
-    transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
-    port.bind(_release_bound_context())
-    with pytest.raises(ProductionPortError, match="pick requires a contact-grasp policy"):
-        _plan(port, "planning.plan_pick_sequence", _identity("pick"), _pick_inputs())
-    assert transport.submissions == []
-    assert transport.pick_requests == []
 
 
 def test_set_tcp_current_lowers_blackboard_entry_before_submission() -> None:

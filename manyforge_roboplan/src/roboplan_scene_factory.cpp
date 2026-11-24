@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
+#include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <roboplan/core/scene.hpp>
 
 namespace manyforge::roboplan_backend {
@@ -180,6 +182,59 @@ std::shared_ptr<roboplan::Scene> make_collision_disabled_scene(
   apply_scene_semantics(*scene, joint_limits, srdf_xml);
   scene->setJointPositions(source.getCurrentJointPositions());
   return scene;
+}
+
+void ignore_pairs_without_group_bodies(
+    roboplan::Scene &scene, const std::vector<std::string> &group_joint_names) {
+  const auto &model = scene.getModel();
+  std::set<std::string> other_frames;
+  for (const auto &geometry : scene.getCollisionModel().geometryObjects) {
+    const auto &frame = model.frames.at(geometry.parentFrame).name;
+    if (collision::link_is_static_wrt_group(model, frame, group_joint_names)) {
+      other_frames.insert(frame);
+    }
+  }
+  std::vector<std::pair<std::string, std::string>> pairs;
+  for (auto first = other_frames.begin(); first != other_frames.end(); ++first) {
+    for (auto second = first; second != other_frames.end(); ++second) {
+      pairs.emplace_back(*first, *second);
+    }
+  }
+  if (pairs.empty()) {
+    return;
+  }
+  if (const auto result = scene.setCollisions(pairs, false);
+      !result.has_value()) {
+    fail("could not ignore pairs without the group's bodies: " +
+         result.error());
+  }
+}
+
+void set_scene_joint_positions(roboplan::Scene &scene,
+                               const std::vector<double> &base_positions,
+                               const std::vector<std::string> &joint_names,
+                               const std::vector<double> &positions) {
+  const auto &model = scene.getModel();
+  if (joint_names.size() != positions.size() ||
+      base_positions.size() != static_cast<std::size_t>(model.nq)) {
+    fail("joint names, positions and model coordinates differ in count");
+  }
+  Eigen::VectorXd q = Eigen::Map<const Eigen::VectorXd>(
+      base_positions.data(), static_cast<Eigen::Index>(base_positions.size()));
+  for (std::size_t index = 0; index < joint_names.size(); ++index) {
+    const auto &name = joint_names[index];
+    if (name.empty() || !model.existJointName(name)) {
+      fail("joint '" + name + "' is absent from the model");
+    }
+    const auto joint = model.getJointId(name);
+    if (joint >= model.idx_qs.size() || joint >= model.nqs.size() ||
+        model.nqs[joint] != 1 || model.idx_qs[joint] < 0 ||
+        model.idx_qs[joint] >= q.size() || !std::isfinite(positions[index])) {
+      fail("joint '" + name + "' is not a scalar joint with a finite position");
+    }
+    q[model.idx_qs[joint]] = positions[index];
+  }
+  scene.setJointPositions(q);
 }
 
 }  // namespace manyforge::roboplan_backend

@@ -118,7 +118,6 @@ namespace fixture = qualification_fixture;
           operation_id,
           operation_revision,
           participant_id,
-          value.program_id,
           value.program_revision,
           value.program_binding_id,
           core::ProgramRunNumber(106U),
@@ -460,7 +459,6 @@ CorePreparedParticipant(const CoreStopSeam &world,
       world.trajectory.joint_names);
   request.operation_id = stage.operation_id;
   request.participant_id = stage.participant_id;
-  request.program_id = binding.program_id;
   request.program_revision = binding.program_revision;
   request.program_binding_id = binding.program_binding_id;
   request.program_run_id = stage.participant_stop_plan.program_run_id;
@@ -521,7 +519,7 @@ CorePreparedParticipant(const CoreStopSeam &world,
        core::CollisionWorldRevision{1U, digest.value()},
        core::CollisionPolicyRevision{1U, digest.value()},
        core::CollisionDecision{}},
-      std::nullopt,
+      {},
       std::nullopt,
       1.0,
       {},
@@ -534,7 +532,6 @@ CorePreparedParticipant(const CoreStopSeam &world,
       stage.operation_id,
       stage.operation_revision,
       stage.participant_id,
-      binding.program_id,
       binding.program_revision,
       binding.program_binding_id,
       stage.participant_stop_plan.program_run_id,
@@ -633,7 +630,7 @@ void ExpectSameSnapshot(const core::ExecutionSnapshot &before,
   EXPECT_EQ(after.source_age_ns, before.source_age_ns);
   EXPECT_EQ(after.error, before.error);
   EXPECT_EQ(after.action_span, before.action_span);
-  EXPECT_EQ(after.contact_policy_id, before.contact_policy_id);
+  EXPECT_EQ(after.collision_rule_id, before.collision_rule_id);
 }
 
 // Items 1/26: controller-reference containment and exact fresh terminal

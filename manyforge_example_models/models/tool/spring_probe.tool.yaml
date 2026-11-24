@@ -1,0 +1,35 @@
+# An example tool parameter file (manyforge.parametric_tool.v1, kind: tool):
+# a probe whose stylus is a spring-loaded rod. The rod is a fixed collision
+# body of the model; its axis, stroke and trip depth are declared for the
+# contact rules (contact allowed up to the stroke). The default TCP belongs
+# to the slider, a tool end: its contact body is the rod.
+# `scripts/manyforge component export <this file> <folder>` writes its URDF
+# and SRDF.
+api_version: manyforge.parametric_tool.v1
+kind: tool
+body:
+  - name: housing
+    pose: {position_m: [0, 0, 0.03]}
+    collision: {cylinder: {radius_m: 0.02, length_m: 0.06}}
+chains:
+  - attach_to: body
+    pose: {position_m: [0, 0, 0.06]}
+    elements:
+      - spring_slider:
+          id: stylus
+          axis: [0, 0, 1]              # the rod is pushed in along the mount z (element frame)
+          stroke_m: 0.005              # how far it can be pushed in
+          trip_depth_m: 0.001          # the push-in at which the probe trips
+          parts:
+            - name: rod
+              pose: {position_m: [0, 0, 0.02]}
+              collision: {cylinder: {radius_m: 0.002, length_m: 0.04}}
+            - name: ball
+              pose: {position_m: [0, 0, 0.04]}
+              collision: {sphere: {radius_m: 0.003}}
+tcps:
+  - id: tcp                            # the default TCP, at the ball centre
+    attach_to: stylus                  # contact bodies: the stylus (default)
+    pose: {position_m: [0, 0, 0.04]}
+mass_kg: 0.3
+center_of_mass_m: [0, 0, 0.035]

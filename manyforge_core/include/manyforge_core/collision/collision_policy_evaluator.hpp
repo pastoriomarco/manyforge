@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -24,22 +26,74 @@ struct EvaluatedPairs {
   CollisionDecision decision;
 };
 
+/// How the evaluation surfaces treat one pair of
+/// `CollisionPolicySnapshot::contact_rules`.
+enum class ContactRuleKind {
+  /// `release` rule: the ordered release state machine.
+  kRelease,
+  /// `contact` for the whole move (`end_from_fraction` 0) with a depth limit:
+  /// the pair may touch at any sample; every colliding sample stays within
+  /// the limit.
+  kBoundedContact,
+  /// `contact` for the whole move without a limit: allowed, depth not checked.
+  kFreeContact,
+  /// `contact` with an end window above 0: allowed only from that
+  /// fraction on, never at the first sample; depth checked when a limit
+  /// exists.
+  kWindowedContact,
+};
+
+[[nodiscard]] inline ContactRuleKind contact_rule_kind(
+    const CollisionPairContactRule& rule) noexcept {
+  const auto* contact = rule.contact();
+  if (contact == nullptr) {
+    return ContactRuleKind::kRelease;
+  }
+  if (!contact->whole_move()) {
+    return ContactRuleKind::kWindowedContact;
+  }
+  return contact->max_penetration_m.has_value() ? ContactRuleKind::kBoundedContact
+                                                : ContactRuleKind::kFreeContact;
+}
+
+/// True for the pairs the ordered contact state machine tracks: release
+/// rules and whole-move contact rules with a depth limit.
+[[nodiscard]] inline bool contact_rule_is_tracked(
+    const CollisionPairContactRule& rule) noexcept {
+  const auto kind = contact_rule_kind(rule);
+  return kind == ContactRuleKind::kRelease ||
+         kind == ContactRuleKind::kBoundedContact;
+}
+
+/// True when a colliding sample of the pair needs a signed distance: a depth
+/// limit exists, or a release rule uses signed-penetration evidence.
+[[nodiscard]] inline bool contact_rule_needs_signed_distance(
+    const CollisionPairContactRule& rule) noexcept {
+  if (const auto* contact = rule.contact()) {
+    return contact->max_penetration_m.has_value();
+  }
+  return rule.release()->release_evidence_mode ==
+         ContactReleaseEvidenceMode::kSignedPenetration;
+}
+
+/// Number of pairs of `policy.contact_rules` the state machine tracks.
+[[nodiscard]] std::size_t tracked_contact_rule_count(
+    const CollisionPolicySnapshot& policy) noexcept;
+
 /// Immutable lookup indexes derived from one CollisionPolicySnapshot. Safe to
 /// share across per-pass evaluators; evaluators still own their mutable
-/// support-contact state machines.
+/// contact state machines.
 struct CollisionPolicyIndex {
   /// Revision of the immutable policy used to build these indexes. Runtime
   /// consumers compare this identity before trusting any allowance lookup.
   CollisionPolicyRevision source_policy_revision;
-  std::map<CollisionPairId, SupportContactPolicyEntry, std::less<>>
-      support_contact_index;
-  std::map<CollisionPairId, bool, std::less<>> static_static_index;
+  /// Every pair under a contact or release rule, by canonical pair.
+  std::map<CollisionPairId, CollisionPairContactRule, std::less<>>
+      contact_rule_index;
   std::map<CollisionPairId, bool, std::less<>> touch_link_index;
-  std::map<std::string, ContactGraspPolicyEntry, std::less<>>
-      contact_grasp_index;
 };
 
-/// Trajectory-scoped state for one support-contact identity. This state is
+/// Trajectory-scoped state for one tracked contact-rule pair. This state is
 /// public so the ordered parallel validator can transfer a bounded chunk
 /// prefix between independent worker-local evaluators. It is not deployment or
 /// scene state and must never survive across validation attempts.
@@ -64,6 +118,8 @@ struct ContactReleaseEvaluationState {
   bool in_contact = false;
   bool separated = false;
   std::optional<double> initial_depth_m;
+  /// Release: depth at the last accepted colliding sample. Whole-move
+  /// contact: depth at the last sample, 0 when it was not in contact.
   double previous_depth_m = 0.0;
   double best_depth_m = 0.0;
 
@@ -74,48 +130,42 @@ struct ContactReleaseEvaluationState {
 using ContactReleaseEvaluationStateMap =
     std::map<CollisionPairId, ContactReleaseEvaluationState, std::less<>>;
 
-/// Match one canonical logical collision pair against an authored contact-
-/// grasp binding. This is shared by validation, runtime selection, and policy
-/// classification so pattern interpretation cannot drift between surfaces.
-[[nodiscard]] bool contact_grasp_pair_matches(
-    const CollisionPairId& pair,
-    const ContactGraspPolicyEntry& policy) noexcept;
-
-/// Build the complete canonical metric-pair selection for one immutable world.
-/// Signed-release and bounded-penetration pairs are always included; binary
-/// release pairs are excluded. When `active_contact_policy_id` names a contact-
-/// grasp entry, its object/link pattern is resolved to concrete world body
-/// pairs before the query hot path.
+/// Build the canonical signed-distance pair selection of one policy: every
+/// contact-rule pair whose rule needs a signed distance (a depth limit, or a
+/// release with signed-penetration evidence). Sorted, unique.
 [[nodiscard]] std::vector<CollisionPairId>
-build_selected_collision_distance_pairs(
-    const CollisionPolicySnapshot& policy,
-    const CollisionWorldSnapshot& world,
-    std::string_view active_contact_policy_id = {});
+build_selected_collision_distance_pairs(const CollisionPolicySnapshot& policy);
 
-/// Clearance margins for one move (collision clearance), from the
-/// existing contact policies. `margin_m` goes on every pair of a robot body
-/// (a component-model body or a carried scene body) and an environment body
-/// (a detached scene resource or a runtime object). A pair the policy allows
-/// to touch keeps margin 0: static, touch-link and support-contact pairs, and
-/// the active contact-grasp entry's pairs. Their penetration tolerances stay
-/// with the policy evaluator, which needs the real contact evidence. Self
-/// pairs (robot-robot) and environment-only pairs keep 0. Null when margin_m
-/// is not positive or no pair qualifies.
-[[nodiscard]] std::shared_ptr<const CollisionClearanceMargins>
-build_collision_clearance_margins(
-    const CollisionWorldSnapshot& world,
-    const CollisionPolicySnapshot& policy,
-    std::string_view active_contact_policy_id, double margin_m);
-
-/// One logical support-pair observation for the shared contact-release state
+/// One logical pair observation for the shared contact-release state
 /// machine. `signed_clearance_m` is required only when `in_contact` is true and
-/// the policy selects signed-penetration release evidence or bounded-
-/// penetration policy mode. Binary release policies ignore it, and absent pairs
-/// must not fabricate a zero clearance.
+/// the rule needs a signed distance. Binary release rules ignore it, and
+/// absent pairs must not fabricate a zero clearance.
 struct ContactReleaseSampleEvidence {
   bool in_contact = false;
   std::optional<double> signed_clearance_m;
+  /// Path steps of at most kSpringSampleTravelM tool travel since the
+  /// previous sample; a spring's step limit scales with it. Absent (or 0):
+  /// the spacing is unknown and the step is not checked.
+  std::optional<double> path_steps;
 };
+
+/// The step limit of a spring rule (OD-356) between two samples `path_steps`
+/// apart; absent when the rule has none or the spacing is unknown.
+[[nodiscard]] inline std::optional<double> compression_step_limit_m(
+    const CollisionContactRule& contact, const std::optional<double>& path_steps) noexcept {
+  if (!contact.max_compression_step_m || !path_steps || !(*path_steps > 0.0)) {
+    return std::nullopt;
+  }
+  return *contact.max_compression_step_m * std::max(1.0, *path_steps);
+}
+
+/// The step limit one pair checks on its own depth: a spring rule without a
+/// spring group. A grouped rule's step limit applies to the rule's depth over
+/// all its pairs (OD-371, `spring_group_step_violations`).
+[[nodiscard]] inline std::optional<double> pair_compression_step_limit_m(
+    const CollisionContactRule& contact, const std::optional<double>& path_steps) noexcept {
+  return contact.spring_group ? std::nullopt : compression_step_limit_m(contact, path_steps);
+}
 
 /// Typed failure emitted by the allocation-free per-sample transition helper.
 /// Callers translate this stable category into surface-specific decisions and
@@ -123,14 +173,15 @@ struct ContactReleaseSampleEvidence {
 enum class ContactReleaseTransitionFailure {
   kNone,
   kInvalidPolicy,
-  kContactProcessNotImplemented,
   kMissingOrInvalidSignedPenetration,
   kNewContactAfterClearStart,
   kInitialPenetrationExceedsPolicy,
   kRecontactAfterRelease,
   kRecontactPenetrationExceedsPolicy,
   kPenetrationIncreased,
-  kContactPenetrationExceedsPolicy,
+  kContactPenetrationExceeded,
+  /// A spring's penetration grew by more than its step limit (OD-356).
+  kContactCompressionStepExceeded,
 };
 
 struct ContactReleaseTransitionResult {
@@ -143,24 +194,25 @@ struct ContactReleaseTransitionResult {
   }
 };
 
-/// Validate the mode-scoped internal policy representation consumed by every
-/// ordered decision surface. Typed DTO defaults are accepted as the
-/// presence-less representation of omitted fields; arbitrary mixtures of
-/// release-only and bounded-only values fail closed.
-[[nodiscard]] bool support_contact_policy_entry_valid(
-    const SupportContactPolicyEntry& policy) noexcept;
+/// Validate one contact-rule pair as consumed by every decision surface: a
+/// contact value needs a finite limit >= 0 and a finite fraction in 0..1 where
+/// present; a release value needs finite numbers >= 0, and binary-contact
+/// evidence admits only the default or the neutral signed-only fields.
+[[nodiscard]] bool contact_rule_valid(
+    const CollisionPairContactRule& rule) noexcept;
 
-/// Advance one contact-release identity by one trajectory-ordered sample.
+/// Advance one tracked contact-rule pair (`contact_rule_is_tracked`) by one
+/// trajectory-ordered sample.
 ///
 /// The first call establishes C_0. Later contact for an initially-clear pair is
 /// rejected; absence marks separation; disallowed recontact is rejected. The
 /// signed release mode additionally validates and updates penetration evidence
-/// while a pair is colliding. Bounded-penetration mode permits arbitrary
-/// contact appearance/disappearance but validates every colliding depth against
-/// its bound. The helper performs no allocation and never infers contact from a
-/// distance tolerance.
+/// while a pair is colliding. A whole-move contact rule with a depth limit
+/// permits arbitrary contact appearance/disappearance but validates every
+/// colliding depth against its limit. The helper performs no allocation and
+/// never infers contact from a distance tolerance.
 [[nodiscard]] ContactReleaseTransitionResult advance_contact_release_sample(
-    const SupportContactPolicyEntry& policy,
+    const CollisionPairContactRule& rule,
     const ContactReleaseSampleEvidence& sample,
     ContactReleaseEvaluationState& state) noexcept;
 
@@ -170,9 +222,7 @@ struct ContactReleaseTransitionResult {
     case ContactReleaseTransitionFailure::kNone:
       return "none";
     case ContactReleaseTransitionFailure::kInvalidPolicy:
-      return "invalid_contact_policy";
-    case ContactReleaseTransitionFailure::kContactProcessNotImplemented:
-      return "contact_process_policy_not_implemented";
+      return "invalid_collision_rule";
     case ContactReleaseTransitionFailure::kMissingOrInvalidSignedPenetration:
       return "missing_contact_release_clearance";
     case ContactReleaseTransitionFailure::kNewContactAfterClearStart:
@@ -185,8 +235,10 @@ struct ContactReleaseTransitionResult {
       return "recontact_penetration_exceeds_policy";
     case ContactReleaseTransitionFailure::kPenetrationIncreased:
       return "penetration_increased";
-    case ContactReleaseTransitionFailure::kContactPenetrationExceedsPolicy:
-      return "contact_penetration_exceeds_policy";
+    case ContactReleaseTransitionFailure::kContactPenetrationExceeded:
+      return "contact_penetration_exceeded";
+    case ContactReleaseTransitionFailure::kContactCompressionStepExceeded:
+      return "contact_compression_step_exceeded";
   }
   return "unknown_contact_release_failure";
 }
@@ -203,14 +255,20 @@ std::shared_ptr<const CollisionPolicyIndex> build_collision_policy_index(
 ///     ordered by (body_a, body_b) lexicographic order;
 ///   - the overall CollisionDecision the kernel uses to gate dispatch.
 ///
-/// The evaluator maintains the support-contact state machine across
-/// repeated classify() calls within one validation pass. Callers MUST
-/// invoke reset() between independent passes (e.g. between moves) so
-/// stale support-contact state cannot leak across trajectories.
+/// The evaluator maintains the contact state machine of the tracked
+/// contact-rule pairs across repeated classify() calls within one validation
+/// pass. Callers MUST invoke reset() between independent passes (e.g. between
+/// moves) so stale contact state cannot leak across trajectories.
+///
+/// A pair under a whole-move contact rule without a depth limit classifies as
+/// kAllowedContactRule. A pair under a contact rule with an end window
+/// classifies as kBlockingCollision here; the validation coordinator and the
+/// runtime surfaces apply its window and depth and relabel an allowed sample
+/// kAllowedContactRule.
 ///
 /// Determinism: classify() is deterministic for fixed inputs; observation
 /// order across pairs does not affect the result. Two-input scenarios
-/// that exercise the support-contact state machine (e.g. "first call:
+/// that exercise the contact state machine (e.g. "first call:
 /// contact, second call: separated, third call: contact again") rely on
 /// the call ordering itself, which is the trajectory-order semantics
 /// the plan defines.
@@ -221,12 +279,12 @@ class CollisionPolicyEvaluator {
       std::shared_ptr<const CollisionPolicySnapshot> snapshot,
       std::shared_ptr<const CollisionPolicyIndex> index = nullptr);
 
-  /// Clear support-contact state machine entries. Call between
-  /// independent validation passes.
+  /// Clear contact state machine entries. Call between independent
+  /// validation passes.
   void reset();
 
-  /// Replace the complete trajectory-scoped support-contact state. The input
-  /// must contain exactly the canonical support-contact identities from the
+  /// Replace the complete trajectory-scoped contact state. The input must
+  /// contain exactly the canonical tracked contact-rule pairs of the
   /// immutable policy index. Returns false without changing state when it does
   /// not match; callers must fail closed rather than guessing a prefix.
   bool restore_support_contact_state(const SupportContactEvaluationStateMap& state);
@@ -239,9 +297,8 @@ class CollisionPolicyEvaluator {
   ///
   /// @param observed_pairs Pairs reported in collision by the engine.
   /// @param world_revision Active CollisionWorldRevision under which
-  ///   `observed_pairs` were produced. Used for the
-  ///   `kAllowedStaticStatic` rule ("truly static under the active
-  ///   revision").
+  ///   `observed_pairs` were produced. A pair of two static bodies of the
+  ///   snapshot (`static_body_ids`) classifies kAllowedStaticStatic.
   /// @param diagnostics_complete Whether the engine supplied every
   ///   diagnostic the policy requires (pair identity, depth, etc.).
   ///   When false and `require_full_diagnostics` is true, every pair

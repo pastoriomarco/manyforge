@@ -107,18 +107,13 @@ constexpr char kDigest5[] =
                                          ModelInstanceId("model:test"),
                                          ModelRevision("model-revision:test"),
                                          {"tcp"}}};
-  std::vector<ProgramContactGraspBindingDTO> contact_grasps{ProgramContactGraspBindingDTO{
-      ContactPolicyId("pick.contact"),
-      ContactPolicyRevision("contact-policy-revision:1"),
-      RuntimeObjectId("selected_object"),
-      {ProgramContactGraspBodyBindingDTO{{ControllableComponentId("component:test"), CollisionBodyRoleId("collision-body-role:tool")},
+  std::vector<ProgramCollisionRuleBodyBindingDTO> collision_rule_bodies{
+      ProgramCollisionRuleBodyBindingDTO{{ControllableComponentId("component:test"), CollisionBodyRoleId("collision-body-role:tool")},
                                          ModelRoleId("tool"),
                                          ModelInstanceId("model:test"),
                                          ModelRevision("model-revision:test"),
-                                         {CollisionBodyId("body:tool")}}},
-      ContactGraspEnvelopeDTO{0.001, 0.8}}};
-  auto value = RuntimeParticipantBindingDTO{ProgramId("program:test"),
-                                      ProgramRevision("program-revision:test"),
+                                         {CollisionBodyId("body:tool")}}};
+  auto value = RuntimeParticipantBindingDTO{ProgramRevision("program-revision:test"),
                                       ProgramBindingId("program-binding:test"),
                                       RetainedBundleId("bundle:test"),
                                       GraphRevision("graph:test"),
@@ -138,7 +133,7 @@ constexpr char kDigest5[] =
                                       std::nullopt,
                                       {},
                                       {},
-                                      std::move(contact_grasps)};
+                                      std::move(collision_rule_bodies)};
   value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
       {value.controllable_component_id, value.command_target_id}, value.frame_bindings.back(), {}};
   return value;
@@ -211,8 +206,6 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
     request.target_mode = motion->target_mode;
     request.target_reference = motion->target_reference;
     request.offset_reference = motion->offset_reference;
-    request.contact_policy_id =
-        motion->contact_policy_id.has_value() ? motion->contact_policy_id->value() : std::string{};
     request.runtime_object_bindings = motion->runtime_object_bindings;
     if (const auto* pose = std::get_if<PoseGoalDTO>(&motion->motion)) {
       request.motion = *pose;
@@ -222,14 +215,21 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
       return Result<ExecuteRequestDTO>::Err(
           ErrorDTO{"invalid_request", "fixture motion is unsupported", {}});
     }
-    if (motion->contact_policy_id.has_value() && !motion->runtime_object_bindings.empty()) {
-      request.resolved_contact_grasp =
-          ResolvedContactGraspBindingDTO{*motion->contact_policy_id,
-                                         ContactPolicyRevision("contact-policy-revision:1"),
-                                         motion->runtime_object_bindings.front().runtime_object_id,
-                                         motion->runtime_object_bindings.front().scene_resource_id,
-                                         {CollisionBodyId("body:tool")},
-                                         ContactGraspEnvelopeDTO{0.001, 0.8}};
+    // The fixture admits a rule the way the kernel does: bodies become ids.
+    for (const auto& rule : motion->collision_rules) {
+      CollisionRule admitted{rule.rule_id, {}, {}, rule.value};
+      for (const auto& [authored, selections] :
+           {std::pair{&rule.a, &admitted.a}, std::pair{&rule.b, &admitted.b}}) {
+        for (const auto& selection : *authored) {
+          if (const auto* object = std::get_if<CollisionRuleSceneObjectSelection>(&selection)) {
+            selections->push_back(*object);
+          } else {
+            selections->push_back(
+                CollisionRuleResolvedBodiesSelection{{CollisionBodyId("body:tool")}});
+          }
+        }
+      }
+      request.collision_rules.push_back(std::move(admitted));
     }
     return Result<ExecuteRequestDTO>::Ok(std::move(request));
   }
@@ -330,13 +330,25 @@ class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
   std::optional<RuntimeParticipantBindingDTO> carrier_binding;
 };
 
+/// The descend leg's contact rule of the pick fixtures: `bodies` may touch
+/// `object` in the last fifth of the leg, at most 1 mm deep.
+[[nodiscard]] std::vector<CollisionRuleDTO> pick_contact_rules(
+    CollisionRuleSelectionDTO bodies = CollisionRuleCollisionBodySelection{
+        {ControllableComponentId("component:test"),
+         CollisionBodyRoleId("collision-body-role:tool")}},
+    const char* object = "workpiece") {
+  return {CollisionRuleDTO{"pick.contact",
+                           {std::move(bodies)},
+                           {CollisionRuleSceneObjectSelection{SceneResourceId(object)}},
+                           CollisionContactRule{0.001, 0.8, std::nullopt}}};
+}
+
 [[nodiscard]] OperationIntentDTO motion_operation(
     std::string request_id, std::string move_id, MotionSpecDTO motion,
-    const std::optional<ContactPolicyId>& contact_policy = std::nullopt,
+    std::vector<CollisionRuleDTO> collision_rules = {},
     std::vector<RuntimeObjectReferenceBindingDTO> runtime_objects = {}) {
   return OperationIntentDTO{
       PublicRequestContextDTO{TestRequestKey(std::move(request_id)), "pick_candidate_test"},
-      ProgramId("program:test"),
       ProgramRevision("program-revision:test"),
       ProgramBindingId("program-binding:test"),
       ProgramRunNumber(114U),
@@ -357,10 +369,11 @@ class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
                                                                 std::nullopt,
                                                                 std::nullopt,
                                                                 std::move(motion),
-                                                                contact_policy,
                                                                 {},
                                                                 {},
-                                                                std::move(runtime_objects)}}},
+                                                                std::move(runtime_objects),
+                                                                std::nullopt,
+                                                                std::move(collision_rules)}}},
       OperationCoordinationPolicy::kIndependent};
 }
 
@@ -661,7 +674,7 @@ class ReplacingPlanningSceneSynchronizer final : public IPlanningSceneSynchroniz
     PickCandidateGrid grid, CollisionWorldLeaseInventory predecessor) {
   auto approach = motion_operation("pick.approach", "approach", PoseGoalDTO{Pose3DTO{}});
   auto descend = motion_operation(
-      "pick.descend", "descend", CartesianPathDTO{}, ContactPolicyId("pick.contact"),
+      "pick.descend", "descend", CartesianPathDTO{}, pick_contact_rules(),
       {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
                                         SceneResourceId("workpiece")}});
   auto retreat = motion_operation("pick.retreat", "retreat", CartesianPathDTO{});
@@ -903,12 +916,11 @@ TEST(AddressedPickCandidatePlanner,
   ASSERT_TRUE(result.value().selected.has_value());
   EXPECT_EQ(result.value().attempted_candidate_count, 1U);
   ASSERT_EQ(motion.requests.size(), 3U);
-  EXPECT_FALSE(motion.requests[0].resolved_contact_grasp.has_value());
-  EXPECT_TRUE(motion.requests[0].contact_policy_id.empty());
-  EXPECT_TRUE(motion.requests[1].resolved_contact_grasp.has_value());
-  EXPECT_EQ(motion.requests[1].contact_policy_id, "pick.contact");
-  EXPECT_FALSE(motion.requests[2].resolved_contact_grasp.has_value());
-  EXPECT_TRUE(motion.requests[2].contact_policy_id.empty());
+  // Each leg keeps its own rules: only the descend carries the contact rule.
+  EXPECT_TRUE(motion.requests[0].collision_rules.empty());
+  ASSERT_EQ(motion.requests[1].collision_rules.size(), 1U);
+  EXPECT_EQ(motion.requests[1].collision_rules.front().rule_id, "pick.contact");
+  EXPECT_TRUE(motion.requests[2].collision_rules.empty());
   EXPECT_EQ(motion.start_states[0].positions_rad, std::vector<double>({0.0, 0.0}));
   EXPECT_EQ(motion.start_states[1].positions_rad, std::vector<double>({1.0, 1.0}));
   EXPECT_EQ(motion.start_states[2].positions_rad, std::vector<double>({2.0, 2.0}));
@@ -1007,7 +1019,7 @@ TEST(AddressedPickPlacePlanningOwner,
   synthesis.approach_offset_envelope.position_max_m = {0.0, 0.0, 0.05};
   auto approach = motion_operation("public.pick.approach", "approach", PoseGoalDTO{Pose3DTO{}});
   auto descend = motion_operation(
-      "public.pick.descend", "descend", CartesianPathDTO{}, ContactPolicyId("pick.contact"),
+      "public.pick.descend", "descend", CartesianPathDTO{}, pick_contact_rules(),
       {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
                                         SceneResourceId("workpiece")}});
   auto retreat = motion_operation("public.pick.retreat", "retreat", CartesianPathDTO{});
@@ -1066,7 +1078,7 @@ TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrier
     FakeMotionPreviewOwner motion;
     motion.motion_binding = arm_runtime_binding();
     auto& arm = *motion.motion_binding;
-    auto endpoint_bodies = arm.contact_grasp_bindings.front().allowed_body_bindings;
+    auto endpoint_bodies = arm.collision_rule_bodies;
     arm.motion_endpoint =
         RuntimeMotionEndpointBindingDTO{{ControllableComponentId("component:test"), CommandTargetId("target:test")},
                                         {{ControllableComponentId("component:test"), FrameRoleId("frame-role:fingertip")},
@@ -1075,8 +1087,7 @@ TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrier
                                          "fingertip"},
                                         std::move(endpoint_bodies),
                                         {CollisionBodyRoleId("collision-body-role:tool")}};
-    arm.contact_grasp_bindings.front().allowed_body_bindings.clear();
-    arm.contact_grasp_bindings.front().bodies_from_motion_endpoint = true;
+    arm.collision_rule_bodies.clear();
     motion.carrier_binding = carrier_runtime_binding();
     if (carrier_identity == 1)
       motion.carrier_binding->controllable_component_id =
@@ -1099,7 +1110,8 @@ TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrier
         PickCandidateSynthesisIntentDTO{},
         qualified(motion_operation("qualified.approach", "approach", PoseGoalDTO{Pose3DTO{}})),
         qualified(motion_operation(
-            "qualified.descend", "descend", CartesianPathDTO{}, ContactPolicyId("pick.contact"),
+            "qualified.descend", "descend", CartesianPathDTO{},
+            pick_contact_rules(CollisionRuleActiveTcpContactBodiesSelection{}),
             {{RuntimeObjectId("selected_object"), SceneResourceId("workpiece")}})),
         tool_operation("qualified.tool", 0.0),
         qualified(motion_operation("qualified.retreat", "retreat", CartesianPathDTO{}))};
@@ -1149,7 +1161,7 @@ TEST(AddressedPickPlacePlanningOwner, AcceptsNewerSameLineageProjectionBeyondCap
   auto approach =
       motion_operation("synchronized.pick.approach", "approach", PoseGoalDTO{Pose3DTO{}});
   auto descend = motion_operation(
-      "synchronized.pick.descend", "descend", CartesianPathDTO{}, ContactPolicyId("pick.contact"),
+      "synchronized.pick.descend", "descend", CartesianPathDTO{}, pick_contact_rules(),
       {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
                                         SceneResourceId("workpiece")}});
   auto tool = tool_operation("synchronized.pick.tool", 0.0);
@@ -1202,7 +1214,7 @@ TEST(AddressedPickPlacePlanningOwner, PreservesPortableAndCandidateTcpOffsetRefe
       ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, synthesis,
       motion_operation("reference.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
       motion_operation("reference.descend", "descend", CartesianPathDTO{},
-                       ContactPolicyId("pick.contact"),
+                       pick_contact_rules(),
                        {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
                                                          SceneResourceId("workpiece")}}),
       tool_operation("reference.tool", 0.0),
@@ -1226,7 +1238,7 @@ TEST(AddressedPickPlacePlanningOwner, PreservesPortableAndCandidateTcpOffsetRefe
       RuntimeObjectId("selected_object"), ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, synthesis,
       motion_operation("reference.inverse.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
       motion_operation("reference.inverse.descend", "descend", CartesianPathDTO{},
-                       ContactPolicyId("pick.contact"),
+                       pick_contact_rules(),
                        {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
                                                          SceneResourceId("workpiece")}}),
       tool_operation("reference.inverse.tool", 0.0),
@@ -1252,7 +1264,7 @@ TEST(AddressedPickPlacePlanningOwner, OffsetReferenceEqualToAToolTcpEntryUsesThe
   FakeMotionPreviewOwner motion;
   motion.motion_binding = arm_runtime_binding();
   auto& arm = *motion.motion_binding;
-  auto endpoint_bodies = arm.contact_grasp_bindings.front().allowed_body_bindings;
+  auto endpoint_bodies = arm.collision_rule_bodies;
   arm.motion_endpoint =
       RuntimeMotionEndpointBindingDTO{{ControllableComponentId("component:test"), CommandTargetId("target:test")},
                                       {{ControllableComponentId("component:test"), FrameRoleId("frame-role:fingertip")},
@@ -1261,8 +1273,7 @@ TEST(AddressedPickPlacePlanningOwner, OffsetReferenceEqualToAToolTcpEntryUsesThe
                                        "fingertip"},
                                       std::move(endpoint_bodies),
                                       {CollisionBodyRoleId("collision-body-role:tool")}};
-  arm.contact_grasp_bindings.front().allowed_body_bindings.clear();
-  arm.contact_grasp_bindings.front().bodies_from_motion_endpoint = true;
+  arm.collision_rule_bodies.clear();
   motion.carrier_binding = carrier_runtime_binding();
   FakeSceneCandidatePreview scene(predecessor);
   FakeSceneCandidateProjection projection(predecessor);
@@ -1281,7 +1292,8 @@ TEST(AddressedPickPlacePlanningOwner, OffsetReferenceEqualToAToolTcpEntryUsesThe
         std::move(synthesis),
         qualified(motion_operation(id + ".approach", "approach", PoseGoalDTO{Pose3DTO{}})),
         qualified(motion_operation(
-            id + ".descend", "descend", CartesianPathDTO{}, ContactPolicyId("pick.contact"),
+            id + ".descend", "descend", CartesianPathDTO{},
+            pick_contact_rules(CollisionRuleActiveTcpContactBodiesSelection{}),
             {{RuntimeObjectId("selected_object"), SceneResourceId("workpiece")}})),
         tool_operation(id + ".tool", 0.0),
         qualified(motion_operation(id + ".retreat", "retreat", CartesianPathDTO{}))};
@@ -1314,7 +1326,7 @@ TEST(AddressedPickPlacePlanningOwner, AcceptsAnyFrameOffsetReferenceAndNamesAnUn
         ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, std::move(synthesis),
         motion_operation(id + ".approach", "approach", PoseGoalDTO{Pose3DTO{}}),
         motion_operation(id + ".descend", "descend", CartesianPathDTO{},
-                         ContactPolicyId("pick.contact"),
+                         pick_contact_rules(),
                          {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
                                                            SceneResourceId("workpiece")}}),
         tool_operation(id + ".tool", 0.0),
@@ -1365,7 +1377,7 @@ TEST(AddressedPickPlacePlanningOwner, NamesAnUnresolvedCarrierFrameWithTheToolTa
         ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:absent")}, PickCandidateSynthesisIntentDTO{},
         motion_operation("absent-carrier-pick.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
         motion_operation("absent-carrier-pick.descend", "descend", CartesianPathDTO{},
-                         ContactPolicyId("pick.contact"),
+                         pick_contact_rules(),
                          {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
                                                            SceneResourceId("workpiece")}}),
         tool_operation("absent-carrier-pick.tool", 0.0),
@@ -1395,56 +1407,80 @@ TEST(AddressedPickPlacePlanningOwner, NamesAnUnresolvedCarrierFrameWithTheToolTa
   }
 }
 
-TEST(AddressedPickPlacePlanningOwner, NamesTheRuntimeObjectAndPolicyOfAnUnresolvedContactGrasp) {
-  const auto plan = [](const std::string& id, const std::string& runtime_object_id,
-                       const std::string& contact_policy_id, bool release = false) {
+TEST(AddressedPickPlacePlanningOwner, TakesTouchBodiesOnlyFromDescendContactRules) {
+  struct Planned {
+    Result<PickPlacePlanningResultDTO> result;
+    std::vector<CollisionBodyRoleId> touch_body_roles;
+  };
+  const auto plan = [](const std::string& id, std::vector<CollisionRuleDTO> descend_rules,
+                       const bool tcp_contact_bodies) {
     auto predecessor = predecessor_projection();
     FakeMotionPreviewOwner motion;
-    if (release) {
-      motion.motion_binding = arm_runtime_binding();
-      motion.motion_binding->contact_grasp_bindings.front().envelope = ContactReleaseEnvelopeDTO{};
+    motion.motion_binding = arm_runtime_binding();
+    if (tcp_contact_bodies) {
+      auto& arm = *motion.motion_binding;
+      arm.motion_endpoint->contact_body_bindings = arm.collision_rule_bodies;
+      arm.motion_endpoint->contact_body_role_ids = {
+          CollisionBodyRoleId("collision-body-role:tool")};
     }
     FakeSceneCandidatePreview scene(predecessor);
     FakeSceneCandidateProjection projection(predecessor);
     AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
-    return owner.PlanPick(PickSequencePlanningIntentDTO{
-        id, SceneResourceId("workpiece"), RuntimeObjectId(runtime_object_id),
+    auto result = owner.PlanPick(PickSequencePlanningIntentDTO{
+        id, SceneResourceId("workpiece"), RuntimeObjectId(""),
         ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, PickCandidateSynthesisIntentDTO{},
         motion_operation(id + ".approach", "approach", PoseGoalDTO{Pose3DTO{}}),
-        motion_operation(id + ".descend", "descend", CartesianPathDTO{},
-                         ContactPolicyId(contact_policy_id),
-                         {RuntimeObjectReferenceBindingDTO{RuntimeObjectId(runtime_object_id),
-                                                           SceneResourceId("workpiece")}}),
+        motion_operation(id + ".descend", "descend", CartesianPathDTO{}, std::move(descend_rules)),
         tool_operation(id + ".tool", 0.0),
         motion_operation(id + ".retreat", "retreat", CartesianPathDTO{})});
+    std::vector<CollisionBodyRoleId> roles;
+    if (scene.last_request.has_value()) {
+      if (const auto* attach = std::get_if<AttachCarriedObjectRequestDTO>(
+              &scene.last_request->request.operation)) {
+        roles = attach->touch_body_roles;
+      }
+    }
+    return Planned{std::move(result), std::move(roles)};
   };
-  const auto expect_named = [](const ErrorDTO& error, const char* runtime_object_id,
-                               const char* contact_policy_id) {
-    EXPECT_EQ(error.code, "missing_reference");
-    EXPECT_EQ(error.details.at("reason"), "pick_contact_grasp_template_unresolved");
-    EXPECT_EQ(error.details.at("reference_type"), "runtime_object");
-    EXPECT_EQ(error.details.at("reference_id"), runtime_object_id);
-    EXPECT_EQ(error.details.at("contact_policy_id"), contact_policy_id);
-    EXPECT_FALSE(error.details.contains("target_role_id"));
-  };
+  const std::vector<CollisionBodyRoleId> tool{CollisionBodyRoleId("collision-body-role:tool")};
 
-  // The Program binds no contact-grasp policy with the descend's ID.
-  const auto missing_policy = plan("absent-policy-pick", "selected_object", "pick.absent");
-  ASSERT_FALSE(missing_policy.ok());
-  expect_named(missing_policy.error(), "selected_object", "pick.absent");
-  EXPECT_NE(missing_policy.error().message.find("absent"), std::string::npos)
-      << missing_policy.error().message;
+  // A descend contact rule names the body that touches the picked object.
+  const auto ruled = plan("ruled-pick", pick_contact_rules(), false);
+  ASSERT_TRUE(ruled.result.ok()) << ruled.result.error().message;
+  EXPECT_EQ(ruled.touch_body_roles, tool);
 
-  // The policy exists but is bound to another runtime object than the selected one.
-  const auto mismatch = plan("mismatched-object-pick", "other_object", "pick.contact");
-  ASSERT_FALSE(mismatch.ok());
-  expect_named(mismatch.error(), "other_object", "pick.contact");
-  EXPECT_NE(mismatch.error().message.find("other than the selected"), std::string::npos)
-      << mismatch.error().message;
+  // Without a descend contact rule the pick plans with no touch body, also
+  // when the TCP has contact bodies.
+  const auto unruled = plan("unruled-pick", {}, true);
+  ASSERT_TRUE(unruled.result.ok()) << unruled.result.error().message;
+  EXPECT_TRUE(unruled.touch_body_roles.empty());
 
-  const auto release = plan("release-policy-pick", "selected_object", "pick.contact", true);
-  ASSERT_FALSE(release.ok());
-  expect_named(release.error(), "selected_object", "pick.contact");
+  // A rule about another object names no touch body for this pick.
+  const auto other_object = plan(
+      "other-object-pick",
+      pick_contact_rules(CollisionRuleCollisionBodySelection{
+                             {ControllableComponentId("component:test"),
+                              CollisionBodyRoleId("collision-body-role:tool")}},
+                         "other_object"),
+      false);
+  ASSERT_TRUE(other_object.result.ok()) << other_object.result.error().message;
+  EXPECT_TRUE(other_object.touch_body_roles.empty());
+
+  // A release rule on the descend is not a contact allowance.
+  auto release = pick_contact_rules();
+  release.front().value = CollisionReleaseRule{};
+  const auto released = plan("release-pick", std::move(release), false);
+  ASSERT_TRUE(released.result.ok()) << released.result.error().message;
+  EXPECT_TRUE(released.touch_body_roles.empty());
+
+  // A body the carrier binding does not hold is refused.
+  const auto stale = plan(
+      "stale-body-pick",
+      pick_contact_rules(CollisionRuleCollisionBodySelection{
+          {ControllableComponentId("component:test"), CollisionBodyRoleId("body-role:absent")}}),
+      false);
+  ASSERT_FALSE(stale.result.ok());
+  EXPECT_EQ(stale.result.error().details.at("reason"), "pick_touch_body_binding_stale");
 }
 
 TEST(AddressedPickPlacePlanningOwner, FailedPlanningRetainsOneBoundedLinkedMotionDiagnostic) {
@@ -1462,7 +1498,7 @@ TEST(AddressedPickPlacePlanningOwner, FailedPlanningRetainsOneBoundedLinkedMotio
       ProgramFrameReferenceDTO{ControllableComponentId("component:test"), FrameRoleId("frame-role:tcp")}, synthesis,
       motion_operation("failed.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
       motion_operation("failed.descend", "descend", CartesianPathDTO{},
-                       ContactPolicyId("pick.contact"),
+                       pick_contact_rules(),
                        {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
                                                          SceneResourceId("workpiece")}}),
       tool_operation("failed.tool", 0.0),
@@ -1499,7 +1535,7 @@ TEST(AddressedPickPlacePlanningOwner, RejectsInvalidOrCancelledPickBeforeRetaini
         {},
         motion_operation("public.pick2.approach", "approach", PoseGoalDTO{Pose3DTO{}}),
         motion_operation("public.pick2.descend", "descend", CartesianPathDTO{},
-                         ContactPolicyId("pick.contact"),
+                         pick_contact_rules(),
                          {RuntimeObjectReferenceBindingDTO{RuntimeObjectId("selected_object"),
                                                            SceneResourceId("workpiece")}}),
         tool_operation("public.pick2.tool", 0.0),

@@ -18,7 +18,6 @@ _APPLIED_SELECTION_FIELDS = frozenset(
         "assistant_mode",
         "assistant_projection",
         "baseline_program_binding_id",
-        "deployment_artifact_id",
         "deployment_revision",
         "graph_revision",
         "node_environment_digest",
@@ -28,7 +27,6 @@ _APPLIED_SELECTION_FIELDS = frozenset(
         "program_binding",
         "program_frame_facts",
         "program_binding_id",
-        "program_id",
         "program_revision",
         "project_path",
         "retained_bundle_id",
@@ -117,7 +115,6 @@ def _binding_correspondence(
         _fail(f"{label}.program_binding", "the exact validated Binding document")
     for field in (
         "program_binding_id",
-        "program_id",
         "program_revision",
         "retained_bundle_id",
         "graph_revision",
@@ -210,15 +207,10 @@ def validate_applied_program_selection(
         "source_document_digest",
     ):
         _sha256(value.get(field), f"{label}.{field}")
-    _text(value.get("deployment_artifact_id"), f"{label}.deployment_artifact_id", 256)
-    _text(value.get("program_id"), f"{label}.program_id", 256)
     _text(value.get("scenario_id"), f"{label}.scenario_id", 256)
     validate_project_path(value.get("project_path"), f"{label}.project_path")
     program = value["program"]
-    if (
-        program.get("program_id") != value["program_id"]
-        or program.get("program_revision") != value["program_revision"]
-    ):
+    if program.get("program_revision") != value["program_revision"]:
         _fail(f"{label}.program", "the corresponding Program identity")
     source = value.get("source")
     if not isinstance(source, dict) or set(source) != _APPLIED_SOURCE_FIELDS:

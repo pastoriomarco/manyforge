@@ -14,7 +14,6 @@ struct CanonicalEmptyAdmissionRecord final {
   std::string canonical_bytes;
   std::string admission_digest;
   std::string cell_id;
-  std::string deployment_artifact_id;
   std::string deployment_revision;
   std::string graph_revision;
   std::string retained_bundle_id;

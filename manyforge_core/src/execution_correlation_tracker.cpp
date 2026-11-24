@@ -63,6 +63,21 @@ std::string ExecutionCorrelationTracker::move_id() const {
   return move_id_;
 }
 
+void ExecutionCorrelationTracker::set_collision_rule_id(std::string collision_rule_id) {
+  std::lock_guard<std::mutex> lock(collision_rule_id_mutex_);
+  collision_rule_id_ = std::move(collision_rule_id);
+}
+
+void ExecutionCorrelationTracker::clear_collision_rule_id() {
+  std::lock_guard<std::mutex> lock(collision_rule_id_mutex_);
+  collision_rule_id_.clear();
+}
+
+std::string ExecutionCorrelationTracker::collision_rule_id() const {
+  std::lock_guard<std::mutex> lock(collision_rule_id_mutex_);
+  return collision_rule_id_;
+}
+
 std::optional<ActionSpanDTO> ExecutionCorrelationTracker::action_span() const {
   std::lock_guard<std::mutex> lock(action_span_mutex_);
   return action_span_;

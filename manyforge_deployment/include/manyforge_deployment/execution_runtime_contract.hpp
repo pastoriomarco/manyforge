@@ -87,7 +87,9 @@ struct Configuration final {
     std::string open_state_ref;
     std::string closed_state_ref;
     double command_duration_s{};
-    std::vector<std::string> touch_links;
+    /// Source link names of the gripper's grip body (the component type's
+    /// `grip_body_role_id`), filled by the Deployment compiler.
+    std::vector<std::string> grip_body_links;
     std::string mount_frame;
     std::string attach_frame;
     std::string tcp_frame;

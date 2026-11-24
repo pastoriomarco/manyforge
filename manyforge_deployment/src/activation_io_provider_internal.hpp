@@ -14,6 +14,18 @@ struct ActivationPreparedIoType final {
   CanonicalValue normalized_configuration;
 };
 
+/// The id of a derived component type: `manyforge.<tag>.<digest of shape>`.
+[[nodiscard]] std::string derived_component_type_id(std::string_view tag,
+                                                    const CanonicalValue &shape);
+
+/// One derived component type per tool generated from a `kind: tool`
+/// parameter file (the profile's `generated_tool`, OD-352 slice 2): its
+/// `tool` target and one gripper target per jaw pair. The id is the
+/// profile's `derived_component_type_id`; there is no configuration.
+[[nodiscard]] std::vector<ActivationPreparedIoType> prepare_activation_tool_types(
+    std::span<const ActivationComponentProfile> profiles,
+    std::span<const QualifiedCapabilityDefinition> capabilities);
+
 [[nodiscard]] std::vector<ActivationPreparedIoType> prepare_activation_io_types(
     const ActivationDeploymentIntent &intent,
     std::span<const ActivationComponentProfile> profiles,

@@ -66,7 +66,6 @@ namespace {
 [[nodiscard]] RuntimeParticipantBinding Binding(const ResolvedStopBasePlanDTO& base) {
   const auto& target = base.escalation_stages.front().command_target;
   RuntimeParticipantBindingDTO value{
-      ProgramId("program.1"),
       ProgramRevision("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
       ProgramBindingId("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
       base.retained_bundle_id,
@@ -134,7 +133,7 @@ namespace {
       base,
       PreparedParticipantStopPlanContextDTO{
           OperationNumber(1U), OperationRevision(4U),
-          OperationParticipantId{OperationNumber(1U), 1U}, binding.value().program_id,
+          OperationParticipantId{OperationNumber(1U), 1U},
           binding.value().program_revision, binding.value().program_binding_id,
           ProgramRunNumber(101U), profile,
           profile ? ParticipantStopProfilePurposeDTO::kMotionInterruptScope

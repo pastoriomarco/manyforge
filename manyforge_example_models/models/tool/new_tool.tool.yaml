@@ -1,0 +1,12 @@
+# The parameters a new Tool starts from (Add component, kind Tool, "Tool
+# (from parameters)"): a body and its default TCP. Edit them on the tool's
+# component page (Body, Chains, TCPs, Wiring, Mass).
+api_version: manyforge.parametric_tool.v1
+kind: tool
+body:
+  - name: housing
+    pose: {position_m: [0, 0, 0.05]}
+    collision: {cylinder: {radius_m: 0.025, length_m: 0.1}}
+chains: []
+tcps:
+  - {id: tcp, pose: {position_m: [0, 0, 0.1]}}

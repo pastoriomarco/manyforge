@@ -134,7 +134,7 @@ needs Docker and network access to `ghcr.io`; no login.
 ```
 
 `pull` fetches the tag named by the checkout's `VERSION` file (for example
-`ghcr.io/pastoriomarco/manyforge-ros:0.3.1`) and tags it as
+`ghcr.io/pastoriomarco/manyforge-ros:0.4.0`) and tags it as
 `manyforge-ros-lyrical-full`, the image `start` runs. To pin one exact image,
 pass its reference or its digest:
 
@@ -439,8 +439,42 @@ the absolute host path of a project inside one of these folders, for example
 After changing `project_folders`, stop the workbench and start it again. Calling
 `start` while it is already running does not update the folder mounts.
 
+#### Paths inside a project
+
+One rule covers every path in a Scenario that names a file or folder: a
+Program scene mesh's `mesh_resource_uri`, a Deployment `model_source`
+(`urdf`, `srdf` and its `package_roots`, as `project_path` or
+`external_path`) and a generated tool's mesh paths (inline parameters; a
+parameter file's mesh paths take the file's folder as their base). The base
+is the Scenario project folder itself (the
+`.scenario` folder), so a project that keeps its meshes beside its Scenarios
+writes `../meshes/part.stl`, and a model next to it `../models/arm.urdf`.
+
+A path is either relative to the project folder or absolute, and it must end
+inside an allowed folder: `examples/`, each site `project_folders` entry
+(`/projects/<folder name>`), the workbench folder (`/workspace`, in the
+workbench and the image) and, for a native operator install, its
+`manyforge_example_models` folder (the examples' model files), its package and
+its Program workspace. `..` may go
+up only while the path stays inside an allowed folder, and no symlink may sit
+between the allowed folder and the file. A URI scheme in a mesh path
+(`file://`, `package://`) is refused, nothing is looked up relative to the
+current directory, and a refusal names the path and the allowed folders. The
+viewer, Load, Apply (Program Apply, Revert) and Export apply the same rule.
+
+Apply reads each scene mesh once and stores a copy in the activation, named by
+its content; the Program keeps its paths. The collision checks and the planner
+read only that copy, so an absolute path and a relative one behave the same. A
+later edit of the file takes effect at the next Apply. An object added later
+through a Scene call (for example from Composer's Scene workspace or the API)
+has its mesh read and stored when it is added, with the same rule, relative to
+the active Scenario's project folder. Export copies every scene mesh into the
+exported project (`assets/scene/`) and rewrites its path there. Save as into
+another folder rewrites the relative model-source and scene-mesh paths so they
+name the same files from the new project; absolute paths stay.
+
 The workbench owns one stable internal runtime identity, independent of which
-Scenario is selected. Portable `manyforge.deployment_intent.v2` documents do not
+Scenario is selected. Portable `manyforge.deployment_intent.v3` documents do not
 contain `cell_id`. Starting empty and starting with a project both establish
 the same command-closed ROS host before ordinary Load/Apply. Loading another
 Scenario changes its equipment, Scene and Program, not the runtime identity.
@@ -582,7 +616,8 @@ the launcher atomically moves the previous `current/` into
 their WAL/SHM companions together. Archived files lose write permissions and
 are never passed to runtime owners. History stays in `history/` at the stable
 state root; installation settings and persistent Program keys also retain
-their existing separate storage. A state root that still holds
+their existing separate storage. The Scene is held in memory by the Manager
+and has no file: every start begins with an empty Scene. A state root that still holds
 `previous-sessions/` from an earlier build, or any other entry the launcher
 does not know, is refused and left unchanged; move that entry out of the
 state root, then start again.
@@ -871,7 +906,12 @@ directory to load those parts together. Program parameters always take their
 Program defaults: a former project with `overrides.yaml` (or a
 `manyforge.scenario.project.v1` manifest) is refused, not read; move any
 needed value into the Program default and recreate the project. Older Scenario
-projects using assignments must be re-authored with direct references. Save updates
+projects using assignments must be re-authored with direct references. Save
+writes the applied Program and Deployment, never edits that are not applied, so
+every saved Scenario loads again. With unapplied Draft edits, Save and Save As
+ask once (over the API: `confirmUnappliedExcluded: true`, else
+`scenario_save_unapplied_edits`) and write the applied state; the Drafts keep
+the edits. Apply first to save them. Save updates
 authored intent and source references; Save As creates another project without
 copying referenced external sources. Missing/invalid sources block
 preparation, while changed compatible sources are reported for review rather
@@ -891,6 +931,7 @@ exported references. Do not use Save As as an asset-collection operation.
   repeat New or Load. Save is disabled for
   Untitled; Save Scenario as writes it to a project folder and continues
   there. Unsaved Untitled changes are not recovered after a Composer restart.
+  Step by step: [Build a Scenario from scratch](../authoring/NEW_SCENARIO.md).
 - **Load Scenario** is New, then Apply of the chosen project. Its components
   come up **prepared**, never enabled. When the cell is not empty, New and
   Load ask once, listing what they stop; they also warn about unsaved Draft
@@ -949,7 +990,10 @@ exported references. Do not use Save As as an asset-collection operation.
   component faults while something executes, or is unhealthy after a Stop,
   the cell is latched ("N errors require attention"): runs, nodes, manual
   motion and manual I/O are blocked until every component is healthy and idle
-  again. Component actions, Apply, New and Load still work.
+  again. Component actions, Apply, New and Load still work. A fault while
+  motion runs also stops every moving robot with its fault Stop profile; the
+  stopped move shows **A component fault stopped motion** and its node fails,
+  or holds for the operator when its recovery policy allows intervention.
 
 A component that is deactivated in the Deployment (its **Active** box off) is
 not part of the running cell: it is never prepared or enabled and blocks
@@ -1067,7 +1111,8 @@ the selected component's page:
   **Controller status** (as the controller reports it) and its **Members**,
   each with an **Active** box;
 - placement: base pose, lane (a member runs on its owner's lane), a tool's
-  mount and **Primary tool** box, **Remove from Draft**, Preview and Apply;
+  mount and **Primary tool** box, **Remove from Draft** and Preview (Apply
+  is the top bar's);
 - its TCPs and frames (see [TCPs](#tcps)), a tool's payload (read-only, from
   its model), its I/O signals (live values stay in the viewer's Tool & I/O
   panel), and its settings in the Deployment Draft: model and target limits,
@@ -1132,7 +1177,8 @@ one edit (action `add_components`); `POST /api/deployment/draft/mutations`
 changes or removes existing rows (action `mutate`); `POST
 /api/deployment/preview` returns the diff and `POST /api/deployment/apply`
 applies it. `POST /api/scenario/load` and `POST /api/scenario/new` are Load and
-New (MCP `manyforge_scenario`). Apply, Load and New answer when they are
+New, and `POST /api/scenario-documents/save` saves the whole Scenario (MCP
+`manyforge_scenario` actions `load`, `new` and `save`). Apply, Load and New answer when they are
 accepted; their outcome is the row with their `request_key` in `apply_commands`
 of `GET /api/deployment/workspace`. `GET /api/components` and `POST
 /api/components/{component_id}/actions` read states and run actions (MCP

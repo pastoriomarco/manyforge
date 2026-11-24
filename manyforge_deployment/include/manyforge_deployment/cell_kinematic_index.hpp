@@ -86,6 +86,12 @@ class CellKinematicIndex final {
   /// Missing and duplicate terminal identities both return null.
   [[nodiscard]] const core::KinematicFramePathDTO* find_frame_path(
       const core::ResolvedFrameDTO& terminal_frame) const noexcept;
+  /// OD-372: true when `robot`'s kinematics places this compiled component
+  /// frame as a frame of a component mounted on it, rigidly (see
+  /// core::mounted_frame_placed_by).
+  [[nodiscard]] bool places_mounted_frame(
+      const core::ControllableComponentId& robot,
+      std::string_view compiled_frame_name) const;
 
  private:
   std::vector<core::ControllableComponentId> components_;  // graph order

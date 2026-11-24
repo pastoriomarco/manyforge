@@ -6,14 +6,14 @@
   },
   "description": "Mock pneumatic Lite6 pick and place. The separate Mock I/O device echoes the valve command to a synthetic workpiece input after 100 ms; this is not physical grasp evidence.",
   "members": {
-    "deployment.yaml": "sha256:d8798d628974e29a57447a91a5aa45fcbfe959e47691074cd01910d90910be52",
-    "program.yaml": "sha256:1e4e2c4a639d7d653bc33b9d3e7b1e52aaf4086037ad3a1f363e9cbf7b34eced"
+    "deployment.yaml": "sha256:e7f349bedadff5147e9683394ed5e48ba5deb785e681d5037e48c594c7e26b63",
+    "program.yaml": "sha256:c8f5b1a073abb6ff6c8a172fd06d76713a027db81da94080438f6bf81f9b9db9"
   },
   "name": "mock_lite6_pneumatic_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:f04d872955b76bcc96a57fabfd12d0c9669127e86b3a5c428f1e69185b92e696",
+    "checked_content_digest": "sha256:c59d175b466b5109b0315d86f129b4369d6157dc01e83cdf5d9ae68a21ef8bdf",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.1"
+    "manyforge_version": "0.4.0"
   },
   "scenario_id": "mock_lite6_pneumatic_pick_and_place",
   "source_snapshot": {

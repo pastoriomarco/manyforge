@@ -32,6 +32,8 @@ import {
   executionRobotPresentation,
   measuredLinkTransforms,
   runtimeScenePresentation,
+  springDisplayOffsets,
+  springOffsetInLink,
 } from './runtimeScenePresentation';
 import type {
   MeasuredRobotPresentation,
@@ -295,7 +297,6 @@ function logicalScene(): LogicalSceneProjection {
           },
         },
         provider_evidence: null,
-        support_contacts: [],
       }],
       policy_epoch: 1,
       revision: { scene_id: 'scene-1', revision_id: 1, content_hash: 'hash-1' },
@@ -1771,7 +1772,7 @@ describe('runtime scene presentation', () => {
       commandSchemaId: 'gripper.command_position', commandSchemaRevision: 'schema-1',
       sourceCoordinateName: 'source-finger', sourceKind: 'model_role',
       coordinateKind: 'linear_m', minPosition: 0, maxPosition: 0.04,
-      programId: 'direct-control-gripper', programRevision: 'schema-1',
+      programRevision: 'schema-1',
       programBindingId: 'gripper-binding',
       targetDescriptor: {} as NonNullable<ExecutionOwnerStatus['directControlGripper']>['targetDescriptor'],
     } as NonNullable<ExecutionOwnerStatus['directControlGripper']>;
@@ -1809,7 +1810,7 @@ describe('runtime scene presentation', () => {
     status.directControl!.activeTcp = { entry: { componentId: 'robot-1', targetId: 'arm', frameComponentId: 'robot-1', frameRoleId: 'tcp' } } as
       NonNullable<ExecutionOwnerStatus['directControl']>['activeTcp'];
     status.directControlGripper = { targetDescriptor: {
-      controllableComponentId: 'robot-1', commandTargetId: 'gripper', operationCapabilityId: 'tool.gripper.command', touchLinks: ['source-tip'],
+      controllableComponentId: 'robot-1', commandTargetId: 'gripper', operationCapabilityId: 'tool.gripper.command', gripBodyLinks: ['source-tip'],
     } } as unknown as NonNullable<ExecutionOwnerStatus['directControlGripper']>;
     const pose = { position_m: { x_m: 7, y_m: 8, z_m: 9 }, orientation: { x: 0, y: 0, z: 0, w: 1 } };
     const measured = measuredLinkTransforms(manifest(), new Map())!;
@@ -1905,4 +1906,47 @@ it('keeps v2 uncertainty local and preserves proved violations over incomplete g
   expect(previewContactPresentation(path, 0, model, objects)).toMatchObject({ defaultDisposition: 'unknown', links: { 'link-1': 'clearance' } });
   path.samples[0].contacts[0].disposition = 'refused';
   expect(previewContactPresentation(path, 0, model, objects).links['link-1']).toBe('refused');
+});
+
+it('shifts each compressed spring side by depth x direction, the deepest pair per part', () => {
+  expect(springDisplayOffsets(null)).toBeUndefined();
+  const frame = {
+    springCompressions: [
+      { ruleId: 'r', a: { kind: 'scene_object', sceneResourceId: 'tube' }, depthM: 0.001, pushDirection: [0, 0, 1] },
+      { ruleId: 'r', a: { kind: 'scene_object', sceneResourceId: 'tube' }, depthM: 0.003, pushDirection: [0, 1, 0] },
+      { ruleId: 'p', a: { kind: 'component_link', componentId: 'tool', link: 'tool__rod' }, depthM: 0.002, pushDirection: [1, 0, 0] },
+    ],
+  } as unknown as ExecutionObservationFrame;
+  expect(springDisplayOffsets(frame)).toEqual({
+    links: { tool__rod: { offsetM: [0.002, 0, 0], depthM: 0.002 } },
+    objects: { tube: { offsetM: [0, 0.003, 0], depthM: 0.003 } },
+  });
+  expect(springDisplayOffsets({ springCompressions: [] } as unknown as ExecutionObservationFrame))
+    .toBeUndefined();
+});
+
+it('shifts a spring slider and the objects it carries together (OD-371)', () => {
+  // A grouped rule publishes every a-side body with the group depth and the
+  // slider's direction, touching or not.
+  const frame = {
+    springCompressions: [
+      { ruleId: 'press', a: { kind: 'component_link', componentId: 'tube_holder', link: 'tube_holder__tool_holder_rod' },
+        depthM: 0.004, pushDirection: [0, 0, -1] },
+      { ruleId: 'press', a: { kind: 'scene_object', sceneResourceId: 'renamed_tube' },
+        depthM: 0.004, pushDirection: [0, 0, -1] },
+    ],
+  } as unknown as ExecutionObservationFrame;
+  expect(springDisplayOffsets(frame)).toEqual({
+    links: { tube_holder__tool_holder_rod: { offsetM: [0, 0, -0.004], depthM: 0.004 } },
+    objects: { renamed_tube: { offsetM: [0, 0, -0.004], depthM: 0.004 } },
+  });
+});
+
+it('expresses a world spring offset in the frame of its link', () => {
+  // A link turned 90 degrees about z: world +x is the link's -y.
+  const turned = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2);
+  const [x, y, z] = springOffsetInLink([0.002, 0, 0], turned);
+  expect(x).toBeCloseTo(0);
+  expect(y).toBeCloseTo(-0.002);
+  expect(z).toBeCloseTo(0);
 });

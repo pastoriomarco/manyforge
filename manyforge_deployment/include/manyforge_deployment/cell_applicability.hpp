@@ -7,7 +7,6 @@
 #include <manyforge_deployment/cell_composition.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/command_schema_codec.hpp>
-#include <manyforge_deployment/contact_policy_codec.hpp>
 #include <manyforge_deployment/control_interface_contract_codec.hpp>
 #include <manyforge_deployment/controller_topology_codec.hpp>
 #include <manyforge_deployment/deployment_applicability_codec.hpp>
@@ -380,10 +379,6 @@ public:
   runtime_profiles() const noexcept {
     return data_->runtime_profiles;
   }
-  [[nodiscard]] const std::vector<QualifiedContactPolicy> &
-  contact_policies() const noexcept {
-    return data_->contact_policies;
-  }
   [[nodiscard]] const std::vector<QualifiedCapabilityDefinition> &
   capability_definitions() const noexcept {
     return data_->capability_definitions;
@@ -453,7 +448,6 @@ private:
          std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref_in,
          const QualifiedAssistantSettings &assistant_settings_in,
          std::vector<QualifiedRuntimeProfile> runtime_profiles_in,
-         std::vector<QualifiedContactPolicy> contact_policies_in,
          std::vector<QualifiedCommandSchema> command_schemas_in,
          std::vector<QualifiedCapabilityDefinition> capability_definitions_in,
          std::vector<QualifiedControlInterfaceContract>
@@ -475,7 +469,6 @@ private:
           selected_site_overlay_ref(std::move(selected_site_overlay_ref_in)),
           assistant_settings(assistant_settings_in),
           runtime_profiles(std::move(runtime_profiles_in)),
-          contact_policies(std::move(contact_policies_in)),
           command_schemas(std::move(command_schemas_in)),
           capability_definitions(std::move(capability_definitions_in)),
           control_interface_contracts(
@@ -498,7 +491,6 @@ private:
     std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref;
     QualifiedAssistantSettings assistant_settings;
     std::vector<QualifiedRuntimeProfile> runtime_profiles;
-    std::vector<QualifiedContactPolicy> contact_policies;
     std::vector<QualifiedCommandSchema> command_schemas;
     std::vector<QualifiedCapabilityDefinition> capability_definitions;
     std::vector<QualifiedControlInterfaceContract> control_interface_contracts;
@@ -522,7 +514,6 @@ private:
       std::optional<core::SiteOverlayRefDTO> selected_site_overlay_ref,
       const QualifiedAssistantSettings &assistant_settings,
       std::vector<QualifiedRuntimeProfile> runtime_profiles,
-      std::vector<QualifiedContactPolicy> contact_policies,
       std::vector<QualifiedCommandSchema> command_schemas,
       std::vector<QualifiedCapabilityDefinition> capability_definitions,
       std::vector<QualifiedControlInterfaceContract>
@@ -543,8 +534,7 @@ private:
       : data_(std::make_shared<const Data>(
             composition, deployment_inputs,
             std::move(selected_site_overlay_ref), assistant_settings,
-            std::move(runtime_profiles), std::move(contact_policies),
-            std::move(command_schemas),
+            std::move(runtime_profiles), std::move(command_schemas),
             std::move(capability_definitions),
             std::move(control_interface_contracts),
             std::move(controller_topologies), std::move(provider_manifests),
@@ -569,8 +559,7 @@ private:
       std::span<const QualifiedStopEvidencePolicy>,
       std::span<const BuildQualifiedValueSchemaEntry>,
       std::span<const QualifiedCommissioningEvidenceRef>,
-      const QualifiedSelectedSiteOverlay &,
-      std::span<const QualifiedContactPolicy>);
+      const QualifiedSelectedSiteOverlay &);
 };
 
 [[nodiscard]] ApplicabilityQualifiedCellIr qualify_cell_applicability(
@@ -587,7 +576,6 @@ private:
     std::span<const BuildQualifiedValueSchemaEntry> value_schemas,
     std::span<const QualifiedCommissioningEvidenceRef>
         commissioning_evidence_refs,
-    const QualifiedSelectedSiteOverlay &selected_site_overlay,
-    std::span<const QualifiedContactPolicy> contact_policies = {});
+    const QualifiedSelectedSiteOverlay &selected_site_overlay);
 
 } // namespace manyforge::deployment

@@ -1,25 +1,21 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [],
     "namespaces": []
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "pick-and-place",
       "ur5"
     ]
   },
-  "description": "Pick-and-place demo for the UR5e with a Robotiq 2F-85. It keeps the original approach, pick, retreat, drop, detach, and rest motion sequence; the gripper closes on the part before attach and opens before detach. The TCP is the gripper mount (the UR5e `tool0`), so pick targets sit 0.14 m above the part, where the open fingers straddle it. Exact scene and attachment revisions invalidate planning automatically.",
   "forest": [
     {
       "children": [
@@ -48,14 +44,14 @@
               ]
             },
             "planning_timeout_s": 10.0,
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
+            },
             "target_mode": "relative",
             "target_reference": {
               "scene_resource_id": "graspable",
               "type": "scene_resource"
-            },
-            "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -93,14 +89,14 @@
               ]
             },
             "planning_timeout_s": 10.0,
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
+            },
             "target_mode": "relative",
             "target_reference": {
               "scene_resource_id": "graspable",
               "type": "scene_resource"
-            },
-            "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -118,6 +114,7 @@
           "instance_id": "close_gripper",
           "node_id": "gripper.command_position",
           "parameters": {
+            "completion_timeout_s": 15.0,
             "position": {
               "kind": "named_preset",
               "name": "closed"
@@ -125,8 +122,7 @@
             "target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            },
-            "completion_timeout_s": 15.0
+            }
           }
         },
         {
@@ -145,8 +141,8 @@
             },
             "touch_bodies": [
               {
-                "component_id": "robotiq_2f_85",
-                "collision_body_id": "gripper_collision"
+                "collision_body_id": "gripper_collision",
+                "component_id": "robotiq_2f_85"
               }
             ]
           }
@@ -176,17 +172,17 @@
               ]
             },
             "planning_timeout_s": 10.0,
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
+            },
             "target_mode": "relative",
             "target_reference": {
-              "type": "component_frame",
               "frame": {
                 "component_id": "robotiq_2f_85",
                 "frame_id": "tcp"
-              }
-            },
-            "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
+              },
+              "type": "component_frame"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -224,22 +220,26 @@
               ]
             },
             "offset_reference": {
-              "type": "component_frame",
               "frame": {
                 "component_id": "ur5_robot",
                 "frame_id": "base"
-              }
+              },
+              "type": "component_frame"
             },
             "planning_timeout_s": 10.0,
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
+            },
             "target_mode": "relative",
             "target_reference": {
               "pose": {
                 "frame_ref": {
-                  "kind": "target_frame",
                   "frame": {
                     "component_id": "ur5_robot",
                     "frame_id": "base"
-                  }
+                  },
+                  "kind": "target_frame"
                 },
                 "orientation": {
                   "rpy_deg": [
@@ -255,10 +255,6 @@
                 ]
               },
               "type": "pose"
-            },
-            "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -283,11 +279,11 @@
             "execution_timeout_s": 30.0,
             "goal": {
               "frame_ref": {
-                "kind": "target_frame",
                 "frame": {
                   "component_id": "ur5_robot",
                   "frame_id": "base"
-                }
+                },
+                "kind": "target_frame"
               },
               "orientation": {
                 "rpy_deg": [
@@ -304,8 +300,8 @@
             },
             "planning_timeout_s": 10.0,
             "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -323,6 +319,7 @@
           "instance_id": "open_gripper",
           "node_id": "gripper.command_position",
           "parameters": {
+            "completion_timeout_s": 15.0,
             "position": {
               "kind": "named_preset",
               "name": "open"
@@ -330,8 +327,7 @@
             "target": {
               "command_target_id": "gripper",
               "component_id": "robotiq_2f_85"
-            },
-            "completion_timeout_s": 15.0
+            }
           }
         },
         {
@@ -371,22 +367,26 @@
               ]
             },
             "offset_reference": {
-              "type": "component_frame",
               "frame": {
                 "component_id": "ur5_robot",
                 "frame_id": "base"
-              }
+              },
+              "type": "component_frame"
             },
             "planning_timeout_s": 10.0,
+            "target": {
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
+            },
             "target_mode": "relative",
             "target_reference": {
               "pose": {
                 "frame_ref": {
-                  "kind": "target_frame",
                   "frame": {
                     "component_id": "ur5_robot",
                     "frame_id": "base"
-                  }
+                  },
+                  "kind": "target_frame"
                 },
                 "orientation": {
                   "rpy_deg": [
@@ -402,10 +402,6 @@
                 ]
               },
               "type": "pose"
-            },
-            "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -456,8 +452,8 @@
             ],
             "planning_timeout_s": 10.0,
             "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
+              "command_target_id": "arm",
+              "component_id": "ur5_robot"
             },
             "tcp_endpoint": {
               "kind": "current"
@@ -476,7 +472,6 @@
       "parameters": {}
     }
   ],
-  "name": "pick_and_place_demo",
   "parameters": [
     {
       "constraints": {
@@ -490,7 +485,6 @@
     }
   ],
   "positions": {},
-  "program_id": "pick_and_place_demo",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

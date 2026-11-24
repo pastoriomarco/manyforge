@@ -8,6 +8,7 @@
 #include <manyforge_deployment/canonical_value.hpp>
 
 #include "activation_deployment_intent_internal.hpp"
+#include "activation_generated_tool_internal.hpp"
 
 namespace manyforge::deployment::detail {
 
@@ -58,7 +59,7 @@ struct ActivationComponentProfile final {
   /// gripper, lanes, defaults); null for model-free kinds.
   CanonicalValue model_descriptor;
   /// The authored lane (a key of the model's `lanes`); none for model-free
-  /// kinds and for a lane-free (pneumatic) tool.
+  /// kinds and for a lane-free (pneumatic or passive) tool.
   std::optional<std::string> lane;
   /// The model's `lanes.<lane>` row, verbatim.
   /// A machine owner's is its machine model's row (absent on a lane it has
@@ -82,6 +83,12 @@ struct ActivationComponentProfile final {
     std::vector<std::string> joint_names;
   };
   std::optional<DeactivatedArm> deactivated_arm{};
+  /// A Tool generated from its parameters (`manyforge.tool`, OD-357): what
+  /// it declares (every jaw pair is a gripper target) and the id of the
+  /// component type derived from it. `model_family.semantics` is then the
+  /// generated tool's own (`generated_tool_semantics`), not the family's.
+  std::optional<GeneratedToolComponent> generated_tool{};
+  std::optional<std::string> derived_component_type_id{};
 };
 
 /// Resolve every authored component: `component_profile_id` names a
@@ -101,7 +108,8 @@ struct ActivationComponentProfile final {
 /// machine's member model is never placed without an owner. Typed failures: `deployment_member_role_unknown`,
 /// `deployment_member_role_repeated`, `deployment_member_missing`,
 /// `deployment_machine_part_without_machine`. The authored lane must be a key of the
-/// model's `lanes`; only a pneumatic tool may name none (lane-free).
+/// model's `lanes`; only a pneumatic tool or a passive tool (no `gripper`
+/// section, `lanes: {}`) may name none (lane-free).
 ///
 /// Results preserve the canonical component order in `intent`.  Unknown
 /// models, duplicate repository identities and missing families fail before
@@ -120,6 +128,14 @@ resolve_activation_component_profiles(
 /// Real lane: provider `component_adapter` with the model's `{bank}`; Mock
 /// and Isaac: inputs `mock`, outputs `mock_output`.
 void expand_activation_machine_members(
+    ActivationDeploymentIntent &intent,
+    const std::vector<ActivationComponentProfile> &profiles);
+
+/// Rewrite each generated tool's wiring rows (OD-357: per jaw pair its
+/// `pneumatic_io` only) into its complete `gripper_target_configurations`
+/// rows, the rest from its parameters (`generated_tool_gripper_rows`, with
+/// its typed refusals).
+void expand_generated_tool_wiring(
     ActivationDeploymentIntent &intent,
     const std::vector<ActivationComponentProfile> &profiles);
 

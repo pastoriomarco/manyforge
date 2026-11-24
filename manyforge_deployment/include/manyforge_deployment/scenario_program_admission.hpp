@@ -20,7 +20,6 @@ enum class ScenarioAssistantMode : std::uint8_t {
 };
 
 struct ScenarioDeploymentCompatibilityDTO final {
-  std::string lane;
   std::vector<std::string> provides;
 
   friend bool operator==(const ScenarioDeploymentCompatibilityDTO &,

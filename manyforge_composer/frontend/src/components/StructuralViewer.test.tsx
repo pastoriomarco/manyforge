@@ -16,8 +16,6 @@ import {
   previewSampleBaseColor,
   MeasuredStateGhostLayers,
   MeasuredStateGhostToggle,
-  frameableContentBounds,
-  framedCameraPresentation,
   sceneObjectMaterial,
   supportsIndependentSceneScale,
   viewerClickWithinDuration,
@@ -25,6 +23,7 @@ import {
   AttachedLogicalSceneObject,
   ViewerFailureBoundary,
 } from './StructuralViewer';
+import { frameableContentBounds, framedCameraPresentation } from '../utils/viewerCamera';
 import type { LogicalSceneObject, SceneRuntimeObservationPose, SceneUrdfManifest } from '../types/api';
 import type {
   AttachedObjectPresentation,
@@ -49,7 +48,6 @@ function sceneObject(
       },
     },
     provider_evidence: null,
-    support_contacts: [],
   };
 }
 
@@ -211,8 +209,8 @@ describe('viewer failure isolation', () => {
     expect(source.includes('else if (!generalTransformEnabled) return;')).toBe(true);
     expect(css).toMatch(/\.viewer-header-controls\s*\{[^}]*flex:\s*1 1 auto/s);
     expect(css).toMatch(/\.viewer-surface-launchers\s*\{[^}]*margin-left:\s*auto/s);
-    // Robot, Object and Tool & I/O.
-    expect(source.slice(launchers, stage).match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(3);
+    // Robot, Object, Tool & I/O and Keys.
+    expect(source.slice(launchers, stage).match(/aria-pressed=\{inspectorPanel ===/g)).toHaveLength(4);
     expect(css).toMatch(
       /\.viewer-surface-launchers > button\[aria-pressed='true'\]\s*\{[^}]*border-color:\s*#68cadd;[^}]*background:\s*#17404c;/s,
     );
@@ -402,6 +400,7 @@ describe('viewer failure isolation', () => {
       object,
       attachmentId: 'attachment-1',
       attachmentRevision: 'attachment-revision-1',
+      holderComponentId: 'robot-1',
       carrierComponentId: 'robot-1',
       commandTargetId: 'arm',
       carrierModelInstanceId: 'model-instance-1',

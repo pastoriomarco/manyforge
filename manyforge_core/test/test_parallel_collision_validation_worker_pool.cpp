@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include "collision_rule_test_helpers.hpp"
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -203,30 +205,22 @@ CollisionPolicySnapshot contact_release_snapshot(const CollisionPairId& pair) {
   policy.policy_id = "contact_release";
   policy.revision.revision_id = 3;
   policy.require_full_diagnostics = true;
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.max_start_penetration_m = 0.10;
-  entry.release_tolerance_m = 1e-5;
-  entry.min_release_progress_m = 0.001;
-  entry.require_separation_by_end = true;
-  entry.require_strictly_decreasing_penetration = true;
-  policy.support_contacts.push_back(entry);
+  auto entry = testing::release_rule(pair);
+  testing::release_of(entry).max_start_penetration_m = 0.10;
+  testing::release_of(entry).release_tolerance_m = 1e-5;
+  testing::release_of(entry).min_release_progress_m = 0.001;
+  testing::release_of(entry).require_separation_by_end = true;
+  testing::release_of(entry).require_strictly_decreasing_penetration = true;
+  testing::add_contact_rule(policy, entry);
   return policy;
 }
 
+/// One pair under a whole-move contact rule with a depth limit.
 CollisionPolicySnapshot bounded_penetration_snapshot(
-    const CollisionPairId& pair, double max_contact_penetration_m) {
+    const CollisionPairId& pair, double max_penetration_m) {
   auto policy = contact_release_snapshot(pair);
-  auto& entry = policy.support_contacts.front();
-  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  entry.max_contact_penetration_m = max_contact_penetration_m;
-  entry.enforce_max_start_penetration = false;
-  entry.max_start_penetration_m = 0.0;
-  entry.release_tolerance_m = 0.0;
-  entry.min_release_progress_m = 0.0;
-  entry.require_separation_by_end = false;
-  entry.require_strictly_decreasing_penetration = false;
-  entry.allow_recontact = false;
+  policy.contact_rules.front().value =
+      CollisionContactRule{max_penetration_m, 0.0, std::nullopt};
   return policy;
 }
 
@@ -689,7 +683,7 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_TRUE(parallel.decision.accepted);
   EXPECT_EQ(pool.last_telemetry().workers_actually_used, 3);
   EXPECT_TRUE(pool.last_telemetry().fallback_reason.empty());
-  EXPECT_TRUE(pool.last_telemetry().support_contact_active);
+  EXPECT_TRUE(pool.last_telemetry().tracked_contact_active);
   EXPECT_TRUE(pool.last_telemetry().contact_release_active);
   EXPECT_TRUE(pool.last_telemetry().ordered_contact_summary_used);
   EXPECT_EQ(engine_a.call_count.load() + engine_b.call_count.load() + engine_c.call_count.load(),
@@ -799,17 +793,84 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   EXPECT_EQ(*rejected.decision.first_failing_waypoint, 6);
   EXPECT_EQ(rejected.waypoint_records[6]
                 .result.raw_diagnostics.at("contact_release_violation"),
-            "contact_penetration_exceeds_policy");
-  const auto violation = contact_policy_violation_details(
+            "contact_penetration_exceeded");
+  const auto violation = contact_rule_violation_details(
       rejected, cfg.pass_config.policy_snapshot, "block_dispatch");
   ASSERT_TRUE(violation.has_value());
-  EXPECT_EQ(violation->at("policy_mode"), "bounded_penetration");
+  EXPECT_EQ(violation->at("policy_mode"), "contact");
   EXPECT_EQ(violation->at("initial_contact_pair_count"), "0");
   EXPECT_EQ(violation->at("current_contact_pair_count"), "1");
   EXPECT_EQ(violation->at("distance_request_mode"),
             "selected_colliding_pairs");
   EXPECT_EQ(violation->at("evaluated_distance_pair_count"), "1");
   EXPECT_EQ(violation->find("release_evidence_mode"), violation->end());
+}
+
+TEST(ParallelCollisionValidationWorkerPoolTest, GroupedSpringIsOneSpringAcrossChunks) {
+  // OD-371: the slider and its carried tube against the endplate, one rule
+  // (stroke 10 mm, 2 mm per sample); the contact moves from the tube to the
+  // slider across the workers' chunk boundary.
+  const CollisionPairId slider{"component/holder/model/holder_model/body/holder_rod/collision/0",
+                               "scene/endplate/shape/0"};
+  const CollisionPairId tube{"scene/endplate/shape/0", "scene/tube/shape/0"};
+  CollisionPolicySnapshot policy;
+  policy.policy_id = "grouped_spring";
+  policy.revision = {11, "grouped-spring"};
+  policy.require_full_diagnostics = true;
+  for (const auto& pair : {slider, tube}) {
+    auto rule = testing::contact_rule(pair, 0.010, std::nullopt, "tube_into_endplate");
+    testing::contact_of(rule).max_compression_step_m = 0.002;
+    testing::contact_of(rule).spring_group =
+        CollisionSpringGroup{ControllableComponentId("holder"), "holder_rod", {0.0, 0.0, 1.0}};
+    testing::add_contact_rule(policy, rule);
+  }
+  const auto sample = [&](double slider_depth, double tube_depth) {
+    CollisionResult result;
+    result.engine_status = CollisionEngineStatus::kOk;
+    result.decision = CollisionDecisionResult::kPass;
+    for (const auto& [pair, depth] : {std::pair{slider, slider_depth}, std::pair{tube, tube_depth}}) {
+      if (depth > 0.0) {
+        result.in_collision = true;
+        result.decision = CollisionDecisionResult::kFail;
+        result.normalized_pairs.push_back(pair);
+        result.pair_clearances.push_back(CollisionPairClearance{pair, -depth});
+      }
+    }
+    return result;
+  };
+  const auto validate = [&](const std::vector<CollisionResult>& results) {
+    MockCollisionQueryEngine engine_a;
+    MockCollisionQueryEngine engine_b;
+    assign_parallel_results({&engine_a, &engine_b}, results);
+    ParallelCollisionValidationWorkerPool::Config cfg;
+    cfg.pass_config.policy_snapshot = policy;
+    cfg.worker_count = 2;
+    cfg.min_waypoints_for_parallel = 1;
+    ParallelCollisionValidationWorkerPool pool(cfg);
+    CollisionCancellationToken cancel;
+    auto bundle = pool.validate_trajectory(
+        test_snapshot(), std::vector<ICollisionQueryEngine*>{&engine_a, &engine_b},
+        long_trajectory(static_cast<int>(results.size())), cancel);
+    EXPECT_TRUE(pool.last_telemetry().ordered_contact_summary_used);
+    return bundle;
+  };
+
+  // The rule's depth: 0, 1 mm, 2.6 mm, 4 mm; the slider's alone jumps to 2.6.
+  const auto handover = validate(
+      {sample(0.0, 0.0), sample(0.0, 0.001), sample(0.0026, 0.0025), sample(0.004, 0.0)});
+  EXPECT_TRUE(handover.decision.accepted);
+
+  // 2.6 mm -> 5.5 mm in one sample: refused on the slider, the deepest pair.
+  const auto jump = validate(
+      {sample(0.0, 0.0), sample(0.0, 0.001), sample(0.0026, 0.0025), sample(0.0055, 0.003)});
+  ASSERT_FALSE(jump.decision.accepted);
+  ASSERT_TRUE(jump.decision.first_failing_waypoint);
+  EXPECT_EQ(*jump.decision.first_failing_waypoint, 3);
+  const auto& record = jump.waypoint_records[3];
+  EXPECT_EQ(record.result.raw_diagnostics.at("contact_release_violation"),
+            "contact_compression_step_exceeded");
+  EXPECT_EQ(record.result.raw_diagnostics.at("contact_release_pair"),
+            slider.body_a + " <-> " + slider.body_b);
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
@@ -819,19 +880,17 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   const CollisionPairId bounded_pair{"scene/insert/shape/0", "scene/socket/shape/0"};
 
   auto policy = contact_release_snapshot(signed_pair);
-  SupportContactPolicyEntry binary;
-  binary.pair = binary_pair;
-  binary.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
-  binary.enforce_max_start_penetration = false;
-  binary.max_start_penetration_m = 0.0;
-  binary.release_tolerance_m = 0.0;
-  binary.min_release_progress_m = 0.0;
-  binary.require_separation_by_end = true;
-  binary.require_strictly_decreasing_penetration = false;
-  policy.support_contacts.push_back(binary);
-  policy.support_contacts.push_back(
-      bounded_penetration_snapshot(bounded_pair, 0.005)
-          .support_contacts.front());
+  auto binary = testing::release_rule(binary_pair);
+  testing::release_of(binary).release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  testing::release_of(binary).enforce_max_start_penetration = false;
+  testing::release_of(binary).max_start_penetration_m = 0.0;
+  testing::release_of(binary).release_tolerance_m = 0.0;
+  testing::release_of(binary).min_release_progress_m = 0.0;
+  testing::release_of(binary).require_separation_by_end = true;
+  testing::release_of(binary).require_strictly_decreasing_penetration = false;
+  testing::add_contact_rule(policy, binary);
+  testing::add_contact_rule(policy, bounded_penetration_snapshot(bounded_pair, 0.005)
+          .contact_rules.front());
 
   auto sample = [](std::vector<CollisionPairId> colliding,
                    std::vector<CollisionPairClearance> clearances) {
@@ -980,9 +1039,9 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
 
   ParallelCollisionValidationWorkerPool::Config cfg;
   cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
-  auto& release = cfg.pass_config.policy_snapshot.support_contacts.front();
-  release.require_separation_by_end = false;
-  release.min_release_progress_m = 0.010;
+  auto& release = cfg.pass_config.policy_snapshot.contact_rules.front();
+  testing::release_of(release).require_separation_by_end = false;
+  testing::release_of(release).min_release_progress_m = 0.010;
   cfg.worker_count = 2;
   cfg.min_waypoints_for_parallel = 1;
   ParallelCollisionValidationWorkerPool pool(cfg);
@@ -1165,9 +1224,9 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
 
   ParallelCollisionValidationWorkerPool::Config cfg;
   cfg.pass_config.policy_snapshot = contact_release_snapshot(pair_a);
-  auto second_entry = cfg.pass_config.policy_snapshot.support_contacts.front();
+  auto second_entry = cfg.pass_config.policy_snapshot.contact_rules.front();
   second_entry.pair = pair_b;
-  cfg.pass_config.policy_snapshot.support_contacts.push_back(second_entry);
+  testing::add_contact_rule(cfg.pass_config.policy_snapshot, second_entry);
   cfg.worker_count = 3;
   cfg.min_waypoints_for_parallel = 1;
   ParallelCollisionValidationWorkerPool pool(cfg);
@@ -1203,7 +1262,7 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
 
   ParallelCollisionValidationWorkerPool::Config cfg;
   cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
-  cfg.pass_config.policy_snapshot.support_contacts.front().allow_recontact = true;
+  testing::release_of(cfg.pass_config.policy_snapshot.contact_rules.front()).allow_recontact = true;
   cfg.pass_config.policy_snapshot.allowed_touch_link_pairs.push_back(pair);
   cfg.worker_count = 2;
   cfg.min_waypoints_for_parallel = 2;
@@ -1383,7 +1442,7 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
     cfg.pass_config.policy_snapshot = std::move(policy);
     cfg.worker_count = 2;
     cfg.min_waypoints_for_parallel = 1;
-    cfg.enable_ordered_support_contact_summaries = summaries_enabled;
+    cfg.enable_ordered_contact_summaries = summaries_enabled;
     ParallelCollisionValidationWorkerPool pool(cfg);
     CollisionCancellationToken cancel;
     (void)pool.validate_trajectory(test_snapshot(),
@@ -1392,25 +1451,36 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
     return pool.last_telemetry().fallback_reason;
   };
 
-  auto process_policy = contact_release_snapshot(pair);
-  process_policy.support_contacts.front().mode = CollisionContactPolicyMode::kContactProcess;
-  EXPECT_EQ(run_with_policy(std::move(process_policy), true), "contact_process_policy_active");
   EXPECT_EQ(run_with_policy(contact_release_snapshot(pair), false),
-            "support_contact_policy_active");
+            "tracked_contact_rule_active");
+
+  // A contact rule with an end window is validated serially.
+  CollisionPolicySnapshot windowed;
+  windowed.policy_id = "windowed_contact";
+  windowed.revision.revision_id = 4;
+  testing::add_contact_rule(windowed, testing::contact_rule(pair, 0.002, 0.8));
+  EXPECT_EQ(run_with_policy(std::move(windowed), true), "windowed_contact_rule_active");
+
+  // A whole-move contact rule without a limit needs no ordered state: the
+  // pool stays parallel.
+  CollisionPolicySnapshot free_contact;
+  free_contact.policy_id = "free_contact";
+  free_contact.revision.revision_id = 5;
+  testing::add_contact_rule(free_contact, testing::contact_rule(pair));
+  EXPECT_TRUE(run_with_policy(std::move(free_contact), true).empty());
 
   auto over_bound = contact_release_snapshot(pair);
-  over_bound.support_contacts.clear();
+  over_bound.contact_rules.clear();
   for (std::size_t i = 0; i <= kMaxOrderedSupportContactIdentities; ++i) {
-    SupportContactPolicyEntry entry;
-    entry.pair = {"robot_" + std::to_string(i), "object_" + std::to_string(i)};
-    over_bound.support_contacts.push_back(std::move(entry));
+    auto entry = testing::release_rule({"robot_" + std::to_string(i), "object_" + std::to_string(i)});
+    testing::add_contact_rule(over_bound, std::move(entry));
   }
   EXPECT_EQ(run_with_policy(std::move(over_bound), true),
-            "support_contact_identity_bound_exceeded");
+            "contact_rule_pair_bound_exceeded");
 
   auto duplicate = contact_release_snapshot(pair);
-  duplicate.support_contacts.push_back(duplicate.support_contacts.front());
-  EXPECT_EQ(run_with_policy(std::move(duplicate), true), "duplicate_support_contact_identity");
+  testing::add_contact_rule(duplicate, duplicate.contact_rules.front());
+  EXPECT_EQ(run_with_policy(std::move(duplicate), true), "duplicate_contact_rule_pair");
 }
 
 TEST(ParallelCollisionValidationWorkerPoolTest,
@@ -1574,10 +1644,10 @@ TEST(ParallelCollisionValidationWorkerPoolTest,
   ManualScheduler scheduler;
   ParallelCollisionValidationWorkerPool::Config cfg;
   cfg.pass_config.policy_snapshot = contact_release_snapshot(pair);
-  auto& release = cfg.pass_config.policy_snapshot.support_contacts.front();
-  release.require_separation_by_end = false;
-  release.require_strictly_decreasing_penetration = false;
-  release.min_release_progress_m = 0.0;
+  auto& release = cfg.pass_config.policy_snapshot.contact_rules.front();
+  testing::release_of(release).require_separation_by_end = false;
+  testing::release_of(release).require_strictly_decreasing_penetration = false;
+  testing::release_of(release).min_release_progress_m = 0.0;
   cfg.pass_config.entering_support_contact_state =
       SupportContactEvaluationStateMap{
           {pair, SupportContactEvaluationState::kSeparated}};

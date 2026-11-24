@@ -176,7 +176,7 @@ Result<ParticipantBindingIdentityDTO> runtime_participant_binding_identity(
 
 Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     RuntimeParticipantBindingDTO value) {
-  if (value.program_id.empty() || value.program_revision.empty() ||
+  if (value.program_revision.empty() ||
       value.program_binding_id.empty() || value.retained_bundle_id.empty() ||
       value.graph_revision.empty() || value.controllable_component_id.empty() ||
       value.component_type_id.empty() || value.component_type_revision.empty() ||
@@ -359,44 +359,29 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     return invalid("runtime participant command schema is incomplete",
                    "runtime_command_schema_invalid");
   }
-  if (!sorted_unique(value.contact_grasp_bindings,
-                     [](const auto& policy) { return policy.contact_policy_id; }) ||
+  if (!sorted_unique(value.collision_rule_bodies, [](const auto& body) { return body.body; }) ||
       std::any_of(
-          value.contact_grasp_bindings.begin(), value.contact_grasp_bindings.end(),
-          [&](const auto& policy) {
-            if (policy.contact_policy_id.empty() || policy.contact_policy_revision.empty() ||
-                policy.runtime_object_id.empty() ||
-                policy.bodies_from_motion_endpoint != policy.allowed_body_bindings.empty() ||
-                !valid_program_contact_envelope(policy.envelope) ||
-                !sorted_unique(policy.allowed_body_bindings, [](const auto& body) {
-                  return std::tie(body.body, body.model_role_id);
-                })) {
+          value.collision_rule_bodies.begin(), value.collision_rule_bodies.end(),
+          [&](const auto& body) {
+            if (body.body.component_id.empty() ||
+                (body.model_role_id.has_value() && body.model_role_id->empty()) ||
+                body.body.collision_body_id.empty() || body.model_instance_id.empty() ||
+                body.model_revision.empty() || body.collision_body_ids.empty()) {
               return true;
             }
-            return std::any_of(
-                policy.allowed_body_bindings.begin(), policy.allowed_body_bindings.end(),
-                [&](const auto& body) {
-                  if (body.body.component_id.empty() ||
-                      (body.model_role_id.has_value() && body.model_role_id->empty()) ||
-                      body.body.collision_body_id.empty() || body.model_instance_id.empty() ||
-                      body.model_revision.empty() || body.collision_body_ids.empty()) {
-                    return true;
-                  }
-                  for (std::size_t index = 0U; index < body.collision_body_ids.size(); ++index) {
-                    if (body.collision_body_ids[index] !=
-                        make_component_collision_body_id(body.body.component_id,
-                                                         body.model_instance_id,
-                                                         body.body.collision_body_id, index)) {
-                      return true;
-                    }
-                  }
-                  return false;
-                });
+            for (std::size_t index = 0U; index < body.collision_body_ids.size(); ++index) {
+              if (body.collision_body_ids[index] !=
+                  make_component_collision_body_id(body.body.component_id, body.model_instance_id,
+                                                   body.body.collision_body_id, index)) {
+                return true;
+              }
+            }
+            return false;
           })) {
     return invalid(
-        "runtime contact-grasp bindings are incomplete, unsorted, "
+        "runtime collision-rule bodies are incomplete, unsorted, "
         "or inconsistent",
-        "runtime_contact_grasp_binding_invalid");
+        "runtime_collision_rule_body_invalid");
   }
   return Result<RuntimeParticipantBinding>::Ok(RuntimeParticipantBinding(std::move(value)));
 }
@@ -443,11 +428,9 @@ Result<RuntimeParticipantBinding> bind_runtime_participant_collision_body_aliase
     }
     return true;
   };
-  for (auto& policy : value.contact_grasp_bindings) {
-    if (!project_bodies(policy.allowed_body_bindings)) {
-      return invalid("runtime contact-grasp body has no unique exact physical projection",
-                     "runtime_collision_body_alias_unresolved");
-    }
+  if (!project_bodies(value.collision_rule_bodies)) {
+    return invalid("runtime collision-rule body has no unique exact physical projection",
+                   "runtime_collision_body_alias_unresolved");
   }
   if (value.motion_endpoint && !project_bodies(value.motion_endpoint->contact_body_bindings)) {
     return invalid("runtime motion-endpoint body has no unique exact physical projection",

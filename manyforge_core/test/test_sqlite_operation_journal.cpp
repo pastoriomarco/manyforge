@@ -71,7 +71,6 @@ class ScopedTemporaryDirectory final {
 [[nodiscard]] OperationIntentDTO CommandIntent(std::string request_id) {
   return OperationIntentDTO{
       PublicRequestContextDTO{TestRequestKey(std::move(request_id)), "journal-test"},
-      ProgramId("program.pick"),
       ProgramRevision("program-revision"),
       ProgramBindingId("program-binding"),
       ProgramRunNumber(1U),
@@ -548,7 +547,6 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsAbsoluteGoalFrameAndRobotQ
       std::nullopt,
       std::nullopt,
       PoseGoalDTO{goal},
-      std::nullopt,
       {},
       {}};
   motion.goal_frame_reference =
@@ -1199,7 +1197,6 @@ TEST(SqliteOperationJournalTest, CapturedScopeAndFailureAreRecorded) {
       std::nullopt,
       std::nullopt,
       JointGoalDTO{{"joint1"}, {0.25}},
-      std::nullopt,
       {},
       {}};
   auto state = PreparedMotionState(32U, 10);
@@ -1783,7 +1780,6 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsItsRequiredOwnerQualifiedT
         std::nullopt,
         std::nullopt,
         JointGoalDTO{{"joint"}, {0.2}},
-        std::nullopt,
         {},
         {}};
     if (selected) {

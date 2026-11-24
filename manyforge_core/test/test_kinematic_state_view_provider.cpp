@@ -177,7 +177,6 @@ class FakeObservedStateProvider final : public IObservedStateProvider {
       {KinematicActiveControlConfigurationExpectationDTO{
           ControlDomainId("domain-a"), ControlDomainRevision("domain-rev-a"),
           ActiveControlConfigurationId("active-a"), ActiveControlConfigurationGeneration(7U)}},
-      50,
       {source_projection("resource-1"), source_projection("resource-2")}};
 }
 
@@ -247,7 +246,6 @@ TEST(ImmutableKinematicStateViewProviderTest,
   EXPECT_DOUBLE_EQ(
       std::get<LinearPositionDTO>(result.value().model_states.front().positions[1]).value_m, 0.5);
   EXPECT_TRUE(IsExactLowercaseSha256Digest(result.value().view_digest.value()));
-  EXPECT_EQ(result.value().actual_receiver_time_skew_ns, 0);
 }
 
 TEST(ImmutableKinematicStateViewProviderTest,
@@ -356,7 +354,6 @@ TEST(ImmutableKinematicStateViewProviderTest, FixedCellPathNeedsNoRuntimeSource)
       GraphRevision("graph-a"),
       KinematicFramePathDTO{ResolvedCellFrameDTO{CellId("cell-a"), "cell"}, {}},
       {},
-      0,
       {}};
 
   const auto result = provider.current_kinematic_state_path(fixed, 0);
@@ -364,7 +361,6 @@ TEST(ImmutableKinematicStateViewProviderTest, FixedCellPathNeedsNoRuntimeSource)
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_TRUE(result.value().resource_states.empty());
   EXPECT_TRUE(result.value().model_states.empty());
-  EXPECT_FALSE(result.value().earliest_received_timestamp_ns.has_value());
   EXPECT_TRUE(IsExactLowercaseSha256Digest(result.value().view_digest.value()));
 }
 
@@ -464,7 +460,7 @@ TEST(ImmutableKinematicStateViewProviderTest,
   EXPECT_FALSE(provider.current_kinematic_state_path(selected, 1000).ok());
 }
 
-TEST(ImmutableKinematicStateViewProviderTest, EnforcesReceiverLocalSkewAcrossSelectedBindings) {
+TEST(ImmutableKinematicStateViewProviderTest, AdmitsFreshBindingsReceivedFarApart) {
   const auto first = valid_source();
   auto second = std::make_shared<FakeObservedStateProvider>();
   auto second_publication = first->publications.begin()->second;
@@ -472,8 +468,10 @@ TEST(ImmutableKinematicStateViewProviderTest, EnforcesReceiverLocalSkewAcrossSel
   second_publication.control_binding_revision = ControlBindingRevision("binding-rev-b");
   second_publication.snapshot.control_binding_id = ControlBindingId("binding-b");
   second_publication.snapshot.control_binding_revision = ControlBindingRevision("binding-rev-b");
-  second_publication.snapshot.received_timestamp_ns = 840;
-  second_publication.received_timestamp_ns = 840;
+  // Each binding is fresh on its own (budget 200 at now 1000); they were
+  // received 90 apart, and no budget applies across them (OD-377).
+  second_publication.snapshot.received_timestamp_ns = 810;
+  second_publication.received_timestamp_ns = 810;
   second->publications.emplace(
       SourceKey{ControlBindingId("binding-b"), ControlBindingRevision("binding-rev-b")},
       std::move(second_publication));
@@ -492,11 +490,11 @@ TEST(ImmutableKinematicStateViewProviderTest, EnforcesReceiverLocalSkewAcrossSel
       KinematicControlBindingSourceDTO{ControlBindingId("binding-b"),
                                        ControlBindingRevision("binding-rev-b")};
 
-  EXPECT_FALSE(provider.current_kinematic_state_path(selected, 1000).ok());
-  selected.maximum_receiver_time_skew_ns = 60;
   const auto accepted = provider.current_kinematic_state_path(selected, 1000);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  EXPECT_EQ(accepted.value().actual_receiver_time_skew_ns, 60);
+  ASSERT_EQ(accepted.value().resource_states.size(), 2U);
+  EXPECT_EQ(accepted.value().resource_states[0].publication_received_timestamp_ns, 900);
+  EXPECT_EQ(accepted.value().resource_states[1].publication_received_timestamp_ns, 810);
 }
 
 }  // namespace

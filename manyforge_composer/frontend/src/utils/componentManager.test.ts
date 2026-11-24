@@ -51,7 +51,7 @@ const device = {
 };
 
 function document(...components: JsonValue[]): Record<string, JsonValue> {
-  return { api_version: 'manyforge.deployment_intent.v2', components, attachments: [], policies: {} };
+  return { api_version: 'manyforge.deployment_intent.v3', components, attachments: [], policies: {} };
 }
 
 describe('Component Manager rows', () => {
@@ -67,6 +67,14 @@ describe('Component Manager rows', () => {
       .map((row) => [row.componentId, row.change])).toEqual([['a', 'applied'], ['b', 'applied']]);
     // Nothing applied yet: every Draft component is to be added.
     expect(componentManagerRows(document(robot), null).map((row) => row.change)).toEqual(['added']);
+  });
+
+  it('lists an owner-less I/O bank (a model-form device of its own) as an I/O device', () => {
+    const bank = {
+      component_id: 'plc_io', component_profile_id: 'manyforge.io_bank_64x64', configuration: {}, lane: 'mock',
+    };
+    expect(componentManagerRows(document(robot, bank), null).map((row) => [row.componentId, row.kind]))
+      .toEqual([['lite6_robot', 'robot'], ['plc_io', 'io_device']]);
   });
 });
 
@@ -199,7 +207,7 @@ describe('Component page facts', () => {
     configuration: { runtime_kind: 'io_provider', runtime_configuration: { io_signals: signals } },
   });
   const cell = {
-    api_version: 'manyforge.deployment_intent.v2',
+    api_version: 'manyforge.deployment_intent.v3',
     components: [
       { component_id: 'lite6_robot', component_profile_id: 'lite6_mock_commanded_v0',
         configuration: { runtime_kind: 'ros2_control', runtime_configuration: {} } },

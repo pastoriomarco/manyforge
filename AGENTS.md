@@ -201,8 +201,11 @@ scenario switching; do not automatically restart/reapply to hide a fault.
 ### Authority and safety
 
 - Runtime use does not require the private development repository.
-- Use the current generated [REST contract](docs/reference/REST_API.md) and
-  [optional MCP contract](docs/reference/MCP_RUNTIME_CONTRACT.md), and the
+- To drive ManyForge over the API, follow
+  [Use ManyForge over the API](docs/INDEX.md#use-manyforge-over-the-api-scripts-and-ai-agents):
+  the [change-request rules](docs/reference/REST_API.md#change-requests), a
+  worked example script, then the generated [REST contract](docs/reference/REST_API.md),
+  [optional MCP contract](docs/reference/MCP_RUNTIME_CONTRACT.md) and
   [architecture map](docs/reference/ARCHITECTURE.md).
 - Observe owner-issued status. A lost response is not proof that a command
   failed; do not repeat effects or infer physical rest from a receipt.
@@ -210,7 +213,6 @@ scenario switching; do not automatically restart/reapply to hide a fault.
   overwrite artifacts without authorization. Never bypass admission, Stop or recovery prerequisites.
 - [scripts/templates/AGENTS.md](scripts/templates/AGENTS.md) is a shipped
   runtime-agent template, not repository development guidance.
-  Material under `agent-skills/` is not a current tool contract.
 
 ## Code changes — mandatory development entrypoint
 

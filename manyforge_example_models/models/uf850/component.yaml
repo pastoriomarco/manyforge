@@ -1,7 +1,7 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
 # `scripts/manyforge component check manyforge_example_models/models/uf850`.
 # The arm only: a tool mounts on `flange` as its own component.
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: robot
 id: ufactory.uf850
 version: 1.0.0
@@ -55,3 +55,4 @@ lanes:
 defaults:
   initial_joint_positions_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # SRDF `home`
   maximum_tcp_linear_speed_mps: 0.15
+  controlled_stop_max_deceleration_rad_s2: 10.0  # xArm-Developer/xarm_ros2 xarm_moveit_config/config/uf850/joint_limits.yaml (humble/rolling)

@@ -66,10 +66,13 @@ CollisionPairId canonical_pair(CollisionPairId pair) {
   return pair;
 }
 
-bool support_contact_identities_are_unique(const CollisionPolicySnapshot& policy) {
+bool tracked_contact_rule_pairs_are_unique(const CollisionPolicySnapshot& policy) {
   std::vector<CollisionPairId> identities;
-  identities.reserve(policy.support_contacts.size());
-  for (const auto& entry : policy.support_contacts) {
+  identities.reserve(policy.contact_rules.size());
+  for (const auto& entry : policy.contact_rules) {
+    if (!contact_rule_is_tracked(entry)) {
+      continue;
+    }
     const auto pair = canonical_pair(entry.pair);
     if (std::find(identities.begin(), identities.end(), pair) != identities.end()) {
       return false;
@@ -120,7 +123,7 @@ CollisionValidationDecisionBundle run_serial_validation_with_pass_state(
     const CollisionValidationPassConfig& pass_config) {
   CollisionValidationCoordinator coordinator(pass_config);
   const auto& policy = pass_config.effective_policy_snapshot();
-  if (policy.support_contacts.empty()) {
+  if (tracked_contact_rule_count(policy) == 0U) {
     return coordinator.validate_trajectory(snapshot, engine, trajectory,
                                            cancel);
   }
@@ -128,7 +131,7 @@ CollisionValidationDecisionBundle run_serial_validation_with_pass_state(
   auto queried = coordinator.query_trajectory_range_unclassified(
       snapshot, engine, trajectory, 0, trajectory.waypoints.size(), cancel);
   auto summary = summarize_ordered_contact_chunk(
-      policy, queried.waypoint_records, 0, trajectory.waypoints.size());
+      policy, queried.waypoint_records, 0, trajectory.waypoints.size(), &pass_config);
   auto support_state = pass_config.entering_support_contact_state.value_or(
       initial_support_contact_state(policy));
   auto finalized = coordinator.finalize_prequeried_range(
@@ -137,12 +140,17 @@ CollisionValidationDecisionBundle run_serial_validation_with_pass_state(
   std::vector<OrderedContactChunkSummary> summaries;
   summaries.push_back(std::move(summary));
   std::string summary_error;
-  const auto release_violations = merge_contact_release_summaries(
+  auto release_violations = merge_contact_release_summaries(
       policy, summaries, trajectory.waypoints.size(), &summary_error,
       pass_config.entering_contact_release_state
           ? &*pass_config.entering_contact_release_state
           : nullptr,
       pass_config.enforce_contact_release_trajectory_end, nullptr);
+  // A grouped spring's step limit compares the whole rule across samples.
+  for (auto& violation :
+       spring_group_release_violations(policy, finalized.waypoint_records, pass_config)) {
+    release_violations.push_back(std::move(violation));
+  }
   if (summary_error.empty()) {
     (void)apply_contact_release_violations(
         policy, release_violations, finalized, &summary_error);
@@ -767,21 +775,19 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
   config_.collision_geometry_count = snapshot.geometry_count;
 
   const auto& effective_policy = pass_config.effective_policy_snapshot();
-  const bool support_contact_present =
-      !effective_policy.support_contacts.empty();
+  const std::size_t tracked_contact_count =
+      tracked_contact_rule_count(effective_policy);
+  const bool tracked_contact_present = tracked_contact_count > 0U;
   const bool contact_release_present = std::any_of(
-      effective_policy.support_contacts.begin(), effective_policy.support_contacts.end(),
-      [](const SupportContactPolicyEntry& entry) {
-        return entry.mode == CollisionContactPolicyMode::kContactRelease;
+      effective_policy.contact_rules.begin(), effective_policy.contact_rules.end(),
+      [](const CollisionPairContactRule& entry) {
+        return contact_rule_kind(entry) == ContactRuleKind::kRelease;
       });
-  const bool contact_process_present = std::any_of(
-      effective_policy.support_contacts.begin(), effective_policy.support_contacts.end(),
-      [](const SupportContactPolicyEntry& entry) {
-        return entry.mode == CollisionContactPolicyMode::kContactProcess;
+  const bool windowed_contact_present = std::any_of(
+      effective_policy.contact_rules.begin(), effective_policy.contact_rules.end(),
+      [](const CollisionPairContactRule& entry) {
+        return contact_rule_kind(entry) == ContactRuleKind::kWindowedContact;
       });
-  const bool contact_grasp_present =
-      !pass_config.contact_policy_id.empty() &&
-      !effective_policy.contact_grasps.empty();
   const int waypoint_count = static_cast<int>(trajectory.waypoints.size());
   const int worker_count_requested = config_.worker_count;
   const int worker_count_available = static_cast<int>(available_engines.size());
@@ -927,9 +933,9 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
     last_telemetry_.total_wall_ns = t1 - t0;
     last_telemetry_.total_worker_wall_ns = serial_worker_wall_ns;
     last_telemetry_.per_worker_waypoint_counts = {serial_waypoints_classified};
-    last_telemetry_.support_contact_active = support_contact_present;
+    last_telemetry_.tracked_contact_active = tracked_contact_present;
     last_telemetry_.contact_release_active = contact_release_present;
-    last_telemetry_.ordered_contact_summary_used = support_contact_present;
+    last_telemetry_.ordered_contact_summary_used = tracked_contact_present;
     last_telemetry_.collision_geometry_count = snapshot.geometry_count;
     last_telemetry_.validation_wall_time_p95_ns = 0;
     last_telemetry_.serial_reference_wall_ns.reset();
@@ -939,7 +945,7 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
     event.worker_count_requested = worker_count_requested;
     event.worker_count_available = worker_count_available;
     event.waypoint_count = waypoint_count;
-    event.support_contact_active = support_contact_present;
+    event.tracked_contact_active = tracked_contact_present;
     maybe_emit_fallback_log(event);
     return bundle;
   };
@@ -953,7 +959,7 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
     last_telemetry_.fallback_reason = "no_worker_contexts";
     last_telemetry_.workers_requested = worker_count_requested;
     last_telemetry_.workers_effective = 0;
-    last_telemetry_.support_contact_active = support_contact_present;
+    last_telemetry_.tracked_contact_active = tracked_contact_present;
     last_telemetry_.contact_release_active = contact_release_present;
     last_telemetry_.collision_geometry_count = snapshot.geometry_count;
     FallbackLogEvent event;
@@ -961,7 +967,7 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
     event.worker_count_requested = worker_count_requested;
     event.worker_count_available = 0;
     event.waypoint_count = waypoint_count;
-    event.support_contact_active = support_contact_present;
+    event.tracked_contact_active = tracked_contact_present;
     maybe_emit_fallback_log(event);
     return bundle;
   }
@@ -989,23 +995,20 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
     return run_engine_serial_fallback(available_engines[0],
                                       "trajectory_too_short");
   }
-  if (contact_process_present) {
-    return run_engine_serial_fallback(available_engines[0], "contact_process_policy_active");
-  }
-  if (support_contact_present && !config_.enable_ordered_support_contact_summaries) {
+  if (tracked_contact_present && !config_.enable_ordered_contact_summaries) {
     return run_engine_serial_fallback(available_engines[0],
-                                      "support_contact_policy_active");
+                                      "tracked_contact_rule_active");
   }
-  if (effective_policy.support_contacts.size() > kMaxOrderedSupportContactIdentities) {
+  if (tracked_contact_count > kMaxOrderedSupportContactIdentities) {
     return run_engine_serial_fallback(available_engines[0],
-                                      "support_contact_identity_bound_exceeded");
+                                      "contact_rule_pair_bound_exceeded");
   }
-  if (!support_contact_identities_are_unique(effective_policy)) {
-    return run_engine_serial_fallback(available_engines[0], "duplicate_support_contact_identity");
+  if (!tracked_contact_rule_pairs_are_unique(effective_policy)) {
+    return run_engine_serial_fallback(available_engines[0], "duplicate_contact_rule_pair");
   }
-  if (contact_grasp_present) {
+  if (windowed_contact_present) {
     return run_engine_serial_fallback(available_engines[0],
-                                      "contact_grasp_policy_active");
+                                      "windowed_contact_rule_active");
   }
 
   const int active_workers = std::min(configured_workers, waypoint_count);
@@ -1024,7 +1027,7 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
   auto trajectory_shared = std::make_shared<TrajectoryDTO>(trajectory);
   auto pass_config_shared =
       std::make_shared<CollisionValidationPassConfig>(pass_config);
-  const bool ordered_contact_path = support_contact_present;
+  const bool ordered_contact_path = tracked_contact_present;
 
   auto run_worker = [snapshot_shared, trajectory_shared, pass_config_shared, cancel,
                      ordered_contact_path](int worker_index, EngineRef engine_ref, int range_begin,
@@ -1042,7 +1045,8 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
             static_cast<std::size_t>(range_begin), static_cast<std::size_t>(range_end), *cancel);
         out.ordered_contact_summary = summarize_ordered_contact_chunk(
             pass_config_shared->effective_policy_snapshot(), out.bundle.waypoint_records,
-            static_cast<std::size_t>(range_begin), static_cast<std::size_t>(range_end));
+            static_cast<std::size_t>(range_begin), static_cast<std::size_t>(range_end),
+            pass_config_shared.get());
       } else {
         out.bundle = coord.validate_trajectory_range(
             *snapshot_shared, *engine_ref.ptr, *trajectory_shared,
@@ -1132,7 +1136,7 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
     last_telemetry_.total_wall_ns = pool_t1 - pool_t0;
     last_telemetry_.total_worker_wall_ns = 0;
     last_telemetry_.per_worker_waypoint_counts.assign(static_cast<std::size_t>(active_workers), 0);
-    last_telemetry_.support_contact_active = support_contact_present;
+    last_telemetry_.tracked_contact_active = tracked_contact_present;
     last_telemetry_.contact_release_active = contact_release_present;
     last_telemetry_.ordered_contact_summary_used = ordered_contact_path;
     last_telemetry_.collision_geometry_count = snapshot.geometry_count;
@@ -1208,12 +1212,12 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
                 } catch (const std::exception& e) {
                   out.worker_exception = true;
                   out.bundle = exception_bundle(*snapshot_shared,
-                                                "ordered_contact_policy_finalize_exception",
+                                                "ordered_contact_rule_finalize_exception",
                                                 "std_exception", e.what());
                 } catch (...) {
                   out.worker_exception = true;
                   out.bundle = exception_bundle(
-                      *snapshot_shared, "ordered_contact_policy_finalize_exception",
+                      *snapshot_shared, "ordered_contact_rule_finalize_exception",
                       reason_codes::kUnknownNonStdException, reason_codes::kUnknownNonStdException);
                 }
                 out.wall_ns += steady_now_ns() - finalize_t0;
@@ -1249,7 +1253,7 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
       last_telemetry_.workers_effective = configured_workers;
       last_telemetry_.fallback_reason = "validation_wall_timeout";
       last_telemetry_.total_wall_ns = pool_t1 - pool_t0;
-      last_telemetry_.support_contact_active = true;
+      last_telemetry_.tracked_contact_active = true;
       last_telemetry_.contact_release_active = contact_release_present;
       last_telemetry_.ordered_contact_summary_used = true;
       last_telemetry_.collision_geometry_count = snapshot.geometry_count;
@@ -1393,11 +1397,17 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
   merged.decision.collision_world_revision = snapshot.revision;
   if (ordered_contact_path && !cancelled && !ordered_worker_exception) {
     std::string summary_error;
-    const auto release_violations = merge_contact_release_summaries(
+    auto release_violations = merge_contact_release_summaries(
         effective_policy, ordered_contact_summaries, trajectory.waypoints.size(), &summary_error,
         pass_config.entering_contact_release_state ? &*pass_config.entering_contact_release_state
                                                    : nullptr,
         pass_config.enforce_contact_release_trajectory_end, nullptr);
+    // A grouped spring's step limit compares the whole rule across samples;
+    // the merged records hold the whole trajectory in order.
+    for (auto& violation :
+         spring_group_release_violations(effective_policy, merged.waypoint_records, pass_config)) {
+      release_violations.push_back(std::move(violation));
+    }
     if (summary_error.empty()) {
       (void)apply_contact_release_violations(effective_policy, release_violations, merged,
                                              &summary_error);
@@ -1470,7 +1480,7 @@ CollisionValidationDecisionBundle ParallelCollisionValidationWorkerPool::validat
   last_telemetry_.total_wall_ns = pool_t1 - pool_t0;
   last_telemetry_.total_worker_wall_ns = 0;
   last_telemetry_.per_worker_waypoint_counts.clear();
-  last_telemetry_.support_contact_active = support_contact_present;
+  last_telemetry_.tracked_contact_active = tracked_contact_present;
   last_telemetry_.contact_release_active = contact_release_present;
   last_telemetry_.ordered_contact_summary_used = ordered_contact_path;
   last_telemetry_.collision_geometry_count = snapshot.geometry_count;

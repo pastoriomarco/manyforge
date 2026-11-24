@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_core VERSION 0.3.1 LANGUAGES CXX)
+project(manyforge_core VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +36,7 @@ endif()
 # Core library
 add_library(manyforge_core
   src/addressed_observed_state_publication.cpp
+  src/cell_model_state.cpp
   src/configured_robot_measured_state.cpp
   src/component_lifecycle.cpp
   src/component_state.cpp
@@ -129,6 +130,9 @@ add_library(manyforge_core
   src/trajectory_sampler.cpp
   src/trajectory_splice.cpp
   src/collision_policy_evaluator.cpp
+  src/collision_rule.cpp
+  src/collision_rule_codec.cpp
+  src/collision_rule_resolver.cpp
   src/collision_validation_coordinator.cpp
   src/ordered_contact_validation.cpp
   src/parallel_collision_validation_worker_pool.cpp
@@ -622,6 +626,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_runtime_collision_monitor
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_cell_model_state
+    test/test_cell_model_state.cpp)
+  target_link_libraries(test_cell_model_state PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_cell_model_state
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_runtime_collision_query_session
     test/test_runtime_collision_query_session.cpp)
   target_link_libraries(test_runtime_collision_query_session PRIVATE
@@ -768,6 +779,20 @@ if(BUILD_TESTING)
   target_link_libraries(test_collision_policy_evaluator PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_collision_policy_evaluator
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_collision_rule_resolver
+    test/test_collision_rule_resolver.cpp)
+  target_link_libraries(test_collision_rule_resolver PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_collision_rule_resolver
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_collision_rule_wire_codec
+    test/test_collision_rule_wire_codec.cpp)
+  target_link_libraries(test_collision_rule_wire_codec PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_collision_rule_wire_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_collision_validation_coordinator

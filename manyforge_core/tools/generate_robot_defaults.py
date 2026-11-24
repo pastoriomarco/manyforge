@@ -4,14 +4,16 @@
 The one source is `manyforge_core/resources/robot_defaults.tsv` (`table`,
 `field`, JSON `value`, C++ constant): the effective value of a robot's (or,
 table `component`, any lifecycle component's) Deployment field when the
-Deployment leaves it out. The outputs are
+Deployment leaves it out. Table `cell` holds values of the cell as a whole:
+`collision_clearance_m` is the clearance of the first row of a new
+Deployment's `collision_rules`. The outputs are
 generated, checked in and kept fresh by `scripts/regen.py --check`; nothing
 reads the TSV at runtime.
 
 - C++: `manyforge::core::k<Default...>` constants (a string value is the
   enum's name; its header turns it into the enumerator).
 - Python: the backend's `ROBOT_RUNTIME_DEFAULTS`, `ROBOT_OPTIONAL_DEFAULTS`,
-  `REAL_ROBOT_OPTIONAL_DEFAULTS` and `COMPONENT_DEFAULTS`
+  `REAL_ROBOT_OPTIONAL_DEFAULTS`, `COMPONENT_DEFAULTS` and `CELL_DEFAULTS`
   (`GET /api/deployment/effective`).
 
 A field whose ros2_control runtime closed schema declares a materialized
@@ -41,6 +43,7 @@ TABLES = {
     "robot_optional": "ROBOT_OPTIONAL_DEFAULTS",
     "real_robot_optional": "REAL_ROBOT_OPTIONAL_DEFAULTS",
     "component": "COMPONENT_DEFAULTS",
+    "cell": "CELL_DEFAULTS",
 }
 _FIELD = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*")
 _CONSTANT = re.compile(r"kDefault[A-Z][A-Za-z0-9]*")

@@ -1,6 +1,7 @@
 import type {
   PreparedActivationInput,
   PreparedActivationOrigin,
+  PreparedSceneMesh,
   ManagerActiveProjection,
   ManagerApplyAvailability,
   ManagerApplyFailure,
@@ -560,7 +561,6 @@ export function parseManagerDeploymentCandidatePreviewResponse(
     [
       'candidate_graph_revision',
       'candidate_retained_bundle_id',
-      'deployment_artifact_id',
       'deployment_revision',
       'expected_admission_generation',
       'destructive_impact',
@@ -627,7 +627,6 @@ export function parseManagerDeploymentCandidatePreviewResponse(
     apiVersion,
     candidateReceipt: {
       schema_version: schemaVersion,
-      deployment_artifact_id: stringAt(receipt.deployment_artifact_id, 'candidateReceipt.deployment_artifact_id'),
       deployment_revision: digestAt(receipt.deployment_revision, 'candidateReceipt.deployment_revision'),
       prepared_activation_id: digestAt(receipt.prepared_activation_id, 'candidateReceipt.prepared_activation_id'),
       candidate_retained_bundle_id: stringAt(receipt.candidate_retained_bundle_id, 'candidateReceipt.candidate_retained_bundle_id'),
@@ -694,9 +693,9 @@ export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus 
   const path = 'appliedProgramStatus';
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'deployment_artifact_id', 'deployment_revision', 'executable',
+    'deployment_revision', 'executable',
     'graph_revision', 'message', 'non_executable', 'program',
-    'program_binding_id', 'program_id', 'program_revision', 'record_digest',
+    'program_binding_id', 'program_revision', 'record_digest',
     'retained_bundle_id', 'origin', 'schema_version',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
@@ -705,10 +704,10 @@ export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus 
   }
   const origin = parsePreparedActivationOrigin(record.origin, `${path}.origin`);
   const executable = booleanAt(record.executable, `${path}.executable`);
-  const noProgram = record.program_id === null;
+  const noProgram = record.program_revision === null;
   if ((noProgram && (schemaVersion !== 'manyforge.applied_program_status.v2'
       || executable || record.non_executable !== null
-      || record.program_revision !== null || record.program !== null))
+      || record.program !== null))
     || (!noProgram && executable !== (record.non_executable === null))
     || executable !== (record.program_binding_id !== null)) {
     return fail(path, 'a binding exactly when executable, named references otherwise');
@@ -720,16 +719,11 @@ export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus 
       `${path}.non_executable`,
     );
   return {
-    deploymentArtifactId: stringAt(
-      record.deployment_artifact_id,
-      `${path}.deployment_artifact_id`,
-    ),
     deploymentRevision: digestAt(
       record.deployment_revision,
       `${path}.deployment_revision`,
     ),
     executable,
-    programId: noProgram ? null : stringAt(record.program_id, `${path}.program_id`),
     programRevision: noProgram ? null : digestAt(record.program_revision, `${path}.program_revision`),
     origin,
     message: nullableStringAt(record.message, `${path}.message`),
@@ -747,8 +741,8 @@ function parseManagerDeploymentImpact(
   exactKeysAt(
     record,
     [
-      'attachment_changed_components', 'component_delta_digest', 'components',
-      'destructive', 'detached_components', 'program',
+      'attachment_changed_components', 'collision_rules', 'component_delta_digest', 'components',
+      'destructive', 'detached_components', 'mesh_depth_reports', 'program',
       'shared_scene_projection_changed',
     ],
     path,
@@ -780,15 +774,15 @@ function parseManagerDeploymentImpact(
   const program = objectAt(record.program, `${path}.program`);
   exactKeysAt(
     program,
-    ['executable', 'non_executable', 'program_id', 'program_revision'],
+    ['executable', 'non_executable', 'program_revision'],
     `${path}.program`,
   );
   const executable = booleanAt(program.executable, `${path}.program.executable`);
   let unresolvedReferences: ProgramUnresolvedReference[] = [];
   let affectedNodes: string[] = [];
   let affectedExecutionGroups: string[] = [];
-  const noProgram = program.program_id === null;
-  if ((noProgram && (executable || program.non_executable !== null || program.program_revision !== null))
+  const noProgram = program.program_revision === null;
+  if ((noProgram && (executable || program.non_executable !== null))
     || (!noProgram && executable !== (program.non_executable === null))) {
     return fail(`${path}.program.non_executable`, 'present exactly for a non-executable Program');
   }
@@ -812,7 +806,6 @@ function parseManagerDeploymentImpact(
     componentDeltaDigest: digestAt(record.component_delta_digest, `${path}.component_delta_digest`),
     program: {
       executable,
-      programId: noProgram ? null : stringAt(program.program_id, `${path}.program.program_id`),
       programRevision: noProgram ? null : digestAt(program.program_revision, `${path}.program.program_revision`),
       unresolvedReferences,
       affectedNodes,
@@ -1002,7 +995,7 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
     'managerApplyStatus.prepared_activation',
   );
   exactKeysAt(activation, [
-    'captured_input_digest', 'deployment_artifact_id', 'deployment_revision',
+    'captured_input_digest', 'deployment_revision',
     'program_binding_id', 'prepared_activation_id',
   ], 'managerApplyStatus.prepared_activation');
   const state = stringAt(record.state, 'managerApplyStatus.state');
@@ -1168,10 +1161,6 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
         activation.captured_input_digest,
         'managerApplyStatus.prepared_activation.captured_input_digest',
       ),
-      deploymentArtifactId: stringAt(
-        activation.deployment_artifact_id,
-        'managerApplyStatus.prepared_activation.deployment_artifact_id',
-      ),
       deploymentRevision: digestAt(
         activation.deployment_revision,
         'managerApplyStatus.prepared_activation.deployment_revision',
@@ -1209,26 +1198,27 @@ export function parsePreparedActivationInput(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'schema_version', 'prepared_activation_id', 'origin',
-    'captured_input_digest', 'deployment_artifact_id',
+    'captured_input_digest',
     'deployment_revision', 'retained_bundle_id', 'graph_revision',
-    'program_id', 'program_revision', 'program_outcome',
-    'node_environment_digest', 'assistant_mode',
+    'program_revision', 'program_outcome',
+    'node_environment_digest', 'assistant_mode', 'scene_meshes',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.prepared_activation_input.v7') {
+  if (schemaVersion !== 'manyforge.prepared_activation_input.v8') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.prepared_activation_input.v7',
+      'manyforge.prepared_activation_input.v8',
     );
   }
+  const sceneMeshes = parsePreparedSceneMeshes(record.scene_meshes, `${path}.scene_meshes`);
   const outcome = objectAt(record.program_outcome, `${path}.program_outcome`);
   const origin = parsePreparedActivationOrigin(record.origin, `${path}.origin`);
   const outcomeKind = stringAt(outcome.kind, `${path}.program_outcome.kind`);
   let programBindingId: string | null;
   if (outcomeKind === 'no_program') {
     exactKeysAt(outcome, ['kind'], `${path}.program_outcome`);
-    if (record.program_id !== null || record.program_revision !== null
-      || record.assistant_mode !== 'optional') {
+    if (record.program_revision !== null
+      || record.assistant_mode !== 'optional' || sceneMeshes.length > 0) {
       return fail(path, 'no_program with no Program identities');
     }
     programBindingId = null;
@@ -1252,10 +1242,6 @@ export function parsePreparedActivationInput(
     origin,
     capturedInputDigest: digestAt(record.captured_input_digest,
       `${path}.captured_input_digest`),
-    deploymentArtifactId: stringAt(
-      record.deployment_artifact_id,
-      `${path}.deployment_artifact_id`,
-    ),
     deploymentRevision: digestAt(
       record.deployment_revision,
       `${path}.deployment_revision`,
@@ -1265,7 +1251,6 @@ export function parsePreparedActivationInput(
       `${path}.retained_bundle_id`,
     ),
     graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
-    programId: outcomeKind === 'no_program' ? null : stringAt(record.program_id, `${path}.program_id`),
     programRevision: outcomeKind === 'no_program' ? null : digestAt(
       record.program_revision,
       `${path}.program_revision`,
@@ -1280,5 +1265,35 @@ export function parsePreparedActivationInput(
       }
       return mode;
     })(),
+    sceneMeshes,
   };
+}
+
+/** Code-point order, as the native side sorts the UTF-8 URIs. */
+function codePointLess(left: string, right: string): boolean {
+  const a = Array.from(left, (character) => character.codePointAt(0) as number);
+  const b = Array.from(right, (character) => character.codePointAt(0) as number);
+  for (let index = 0; index < Math.min(a.length, b.length); index += 1) {
+    if (a[index] !== b[index]) return a[index] < b[index];
+  }
+  return a.length < b.length;
+}
+
+/** The captured Program scene meshes: sorted by URI, unique (OD-335). */
+function parsePreparedSceneMeshes(value: unknown, path: string): PreparedSceneMesh[] {
+  const rows = boundedArrayAt(value, path, 4096).map((raw, index) => {
+    const row = objectAt(raw, `${path}[${index}]`);
+    exactKeysAt(row, ['byte_size', 'content_digest', 'resource_uri'], `${path}[${index}]`);
+    return {
+      byteSize: positiveIntegerAt(row.byte_size, `${path}[${index}].byte_size`),
+      contentDigest: digestAt(row.content_digest, `${path}[${index}].content_digest`),
+      resourceUri: nonEmptyStringAt(row.resource_uri, `${path}[${index}].resource_uri`),
+    };
+  });
+  rows.forEach((row, index) => {
+    if (index > 0 && !codePointLess(rows[index - 1].resourceUri, row.resourceUri)) {
+      fail(`${path}[${index}].resource_uri`, 'sorted unique scene mesh URIs');
+    }
+  });
+  return rows;
 }

@@ -9,6 +9,7 @@
 #include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
+#include <manyforge_core/types/collision_rule.hpp>
 #include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <functional>
@@ -43,6 +44,16 @@ struct GeometricContactInputBinding final {
       body_static_wrt_group;
   /// A model coordinate has no position authority, e.g. a pneumatic tool.
   bool model_coordinate_unavailable{};
+  /// Two selections (OD-356) in place of the TCP contact bodies against
+  /// `target_scene_resource_id`; both empty for that form. As authored: a
+  /// collision body (OD-371) is resolved against the prepared world.
+  std::vector<core::CollisionRuleSelectionDTO> contact_a{};
+  std::vector<core::CollisionRuleSelectionDTO> contact_b{};
+  /// True only while a pair penetrates deeper than this; absent: any contact.
+  std::optional<double> trip_depth_m{};
+  /// Hysteresis (OD-360): once true, false again only when no pair
+  /// penetrates deeper than this; absent: `trip_depth_m`. Below it.
+  std::optional<double> release_depth_m{};
 };
 
 struct GeometricContactInputBaseline final {

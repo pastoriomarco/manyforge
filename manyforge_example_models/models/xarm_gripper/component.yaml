@@ -1,7 +1,7 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
 # `scripts/manyforge component check manyforge_example_models/models/xarm_gripper`.
 # Mounts on a robot's `flange` interface as its own component.
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: tool
 id: ufactory.xarm_gripper
 version: 1.0.0
@@ -23,7 +23,7 @@ gripper:
   actuation: position_commanded
   states: {open: open, closed: closed}
   attach_frame: link_tcp
-  touch_links: [left_finger, left_inner_knuckle, left_outer_knuckle, right_finger, right_inner_knuckle, right_outer_knuckle, xarm_gripper_base_link]
+  grip_body: gripper_collision      # the collision body made of the gripper's own links
 lanes:
   mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
     adapter: mock

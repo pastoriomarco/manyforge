@@ -295,7 +295,9 @@ void register_model_compiler_bindings(py::module_& module) {
       .value("kChainJoint",
              deployment::SrdfExpansionProvenanceKind::kChainJoint)
       .value("kSubgroup",
-             deployment::SrdfExpansionProvenanceKind::kSubgroup);
+             deployment::SrdfExpansionProvenanceKind::kSubgroup)
+      .value("kJointChildLink",
+             deployment::SrdfExpansionProvenanceKind::kJointChildLink);
 
   py::enum_<deployment::OccurrenceSymbolKind>(module,
                                                "OccurrenceSymbolKind")

@@ -29,8 +29,11 @@ import uuid
 MARKER_SCHEMA = "manyforge.workbench_session.v2"
 SELECTION_SCHEMA = "manyforge.workbench_session_selection.v2"
 # v2: the archive is previous-runs/<id>; unfinished operations are listed
-# (contract 1.7 "Session report", 1.14; BS 4.4).
-REPORT_SCHEMA = "manyforge.workbench_previous_session.v2"
+# (contract 1.7 "Session report", 1.14; BS 4.4). v3: three journal families;
+# the Scene is held in memory and leaves no journal. Headless still files a
+# pending v2 report (four families, "scene" among them) as recorded.
+REPORT_SCHEMA = "manyforge.workbench_previous_session.v3"
+JOURNAL_FAMILIES = ("program_cycle", "manager", "kernel_operation")
 MAXIMUM_REPORTED_OPERATIONS = 64
 _TERMINAL_OPERATION_STATES = (
     "completed", "stopped", "failed", "interrupted", "intervention_required", "cancelled_pre_dispatch",
@@ -198,7 +201,6 @@ _RECORDS_LOST_TABLES = {
     "manager/manager-bootstrap-journal.sqlite3": "bootstrap_journal_metadata",
     "manager/manager-apply-journal.sqlite3": "apply_journal_metadata",
     "manager/active-bundle-publication.sqlite3": "publication_store_metadata",
-    "logical-scene.sqlite3": "logical_scene_store_metadata",
     "execution-state/operation-journal.sqlite3": "journal_metadata",
 }
 _INCOMPLETE_REASON = " (some records of that start could not be written)"
@@ -240,13 +242,6 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str], list[
             "SELECT 1 FROM manager_apply_terminal_outcomes WHERE outcome_state='unknown_effect' OR effect_disposition='unknown' LIMIT 1",
         ], ["manager_apply_intents"]),
         ("manager", "manager/active-bundle-publication.sqlite3", 1296449872, [], ["active_bundle_publication_receipts"]),
-        ("scene", "logical-scene.sqlite3", 1296454467, [
-            "SELECT 1 FROM logical_scene_transaction_intents i LEFT JOIN logical_scene_request_outcomes t USING(transaction_sequence) WHERE t.transaction_sequence IS NULL LIMIT 1",
-            "SELECT 1 FROM logical_scene_request_outcomes WHERE projection_status='failed_projection_uncertain' LIMIT 1",
-            "SELECT 1 FROM logical_scene_maintenance_initialization_intents i LEFT JOIN logical_scene_maintenance_initialization_results r USING(initialization_sequence) WHERE r.initialization_sequence IS NULL LIMIT 1",
-            "SELECT 1 FROM logical_scene_maintenance_initialization_results r LEFT JOIN logical_scene_maintenance_initialization_completions c USING(initialization_sequence) WHERE r.effects_unknown=1 OR r.state='interrupted' OR (r.state='initialized' AND c.initialization_sequence IS NULL) LIMIT 1",
-            "SELECT 1 FROM logical_scene_initial_baseline_requests i LEFT JOIN logical_scene_initial_baseline_results r USING(initialization_sequence) WHERE r.initialization_sequence IS NULL OR r.state='interrupted' LIMIT 1",
-        ], ["canonical_empty_scene_acceptance", "logical_scene_transaction_intents", "logical_scene_maintenance_initialization_intents", "logical_scene_initial_baseline_requests"]),
     ]
     for family, relative, application, queries, opaque in sources:
         path = folder / relative
@@ -347,7 +342,7 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
     source = _safe_path(root / "previous-runs" / identity, root)
     if not source.exists():
         source = root / "current"
-    effects, unknown, unresolved, incomplete = _effect_observations(source) if marker is not None else ("unknown", ["program_cycle", "scene", "manager", "kernel_operation"], [], [])
+    effects, unknown, unresolved, incomplete = _effect_observations(source) if marker is not None else ("unknown", list(JOURNAL_FAMILIES), [], [])
     operations = _unfinished_operations(root, source) if marker is not None else None
     message = (f"Previous ManyForge session {identity}: effects are {effects}"
                + ("; shutdown was unclean or could not be verified." if shutdown != "clean" else "; owned processes stopped normally.")
@@ -368,7 +363,7 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
         "shutdown": shutdown,
         "effects": effects,
         "history_coverage": "not_imported",
-        "journal_families": ["program_cycle", "scene", "manager", "kernel_operation"],
+        "journal_families": list(JOURNAL_FAMILIES),
         "message": (message + " Up to five previous runs (2 GiB in total) are normally kept; "
                     "copy any journals you want to retain."),
         # Unknown (null) when the run's Kernel journal could not be read.

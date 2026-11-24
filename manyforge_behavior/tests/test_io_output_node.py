@@ -60,7 +60,6 @@ def _context(*, tree: Mapping[str, Any] | None = None):
         applied_record_digest=_D,
         scenario_id="io_scenario",
         source_document_digest=_A,
-        program_id="io_program",
         program_revision=_A,
         program_binding_id=_A,
         retained_bundle_id=_B,
@@ -68,7 +67,6 @@ def _context(*, tree: Mapping[str, Any] | None = None):
         node_environment_digest=_D,
         program_binding={
             "program_binding_id": _A,
-            "program_id": "io_program",
             "program_revision": _A,
             "retained_bundle_id": _B,
             "graph_revision": _C,
@@ -80,7 +78,7 @@ def _context(*, tree: Mapping[str, Any] | None = None):
         },
         program=(
             {} if tree is None
-            else {"program_id": "io_program", "program_revision": _A, "tree": tree}
+            else {"program_revision": _A, "tree": tree}
         ),
     )
 

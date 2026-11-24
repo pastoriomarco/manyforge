@@ -123,7 +123,7 @@ describe('Program workspace request fencing', () => {
     }, {
       type: 'request_started',
       generation: 4,
-      action: 'save',
+      action: 'save_scenario_document',
     });
     const failed = programWorkspaceReducer(ready, {
       type: 'request_failed',

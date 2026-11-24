@@ -102,7 +102,6 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
             "schema_version": "manyforge.program_run_capture.v3",
             "program_run_id": 1,
             "scenario_id": "pick",
-            "program_id": "program.pick",
             "node_policies": [],
             "node_policy_digest": "sha256:" + hashlib.sha256(b"[]").hexdigest(),
             "owner_identities": [
@@ -2213,6 +2212,51 @@ def test_group_stop_and_resume_are_critical_without_a_cycle_revision_change() ->
         _program_event_class(
             cycle("active"), {**cycle("active"), "execution_control_revision": 4}
         )
+        == "critical"
+    )
+
+
+def test_operator_questions_and_program_stop_attribution_are_critical() -> None:
+    """OD-342: a question asked or answered, and a Program node's Stop
+    attribution on a group, are operator-facing."""
+
+    def cycle(*, questions=(), stopped_by_node=None) -> dict[str, Any]:
+        return {
+            "execution_control_revision": 3,
+            "node_status_revision": 1,
+            "runtime_controls": {
+                "operator_questions": [
+                    {"offer_id": offer_id, "offer_revision": revision}
+                    for offer_id, revision in questions
+                ],
+                "execution_selections": {
+                    "groups": [
+                        {
+                            "group_id": "arm",
+                            "state": "held",
+                            "stopped_by": None if stopped_by_node is None else "program",
+                            "stopped_by_node_instance_id": stopped_by_node,
+                        }
+                    ]
+                },
+            },
+        }
+
+    asked = (("sha256:" + "a" * 64, 1),)
+    assert _program_event_class(cycle(), cycle(questions=asked)) == "critical"
+    assert _program_event_class(cycle(questions=asked), cycle()) == "critical"
+    assert (
+        _program_event_class(
+            cycle(questions=asked), cycle(questions=(("sha256:" + "a" * 64, 2),))
+        )
+        == "critical"
+    )
+    assert (
+        _program_event_class(cycle(questions=asked), cycle(questions=asked))
+        == "node_progress"
+    )
+    assert (
+        _program_event_class(cycle(), cycle(stopped_by_node="ask_bin_full"))
         == "critical"
     )
 

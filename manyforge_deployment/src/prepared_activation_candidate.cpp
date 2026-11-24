@@ -26,6 +26,7 @@ build_prepared_activation_candidate(
   const auto component_profiles =
       resolve_activation_component_profiles(capability_root, deployment_intent);
   expand_activation_machine_members(deployment_intent, component_profiles);
+  expand_generated_tool_wiring(deployment_intent, component_profiles);
   auto prepared_sources = parse_activation_prepared_model_closure(prepared_model_closure);
   std::vector<ActivationPreparedModel> prepared_models;
   try {

@@ -50,10 +50,6 @@ public:
   [[nodiscard]] const core::CellId &cell_id() const noexcept {
     return cell_id_;
   }
-  [[nodiscard]] const core::DeploymentArtifactId &
-  deployment_artifact_id() const noexcept {
-    return deployment_artifact_id_;
-  }
   [[nodiscard]] const core::DeploymentRevision &
   deployment_revision() const noexcept {
     return deployment_revision_;
@@ -86,7 +82,6 @@ public:
 private:
   CanonicalEmptyRetainedBundleAdmission(
       core::ContentDigest admission_digest, core::CellId cell_id,
-      core::DeploymentArtifactId deployment_artifact_id,
       core::DeploymentRevision deployment_revision,
       core::GraphRevision graph_revision,
       core::RetainedBundleId retained_bundle_id,
@@ -97,7 +92,6 @@ private:
       std::string canonical_bytes)
       : admission_digest_(std::move(admission_digest)),
         cell_id_(std::move(cell_id)),
-        deployment_artifact_id_(std::move(deployment_artifact_id)),
         deployment_revision_(std::move(deployment_revision)),
         graph_revision_(std::move(graph_revision)),
         retained_bundle_id_(std::move(retained_bundle_id)),
@@ -114,7 +108,6 @@ private:
 
   core::ContentDigest admission_digest_;
   core::CellId cell_id_;
-  core::DeploymentArtifactId deployment_artifact_id_;
   core::DeploymentRevision deployment_revision_;
   core::GraphRevision graph_revision_;
   core::RetainedBundleId retained_bundle_id_;

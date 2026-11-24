@@ -53,7 +53,6 @@ public:
 /// bounded prepared activation; the caller never authors that internal identity.
 struct ManagerNamedApplyRequestDTO final {
   manyforge::core::PublicRequestContextDTO request_context;
-  manyforge::core::DeploymentArtifactId deployment_artifact_id;
   manyforge::core::DeploymentRevision deployment_revision;
   manyforge::core::RetainedBundleId expected_current_retained_bundle_id;
   manyforge::core::GraphRevision expected_current_graph_revision;

@@ -428,7 +428,7 @@ class ExecuteHeadless(AdmissionHeadless):
         self.started.append("program_run_start")
         return {"accepted": True}
 
-    def submit_control_command(self, body):
+    def submit_control_command(self, body, *, received_monotonic_ns=None):
         self.started.append(body["command_envelope"]["command_kind"])
         return {"accepted": True}
 

@@ -1,12 +1,11 @@
-/* GENERATED FILE -- program_binding_transport.v3.json; DO NOT EDIT. */
+/* GENERATED FILE -- program_binding_transport.v4.json; DO NOT EDIT. */
 
-export type CatalogRecordKind = 'model_asset' | 'runtime_profile' | 'component_type' | 'control_interface_contract' | 'controller_topology' | 'provider_manifest' | 'command_schema' | 'capability_definition' | 'contact_policy' | 'stop_evidence_policy';
+export type CatalogRecordKind = 'model_asset' | 'runtime_profile' | 'component_type' | 'control_interface_contract' | 'controller_topology' | 'provider_manifest' | 'command_schema' | 'capability_definition' | 'stop_evidence_policy';
 export type ProgramOperatorStopPolicy = 'inherit' | 'hold' | 'continue';
 export type ProgramInterventionStopScope = 'all' | 'own_groups';
 export interface ProgramBindingDocument {
-  api_version: 'manyforge.program_binding.v3';
+  api_version: 'manyforge.program_binding.v4';
   program_binding_id: string;
-  program_id: string;
   program_revision: string;
   retained_bundle_id: string;
   graph_revision: string;
@@ -17,8 +16,9 @@ export interface ProgramBindingDocument {
   collision_body_bindings: ProgramCollisionBodyBinding[];
   signal_bindings: ProgramSignalBinding[];
   node_policies: ProgramNodePolicy[];
-  contact_grasp_bindings: ProgramContactGraspBinding[];
+  collision_rule_bodies: ProgramCollisionRuleBodyBinding[];
   provenance: ProgramBindingProvenance;
+  collision_rule_spring_sliders?: ProgramCollisionRuleSpringSliderBinding[];
 }
 export interface ProgramBindingNodeEnvironment {
   catalog_id: string;
@@ -106,21 +106,18 @@ export interface ProgramCommandSchemaRef {
   command_schema_id: string;
   command_schema_revision: string;
 }
-export interface ProgramContactGraspEnvelopeBinding {
-  contact_policy_id: string;
-  contact_policy_revision: string;
-  runtime_object_id: string;
-  allowed_body_bindings: ProgramContactGraspBodyBinding[];
-  max_penetration_m: number;
-  terminal_window_start_fraction: number;
-  bodies_from_motion_endpoint?: true;
-}
-export interface ProgramContactGraspBodyBinding {
+export interface ProgramCollisionRuleBodyBinding {
   body: ProgramBodyReference;
   model_role_id: string | null;
   model_instance_id: string;
   model_revision: string;
   collision_body_ids: string[];
+}
+export interface ProgramCollisionRuleSpringSliderBinding {
+  body: ProgramBodyReference;
+  axis: [number, number, number];
+  stroke_m: number;
+  max_compression_step_m: number;
 }
 export interface ProgramBindingProvenance {
   binding_compiler_contract_digest: string;
@@ -154,22 +151,6 @@ export interface ProgramPneumaticInputBinding {
   input: 'open' | 'closed' | 'pressure' | 'workpiece_grasped';
   signal: ProgramSignalReference;
 }
-export interface ProgramContactReleaseBinding {
-  contact_policy_id: string;
-  contact_policy_revision: string;
-  runtime_object_id: string;
-  allowed_body_bindings: ProgramContactGraspBodyBinding[];
-  mode: 'contact_release';
-  release_evidence_mode: 'signed_penetration' | 'binary_contact';
-  enforce_max_start_penetration: boolean;
-  max_start_penetration_m: number;
-  min_release_progress_m: number;
-  release_tolerance_m: number;
-  require_strictly_decreasing_penetration: boolean;
-  require_separation_by_end: boolean;
-  allow_recontact: boolean;
-  bodies_from_motion_endpoint?: true;
-}
 export interface ProgramTargetReference {
   component_id: string;
   command_target_id: string;
@@ -190,4 +171,3 @@ export interface ProgramFrameAssociation {
   frame: ProgramFrameReference;
   contact_body_role_ids: string[];
 }
-export type ProgramContactGraspBinding = ProgramContactGraspEnvelopeBinding | ProgramContactReleaseBinding;

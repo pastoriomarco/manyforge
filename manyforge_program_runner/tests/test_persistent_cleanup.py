@@ -293,7 +293,7 @@ def _with_scene(document: dict[str, Any], *resource_ids: str) -> dict[str, Any]:
         changed,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return changed
 

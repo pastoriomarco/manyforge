@@ -27,11 +27,9 @@ const check: ProgramTreeNode = {
 
 function program(keys: BlackboardKeyDeclaration[]): ProgramAuthoringDocument {
   return {
-    api_version: 'manyforge.program.v3',
-    program_id: 'outcomes',
+    api_version: 'manyforge.program.v4',
     program_profile: 'composable-cell-v1',
-    name: 'Outcomes',
-    catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+    catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
     blackboard: { namespaces: [{ namespace_id: 'cell', owner: 'program' }], keys },
     schema_version: 'manyforge.composer_authoring_forest.v2',
     forest: [{ node_id: 'sequence', instance_id: 'main', parameters: {}, children: [move, check] }],
@@ -68,8 +66,18 @@ describe('blackboard key namespaces', () => {
 
   it('adds each plain motion node outcome key as a read-only run key', () => {
     const keys = programBlackboardKeys(program([key('cell.part'), key('total')]));
-    expect(keys.map((row) => row.key)).toEqual(['cell.part', 'node_outcome.approach', 'total']);
+    expect(keys.map((row) => row.key))
+      .toEqual(['cell.part', 'motion_group_state.all', 'node_outcome.approach', 'total']);
+    expect(keys[2]).toMatchObject({ type: 'string', access: 'read', persistence: 'run' });
+  });
+
+  it('adds the read-only state key of all and of every named motion group', () => {
+    const draft = program([key('total')]);
+    draft.forest = [{ ...draft.forest[0]!, children: [{ ...move, execution_groups: ['arm'] }, check] }];
+    const keys = programBlackboardKeys(draft).filter((row) => isSystemKey(row.key) && row.key.startsWith('motion_group_state.'));
+    expect(keys.map((row) => row.key)).toEqual(['motion_group_state.all', 'motion_group_state.arm']);
     expect(keys[1]).toMatchObject({ type: 'string', access: 'read', persistence: 'run' });
+    expect(keys[1]!.description).toContain('ready | running | stopping | held | mixed | faulted | unavailable');
   });
 
   it('offers outcome keys to readers only, grouped by namespace', () => {
@@ -79,6 +87,7 @@ describe('blackboard key namespaces', () => {
       .map((choice) => [choice.group, choice.value])).toEqual([
       ['No namespace', 'total'],
       ['cell', 'cell.part'],
+      ['Motion group states', 'motion_group_state.all'],
       ['Node outcomes', 'node_outcome.approach'],
     ]);
     expect(programSemanticChoices(schema, check, setEntry, 'key', draft)
@@ -92,6 +101,7 @@ describe('blackboard key namespaces', () => {
       .map((choice) => [choice.group, choice.value])).toEqual([
       ['No namespace', 'total'],
       ['Interrupt states', 'interrupt_state.light_curtain'],
+      ['Motion group states', 'motion_group_state.all'],
       ['Node outcomes', 'node_outcome.approach'],
     ]);
     // Writes stay refused: a writer is never offered the key.
@@ -173,12 +183,15 @@ describe('blackboard key namespaces', () => {
     expect(markup).toContain('<summary>cell (1)</summary>');
     expect(markup).not.toMatch(/<details[^>]*open/);
     expect(markup).toMatch(/<button[^>]*disabled=""[^>]*title="System-owned[^"]*"[^>]*><span><strong>node_outcome\.approach/);
+    expect(markup).toContain('<summary>Motion group states (1)</summary>');
+    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*title="System-owned[^"]*"[^>]*><span><strong>motion_group_state\.all/);
   });
 });
 
 describe('reserved system names', () => {
   it('refuses the system namespaces as user key, namespace or parameter names', () => {
-    for (const name of ['node_outcome', 'interrupt_state', 'node_outcome.pick', ' interrupt_state.guard']) {
+    for (const name of ['node_outcome', 'interrupt_state', 'motion_group_state', 'node_outcome.pick',
+      ' interrupt_state.guard', 'motion_group_state.arm']) {
       expect(reservedNameProblem(name, 'A parameter ID')).toContain('reserved for the system-owned');
     }
     expect(reservedNameProblem('cell.node_outcome', 'A blackboard key')).toBeNull();

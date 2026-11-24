@@ -53,8 +53,9 @@ inline constexpr double kMaximumSafeInteger = 9'007'199'254'740'991.0;
 inline constexpr std::size_t kRandomTokenBytes = 16U;
 inline constexpr int kManagedPackageRootFd = 6;
 inline constexpr int kManagedProgramArtifactRootFd = 8;
-// Optional Manager-opened scene-asset root; never a retained package root.
-inline constexpr int kManagedSceneAssetRootFd = 9;
+// Optional Manager-opened scene content (activation) root; never a retained
+// package root.
+inline constexpr int kManagedSceneContentRootFd = 9;
 inline constexpr int kSocketBacklog = 16;
 // The host tick: subordinate reconciliation and the component-state refresh.
 inline constexpr int kReconcilePeriodMilliseconds = 5;
@@ -85,9 +86,10 @@ struct ManagedRuntimeChildConfig final {
   int manager_liveness_channel_fd{-1};
   int package_root_fd{-1};
   int program_artifact_root_fd{-1};
-  /// Approved scene-asset root for relative scene meshes; absent when the
-  /// Manager has none configured (relative scene meshes then fail closed).
-  std::optional<int> scene_asset_root_fd;
+  /// Scene content (activation) root: Program scene meshes are read from its
+  /// raw-artifact store by digest; absent when the Manager has no activation
+  /// root configured (scene meshes then fail closed).
+  std::optional<int> scene_content_root_fd;
   /// Generic machine site facts (`manyforge.site.v2`); absent when the
   /// Manager has no site settings file configured.
   std::optional<component_manager::SiteSettings> site_settings;

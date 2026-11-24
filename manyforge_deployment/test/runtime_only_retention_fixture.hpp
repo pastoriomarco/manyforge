@@ -181,11 +181,9 @@ class RuntimeOnlyCompilerInputArtifactSource final
     catalogs = runtime_only_catalogs(profile);
   }
   return "{\"api_version\":\"manyforge.deployment.v1\","
-         "\"deployment_artifact_id\":\"runtime_only_deployment\","
          "\"deployment_revision\":\"" +
          std::string(kRuntimeOnlyZeroDigest) + "\",\"cell_id\":\"" + std::string(cell_id) +
          "\","
-         "\"name\":\"Runtime-only retention fixture\","
          "\"catalogs\":" + std::move(catalogs) +
          ",\"graph\":" + std::move(graph) +
          ",\"desired_control_configurations\":[],"

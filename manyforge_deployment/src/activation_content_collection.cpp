@@ -223,12 +223,16 @@ void remove_unreferenced(const std::filesystem::path &root,
 
 ActivationContentCollection collect_unreferenced_activation_content(
     const std::filesystem::path &activation_root,
-    const ActiveActivationContent &active, ActivationContentReferences &known) {
+    const std::function<ActiveActivationContent()> &active_content,
+    ActivationContentReferences &known) {
   ActivationContentCollection result;
   const Flock writers(activation_root / std::string(kWriterLockFilename),
                       LOCK_EX | LOCK_NB);
   if (!writers.held())
     return result;
+  // Read what is live only now: a writer that stored content and made it
+  // live (a scene commit) before releasing its hold is seen here.
+  const auto active = active_content();
   result.collected = true;
   const auto read_live = [&](const std::filesystem::path &path) {
     auto bytes = read_file(path);
@@ -276,6 +280,12 @@ ActivationContentCollection collect_unreferenced_activation_content(
       add_tokens(read_live(path), tokens);
   }
   roots.insert(tokens.begin(), tokens.end());
+  // Scene meshes are live by name; they reference nothing, so they are
+  // never read for references.
+  Names scene_meshes;
+  for (const auto &digest : active.scene_mesh_digests)
+    add_digest(digest.value(), scene_meshes);
+  tokens.insert(scene_meshes.begin(), scene_meshes.end());
 
   // Live bundles, Programs and bindings come from the roots only (a bundle
   // naming another bundle never keeps it); their documents and every live
@@ -299,7 +309,9 @@ ActivationContentCollection collect_unreferenced_activation_content(
     for (const auto &hex : raw)
       if (!live_raw.contains(hex) && tokens.contains(hex)) {
         live_raw.insert(hex);
-        add_live_tokens(entry_path(activation_root, kRawArtifacts, hex), tokens);
+        if (!scene_meshes.contains(hex))
+          add_live_tokens(entry_path(activation_root, kRawArtifacts, hex),
+                          tokens);
         changed = true;
       }
     for (const auto &[hex, key_tokens] : catalog) {

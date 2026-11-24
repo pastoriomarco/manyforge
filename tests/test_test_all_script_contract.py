@@ -344,7 +344,8 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         ("colcon", 'printf "ros-overlay-build\\n" >> "$FAKE_LOG"\n'
                    'while [ "$1" != "--install-base" ]; do shift; done\n'
                    'mkdir -p "$2"\n'
-                   'printf \'printf "ros-overlay-source\\n" >> "$FAKE_LOG"\\n\' > "$2/setup.bash"\n'),
+                   'printf \'printf "ros-overlay-source\\n" >> "$FAKE_LOG"\\n\' > "$2/setup.bash"\n'
+                   'printf \'printf "ros-overlay-local-source\\n" >> "$FAKE_LOG"\\n\' > "$2/local_setup.bash"\n'),
     ):
         (fake_bin / name).write_text("#!/bin/sh\nset -eu\n" + body)
         (fake_bin / name).chmod(0o755)
@@ -412,8 +413,16 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
     assert completed.returncode == 0, completed.stdout + completed.stderr
     events = marker.read_text(encoding="utf-8").splitlines()
     assert events.index("producer-configure") < events.index("producer-build")
-    assert events.index("producer-build") < events.index("ros-overlay-build")
-    assert events.index("ros-overlay-build") < events.index("ros-overlay-source")
+    # The I/O bank messages first (the producer links them), then the overlay.
+    overlay_builds = [index for index, event in enumerate(events) if event == "ros-overlay-build"]
+    assert len(overlay_builds) == 2
+    assert overlay_builds[0] < events.index("producer-configure")
+    # The producer is configured in the overlay's environment: its tests and
+    # the host they start find the I/O bank message libraries.
+    assert overlay_builds[0] < events.index("ros-overlay-local-source")
+    assert events.index("ros-overlay-local-source") < events.index("producer-configure")
+    assert events.index("producer-build") < overlay_builds[1]
+    assert overlay_builds[1] < events.index("ros-overlay-source")
     assert events.index("ros-overlay-source") < events.index("headless-configure")
     assert events.index("producer-build") < events.index("headless-configure")
     assert events.index("headless-configure") < events.index("headless-build")

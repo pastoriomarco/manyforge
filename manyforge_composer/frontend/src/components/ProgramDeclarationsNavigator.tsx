@@ -8,7 +8,7 @@ import type {
   ProgramTreeNode,
 } from '../types/api';
 import {
-  groupByNamespace, INTERRUPT_STATE_NAMESPACE, keyNamespace, NODE_OUTCOME_NAMESPACE,
+  groupByNamespace, INTERRUPT_STATE_NAMESPACE, isSystemKey, keyNamespace, NODE_OUTCOME_NAMESPACE,
 } from '../utils/blackboardNamespaces';
 import {
   collectBlackboardUsages,
@@ -67,7 +67,8 @@ export function ProgramDeclarationsNavigator({
     [formulaReferences],
   );
 
-  // Declared keys plus the system-owned node outcome and interrupt state keys.
+  // Declared keys plus the system-owned node outcome, interrupt state and
+  // motion group state keys.
   const readableKeys = useMemo(
     () => programBlackboardKeys({ blackboard: { namespaces: [], keys }, forest: roots }, globalRuleIds),
     [globalRuleIds, keys, roots],
@@ -77,9 +78,10 @@ export function ProgramDeclarationsNavigator({
     const usages = (blackboardUsages[key.key]?.length ?? 0)
       + (formulaUsages.keys[key.key]?.length ?? 0);
     const namespace = keyNamespace(key.key);
-    if (namespace === NODE_OUTCOME_NAMESPACE || namespace === INTERRUPT_STATE_NAMESPACE) {
-      const owner = namespace === NODE_OUTCOME_NAMESPACE
-        ? 'written only by its motion node' : 'published only by its Deployment global rule';
+    if (isSystemKey(key.key)) {
+      const owner = namespace === NODE_OUTCOME_NAMESPACE ? 'written only by its motion node'
+        : namespace === INTERRUPT_STATE_NAMESPACE ? 'published only by its Deployment global rule'
+          : 'written only by the Program runner from the group\'s run controls';
       return (
         <button
           key={key.key}

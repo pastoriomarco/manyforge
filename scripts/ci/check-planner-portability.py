@@ -70,7 +70,7 @@ REQUIRED_EVIDENCE = {
     "start_incompatibility_forces_planning",
     "goal_incompatibility_forces_planning",
     "model_binding_participates_in_cache_identity",
-    "contact_policy_participates_in_cache_identity",
+    "collision_rules_participate_in_cache_identity",
     "cache_identity_mismatch_forces_planning",
     "planner_candidate_cannot_bypass_non_collision_validation",
     "planner_candidate_cannot_bypass_collision_authority",

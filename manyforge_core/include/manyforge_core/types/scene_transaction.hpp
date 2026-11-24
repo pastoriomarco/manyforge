@@ -46,10 +46,6 @@ struct AddObjectRequestDTO final {
   CollisionShapeDTO shape;
   Pose3DTO pose;
   SceneTransactionFrameRefDTO frame_ref;
-  /// Backend-neutral object-to-object support declarations. The scene owner
-  /// resolves these portable resource ids to instance-scoped collision bodies;
-  /// callers never author planner-native body names here.
-  std::vector<SupportContactDTO> support_contacts{};
   /// Object mass (kg, finite, >= 0); copied into the snapshot row.
   double mass_kg{0.0};
 
@@ -59,13 +55,12 @@ struct AddObjectRequestDTO final {
 
 /// Public request to create or completely replace one portable scene
 /// resource. Unlike UpdateObjectPoseRequestDTO, this operation replaces the
-/// authored shape and support declarations and clears provider evidence.
+/// authored shape and clears provider evidence.
 struct UpsertObjectRequestDTO final {
   SceneResourceId scene_resource_id;
   CollisionShapeDTO shape;
   Pose3DTO pose;
   SceneTransactionFrameRefDTO frame_ref;
-  std::vector<SupportContactDTO> support_contacts{};
   double mass_kg{0.0};
 };
 
@@ -96,6 +91,9 @@ struct AttachCarriedObjectRequestDTO final {
   /// The attach node's `on_grasp_lost`; absent means the defaults. A
   /// non-default response needs a bound and is never encoded equal to them.
   std::optional<GraspLostResponseDTO> on_grasp_lost{};
+  /// OD-372: the component that owns `frame_role_id` and the touch bodies,
+  /// mounted on the target's robot; absent means the target's own component.
+  std::optional<ControllableComponentId> carrier_component_id{};
 };
 
 struct DetachCarriedObjectRequestDTO final {
@@ -185,7 +183,7 @@ struct ResolvedDetachCarriedObjectDTO final {
 struct ResolvedCollisionPolicyDTO final {
   /// The exact caller-configured policy retained in logical scene truth.
   CollisionPolicySnapshot configured_policy;
-  /// The projection-ready policy after owner-derived touch/support allowances.
+  /// The projection-ready policy after owner-derived touch allowances.
   CollisionPolicySnapshot effective_policy;
 
   friend bool operator==(const ResolvedCollisionPolicyDTO&,

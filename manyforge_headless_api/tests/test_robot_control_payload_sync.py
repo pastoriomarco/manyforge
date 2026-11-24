@@ -106,17 +106,6 @@ def test_direct_motion_reaches_native_submit_without_bridge(native_ok):
     assert response.code == ("operation_start_received" if native_ok else "component_not_ready")
 
 
-def test_other_program_id_motion_reaches_native_submit():
-    calls = []
-    payload = _payload(_direct_motion_request())
-    payload["program_id"] = "ordinary.program"
-    client = _client(lambda _command: pytest.fail("unexpected execution bridge request"),
-                     calls, {"ok": True, "accepted": {}})
-    response, _ = _dispatch(_Service(client), payload)
-    assert response.disposition == "received"
-    assert calls == ["submit"]
-
-
 def test_gripper_does_not_sync():
     calls = []
     client = _client(lambda _command: pytest.fail("unexpected payload sync"),
@@ -126,7 +115,7 @@ def test_gripper_does_not_sync():
     assert calls == ["submit"]
 
 
-def test_set_tcp_does_not_sync_even_with_direct_motion_program_id():
+def test_set_tcp_does_not_sync():
     from manyforge_headless_api.models import OperationIntentRequest
     from manyforge_headless_api.tests.test_models import _planning_operation
 
@@ -135,7 +124,6 @@ def test_set_tcp_does_not_sync_even_with_direct_motion_program_id():
         "tcp": {"kind": "default_of_target",
                 "target": {"component_id": "robot", "command_target_id": "arm"}},
     })
-    body["program_id"] = "manyforge.direct_control.motion"
     calls = []
     client = _client(lambda _command: pytest.fail("unexpected payload sync"),
                      calls, {"ok": True, "accepted": {}})

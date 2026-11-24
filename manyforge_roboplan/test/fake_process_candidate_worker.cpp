@@ -226,6 +226,27 @@ int run() {
       input.model.native_scene_name.starts_with(kCrashOncePrefix);
   const bool count_generations =
       input.model.native_scene_name.starts_with(kCountGenerationsPrefix);
+  // One line per worker start: the content digest of each scene mesh shape
+  // it was initialized with, as carried on the wire.
+  constexpr std::string_view kRecordMeshStartsPrefix = "record-mesh-starts:";
+  const bool record_mesh_starts =
+      input.model.native_scene_name.starts_with(kRecordMeshStartsPrefix);
+  if (record_mesh_starts) {
+    std::string line;
+    for (const auto &geometry : input.model.geometries)
+      if (const auto *mesh = std::get_if<core::MeshShapeDTO>(&geometry.shape))
+        line += mesh->content_digest + " ";
+    line += "\n";
+    const std::string path(
+        input.model.native_scene_name.substr(kRecordMeshStartsPrefix.size()));
+    const int log = ::open(path.c_str(),
+                           O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (log < 0 || ::write(log, line.data(), line.size()) !=
+                       static_cast<ssize_t>(line.size()) ||
+        ::close(log) != 0) {
+      fail("fake worker could not record its start");
+    }
+  }
   const std::filesystem::path generation_counter(
       count_generations
           ? input.model.native_scene_name.substr(kCountGenerationsPrefix.size())
@@ -265,6 +286,9 @@ int run() {
     first_generation_marker = configured_marker;
   } else if (count_generations) {
     first_generation_marker = generation_counter;
+  } else if (record_mesh_starts) {
+    first_generation_marker =
+        input.model.native_scene_name.substr(kRecordMeshStartsPrefix.size());
   } else if (crash_once) {
     first_generation_marker =
         input.model.native_scene_name.substr(kCrashOncePrefix.size());

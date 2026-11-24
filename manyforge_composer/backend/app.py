@@ -32,6 +32,7 @@ from .routes_catalog import create_catalog_router
 from .routes_composer_settings import create_composer_settings_router
 from .routes_draft import create_draft_router
 from .routes_deployment_draft import create_deployment_draft_router
+from .routes_tool_parameters import create_tool_parameters_router
 from .routes_filesystem import create_filesystem_router
 from .routes_nodes import create_nodes_router
 from .routes_scenario_documents import create_scenario_document_router
@@ -298,16 +299,6 @@ def create_app(
 
     security = security or SecurityConfig()
     state.allowed_fs_roots = list(security.allowed_fs_roots)
-    state.allowed_program_write_roots = (
-        None
-        if security.allowed_program_write_roots is None
-        else list(security.allowed_program_write_roots)
-    )
-    state.allowed_deployment_write_roots = (
-        None
-        if security.allowed_deployment_write_roots is None
-        else list(security.allowed_deployment_write_roots)
-    )
 
     execution_controls = ExecutionControlClient(
         thread_name_prefix="manyforge_composer_control",
@@ -358,7 +349,6 @@ def create_app(
         "/api/program/discard",
         "/api/program/revert",
         "/api/program/runs",
-        "/api/program/save",
         "/api/program/validate",
         "/api/scenario-documents/",
     ):
@@ -600,6 +590,10 @@ def create_app(
     app.include_router(
         create_deployment_draft_router(state),
         tags=["composer-deployment-draft"],
+    )
+    app.include_router(
+        create_tool_parameters_router(state),
+        tags=["composer-tool-parameters"],
     )
     app.include_router(
         create_scenario_document_router(state),

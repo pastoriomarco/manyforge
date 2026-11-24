@@ -90,7 +90,7 @@ const limit = {
 function compiledDocument(parameters: Record<string, JsonValue>): Record<string, JsonValue> {
   return {
     api_version: 'manyforge.deployment.v1',
-    deployment_artifact_id: 'cell-a', deployment_revision: digest, cell_id: 'cell-a', name: 'Cell A',
+    deployment_revision: digest, cell_id: 'cell-a',
     graph: {
       control_bindings: [{ control_binding_id: 'arm_binding', control_binding_revision: digest,
         controllable_component_id: 'robot', command_target_id: 'arm',
@@ -112,8 +112,7 @@ function compiledDocument(parameters: Record<string, JsonValue>): Record<string,
 
 function intentDocument(stop: Record<string, JsonValue>): Record<string, JsonValue> {
   return {
-    api_version: 'manyforge.deployment_intent.v2',
-    deployment_artifact_id: 'cell-a', name: 'Cell A',
+    api_version: 'manyforge.deployment_intent.v3',
     components: [{
       component_id: 'robot', target_settings: { arm: { controlled_stop: {
         stop_mode: 'soft_on_path', allow_natural_completion_on_short_path: true,
@@ -140,7 +139,7 @@ function controller(document: Record<string, JsonValue>): DeploymentWorkspaceCon
       },
       draft: {
         id: 'deployment-draft-1', revision: 1, document,
-        deploymentArtifactId: 'cell-a', deploymentRevision: digest, graphRevision: digest,
+        deploymentRevision: digest, graphRevision: digest,
         differsFromSaved: false,
       },
       saved: { path: '/workspace/cell-a.deployment.yaml', deploymentRevision: digest, differsFromApplied: null },
@@ -159,8 +158,8 @@ function controller(document: Record<string, JsonValue>): DeploymentWorkspaceCon
     mutationAvailable: true, mutationUnavailableReason: null,
     documentUnavailableReason: null,
     refresh: vi.fn(), clearFeedback: vi.fn(), dismissError: vi.fn(), open: vi.fn(), mutate: vi.fn(),
-    updateControlledStop: vi.fn(), updateMotionTargetLimit: vi.fn(), revert: vi.fn(), save: vi.fn(),
-    saveAs: vi.fn(), discard: vi.fn(), applyDraft: vi.fn(), applyConfirmedScope: vi.fn(), confirmApply: vi.fn(async () => null),
+    updateControlledStop: vi.fn(), updateMotionTargetLimit: vi.fn(), revert: vi.fn(),
+    discard: vi.fn(), applyDraft: vi.fn(), applyConfirmedScope: vi.fn(), confirmApply: vi.fn(async () => null),
     cancelApplyConfirmation: vi.fn(),
   } as unknown as DeploymentWorkspaceController;
 }

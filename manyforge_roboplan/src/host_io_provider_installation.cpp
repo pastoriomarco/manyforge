@@ -42,9 +42,9 @@ std::vector<Composition *> views(Composition &root) {
     require(part != nullptr, "I/O component view is absent");
     result.push_back(part.get());
   }
-  std::set<core::ControllableComponentId> components;
+  std::set<std::pair<core::ControllableComponentId, std::string>> owners;
   for (const auto *view : result)
-    require(components.insert(view->controllable_component_id).second,
+    require(owners.insert(view->owner_key()).second,
             "I/O component view is repeated");
   return result;
 }
@@ -84,7 +84,9 @@ GeometricContactInputBinding geometric_contact_binding(
     Composition &root,
     const deployment::RetainedIoSignalConfiguration &row,
     const std::shared_ptr<core::IScheduler> &scheduler) {
-  require(row.provider.robot_component_id && row.provider.target_scene_resource_id,
+  require(row.provider.robot_component_id &&
+              (row.provider.target_scene_resource_id ||
+               (!row.provider.contact_a.empty() && !row.provider.contact_b.empty())),
           "geometric contact selector is incomplete");
   const auto &robot = *row.provider.robot_component_id;
   Composition *view = nullptr;
@@ -141,14 +143,15 @@ GeometricContactInputBinding geometric_contact_binding(
           core::IoSourceIncarnation("installation-owned"),
           std::vector<core::IoSignalDescriptorDTO>{},
           std::move(read_contact_bodies),
-          *row.provider.target_scene_resource_id,
+          row.provider.target_scene_resource_id.value_or(core::SceneResourceId(std::string{})),
           std::move(observed_states), std::move(publisher), engine,
           scheduler, view->runtime->collision_monitor_period_ns,
           view->runtime->runtime_collision_immediate_query_budget_ns,
           [engine](const core::CollisionWorldSnapshot &world,
                    const core::CollisionBodyId &body) {
             return engine->IsBodyStaticWrtGroup(world, body);
-          }, unavailable_coordinate};
+          }, unavailable_coordinate, row.provider.contact_a, row.provider.contact_b,
+          row.provider.trip_depth_m, row.provider.release_depth_m};
 }
 bool same_aliases(const std::vector<IoOutputAliasIdentity> &left,
                   const std::vector<IoOutputAliasIdentity> &right) {
@@ -603,8 +606,14 @@ core::Result<void> PrepareCompositionIoProviderResources(
           else
             require(source.rows.front().provider.robot_component_id ==
                             row.provider.robot_component_id &&
-                        source.geometric_contact->target_scene_resource_id ==
-                            *row.provider.target_scene_resource_id,
+                        source.rows.front().provider.target_scene_resource_id ==
+                            row.provider.target_scene_resource_id &&
+                        source.rows.front().provider.contact_a == row.provider.contact_a &&
+                        source.rows.front().provider.contact_b == row.provider.contact_b &&
+                        source.rows.front().provider.trip_depth_m ==
+                            row.provider.trip_depth_m &&
+                        source.rows.front().provider.release_depth_m ==
+                            row.provider.release_depth_m,
                     "geometric contact source changes its selector");
           source.geometric_contact->signals.push_back(row.descriptor);
         }

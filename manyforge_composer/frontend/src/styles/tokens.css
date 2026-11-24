@@ -362,4 +362,7 @@
   /* Distance of commands overlaid on a surface (tree editor, 3D viewer)
      from its edges: one value so every surface looks the same. */
   --mf-surface-overlay-inset: 0.45rem;
+  /* How much of their own fill the panels over the 3D viewer keep: the scene
+     stays visible behind them (maintainer, 2026-11-24). */
+  --mf-viewer-overlay-fill: 72%;
 }

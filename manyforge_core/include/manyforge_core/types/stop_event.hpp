@@ -119,6 +119,9 @@ enum class StopKind : std::uint8_t {
   kPreparedDispatchInvalid,
   kPlannedStop,
   kStopFailedHalt,
+  /// OD-379: a component entered `fault` while motion executed; every
+  /// moving robot stops with its fault Stop profile (Kernel-internal).
+  kComponentFault,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(StopKind value) noexcept {
@@ -161,6 +164,8 @@ enum class StopKind : std::uint8_t {
       return "planned_stop";
     case StopKind::kStopFailedHalt:
       return "stop_failed_halt";
+    case StopKind::kComponentFault:
+      return "component_fault";
   }
   return {};
 }

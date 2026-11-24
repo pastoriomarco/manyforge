@@ -451,27 +451,33 @@ void RuntimeCollisionLookaheadSession::detach() {
 
 RuntimeCollisionLookaheadSession::PreparedArm RuntimeCollisionLookaheadSession::prepare_arm(
     std::uint64_t execution_id, std::uint64_t execution_generation,
-    std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id) {
+    std::shared_ptr<const TrajectoryDTO> trajectory,
+    std::vector<BoundCellModelStateSource> live_sources) {
   if (execution_id == 0 || !trajectory || trajectory->waypoints.empty()) {
     throw std::invalid_argument("runtime collision lookahead arm invalid");
   }
-  return PreparedArm{execution_id,
-                     execution_generation,
-                     std::move(trajectory),
-                     std::move(contact_policy_id),
-                     "lookahead_rearmed",
-                     "lookahead_rearmed"};
+  return PreparedArm{
+      execution_id,
+      execution_generation,
+      std::move(trajectory),
+      "lookahead_rearmed",
+      "lookahead_rearmed",
+      live_sources.empty()
+          ? nullptr
+          : std::make_shared<const std::vector<BoundCellModelStateSource>>(
+                std::move(live_sources))};
 }
 
 void RuntimeCollisionLookaheadSession::arm(
     std::uint64_t execution_id, std::uint64_t execution_generation,
-    std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id) {
+    std::shared_ptr<const TrajectoryDTO> trajectory,
+    std::vector<BoundCellModelStateSource> live_sources) {
   if (closing_.load(std::memory_order_acquire))
     throw std::logic_error("runtime collision lookahead is detached");
   if (execution_generation == 0)
     throw std::invalid_argument("runtime collision lookahead arm invalid");
   publish_prepared_arm(prepare_arm(execution_id, execution_generation, std::move(trajectory),
-                                   std::move(contact_policy_id)));
+                                   std::move(live_sources)));
 }
 
 void RuntimeCollisionLookaheadSession::publish_prepared_arm(PreparedArm prepared) noexcept {
@@ -490,7 +496,7 @@ void RuntimeCollisionLookaheadSession::publish_prepared_arm(PreparedArm prepared
                   prepared.execution_generation,
                   next_arm_generation_++,
                   std::move(prepared.trajectory),
-                  std::move(prepared.contact_policy_id)};
+                  std::move(prepared.live_sources)};
   pending_job_.reset();
   indexed_arm_generation_ = 0;
   // A stop/reset revocation can invalidate the permit generation without
@@ -623,7 +629,7 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
                  !progress_generation_is_terminal(job.arm.execution_generation);
       if (admitted) {
         job.arm.trajectory = arm_.trajectory;
-        job.arm.contact_policy_id = arm_.contact_policy_id;
+        job.arm.live_sources = arm_.live_sources;
         job.cancel = std::move(cancel);
         active_cancel_.store(job.cancel, std::memory_order_release);
         job_active_ = true;
@@ -913,6 +919,20 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     result.reason = "no_future_samples";
     return finish(std::move(result));
   }
+  // The other components of the cell, where they are now, in every sample.
+  // One whose state is stale or absent ends the cycle with that component's
+  // stream condition, which stops the move as its own lost observation does.
+  if (job.arm.live_sources) {
+    if (const auto unavailable = overlay_cell_model_state(*job.arm.live_sources, clock_->now(),
+                                                          selection.trajectory)) {
+      result.reason = std::string(unavailable.verdict == PeerStateVerdict::kStale
+                                      ? kComponentStreamStaleCode
+                                      : kComponentStreamAbsentCode);
+      result.checked_input_details["peer_component_id"] =
+          unavailable.source->component_id.value();
+      return finish(std::move(result));
+    }
+  }
 
   // Publish a changed immutable scene revision once before worker fan-out. The
   // ManyForge collision contexts share this prepared-scene cache but retain
@@ -942,14 +962,39 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
   pass.require_pose_source_borrow = false;
   pass.per_state_timeout_ns = config_.query_budget_ns;
   pass.surface = CollisionSurface::kObservedRuntimeLookahead;
-  pass.contact_policy_id = job.arm.contact_policy_id;
-  if (!job.arm.contact_policy_id.empty() && !policy_bundle->policy->contact_grasps.empty()) {
+  // A contact rule with an end window is checked against the sample's
+  // position in the whole accepted trajectory, not in this prefix.
+  if (std::any_of(policy_bundle->policy->contact_rules.begin(),
+                  policy_bundle->policy->contact_rules.end(),
+                  [](const CollisionPairContactRule& rule) {
+                    return contact_rule_kind(rule) == ContactRuleKind::kWindowedContact;
+                  })) {
     pass.original_trajectory_sample_fractions = selection.original_trajectory_sample_fractions;
   }
+  // A spring rule's step limit scales with the samples' spacing on the
+  // accepted trajectory, whose waypoints are at most kSpringSampleTravelM of
+  // tool travel apart (pre-dispatch validation densified it). The first
+  // sample's predecessor is unknown.
+  if (std::any_of(policy_bundle->policy->contact_rules.begin(),
+                  policy_bundle->policy->contact_rules.end(),
+                  [](const CollisionPairContactRule& rule) {
+                    return rule.contact() != nullptr &&
+                           rule.contact()->max_compression_step_m.has_value();
+                  })) {
+    const auto denominator = static_cast<double>(
+        std::max<std::size_t>(job.arm.trajectory->waypoints.size(), 2U) - 1U);
+    const auto& fractions = selection.original_trajectory_sample_fractions;
+    std::vector<double> steps(fractions.size(), 0.0);
+    for (std::size_t index = 1; index < fractions.size(); ++index) {
+      steps[index] = std::max(
+          1.0, std::ceil((fractions[index] - fractions[index - 1U]) * denominator - 1e-9));
+    }
+    pass.sample_path_steps = std::move(steps);
+  }
   pass.enforce_contact_release_trajectory_end = selection.reaches_trajectory_end;
-  if (!policy_bundle->policy->support_contacts.empty()) {
-    if (!job.contact_state.valid ||
-        job.contact_state.count != policy_bundle->policy->support_contacts.size()) {
+  if (const auto tracked_count = tracked_contact_rule_count(*policy_bundle->policy);
+      tracked_count > 0U) {
+    if (!job.contact_state.valid || job.contact_state.count != tracked_count) {
       result.reason = "runtime_contact_state_unavailable";
       return finish(std::move(result));
     }
@@ -963,10 +1008,10 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
       }
       auto support = entry.support_state;
       auto release = entry.release_state;
-      const auto policy = policy_bundle->policy_index->support_contact_index.find(*entry.pair);
+      const auto policy = policy_bundle->policy_index->contact_rule_index.find(*entry.pair);
       if (release.initialized && release.started_in_contact &&
-          policy != policy_bundle->policy_index->support_contact_index.end() &&
-          policy->second.mode == CollisionContactPolicyMode::kContactRelease) {
+          policy != policy_bundle->policy_index->contact_rule_index.end() &&
+          policy->second.release() != nullptr) {
         // LKA-1: the cursor (controller feedback) can trail the monitor's
         // latest observation, so the first planned sample may lie before it
         // in trajectory order. Keep only the motion-start facts; the first
@@ -1009,7 +1054,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
         ++entering_contact_pair_count;
       }
     }
-    if (auto violation = contact_policy_violation_details(
+    if (auto violation = contact_rule_violation_details(
             decision, *policy_bundle->policy, "preempt_trajectory", entering_contact_pair_count)) {
       violation->emplace("surface", "observed_runtime_lookahead");
       for (auto& [key, value] : *violation) {

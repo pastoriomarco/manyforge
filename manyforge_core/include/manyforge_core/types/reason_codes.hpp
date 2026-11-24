@@ -7,25 +7,16 @@ namespace manyforge::core::reason_codes {
 
 inline constexpr char kPreviewFailed[] = "preview_failed";
 
-inline constexpr char kRuntimeContactGraspUnknownPolicy[] =
-    "runtime_contact_grasp_unknown_policy";
-inline constexpr char kRuntimeContactGraspInvalidPolicy[] =
-    "runtime_contact_grasp_invalid_policy";
 inline constexpr char kMissingGraspContactClearance[] =
     "missing_grasp_contact_clearance";
-inline constexpr char kGraspContactPenetrationExceeded[] =
-    "grasp_contact_penetration_exceeded";
-inline constexpr char kUnknownContactPolicyId[] = "unknown_contact_policy_id";
-inline constexpr char kInvalidContactGraspPolicy[] =
-    "invalid_contact_grasp_policy";
-inline constexpr char kInvalidContactGraspSampleFractions[] =
-    "invalid_contact_grasp_sample_fractions";
+inline constexpr char kContactPenetrationExceeded[] =
+    "contact_penetration_exceeded";
+inline constexpr char kContactCompressionStepExceeded[] =
+    "contact_compression_step_exceeded";
 inline constexpr char kMissingSignedClearance[] = "missing_signed_clearance";
 inline constexpr char kInitialSampleInContact[] = "initial_sample_in_contact";
 inline constexpr char kContactBeforeTerminalWindow[] =
     "contact_before_terminal_window";
-inline constexpr char kPenetrationExceedsPolicy[] =
-    "penetration_exceeds_policy";
 
 inline constexpr char kCollisionValidationSerialFallbackException[] =
     "collision_validation_serial_fallback_exception";

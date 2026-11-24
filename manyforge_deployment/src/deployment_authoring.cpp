@@ -93,7 +93,6 @@ std::vector<QualifiedRuntimeProfile> SelectedBuildProfiles(const CanonicalValue&
 CompiledDeploymentDraft Result(const RevisionVerifiedDeploymentArtifact& deployment) {
   return CompiledDeploymentDraft{
       .canonical_json = canonical_json(deployment.normalized_authored_root()),
-      .deployment_artifact_id = deployment.deployment_artifact_id().value(),
       .deployment_revision = deployment.deployment_revision().value(),
       .graph_revision = deployment.graph().graph().graph_revision.value(),
   };

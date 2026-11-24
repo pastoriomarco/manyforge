@@ -949,7 +949,11 @@ def prepare_captured_model_source(
     independently joins that mapping back to the original captured resource.
     """
 
-    if set(component_source) != {"component_id", "entrypoints", "resources"}:
+    # `generated_component` (what a Tool's parameters declare)
+    # is no XML: native activation reads it from the captured closure.
+    if set(component_source) - {"generated_component"} != {
+        "component_id", "entrypoints", "resources"
+    }:
         raise StructuralModelPreparationError(
             "captured component source has an invalid shape"
         )

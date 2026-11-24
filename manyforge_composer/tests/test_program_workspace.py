@@ -16,7 +16,6 @@ from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.executable_node_resolver import build_executable_node_resolver
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
-from manyforge_composer.backend import program_artifacts
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.draft_session import DraftSessionError
 from manyforge_composer.backend.execution_observation_stream import (
@@ -25,7 +24,6 @@ from manyforge_composer.backend.execution_observation_stream import (
 from manyforge_composer.backend.program_artifacts import (
     ProgramArtifactError,
     load_program_artifact,
-    save_program_artifact,
 )
 from manyforge_composer.backend import routes_draft
 from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
@@ -36,7 +34,7 @@ from manyforge_composer.backend.deployment_draft import (
     DeploymentDraftSession,
 )
 from manyforge_composer.backend.routes_draft import _observed_scene_arguments
-from manyforge_composer.backend.security import SecurityConfig, UNTITLED_SCENARIO_PATH
+from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessClientError
 
@@ -58,7 +56,7 @@ def test_program_artifact_preserves_unsupported_format_details(tmp_path: Path) -
     assert response.value.detail["code"] == "program_format_unsupported"
     assert response.value.detail["context"] == {
         "actual_api_version": "manyforge.program.v2",
-        "supported_api_version": "manyforge.program.v3",
+        "supported_api_version": "manyforge.program.v4",
     }
 
 
@@ -82,14 +80,14 @@ def test_non_executable_outcome_uses_exact_direct_target() -> None:
     digest = "sha256:" + "a" * 64
     outcome = {
         "api_version": "manyforge.program-binding-outcome.v2",
-        "program_id": "program", "program_revision": digest,
+        "program_revision": digest,
         "retained_bundle_id": digest, "graph_revision": digest,
         "unresolved_targets": [{"target": {"component_id": "robot",
                                             "command_target_id": "arm"},
                                 "reason": "capability_unavailable", "detail": "missing"}],
         "affected_nodes": [], "affected_execution_groups": [],
     }
-    publication = {"program_id": "program", "program_revision": digest,
+    publication = {"program_revision": digest,
                    "retained_bundle_id": digest, "graph_revision": digest,
                    "program_outcome": {"kind": "non_executable", "outcome": outcome}}
     assert ComposerState._program_outcome_identity(publication)[0] == "non_executable"
@@ -216,14 +214,12 @@ def _client(
     tmp_path: Path,
     *,
     allowed_fs_roots: list[str] | None = None,
-    allowed_program_write_roots: list[str] | None = None,
 ) -> TestClient:
     return TestClient(
         create_app(
             _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1)),
             security=SecurityConfig(
                 allowed_fs_roots=allowed_fs_roots or [str(tmp_path)],
-                allowed_program_write_roots=allowed_program_write_roots,
                 cors_origins=["http://localhost:3000"],
             ),
         )
@@ -1010,7 +1006,6 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
                                 "dimensions_m": {"x": 0.5, "y": 0.6, "z": 0.7},
                             }],
                             "provider_evidence": None,
-                            "support_contacts": [],
                         }],
                     },
                 }
@@ -1023,7 +1018,7 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     state = ComposerState(application_start_id=0x3F9A0000000000A1, program=Program.from_dict(document, catalog))
     state.headless_client = Headless()  # type: ignore[assignment]
@@ -1054,7 +1049,6 @@ def _carried_scene() -> dict:
             },
             "collision_shapes": [{"type": "box", "dimensions_m": {"x": 0.1, "y": 0.1, "z": 0.1}}],
             "provider_evidence": None,
-            "support_contacts": [],
         }]},
     }}}
 
@@ -1149,7 +1143,7 @@ def _assert_program_workspace_contract(workspace: dict) -> None:
     assert identity["programDraftRevision"] == workspace["draft"]["draftRevision"]
 
 
-def test_open_mutate_save_and_save_as_preserve_exact_workspace_facts(
+def test_open_and_mutate_preserve_exact_workspace_facts(
     tmp_path: Path,
 ) -> None:
     source = _copy_program(tmp_path)
@@ -1184,29 +1178,7 @@ def test_open_mutate_save_and_save_as_preserve_exact_workspace_facts(
     mutated = mutated_response.json()["workspace"]
     assert mutated["hasUnsavedChanges"] is True
     assert mutated["saved"]["matchesDraft"] is False
-
-    saved_response = client.post("/api/program/save", json=_fence(mutated))
-    assert saved_response.status_code == 200
-    saved = saved_response.json()
-    _assert_program_workspace_contract(saved)
-    assert saved["saved"]["matchesDraft"] is True
-    assert Program(source, build_node_environment().catalog).to_dict()["tree"][
-        "children"
-    ][0]["parameters"]["planning_timeout_s"] == 3.0
-
-    save_as_response = client.post(
-        "/api/program/save-as",
-        json={
-            **_fence(saved),
-            "path": str(tmp_path / "copy"),
-            "confirmOverwrite": False,
-        },
-    )
-    assert save_as_response.status_code == 200
-    save_as = save_as_response.json()
-    expected_copy = tmp_path / "copy.program.yaml"
-    assert save_as["saved"]["path"] == str(expected_copy.resolve())
-    assert expected_copy.is_file()
+    _assert_program_workspace_contract(mutated)
 
 
 def test_node_policy_mutation_is_closed_draft_only_and_revision_fenced(
@@ -1282,11 +1254,8 @@ def test_program_settings_mutation_is_validated_and_draft_only(
             **_fence(opened),
             "mutation": "program_draft_update_settings",
             "arguments": {
-                "name": "Portable pick",
-                "description": "Edited only in the Composer Draft.",
                 "program_profile": "composable-cell-v1",
                 "compatibility": {
-                    "lanes": ["manyforge-only", "real-robot"],
                     "assistant": "optional",
                     "requires": ["scene.mutable"],
                     "tags": ["pick"],
@@ -1298,10 +1267,8 @@ def test_program_settings_mutation_is_validated_and_draft_only(
 
     assert response.status_code == 200, response.text
     workspace = response.json()["workspace"]
-    assert workspace["draft"]["program"]["name"] == "Portable pick"
-    assert workspace["draft"]["program"]["compatibility"]["lanes"] == [
-        "manyforge-only",
-        "real-robot",
+    assert workspace["draft"]["program"]["compatibility"]["requires"] == [
+        "scene.mutable",
     ]
     assert workspace["hasUnsavedChanges"] is True
     assert source.read_bytes() == original_bytes
@@ -1363,302 +1330,6 @@ def test_node_policy_rejections_are_atomic_and_do_not_read_headless(
     assert headless.calls == []
     assert state.draft_session.workspace_snapshot() == before
     assert source.read_bytes() == original_bytes
-
-
-def test_examples_open_read_only_and_save_as_is_confined_to_program_workspace(
-    tmp_path: Path,
-) -> None:
-    workspace_root = tmp_path / "program-workspace"
-    outside_root = tmp_path / "outside"
-    workspace_root.mkdir()
-    outside_root.mkdir()
-    client = _client(
-        tmp_path,
-        allowed_fs_roots=[str(_ROOT / "examples"), str(workspace_root)],
-        allowed_program_write_roots=[str(workspace_root)],
-    )
-
-    empty = client.get("/api/program/workspace").json()
-    opened_response = client.post(
-        "/api/program/open-draft",
-        json={
-            **_fence(empty),
-            "path": str(_SOURCE_PROGRAM),
-            "confirmDiscard": False,
-        },
-    )
-    assert opened_response.status_code == 200
-    opened = opened_response.json()
-    assert opened["saved"]["path"] == str(_SOURCE_PROGRAM.resolve())
-
-    before_failed_save = client.get("/api/program/workspace").json()
-    denied_save = client.post("/api/program/save", json=_fence(before_failed_save))
-    assert denied_save.status_code == 403
-    assert denied_save.json()["detail"]["code"] == "program_artifact_path_invalid"
-    assert client.get("/api/program/workspace").json() == before_failed_save
-
-    for path in (_SOURCE_PROGRAM, outside_root / "outside"):
-        denied_save_as = client.post(
-            "/api/program/save-as",
-            json={
-                **_fence(before_failed_save),
-                "path": str(path),
-                "confirmOverwrite": False,
-            },
-        )
-        assert denied_save_as.status_code == 403
-        assert (
-            denied_save_as.json()["detail"]["code"]
-            == "program_artifact_path_invalid"
-        )
-        assert client.get("/api/program/workspace").json() == before_failed_save
-
-    saved = client.post(
-        "/api/program/save-as",
-        json={
-            **_fence(before_failed_save),
-            "path": str(workspace_root / "saved"),
-            "confirmOverwrite": False,
-        },
-    )
-    assert saved.status_code == 200
-    assert saved.json()["saved"]["path"] == str(
-        (workspace_root / "saved.program.yaml").resolve()
-    )
-
-
-def test_program_save_as_never_writes_into_the_built_in_untitled_scenario(
-    tmp_path: Path,
-) -> None:
-    # A write root that contains the package still never reaches Untitled.
-    package = str(UNTITLED_SCENARIO_PATH.parent)
-    client = _client(
-        tmp_path,
-        allowed_fs_roots=[str(_ROOT / "examples"), str(tmp_path), package],
-        allowed_program_write_roots=[str(tmp_path), package],
-    )
-    untitled_files = {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()}
-    empty = client.get("/api/program/workspace").json()
-    opened = client.post(
-        "/api/program/open-draft",
-        json={**_fence(empty), "path": str(_SOURCE_PROGRAM), "confirmDiscard": False},
-    )
-    assert opened.status_code == 200, opened.text
-    before = client.get("/api/program/workspace").json()
-    for path in (UNTITLED_SCENARIO_PATH / "extra", UNTITLED_SCENARIO_PATH / "program.yaml"):
-        refused = client.post(
-            "/api/program/save-as",
-            json={**_fence(before), "path": str(path), "confirmOverwrite": True},
-        )
-        assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"]["code"] == "scenario_project_read_only"
-        assert client.get("/api/program/workspace").json() == before
-    assert {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()} == untitled_files
-
-    saved = client.post(
-        "/api/program/save-as",
-        json={**_fence(before), "path": str(tmp_path / "saved"), "confirmOverwrite": False},
-    )
-    assert saved.status_code == 200, saved.text
-    assert saved.json()["saved"]["path"] == str((tmp_path / "saved.program.yaml").resolve())
-
-
-@pytest.mark.parametrize("route", ["save", "save-as"])
-@pytest.mark.parametrize(
-    ("admission", "code"),
-    [
-        ({"authoring_allowed": False, "admission_generation": 1}, "authoring_not_ready"),
-    ],
-)
-def test_refused_program_save_writes_no_artifact(
-    tmp_path: Path, route: str, admission: dict, code: str
-) -> None:
-    """Admission precedes the artifact write, so its refusal has no effect."""
-
-    from manyforge_composer.backend.authoring_admission import (
-        AuthoringAdmissionCoordinator,
-    )
-
-    class Refusing:
-        def authoring_admission(self) -> dict:
-            return dict(admission)
-
-        def acquire_authoring_transaction(self, _request):
-            raise AssertionError("a refused Save takes no claim")
-
-    source = _copy_program(tmp_path)
-    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)]))
-    client = TestClient(
-        create_app(
-            state,
-            security=SecurityConfig(
-                allowed_fs_roots=[str(tmp_path)],
-                cors_origins=["http://localhost:3000"],
-            ),
-        )
-    )
-    empty = client.get("/api/program/workspace").json()
-    opened = client.post(
-        "/api/program/open-draft", json={**_fence(empty), "path": str(source)}
-    ).json()
-    edited = client.post(
-        "/api/program/draft/mutations",
-        json={
-            **_fence(opened),
-            "mutation": "tree_draft_update_node_params",
-            "arguments": {
-                "instance_id": "move_to_pick",
-                "expected_node_id": "motion.move_to_joint_target",
-                "parameters": {"planning_timeout_s": 3.0},
-            },
-        },
-    ).json()["workspace"]
-    before = client.get("/api/program/workspace").json()
-    source_bytes = source.read_bytes()
-    state.authoring_admission = AuthoringAdmissionCoordinator(Refusing(), 0x3F9A0000000000A1)  # type: ignore[arg-type]
-
-    target = tmp_path / "saved"
-    refused = client.post(
-        f"/api/program/{route}",
-        json=(
-            _fence(edited)
-            if route == "save"
-            else {**_fence(edited), "path": str(target), "confirmOverwrite": False}
-        ),
-    )
-
-    assert refused.status_code == 409, refused.text
-    assert refused.json()["detail"]["code"] == code
-    assert refused.json()["detail"]["effect"] == "none"
-    assert source.read_bytes() == source_bytes
-    assert not (tmp_path / "saved.program.yaml").exists()
-    assert client.get("/api/program/workspace").json() == before
-
-
-@pytest.mark.parametrize("stale_at", ["before_write", "after_write"])
-def test_save_draft_refusal_is_marked_only_before_the_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_at: str
-) -> None:
-    """A Draft refusal before the write has no effect; a failed adoption after
-    the write (the race) is never marked as no-effect."""
-
-    source = _copy_program(tmp_path)
-    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)]))
-    client = TestClient(
-        create_app(
-            state,
-            security=SecurityConfig(
-                allowed_fs_roots=[str(tmp_path)],
-                cors_origins=["http://localhost:3000"],
-            ),
-        )
-    )
-    empty = client.get("/api/program/workspace").json()
-    opened = client.post(
-        "/api/program/open-draft", json={**_fence(empty), "path": str(source)}
-    ).json()
-
-    def stale(*_args, **_kwargs):
-        raise DraftSessionError(
-            "composer_draft_revision_stale", "Draft changed", status_code=409
-        )
-
-    monkeypatch.setattr(
-        state.draft_session,
-        "require_current" if stale_at == "before_write" else "install_prepared_save",
-        stale,
-    )
-    target = tmp_path / "saved.program.yaml"
-    refused = client.post(
-        "/api/program/save-as",
-        json={**_fence(opened), "path": str(tmp_path / "saved"), "confirmOverwrite": False},
-    )
-
-    detail = refused.json()["detail"]
-    if stale_at == "before_write":
-        assert refused.status_code == 409, refused.text
-        assert detail["code"] == "composer_draft_revision_stale"
-        assert detail["effect"] == "none"
-        assert not target.exists()
-    else:
-        # Written, then the workspace owner contained the failed adoption: the
-        # definite "written but not adopted" outcome names the written file and
-        # never carries the no-effect marker.
-        assert refused.status_code == 409, refused.text
-        assert detail["code"] == "program_saved_baseline_not_adopted"
-        assert detail["causeCode"] == "composer_workspace_install_failed"
-        assert detail["path"] == str(target)
-        assert str(target) in detail["message"]
-        assert "effect" not in detail
-        assert target.exists()
-
-
-def test_explicit_invalid_program_write_roots_fail_closed_without_draft_change(
-    tmp_path: Path,
-) -> None:
-    source = _copy_program(tmp_path)
-    client = _client(
-        tmp_path,
-        allowed_program_write_roots=["invalid\x00root"],
-    )
-    empty = client.get("/api/program/workspace").json()
-    opened = client.post(
-        "/api/program/open-draft",
-        json={**_fence(empty), "path": str(source)},
-    ).json()
-    before = client.get("/api/program/workspace").json()
-
-    rejected = client.post("/api/program/save", json=_fence(before))
-
-    assert rejected.status_code == 503
-    assert rejected.json()["detail"]["code"] == "program_artifact_roots_unavailable"
-    assert client.get("/api/program/workspace").json() == before
-
-
-def test_create_app_security_fallback_overrides_preseeded_write_roots(
-    tmp_path: Path,
-) -> None:
-    read_root = tmp_path / "read-root"
-    preseeded_write_root = tmp_path / "preseeded-write-root"
-    read_root.mkdir()
-    preseeded_write_root.mkdir()
-    source = _copy_program(read_root)
-    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1,
-        allowed_fs_roots=[str(preseeded_write_root)],
-        allowed_program_write_roots=[str(preseeded_write_root)],
-    ))
-    client = TestClient(
-        create_app(
-            state,
-            security=SecurityConfig(
-                allowed_fs_roots=[str(read_root)],
-                allowed_program_write_roots=None,
-                cors_origins=["http://localhost:3000"],
-            ),
-        )
-    )
-
-    empty = client.get("/api/program/workspace").json()
-    opened = client.post(
-        "/api/program/open-draft",
-        json={**_fence(empty), "path": str(source)},
-    ).json()
-    before = client.get("/api/program/workspace").json()
-
-    rejected = client.post(
-        "/api/program/save-as",
-        json={
-            **_fence(before),
-            "path": str(preseeded_write_root / "bypass"),
-            "confirmOverwrite": False,
-        },
-    )
-
-    assert state.allowed_program_write_roots is None
-    assert rejected.status_code == 403
-    assert rejected.json()["detail"]["code"] == "program_artifact_path_invalid"
-    assert client.get("/api/program/workspace").json() == before
-    assert not (preseeded_write_root / "bypass.program.yaml").exists()
 
 
 def test_dirty_open_confirmation_and_rotated_identity_are_fail_closed(
@@ -1740,14 +1411,6 @@ def test_routes_reject_unsupported_mutation_malformed_body_and_unavailable_load(
         },
     )
     assert malformed.status_code == 422
-    invalid_save_as = client.post(
-        "/api/program/save-as",
-        json={**_fence(workspace), "path": "/", "confirmOverwrite": False},
-    )
-    assert invalid_save_as.status_code == 400
-    assert invalid_save_as.json()["detail"]["code"] == (
-        "program_artifact_path_invalid"
-    )
 
 
 def test_scene_and_viewer_edits_share_one_revision_fenced_program_draft(
@@ -1821,9 +1484,8 @@ def test_scene_and_viewer_edits_share_one_revision_fenced_program_draft(
     assert viewer_workspace["applied"]["available"] is False
 
 
-def test_artifact_roots_symlinks_overwrite_confirmation_and_atomic_failure(
+def test_artifact_load_refuses_a_symlink_out_of_the_allowed_roots(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     allowed = tmp_path / "allowed"
     outside = tmp_path / "outside"
@@ -1841,36 +1503,6 @@ def test_artifact_roots_symlinks_overwrite_confirmation_and_atomic_failure(
             catalog=catalog,
         )
     assert escaped.value.status_code == 403
-
-    program = Program(outside_program, catalog)
-    existing = allowed / "existing.program.yaml"
-    existing.write_text("sentinel", encoding="utf-8")
-    with pytest.raises(ProgramArtifactError) as confirmation:
-        save_program_artifact(
-            program,
-            str(existing),
-            allowed_roots=[str(allowed)],
-            overwrite=False,
-        )
-    assert confirmation.value.code == (
-        "program_artifact_overwrite_confirmation_required"
-    )
-    assert existing.read_text(encoding="utf-8") == "sentinel"
-
-    def fail_replace(*_args: object, **_kwargs: object) -> None:
-        raise OSError("injected replace failure")
-
-    monkeypatch.setattr(program_artifacts.os, "replace", fail_replace)
-    with pytest.raises(ProgramArtifactError) as failed:
-        save_program_artifact(
-            program,
-            str(existing),
-            allowed_roots=[str(allowed)],
-            overwrite=True,
-        )
-    assert failed.value.code == "program_artifact_write_failed"
-    assert existing.read_text(encoding="utf-8") == "sentinel"
-    assert list(allowed.glob(".*.tmp-*")) == []
 
 
 # --- V13.5 formula checks and path-keyed value sources --------------------
@@ -1922,7 +1554,7 @@ def _expression_program(tmp_path: Path) -> Path:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     target = tmp_path / "formulas.program.yaml"
     target.write_text(json.dumps(document), encoding="utf-8")
@@ -2294,8 +1926,6 @@ def test_program_apply_sends_the_browser_start_id_and_a_fresh_manager_key(
     assert "manager_request_id" not in submitted[0]
 
 
-
-
 def test_program_apply_refuses_a_no_op_before_any_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2378,7 +2008,8 @@ def test_program_revert_refuses_saved_equal_to_applied_before_any_effect(
 
 
 def _deployment(name: str, revision: str | None = None) -> dict:
-    document = {"deployment_artifact_id": "cell", "name": name}
+    # An opaque fixture document; only its content and revision are compared.
+    document = {"label": name}
     if revision is not None:
         document["deployment_revision"] = revision
     return document
@@ -2389,7 +2020,6 @@ def _compile_as_is(source: str) -> CompiledDeploymentDocument:
     return CompiledDeploymentDocument(
         document=document,
         canonical_json=source,
-        deployment_artifact_id=document["deployment_artifact_id"],
         deployment_revision=document.get("deployment_revision"),
         graph_revision=None,
     )
@@ -2421,7 +2051,7 @@ def _program_revert_scenario(
         program_session=state.draft_session, deployment_session=deployment
     )
     edited = state.draft_session.retained_state()
-    edited["authoring"]["description"] = "Edited only in the Draft."
+    edited["authoring"]["compatibility"]["tags"] = ["edited-only-in-the-draft"]
     edited["draft_revision"] += 1
     candidate, edited["diagnostics"] = derive_candidate(
         edited["authoring"], state.node_catalog
@@ -2537,9 +2167,9 @@ def test_program_revert_restores_both_drafts_to_saved_in_one_workspace_revision(
         draft_deployment=_deployment("Edited cell", "sha256:" + "3" * 64),
         applied_deployment=saved,
     )
-    saved_description = state.draft_session.retained_state()["saved_document"][
-        "description"
-    ]
+    saved_tags = state.draft_session.retained_state()["saved_document"][
+        "compatibility"
+    ]["tags"]
     revision_before = state.authoring_workspace.identity().workspace_revision
     body = _fence({"draft": {
         "draftId": state.draft_session.draft_id,
@@ -2557,8 +2187,8 @@ def test_program_revert_restores_both_drafts_to_saved_in_one_workspace_revision(
     # The Deployment Draft that left Saved returns to it together with the
     # Program restore, in one workspace revision.
     assert state.deployment_draft_session.retained_state()["document"] == saved
-    assert state.draft_session.retained_state()["authoring"]["description"] == (
-        saved_description
+    assert state.draft_session.retained_state()["authoring"]["compatibility"]["tags"] == (
+        saved_tags
     )
     assert state.authoring_workspace.identity().workspace_revision == revision_before + 1
 

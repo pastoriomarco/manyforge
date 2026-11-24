@@ -105,3 +105,16 @@ describe('Program viewer settings round trip', () => {
       .hidden_execution_groups).toEqual(['all', 'robot_b']);
   });
 });
+
+describe('Scenario default 3D view (OD-355)', () => {
+  it('round-trips the saved view and clears it with null', () => {
+    const view = { position_m: [1.5, -1.2, 1.1] as [number, number, number], target_m: [0.2, 0, 0.4] as [number, number, number] };
+    const draft = viewerPresentationDraftFromProgram({ default_view: view });
+    expect(draft.defaultView).toEqual(view);
+    expect(programViewerMetadata(draft).default_view).toEqual(view);
+    const cleared = viewerPresentationDraftReducer(draft, { type: 'set_default_view', view: null });
+    expect(programViewerMetadata(cleared)).not.toHaveProperty('default_view');
+    expect(viewerPresentationDraftFromProgram(undefined).defaultView).toBeNull();
+    expect(DEFAULT_VIEWER_PRESENTATION_DRAFT.defaultView).toBeNull();
+  });
+});

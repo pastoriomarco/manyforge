@@ -914,7 +914,6 @@ bool FilesystemProgramRepository::put_if_absent(
 
 std::shared_ptr<const ProgramBindingContract>
 FilesystemProgramRepository::get_verified(
-    const core::ProgramId& program_id,
     const core::ProgramRevision& program_revision,
     const RetainedBundle& retained_bundle) const {
   storage_->files.require_owner_process();
@@ -928,7 +927,7 @@ FilesystemProgramRepository::get_verified(
       memo(16U);
   return memo.get(
       detail::verified_read_key(storage_->files.trusted_root().string(),
-                                std::string(*hex), program_id.value(),
+                                std::string(*hex),
                                 retained_bundle.retained_bundle_id().value()),
       kPosixErrors, kReadMessages,
       [&]() -> std::shared_ptr<const ProgramBindingContract> {
@@ -938,8 +937,7 @@ FilesystemProgramRepository::get_verified(
         }
         auto program = verify_durable_program(*bytes, retained_bundle,
                                               storage_->files.trusted_root());
-        if (program->value().program_id != program_id ||
-            program->value().program_revision != program_revision) {
+        if (program->value().program_revision != program_revision) {
           throw ProgramContractError(
               "durable Program repository key/content or Program identity "
               "mismatch");

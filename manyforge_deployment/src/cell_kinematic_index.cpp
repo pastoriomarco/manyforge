@@ -151,4 +151,19 @@ const core::KinematicFramePathDTO* CellKinematicIndex::find_frame_path(
   return match;
 }
 
+bool CellKinematicIndex::places_mounted_frame(
+    const core::ControllableComponentId& robot,
+    std::string_view compiled_frame_name) const {
+  // Every frame on one compiled link shares that link's path.
+  const auto path = std::find_if(
+      frame_paths_.begin(), frame_paths_.end(), [&](const auto& candidate) {
+        const auto* frame = std::get_if<core::ResolvedComponentModelFrameDTO>(
+            &candidate.terminal_frame);
+        return frame != nullptr &&
+               frame->compiled_frame_name == compiled_frame_name;
+      });
+  return path != frame_paths_.end() &&
+         core::mounted_frame_placed_by(*path, robot);
+}
+
 }  // namespace manyforge::deployment

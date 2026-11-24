@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [
       {
@@ -19,13 +19,10 @@
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [
       "lite_gripper"
     ],
@@ -34,7 +31,6 @@
       "pick-and-place"
     ]
   },
-  "description": "Lite6 pneumatic pick and place using the same Program for Mock and Real. Close waits for the configured workpiece input; the workpiece-loss rule monitors carrying until intentional release.",
   "forest": [
     {
       "children": [
@@ -643,7 +639,6 @@
       "parameters": {}
     }
   ],
-  "name": "lite6_pneumatic_pick_and_place",
   "parameters": [
     {
       "constraints": {
@@ -694,7 +689,6 @@
     }
   ],
   "positions": {},
-  "program_id": "lite6_pneumatic_pick_and_place",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

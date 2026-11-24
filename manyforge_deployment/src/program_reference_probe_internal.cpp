@@ -739,6 +739,7 @@ resolve_target_frame_associations(
     std::span<const core::ProgramFrameReferenceDTO> frame_references,
     const core::ComponentTypeCommandTargetDTO& target_type,
     const CompositionTargetResolution& target,
+    const core::CellGraphDTO& graph,
     const VerifiedRetainedModelMap& model_map,
     std::span<const core::ProgramFrameBindingDTO> frames) {
   std::vector<core::ProgramTargetFrameAssociationDTO> result;
@@ -760,8 +761,10 @@ resolve_target_frame_associations(
           resolved->compiled_frame_name != qualified->compiled_frame_name) continue;
       const auto* declared = detail::declared_target_frame_role(target_type, candidate.frame_role_id);
       std::vector<core::CollisionBodyRoleId> candidate_contacts;
-      if (declared && reference.component_id == program_target.component_id)
-        candidate_contacts = declared->contact_body_role_ids;
+      if (reference.component_id == program_target.component_id)
+        candidate_contacts = detail::tcp_contact_bodies(
+            declared, graph, resolved->model_instance_id,
+            candidate.frame_role_id, target);
       if (!selected) {
         selected = *resolved;
         contacts = std::move(candidate_contacts);
@@ -857,9 +860,8 @@ resolve_target_frame_associations(
       }
       const auto* declared =
           detail::declared_target_frame_role(target_type, role);
-      std::vector<core::CollisionBodyRoleId> contact_bodies;
-      if (declared != nullptr)
-        contact_bodies = declared->contact_body_role_ids;
+      auto contact_bodies = detail::tcp_contact_bodies(
+          declared, graph, resolved->model_instance_id, role, *composed);
       std::sort(contact_bodies.begin(), contact_bodies.end());
       const core::TcpEntryDTO physical{owner.controllable_component_id,
                                        target_type.command_target_id, role};

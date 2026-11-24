@@ -81,22 +81,14 @@ capability(std::string_view name,
   return *selected;
 }
 
-// One closed-schema-qualified component type derived from its targets (an
-// I/O device's `io` targets; none for a machine owner).
+// One closed-schema-qualified component type derived from its shape (a
+// component type without its identity fields).
 ActivationPreparedIoType
-derived_type(const std::string &component_id, std::string_view tag,
-             Array target_rows,
-             const std::vector<QualifiedCapabilityDefinition> &selected_capabilities,
-             Value config) {
-  Value shape(Object{{"tags", Value(Array{Value(std::string(tag))})},
-                     {"model_roles", Value(Array{})},
-                     {"model_mounts", Value(Array{})},
-                     {"attachment_interfaces", Value(Array{})},
-                     {"command_targets", Value(std::move(target_rows))}});
-  const auto shape_digest = content_identity::framed_sha256(
-      "io-provider-component-shape", core::kComponentTypeApiVersion, shape);
-  const core::ComponentTypeId id("manyforge." + std::string(tag) + "." +
-                          shape_digest.substr(7U));
+derived_type_of_shape(const std::string &component_id, std::string_view tag,
+                      const Value &shape,
+                      const std::vector<QualifiedCapabilityDefinition> &selected_capabilities,
+                      Value config) {
+  const core::ComponentTypeId id(derived_component_type_id(tag, shape));
   auto document = with(
       with(with(shape, "api_version",
                 Value(std::string(core::kComponentTypeApiVersion))),
@@ -132,7 +124,51 @@ derived_type(const std::string &component_id, std::string_view tag,
                                                  selected_capabilities);
   return {component_id, std::move(type), bytes, std::move(config)};
 }
+
+// One component type derived from its targets (an I/O device's `io`
+// targets; none for a machine owner): model-free, never mounted.
+ActivationPreparedIoType
+derived_type(const std::string &component_id, std::string_view tag,
+             Array target_rows,
+             const std::vector<QualifiedCapabilityDefinition> &selected_capabilities,
+             Value config) {
+  return derived_type_of_shape(
+      component_id, tag,
+      Value(Object{{"tags", Value(Array{Value(std::string(tag))})},
+                   {"model_roles", Value(Array{})},
+                   {"model_mounts", Value(Array{})},
+                   {"attachment_interfaces", Value(Array{})},
+                   {"command_targets", Value(std::move(target_rows))}}),
+      selected_capabilities, std::move(config));
+}
 } // namespace
+
+std::string derived_component_type_id(std::string_view tag,
+                                      const CanonicalValue &shape) {
+  return "manyforge." + std::string(tag) + "." +
+         content_identity::framed_sha256("io-provider-component-shape",
+                                         core::kComponentTypeApiVersion, shape)
+             .substr(7U);
+}
+
+std::vector<ActivationPreparedIoType> prepare_activation_tool_types(
+    std::span<const ActivationComponentProfile> profiles,
+    std::span<const QualifiedCapabilityDefinition> capabilities) {
+  std::vector<ActivationPreparedIoType> result;
+  for (const auto &profile : profiles) {
+    if (!profile.generated_tool.has_value()) continue;
+    std::vector<QualifiedCapabilityDefinition> selected;
+    if (!profile.generated_tool->gripper_targets.empty())
+      for (const std::string_view name :
+           {"model.kinematics.fk", "model.limits.joint", "tool.gripper.command",
+            "tool.gripper.feedback"})
+        selected.push_back(capability(name, capabilities));
+    result.push_back(derived_type_of_shape(
+        profile.component_id, "tool",
+        generated_tool_type_shape(*profile.generated_tool), selected, Value()));
+  }
+  return result;
+}
 
 std::vector<ActivationPreparedIoType> prepare_activation_io_types(
     const ActivationDeploymentIntent &intent,

@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -107,8 +107,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [
       "xarm_gripper"
     ],
@@ -283,16 +288,7 @@
               "mount_frame": "xarm_gripper_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "link_tcp",
-              "touch_links": [
-                "left_finger",
-                "left_inner_knuckle",
-                "left_outer_knuckle",
-                "right_finger",
-                "right_inner_knuckle",
-                "right_outer_knuckle",
-                "xarm_gripper_base_link"
-              ]
+              "tcp_frame": "link_tcp"
             }
           ]
         },
@@ -316,8 +312,5 @@
       "target_settings": {}
     }
   ],
-  "deployment_artifact_id": "uf850_xarm_gripper_mock",
-  "description": "Mock UFACTORY UF850 with the xArm gripper mounted on its flange as its own tool component. The model bundles are self-contained.",
-  "name": "uf850_xarm_gripper_mock",
   "policies": {}
 }

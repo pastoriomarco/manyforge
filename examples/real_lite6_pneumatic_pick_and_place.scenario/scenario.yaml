@@ -6,14 +6,14 @@
   },
   "description": "Real Lite6 pneumatic pick and place: site address lite6_main, illustrative controller output CO0 and output polarity, and a separate periodically published ROS Boolean workpiece input. Configure the actual cell wiring, polarity and sensor topic before use.",
   "members": {
-    "deployment.yaml": "sha256:677160431983374029eefa3a56a761c5f83dc156a7f068cea387624f408d8346",
-    "program.yaml": "sha256:1e4e2c4a639d7d653bc33b9d3e7b1e52aaf4086037ad3a1f363e9cbf7b34eced"
+    "deployment.yaml": "sha256:b2b591d643bbaffa0f1a2ae133eb318e9a0e2bb75775231d7cbcf42642bd2345",
+    "program.yaml": "sha256:c8f5b1a073abb6ff6c8a172fd06d76713a027db81da94080438f6bf81f9b9db9"
   },
   "name": "real_lite6_pneumatic_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:3db298078c38697eb3d5f6e023ec9677e0694284e0433c2bb63ea443d8822237",
+    "checked_content_digest": "sha256:82b4e0befdcd9363ce8c650c3491601795bc6a3e0e8836141e15aaf8a9af366c",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.1"
+    "manyforge_version": "0.4.0"
   },
   "scenario_id": "real_lite6_pneumatic_pick_and_place",
   "source_snapshot": {

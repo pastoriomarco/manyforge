@@ -43,9 +43,8 @@ def _row_entries(catalog: dict) -> list[dict]:
 def _intent(rows: list[dict]) -> dict:
     # A model row without a root pose is a mounted tool: give it a mount row.
     return {
-        "api_version": "manyforge.deployment_intent.v2",
-        "deployment_artifact_id": "catalog_check",
-        "name": "catalog check",
+        "api_version": "manyforge.deployment_intent.v3",
+        "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
         "components": rows,
         "attachments": [
             {
@@ -100,7 +99,7 @@ def test_catalog_offers_curated_rows_with_kinds_tags_and_assemblies() -> None:
     assert robot["componentProfileId"] == "universal_robots.ur10e"
     assert robot["modelFamilyId"] == "ur10e"
     assert "articulated-arm" in robot["tags"] and "gripper" not in robot["tags"]
-    assert robot["lane"] == "manyforge-only"
+    assert robot["lane"] == "mock"  # the row's own placement lane
     assert [row["component_id"] for row in robot["components"]] == ["ur10e_robot"]
     # A UFactory arm is always a machine member, added with its machine
     # entry; no catalog entry offers it (or any machine row) alone.
@@ -217,8 +216,8 @@ def test_tool_kind_and_mount_interfaces_come_from_the_component_type(
     scenario = tmp_path / "examples" / "cell.scenario"
     scenario.mkdir(parents=True)
     (scenario / "deployment.yaml").write_text(json.dumps({
-        "api_version": "manyforge.deployment_intent.v2",
-        "deployment_artifact_id": "cell", "name": "Cell",
+        "api_version": "manyforge.deployment_intent.v3",
+        "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
         "components": [arm, hand],
         "attachments": [{
             "parent": {"component_id": "arm", "interface": "flange"},
@@ -226,6 +225,8 @@ def test_tool_kind_and_mount_interfaces_come_from_the_component_type(
         }],
         "policies": {},
     }))
+    # The entry describes its example by the Scenario's one description.
+    (scenario / "scenario.yaml").write_text(json.dumps({"description": "Cell"}))
     monkeypatch.setattr(catalog_module, "_COMPONENT_TYPES", types)
     monkeypatch.setattr(catalog_module, "_EXAMPLES", tmp_path / "examples")
 
@@ -238,14 +239,17 @@ def test_tool_kind_and_mount_interfaces_come_from_the_component_type(
     # The tool row stays without a root pose; the catalog offers no attachment.
     assert "root_pose_in_cell" not in entries["hand"]["components"][0]
     assert "root_pose_in_cell" in entries["arm"]["components"][0]
+    assert entries["arm"]["description"] == "Cell"
     assert catalog["componentProfiles"] == {
         "vendor.arm": {
             "lanes": ["mock", "real"], "tags": ["articulated-arm"],
             "attachmentInterfaces": ["flange"], "tcpTargets": [], "frameTargets": [],
+            "collisionBodyTargets": [],
         },
         "vendor.hand": {
             "lanes": [], "tags": ["gripper", "tool"],
             "attachmentInterfaces": [], "tcpTargets": [], "frameTargets": [],
+            "collisionBodyTargets": [],
         },
     }
     model_row = {"configuration": {"runtime_kind": "ros2_control"}}
@@ -329,6 +333,63 @@ def test_profile_facts_carry_each_targets_tcp_roles_and_default(
     ]
 
 
+def test_profile_facts_carry_each_targets_collision_bodies_contact_bodies_and_grip_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def bodies(*roles: str) -> list[dict]:
+        return [{"collision_body_role_id": role, "model_role_id": "tool_model"} for role in roles]
+
+    types = tmp_path / "component_type"
+    types.mkdir()
+    (types / "gripper.component.json").write_text(json.dumps({
+        "tags": ["tool", "gripper"], "attachment_interfaces": [],
+        "command_targets": [{
+            "command_target_id": "gripper",
+            "collision_body_roles": bodies("gripper_pads", "gripper_collision"),
+            "grip_body_role_id": "gripper_collision",
+            "default_tcp_frame_role_id": "tcp",
+            "frame_roles": [
+                {"frame_role_id": "mount"},
+                {"frame_role_id": "tcp", "tcp": True,
+                 "contact_body_role_ids": ["gripper_pads"]},
+                {"frame_role_id": "edge", "tcp": True},
+            ],
+        }],
+    }))
+    # A passive tool: collision bodies, no grip body, a TCP without contact bodies.
+    (types / "probe.component.json").write_text(json.dumps({
+        "tags": ["tool"], "attachment_interfaces": [],
+        "command_targets": [
+            {"command_target_id": "tool", "collision_body_roles": bodies("default_collision"),
+             "default_tcp_frame_role_id": "tcp",
+             "frame_roles": [{"frame_role_id": "tcp", "tcp": True}]},
+            {"command_target_id": "bare", "frame_roles": []},
+        ],
+    }))
+    _models(tmp_path, monkeypatch, {
+        "gripper": {"id": "gripper_model"}, "probe": {"id": "probe_model"},
+    })
+    (tmp_path / "examples").mkdir()
+    monkeypatch.setattr(catalog_module, "_COMPONENT_TYPES", types)
+    monkeypatch.setattr(catalog_module, "_EXAMPLES", tmp_path / "examples")
+
+    profiles = component_catalog(None)["componentProfiles"]
+
+    assert profiles["gripper_model"]["collisionBodyTargets"] == [{
+        "commandTargetId": "gripper",
+        "collisionBodyRoleIds": ["gripper_collision", "gripper_pads"],
+        "tcpContactBodyRoleIds": {"edge": [], "tcp": ["gripper_pads"]},
+        "gripBodyRoleId": "gripper_collision",
+    }]
+    # A target without collision bodies is not listed.
+    assert profiles["probe_model"]["collisionBodyTargets"] == [{
+        "commandTargetId": "tool",
+        "collisionBodyRoleIds": ["default_collision"],
+        "tcpContactBodyRoleIds": {"tcp": []},
+        "gripBodyRoleId": None,
+    }]
+
+
 def test_maintained_models_declare_one_tcp_target_each() -> None:
     profiles = component_catalog(None)["componentProfiles"]
 
@@ -388,6 +449,16 @@ def test_machine_entries_come_from_the_machine_models() -> None:
     assert row["configuration"]["runtime_configuration"]["initial_joint_positions_rad"] == [
         0.0, 0.0, 1.57, 0.0, 0.0, 0.0,
     ]
+    # A new arm is applicable as added: its controlled Stop is filled from the
+    # model's deceleration, one limit per arm joint.
+    stop = row["target_settings"]["arm"]["controlled_stop"]
+    assert stop["stop_mode"] == "soft_on_path"
+    assert [(limit["source_joint_name"], limit["max_deceleration_rad_s2"])
+            for limit in stop["per_joint_limits"]] == [(f"joint{i}", 10.0) for i in range(1, 7)]
+    # Its fault Stop (OD-373): a runtime collision Stop is controlled and retryable.
+    fault = row["configuration"]["default_fault_stop_profile"]
+    assert fault["stop_mode"] == "soft_on_path"
+    assert fault["per_joint_max_deceleration_rad_s2"] == {f"joint{i}": 10.0 for i in range(1, 7)}
     # Filled with ids, owner and role, the rows are a valid machine in a Draft.
     rows = [
         {**lite6["owner_row"], "lane": "mock"},
@@ -421,6 +492,90 @@ def test_sensor_entries_come_from_the_sensor_models() -> None:
                                                     "source_frame_id": "camera_link"}},
     }
     assert validate_deployment_intent(_intent([row]), source="sensor")["components"] == [row]
+
+
+def test_the_passive_tool_is_offered_from_its_model(tmp_path: Path) -> None:
+    # OD-336: one generic passive tool, mount and TCP frames only, no lane;
+    # its default model is the placeholder a project points at its own files.
+    catalog = component_catalog(None)
+    [entry] = [entry for entry in catalog["entries"]
+               if entry.get("entryId") == "model/manyforge.passive_tool"]
+    assert entry["kind"] == "tool"
+    assert entry["componentId"] == "passive_tool"
+    assert entry["modelFamilyId"] == "passive_tool"
+    assert entry["lane"] is None and entry["tags"] == ["tool"]
+    assert entry["sources"] == ["manyforge_example_models/models/passive_tool/component.yaml"]
+    [row] = entry["components"]
+    assert row["component_profile_id"] == "manyforge.passive_tool"
+    assert "lane" not in row and "root_pose_in_cell" not in row
+    assert row["configuration"] == {
+        "runtime_kind": "ros2_control",
+        "runtime_configuration": {"component_streams": []},
+    }
+    source = row["model_source"]
+    assert source["urdf"]["external_path"].endswith("models/passive_tool/passive_tool.urdf")
+    assert source["srdf"]["external_path"].endswith("models/passive_tool/passive_tool.srdf")
+    # The model folder is its own package: mesh URIs `package://passive_tool/...`.
+    assert set(source["package_roots"]) == {"passive_tool"}
+    assert source["package_roots"]["passive_tool"]["external_path"].endswith(
+        "manyforge_example_models/models/passive_tool")
+    validate_deployment_intent(_intent([row]), source=entry["entryId"])
+    facts = catalog["componentProfiles"]["manyforge.passive_tool"]
+    assert facts["lanes"] == [] and facts["tags"] == ["tool"]
+    assert facts["attachmentInterfaces"] == ["mount"]
+    assert facts["tcpTargets"] == [
+        {"commandTargetId": "tool", "tcpFrameRoleIds": ["tcp"], "defaultTcpFrameRoleId": "tcp"},
+    ]
+    assert facts["hasMotionTarget"] is False
+    # From a project, the same files, relative to it.
+    project = tmp_path / "cell.scenario"
+    project.mkdir()
+    [relative] = [entry for entry in component_catalog(str(project))["entries"]
+                  if entry.get("entryId") == "model/manyforge.passive_tool"]
+    resolved = resolve_source_reference(
+        relative["components"][0]["model_source"]["urdf"], project_root=project)
+    assert resolved == Path(source["urdf"]["external_path"])
+
+
+def test_the_tool_is_offered_with_its_starter_parameters_inline() -> None:
+    # OD-357: the Tool from parameters; its row holds them inline.
+    catalog = component_catalog(None)
+    [entry] = [entry for entry in catalog["entries"]
+               if entry.get("entryId") == "model/manyforge.tool"]
+    assert entry["kind"] == "tool"
+    assert entry["componentId"] == "tool"
+    assert entry["lane"] is None
+    [row] = entry["components"]
+    assert row["component_profile_id"] == "manyforge.tool"
+    parameters = row["model_source"]["parameters"]
+    assert set(row["model_source"]) == {"parameters"}
+    assert parameters["api_version"] == "manyforge.parametric_tool.v1"
+    assert parameters["kind"] == "tool"
+    assert [tcp["id"] for tcp in parameters["tcps"]] == ["tcp"]
+    validate_deployment_intent(_intent([row]), source=entry["entryId"])
+
+
+def test_owner_less_io_banks_come_from_their_models() -> None:
+    catalog = component_catalog(None)
+    [entry] = [entry for entry in catalog["entries"]
+               if entry.get("entryId") == "model/manyforge.io_bank_64x64"]
+    assert entry["kind"] == "io_device"
+    assert entry["componentId"] == "io_bank_64x64"
+    assert entry["lane"] == "mock" and entry["modelFamilyId"] is None
+    assert entry["sources"] == ["components/io_device/manyforge.io_bank_64x64/component.yaml"]
+    assert entry["components"] == [{
+        "component_id": "io_bank_64x64",
+        "component_profile_id": "manyforge.io_bank_64x64",
+        "configuration": {},
+        "lane": "mock",
+    }]
+    # It runs on every lane: Mock and Isaac through the host's Mock I/O.
+    assert catalog["componentProfiles"]["manyforge.io_bank_64x64"]["lanes"] == [
+        "isaac", "mock", "real"]
+    # A machine's I/O banks are offered only with their machine.
+    assert not [entry for entry in catalog["entries"]
+                if entry.get("componentProfileId") == "ufactory.lite6_controller_io"]
+    validate_deployment_intent(_intent(entry["components"]), source=entry["entryId"])
 
 
 def test_the_assistant_model_is_offered_like_a_sensor(monkeypatch) -> None:

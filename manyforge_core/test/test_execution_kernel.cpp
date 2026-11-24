@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "collision_rule_test_helpers.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <barrier>
@@ -976,7 +978,8 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
               }),
           runtime_result.pair_clearances.end());
       for (const auto& clearance : runtime_result.pair_clearances) {
-        runtime_clearance_observations.push_back({&clearance.pair, clearance.signed_clearance_m});
+        runtime_clearance_observations.push_back(
+            {&clearance.pair, clearance.signed_clearance_m, std::nullopt});
       }
       for (const auto& pair : runtime_result.normalized_pairs) {
         std::optional<double> clearance;
@@ -986,7 +989,7 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
         if (it != runtime_result.pair_clearances.end()) {
           clearance = it->signed_clearance_m;
         }
-        runtime_observations.push_back({&pair, clearance});
+        runtime_observations.push_back({&pair, clearance, std::nullopt});
       }
       RuntimeCollisionQueryResultView view;
       view.engine_status = runtime_result.engine_status;
@@ -2136,7 +2139,7 @@ CollisionWorldBody make_test_robot_link_body(const std::string& link_name) {
   return body;
 }
 
-void install_mock_contact_grasp_world(MockCollisionWorldPublisher& publisher,
+void install_mock_contact_rule_world(MockCollisionWorldPublisher& publisher,
                                       const std::string& object_id,
                                       const std::vector<std::string>& allowed_links) {
   install_mock_retained_object(publisher, object_id);
@@ -2155,24 +2158,24 @@ void install_mock_contact_grasp_world(MockCollisionWorldPublisher& publisher,
 void install_mock_detached_logical_object(MockCollisionWorldPublisher& publisher,
                                           const std::string& object_id) {
   const ProjectionLeaseBindingDTO binding{publisher.lease_projection_revision,
-                                          ProjectionLeaseId("mock_contact_grasp_lease")};
+                                          ProjectionLeaseId("mock_contact_rule_lease")};
   auto scene = *testing::make_test_logical_scene(binding);
   scene.objects = {
       SceneObjectSnapshotDTO{SceneResourceId(object_id),
                              {BoxShapeDTO{Vector3DTO{0.1, 0.1, 0.1}}},
                              CellFixedSceneObjectPlacementDTO{scene.cell_id, make_test_pose()},
-                             std::nullopt,
-                             {}}};
+                             std::nullopt}};
   scene.revision.content_hash = logical_scene_identity::ComputeLogicalSceneContentHash(scene);
   publisher.lease_projection_revision.scene_revision = scene.revision;
   publisher.current_logical_scene =
       std::make_shared<const LogicalSceneSnapshotDTO>(std::move(scene));
 }
 
-// Binds a resolved, versioned contact grasp exactly as the addressed owner
-// does; the prepared motion product admits no unversioned contact policy.
-void bind_resolved_contact_grasp(ExecuteRequestDTO& request, MockCollisionWorldPublisher& publisher,
-                                 const std::string& policy_id, const std::string& object_id,
+// Gives the request one admitted contact rule, as the addressed owner does:
+// `allowed_links` may touch `object_id` in the last quarter of the move, at
+// most `max_penetration_m` deep. The rule's id is `rule_id`.
+void add_admitted_contact_rule(ExecuteRequestDTO& request, MockCollisionWorldPublisher& publisher,
+                                 const std::string& rule_id, const std::string& object_id,
                                  const std::vector<std::string>& allowed_links,
                                  double max_penetration_m) {
   install_mock_detached_logical_object(publisher, object_id);
@@ -2181,20 +2184,22 @@ void bind_resolved_contact_grasp(ExecuteRequestDTO& request, MockCollisionWorldP
     allowed_bodies.emplace_back("component/arm/model/arm_model/body/" + link + "/collision/0");
   }
   std::sort(allowed_bodies.begin(), allowed_bodies.end());
-  request.contact_policy_id = policy_id;
-  request.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
-      RuntimeObjectId("selected_object"), SceneResourceId(object_id)}};
-  request.resolved_contact_grasp =
-      ResolvedContactGraspBindingDTO{ContactPolicyId(policy_id),
-                                     ContactPolicyRevision(kTestDigestA),
-                                     RuntimeObjectId("selected_object"),
-                                     SceneResourceId(object_id),
-                                     std::move(allowed_bodies),
-                                     ContactGraspEnvelopeDTO{max_penetration_m, 0.75}};
+  request.collision_rules.push_back(
+      CollisionRule{rule_id,
+                    {CollisionRuleResolvedBodiesSelection{std::move(allowed_bodies)}},
+                    {CollisionRuleSceneObjectSelection{SceneResourceId(object_id)}},
+                    CollisionContactRule{max_penetration_m, 0.75, std::nullopt}});
 }
 
-[[nodiscard]] bool is_bound_contact_grasp_policy(const std::string& policy_id) {
-  return policy_id.rfind("contact_grasp.bound.", 0) == 0U;
+/// The move's row without selections: its own clearance.
+CollisionRule move_clearance_rule(const double clearance_m) {
+  return CollisionRule{"this_move", {}, {}, CollisionClearanceRule{clearance_m}};
+}
+
+/// Cell rules holding only the first rule.
+std::vector<CollisionRule> cell_clearance_rules(const double clearance_m) {
+  return {CollisionRule{std::string(kEverythingCollisionRuleId), {}, {},
+                        CollisionClearanceRule{clearance_m}}};
 }
 
 CollisionWorldBody make_dynamic_test_body() {
@@ -2221,17 +2226,15 @@ CollisionPolicySnapshot make_test_collision_policy_snapshot() {
   return snapshot;
 }
 
-// A collision policy with one active support contact (an unrelated pair).
-// The planner switches that pair off, so a fresh plan under this policy is
-// collision-validated before dispatch.
-CollisionPolicySnapshot make_support_contact_test_policy() {
+// A collision policy with one contact rule on an unrelated pair (whole move,
+// 5 mm deep at most). The planner switches that pair off, so a fresh plan
+// under this policy is collision-validated before dispatch.
+CollisionPolicySnapshot make_contact_rule_test_policy() {
   auto policy = make_test_collision_policy_snapshot();
-  policy.policy_id = "support_contact_test_policy";
-  SupportContactPolicyEntry entry;
-  entry.pair = CollisionPairId{"scene/insert/shape/0", "scene/fixture/shape/0"};
-  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  entry.max_contact_penetration_m = 0.005;
-  policy.support_contacts.push_back(entry);
+  policy.policy_id = "contact_rule_test_policy";
+  testing::add_contact_rule(
+      policy, testing::contact_rule(
+                  CollisionPairId{"scene/fixture/shape/0", "scene/insert/shape/0"}, 0.005));
   return policy;
 }
 
@@ -2294,7 +2297,7 @@ double clearance_test_joint(const CollisionQuery& query, const std::string& join
                    static_cast<std::size_t>(std::distance(names.begin(), found)));
 }
 
-CollisionResult make_support_contact_collision_result(const CollisionPairId& pair,
+CollisionResult make_pair_collision_result(const CollisionPairId& pair,
                                                       double signed_clearance_m) {
   CollisionResult result;
   result.in_collision = signed_clearance_m < 0.0;
@@ -2307,26 +2310,6 @@ CollisionResult make_support_contact_collision_result(const CollisionPairId& pai
   result.engine_status = CollisionEngineStatus::kOk;
   result.pair_clearances = {CollisionPairClearance{pair, signed_clearance_m}};
   return result;
-}
-
-CollisionResult make_contact_grasp_collision_result(const CollisionPairId& pair,
-                                                    double signed_clearance_m) {
-  return make_support_contact_collision_result(pair, signed_clearance_m);
-}
-
-CollisionPolicySnapshot make_contact_grasp_policy_snapshot(
-    const std::string& policy_id, const std::string& selected_object_id,
-    std::vector<std::string> allowed_robot_links, double max_penetration_m) {
-  auto policy = make_test_collision_policy_snapshot();
-  policy.require_full_diagnostics = true;
-  ContactGraspPolicyEntry entry;
-  entry.policy_id = policy_id;
-  entry.selected_object_id = selected_object_id;
-  entry.allowed_robot_links = std::move(allowed_robot_links);
-  entry.max_penetration_m = max_penetration_m;
-  entry.terminal_window_start_fraction = 0.75;
-  policy.contact_grasps.push_back(std::move(entry));
-  return policy;
 }
 
 // Audit 6G: 2 s bound (2000 x 1 ms), matching the cv-based fake-backend
@@ -3573,7 +3556,7 @@ TEST_F(ExecutionKernelTest, MotionPreviewDiagnosticRetainsMeasuredClearanceAndEf
   auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
   ASSERT_TRUE(inventory);
   auto request = make_test_request("preview_measured_clearance");
-  request.clearance_m = 0.003;
+  request.collision_rules = {move_clearance_rule(0.003)};
   std::optional<MotionPathPreview> path;
   const auto result = kernel.preview_motion(request, std::move(*inventory),
       RobotStateDTO{{"j1", "j2"}, {0.0, 0.0}, {}}, 0U, {}, &path);
@@ -3690,13 +3673,13 @@ TEST_F(ExecutionKernelTest, MotionPreviewDiagnosticKeepsStatefulContactLocalAfte
                           {1.0, {0.5, 0.5}, {}, {}},
                           {2.0, {1.0, 1.0}, {}, {}}};
   planner.next_result.trajectory = trajectory;
-  auto policy = make_support_contact_test_policy();
-  const auto support_pair = policy.support_contacts.front().pair;
+  auto policy = make_contact_rule_test_policy();
+  const auto support_pair = policy.contact_rules.front().pair;
   collision_engine->result_for_query = [support_pair](const CollisionQuery& query) -> std::optional<CollisionResult> {
     if (query.waypoint_index && *query.waypoint_index == 1)
       return make_authoritative_collision_result();
     if (query.waypoint_index && *query.waypoint_index == 2)
-      return make_support_contact_collision_result(support_pair, -0.001);
+      return make_pair_collision_result(support_pair, -0.001);
     return std::nullopt;
   };
   auto inventory = collision_world_publisher.current_scene_snapshot_lease_inventory();
@@ -3888,7 +3871,6 @@ TEST_F(ExecutionKernelTest, MotionPreviewTimeoutAfterSuccessDoesNotInventFailure
       runtime_unit_epochs.begin(), runtime_unit_epochs.end(),
       [](const auto& lhs, const auto& rhs) { return lhs.runtime_unit_id < rhs.runtime_unit_id; });
   RuntimeParticipantBindingDTO value{
-      ProgramId("program.prepared"),
       ProgramRevision(kTestDigestA),
       ProgramBindingId(kTestDigestB),
       base.retained_bundle_id,
@@ -4019,7 +4001,6 @@ TEST_F(ExecutionKernelTest, MotionPreviewTimeoutAfterSuccessDoesNotInventFailure
   resolved.operation_id = OperationNumber(1001U);
   resolved.participant_id = OperationParticipantId{OperationNumber(957U), 1U};
   if (!resolved.program_run_id) resolved.program_run_id = ProgramRunNumber(117U);
-  resolved.program_id = sealed.program_id;
   resolved.program_revision = sealed.program_revision;
   resolved.program_binding_id = sealed.program_binding_id;
   resolved.controllable_component_id = sealed.controllable_component_id;
@@ -4073,7 +4054,7 @@ TEST_F(ExecutionKernelTest, MotionPreviewTimeoutAfterSuccessDoesNotInventFailure
   auto stop = MakePreparedParticipantStopPlan(
       readiness.value().value().resolved_stop_base_plan,
       PreparedParticipantStopPlanContextDTO{
-          resolved.operation_id, revision, resolved.participant_id, sealed.program_id,
+          resolved.operation_id, revision, resolved.participant_id,
           sealed.program_revision, sealed.program_binding_id, resolved.program_run_id,
           std::nullopt, ParticipantStopProfilePurposeDTO::kOrdinary, std::nullopt,
           MotionInterruptNodeCategory::kGeneric},
@@ -4296,7 +4277,7 @@ TEST_F(ExecutionKernelTest, TerminalCleanupCompletionDuringRunningRefreshIsRepub
 TEST_F(ExecutionKernelTest, AutomaticPlanningRetryUsesExactPreparedFailureCause) {
   for (const auto* code :
        {kErrorPlanningFailed, kErrorPlanningTimeout, kErrorIkFailed, kErrorCartesianIncomplete,
-        kErrorContactPolicyViolation, kErrorSceneChangedDuringValidation, kErrorValidationDeferred,
+        kErrorContactRuleViolation, kErrorSceneChangedDuringValidation, kErrorValidationDeferred,
         kErrorValidationCollision, kErrorExecutionRejected}) {
     SCOPED_TRACE(code);
     PlanResultDTO failed_plan;
@@ -4328,7 +4309,7 @@ TEST_F(ExecutionKernelTest, AutomaticPlanningRetryUsesExactPreparedFailureCause)
 
 TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsInconclusiveOrNonCollisionFailure) {
   for (const auto* reason : {"collision_validation_cancelled", "collision_validation_wall_timeout",
-                             "stale_observed_robot_state", "contact_policy_violation"}) {
+                             "stale_observed_robot_state", "contact_rule_violation"}) {
     SCOPED_TRACE(reason);
     // Even a backend validator using validation_collision and convincing
     // diagnostics cannot manufacture the authoritative collision decision.
@@ -4358,10 +4339,10 @@ TEST_F(ExecutionKernelTest, AutomaticValidationRetryRequiresAuthoritativeBlockin
     if (event.type == KernelEventType::kParticipantSettled)
       failure_candidate = event.retry_eligibility;
   });
-  // A support contact (an unrelated pair) is active: the planner switches it
+  // A contact rule (an unrelated pair) is active: the planner switches it
   // off, so the fresh plan is collision-validated before dispatch.
-  collision_world_publisher.current_policy = make_support_contact_test_policy();
-  kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
+  collision_world_publisher.current_policy = make_contact_rule_test_policy();
+  kernel.set_collision_validation_policy_snapshot(make_contact_rule_test_policy());
   collision_engine->default_result = make_authoritative_collision_result();
   const auto prepared =
       kernel.PrepareMotion(prepared_motion_request(make_test_request("automatic_collision")));
@@ -4385,10 +4366,10 @@ TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsAuthoritativeInconclu
     if (event.type == KernelEventType::kParticipantSettled)
       failure_candidate = event.retry_eligibility;
   });
-  // A support contact (an unrelated pair) is active: the planner switches it
+  // A contact rule (an unrelated pair) is active: the planner switches it
   // off, so the fresh plan is collision-validated before dispatch.
-  collision_world_publisher.current_policy = make_support_contact_test_policy();
-  kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
+  collision_world_publisher.current_policy = make_contact_rule_test_policy();
+  kernel.set_collision_validation_policy_snapshot(make_contact_rule_test_policy());
   auto inconclusive = make_authoritative_collision_result();
   inconclusive.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
   inconclusive.decision = CollisionDecisionResult::kInconclusiveFail;
@@ -4411,10 +4392,10 @@ TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsAuthoritativeInconclu
 }
 
 TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsGenericEngineFailureWithoutCollision) {
-  // A support contact (an unrelated pair) is active: the planner switches it
+  // A contact rule (an unrelated pair) is active: the planner switches it
   // off, so the fresh plan is collision-validated before dispatch.
-  collision_world_publisher.current_policy = make_support_contact_test_policy();
-  kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
+  collision_world_publisher.current_policy = make_contact_rule_test_policy();
+  kernel.set_collision_validation_policy_snapshot(make_contact_rule_test_policy());
   CollisionResult failed_query;
   // Engine failures use an inconclusive decision, preserved by policy merging;
   // kFail with no blocking pairs is reclassified as a clear policy result.
@@ -4433,6 +4414,46 @@ TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsGenericEngineFailureW
   EXPECT_EQ(assessment.retry_eligibility.reason,
             MotionRetryIneligibilityReason::kValidationNotConclusiveCollision);
   EXPECT_EQ(execution.execute_count, 0);
+}
+
+// OD-370 (A): Program Reset retires a preparation that failed in pre-dispatch
+// collision validation. The Kernel returns to Idle with no motion, so a later
+// Apply that keeps this owner may replace its collision resources.
+TEST_F(ExecutionKernelTest, CertifiedResetRetiresFailedPreDispatchValidationToIdle) {
+  collision_world_publisher.current_policy = make_contact_rule_test_policy();
+  kernel.set_collision_validation_policy_snapshot(make_contact_rule_test_policy());
+  collision_engine->default_result = make_authoritative_collision_result();
+  const auto prepared =
+      kernel.PrepareMotion(prepared_motion_request(make_test_request("od370_validation_failed")));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
+  ASSERT_EQ(ended_as(kernel), "failed");
+
+  const ConfigurationFenceId apply_fence_id{"apply:od370-failed-preparation"};
+  const auto apply_scope = make_collision_apply_fence_scope();
+  ASSERT_TRUE(apply_scope.valid());
+  FakeCollisionApplyFenceAdmissionGate admission_gate;
+  admission_gate.held_fence_id = apply_fence_id;
+  admission_gate.held_scope = apply_scope;
+  const auto refused = kernel.replace_collision_resources_under_apply_fence(
+      apply_fence_id, apply_scope, admission_gate, make_owned_collision_pipeline_resources());
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "collision_resource_kernel_not_idle");
+  // Apply asks the same refusal before any effect (OD-370 (B)).
+  const auto asked = kernel.collision_resource_replacement_refusal();
+  ASSERT_TRUE(asked.has_value());
+  EXPECT_EQ(asked->details.at("reason"), "collision_resource_kernel_not_idle");
+
+  const auto reset = kernel.reset_after_certified_containment(prepared.value());
+  ASSERT_TRUE(reset.accepted) << (reset.error ? reset.error->message : std::string());
+  EXPECT_EQ(ended_as(kernel), "working:Idle");
+  EXPECT_EQ(execution.execute_count, 0);
+  EXPECT_EQ(execution.stop_count, 0);
+  EXPECT_FALSE(kernel.collision_resource_replacement_refusal().has_value());
+
+  const auto installed = kernel.replace_collision_resources_under_apply_fence(
+      apply_fence_id, apply_scope, admission_gate, make_owned_collision_pipeline_resources());
+  ASSERT_TRUE(installed.ok()) << installed.error().message;
 }
 
 TEST_F(ExecutionKernelTest, AutomaticRetryRejectsPlanningCodeAfterDispatch) {
@@ -5707,24 +5728,24 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest,
-       ApplyRecoveryAction_RetryAfterSceneRepairAcceptsContactPolicyViolation) {
+       ApplyRecoveryAction_RetryAfterSceneRepairAcceptsContactRuleViolation) {
   std::vector<KernelEvent> events;
   const auto sub =
       kernel.subscribe_events([&](const KernelEvent& event) { events.push_back(event); });
   execution.snapshot.joint_positions_rad = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-  store_cache("move_contact_policy_ack", make_test_trajectory());
+  store_cache("move_contact_rule_ack", make_test_trajectory());
   context.next_validation = ValidationResultDTO{
-      false, ErrorDTO{kErrorContactPolicyViolation,
-                      "Cached trajectory violates the active contact policy",
-                      {{"policy_id", "support-contact-policy"},
-                       {"contact_policy_violation", "contact_penetration_exceeds_policy"}}}};
+      false, ErrorDTO{kErrorContactRuleViolation,
+                      "Cached trajectory violates a contact rule of the move",
+                      {{"collision_rule_id", "table_contact"},
+                       {"contact_rule_violation", "contact_penetration_exceeded"}}}};
 
-  execute_sync(make_test_request("move_contact_policy_ack"));
+  execute_sync(make_test_request("move_contact_rule_ack"));
   ASSERT_EQ(ended_as(kernel), "failed");
 
   const auto ack = apply_recovery_action_after_projection(
       kernel, RecoveryAction::kRetryAfterSceneRepair, "operator_alice",
-      "ui_retry_after_contact_policy_repair");
+      "ui_retry_after_contact_rule_repair");
 
   ASSERT_TRUE(ack.accepted) << (ack.error.has_value() ? ack.error->message : std::string{});
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
@@ -5736,7 +5757,7 @@ TEST_F(ExecutionKernelTest,
         return event.type == KernelEventType::kFailedValidationAcknowledged;
       });
   ASSERT_NE(acknowledged, events.end());
-  EXPECT_EQ(acknowledged->details.at("error_code"), kErrorContactPolicyViolation);
+  EXPECT_EQ(acknowledged->details.at("error_code"), kErrorContactRuleViolation);
   kernel.unsubscribe_events(sub);
 }
 
@@ -6100,16 +6121,18 @@ TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_RefusesACollidingCachedTra
 TEST_F(ExecutionKernelTest, Config_CollisionClearanceRejectsOutOfRange) {
   for (const double bad : {-0.001, 0.0501}) {
     ExecutionKernelConfig config;
-    config.collision_clearance_m = bad;
+    config.collision_rules = cell_clearance_rules(bad);
     EXPECT_THROW((ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner),
                                   execution_owner, clock_owner, scheduler, cache_owner, config}),
                  std::invalid_argument);
   }
-  // 0.1 mm by default; 0 turns the clearance off; no lower floor otherwise.
-  EXPECT_DOUBLE_EQ(ExecutionKernelConfig{}.collision_clearance_m, 0.001);
+  // The first rule is 1 mm by default; 0 turns the clearance off; no lower
+  // floor otherwise.
+  ASSERT_EQ(ExecutionKernelConfig{}.collision_rules.size(), 1U);
+  EXPECT_EQ(ExecutionKernelConfig{}.collision_rules.front(), cell_clearance_rules(0.001).front());
   for (const double admitted : {0.0, 0.0002, 0.05}) {
     ExecutionKernelConfig config;
-    config.collision_clearance_m = admitted;
+    config.collision_rules = cell_clearance_rules(admitted);
     EXPECT_NO_THROW(
         (ExecutionKernel{planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
                          clock_owner, scheduler, cache_owner, config}));
@@ -6164,20 +6187,20 @@ TEST_F(ExecutionKernelTest, Execute_DefaultClearanceAppliesWithoutAConfiguredOne
   EXPECT_EQ(execution.execute_count, 1);
   const auto& margins = planner.last_request.retained_clearance_margins;
   ASSERT_TRUE(margins);
-  EXPECT_DOUBLE_EQ(margins->margin_m, kDefaultCollisionClearanceM);
+  EXPECT_EQ(margins->rule_id_for(target), kEverythingCollisionRuleId);
   EXPECT_DOUBLE_EQ(margins->margin_for(target), kDefaultCollisionClearanceM);
   EXPECT_DOUBLE_EQ(margins->margin_for(clearance_test_pair("table")), 0.001);
   EXPECT_EQ(queries_with_margins.load(), 3);
 }
 
-TEST_F(ExecutionKernelTest, Execute_ClearanceAppliesToTheMoveTargetWithoutAContactPolicy) {
+TEST_F(ExecutionKernelTest, Execute_ClearanceAppliesToTheMoveTargetWithoutAContactRule) {
   // The move's target object is not exempt by itself. With a
-  // 3 mm clearance and no contact-grasp policy, the planner keeps 3 mm from
+  // 3 mm clearance and no contact rule, the planner keeps 3 mm from
   // the target and from the table (a planner keeping it refuses an approach
   // within 1 mm). The mock planner does not, so the pre-dispatch check refuses
   // its plan, and every replan: the move fails and nothing is sent.
   ExecuteRequestDTO req = make_relative_object_request("clearance_pick", "graspable");
-  req.clearance_m = 0.003;
+  req.collision_rules = {move_clearance_rule(0.003)};
   Pose3DTO reference;
   reference.position_m = {0.3, -0.2, 0.15};
   reference.orientation = {0.0, 0.0, 0.0, 1.0};
@@ -6211,7 +6234,7 @@ TEST_F(ExecutionKernelTest, Execute_PerMoveClearanceReplacesTheDeploymentClearan
   // move's own clearance_m of 0.5 mm is accepted, and the planner and the
   // pre-dispatch check carry 0.5 mm; 0 turns the clearance off for the move.
   ExecutionKernelConfig config;
-  config.collision_clearance_m = 0.003;
+  config.collision_rules = cell_clearance_rules(0.003);
   const auto cell_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,   test_execution_kernel_ports(context_owner),
                               execution_owner, clock_owner,
                               scheduler,       cache_owner,
@@ -6245,7 +6268,7 @@ TEST_F(ExecutionKernelTest, Execute_PerMoveClearanceReplacesTheDeploymentClearan
   };
 
   ExecuteRequestDTO req = make_relative_object_request("clearance_pick_close", "graspable");
-  req.clearance_m = 0.0005;
+  req.collision_rules = {move_clearance_rule(0.0005)};
   context.next_reference_pose = Result<Pose3DTO>::Ok(reference);
   const auto result = execute_sync(cell_kernel, req);
   ASSERT_TRUE(result.ok()) << result.error().message;
@@ -6253,7 +6276,7 @@ TEST_F(ExecutionKernelTest, Execute_PerMoveClearanceReplacesTheDeploymentClearan
   EXPECT_EQ(execution.execute_count, 1);
   const auto& margins = planner.last_request.retained_clearance_margins;
   ASSERT_TRUE(margins);
-  EXPECT_DOUBLE_EQ(margins->margin_m, 0.0005);
+  EXPECT_EQ(margins->rule_id_for(target), "this_move");
   EXPECT_DOUBLE_EQ(margins->margin_for(target), 0.0005);
   EXPECT_DOUBLE_EQ(margins->margin_for(table), 0.0005);
   {
@@ -6264,7 +6287,7 @@ TEST_F(ExecutionKernelTest, Execute_PerMoveClearanceReplacesTheDeploymentClearan
   // A computed completion waits for its acknowledgement before the next move.
   ASSERT_TRUE(cell_kernel.acknowledge_completed(result.value()).accepted);
   ExecuteRequestDTO off = make_relative_object_request("clearance_pick_off", "graspable");
-  off.clearance_m = 0.0;
+  off.collision_rules = {move_clearance_rule(0.0)};
   context.next_reference_pose = Result<Pose3DTO>::Ok(reference);
   const auto off_result = execute_sync(cell_kernel, off);
   ASSERT_TRUE(off_result.ok()) << off_result.error().message;
@@ -6285,7 +6308,7 @@ TEST_F(ExecutionKernelTest, Execute_ClearanceReleasesAMoveThatStartsInsideIt) {
   };
 
   auto request = make_test_request("clearance_jog_away");
-  request.clearance_m = 0.003;
+  request.collision_rules = {move_clearance_rule(0.003)};
   const auto result = execute_sync(request);
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_EQ(ended_as(kernel), "completed");
@@ -6311,7 +6334,7 @@ TEST_F(ExecutionKernelTest, Execute_ClearanceRefusesAMoveCloserToWhatItStartsNea
   };
 
   auto request = make_test_request("clearance_jog_toward");
-  request.clearance_m = 0.003;
+  request.collision_rules = {move_clearance_rule(0.003)};
   store_cache(request, make_test_trajectory());
   ValidationOutcomeRecorder outcome(kernel);
   execute_sync(request);
@@ -6319,7 +6342,11 @@ TEST_F(ExecutionKernelTest, Execute_ClearanceRefusesAMoveCloserToWhatItStartsNea
   ASSERT_TRUE(refusal.has_value());
   EXPECT_EQ(refusal->code, kErrorValidationCollision);
   EXPECT_EQ(refusal->details.at("classification"), "clearance");
-  EXPECT_DOUBLE_EQ(std::stod(refusal->details.at("collision_clearance_m")), 0.003);
+  // The refusal names the rule that holds the pair and the pair's clearance
+  // (released at the start to just below its start distance).
+  EXPECT_EQ(refusal->details.at("collision_rule_id"), "this_move");
+  EXPECT_NEAR(std::stod(refusal->details.at("clearance_m")),
+              0.002 - kClearanceStartReleaseToleranceM, 1e-12);
   EXPECT_EQ(planner.plan_count, 1);
   ASSERT_TRUE(planner.last_request.retained_clearance_margins);
   EXPECT_NEAR(planner.last_request.retained_clearance_margins->margin_for(wall),
@@ -6408,7 +6435,7 @@ TEST_F(ExecutionKernelTest, Execute_FreshCollidingPlanFailsAfterTheValidationAtt
 
 TEST_F(ExecutionKernelTest, Execute_FreshPlanCheckOffDispatchesOnPlanningEvidence) {
   // With the Deployment's `collision_check_fresh_plans` off, the planner's
-  // own check stands for a fresh plan without an active contact policy.
+  // own check stands for a fresh plan without contact or release rules.
   // Dispatch runs the start-state and limit checks only; an engine that would
   // refuse every state is never asked.
   kernel.set_collision_check_fresh_plans(false);
@@ -6426,14 +6453,14 @@ TEST_F(ExecutionKernelTest, Execute_FreshPlanCheckOffDispatchesOnPlanningEvidenc
   EXPECT_EQ(outcome.collision_evidence(), "planning");
 }
 
-TEST_F(ExecutionKernelTest, Execute_FreshPlanWithAnActiveContactPolicyIsCollisionValidated) {
-  // The planner switches the pairs of an active contact policy off, so its
-  // release / bounded-penetration / grasp rules are checked before dispatch.
-  collision_world_publisher.current_policy = make_support_contact_test_policy();
-  kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
+TEST_F(ExecutionKernelTest, Execute_FreshPlanWithAnActiveContactRuleIsCollisionValidated) {
+  // The planner switches the pairs under contact and release rules off, so
+  // those rules are checked before dispatch.
+  collision_world_publisher.current_policy = make_contact_rule_test_policy();
+  kernel.set_collision_validation_policy_snapshot(make_contact_rule_test_policy());
   ValidationOutcomeRecorder outcome(kernel);
 
-  const auto result = execute_sync(make_test_request("fresh_plan_contact_policy"));
+  const auto result = execute_sync(make_test_request("fresh_plan_contact_rule"));
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(planner.plan_count, 1);
@@ -6459,11 +6486,9 @@ TEST_F(ExecutionKernelTest, Execute_BoundedPenetrationLaterFirstContactEmitsNati
   auto policy = make_test_collision_policy_snapshot();
   policy.policy_id = "bounded-predispatch-contact";
   policy.require_full_diagnostics = true;
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  entry.max_contact_penetration_m = 0.005;
-  policy.support_contacts.push_back(entry);
+  // Whole-move contact, at most 5 mm deep; the rule carries the policy's id.
+  testing::add_contact_rule(
+      policy, testing::contact_rule(pair, 0.005, std::nullopt, policy.policy_id));
   collision_world_publisher.current_policy = policy;
   kernel.set_collision_validation_policy_snapshot(policy);
 
@@ -6471,7 +6496,7 @@ TEST_F(ExecutionKernelTest, Execute_BoundedPenetrationLaterFirstContactEmitsNati
   initially_clear.engine_status = CollisionEngineStatus::kOk;
   initially_clear.decision = CollisionDecisionResult::kPass;
   collision_engine->result_by_waypoint[0] = initially_clear;
-  collision_engine->result_by_waypoint[1] = make_support_contact_collision_result(pair, -0.006);
+  collision_engine->result_by_waypoint[1] = make_pair_collision_result(pair, -0.006);
 
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
@@ -6486,9 +6511,8 @@ TEST_F(ExecutionKernelTest, Execute_BoundedPenetrationLaterFirstContactEmitsNati
 
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorContactPolicyViolation);
-  EXPECT_EQ(snapshot.error->details.at("policy_id"), "bounded-predispatch-contact");
-  EXPECT_EQ(snapshot.error->details.at("contact_policy_id"), "bounded-predispatch-contact");
+  EXPECT_EQ(snapshot.error->code, kErrorContactRuleViolation);
+  EXPECT_EQ(snapshot.error->details.at("collision_rule_id"), "bounded-predispatch-contact");
   EXPECT_EQ(snapshot.error->details.at("within_penetration_bound"), "false");
 
   std::optional<KernelEvent> violation;
@@ -6496,7 +6520,7 @@ TEST_F(ExecutionKernelTest, Execute_BoundedPenetrationLaterFirstContactEmitsNati
   {
     std::lock_guard<std::mutex> lock(events_mutex);
     const auto found = std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
-      return event.type == KernelEventType::kContactPolicyViolation;
+      return event.type == KernelEventType::kContactRuleViolation;
     });
     if (found != events.end()) {
       violation = *found;
@@ -6513,23 +6537,24 @@ TEST_F(ExecutionKernelTest, Execute_BoundedPenetrationLaterFirstContactEmitsNati
 
   ASSERT_TRUE(violation.has_value());
   EXPECT_EQ(violation->details.at("surface"), "pre_dispatch_validation");
-  EXPECT_EQ(violation->details.at("contact_policy_id"), "bounded-predispatch-contact");
-  EXPECT_EQ(violation->details.at("policy_mode"), "bounded_penetration");
+  EXPECT_EQ(violation->details.at("collision_rule_id"), "bounded-predispatch-contact");
+  EXPECT_EQ(violation->details.at("policy_mode"), "contact");
   EXPECT_EQ(violation->details.at("initial_contact_pair_count"), "0");
   EXPECT_EQ(violation->details.at("current_contact_pair_count"), "1");
   EXPECT_EQ(violation->details.at("contact_present"), "true");
   EXPECT_EQ(violation->details.at("distance_request_mode"), "selected_colliding_pairs");
   EXPECT_EQ(violation->details.at("evaluated_distance_pair_count"), "1");
   EXPECT_DOUBLE_EQ(std::stod(violation->details.at("penetration_depth_m")), 0.006);
-  EXPECT_DOUBLE_EQ(std::stod(violation->details.at("max_contact_penetration_m")), 0.005);
+  EXPECT_DOUBLE_EQ(std::stod(violation->details.at("max_penetration_m")), 0.005);
   EXPECT_EQ(violation->details.at("within_penetration_bound"), "false");
   EXPECT_EQ(violation->details.at("response"), "block_dispatch");
   EXPECT_EQ(violation->details.find("release_evidence_mode"), violation->details.end());
 
   ASSERT_TRUE(error_raised.has_value());
   ASSERT_TRUE(error_raised->error.has_value());
-  EXPECT_EQ(error_raised->error->code, kErrorContactPolicyViolation);
-  EXPECT_EQ(error_raised->error->details.at("policy_id"), "bounded-predispatch-contact");
+  EXPECT_EQ(error_raised->error->code, kErrorContactRuleViolation);
+  EXPECT_EQ(error_raised->error->details.at("collision_rule_id"),
+            "bounded-predispatch-contact");
   EXPECT_EQ(error_raised->error->details.at("within_penetration_bound"), "false");
 }
 
@@ -6548,7 +6573,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionDiagnosticsReportClass
   collision_engine->default_result = result;
 
   auto policy = make_test_collision_policy_snapshot();
-  policy.allowed_static_static_pairs.push_back(allowed_pair);
+  policy.static_body_ids = {allowed_pair.body_a, allowed_pair.body_b};
   collision_world_publisher.current_policy = policy;
 
   std::mutex events_mutex;
@@ -6778,9 +6803,9 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplanBudgetExhaustedF
                                config);
   ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
-  // An active support contact: each fresh plan is collision-validated.
-  local_publisher.current_policy = make_support_contact_test_policy();
-  local_kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
+  // An active contact rule: each fresh plan is collision-validated.
+  local_publisher.current_policy = make_contact_rule_test_policy();
+  local_kernel.set_collision_validation_policy_snapshot(make_contact_rule_test_policy());
   local_engine->default_result = make_authoritative_collision_result();
 
   auto result = prepare_and_dispatch(local_kernel, make_test_request("replan_exhausted"));
@@ -6796,7 +6821,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplanBudgetExhaustedF
   EXPECT_EQ(snapshot.error->details.at("collision_result_decision"), "fail");
 }
 
-TEST_F(ExecutionKernelTest, Execute_AuthoritativeContactPolicyViolationRetainsReplanBehavior) {
+TEST_F(ExecutionKernelTest, Execute_AuthoritativeContactRuleViolationRetainsReplanBehavior) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
   auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
@@ -6828,17 +6853,15 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeContactPolicyViolationRetainsRe
   const CollisionPairId pair{"scene/insert/shape/0", "scene/fixture/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.policy_id = "bounded-replan-policy";
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  entry.max_contact_penetration_m = 0.005;
-  policy.support_contacts.push_back(entry);
+  // Whole-move contact, at most 5 mm deep; the rule carries the policy's id.
+  testing::add_contact_rule(
+      policy, testing::contact_rule(pair, 0.005, std::nullopt, policy.policy_id));
   local_publisher.current_policy = policy;
   local_kernel.set_collision_validation_policy_snapshot(policy);
-  local_engine->default_result = make_support_contact_collision_result(pair, -0.006);
+  local_engine->default_result = make_pair_collision_result(pair, -0.006);
 
   const auto result =
-      prepare_and_dispatch(local_kernel, make_test_request("contact_policy_replan"));
+      prepare_and_dispatch(local_kernel, make_test_request("contact_rule_replan"));
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
@@ -6847,8 +6870,8 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeContactPolicyViolationRetainsRe
   EXPECT_EQ(controlled_execution.execute_count, 0);
   const auto snapshot = local_kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorContactPolicyViolation);
-  EXPECT_EQ(snapshot.error->details.at("policy_id"), "bounded-replan-policy");
+  EXPECT_EQ(snapshot.error->code, kErrorContactRuleViolation);
+  EXPECT_EQ(snapshot.error->details.at("collision_rule_id"), "bounded-replan-policy");
 }
 
 TEST_F(ExecutionKernelTest,
@@ -6896,11 +6919,11 @@ TEST_F(ExecutionKernelTest,
   local_publisher.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(std::move(world));
 
-  auto touching = make_support_contact_collision_result(carried_contact, 0.0);
+  auto touching = make_pair_collision_result(carried_contact, 0.0);
   touching.in_collision = true;
   touching.normalized_pairs = {carried_contact};
   touching.decision = CollisionDecisionResult::kFail;
-  const auto separated = make_support_contact_collision_result(carried_contact, 0.01);
+  const auto separated = make_pair_collision_result(carried_contact, 0.01);
   local_engine->result_for_query =
       [touching, separated](const CollisionQuery& query) -> std::optional<CollisionResult> {
     return query.waypoint_index == 0 ? touching : separated;
@@ -6988,7 +7011,7 @@ TEST_F(ExecutionKernelTest, Execute_DoesNotPromoteDetachedCollisionOrNoncollidin
   local_publisher.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(std::move(world));
 
-  auto blocking = make_support_contact_collision_result(blocking_detached_pair, 0.0);
+  auto blocking = make_pair_collision_result(blocking_detached_pair, 0.0);
   blocking.in_collision = true;
   blocking.normalized_pairs = {blocking_detached_pair};
   blocking.decision = CollisionDecisionResult::kFail;
@@ -7862,6 +7885,111 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ExpandsObservedStateBeforeEngine
   EXPECT_EQ(ended_as(controlled_kernel), "completed");
 }
 
+TEST_F(ExecutionKernelTest, CollisionMonitoring_PlacesAnotherComponentWhereItIsObserved) {
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeFakeClock& local_clock = *local_clock_owner;
+  ThreadSafeManualScheduler local_scheduler;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  ExecutionKernelConfig config;
+  config.collision_monitor_period_ns = 10'000'000;
+  config.runtime_collision_immediate_query_budget_ns = 10'000'000;
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  // Another component of the cell owns the model coordinate `peer_joint`.
+  const auto peer = std::make_shared<ObservedRobotStatePublication>(
+      std::vector<std::string>{"peer_joint"},
+      std::vector<ObservedRobotStateSourceConfig>{ObservedRobotStateSourceConfig{
+          ObservedRobotStateSourceKind::kCommandedState, "peer",
+          ObservedRobotStateAuthorityProfile::kCommandedSimulation, 0}});
+  const std::vector<std::string> peer_joint{"peer_joint"};
+  const auto publish_peer = [&](double position) {
+    const std::vector<double> positions{position};
+    return peer
+        ->publish(ObservedRobotStateSourceKind::kCommandedState, peer_joint, positions, {},
+                  local_clock.now(), local_clock.now())
+        .published;
+  };
+  const auto cell = std::make_shared<CellModelStateHandle>();
+  cell->Replace(std::make_shared<const CellModelStateSources>(
+      CellModelStateSources{{ControllableComponentId("peer_robot"), peer}}));
+  auto kernel_ports = test_execution_kernel_ports(context_owner);
+  kernel_ports.cell_model_state = cell;
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
+                                    kernel_ports,
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner,
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
+                                         local_collision_engine, local_runtime_engine);
+
+  context.current_state_value.joint_names = {"j1", "j2"};
+  context.current_state_value.positions_rad = {0.0, 0.0};
+  controlled_execution.snapshot.timestamp_ns = local_clock.now();
+
+  TrajectoryDTO expanded;
+  // The adapter's expansion leaves the other component at its all-zero value.
+  expanded.joint_names = {"j1", "j2", "peer_joint"};
+  expanded.waypoints.push_back(TrajectoryWaypointDTO{0.0, {0.0, 0.0, 0.0}, {}, {}});
+  context.next_expand_result = Result<TrajectoryDTO>::Ok(expanded);
+  // Where the other component is when the move is validated and dispatched.
+  ASSERT_TRUE(publish_peer(0.4));
+
+  std::vector<std::string> queried_joint_names;
+  std::vector<double> queried_positions;
+  local_runtime_engine->on_check = [&](const CollisionQuery& query) {
+    queried_joint_names = query.robot_state.joint_names;
+    queried_positions = query.robot_state.positions_rad;
+  };
+
+  auto result = prepare_and_dispatch(controlled_kernel, make_test_request());
+  ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  const int expand_count_after_dispatch = context.expand_count;
+  // The other component moves while this robot is executing.
+  ASSERT_TRUE(publish_peer(0.9));
+  auto live_snapshot = make_test_collision_world_snapshot();
+  live_snapshot.revision = CollisionWorldRevision{100, test_digest("expanded-runtime-state")};
+  local_collision_world.current_snapshot =
+      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
+
+  ASSERT_TRUE(wait_for_pending_scheduler_work(local_scheduler))
+      << "runtime collision monitor did not schedule its first tick";
+  local_clock.advance(10'000'000);
+  local_scheduler.advance_to(local_clock.now());
+  for (int attempt = 0; attempt < 100 && local_runtime_engine->check_count.load() == 0; ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    local_scheduler.advance_to(local_clock.now());
+  }
+
+  controlled_execution.release();
+  EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
+
+  EXPECT_GE(context.expand_count, 1);
+  EXPECT_EQ(context.expand_count, expand_count_after_dispatch)
+      << "runtime collision ticks must not call the observed-state provider";
+  ASSERT_EQ(context.last_expand_trajectory.joint_names, (std::vector<std::string>{"j1", "j2"}));
+  ASSERT_GE(context.last_expand_trajectory.waypoints.size(), 1u);
+  EXPECT_EQ(context.last_expand_trajectory.waypoints.front().positions_rad,
+            (std::vector<double>{0.0, 0.0}));
+  EXPECT_EQ(queried_joint_names, (std::vector<std::string>{"j1", "j2", "peer_joint"}));
+  ASSERT_EQ(queried_positions.size(), 3u);
+  EXPECT_DOUBLE_EQ(queried_positions[0], 0.0);
+  EXPECT_DOUBLE_EQ(queried_positions[1], 0.0);
+  // Neither the adapter's all-zero value nor the position at dispatch: where
+  // the other component is at this check.
+  EXPECT_DOUBLE_EQ(queried_positions[2], 0.9);
+  EXPECT_EQ(ended_as(controlled_kernel), "completed");
+}
+
 TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesBackendObservedStateForRuntimeQuery) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
@@ -8238,18 +8366,15 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseAllowsBoundedOngoi
   const CollisionPairId pair{"scene/part/shape/0", "scene/support/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.require_full_diagnostics = true;
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.max_start_penetration_m = 0.010;
-  entry.require_separation_by_end = true;
-  entry.require_strictly_decreasing_penetration = true;
-  policy.support_contacts.push_back(entry);
+  CollisionReleaseRule release;
+  release.max_start_penetration_m = 0.010;
+  testing::add_contact_rule(policy, testing::release_rule(pair, release));
   local_collision_world.current_policy = policy;
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
   local_collision_engine->result_by_waypoint[0] =
-      make_support_contact_collision_result(pair, -0.004);
+      make_pair_collision_result(pair, -0.004);
   local_collision_engine->result_by_waypoint[1] =
-      make_support_contact_collision_result(pair, 0.002);
+      make_pair_collision_result(pair, 0.002);
 
   auto result = prepare_and_dispatch(controlled_kernel, make_test_request());
   ASSERT_TRUE(result.ok());
@@ -8257,7 +8382,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseAllowsBoundedOngoi
       << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   local_runtime_engine->result_by_waypoint.clear();
-  local_runtime_engine->default_result = make_support_contact_collision_result(pair, -0.004);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.004);
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
   const int baseline_stop_count = controlled_execution.stop_count_value();
 
@@ -8303,32 +8428,28 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleasePenetrationIncreas
   const CollisionPairId pair{"scene/part/shape/0", "scene/support/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.require_full_diagnostics = true;
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.max_start_penetration_m = 0.010;
-  entry.release_tolerance_m = 1e-5;
-  entry.require_separation_by_end = true;
-  entry.require_strictly_decreasing_penetration = true;
-  policy.support_contacts.push_back(entry);
+  CollisionReleaseRule release;
+  release.max_start_penetration_m = 0.010;
+  testing::add_contact_rule(policy, testing::release_rule(pair, release));
   local_collision_world.current_policy = policy;
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
   local_collision_engine->result_by_waypoint[0] =
-      make_support_contact_collision_result(pair, -0.004);
+      make_pair_collision_result(pair, -0.004);
   local_collision_engine->result_by_waypoint[1] =
-      make_support_contact_collision_result(pair, 0.002);
+      make_pair_collision_result(pair, 0.002);
   auto result = prepare_and_dispatch(controlled_kernel, make_test_request());
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(controlled_execution.wait_until_execute_called())
       << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   local_runtime_engine->result_by_waypoint.clear();
-  local_runtime_engine->default_result = make_support_contact_collision_result(pair, -0.004);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.004);
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
   ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
   ASSERT_EQ(controlled_execution.stop_count_value(), 0);
 
-  local_runtime_engine->default_result = make_support_contact_collision_result(pair, -0.006);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.006);
   local_clock.advance(10'000'000);
   controlled_execution.set_progress(0.50, {0.50, 0.90}, local_clock.now());
   auto tick = controlled_kernel.collision_check_tick();
@@ -8345,11 +8466,11 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleasePenetrationIncreas
   std::lock_guard<std::mutex> events_lock(events_mutex);
   const auto violation_event =
       std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
-        return event.type == KernelEventType::kContactPolicyViolation;
+        return event.type == KernelEventType::kContactRuleViolation;
       });
   ASSERT_NE(violation_event, events.end());
   EXPECT_EQ(violation_event->details.at("surface"), "observed_runtime_monitor");
-  EXPECT_EQ(violation_event->details.at("policy_mode"), "contact_release");
+  EXPECT_EQ(violation_event->details.at("policy_mode"), "release");
   EXPECT_EQ(violation_event->details.at("release_evidence_mode"), "signed_penetration");
   EXPECT_EQ(violation_event->details.at("contact_body_a"), pair.body_a);
   EXPECT_EQ(violation_event->details.at("contact_body_b"), pair.body_b);
@@ -8361,7 +8482,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleasePenetrationIncreas
   EXPECT_EQ(violation_event->details.at("response"), "preempt_trajectory");
   EXPECT_EQ(violation_event->details.at("classification"), "blocking_collision");
   EXPECT_DOUBLE_EQ(std::stod(violation_event->details.at("penetration_depth_m")), 0.006);
-  EXPECT_EQ(violation_event->details.find("max_contact_penetration_m"),
+  EXPECT_EQ(violation_event->details.find("max_penetration_m"),
             violation_event->details.end());
 }
 
@@ -8398,31 +8519,29 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_BoundedPenetrationEvaluatesLater
   auto policy = make_test_collision_policy_snapshot();
   policy.policy_id = "bounded-runtime-contact";
   policy.require_full_diagnostics = true;
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  entry.max_contact_penetration_m = 0.005;
-  policy.support_contacts.push_back(entry);
+  // Whole-move contact, at most 5 mm deep; the rule carries the policy's id.
+  testing::add_contact_rule(
+      policy, testing::contact_rule(pair, 0.005, std::nullopt, policy.policy_id));
   local_collision_world.current_policy = policy;
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
   // Predispatch also starts clear and admits a later/final in-bound contact.
   local_collision_engine->result_by_waypoint[0] =
-      make_support_contact_collision_result(pair, 0.002);
+      make_pair_collision_result(pair, 0.002);
   local_collision_engine->result_by_waypoint[1] =
-      make_support_contact_collision_result(pair, -0.004);
+      make_pair_collision_result(pair, -0.004);
   auto result = prepare_and_dispatch(controlled_kernel, make_test_request());
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(controlled_execution.wait_until_execute_called());
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
   local_runtime_engine->result_by_waypoint.clear();
-  local_runtime_engine->default_result = make_support_contact_collision_result(pair, 0.002);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, 0.002);
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
   ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
   ASSERT_EQ(controlled_execution.stop_count_value(), 0);
 
-  local_runtime_engine->default_result = make_support_contact_collision_result(pair, -0.006);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.006);
   local_clock.advance(10'000'000);
   controlled_execution.set_progress(0.50, {0.50, 0.90}, local_clock.now());
   ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
@@ -8432,18 +8551,18 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_BoundedPenetrationEvaluatesLater
 
   std::lock_guard<std::mutex> events_lock(events_mutex);
   const auto violation = std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
-    return event.type == KernelEventType::kContactPolicyViolation &&
-           event.details.at("policy_mode") == "bounded_penetration";
+    return event.type == KernelEventType::kContactRuleViolation &&
+           event.details.at("policy_mode") == "contact";
   });
   ASSERT_NE(violation, events.end());
-  EXPECT_EQ(violation->details.at("contact_policy_id"), "bounded-runtime-contact");
+  EXPECT_EQ(violation->details.at("collision_rule_id"), "bounded-runtime-contact");
   EXPECT_EQ(violation->details.at("initial_contact_pair_count"), "0");
   EXPECT_EQ(violation->details.at("current_contact_pair_count"), "1");
   EXPECT_EQ(violation->details.at("contact_present"), "true");
   EXPECT_EQ(violation->details.at("distance_request_mode"), "selected_colliding_pairs");
   EXPECT_EQ(violation->details.at("evaluated_distance_pair_count"), "1");
   EXPECT_DOUBLE_EQ(std::stod(violation->details.at("penetration_depth_m")), 0.006);
-  EXPECT_DOUBLE_EQ(std::stod(violation->details.at("max_contact_penetration_m")), 0.005);
+  EXPECT_DOUBLE_EQ(std::stod(violation->details.at("max_penetration_m")), 0.005);
   EXPECT_EQ(violation->details.at("within_penetration_bound"), "false");
   EXPECT_EQ(violation->details.find("release_evidence_mode"), violation->details.end());
 }
@@ -8480,18 +8599,16 @@ TEST_F(ExecutionKernelTest,
   auto policy = make_test_collision_policy_snapshot();
   policy.policy_id = "bounded-runtime-missing-clearance";
   policy.require_full_diagnostics = true;
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  entry.max_contact_penetration_m = 0.005;
-  policy.support_contacts.push_back(entry);
+  // Whole-move contact, at most 5 mm deep; the rule carries the policy's id.
+  testing::add_contact_rule(
+      policy, testing::contact_rule(pair, 0.005, std::nullopt, policy.policy_id));
   local_collision_world.current_policy = policy;
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
   local_collision_engine->result_by_waypoint[0] =
-      make_support_contact_collision_result(pair, 0.002);
+      make_pair_collision_result(pair, 0.002);
   local_collision_engine->result_by_waypoint[1] =
-      make_support_contact_collision_result(pair, 0.002);
+      make_pair_collision_result(pair, 0.002);
   auto result = prepare_and_dispatch(controlled_kernel, make_test_request());
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(controlled_execution.wait_until_execute_called());
@@ -8514,120 +8631,129 @@ TEST_F(ExecutionKernelTest,
   std::lock_guard<std::mutex> events_lock(events_mutex);
   const auto violation = std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
     const auto reason = event.details.find("violation_reason");
-    return event.type == KernelEventType::kContactPolicyViolation &&
+    return event.type == KernelEventType::kContactRuleViolation &&
            reason != event.details.end() && reason->second == "missing_contact_release_clearance";
   });
   ASSERT_NE(violation, events.end());
   ASSERT_NE(violation->details.find("policy_mode"), violation->details.end());
-  EXPECT_EQ(violation->details.at("policy_mode"), "bounded_penetration");
+  EXPECT_EQ(violation->details.at("policy_mode"), "contact");
   EXPECT_EQ(violation->details.at("violation_reason"), "missing_contact_release_clearance");
-  ASSERT_NE(violation->details.find("contact_policy_id"), violation->details.end());
-  EXPECT_EQ(violation->details.at("contact_policy_id"), "bounded-runtime-missing-clearance");
-  EXPECT_EQ(violation->details.at("zone_id"),
-            "support_pair:scene/fixture/shape/0<->scene/insert/shape/0");
-  EXPECT_EQ(violation->details.at("contact_body_a"), "scene/fixture/shape/0");
+  ASSERT_NE(violation->details.find("collision_rule_id"), violation->details.end());
+  EXPECT_EQ(violation->details.at("collision_rule_id"), "bounded-runtime-missing-clearance");
   EXPECT_EQ(violation->details.at("contact_body_b"), "scene/insert/shape/0");
   EXPECT_EQ(violation->details.at("contact_present"), "true");
   EXPECT_EQ(violation->details.at("distance_request_mode"), "selected_colliding_pairs");
   EXPECT_EQ(violation->details.at("evaluated_distance_pair_count"), "0");
   EXPECT_EQ(violation->details.at("classification"), "diagnostic_incomplete");
-  ASSERT_NE(violation->details.find("max_contact_penetration_m"), violation->details.end());
-  EXPECT_DOUBLE_EQ(std::stod(violation->details.at("max_contact_penetration_m")), 0.005);
+  ASSERT_NE(violation->details.find("max_penetration_m"), violation->details.end());
+  EXPECT_DOUBLE_EQ(std::stod(violation->details.at("max_penetration_m")), 0.005);
   EXPECT_EQ(violation->details.find("within_penetration_bound"), violation->details.end());
   EXPECT_EQ(violation->details.find("penetration_depth_m"), violation->details.end());
   EXPECT_EQ(violation->details.find("current_penetration_m"), violation->details.end());
 }
 
-TEST_F(ExecutionKernelTest, Execute_ResolvedContactGraspInstallsExactEphemeralPolicy) {
+TEST_F(ExecutionKernelTest, Execute_ContactRuleInstallsExactlyItsPairsForTheMove) {
   // SetUp installs the authoritative collision resources for the fixture's
   // Kernel. A second install is prohibited without an Apply fence.
-  install_mock_contact_grasp_world(collision_world_publisher, "graspable",
+  install_mock_contact_rule_world(collision_world_publisher, "graspable",
                                    {"right_finger", "left_finger"});
   install_mock_detached_logical_object(collision_world_publisher, "graspable");
 
   const CollisionBodyId allowed_body("component/arm/model/arm_model/body/right_finger/collision/0");
-  auto request = make_test_request("resolved_contact_grasp");
-  request.contact_policy_id = "pick_grasp";
-  request.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
-      RuntimeObjectId("selected_object"), SceneResourceId("graspable")}};
-  request.resolved_contact_grasp =
-      ResolvedContactGraspBindingDTO{ContactPolicyId("pick_grasp"),
-                                     ContactPolicyRevision(kTestDigestA),
-                                     RuntimeObjectId("selected_object"),
-                                     SceneResourceId("graspable"),
-                                     {allowed_body},
-                                     ContactGraspEnvelopeDTO{0.002, 0.75}};
+  auto request = make_test_request("contact_rule");
+  request.collision_rules = {
+      CollisionRule{"pick_grasp",
+                    {CollisionRuleResolvedBodiesSelection{{allowed_body}}},
+                    {CollisionRuleSceneObjectSelection{SceneResourceId("graspable")}},
+                    CollisionContactRule{0.002, 0.75, std::nullopt}}};
 
   const auto result = execute_sync(request);
   ASSERT_TRUE(result.ok()) << result.error().code << ": " << result.error().message;
   EXPECT_EQ(ended_as(kernel), "completed");
-  ASSERT_TRUE(planner.last_request.contact_policy_id.has_value());
-  EXPECT_EQ(planner.last_request.contact_policy_id->rfind("contact_grasp.bound.", 0), 0U);
   ASSERT_TRUE(planner.last_request.retained_collision_policy);
   const auto& effective_policy = *planner.last_request.retained_collision_policy;
-  ASSERT_EQ(effective_policy.contact_grasps.size(), 1U);
-  const auto& grasp = effective_policy.contact_grasps.front();
-  EXPECT_EQ(grasp.policy_id, *planner.last_request.contact_policy_id);
-  EXPECT_EQ(grasp.selected_object_id, "graspable");
-  EXPECT_EQ(grasp.allowed_robot_links, std::vector<std::string>{allowed_body});
-  EXPECT_DOUBLE_EQ(grasp.max_penetration_m, 0.002);
-  EXPECT_DOUBLE_EQ(grasp.terminal_window_start_fraction, 0.75);
+  ASSERT_EQ(effective_policy.contact_rules.size(), 1U);
+  const auto& grasp = effective_policy.contact_rules.front();
+  EXPECT_EQ(grasp.rule_id, "pick_grasp");
+  EXPECT_EQ(grasp.pair, (CollisionPairId{allowed_body, "scene/graspable/shape/0"}));
+  ASSERT_NE(grasp.contact(), nullptr);
+  EXPECT_EQ(grasp.contact()->max_penetration_m, std::optional<double>{0.002});
+  EXPECT_DOUBLE_EQ(grasp.contact()->end_from_fraction, 0.75);
+  // The other finger keeps the first rule's clearance to the object; the
+  // ruled pair has none.
+  const auto& margins = planner.last_request.retained_clearance_margins;
+  ASSERT_TRUE(margins);
+  EXPECT_DOUBLE_EQ(margins->margin_for(grasp.pair), 0.0);
+  EXPECT_DOUBLE_EQ(
+      margins->margin_for(CollisionPairId{
+          "component/arm/model/arm_model/body/left_finger/collision/0", "scene/graspable/shape/0"}),
+      kDefaultCollisionClearanceM);
 
   ASSERT_TRUE(collision_world_publisher.current_policy.has_value());
-  EXPECT_TRUE(collision_world_publisher.current_policy->contact_grasps.empty())
-      << "operation-local binding must not mutate configured policy";
-  ASSERT_TRUE(collision_world_publisher.current_logical_scene);
-  ASSERT_EQ(collision_world_publisher.current_logical_scene->objects.size(), 1U);
-  EXPECT_TRUE(std::holds_alternative<CellFixedSceneObjectPlacementDTO>(
-      collision_world_publisher.current_logical_scene->objects.front().placement));
+  EXPECT_TRUE(collision_world_publisher.current_policy->contact_rules.empty())
+      << "a move's rules must not change the published policy";
 }
 
-TEST_F(ExecutionKernelTest, Execute_ResolvedContactReleaseInstallsOnlyExactDeparturePairs) {
-  // SetUp installs the authoritative collision resources for the fixture's
-  // Kernel. A second install is prohibited without an Apply fence.
-  install_mock_contact_grasp_world(collision_world_publisher, "graspable",
+TEST_F(ExecutionKernelTest, Execute_ReleaseRuleInstallsExactlyItsPairsForTheMove) {
+  install_mock_contact_rule_world(collision_world_publisher, "graspable",
                                    {"right_finger", "left_finger"});
   install_mock_detached_logical_object(collision_world_publisher, "graspable");
 
   const CollisionBodyId allowed_body("component/arm/model/arm_model/body/right_finger/collision/0");
-  auto request = make_test_request("resolved_contact_grasp");
-  request.contact_policy_id = "pick_grasp";
-  request.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
-      RuntimeObjectId("selected_object"), SceneResourceId("graspable")}};
-  request.resolved_contact_grasp =
-      ResolvedContactGraspBindingDTO{ContactPolicyId("pick_grasp"),
-                                     ContactPolicyRevision(kTestDigestA),
-                                     RuntimeObjectId("selected_object"),
-                                     SceneResourceId("graspable"),
-                                     {allowed_body},
-                                     ContactReleaseEnvelopeDTO{ContactReleaseEvidenceModeDTO::kSignedPenetration, true, 0.002}};
+  auto request = make_test_request("release_rule");
+  CollisionReleaseRule departure;
+  departure.max_start_penetration_m = 0.002;
+  request.collision_rules = {
+      CollisionRule{"pick_release",
+                    {CollisionRuleResolvedBodiesSelection{{allowed_body}}},
+                    {CollisionRuleSceneObjectSelection{SceneResourceId("graspable")}},
+                    departure}};
 
   const auto result = execute_sync(request);
   ASSERT_TRUE(result.ok()) << result.error().code << ": " << result.error().message;
   EXPECT_EQ(ended_as(kernel), "completed");
-  EXPECT_FALSE(planner.last_request.contact_policy_id.has_value());
   ASSERT_TRUE(planner.last_request.retained_collision_policy);
   const auto& effective_policy = *planner.last_request.retained_collision_policy;
-  EXPECT_TRUE(effective_policy.contact_grasps.empty());
-  ASSERT_EQ(effective_policy.support_contacts.size(), 1U);
-  const auto& release = effective_policy.support_contacts.front();
-  EXPECT_EQ(release.mode, CollisionContactPolicyMode::kContactRelease);
+  ASSERT_EQ(effective_policy.contact_rules.size(), 1U);
+  const auto& release = effective_policy.contact_rules.front();
+  EXPECT_EQ(release.rule_id, "pick_release");
   EXPECT_EQ(release.pair, (CollisionPairId{allowed_body, "scene/graspable/shape/0"}));
-  EXPECT_DOUBLE_EQ(release.max_start_penetration_m, 0.002);
-  EXPECT_TRUE(release.require_strictly_decreasing_penetration);
-  EXPECT_TRUE(release.require_separation_by_end);
-  EXPECT_FALSE(release.allow_recontact);
+  ASSERT_NE(release.release(), nullptr);
+  EXPECT_EQ(*release.release(), departure);
 
   ASSERT_TRUE(collision_world_publisher.current_policy.has_value());
-  EXPECT_TRUE(collision_world_publisher.current_policy->support_contacts.empty())
-      << "operation-local binding must not mutate configured policy";
-  ASSERT_TRUE(collision_world_publisher.current_logical_scene);
-  ASSERT_EQ(collision_world_publisher.current_logical_scene->objects.size(), 1U);
-  EXPECT_TRUE(std::holds_alternative<CellFixedSceneObjectPlacementDTO>(
-      collision_world_publisher.current_logical_scene->objects.front().placement));
+  EXPECT_TRUE(collision_world_publisher.current_policy->contact_rules.empty())
+      << "a move's rules must not change the published policy";
 }
 
-TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspAllowsBoundedRuntimeContact) {
+TEST_F(ExecutionKernelTest, Execute_RefusesRulesThatOverlapOrNameNothing) {
+  install_mock_contact_rule_world(collision_world_publisher, "graspable", {"right_finger"});
+  install_mock_detached_logical_object(collision_world_publisher, "graspable");
+  const CollisionBodyId finger("component/arm/model/arm_model/body/right_finger/collision/0");
+  const auto rule = [&](std::string rule_id, const char* object) {
+    return CollisionRule{std::move(rule_id),
+                         {CollisionRuleResolvedBodiesSelection{{finger}}},
+                         {CollisionRuleSceneObjectSelection{SceneResourceId(object)}},
+                         CollisionContactRule{std::nullopt, 0.0, std::nullopt}};
+  };
+
+  auto overlapping = make_test_request("overlapping_rules");
+  overlapping.collision_rules = {rule("first", "graspable"), rule("second", "graspable")};
+  auto refused = execute_sync(overlapping);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, kErrorInvalidCollisionRule);
+  EXPECT_EQ(refused.error().details.at("reason"), "collision_rules_overlap");
+
+  auto unresolved = make_test_request("unresolved_rule");
+  unresolved.collision_rules = {rule("absent_object", "absent")};
+  refused = execute_sync(unresolved);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "collision_rule_selection_unresolved");
+  EXPECT_EQ(refused.error().details.at("collision_rule_id"), "absent_object");
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest, CollisionMonitoring_WindowedContactRuleAllowsBoundedRuntimeContact) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
   auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
@@ -8648,18 +8774,19 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspAllowsBoundedRuntime
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
-  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  constexpr const char* kRuleId = "fingers_on_graspable";
   const CollisionPairId pair{"component/arm/model/arm_model/body/right_finger/collision/0",
                              "scene/graspable/shape/0"};
-  auto policy = make_contact_grasp_policy_snapshot(kPolicyId, "graspable",
-                                                   {"right_finger", "left_finger"}, 0.002);
+  // The published policy holds no rule: the move brings its own.
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
   local_collision_world.current_policy = policy;
-  install_mock_contact_grasp_world(local_collision_world, "graspable",
+  install_mock_contact_rule_world(local_collision_world, "graspable",
                                    {"right_finger", "left_finger"});
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
-  auto request = make_test_request("runtime_contact_grasp_allowed");
-  bind_resolved_contact_grasp(request, local_collision_world, kPolicyId, "graspable",
+  auto request = make_test_request("runtime_contact_rule_allowed");
+  add_admitted_contact_rule(request, local_collision_world, kRuleId, "graspable",
                               {"right_finger", "left_finger"}, 0.002);
   auto result = prepare_and_dispatch(controlled_kernel, request);
   ASSERT_TRUE(result.ok());
@@ -8668,7 +8795,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspAllowsBoundedRuntime
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
   local_runtime_engine->result_by_waypoint.clear();
-  local_runtime_engine->default_result = make_contact_grasp_collision_result(pair, -0.001);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.001);
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
   const int baseline_stop_count = controlled_execution.stop_count_value();
 
@@ -8681,7 +8808,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspAllowsBoundedRuntime
   controlled_kernel.wait_for_completion();
 }
 
-TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspPenetrationExceededFailsClosed) {
+TEST_F(ExecutionKernelTest, CollisionMonitoring_WindowedContactRulePenetrationExceededFailsClosed) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
   auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
@@ -8709,18 +8836,19 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspPenetrationExceededF
     events.push_back(event);
   });
 
-  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  constexpr const char* kRuleId = "fingers_on_graspable";
   const CollisionPairId pair{"component/arm/model/arm_model/body/right_finger/collision/0",
                              "scene/graspable/shape/0"};
-  auto policy = make_contact_grasp_policy_snapshot(kPolicyId, "graspable",
-                                                   {"right_finger", "left_finger"}, 0.002);
+  // The published policy holds no rule: the move brings its own.
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
   local_collision_world.current_policy = policy;
-  install_mock_contact_grasp_world(local_collision_world, "graspable",
+  install_mock_contact_rule_world(local_collision_world, "graspable",
                                    {"right_finger", "left_finger"});
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
-  auto request = make_test_request("runtime_contact_grasp_over_limit");
-  bind_resolved_contact_grasp(request, local_collision_world, kPolicyId, "graspable",
+  auto request = make_test_request("runtime_contact_rule_over_limit");
+  add_admitted_contact_rule(request, local_collision_world, kRuleId, "graspable",
                               {"right_finger", "left_finger"}, 0.002);
   auto result = prepare_and_dispatch(controlled_kernel, request);
   ASSERT_TRUE(result.ok());
@@ -8729,7 +8857,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspPenetrationExceededF
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
   local_runtime_engine->result_by_waypoint.clear();
-  local_runtime_engine->default_result = make_contact_grasp_collision_result(pair, -0.006);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.006);
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
 
   auto tick = controlled_kernel.collision_check_tick();
@@ -8741,22 +8869,18 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspPenetrationExceededF
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("reason"), "runtime_collision_detected");
-  EXPECT_EQ(latch->at("collision_result_raw_contact_grasp_violation"),
-            "grasp_contact_penetration_exceeded");
-  EXPECT_TRUE(
-      is_bound_contact_grasp_policy(latch->at("collision_result_raw_contact_grasp_policy_id")));
+  EXPECT_EQ(latch->at("collision_result_raw_contact_rule_violation"),
+            "contact_penetration_exceeded");
+  EXPECT_EQ(latch->at("collision_result_raw_contact_rule_id"), kRuleId);
 
   std::lock_guard<std::mutex> events_lock(events_mutex);
   const auto violation = std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
-    return event.type == KernelEventType::kContactPolicyViolation &&
-           event.details.at("violation_reason") == "grasp_contact_penetration_exceeded";
+    return event.type == KernelEventType::kContactRuleViolation &&
+           event.details.at("violation_reason") == "contact_penetration_exceeded";
   });
   ASSERT_NE(violation, events.end());
-  EXPECT_TRUE(is_bound_contact_grasp_policy(violation->details.at("contact_policy_id")));
-  EXPECT_EQ(violation->details.at("policy_mode"), "contact_grasp");
-  EXPECT_EQ(violation->details.at("zone_id"),
-            "contact_grasp_pair:component/arm/model/arm_model/body/"
-            "right_finger/collision/0<->scene/graspable/shape/0");
+  EXPECT_EQ(violation->details.at("collision_rule_id"), kRuleId);
+  EXPECT_EQ(violation->details.at("policy_mode"), "contact");
   EXPECT_EQ(violation->details.at("contact_body_a"), pair.body_a);
   EXPECT_EQ(violation->details.at("contact_body_b"), pair.body_b);
   EXPECT_EQ(violation->details.at("contact_present"), "true");
@@ -8772,7 +8896,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspPenetrationExceededF
 }
 
 TEST_F(ExecutionKernelTest,
-       CollisionMonitoring_ContactGraspMixedAllowedAndViolationKeepsViolation) {
+       CollisionMonitoring_WindowedContactRuleMixedAllowedAndViolationKeepsViolation) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
   auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
@@ -8794,20 +8918,21 @@ TEST_F(ExecutionKernelTest,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
-  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  constexpr const char* kRuleId = "fingers_on_graspable";
   const CollisionPairId violating_pair{
       "component/arm/model/arm_model/body/right_finger/collision/0", "scene/graspable/shape/0"};
   const CollisionPairId allowed_pair{"component/arm/model/arm_model/body/left_finger/collision/0",
                                      "scene/graspable/shape/0"};
-  auto policy = make_contact_grasp_policy_snapshot(kPolicyId, "graspable",
-                                                   {"right_finger", "left_finger"}, 0.002);
+  // The published policy holds no rule: the move brings its own.
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
   local_collision_world.current_policy = policy;
-  install_mock_contact_grasp_world(local_collision_world, "graspable",
+  install_mock_contact_rule_world(local_collision_world, "graspable",
                                    {"right_finger", "left_finger"});
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
-  auto request = make_test_request("runtime_contact_grasp_mixed_pairs");
-  bind_resolved_contact_grasp(request, local_collision_world, kPolicyId, "graspable",
+  auto request = make_test_request("runtime_contact_rule_mixed_pairs");
+  add_admitted_contact_rule(request, local_collision_world, kRuleId, "graspable",
                               {"right_finger", "left_finger"}, 0.002);
   auto result = prepare_and_dispatch(controlled_kernel, request);
   ASSERT_TRUE(result.ok());
@@ -8836,14 +8961,14 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
-  EXPECT_EQ(latch->at("collision_result_raw_contact_grasp_violation"),
-            "grasp_contact_penetration_exceeded");
+  EXPECT_EQ(latch->at("collision_result_raw_contact_rule_violation"),
+            "contact_penetration_exceeded");
   EXPECT_EQ(latch->at("collision_result_first_failure_pair"),
             "component/arm/model/arm_model/body/right_finger/collision/0 <-> "
             "scene/graspable/shape/0");
 }
 
-TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspMissingClearanceFailsClosed) {
+TEST_F(ExecutionKernelTest, CollisionMonitoring_WindowedContactRuleMissingClearanceFailsClosed) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
   auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
@@ -8871,18 +8996,19 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspMissingClearanceFail
     events.push_back(event);
   });
 
-  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  constexpr const char* kRuleId = "fingers_on_graspable";
   const CollisionPairId pair{"component/arm/model/arm_model/body/right_finger/collision/0",
                              "scene/graspable/shape/0"};
-  auto policy = make_contact_grasp_policy_snapshot(kPolicyId, "graspable",
-                                                   {"right_finger", "left_finger"}, 0.002);
+  // The published policy holds no rule: the move brings its own.
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
   local_collision_world.current_policy = policy;
-  install_mock_contact_grasp_world(local_collision_world, "graspable",
+  install_mock_contact_rule_world(local_collision_world, "graspable",
                                    {"right_finger", "left_finger"});
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
-  auto request = make_test_request("runtime_contact_grasp_missing_clearance");
-  bind_resolved_contact_grasp(request, local_collision_world, kPolicyId, "graspable",
+  auto request = make_test_request("runtime_contact_rule_missing_clearance");
+  add_admitted_contact_rule(request, local_collision_world, kRuleId, "graspable",
                               {"right_finger", "left_finger"}, 0.002);
   auto result = prepare_and_dispatch(controlled_kernel, request);
   ASSERT_TRUE(result.ok());
@@ -8890,7 +9016,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspMissingClearanceFail
       << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
-  auto runtime_result = make_contact_grasp_collision_result(pair, -0.001);
+  auto runtime_result = make_pair_collision_result(pair, -0.001);
   runtime_result.pair_clearances.clear();
   runtime_result.min_clearance_m.reset();
   runtime_result.min_clearance_pair.reset();
@@ -8910,20 +9036,17 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspMissingClearanceFail
   EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
-  EXPECT_EQ(latch->at("collision_result_raw_contact_grasp_violation"),
+  EXPECT_EQ(latch->at("collision_result_raw_contact_rule_violation"),
             "missing_grasp_contact_clearance");
 
   std::lock_guard<std::mutex> events_lock(events_mutex);
   const auto violation = std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
-    return event.type == KernelEventType::kContactPolicyViolation &&
+    return event.type == KernelEventType::kContactRuleViolation &&
            event.details.at("violation_reason") == "missing_grasp_contact_clearance";
   });
   ASSERT_NE(violation, events.end());
-  EXPECT_TRUE(is_bound_contact_grasp_policy(violation->details.at("contact_policy_id")));
-  EXPECT_EQ(violation->details.at("policy_mode"), "contact_grasp");
-  EXPECT_EQ(violation->details.at("zone_id"),
-            "contact_grasp_pair:component/arm/model/arm_model/body/"
-            "right_finger/collision/0<->scene/graspable/shape/0");
+  EXPECT_EQ(violation->details.at("collision_rule_id"), kRuleId);
+  EXPECT_EQ(violation->details.at("policy_mode"), "contact");
   EXPECT_EQ(violation->details.at("contact_body_a"), pair.body_a);
   EXPECT_EQ(violation->details.at("contact_body_b"), pair.body_b);
   EXPECT_EQ(violation->details.at("contact_present"), "true");
@@ -8938,7 +9061,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspMissingClearanceFail
   EXPECT_EQ(violation->details.find("within_penetration_bound"), violation->details.end());
 }
 
-TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspUnexpectedPairFailsClosed) {
+TEST_F(ExecutionKernelTest, CollisionMonitoring_WindowedContactRuleUnexpectedPairFailsClosed) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
   auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
@@ -8966,18 +9089,19 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspUnexpectedPairFailsC
     events.push_back(event);
   });
 
-  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  constexpr const char* kRuleId = "fingers_on_graspable";
   const CollisionPairId unexpected_pair{
       "component/arm/model/arm_model/body/right_finger/collision/0", "scene/other_part/shape/0"};
-  auto policy = make_contact_grasp_policy_snapshot(kPolicyId, "graspable",
-                                                   {"right_finger", "left_finger"}, 0.002);
+  // The published policy holds no rule: the move brings its own.
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
   local_collision_world.current_policy = policy;
-  install_mock_contact_grasp_world(local_collision_world, "graspable",
+  install_mock_contact_rule_world(local_collision_world, "graspable",
                                    {"right_finger", "left_finger"});
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
-  auto request = make_test_request("runtime_contact_grasp_unexpected_pair");
-  bind_resolved_contact_grasp(request, local_collision_world, kPolicyId, "graspable",
+  auto request = make_test_request("runtime_contact_rule_unexpected_pair");
+  add_admitted_contact_rule(request, local_collision_world, kRuleId, "graspable",
                               {"right_finger", "left_finger"}, 0.002);
   auto result = prepare_and_dispatch(controlled_kernel, request);
   ASSERT_TRUE(result.ok());
@@ -8985,7 +9109,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspUnexpectedPairFailsC
       << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
-  auto runtime_result = make_contact_grasp_collision_result(unexpected_pair, -0.001);
+  auto runtime_result = make_pair_collision_result(unexpected_pair, -0.001);
   runtime_result.pair_clearances.clear();
   runtime_result.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
   runtime_result.decision = CollisionDecisionResult::kInconclusiveFail;
@@ -9004,20 +9128,20 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspUnexpectedPairFailsC
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
   EXPECT_EQ(latch->at("reason"), "runtime_collision_monitor_inconclusive");
-  EXPECT_EQ(latch->find("collision_result_raw_contact_grasp_violation"), latch->end());
+  EXPECT_EQ(latch->find("collision_result_raw_contact_rule_violation"), latch->end());
   EXPECT_EQ(latch->find("collision_result_first_failure_pair"), latch->end());
 
   std::lock_guard<std::mutex> events_lock(events_mutex);
   EXPECT_EQ(std::find_if(events.begin(), events.end(),
                          [](const auto& event) {
-                           return event.type == KernelEventType::kContactPolicyViolation;
+                           return event.type == KernelEventType::kContactRuleViolation;
                          }),
             events.end());
 }
 
-// A move keeps its admitted operation-local contact policy for the whole
-// move; the published policy never carries it.
-TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspHeldAcrossTicks) {
+// A move keeps its admitted contact and release rules for the whole
+// move; the published policy never carries them.
+TEST_F(ExecutionKernelTest, CollisionMonitoring_WindowedContactRuleHeldAcrossTicks) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
   auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
@@ -9039,34 +9163,33 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspHeldAcrossTicks) {
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
-  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  constexpr const char* kRuleId = "fingers_on_graspable";
   const CollisionPairId pair{"component/arm/model/arm_model/body/right_finger/collision/0",
                              "scene/graspable/shape/0"};
-  auto policy = make_contact_grasp_policy_snapshot(kPolicyId, "graspable",
-                                                   {"right_finger", "left_finger"}, 0.002);
+  // The published policy holds no rule: the move brings its own.
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
   local_collision_world.current_policy = policy;
-  install_mock_contact_grasp_world(local_collision_world, "graspable",
+  install_mock_contact_rule_world(local_collision_world, "graspable",
                                    {"right_finger", "left_finger"});
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
-  auto request = make_test_request("runtime_contact_grasp_held");
-  bind_resolved_contact_grasp(request, local_collision_world, kPolicyId, "graspable",
+  auto request = make_test_request("runtime_contact_rule_held");
+  add_admitted_contact_rule(request, local_collision_world, kRuleId, "graspable",
                               {"right_finger", "left_finger"}, 0.002);
   ASSERT_TRUE(prepare_and_dispatch(controlled_kernel, request).ok());
   ASSERT_TRUE(controlled_execution.wait_until_execute_called())
       << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   ASSERT_TRUE(local_collision_world.current_policy.has_value());
-  ASSERT_FALSE(local_collision_world.current_policy->contact_grasps.empty());
-  EXPECT_FALSE(is_bound_contact_grasp_policy(
-      local_collision_world.current_policy->contact_grasps.front().policy_id))
-      << "the published policy never carries the operation-local grasp";
+  EXPECT_TRUE(local_collision_world.current_policy->contact_rules.empty())
+      << "the published policy never carries the move's rules";
 
   local_runtime_engine->result_by_waypoint.clear();
   const int baseline_checks = local_runtime_engine->check_count.load();
   for (const double clearance : {-0.0005, -0.001, -0.0015}) {
     local_clock.advance(10'000'000);
-    local_runtime_engine->default_result = make_contact_grasp_collision_result(pair, clearance);
+    local_runtime_engine->default_result = make_pair_collision_result(pair, clearance);
     controlled_execution.set_progress(0.5, {0.5, 0.5}, local_clock.now());
     ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
     EXPECT_FALSE(collisions.latest().has_value())
@@ -9080,7 +9203,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspHeldAcrossTicks) {
   controlled_kernel.wait_for_completion();
 }
 
-TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseKeepsItsSupportContacts) {
+TEST_F(ExecutionKernelTest, CollisionMonitoring_ReleaseRuleKeepsItsPairs) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
   auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
@@ -9107,30 +9230,31 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseKeepsItsSupportCon
   auto policy = make_test_collision_policy_snapshot();
   policy.require_full_diagnostics = true;
   local_collision_world.current_policy = policy;
-  install_mock_contact_grasp_world(local_collision_world, "graspable", {"right_finger"});
+  install_mock_contact_rule_world(local_collision_world, "graspable", {"right_finger"});
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
   local_collision_engine->result_by_waypoint[0] =
-      make_support_contact_collision_result(pair, -0.001);
+      make_pair_collision_result(pair, -0.001);
   local_collision_engine->result_by_waypoint[1] =
-      make_support_contact_collision_result(pair, 0.002);
+      make_pair_collision_result(pair, 0.002);
 
   // A Program release (end_rest): it starts 1 mm into the object it releases.
   auto request = make_test_request("runtime_contact_release_withdraw");
-  bind_resolved_contact_grasp(request, local_collision_world, "pick_release", "graspable",
+  add_admitted_contact_rule(request, local_collision_world, "pick_release", "graspable",
                               {"right_finger"}, 0.002);
-  request.resolved_contact_grasp->envelope = ContactReleaseEnvelopeDTO{
-      ContactReleaseEvidenceModeDTO::kSignedPenetration, true, 0.002};
+  CollisionReleaseRule release;
+  release.max_start_penetration_m = 0.002;
+  request.collision_rules.front().value = release;
   ASSERT_TRUE(prepare_and_dispatch(controlled_kernel, request).ok());
   ASSERT_TRUE(controlled_execution.wait_until_execute_called())
       << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   ASSERT_TRUE(local_collision_world.current_policy.has_value());
-  EXPECT_TRUE(local_collision_world.current_policy->support_contacts.empty());
+  EXPECT_TRUE(local_collision_world.current_policy->contact_rules.empty());
 
   local_runtime_engine->result_by_waypoint.clear();
   for (const double clearance : {-0.001, -0.0005, 0.003}) {
     local_clock.advance(10'000'000);
-    local_runtime_engine->default_result = make_support_contact_collision_result(pair, clearance);
+    local_runtime_engine->default_result = make_pair_collision_result(pair, clearance);
     controlled_execution.set_progress(0.5, {0.5, 0.5}, local_clock.now());
     ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
     EXPECT_FALSE(collisions.latest().has_value())
@@ -9144,7 +9268,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseKeepsItsSupportCon
 }
 
 TEST_F(ExecutionKernelTest,
-       CollisionMonitoring_ContactGraspFollowsNewWorldWithTheAdmittedPolicy) {
+       CollisionMonitoring_WindowedContactRuleFollowsNewWorldWithTheAdmittedPolicy) {
   auto controlled_execution_owner = std::make_shared<ControlledExecution>();
   ControlledExecution& controlled_execution = *controlled_execution_owner;
   auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
@@ -9166,18 +9290,19 @@ TEST_F(ExecutionKernelTest,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
 
-  constexpr const char* kPolicyId = "contact_grasp/graspable";
+  constexpr const char* kRuleId = "fingers_on_graspable";
   const CollisionPairId pair{"component/arm/model/arm_model/body/right_finger/collision/0",
                              "scene/graspable/shape/0"};
-  auto policy = make_contact_grasp_policy_snapshot(kPolicyId, "graspable",
-                                                   {"right_finger", "left_finger"}, 0.002);
+  // The published policy holds no rule: the move brings its own.
+  auto policy = make_test_collision_policy_snapshot();
+  policy.require_full_diagnostics = true;
   local_collision_world.current_policy = policy;
-  install_mock_contact_grasp_world(local_collision_world, "graspable",
+  install_mock_contact_rule_world(local_collision_world, "graspable",
                                    {"right_finger", "left_finger"});
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
 
-  auto request = make_test_request("runtime_contact_grasp_new_world");
-  bind_resolved_contact_grasp(request, local_collision_world, kPolicyId, "graspable",
+  auto request = make_test_request("runtime_contact_rule_new_world");
+  add_admitted_contact_rule(request, local_collision_world, kRuleId, "graspable",
                               {"right_finger", "left_finger"}, 0.002);
   ASSERT_TRUE(prepare_and_dispatch(controlled_kernel, request).ok());
   ASSERT_TRUE(controlled_execution.wait_until_execute_called())
@@ -9185,17 +9310,17 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
 
   local_runtime_engine->result_by_waypoint.clear();
-  local_runtime_engine->default_result = make_contact_grasp_collision_result(pair, -0.001);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.001);
   local_clock.advance(10'000'000);
   controlled_execution.set_progress(0.5, {0.5, 0.5}, local_clock.now());
   ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
   ASSERT_FALSE(collisions.latest().has_value()) << collisions.latest()->at("reason");
 
   // Mid-move a new Scene arrives: a new world revision with an extra body and
-  // a new published policy revision without the authored grasp.
+  // a new published policy revision without the rule.
   auto fresh_world = *local_collision_world.current_snapshot;
   const CollisionWorldRevision fresh_revision{fresh_world.revision.revision_id + 1,
-                                              test_digest("contact-grasp-world-fresh")};
+                                              test_digest("contact-rule-world-fresh")};
   fresh_world.revision = fresh_revision;
   fresh_world.bodies.push_back(make_dynamic_test_body());
   std::sort(fresh_world.bodies.begin(), fresh_world.bodies.end(),
@@ -9206,29 +9331,28 @@ TEST_F(ExecutionKernelTest,
       std::make_shared<const CollisionWorldSnapshot>(std::move(fresh_world));
   auto fresh_policy = make_test_collision_policy_snapshot();
   fresh_policy.revision.revision_id = 2;
-  fresh_policy.revision.content_hash = test_digest("contact-grasp-policy-fresh");
+  fresh_policy.revision.content_hash = test_digest("contact-rule-policy-fresh");
   local_collision_world.current_policy = fresh_policy;
 
   for (const double clearance : {-0.001, -0.0015}) {
     local_clock.advance(10'000'000);
-    local_runtime_engine->default_result = make_contact_grasp_collision_result(pair, clearance);
+    local_runtime_engine->default_result = make_pair_collision_result(pair, clearance);
     controlled_execution.set_progress(0.5, {0.5, 0.5}, local_clock.now());
     ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
     EXPECT_FALSE(collisions.latest().has_value()) << collisions.latest()->at("reason");
     expect_collision_world_revision(local_runtime_engine->last_collision_world_revision,
                                     fresh_revision);
   }
-  // The admitted grasp still bounds penetration on the new world.
+  // The admitted rule still bounds penetration on the new world.
   local_clock.advance(10'000'000);
-  local_runtime_engine->default_result = make_contact_grasp_collision_result(pair, -0.006);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.006);
   controlled_execution.set_progress(0.5, {0.5, 0.5}, local_clock.now());
   ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
   const auto latch = collisions.latest();
   ASSERT_TRUE(latch.has_value());
-  EXPECT_EQ(latch->at("collision_result_raw_contact_grasp_violation"),
-            "grasp_contact_penetration_exceeded");
-  EXPECT_TRUE(
-      is_bound_contact_grasp_policy(latch->at("collision_result_raw_contact_grasp_policy_id")));
+  EXPECT_EQ(latch->at("collision_result_raw_contact_rule_violation"),
+            "contact_penetration_exceeded");
+  EXPECT_EQ(latch->at("collision_result_raw_contact_rule_id"), kRuleId);
   EXPECT_EQ(latch->at("collision_world_revision_id"),
             std::to_string(fresh_revision.revision_id));
 
@@ -9261,37 +9385,34 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_NonContactMoveFollowsThePublishe
   const CollisionPairId pair{"scene/part/shape/0", "scene/support/shape/0"};
   auto policy = make_test_collision_policy_snapshot();
   policy.require_full_diagnostics = true;
-  SupportContactPolicyEntry entry;
-  entry.pair = pair;
-  entry.max_start_penetration_m = 0.010;
-  entry.require_separation_by_end = true;
-  entry.require_strictly_decreasing_penetration = true;
-  policy.support_contacts.push_back(entry);
+  CollisionReleaseRule release;
+  release.max_start_penetration_m = 0.010;
+  testing::add_contact_rule(policy, testing::release_rule(pair, release));
   local_collision_world.current_policy = policy;
   controlled_kernel.set_collision_validation_policy_snapshot(policy);
   local_collision_engine->result_by_waypoint[0] =
-      make_support_contact_collision_result(pair, -0.004);
+      make_pair_collision_result(pair, -0.004);
   local_collision_engine->result_by_waypoint[1] =
-      make_support_contact_collision_result(pair, 0.002);
+      make_pair_collision_result(pair, 0.002);
 
   ASSERT_TRUE(prepare_and_dispatch(controlled_kernel, make_test_request()).ok());
   ASSERT_TRUE(controlled_execution.wait_until_execute_called())
       << "wait_until_execute_called timed out";
   ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
   local_runtime_engine->result_by_waypoint.clear();
-  local_runtime_engine->default_result = make_support_contact_collision_result(pair, -0.004);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.004);
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
   ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
   ASSERT_FALSE(collisions.latest().has_value()) << collisions.latest()->at("reason");
 
-  // A new published policy revision drops the support contact: a move without
-  // an operation-local policy follows it, so the same contact now blocks.
+  // A new published policy revision drops the release rule: a move without
+  // contact or release rules follows it, so the same contact now blocks.
   auto fresh_policy = make_test_collision_policy_snapshot();
   fresh_policy.require_full_diagnostics = true;
   fresh_policy.revision.revision_id = 2;
   fresh_policy.revision.content_hash = test_digest("published-policy-fresh");
   local_collision_world.current_policy = fresh_policy;
-  local_runtime_engine->default_result = make_support_contact_collision_result(pair, -0.003);
+  local_runtime_engine->default_result = make_pair_collision_result(pair, -0.003);
   local_clock.advance(10'000'000);
   controlled_execution.set_progress(0.50, {0.50, 0.90}, local_clock.now());
   ASSERT_TRUE(controlled_kernel.collision_check_tick().ok());
@@ -11084,7 +11205,7 @@ TEST_F(ExecutionKernelTest, Execute_ActionSpanStampsEventsAndSnapshot) {
   EXPECT_EQ(snapshot.action_span->node_instance_id, span.node_instance_id);
   EXPECT_EQ(snapshot.action_span->node_attempt_id, span.node_attempt_id);
   EXPECT_EQ(snapshot.action_span->parent_node_attempt_id, span.parent_node_attempt_id);
-  EXPECT_TRUE(snapshot.contact_policy_id.empty());
+  EXPECT_TRUE(snapshot.collision_rule_id.empty());
 
   ASSERT_TRUE(kernel.acknowledge_completed(result.value()).accepted);
 
@@ -11110,47 +11231,49 @@ TEST_F(ExecutionKernelTest, Execute_ActionSpanStampsEventsAndSnapshot) {
           << "stale action span leaked onto uncorrelated execution";
       EXPECT_EQ(event.details.count("node_attempt_id"), 0u)
           << "stale node attempt leaked onto uncorrelated execution";
-      EXPECT_EQ(event.details.count("contact_policy_id"), 0u)
-          << "stale contact policy leaked onto uncorrelated execution";
+      EXPECT_EQ(event.details.count("collision_rule_id"), 0u)
+          << "stale rule id leaked onto uncorrelated execution";
     }
   }
 }
 
-TEST_F(ExecutionKernelTest, Execute_ContactPolicyStampsEventsAndFailedSnapshot) {
-  // K6: contact policy ids are part of the same action-correlation envelope.
-  // Unknown policies fail validation by design, but the failure still needs to
-  // carry the originating behavior span and concrete policy id for incident
-  // grouping and operator diagnostics.
+TEST_F(ExecutionKernelTest, Execute_SingleContactRuleStampsEventsAndSnapshot) {
+  // The id of a move's one contact or release rule is part of the same
+  // action-correlation envelope: its events and snapshot carry `collision_rule_id`.
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
   kernel.subscribe_events([&](const KernelEvent& e) {
     std::lock_guard<std::mutex> lock(events_mutex);
     events.push_back(e);
   });
+  install_mock_contact_rule_world(collision_world_publisher, "graspable", {"right_finger"});
 
   const auto span = make_test_action_span();
-  constexpr const char* kContactPolicyId = "contact_grasp/lite6_box";
-  auto request = make_test_request("contact_policy_correlated_move");
+  constexpr const char* kRuleId = "fingers_on_box";
+  auto request = make_test_request("contact_rule_correlated_move");
   request.binding.program_run_id = span.program_run_id;
   request.action_span = span;
-  request.contact_policy_id = kContactPolicyId;
+  request.collision_rules = {move_clearance_rule(0.002)};
+  add_admitted_contact_rule(request, collision_world_publisher, kRuleId, "graspable",
+                              {"right_finger"}, 0.002);
 
   auto result = execute_sync(request);
-  ASSERT_TRUE(result.ok());
-  EXPECT_EQ(ended_as(kernel), "failed");
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
 
   auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.action_span.has_value());
   EXPECT_EQ(snapshot.action_span->action_span_id, span.action_span_id);
   EXPECT_EQ(snapshot.action_span->node_attempt_id, span.node_attempt_id);
-  EXPECT_EQ(snapshot.contact_policy_id, kContactPolicyId);
+  // The clearance row is not a contact rule: one contact rule, one id.
+  EXPECT_EQ(snapshot.collision_rule_id, kRuleId);
 
   {
     std::lock_guard<std::mutex> lock(events_mutex);
     ASSERT_FALSE(events.empty());
     for (const auto& event : events) {
       expect_action_span_details(event.details, span);
-      expect_detail(event.details, "contact_policy_id", kContactPolicyId);
+      expect_detail(event.details, "collision_rule_id", kRuleId);
     }
   }
 }
@@ -11638,7 +11761,7 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
       auto plan = MakePreparedParticipantStopPlan(
           authority.stop_readiness.value().resolved_stop_base_plan,
           {binding.operation_id, authority.operation_revision, binding.participant_id,
-           binding.program_id, binding.program_revision, binding.program_binding_id,
+           binding.program_revision, binding.program_binding_id,
            binding.program_run_id, profile, ParticipantStopProfilePurposeDTO::kOperator,
            std::nullopt, authority.stop_node_category},
           authority.binding.value().resources, authority.retained_default_stop_limits);
@@ -11674,7 +11797,7 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
     auto plan = MakePreparedParticipantStopPlan(
         authority.stop_readiness.value().resolved_stop_base_plan,
         {participant.operation_id, participant.operation_revision, participant.participant_id,
-         participant.program_id, participant.program_revision, participant.program_binding_id,
+         participant.program_revision, participant.program_binding_id,
          participant.program_run_id, previous.participant_stop_profile,
          previous.participant_stop_profile_purpose, previous.motion_interrupt_scope_id, category},
         authority.binding.value().resources, authority.retained_default_stop_limits);
@@ -16616,7 +16739,7 @@ ResolvedPreparedMotionExecutionRequestDTO scale_replacement_request(const std::s
   auto stop = MakePreparedParticipantStopPlan(
       request.stop_readiness.value().resolved_stop_base_plan,
       PreparedParticipantStopPlanContextDTO{
-          binding.operation_id, request.operation_revision, binding.participant_id, old.program_id,
+          binding.operation_id, request.operation_revision, binding.participant_id,
           old.program_revision, old.program_binding_id, old.program_run_id,
           old.participant_stop_profile, old.participant_stop_profile_purpose,
           old.motion_interrupt_scope_id, request.stop_node_category},
@@ -16916,7 +17039,7 @@ ResolvedPreparedMotionExecutionRequestDTO kernel_spring_authority(
   auto plan = MakePreparedParticipantStopPlan(
       authority.stop_readiness.value().resolved_stop_base_plan,
       {binding.operation_id, authority.operation_revision, binding.participant_id,
-       binding.program_id, binding.program_revision, binding.program_binding_id,
+       binding.program_revision, binding.program_binding_id,
        binding.program_run_id, profile, ParticipantStopProfilePurposeDTO::kOperator, std::nullopt,
        authority.stop_node_category},
       authority.binding.value().resources, authority.retained_default_stop_limits);

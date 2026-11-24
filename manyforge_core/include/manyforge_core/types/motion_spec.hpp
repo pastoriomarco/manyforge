@@ -41,12 +41,6 @@ struct ResolvedJointGoalDTO {
   friend bool operator==(const ResolvedJointGoalDTO&, const ResolvedJointGoalDTO&) = default;
 };
 
-/// Pose goal for motion planning
-struct PoseGoalDTO {
-  Pose3DTO goal;  // expressed in base_frame
-  friend bool operator==(const PoseGoalDTO&, const PoseGoalDTO&) = default;
-};
-
 /// Named target reference
 struct NamedTargetDTO {
   std::string name;
@@ -202,6 +196,30 @@ struct CartesianPathDTO {
   friend bool operator==(const CartesianPathDTO&, const CartesianPathDTO&) = default;
 };
 
+/// Straight-line settings of a linear pose goal (Program `motion_type:
+/// linear`, OD-341). The same settings and defaults as a Cartesian path.
+struct LinearPoseMotionDTO {
+  double max_translation_step_m = 0.005;
+  double max_rotation_step_rad = 0.05;
+  /// Absent: the Deployment's `cartesian_timing`.
+  std::optional<CartesianSpeedModeDTO> speed_mode{};
+  double max_angular_speed_rad_s = 0.5;
+  double max_linear_acceleration_mps2 = 0.5;
+  double max_angular_acceleration_rad_s2 = 2.5;
+  friend bool operator==(const LinearPoseMotionDTO&, const LinearPoseMotionDTO&) = default;
+};
+
+/// Pose goal for motion planning
+struct PoseGoalDTO {
+  Pose3DTO goal;  // expressed in base_frame
+  /// Absent: a joint move (IK, then joint-space planning). Present: the TCP
+  /// moves on the strict straight line from the planning start state's TCP
+  /// pose to `goal`, planned as a two-waypoint Cartesian path (no deviation,
+  /// no joint-space fallback).
+  std::optional<LinearPoseMotionDTO> linear{};
+  friend bool operator==(const PoseGoalDTO&, const PoseGoalDTO&) = default;
+};
+
 /// Motion specification as a tagged union
 using MotionSpecDTO = std::variant<JointGoalDTO, PoseGoalDTO, NamedTargetDTO, CartesianPathDTO>;
 
@@ -210,5 +228,38 @@ using MotionSpecDTO = std::variant<JointGoalDTO, PoseGoalDTO, NamedTargetDTO, Ca
 /// is connected; the addressed boundary never copies an unresolved name.
 using ResolvedMotionSpecDTO =
     std::variant<ResolvedJointGoalDTO, PoseGoalDTO, NamedTargetDTO, CartesianPathDTO>;
+
+/// Number of Cartesian source waypoints the planner traces for this motion:
+/// a Cartesian path's own, 2 (start and goal) for a linear pose goal,
+/// nullopt for a joint-space motion.
+template <typename Motion>
+[[nodiscard]] std::optional<std::size_t> cartesian_waypoint_count(const Motion& motion) noexcept {
+  if (const auto* path = std::get_if<CartesianPathDTO>(&motion)) return path->waypoints.size();
+  if (const auto* pose = std::get_if<PoseGoalDTO>(&motion); pose && pose->linear) return 2U;
+  return std::nullopt;
+}
+
+/// True when the motion is planned as a Cartesian path (a Cartesian path or a
+/// linear pose goal) rather than in joint space.
+template <typename Motion>
+[[nodiscard]] bool cartesian_planned(const Motion& motion) noexcept {
+  return cartesian_waypoint_count(motion).has_value();
+}
+
+/// The two-waypoint Cartesian path of a linear pose goal from `start_tcp`,
+/// the TCP pose of the planning start state.
+[[nodiscard]] inline CartesianPathDTO linear_pose_path(const Pose3DTO& start_tcp,
+                                                       const PoseGoalDTO& pose) {
+  const auto& linear = *pose.linear;  // callers pass a linear pose goal
+  return CartesianPathDTO{{start_tcp, pose.goal},
+                          linear.max_translation_step_m,
+                          linear.max_rotation_step_rad,
+                          linear.speed_mode,
+                          linear.max_angular_speed_rad_s,
+                          linear.max_linear_acceleration_mps2,
+                          linear.max_angular_acceleration_rad_s2,
+                          CartesianFallbackPolicyDTO::kFailClosed,
+                          {}};
+}
 
 }  // namespace manyforge::core

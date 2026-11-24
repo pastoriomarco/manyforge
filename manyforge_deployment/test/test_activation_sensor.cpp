@@ -43,9 +43,10 @@ Value Sensor(Object settings = Settings()) {
 }
 
 Value Intent(Array components) {
-  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v2")},
-                      {"deployment_artifact_id", Value("sensor")},
-                      {"name", Value("sensor")},
+  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v3")},
+      {"collision_rules",
+       Value(Array{Value(Object{{"clearance_m", Value(0.001)},
+                   {"rule_id", Value("everything")}})})},
                       {"attachments", Value(Array{})},
                       {"components", Value(std::move(components))},
                       {"policies", Value(Object{})}});

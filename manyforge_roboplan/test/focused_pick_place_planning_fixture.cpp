@@ -4,7 +4,9 @@
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace manyforge::roboplan_backend::process_fixture {
@@ -62,6 +64,37 @@ BoxObject(std::string id, SceneObjectPlacementDTO placement) {
        testing::make_test_logical_scene(binding)->configured_collision_policy}};
 }
 
+/// The fixture's admission of a motion's rules: a collision body and the
+/// TCP's contact bodies are the one tool body of ArmBinding.
+[[nodiscard]] std::vector<CollisionRule>
+AdmittedRules(const std::vector<CollisionRuleDTO> &rules) {
+  const auto admit = [](const std::vector<CollisionRuleSelectionDTO> &side) {
+    std::vector<CollisionRuleSelection> admitted;
+    for (const auto &selection : side) {
+      std::visit(
+          [&](const auto &value) {
+            using Value = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<Value, CollisionRuleCollisionBodySelection> ||
+                          std::is_same_v<Value, CollisionRuleModelGroupSelection> ||
+                          std::is_same_v<Value,
+                                         CollisionRuleActiveTcpContactBodiesSelection>) {
+              admitted.emplace_back(CollisionRuleResolvedBodiesSelection{
+                  {CollisionBodyId("body:tool")}});
+            } else {
+              admitted.emplace_back(value);
+            }
+          },
+          selection);
+    }
+    return admitted;
+  };
+  std::vector<CollisionRule> admitted;
+  for (const auto &rule : rules) {
+    admitted.push_back(CollisionRule{rule.rule_id, admit(rule.a), admit(rule.b), rule.value});
+  }
+  return admitted;
+}
+
 [[nodiscard]] RuntimeParticipantBindingDTO ArmBinding() {
   std::vector<ProgramFrameBindingDTO> frames{
       {{ControllableComponentId("component:test"), FrameRoleId("frame-role:base")}, ModelInstanceId("model:test"),
@@ -73,19 +106,13 @@ BoxObject(std::string id, SceneObjectPlacementDTO placement) {
        ModelInstanceId("model:test"),
        ModelRevision("model-revision:test"),
        {"tcp"}}};
-  std::vector<ProgramContactGraspBindingDTO> contact_grasps{
-      {ContactPolicyId("pick.contact"),
-       ContactPolicyRevision("contact-policy-revision:1"),
-       RuntimeObjectId("selected_object"),
-       {ProgramContactGraspBodyBindingDTO{
-           {ControllableComponentId("component:test"), CollisionBodyRoleId("collision-body-role:tool")},
-           ModelRoleId("tool"),
-           ModelInstanceId("model:test"),
-           ModelRevision("model-revision:test"),
-           {CollisionBodyId("body:tool")}}},
-       ContactGraspEnvelopeDTO{0.001, 0.8}}};
-  return {ProgramId("program:test"),
-          ProgramRevision("program-revision:test"),
+  std::vector<ProgramCollisionRuleBodyBindingDTO> collision_rule_bodies{
+      {{ControllableComponentId("component:test"), CollisionBodyRoleId("collision-body-role:tool")},
+       ModelRoleId("tool"),
+       ModelInstanceId("model:test"),
+       ModelRevision("model-revision:test"),
+       {CollisionBodyId("body:tool")}}};
+  return {ProgramRevision("program-revision:test"),
           ProgramBindingId("program-binding:test"),
           RetainedBundleId("bundle:test"),
           GraphRevision("graph:test"),
@@ -105,7 +132,7 @@ BoxObject(std::string id, SceneObjectPlacementDTO placement) {
           std::nullopt,
           {},
           {},
-          std::move(contact_grasps)};
+          std::move(collision_rule_bodies)};
 }
 
 [[nodiscard]] RuntimeParticipantBindingDTO CarrierBinding() {
@@ -153,9 +180,7 @@ public:
     request.target_reference = motion->target_reference;
     request.offset_reference = motion->offset_reference;
     request.goal_frame_reference = motion->goal_frame_reference;
-    request.contact_policy_id = motion->contact_policy_id.has_value()
-                                    ? motion->contact_policy_id->value()
-                                    : std::string{};
+    request.collision_rules = AdmittedRules(motion->collision_rules);
     request.runtime_object_bindings = motion->runtime_object_bindings;
     if (const auto *pose = std::get_if<PoseGoalDTO>(&motion->motion)) {
       request.motion = *pose;
@@ -165,16 +190,6 @@ public:
     } else {
       return Result<ExecuteRequestDTO>::Err(
           ErrorDTO{"invalid_request", "fixture motion is unsupported", {}});
-    }
-    if (motion->contact_policy_id.has_value() &&
-        !motion->runtime_object_bindings.empty()) {
-      request.resolved_contact_grasp = ResolvedContactGraspBindingDTO{
-          *motion->contact_policy_id,
-          ContactPolicyRevision("contact-policy-revision:1"),
-          motion->runtime_object_bindings.front().runtime_object_id,
-          motion->runtime_object_bindings.front().scene_resource_id,
-          {CollisionBodyId("body:tool")},
-          ContactGraspEnvelopeDTO{0.001, 0.8}};
     }
     return Result<ExecuteRequestDTO>::Ok(std::move(request));
   }

@@ -152,7 +152,6 @@ describe('Copy current position to Draft', () => {
       pose_in_cell: { position_m: { x: 0.4, y: 0.1, z: 0.2 }, orientation_xyzw: [0, 0, 0, 1] },
     },
     provider_evidence: null,
-    support_contacts: [],
   };
   const carried: LogicalSceneObject = {
     ...resting,

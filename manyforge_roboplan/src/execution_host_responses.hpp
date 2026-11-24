@@ -79,7 +79,7 @@ StopAcceptedValue(const core::StopAcceptedDTO &value);
 [[nodiscard]] CanonicalValue
 StopEventIdValue(const std::optional<core::StopEventId> &value);
 
-/// Program execution scope `manyforge.program_execution_scope.v3`.
+/// Program execution scope `manyforge.program_execution_scope.v4`.
 [[nodiscard]] CanonicalValue
 ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value);
 

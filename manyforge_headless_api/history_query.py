@@ -14,7 +14,7 @@ HistoryTime = Annotated[int, Field(ge=0, le=2**63 - 1)]
 HistoryIdentity = Annotated[str, Field(min_length=1, max_length=1024)]
 CORRELATION_FIELDS = (
     "program_run_id", "operation_id", "action_span_id", "node_instance_id", "node_attempt_id",
-    "intervention_session_id", "contact_policy_id", "incident_id", "condition_id", "alarm_condition_id",
+    "intervention_session_id", "collision_rule_id", "incident_id", "condition_id", "alarm_condition_id",
     "activation_id", "stop_event_id", "resource_id", "channel", "phase", "parent_node_attempt_id",
 )
 
@@ -55,7 +55,8 @@ class HistorianQueryRequest(BaseModel):
     node_attempt_id: HistoryIdentity | None = None
     parent_node_attempt_id: HistoryIdentity | None = None
     intervention_session_id: HistoryIdentity | None = None
-    contact_policy_id: HistoryIdentity | None = None
+    # Collision rule named by a contact or clearance refusal.
+    collision_rule_id: HistoryIdentity | None = None
     incident_id: HistoryIdentity | None = None
     condition_id: HistoryIdentity | None = None
     alarm_condition_id: HistoryIdentity | None = None

@@ -1142,6 +1142,16 @@ export function ProgramDeclarationsEditor({
                 </select>
               </label>
             )}
+            {keyInitialText !== null && keyExpression === null && (
+              <ProgramValueInput
+                id="program-key-initial"
+                label="Initial value"
+                type={keyType}
+                text={keyInitialText}
+                error={errorTarget === 'program-key-initial' ? error : null}
+                onChange={setKeyInitialText}
+              />
+            )}
             {interruptKeyUses.has(keyName.trim()) && keyInitialText === null && (
               <p className="program-form-error inline-message severity-error" aria-label="Key initial required">
                 {INTERRUPT_KEY_INITIAL_REQUIRED}: an interrupt condition reads this key, so it must declare an initial value.

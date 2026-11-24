@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/types/action_span.hpp>
+#include <manyforge_core/types/collision_rule.hpp>
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/execution_status.hpp>
@@ -77,23 +78,24 @@ struct MotionParticipantIntentDTO final {
   std::optional<ReferenceDTO> target_reference;
   std::optional<ReferenceDTO> offset_reference;
   MotionSpecDTO motion;
-  std::optional<ContactPolicyId> contact_policy_id;
   /// Source-local URDF joint names scoped by the participant target.
   std::map<std::string, JointDynamicsLimitDTO> per_joint_dynamics_limits;
   std::vector<MotionInterruptScopeDTO> motion_interrupt_scopes;
-  /// Public selection of one declared Program runtime-object key. Admission
-  /// resolves and validates these rows against the exact Program Binding and
-  /// retained logical scene; equal spelling is never treated as proof.
+  /// Public selection of one declared Program runtime-object key used by a
+  /// target reference. Admission resolves and validates these rows against
+  /// the exact Program Binding and retained logical scene; equal spelling is
+  /// never treated as proof.
   std::vector<RuntimeObjectReferenceBindingDTO> runtime_object_bindings{};
   /// Absolute pose/Cartesian goal expressed in this frame instead of the
   /// moving target's base frame. Resolved once at admission through the same
   /// cell reference resolver as relative targets. Forbidden for relative or
   /// joint/named motion and for inline poses.
   std::optional<ReferenceDTO> goal_frame_reference{};
-  /// Collision clearance for this move, in [0, kMaxCollisionClearanceM] m.
-  /// Absent means the Deployment's `collision_clearance_m`; 0 turns the
-  /// clearance off for this move.
-  std::optional<double> clearance_m{};
+  /// The move's collision rules (the motion node's `collision_rules`). A row
+  /// replaces the cell rule's value for exactly its pairs; the row without
+  /// selections replaces the clearance of the cell's first rule (0 turns it
+  /// off for this move). Empty keeps the cell rules.
+  std::vector<CollisionRuleDTO> collision_rules{};
   friend bool operator==(const MotionParticipantIntentDTO&,
                          const MotionParticipantIntentDTO&) = default;
 };
@@ -137,7 +139,6 @@ struct ManualProgramHandoverContextDTO final {
 
 struct OperationIntentDTO final {
   PublicRequestContextDTO request_context;
-  ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
   /// Present for Program work and equal to the run the Kernel holds; absent

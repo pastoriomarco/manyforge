@@ -6,14 +6,14 @@
   },
   "description": "Real Lite6 machine, arm only (its I/O members deactivated), showing measured state, using the same robot model as the Mock pick-and-place example. The machine's address is a site fact: device_address_ref lite6_main resolves in the machine site settings (manyforge.site.v1). The gripper is the Mock pneumatic target with no output on Real (display only, no gripper feedback).",
   "members": {
-    "deployment.yaml": "sha256:beb170609e9f114c6898ac894889f7720937b55fa68f3cc0b322999a8ffaa9e9",
-    "program.yaml": "sha256:694aa77b9c5f1fe6a413dbc31a433003c6a7bfe7f98df4c40b653ee2386c57fe"
+    "deployment.yaml": "sha256:6c21e39ca554ce4e98c81596ed96fbbb1812473c679c76d023cbc1808b71673b",
+    "program.yaml": "sha256:2ca1420f72e900f758334840473a0a466c20a53bcf09466a5ed4d5c8ca8818a6"
   },
   "name": "real_lite6_arm_observation",
   "saved_status": {
-    "checked_content_digest": "sha256:9dbf2e54a8365bd0c48b1f2fa538eb2e795f253f97a51633e06081add26e41b6",
+    "checked_content_digest": "sha256:779304df92b3b2e2d9bf521c2d16bcb38bbd37e288acaf4d8018345a2a0ce2db",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.1"
+    "manyforge_version": "0.4.0"
   },
   "scenario_id": "real_lite6_arm_observation",
   "source_snapshot": {

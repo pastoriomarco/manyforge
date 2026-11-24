@@ -137,6 +137,11 @@ public:
   [[nodiscard]] std::optional<std::pair<std::string, std::string>>
   ViewerPoseSources() const;
 
+  /// The logical scene's active projection revision (canonical JSON) from
+  /// the section's last valid value, whatever its freshness; none before a
+  /// value or while it shows none (OD-378).
+  [[nodiscard]] std::optional<std::string> LogicalSceneActiveProjection() const;
+
 private:
   std::string cell_id_;
   std::int64_t manager_silence_ns_;

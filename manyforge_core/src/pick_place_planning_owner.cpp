@@ -46,7 +46,7 @@ template <typename T>
 
 [[nodiscard]] bool same_program_context(const OperationIntentDTO& left,
                                         const OperationIntentDTO& right) {
-  return left.program_id == right.program_id && left.program_revision == right.program_revision &&
+  return left.program_revision == right.program_revision &&
          left.program_binding_id == right.program_binding_id &&
          left.program_run_id == right.program_run_id &&
          left.expected_graph_revision == right.expected_graph_revision &&
@@ -164,77 +164,80 @@ template <typename T>
          predecessor.bundle.world && predecessor.bundle.policy.has_value();
 }
 
+/// The carrier's collision bodies that touch the picked object while it is
+/// carried during planning: the bodies the descend leg's contact rules pair
+/// with the selected object. Without such a rule there are none: the planned
+/// pick allows no contact between the carrier and the object.
 [[nodiscard]] Result<std::vector<CollisionBodyRoleId>> touch_roles(
     const RuntimeParticipantBindingDTO& arm_binding,
-    const RuntimeParticipantBindingDTO& carrier_binding, const ContactPolicyId& policy_id,
-    const RuntimeObjectId& runtime_object_id) {
-  const auto policy = std::lower_bound(
-      arm_binding.contact_grasp_bindings.begin(), arm_binding.contact_grasp_bindings.end(),
-      policy_id,
-      [](const ProgramContactGraspBindingDTO& candidate, const ContactPolicyId& selected) {
-        return candidate.contact_policy_id < selected;
-      });
-  const bool policy_bound =
-      policy != arm_binding.contact_grasp_bindings.end() && policy->contact_policy_id == policy_id &&
-      std::holds_alternative<ContactGraspEnvelopeDTO>(policy->envelope);
-  if (!policy_bound || policy->runtime_object_id != runtime_object_id) {
-    // One reason for both causes. The message says which one happened; the
-    // details name the selected runtime object as the one reference and carry
-    // the contact policy beside it.
-    auto unresolved =
-        planning_error<std::vector<CollisionBodyRoleId>>(
-            "pick_contact_grasp_template_unresolved",
-            policy_bound ? "pick contact policy is bound to a runtime object other than the "
-                           "selected Program runtime object"
-                         : "pick contact policy is absent from the exact arm contact-grasp "
-                           "bindings",
-            ErrorCode::kMissingReference)
-            .error();
-    unresolved.details.emplace("reference_type", "runtime_object");
-    unresolved.details.emplace("reference_id", runtime_object_id.value());
-    unresolved.details.emplace("contact_policy_id", policy_id.value());
-    return Result<std::vector<CollisionBodyRoleId>>::Err(std::move(unresolved));
-  }
-  if (policy->bodies_from_motion_endpoint && !arm_binding.motion_endpoint) {
-    return planning_error<std::vector<CollisionBodyRoleId>>(
-        "pick_motion_endpoint_unresolved",
-        "pick contact policy requires a selected motion endpoint", ErrorCode::kMissingReference);
-  }
-  const auto& bodies = policy->bodies_from_motion_endpoint
-                           ? arm_binding.motion_endpoint->contact_body_bindings
-                           : policy->allowed_body_bindings;
+    const RuntimeParticipantBindingDTO& carrier_binding,
+    const MotionParticipantIntentDTO& descend_motion, const SceneResourceId& selected_object_id) {
+  using Roles = Result<std::vector<CollisionBodyRoleId>>;
   std::vector<CollisionBodyRoleId> roles;
-  for (const auto& body : bodies) {
-    if (body.body.component_id != carrier_binding.controllable_component_id) {
+  bool stale = false;
+  // A touch body is a collision body of the exact carrier binding.
+  const auto add = [&](const ProgramCollisionBodyReferenceDTO& body,
+                       const ProgramCollisionRuleBodyBindingDTO* bound) {
+    if (body.component_id != carrier_binding.controllable_component_id) {
+      return;
+    }
+    const auto exact = std::lower_bound(
+        carrier_binding.collision_body_bindings.begin(),
+        carrier_binding.collision_body_bindings.end(), body,
+        [](const ProgramCollisionBodyBindingDTO& candidate,
+           const ProgramCollisionBodyReferenceDTO& selected) {
+          return candidate.reference < selected;
+        });
+    if (exact == carrier_binding.collision_body_bindings.end() || exact->reference != body ||
+        (bound != nullptr && (exact->model_instance_id != bound->model_instance_id ||
+                              exact->model_revision != bound->model_revision))) {
+      stale = true;
+      return;
+    }
+    roles.push_back(body.collision_body_id);
+  };
+  const auto add_tcp_contact_bodies = [&] {
+    if (!arm_binding.motion_endpoint) {
+      return;
+    }
+    for (const auto& body : arm_binding.motion_endpoint->contact_body_bindings) {
+      add(body.body, &body);
+    }
+  };
+  const auto selects_object = [&](const std::vector<CollisionRuleSelectionDTO>& side) {
+    return std::any_of(side.begin(), side.end(), [&](const CollisionRuleSelectionDTO& selection) {
+      const auto* object = std::get_if<CollisionRuleSceneObjectSelection>(&selection);
+      return object != nullptr && object->scene_resource_id == selected_object_id;
+    });
+  };
+  for (const auto& rule : descend_motion.collision_rules) {
+    if (!std::holds_alternative<CollisionContactRule>(rule.value)) {
       continue;
     }
-    const auto exact =
-        std::lower_bound(carrier_binding.collision_body_bindings.begin(),
-                         carrier_binding.collision_body_bindings.end(), body.body,
-                         [](const ProgramCollisionBodyBindingDTO& candidate,
-                            const ProgramCollisionBodyReferenceDTO& selected) {
-                           return candidate.reference < selected;
-                         });
-    if (exact == carrier_binding.collision_body_bindings.end() ||
-        exact->reference != body.body ||
-        exact->model_instance_id != body.model_instance_id ||
-        exact->model_revision != body.model_revision) {
-      return planning_error<std::vector<CollisionBodyRoleId>>(
-          "pick_touch_body_binding_stale",
-          "pick touch-body role differs from the exact carrier binding",
-          ErrorCode::kInvariantViolation);
+    for (const auto& [object_side, body_side] :
+         {std::pair{&rule.a, &rule.b}, std::pair{&rule.b, &rule.a}}) {
+      if (!selects_object(*object_side)) {
+        continue;
+      }
+      for (const auto& selection : *body_side) {
+        if (const auto* body = std::get_if<CollisionRuleCollisionBodySelection>(&selection)) {
+          add(body->body, nullptr);
+        } else if (std::holds_alternative<CollisionRuleActiveTcpContactBodiesSelection>(
+                       selection)) {
+          add_tcp_contact_bodies();
+        }
+      }
     }
-    roles.push_back(body.body.collision_body_id);
+  }
+  if (stale) {
+    return planning_error<std::vector<CollisionBodyRoleId>>(
+        "pick_touch_body_binding_stale",
+        "pick touch-body role differs from the exact carrier binding",
+        ErrorCode::kInvariantViolation);
   }
   std::sort(roles.begin(), roles.end());
   roles.erase(std::unique(roles.begin(), roles.end()), roles.end());
-  if (roles.empty()) {
-    return planning_error<std::vector<CollisionBodyRoleId>>(
-        "pick_carrier_touch_roles_unresolved",
-        "pick contact policy has no touch body on the exact carrier target",
-        ErrorCode::kMissingReference);
-  }
-  return Result<std::vector<CollisionBodyRoleId>>::Ok(std::move(roles));
+  return Roles::Ok(std::move(roles));
 }
 
 struct ProjectionLeaseGuard final {
@@ -458,20 +461,21 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
   const auto* approach_motion = motion_payload(intent.approach_operation);
   const auto* descend_motion = motion_payload(intent.descend_operation);
   const auto* retreat_motion = motion_payload(intent.retreat_operation);
-  if (!common.ok() || intent.selected_runtime_object_id.empty() || approach_motion == nullptr ||
-      descend_motion == nullptr || retreat_motion == nullptr ||
-      approach_motion->contact_policy_id.has_value() ||
-      !approach_motion->runtime_object_bindings.empty() ||
-      !descend_motion->contact_policy_id.has_value() ||
-      descend_motion->runtime_object_bindings !=
-          std::vector<RuntimeObjectReferenceBindingDTO>{
-              {intent.selected_runtime_object_id, intent.selected_object_id}} ||
-      retreat_motion->contact_policy_id.has_value() ||
+  // The descend leg binds the selected runtime object when the intent names
+  // one; no other leg binds a runtime object.
+  const auto descend_runtime_objects =
+      intent.selected_runtime_object_id.empty()
+          ? std::vector<RuntimeObjectReferenceBindingDTO>{}
+          : std::vector<RuntimeObjectReferenceBindingDTO>{
+                {intent.selected_runtime_object_id, intent.selected_object_id}};
+  if (!common.ok() || approach_motion == nullptr || descend_motion == nullptr ||
+      retreat_motion == nullptr || !approach_motion->runtime_object_bindings.empty() ||
+      descend_motion->runtime_object_bindings != descend_runtime_objects ||
       !retreat_motion->runtime_object_bindings.empty()) {
     return common.ok() ? planning_error<PickPlacePlanningResultDTO>(
                              "pick_public_phase_contract_invalid",
-                             "pick requires contact only on descend and one exact "
-                             "selected runtime-object binding")
+                             "pick allows a runtime-object binding only on descend, and only "
+                             "the exact selected runtime object")
                        : Result<PickPlacePlanningResultDTO>::Err(common.error());
   }
 
@@ -531,15 +535,15 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
       carrier.value().command_target_id != requested_carrier.command_target_id) {
     return planning_error<PickPlacePlanningResultDTO>(
         "pick_carrier_touch_roles_unresolved",
-        "pick contact policy has no touch body on the exact carrier target",
+        "pick has no touch body on the exact carrier target",
         ErrorCode::kMissingReference);
   }
   if (find_frame(carrier.value(), intent.carrier_frame) == nullptr) {
     return carrier_frame_unresolved<PickPlacePlanningResultDTO>(
         "pick_carrier_frame_unresolved", carrier.value(), intent.carrier_frame);
   }
-  auto roles = touch_roles(arm.value(), carrier.value(), *descend_motion->contact_policy_id,
-                           intent.selected_runtime_object_id);
+  auto roles =
+      touch_roles(arm.value(), carrier.value(), *descend_motion, intent.selected_object_id);
   if (!roles.ok()) {
     return Result<PickPlacePlanningResultDTO>::Err(roles.error());
   }
@@ -653,16 +657,12 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
   const auto* descend_motion = motion_payload(intent.descend_operation);
   const auto* retreat_motion = motion_payload(intent.retreat_operation);
   if (!common.ok() || approach_motion == nullptr || descend_motion == nullptr ||
-      retreat_motion == nullptr || approach_motion->contact_policy_id.has_value() ||
-      descend_motion->contact_policy_id.has_value() ||
-      retreat_motion->contact_policy_id.has_value() ||
-      !approach_motion->runtime_object_bindings.empty() ||
+      retreat_motion == nullptr || !approach_motion->runtime_object_bindings.empty() ||
       !descend_motion->runtime_object_bindings.empty() ||
       !retreat_motion->runtime_object_bindings.empty()) {
     return common.ok() ? planning_error<PickPlacePlanningResultDTO>(
                              "place_public_phase_contract_invalid",
-                             "place motion phases cannot carry contact-grasp or "
-                             "runtime-object bindings")
+                             "place motion phases cannot carry runtime-object bindings")
                        : Result<PickPlacePlanningResultDTO>::Err(common.error());
   }
 

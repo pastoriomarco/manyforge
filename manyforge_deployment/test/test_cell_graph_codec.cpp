@@ -620,6 +620,37 @@ TEST(CellGraphCodec, OwnedOccurrenceCarriesSortedCustomTcps) {
                 .find("custom_tcps"),
             std::string::npos);
 
+  // A custom TCP's contact bodies: sorted, unique, emitted only when present.
+  const std::string with_contact =
+      "    custom_tcps:\n"
+      "      - frame_role_id: pen\n"
+      "        parent_link_name: link_eef\n"
+      "        pose_in_parent_link:\n"
+      "          position_m: [0.0, 0.0, 0.12]\n"
+      "          orientation_xyzw: [0.0, 0.0, 0.0, 1.0]\n"
+      "        contact_body_role_ids: [gripper_fingers, tip]\n";
+  const auto contact_graph =
+      replace_once(two_instance_graph(false), anchor, anchor + with_contact);
+  const auto contact_validated = validate(contact_graph);
+  const auto& contact_rows = contact_validated.graph().model_instances[0].custom_tcps;
+  ASSERT_EQ(contact_rows.size(), 1U);
+  ASSERT_EQ(contact_rows[0].contact_body_role_ids.size(), 2U);
+  EXPECT_EQ(contact_rows[0].contact_body_role_ids[0].value(), "gripper_fingers");
+  EXPECT_EQ(contact_rows[0].contact_body_role_ids[1].value(), "tip");
+  EXPECT_NE(canonical_json(decode(contact_graph).structurally_normalized_root())
+                .find("\"contact_body_role_ids\":[\"gripper_fingers\",\"tip\"]"),
+            std::string::npos);
+  EXPECT_TRUE(rows[0].contact_body_role_ids.empty());
+  EXPECT_EQ(canonical_json(decode(graph).structurally_normalized_root())
+                .find("contact_body_role_ids"),
+            std::string::npos);
+  for (const std::string_view refused :
+       {"[tip, gripper_fingers]", "[tip, tip]", "[]"}) {
+    EXPECT_THROW((void)decode(replace_once(
+                     contact_graph, "[gripper_fingers, tip]", std::string(refused))),
+                 CellGraphCodecError);
+  }
+
   // Unsorted, empty or malformed rows are refused.
   const std::string unsorted =
       "    custom_tcps:\n"

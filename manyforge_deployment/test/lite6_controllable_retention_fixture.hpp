@@ -185,13 +185,13 @@ provider_contract_role_id(const CanonicalValue &declaration) {
          CanonicalValue(std::string(controllable_component_id))},
         {"description",
          CanonicalValue("ROS mock UFACTORY lite pneumatic gripper.")},
+        {"grip_body_links", CanonicalValue(CanonicalValue::Array{
+                                CanonicalValue("lite_gripper_base_link"),
+                                CanonicalValue("lite_gripper_left_finger"),
+                                CanonicalValue("lite_gripper_right_finger")})},
         {"mount_frame", CanonicalValue("link_eef")},
         {"open_state_ref", CanonicalValue("open")},
         {"tcp_frame", CanonicalValue("link_tcp")},
-        {"touch_links", CanonicalValue(CanonicalValue::Array{
-                            CanonicalValue("lite_gripper_base_link"),
-                            CanonicalValue("lite_gripper_left_finger"),
-                            CanonicalValue("lite_gripper_right_finger")})},
     };
   gripper_configuration.emplace_back("output_mode", CanonicalValue("commanded"));
   return CanonicalValue(std::move(gripper_configuration));
@@ -573,7 +573,8 @@ assistant_source(const bool composer_draft_enabled = false) {
     bool shared_arm_endpoint_bodies = false,
     std::string_view flange_frame_alias = "flange",
     bool flange_is_default = false, bool multi_contact = false,
-    bool ambiguous_root_alias = false) {
+    bool ambiguous_root_alias = false,
+    bool declare_default_collision = false) {
   const std::string_view primary_capability_id = "execution.trajectory.execute";
   const auto *descriptor =
       core::find_builtin_capability_definition(primary_capability_id);
@@ -829,6 +830,16 @@ assistant_source(const bool composer_draft_enabled = false) {
         {"collision_body_role_id", CanonicalValue("arm_link1")},
         {"model_role_id", CanonicalValue("arm_model")},
         {"asset_collision_body_role_id", CanonicalValue("arm_link1")},
+    });
+  }
+  // OD-350: the reserved default body, which this fixture's model never binds.
+  if (declare_default_collision) {
+    arm_collision_roles.emplace_back(CanonicalValue::Object{
+        {"collision_body_role_id",
+         CanonicalValue(std::string(core::kDefaultCollisionBodyRoleId))},
+        {"model_role_id", CanonicalValue("arm_model")},
+        {"asset_collision_body_role_id",
+         CanonicalValue(std::string(core::kDefaultCollisionBodyRoleId))},
     });
   }
 
@@ -2809,7 +2820,8 @@ make_lite6_controllable_retention_fixture(
     bool shared_arm_endpoint_bodies = false,
     std::string_view flange_frame_alias = "flange",
     bool flange_is_default = false, bool multi_contact = false,
-    bool ambiguous_root_alias = false) {
+    bool ambiguous_root_alias = false,
+    bool declare_default_collision = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   // A gripper-only component is a separate tool with its own model: it
   // always comes with its own structural override and role mapping.
@@ -2849,7 +2861,8 @@ make_lite6_controllable_retention_fixture(
       direct_provider_id,
       include_lifecycle_recover, include_observed_state,
       associate_arm_tcp_contact_bodies, shared_arm_endpoint_bodies,
-      flange_frame_alias, flange_is_default, multi_contact, ambiguous_root_alias);
+      flange_frame_alias, flange_is_default, multi_contact, ambiguous_root_alias,
+      declare_default_collision);
   if (gripper_only) {
     catalog = fixture_detail::add_gripper_only_catalog(
         std::move(catalog), stoppable, gripper_lifecycle_semantic_digest,
@@ -2934,15 +2947,9 @@ make_lite6_controllable_retention_fixture(
       deployment_graph.end());
   CanonicalValue::Object deployment_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
-      {"deployment_artifact_id",
-       CanonicalValue(gripper_only ? "lite6_gripper_only_fixture"
-                                   : "lite6_motion_fixture")},
       {"deployment_revision",
        CanonicalValue(std::string(fixture_detail::kZeroDigest))},
       {"cell_id", CanonicalValue(graph.graph().cell_id.value())},
-      {"name",
-       CanonicalValue(gripper_only ? "Lite6 gripper-only fixture"
-                                   : "Lite6 addressed motion fixture")},
       {"catalogs", detail::encode_deployment_catalogs(catalog_records)},
       {"graph", CanonicalValue(std::move(deployment_graph))},
       {"desired_control_configurations",
@@ -2950,18 +2957,6 @@ make_lite6_controllable_retention_fixture(
       {"capability_provider_bindings",
        inputs.normalized_capability_provider_bindings()},
   };
-  if (structural_override != nullptr) {
-    for (auto &[name, value] : deployment_members) {
-      if (name == "deployment_artifact_id")
-        value = CanonicalValue(structural.catalog_reference.record_id.value() +
-                               (gripper_only ? "_gripper_only_ros_fixture"
-                                             : "_arm_only_ros_fixture"));
-      else if (name == "name")
-        value = CanonicalValue(structural.catalog_reference.record_id.value() +
-                               (gripper_only ? " gripper-only ROS fixture"
-                                             : " arm-only ROS fixture"));
-    }
-  }
   if (inputs.normalized_policies().has_value()) {
     deployment_members.emplace_back("policies", *inputs.normalized_policies());
   }
@@ -3221,7 +3216,8 @@ make_lite6_ros2_control_observed_consumer_retention_fixture(
     bool shared_arm_endpoint_bodies = false,
     std::string_view flange_frame_alias = "flange",
     bool flange_is_default = false, bool multi_contact = false,
-    bool ambiguous_root_alias = false) {
+    bool ambiguous_root_alias = false,
+    bool declare_default_collision = false) {
   std::optional<Lite6StructuralRetentionFixture> structural;
   if (multi_contact)
     structural.emplace(make_lite6_structural_retention_fixture("arm_collision", true));
@@ -3233,7 +3229,8 @@ make_lite6_ros2_control_observed_consumer_retention_fixture(
       structural ? &*structural : nullptr, nullptr, true,
       "pneumatic", std::nullopt, "commanded", nullptr, nullptr,
       associate_tcp_contact_bodies, shared_arm_endpoint_bodies,
-      flange_frame_alias, flange_is_default, multi_contact, ambiguous_root_alias);
+      flange_frame_alias, flange_is_default, multi_contact, ambiguous_root_alias,
+      declare_default_collision);
 }
 
 /// Same retained observed-state fixture with endpoint-associated contact body

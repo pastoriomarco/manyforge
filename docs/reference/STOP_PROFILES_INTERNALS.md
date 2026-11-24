@@ -188,6 +188,26 @@ collision observation or rule trip
   -> the same request_stop_locked() path above
 ```
 
+A component that enters `fault` while an operation executes:
+
+```text
+observe_component_states (component runtime feed, Kernel lock)
+  -> the latch arms
+  -> one Kernel-internal Stop, kind component_fault, whole cell, fault mode
+  -> the same request_stop_locked() path above
+```
+
+It is issued in the same locked step that arms the latch, once per fault
+episode of a component (`fault` entered, not repeated), and only while an
+operation executes. Each started robot participant uses its fault Stop plan
+(`default_fault_stop_profile`), exactly as a runtime-collision Stop; a
+participant already stopping is covered, not restarted. The participants it
+starts end `intervention_required` with the typed cause `component_fault`
+(`details.component_id`, `fault_code`), recovery class `runtime_collision`
+(the GUI names it by its reason). Interrupt evaluation pauses while latched;
+the fault Stop does not depend on it. An e-stop `stop`, `offline` and
+`simulation_not_playing` issue no Stop.
+
 The important behavioral invariant is that product Stop has one authority.
 Subordinate engines may publish collision/interrupt facts but cannot issue a
 competing backend Stop. Resume always creates new prepared participant/goal
@@ -212,7 +232,8 @@ itself once every component is healthy and idle. There is no recovery
 endpoint. A Program node whose Stop is unconfirmed waits for its component's
 activity to leave `unknown` and then gets its normal result; only nodes with
 `allow_intervention` hold for the operator. A rule trip is an operational
-stop: never a fault, never a latch.
+stop: never a fault, never a latch. A component entering `fault` while an
+operation executes also stops every moving robot (`component_fault`, above).
 
 ## 5. soft_on_path Planner
 

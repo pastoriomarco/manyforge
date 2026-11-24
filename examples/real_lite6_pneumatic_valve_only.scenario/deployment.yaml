@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -51,8 +51,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [
       "lite_gripper"
     ],
@@ -231,12 +236,7 @@
                   }
                 ]
               },
-              "tcp_frame": "link_tcp",
-              "touch_links": [
-                "lite_gripper_base_link",
-                "lite_gripper_left_finger",
-                "lite_gripper_right_finger"
-              ]
+              "tcp_frame": "link_tcp"
             }
           ]
         },
@@ -259,9 +259,6 @@
       "target_settings": {}
     }
   ],
-  "deployment_artifact_id": "lite6_pneumatic_real_no_sensor",
-  "description": "Real Lite6 pneumatic example without a grasp sensor: a valve-only gripper on site address lite6_main, illustrative controller output CO0 and output polarity. Close completes after its dwell; there is no grasp sensor and no workpiece-loss rule. Configure the actual cell wiring and polarity before use; this example is not a hardware qualification.",
-  "name": "lite6_pneumatic_real_no_sensor",
   "policies": {
     "interrupt_rules": []
   }

@@ -72,13 +72,12 @@ def _context(signal_rows=None, *, coordinate_roles=(), tree=None) -> ProgramRunP
     ])
     program = {}
     if tree is not None:
-        program = {"program_id": "io_program", "program_revision": _A, "tree": tree}
+        program = {"program_revision": _A, "tree": tree}
     return ProgramRunPortContext(
         program_run_id=1,
         applied_record_digest=_D,
         scenario_id="io_scenario",
         source_document_digest=_A,
-        program_id="io_program",
         program_revision=_A,
         program_binding_id=_A,
         retained_bundle_id=_B,
@@ -86,7 +85,6 @@ def _context(signal_rows=None, *, coordinate_roles=(), tree=None) -> ProgramRunP
         node_environment_digest=_D,
         program_binding={
             "program_binding_id": _A,
-            "program_id": "io_program",
             "program_revision": _A,
             "retained_bundle_id": _B,
             "graph_revision": _C,
@@ -151,7 +149,7 @@ class _Transport:
         return {
             "ok": True,
             "scope": {
-                "schema_version": "manyforge.program_execution_scope.v3",
+                "schema_version": "manyforge.program_execution_scope.v4",
                 "program_run_id": program_run_id,
                 "claim_generation": 5,
                 "hold_revision": 0,
@@ -407,11 +405,11 @@ def _wait_program(edge: str | None, *, timeout_s: float | None = None) -> dict[s
         "parameters": parameters,
         "children": [],
     }
-    document = program_document(catalog, tree, program_id="io_program", name="I/O wait")
+    document = program_document(catalog, tree)
     document["program_revision"] = _A
     document["program_revision"] = compute_content_identity(
         document, own_field="program_revision", identity_domain="program-revision",
-        api_version="manyforge.program.v3")
+        api_version="manyforge.program.v4")
 
     return document
 

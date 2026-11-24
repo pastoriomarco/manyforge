@@ -27,8 +27,9 @@ struct RetainedPlannerSceneProjectionConfig final {
 /// One exact host-owned native projection state machine.
 ///
 /// The logical scene remains externally owned. This adapter accepts only
-/// owner-normalized transactions and verifies their deterministic successor
-/// snapshot before effects. The collision world is a lazily derived cache of
+/// owner-normalized transactions: the owner validated and digested each
+/// successor once, and this adapter applies its resolved delta to the exact
+/// predecessor, trusting the proposed revision and digest. The collision world is a lazily derived cache of
 /// the latest logical scene: a commit only records the scene and advances a
 /// change counter; the world, policy and runtime bundle are rebuilt when a
 /// consumer is about to compute collisions (planning, validation, the
@@ -110,6 +111,16 @@ public:
   ProjectEffectiveCollisionPolicy(
       const core::LogicalSceneSnapshotDTO &logical_scene,
       std::uint64_t effective_policy_revision_id) const override;
+  /// Health plus CommitCandidatePolicy; the owner's candidate is not read.
+  [[nodiscard]] core::Result<core::SceneCommitPreflightDTO> CommitPreflight(
+      const core::ProjectionRevisionDTO &selected_revision,
+      const core::SceneTransactionDTO *transaction,
+      const core::LogicalSceneSnapshotDTO *candidate) const override;
+  /// The effective policy of the owner's validated successor, rebuilt from
+  /// this projection's predecessor and the transaction's resolved delta.
+  /// Absent unless the projection is healthy at the exact predecessor.
+  [[nodiscard]] std::optional<core::Result<core::CollisionPolicySnapshot>>
+  CommitCandidatePolicy(const core::SceneTransactionDTO &transaction) const;
 
   [[nodiscard]] std::shared_ptr<const core::LogicalSceneSnapshotDTO>
   logical_snapshot() const;

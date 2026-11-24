@@ -62,7 +62,7 @@ def _identified(document: dict[str, Any]) -> dict[str, Any]:
         result,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return result
 
@@ -219,77 +219,13 @@ def test_program_document_copy_is_detached() -> None:
     assert "unexpected" not in program.to_dict()["tree"]["parameters"]
 
 
-def test_program_scene_support_contacts_are_typed_and_reference_scene() -> None:
+def test_program_scene_metadata_is_kept_as_authored() -> None:
     source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
-    source["scene"][1]["metadata"] = {
-        "display_hint": "retained",
-        "support_contacts": [
-            {
-                "support_object_id": source["scene"][0]["scene_resource_id"],
-                "mode": "contact_release",
-                "release_evidence_mode": "binary_contact",
-                "require_separation_by_end": True,
-                "allow_recontact": False,
-            }
-        ],
-    }
+    source["scene"][1]["metadata"] = {"display_hint": "retained"}
 
     parsed = Program.from_dict(_identified(source), _catalog())
 
-    assert parsed.to_dict()["scene"][1]["metadata"] == source["scene"][1][
-        "metadata"
-    ]
-
-
-def test_program_scene_support_contact_accepts_explicit_binary_neutral_fields() -> None:
-    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
-    source["scene"][1]["metadata"] = {
-        "support_contacts": [
-            {
-                "support_object_id": source["scene"][0]["scene_resource_id"],
-                "mode": "contact_release",
-                "release_evidence_mode": "binary_contact",
-                "enforce_max_start_penetration": False,
-                "max_start_penetration_m": 0.0,
-                "release_tolerance_m": 0.0,
-                "min_release_progress_m": 0.0,
-                "require_strictly_decreasing_penetration": False,
-            }
-        ]
-    }
-
-    identified = _identified(source)
-    assert Program.from_dict(identified, _catalog()).to_dict() == identified
-
-
-@pytest.mark.parametrize("support_object_id", ["missing", "self"])
-def test_program_scene_support_contact_rejects_invalid_reference(
-    support_object_id: str,
-) -> None:
-    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
-    if support_object_id == "self":
-        support_object_id = source["scene"][0]["scene_resource_id"]
-    source["scene"][0]["metadata"] = {
-        "support_contacts": [{"support_object_id": support_object_id}]
-    }
-
-    with pytest.raises(ProgramValidationError, match="support_object_id"):
-        Program.from_dict(_identified(source), _catalog())
-
-
-def test_program_scene_support_contact_rejects_cycle() -> None:
-    source = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
-    first_id = source["scene"][0]["scene_resource_id"]
-    second_id = source["scene"][1]["scene_resource_id"]
-    source["scene"][0]["metadata"] = {
-        "support_contacts": [{"support_object_id": second_id}]
-    }
-    source["scene"][1]["metadata"] = {
-        "support_contacts": [{"support_object_id": first_id}]
-    }
-
-    with pytest.raises(ProgramValidationError, match="cyclic support-contact"):
-        Program.from_dict(_identified(source), _catalog())
+    assert parsed.to_dict()["scene"][1]["metadata"] == {"display_hint": "retained"}
 
 
 def test_program_node_policy_defaults_are_omission_compatible() -> None:
@@ -503,7 +439,7 @@ def test_program_node_policy_rejects_closed_values_and_bounds(
 def test_program_rejects_stale_revision_before_semantic_use() -> None:
     catalog = _catalog()
     document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
-    document["name"] = "changed without updating identity"
+    document["parameters"][0]["description"] = "changed without updating identity"
 
     with pytest.raises(ProgramValidationError, match="content identity mismatch"):
         Program.from_dict(document, catalog)
@@ -549,7 +485,7 @@ def test_program_hand_edit_loads_with_edited_outside_diagnostic() -> None:
     catalog = _catalog()
     document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
     assert Program.from_dict(document, catalog).load_diagnostics == ()
-    document["name"] = "changed without updating identity"
+    document["parameters"][0]["description"] = "changed without updating identity"
 
     program = Program.from_dict(document, catalog, authoring_load=True)
 
@@ -602,10 +538,10 @@ def test_program_saved_under_older_catalog_minor_loads_as_active(monkeypatch: py
     catalog = _catalog()
     # The shipped v3 catalog starts at minor zero. Exercise the same
     # compatibility boundary against a later synthetic active minor.
-    monkeypatch.setattr(catalog_module, "EXPECTED_CONTENT_VERSION", "3.1.0")
+    monkeypatch.setattr(catalog_module, "EXPECTED_CONTENT_VERSION", "4.1.0")
     major, minor, _patch = catalog.content_version.split(".")
     assert int(minor) > 0
-    source = _with_catalog_version(load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM), "3.1.0")
+    source = _with_catalog_version(load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM), "4.1.0")
     active = Program.from_dict(source, catalog)
     older = _with_catalog_version(source, f"{major}.{int(minor) - 1}.0")
 
@@ -767,7 +703,7 @@ def test_program_accepts_ordered_free_text_parameter_defaults() -> None:
         ("unexpanded_interpolation", "legacy.*interpolation.*value_sources"),
         ("undeclared_value_source", "names no Program parameter"),
         ("empty_blackboard_fields", "must not be empty"),
-        ("unknown_viewer_role", "is unavailable in Program v3"),
+        ("unknown_viewer_role", "is unavailable in Program v4"),
         ("unknown_viewer_scene_resource", "does not name a declared scene resource"),
         ("removed_scene_policy_ids", r"contains unknown fields \['collision_policy_ids'\]"),
         ("inapplicable_constraint", "numeric constraints are unsupported"),
@@ -840,14 +776,14 @@ def test_translated_historical_program_negative_corpus(
         Program.from_dict(_identified(document), catalog)
 
 
-def test_contact_selector_keeps_exact_direct_target() -> None:
+def test_collision_rule_user_keeps_exact_direct_target() -> None:
     document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
     parsed = Program.from_dict(_identified(document), _catalog())
     pending = [parsed.to_dict()["tree"]]
     selected = []
     while pending:
         node = pending.pop()
-        if "contact_policy_id" in node.get("parameters", {}):
+        if "collision_rules" in node.get("parameters", {}):
             selected.append(node["parameters"]["target"])
         pending.extend(node.get("children", ()))
     assert selected == [target("ur5_robot", "arm")]
@@ -1065,7 +1001,8 @@ def test_logic_only_declarations_accept_an_empty_component_role_map() -> None:
     )
 
     assert parameters == {}
-    assert keys == {}
+    # Only the system key of the `all` motion group (OD-339).
+    assert list(keys) == ["motion_group_state.all"]
 
 
 def test_program_refuses_legacy_component_role_map() -> None:
@@ -1173,84 +1110,167 @@ def test_motion_endpoint_rejects_ambiguous_or_uncaptured_selection(mutation) -> 
         Program.from_dict(_identified(document), _catalog())
 
 
-@pytest.mark.parametrize('reverse', [False, True])
-def test_contact_policy_motion_endpoint_is_one_exact_pair(reverse) -> None:
-    document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
-    # Every user of endpoint-derived contact bodies must select its TCP.
-    for node in document['tree']['children']:
-        parameters = node.get('parameters', {})
-        if 'contact_policy_id' in parameters:
-            parameters['tcp_endpoint'] = {'kind': 'entry', 'target': target('robotiq_2f_85', 'gripper'), 'frame': frame('robotiq_2f_85', 'tcp')}  # TCP migration: selector now needs kind (entry)
-    policy = document['contact_policies'][0]
-    old_pair = policy['zones'][0]['body_pairs'][0]
-    runtime = next(value for value in old_pair.values() if value['kind'] == 'runtime_object')
-    pair = {'body_a': {'kind': 'motion_endpoint'}, 'body_b': runtime}
-    if reverse:
-        pair = {'body_a': runtime, 'body_b': {'kind': 'motion_endpoint'}}
-    policy['zones'][0]['body_pairs'] = [pair]
-    policy['version'] = compute_content_identity(policy, own_field='version', identity_domain='catalog-record-revision/contact_policy', api_version='manyforge.contact_policy.v1')
-    assert Program.from_dict(_identified(document), _catalog()).to_dict()['contact_policies'][0]['zones'][0]['body_pairs'] == [pair]
-    for invalid_pairs in ([pair, old_pair], [{'body_a': {'kind': 'motion_endpoint', 'target_role': 'gripper'}, 'body_b': runtime}]):
-        policy['zones'][0]['body_pairs'] = invalid_pairs
-        policy['version'] = compute_content_identity(policy, own_field='version', identity_domain='catalog-record-revision/contact_policy', api_version='manyforge.contact_policy.v1')
-        with pytest.raises(ProgramValidationError):
-            Program.from_dict(_identified(document), _catalog())
+_TCP_ON_CUBE = {
+    "a": [{"kind": "active_tcp_contact_bodies"}],
+    "b": [{"kind": "scene_object", "scene_resource_id": "cube_part"}],
+}
 
 
-@pytest.mark.parametrize("node_kind", ["probe", "pick"])
-@pytest.mark.parametrize("selection", ["qualified_explicit", "qualified_endpoint"])  # TCP migration: missing endpoint = current, not refused
-def test_endpoint_contact_policy_requires_qualified_tcp_at_authoring(node_kind, selection) -> None:
+def _rule_document(rules, *, node_id="motion.move_to_pose"):
+    """The contact example reduced to one node that carries ``rules``."""
+
     document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
-    if node_kind == "probe":
-        document["tree"] = {
-            "node_id": "motion.probe_search", "instance_id": "probe", "children": [],
-            "parameters": {
-                "target": target("ur5_robot", "arm"), "base_frame": frame("ur5_robot", "base"),
-                "tcp_endpoint": {"kind": "current"},  # TCP migration: the arm declares no tcp frame
-                "goal": {
-                    "frame_ref": {"kind": "target_frame", "frame": frame("ur5_robot", "base")},
-                    "position_m": [0.4, 0.0, 0.2], "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
-                },
-                "contact_policy_id": "selected_object_grasp",
-                "contact_scene_resource_id": "cube_part",
-                "stop_mode": "soft_on_path",
-                "interrupt_condition": {"compare": {
-                    "op": "==", "operand": {"key": "gripper_closed"}, "value": True,
-                }},
-            },
-        }
     pending = [document["tree"]]
-    users = []
     while pending:
         node = pending.pop()
-        if "contact_policy_id" in node.get("parameters", {}):
-            users.append(node)
+        if node["node_id"] == node_id:
+            document["tree"] = deepcopy(node)
+            break
         pending.extend(node.get("children", ()))
-    assert len(users) == 1
-    parameters = users[0]["parameters"]
-    assert users[0]["node_id"] == (
-        "motion.probe_search" if node_kind == "probe" else "planning.plan_pick_sequence"
-    )
-    parameters["tcp_endpoint"] = {"kind": "current"}  # TCP migration: contact follows the Active TCP
-    policy = next(
-        row for row in document["contact_policies"]
-        if row["policy_id"] == parameters["contact_policy_id"]
-    )
-    if selection != "qualified_explicit":
-        old_pair = policy["zones"][0]["body_pairs"][0]
-        runtime = next(value for value in old_pair.values() if value["kind"] == "runtime_object")
-        policy["zones"][0]["body_pairs"] = [
-            {"body_a": {"kind": "motion_endpoint"}, "body_b": runtime}
-        ]
-        policy["version"] = compute_content_identity(
-            policy, own_field="version", identity_domain="catalog-record-revision/contact_policy",
-            api_version="manyforge.contact_policy.v1",
-        )
-    parsed = Program.from_dict(_identified(document), _catalog())
-    assert parsed.to_dict()["contact_policies"] == document["contact_policies"]
+    else:
+        raise AssertionError(f"contact fixture has no {node_id} node")
+    document["tree"]["parameters"]["collision_rules"] = deepcopy(rules)
+    return document
 
 
-def test_joint_goal_can_author_an_explicit_endpoint_withdrawal_policy() -> None:
+def _node_rules(document):
+    program = Program.from_dict(_identified(document), _catalog())
+    return program.to_dict()["tree"]["parameters"]["collision_rules"]
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        [{"rule_id": "everything_else", "clearance_m": 0.002}],
+        [{"rule_id": "tip_on_cube", **_TCP_ON_CUBE, "contact": {}}],
+        [{"rule_id": "tip_on_cube", **_TCP_ON_CUBE,
+          "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8}}],
+        [{"rule_id": "leave_cube", **_TCP_ON_CUBE, "release": {}}],
+        [{"rule_id": "leave_cube", **_TCP_ON_CUBE, "release": {
+            "release_evidence_mode": "signed_penetration",
+            "enforce_max_start_penetration": True, "max_start_penetration_m": 0.002,
+            "min_release_progress_m": 0.0, "release_tolerance_m": 1e-5,
+            "require_strictly_decreasing_penetration": True,
+            "require_separation_by_end": True, "allow_recontact": False}}],
+        [{"rule_id": "leave_cube", **_TCP_ON_CUBE,
+          "release": {"release_evidence_mode": "binary_contact"}}],
+        [{"rule_id": "everything_else", "clearance_m": 0.0},
+         {"rule_id": "gripper_near_table",
+          "a": [{"kind": "collision_body", "component_id": "robotiq_2f_85",
+                 "collision_body_id": "gripper_collision"},
+                {"kind": "attached_object", "component_id": "robotiq_2f_85"}],
+          "b": [{"kind": "scene_objects"},
+                {"kind": "component", "component_id": "ur5_robot"},
+                {"kind": "link", "component_id": "ur5_robot", "link": "wrist_3_link"}],
+          "clearance_m": 0.01}],
+        [{"rule_id": "planned_object", "a": [{"kind": "active_tcp_contact_bodies"}],
+          "b": [{"kind": "scene_object", "blackboard_key": "planning.pick_plan",
+                 "field": "selected_object_id"}],
+          "contact": {"end_from_fraction": 0.8}}],
+    ],
+)
+def test_motion_node_keeps_its_collision_rules_as_authored(rules) -> None:
+    assert _node_rules(_rule_document(rules)) == rules
+
+
+@pytest.mark.parametrize(
+    "rules",
+    [
+        [{"rule_id": "", "clearance_m": 0.001}],
+        [{"rule_id": "twice", "clearance_m": 0.001},
+         {"rule_id": "twice", **_TCP_ON_CUBE, "contact": {}}],
+        [{"rule_id": "first", "clearance_m": 0.001},
+         {"rule_id": "second", "clearance_m": 0.002}],
+        [{"rule_id": "too_far", "clearance_m": 0.051}],
+        [{"rule_id": "no_value", **_TCP_ON_CUBE}],
+        [{"rule_id": "two_values", **_TCP_ON_CUBE, "clearance_m": 0.001, "contact": {}}],
+        [{"rule_id": "one_side", "a": _TCP_ON_CUBE["a"], "contact": {}}],
+        [{"rule_id": "contact_everywhere", "contact": {}}],
+        [{"rule_id": "leg_on_a_move", "leg": "descend", **_TCP_ON_CUBE, "contact": {}}],
+        [{"rule_id": "late", **_TCP_ON_CUBE, "contact": {"end_from_fraction": 1.5}}],
+        [{"rule_id": "deep", **_TCP_ON_CUBE, "contact": {"max_penetration_m": -0.001}}],
+        [{"rule_id": "odd", **_TCP_ON_CUBE, "contact": {"terminal_window_start_fraction": 0.8}}],
+        [{"rule_id": "evidence", **_TCP_ON_CUBE, "release": {"release_evidence_mode": "distance"}}],
+        [{"rule_id": "number", **_TCP_ON_CUBE, "release": {"release_tolerance_m": True}}],
+        [{"rule_id": "flag", **_TCP_ON_CUBE, "release": {"allow_recontact": 1}}],
+        [{"rule_id": "unknown", **_TCP_ON_CUBE, "release": {"max_penetration_m": 0.002}}],
+        [{"rule_id": "kind", "a": [{"kind": "motion_endpoint"}], "b": _TCP_ON_CUBE["b"],
+          "contact": {}}],
+        [{"rule_id": "extra", "a": [{"kind": "scene_objects", "component_id": "ur5_robot"}],
+          "b": _TCP_ON_CUBE["b"], "contact": {}}],
+        [{"rule_id": "both", "a": _TCP_ON_CUBE["a"],
+          "b": [{"kind": "scene_object", "scene_resource_id": "cube_part",
+                 "blackboard_key": "planning.pick_plan"}], "contact": {}}],
+        [{"rule_id": "missing_object", "a": _TCP_ON_CUBE["a"],
+          "b": [{"kind": "scene_object", "scene_resource_id": "no_such_part"}], "contact": {}}],
+        [{"rule_id": "not_an_object_key", "a": _TCP_ON_CUBE["a"],
+          "b": [{"kind": "scene_object", "blackboard_key": "gripper_closed"}], "contact": {}}],
+        [{"rule_id": "not_an_object_field", "a": _TCP_ON_CUBE["a"],
+          "b": [{"kind": "scene_object", "blackboard_key": "planning.pick_plan",
+                 "field": "tool_position"}], "contact": {}}],
+        [{"rule_id": f"rule_{index}", "clearance_m": 0.001} for index in range(65)],
+    ],
+)
+def test_motion_node_rejects_malformed_collision_rules(rules) -> None:
+    with pytest.raises(ProgramValidationError):
+        Program.from_dict(_identified(_rule_document(rules)), _catalog())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("enforce_max_start_penetration", True), ("max_start_penetration_m", 0.002),
+    ("min_release_progress_m", 0.001), ("release_tolerance_m", 1e-5),
+    ("require_strictly_decreasing_penetration", True),
+])
+def test_binary_contact_release_rejects_non_neutral_metric_constraints(field, value) -> None:
+    rules = [{"rule_id": "leave_cube", **_TCP_ON_CUBE,
+              "release": {"release_evidence_mode": "binary_contact", field: value}}]
+    with pytest.raises(ProgramValidationError, match="binary_contact forbids"):
+        Program.from_dict(_identified(_rule_document(rules)), _catalog())
+
+
+def test_sequence_collision_rules_name_their_leg() -> None:
+    rules = [
+        {"rule_id": "grasp", "leg": "descend", **_TCP_ON_CUBE,
+         "contact": {"max_penetration_m": 0.002, "end_from_fraction": 0.8}},
+        {"rule_id": "lift", "leg": "retreat",
+         "a": [{"kind": "attached_object", "component_id": "robotiq_2f_85"}],
+         "b": [{"kind": "scene_object", "scene_resource_id": "table"}],
+         "release": {"release_evidence_mode": "binary_contact"}},
+        {"rule_id": "approach_clearance", "leg": "approach", "clearance_m": 0.005},
+    ]
+    document = _rule_document(rules, node_id="planning.plan_pick_sequence")
+    assert _node_rules(document) == rules
+
+    for invalid in (
+        [{"rule_id": "no_leg", **_TCP_ON_CUBE, "contact": {}}],
+        [{"rule_id": "other_leg", "leg": "tool", **_TCP_ON_CUBE, "contact": {}}],
+        [{"rule_id": "first", "leg": "approach", "clearance_m": 0.001},
+         {"rule_id": "second", "leg": "descend", "clearance_m": 0.002}],
+    ):
+        with pytest.raises(ProgramValidationError):
+            Program.from_dict(
+                _identified(_rule_document(invalid, node_id="planning.plan_pick_sequence")),
+                _catalog(),
+            )
+
+
+def test_pick_sequence_needs_no_collision_rule() -> None:
+    document = _rule_document([], node_id="planning.plan_pick_sequence")
+    del document["tree"]["parameters"]["collision_rules"]
+    program = Program.from_dict(_identified(document), _catalog())
+    assert "collision_rules" not in program.to_dict()["tree"]["parameters"]
+
+
+def test_collision_rules_take_no_value_source() -> None:
+    document = _rule_document([{"rule_id": "everything_else", "clearance_m": 0.002}])
+    document["tree"].setdefault("value_sources", {})["collision_rules[0].clearance_m"] = {
+        "kind": "expression", "expression": "0.001",
+    }
+    with pytest.raises(ProgramValidationError, match="cannot dynamically select"):
+        Program.from_dict(_identified(document), _catalog())
+
+
+def test_joint_goal_can_author_a_withdrawal_release_rule() -> None:
     authoring = load_strict_json_yaml(_ROOT / 'examples/mock_lite6_signal_moves.scenario/program.yaml')
     assert len(authoring['forest']) == 1
     document = {
@@ -1259,13 +1279,19 @@ def test_joint_goal_can_author_an_explicit_endpoint_withdrawal_policy() -> None:
     }
     document['tree'] = deepcopy(authoring['forest'][0])
     document['program_revision'] = 'sha256:' + '0' * 64
+    rule = {
+        'rule_id': 'withdraw_from_block',
+        'a': [{'kind': 'active_tcp_contact_bodies'}],
+        'b': [{'kind': 'scene_object', 'scene_resource_id': 'probe_block'}],
+        'release': {'release_evidence_mode': 'signed_penetration',
+                    'max_start_penetration_m': 0.002},
+    }
     pending = [document['tree']]
     while pending:
         node = pending.pop()
         if node['instance_id'] == 'end_rest':
             assert node['node_id'] == 'motion.move_to_joint_target'
-            node['parameters']['contact_policy_id'] = 'withdrawal_contact_policy'
-            node['parameters']['contact_scene_resource_id'] = 'probe_block'
+            node['parameters']['collision_rules'] = [deepcopy(rule)]
             break
         pending.extend(node.get('children', ()))
     else:
@@ -1275,109 +1301,12 @@ def test_joint_goal_can_author_an_explicit_endpoint_withdrawal_policy() -> None:
     while pending:
         node = pending.pop()
         if node['instance_id'] == 'end_rest':
-            assert node['parameters']['contact_policy_id'] == 'withdrawal_contact_policy'
-            assert node['parameters']['contact_scene_resource_id'] == 'probe_block'
+            assert node['parameters']['collision_rules'] == [rule]
             assert node['parameters']['tcp_endpoint'] == {
                 'kind': 'default_of_target', 'target': target('lite_gripper', 'gripper')
             }
             break
         pending.extend(node.get('children', ()))
-
-
-def _contact_release_document(*, evidence="signed_penetration", pick=False):
-    document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
-    if not pick:
-        pending = [document["tree"]]
-        while pending:
-            node = pending.pop()
-            if node["node_id"] == "motion.move_to_pose":
-                document["tree"] = deepcopy(node)
-                break
-            pending.extend(node.get("children", ()))
-        else:
-            raise AssertionError("contact fixture has no pose move")
-        document["tree"]["parameters"].update(
-            tcp_endpoint={"kind": "entry", "target": target("robotiq_2f_85", "gripper"), "frame": frame("robotiq_2f_85", "tcp")},  # TCP migration: selector now needs kind (entry)
-            contact_policy_id=document["contact_policies"][0]["policy_id"],
-            contact_scene_resource_id="cube_part",
-        )
-    policy = document["contact_policies"][0]
-    policy["mode"] = "contact_release"
-    zone = policy["zones"][0]
-    zone.pop("max_penetration_m")
-    zone.pop("terminal_window_start_fraction")
-    zone["release_evidence_mode"] = evidence
-    old_pair = zone["body_pairs"][0]
-    runtime = next(side for side in old_pair.values() if side["kind"] == "runtime_object")
-    zone["body_pairs"] = [{"body_a": {"kind": "motion_endpoint"}, "body_b": runtime}]
-    return document
-
-
-def _identify_contact_release(document):
-    policy = document["contact_policies"][0]
-    policy["version"] = compute_content_identity(
-        policy, own_field="version", identity_domain="catalog-record-revision/contact_policy",
-        api_version="manyforge.contact_policy.v1",
-    )
-    return _identified(document)
-
-
-@pytest.mark.parametrize("evidence", ["signed_penetration", "binary_contact"])
-@pytest.mark.parametrize("explicit", [False, True])
-def test_contact_release_keeps_exact_endpoint_policy_and_authored_envelope(evidence, explicit):
-    document = _contact_release_document(evidence=evidence)
-    if explicit:
-        document["contact_policies"][0]["zones"][0].update(
-            enforce_max_start_penetration=evidence == "signed_penetration",
-            max_start_penetration_m=0.002 if evidence == "signed_penetration" else 0.0,
-            min_release_progress_m=0.0,
-            release_tolerance_m=1e-5 if evidence == "signed_penetration" else 0.0,
-            require_strictly_decreasing_penetration=evidence == "signed_penetration",
-            require_separation_by_end=True,
-            allow_recontact=False,
-        )
-    identified = _identify_contact_release(document)
-    parsed = Program.from_dict(identified, _catalog())
-    assert parsed.to_dict()["contact_policies"] == identified["contact_policies"]
-    assert parsed.to_dict()["tree"]["parameters"]["tcp_endpoint"] == {  # TCP migration: selector needs kind (entry)
-        "kind": "entry", "target": target("robotiq_2f_85", "gripper"), "frame": frame("robotiq_2f_85", "tcp"),
-    }
-
-
-@pytest.mark.parametrize("field,value", [
-    ("release_evidence_mode", None), ("release_evidence_mode", "distance"),
-    ("max_start_penetration_m", -0.001), ("min_release_progress_m", 1000.001),
-    ("release_tolerance_m", True), ("allow_recontact", 1),
-    ("max_penetration_m", 0.002), ("terminal_window_start_fraction", 0.9),
-    ("unknown_release_field", False),
-])
-def test_contact_release_rejects_crossed_or_malformed_envelope(field, value):
-    document = _contact_release_document()
-    zone = document["contact_policies"][0]["zones"][0]
-    if value is None:
-        zone.pop(field)
-    else:
-        zone[field] = value
-    with pytest.raises(ProgramValidationError):
-        Program.from_dict(_identify_contact_release(document), _catalog())
-
-
-@pytest.mark.parametrize("field,value", [
-    ("enforce_max_start_penetration", True), ("max_start_penetration_m", 0.002),
-    ("min_release_progress_m", 0.001), ("release_tolerance_m", 1e-5),
-    ("require_strictly_decreasing_penetration", True),
-])
-def test_binary_contact_release_rejects_non_neutral_metric_constraints(field, value):
-    document = _contact_release_document(evidence="binary_contact")
-    document["contact_policies"][0]["zones"][0][field] = value
-    with pytest.raises(ProgramValidationError, match="binary_contact forbids"):
-        Program.from_dict(_identify_contact_release(document), _catalog())
-
-
-def test_pick_rejects_a_contact_release_policy_before_runtime():
-    document = _contact_release_document(pick=True)
-    with pytest.raises(ProgramValidationError, match="pick requires a contact_grasp policy"):
-        Program.from_dict(_identify_contact_release(document), _catalog())
 
 
 @pytest.mark.parametrize(

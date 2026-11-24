@@ -6,7 +6,7 @@
 # rows, none in the Deployment): the Deployment row names the topic and the source frame
 # (both required) and the limits; until something publishes the topic, its
 # `pointcloud` stream shows none (e.g. on Mock).
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: sensor
 id: manyforge.pointcloud_source
 version: 1.0.0

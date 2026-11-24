@@ -282,7 +282,6 @@ SceneRevisionValue(const core::SceneRevision &value) {
       {"intent_digest", CanonicalValue(intent_digest.value())},
       {"program_binding_id",
        CanonicalValue(binding.program_binding_id.value())},
-      {"program_id", CanonicalValue(binding.program_id.value())},
       {"program_revision", CanonicalValue(binding.program_revision.value())},
       {"program_run_id", RunValue(intent.program_run_id)},
       {"request_key", CanonicalValue(RequestKeyText(intent.request_context.request_key))},
@@ -373,7 +372,6 @@ SceneRevisionValue(const core::SceneRevision &value) {
                            : CanonicalValue(nullptr)},
       {"program_binding_id",
        CanonicalValue(binding.program_binding_id.value())},
-      {"program_id", CanonicalValue(binding.program_id.value())},
       {"program_revision", CanonicalValue(binding.program_revision.value())},
       {"program_run_id", RunValue(intent.program_run_id)},
       {"request_key", CanonicalValue(RequestKeyText(intent.request_context.request_key))},
@@ -423,10 +421,31 @@ MotionSpecValue(const core::MotionSpecDTO &motion) {
               {"positions_rad", CanonicalValue(std::move(positions))},
           });
         } else if constexpr (std::is_same_v<Motion, core::PoseGoalDTO>) {
-          return CanonicalValue(CanonicalValue::Object{
+          CanonicalValue::Object pose{
               {"goal", PoseValue(value.goal)},
               {"kind", CanonicalValue("pose_goal")},
-          });
+          };
+          if (value.linear) {
+            const auto &linear = *value.linear;
+            pose.emplace_back("max_angular_acceleration_rad_s2",
+                              CanonicalValue(linear.max_angular_acceleration_rad_s2));
+            pose.emplace_back("max_angular_speed_rad_s",
+                              CanonicalValue(linear.max_angular_speed_rad_s));
+            pose.emplace_back("max_linear_acceleration_mps2",
+                              CanonicalValue(linear.max_linear_acceleration_mps2));
+            pose.emplace_back("max_rotation_step_rad",
+                              CanonicalValue(linear.max_rotation_step_rad));
+            pose.emplace_back("max_translation_step_m",
+                              CanonicalValue(linear.max_translation_step_m));
+            pose.emplace_back("motion_type", CanonicalValue("linear"));
+            if (linear.speed_mode) {
+              pose.emplace_back("speed_mode",
+                                CanonicalValue(std::string(
+                                    core::cartesian_speed_mode_name(
+                                        *linear.speed_mode))));
+            }
+          }
+          return CanonicalValue(std::move(pose));
         } else if constexpr (std::is_same_v<Motion, core::NamedTargetDTO>) {
           return CanonicalValue(CanonicalValue::Object{
               {"kind", CanonicalValue("named_target")},
@@ -726,6 +745,12 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
     if (indices != nullptr)
       indices->emplace_back(static_cast<double>(node.node_index));
   }
+  // OD-342: [held node index, requesting Program node index] pairs.
+  CanonicalValue::Array program_held;
+  for (const auto &hold : value.program_held_nodes)
+    program_held.emplace_back(CanonicalValue(CanonicalValue::Array{
+        CanonicalValue(static_cast<double>(hold.node_index)),
+        CanonicalValue(static_cast<double>(hold.stopped_by_node_index))}));
   return CanonicalValue(CanonicalValue::Object{
       {"schema_version",
        CanonicalValue(std::string(core::kProgramExecutionScopeSchema))},
@@ -747,6 +772,8 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
       {"stopped_by", value.stopped_by_rule_id ? CanonicalValue("rule") : CanonicalValue(nullptr)},
       {"rule_id", value.stopped_by_rule_id ? CanonicalValue(*value.stopped_by_rule_id)
                                            : CanonicalValue(nullptr)},
+      // Held nodes a Program node's own Stop holds (stopped_by: program).
+      {"program_held_nodes", CanonicalValue(std::move(program_held))},
       {"frozen", CanonicalValue(std::string(core::to_string(value.frozen)))},
       {"frozen_by", StopEventIdValue(value.frozen_by)},
       {"all_groups_held", CanonicalValue(value.all_groups_held)}});

@@ -6,6 +6,10 @@ from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any, Sequence
 
+from manyforge_behavior.collision_rules import (
+    CollisionRuleError,
+    validate_collision_rules,
+)
 from manyforge_behavior.program import ProgramValidationError, motion_tcp_selection
 
 
@@ -32,11 +36,13 @@ _COMMON_OPTIONAL = frozenset(
         "tool_command_duration_s",
         "tool_wait_for_duration",
         "tool_completion_timeout_s",
+        # Rows name their leg; each leg's rows also go on that leg's move.
+        "collision_rules",
     }
 )
 _SPECIFIC = {
     "pick": (
-        frozenset({"contact_policy_id"}),
+        frozenset(),
         frozenset({"synthesis", "no_feasible_plan_policy"}),
     ),
     "place": (
@@ -51,7 +57,7 @@ _STATIC_FIELDS = frozenset(
         "base_frame",
         "tcp_endpoint",
         "carrier_frame_ref",
-        "contact_policy_id",
+        "collision_rules",
         "planner",
     }
 )
@@ -185,8 +191,15 @@ def build_pick_place_subtree(
             plan_sources[name] = deepcopy(sources[name])
         elif name in values:
             plan_parameters[name] = literal(name)
-    if kind == "pick":
-        plan_parameters["contact_policy_id"] = literal("contact_policy_id")
+    collision_rules = literal("collision_rules", [])
+    try:
+        validate_collision_rules(
+            collision_rules, path="collision_rules", move_rules=True, legs=True
+        )
+    except CollisionRuleError as exc:
+        raise PickPlaceTemplateError(str(exc)) from exc
+    if collision_rules:
+        plan_parameters["collision_rules"] = deepcopy(collision_rules)
     plan_sources = dict(sorted(plan_sources.items()))
 
     def motion_parameters(phase: str) -> dict[str, Any]:
@@ -194,13 +207,18 @@ def build_pick_place_subtree(
         # Without a phase speed the move inherits the Program motion default.
         if f"{phase}_velocity_scale" in motion_options:
             result["velocity_scale"] = motion_options[f"{phase}_velocity_scale"]
+        leg_rules = [
+            {name: deepcopy(value) for name, value in row.items() if name != "leg"}
+            for row in collision_rules
+            if row["leg"] == phase
+        ]
+        if leg_rules:
+            result["collision_rules"] = leg_rules
         return result
 
     approach_parameters = motion_parameters("approach")
     descend_parameters = motion_parameters("descend")
     retreat_parameters = motion_parameters("retreat")
-    if kind == "pick":
-        descend_parameters["contact_policy_id"] = literal("contact_policy_id")
 
     gripper_parameters = {"target": literal("tool_target")}
     gripper_sources: dict[str, dict[str, Any]] = {
@@ -249,28 +267,13 @@ def build_pick_place_subtree(
             "node_id": "motion.follow_cartesian_path",
             "instance_id": f"{generated_prefix}.descend",
             "parameters": descend_parameters,
-            "value_sources": dict(
-                sorted(
-                    {
-                        "path": {
-                            "kind": "blackboard_field",
-                            "reference": result_key,
-                            "field": "descend_path",
-                        },
-                        **(
-                            {
-                                "contact_scene_resource_id": {
-                                    "kind": "blackboard_field",
-                                    "reference": result_key,
-                                    "field": "selected_object_id",
-                                }
-                            }
-                            if kind == "pick"
-                            else {}
-                        ),
-                    }.items()
-                )
-            ),
+            "value_sources": {
+                "path": {
+                    "kind": "blackboard_field",
+                    "reference": result_key,
+                    "field": "descend_path",
+                }
+            },
             "children": [],
         },
         {

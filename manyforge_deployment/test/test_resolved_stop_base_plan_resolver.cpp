@@ -164,7 +164,6 @@ make_runtime_context(const RetainedBundle &retained_bundle,
       "epoch." + control_binding.provider_runtime_unit_id.value());
   const core::RuntimeEpoch provider_epoch("provider.epoch.1");
   core::RuntimeParticipantBindingDTO value{
-      core::ProgramId("resolved.stop.plan.program"),
       core::ProgramRevision(std::string(kZeroDigest)),
       core::ProgramBindingId("resolved.stop.plan.binding"),
       retained_bundle.retained_bundle_id(),

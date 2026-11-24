@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import json
 from pathlib import Path
 import sys
@@ -238,6 +239,11 @@ def _serve(args: argparse.Namespace) -> int:
         canonical_empty_admission_filename=args.canonical_empty_admission_filename,
         disk_free_floor_bytes=args.disk_free_floor_bytes,
         disk_free_margin_bytes=args.disk_free_margin_bytes,
+        scene_mesh_allowed_roots=tuple(
+            root.strip()
+            for root in os.environ.get("MANYFORGE_FS_ROOTS", "").split(",")
+            if root.strip()
+        ),
     )
     # Internal request success is not a runtime event. Semantic owner state,
     # warnings, failures, and journals remain observable without a log line

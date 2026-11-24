@@ -1,10 +1,8 @@
 #include "../../manyforge_headless/src/scene_admission_reconciliation_internal.hpp"
 #include <gtest/gtest.h>
 #include <manyforge_scene/scene_candidate_preview.hpp>
-#include <sqlite3.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -13,24 +11,22 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <future>
 #include <initializer_list>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/logical_scene_projection.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
-#include <manyforge_persistence/sqlite_record_writer.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -46,7 +42,6 @@
 #include "manyforge_scene/logical_scene_owner.hpp"
 #include "manyforge_scene/logical_scene_value_codec.hpp"
 #include "manyforge_scene/scene_transaction_codec.hpp"
-#include "sqlite_scene_lifecycle_internal.hpp"
 
 namespace manyforge::scene {
 namespace {
@@ -224,15 +219,19 @@ private:
 constexpr std::string_view kExpectedSceneId =
     "sha256:b6edf7957c79f97cabefc2c61056f0bb09e00d1cac1ff3080ed540b650346dad";
 constexpr std::string_view kExpectedEmptySceneContentHash =
-    "sha256:bb42a1086f1fc8a45d1bcee2edc2bfce5ee2494029fdeeb5b2066717420cdfe5";
+    "sha256:84a0569fa0733fa8dcd5d34279f728d25e7f1fab03ceb56b6b6a593eecadad5c";
 constexpr std::int64_t kSustainedNoOpCommitP95BudgetNs = 50'000'000;
 
 static_assert(
-    !std::is_constructible_v<LogicalSceneOwner, std::filesystem::path,
+    !std::is_constructible_v<LogicalSceneOwner,
                              ProjectionBootstrapPrerequisiteQueryDTO,
                              const IActiveBundlePublicationReader &>);
-static_assert(std::is_constructible_v<
+static_assert(!std::is_constructible_v<
               LogicalSceneOwner, std::filesystem::path,
+              const deployment::CanonicalEmptyRetainedBundleAdmission &,
+              const IActiveBundlePublicationReader &>);
+static_assert(std::is_constructible_v<
+              LogicalSceneOwner,
               const deployment::CanonicalEmptyRetainedBundleAdmission &,
               const IActiveBundlePublicationReader &>);
 
@@ -264,12 +263,6 @@ private:
   std::vector<char> buffer_;
   std::filesystem::path path_;
 };
-
-void ExpectNoSqliteSidecars(const std::filesystem::path &path) {
-  EXPECT_FALSE(std::filesystem::exists(path.string() + "-wal"));
-  EXPECT_FALSE(std::filesystem::exists(path.string() + "-shm"));
-  EXPECT_FALSE(std::filesystem::exists(path.string() + "-journal"));
-}
 
 deployment::CanonicalEmptyRetainedBundleAdmission LoadAdmission() {
   const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
@@ -318,6 +311,12 @@ public:
   void RunBeforeNextAcquire(std::function<void()> action) {
     before_next_acquire_ = std::move(action);
   }
+  // Opt-in: an intent already settled here is admitted again as new, as by a
+  // Kernel that no longer holds that settlement.
+  void AdmitSettledIntentsAgain() {
+    std::lock_guard lock(mutex_);
+    admit_settled_intents_again_ = true;
+  }
 
   void RefuseApplyClaimLookupAfter(std::size_t successful_reads) {
     std::lock_guard lock(mutex_);
@@ -327,6 +326,20 @@ public:
   void RejectProgramResetSceneAuthorization(bool reject) {
     std::lock_guard lock(mutex_);
     reject_program_reset_scene_authorization_ = reject;
+  }
+
+  // Calls received from the scene owner (OD-376 counts them per Commit).
+  [[nodiscard]] std::size_t acquire_calls() const {
+    std::lock_guard lock(mutex_);
+    return acquire_calls_;
+  }
+  [[nodiscard]] std::size_t release_calls() const {
+    std::lock_guard lock(mutex_);
+    return release_calls_;
+  }
+  [[nodiscard]] std::size_t recovery_receipt_calls() const {
+    std::lock_guard lock(mutex_);
+    return recovery_receipt_calls_;
   }
 
   [[nodiscard]] std::vector<core::CellAdmissionClaimDTO> Claims() const {
@@ -378,6 +391,7 @@ public:
       action();
     }
     std::lock_guard lock(mutex_);
+    ++acquire_calls_;
     if (next_rejection_.has_value()) {
       return core::Result<core::CellAdmissionClaimDTO>::Err(
           *std::exchange(next_rejection_, std::nullopt));
@@ -389,7 +403,9 @@ public:
                    "scene test expected admission generation 1", {}});
     }
     for (std::size_t index = 0U; index < entries_.size(); ++index) {
-      if (entries_[index].claim.intent != intent) {
+      if (entries_[index].claim.intent != intent ||
+          (admit_settled_intents_again_ &&
+           entries_[index].release.has_value())) {
         continue;
       }
       if (!entries_[index].release.has_value() && held_index_ == index) {
@@ -426,6 +442,7 @@ public:
   ReleaseCellAdmissionClaim(
       const core::CellAdmissionClaimReleaseDTO &release) override {
     std::lock_guard lock(mutex_);
+    ++release_calls_;
     if (lost_reply_ == LostReply::kRelease) {
       lost_reply_ = LostReply::kNone;
       return core::Result<core::AuthoringAdmissionDTO>::Err(
@@ -460,6 +477,7 @@ public:
   GetCellAdmissionRecoveryReceipt(
       const core::CellAdmissionRecoveryReceiptQueryDTO &query) const override {
     std::lock_guard lock(mutex_);
+    ++recovery_receipt_calls_;
     if (query.intent.claim_kind == core::CellAdmissionClaimKindDTO::kManagerApply &&
         remaining_apply_claim_reads_.has_value()) {
       if (*remaining_apply_claim_reads_ == 0U) {
@@ -528,10 +546,14 @@ private:
   std::optional<std::size_t> held_index_;
   std::uint64_t next_claim_generation_{1U};
   bool reject_program_reset_scene_authorization_{};
+  bool admit_settled_intents_again_{};
   LostReply lost_reply_{LostReply::kNone};
   std::optional<ErrorDTO> next_rejection_;
   std::function<void()> before_next_acquire_;
   mutable std::optional<std::size_t> remaining_apply_claim_reads_;
+  std::size_t acquire_calls_{};
+  std::size_t release_calls_{};
+  mutable std::size_t recovery_receipt_calls_{};
 };
 
 class ControlledPublicationReader final
@@ -597,115 +619,6 @@ private:
   std::optional<ActiveBundlePublicationReceiptDTO> current_;
 };
 
-struct SceneLifecycleObservation final {
-  SceneLifecycleObservation(
-      const sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent
-          attempt,
-      const sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent
-          acquired)
-      : expected_attempt(attempt), expected_acquired(acquired),
-        release_signal(release_after_acquired.get_future().share()) {}
-
-  sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent
-      expected_attempt;
-  sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent
-      expected_acquired;
-  std::promise<void> attempted;
-  std::promise<void> acquired;
-  std::promise<void> release_after_acquired;
-  std::shared_future<void> release_signal;
-  std::atomic<bool> attempt_notified{false};
-  std::atomic<bool> acquired_notified{false};
-};
-
-void ObserveSceneLifecycleEvent(
-    const sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent
-        event,
-    void *const context) noexcept {
-  auto &observation = *static_cast<SceneLifecycleObservation *>(context);
-  try {
-    if (event == observation.expected_attempt &&
-        !observation.attempt_notified.exchange(true)) {
-      observation.attempted.set_value();
-      return;
-    }
-    if (event == observation.expected_acquired &&
-        !observation.acquired_notified.exchange(true)) {
-      observation.acquired.set_value();
-      observation.release_signal.wait();
-    }
-  } catch (...) {
-  }
-}
-
-class ScopedSceneLifecycleObserver final {
-public:
-  explicit ScopedSceneLifecycleObserver(
-      SceneLifecycleObservation &observation) {
-    sqlite_lifecycle_internal::
-        SetCanonicalEmptySceneStoreLifecycleEventObserverForTesting(
-            &ObserveSceneLifecycleEvent, &observation);
-  }
-
-  ~ScopedSceneLifecycleObserver() {
-    sqlite_lifecycle_internal::
-        ClearCanonicalEmptySceneStoreLifecycleEventObserverForTesting();
-  }
-
-  ScopedSceneLifecycleObserver(const ScopedSceneLifecycleObserver &) = delete;
-  ScopedSceneLifecycleObserver &
-  operator=(const ScopedSceneLifecycleObserver &) = delete;
-};
-
-template <typename Action>
-void ExpectActionAcquiresSceneLifecycleGate(
-    const sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent
-        expected_attempt,
-    const sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleEvent
-        expected_acquired,
-    Action action) {
-  sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleLock held(
-      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleMutex());
-  SceneLifecycleObservation observation(expected_attempt, expected_acquired);
-  auto attempted = observation.attempted.get_future();
-  auto acquired = observation.acquired.get_future();
-  const ScopedSceneLifecycleObserver observer(observation);
-  auto completion = std::async(
-      std::launch::async, [action = std::move(action)]() mutable { action(); });
-
-  const auto attempt_status = attempted.wait_for(2s);
-  if (attempt_status != std::future_status::ready) {
-    held.unlock();
-    observation.release_after_acquired.set_value();
-    ADD_FAILURE()
-        << "production action did not attempt the scene lifecycle gate";
-    EXPECT_NO_THROW(completion.get());
-    return;
-  }
-
-  held.unlock();
-  const auto acquired_status = acquired.wait_for(2s);
-  if (acquired_status != std::future_status::ready) {
-    observation.release_after_acquired.set_value();
-    ADD_FAILURE()
-        << "production action did not acquire the scene lifecycle gate";
-    EXPECT_NO_THROW(completion.get());
-    return;
-  }
-
-  auto &mutex =
-      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleMutex();
-  const bool acquired_by_test = mutex.try_lock();
-  if (acquired_by_test) {
-    mutex.unlock();
-  }
-  EXPECT_FALSE(acquired_by_test)
-      << "production action reported acquisition without holding the gate";
-
-  observation.release_after_acquired.set_value();
-  EXPECT_NO_THROW(completion.get());
-}
-
 ProjectionBootstrapIntentDTO
 Intent(const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        std::string bootstrap_id = "bootstrap-alpha") {
@@ -758,32 +671,6 @@ FinalizeRequest(const ProjectionBootstrapAcceptedDTO &accepted,
   };
 }
 
-void ExecuteSql(const std::filesystem::path &database_path,
-                const std::string &sql) {
-  sqlite3 *database = nullptr;
-  const auto open =
-      sqlite3_open_v2(database_path.c_str(), &database,
-                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr);
-  if (open != SQLITE_OK) {
-    const std::string detail =
-        database == nullptr ? sqlite3_errstr(open) : sqlite3_errmsg(database);
-    if (database != nullptr) {
-      sqlite3_close(database);
-    }
-    throw std::runtime_error("cannot open test database: " + detail);
-  }
-  char *error = nullptr;
-  const auto result =
-      sqlite3_exec(database, sql.c_str(), nullptr, nullptr, &error);
-  const std::string detail =
-      error == nullptr ? sqlite3_errmsg(database) : error;
-  sqlite3_free(error);
-  sqlite3_close(database);
-  if (result != SQLITE_OK) {
-    throw std::runtime_error("test SQL failed: " + detail);
-  }
-}
-
 void Require(const bool condition, const std::string_view message) {
   if (!condition) {
     throw std::runtime_error(std::string(message));
@@ -820,12 +707,10 @@ void ExpectExactCanonicalEmptySnapshot(
   EXPECT_EQ(snapshot.configured_collision_policy.revision.revision_id, 1U);
   EXPECT_EQ(snapshot.configured_collision_policy.revision.content_hash,
             core::kCanonicalEmptyCollisionPolicyDigest);
-  EXPECT_TRUE(
-      snapshot.configured_collision_policy.allowed_static_static_pairs.empty());
+  EXPECT_TRUE(snapshot.configured_collision_policy.static_body_ids.empty());
   EXPECT_TRUE(
       snapshot.configured_collision_policy.allowed_touch_link_pairs.empty());
-  EXPECT_TRUE(snapshot.configured_collision_policy.support_contacts.empty());
-  EXPECT_TRUE(snapshot.configured_collision_policy.contact_grasps.empty());
+  EXPECT_TRUE(snapshot.configured_collision_policy.contact_rules.empty());
   EXPECT_TRUE(snapshot.configured_collision_policy.require_full_diagnostics);
   EXPECT_TRUE(snapshot.objects.empty());
   EXPECT_TRUE(snapshot.carried_object_attachments.empty());
@@ -835,11 +720,9 @@ void ExpectExactCanonicalEmptySnapshot(
 }
 
 TEST(CanonicalEmptySceneOwner, SealedAdmissionMintsGoldenAndHoldsGatesClosed) {
-  TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader);
+  LogicalSceneOwner owner(admission, publication_reader);
 
   EXPECT_EQ(owner.fixed_query().cell_id, admission.cell_id());
   EXPECT_EQ(owner.fixed_query().canonical_empty_retained_bundle_id,
@@ -876,8 +759,6 @@ TEST(CanonicalEmptySceneOwner, SealedAdmissionMintsGoldenAndHoldsGatesClosed) {
   EXPECT_FALSE(access.active_projection.has_value());
   EXPECT_FALSE(owner.ReadActiveSnapshot().has_value());
   const auto integrity = owner.VerifyIntegrity();
-  EXPECT_EQ(integrity.schema_id, kLogicalSceneStoreSchemaId);
-  EXPECT_EQ(integrity.schema_version, kLogicalSceneStoreSchemaVersion);
   EXPECT_EQ(integrity.acceptance_row_count, 1);
   EXPECT_EQ(integrity.rebuild_row_count, 0);
   EXPECT_EQ(integrity.finalization_row_count, 0);
@@ -886,15 +767,13 @@ TEST(CanonicalEmptySceneOwner, SealedAdmissionMintsGoldenAndHoldsGatesClosed) {
 
 TEST(CanonicalEmptySceneOwner,
      BeginAcceptsOnlyExactAdmittedBundleAndOneBootstrapLineage) {
-  TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader);
+  LogicalSceneOwner owner(admission, publication_reader);
 
   auto cross_spliced = Intent(admission);
-  cross_spliced.canonical_empty_retained_bundle.deployment_artifact_id =
-      core::DeploymentArtifactId("forged-deployment");
+  cross_spliced.canonical_empty_retained_bundle.deployment_revision =
+      core::DeploymentRevision("forged-deployment");
   EXPECT_THROW(owner.BeginProjectionBootstrap(cross_spliced),
                LogicalSceneOwnerConflictError);
   EXPECT_EQ(owner.VerifyIntegrity().acceptance_row_count, 0);
@@ -910,89 +789,43 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(owner.VerifyIntegrity().acceptance_row_count, 1);
 }
 
-TEST(CanonicalEmptySceneOwner,
-     RestartReconstructsCompleteSnapshotAndExactReplay) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
+TEST(CanonicalEmptySceneOwner, ZeroNativeRebuildIsIdempotentAndStatusComplete) {
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  ProjectionRevisionDTO target = [&] {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader);
-    const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
-    ExpectExactCanonicalEmptySnapshot(accepted, admission);
-    owner.Close();
-    return accepted.canonical_empty_target;
-  }();
+  LogicalSceneOwner owner(admission, publication_reader);
+  const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
+  const auto rebuilt =
+      owner.RebuildProjectionBootstrap(RebuildRequest(accepted));
+  ASSERT_TRUE(rebuilt.presence_valid());
+  ASSERT_TRUE(rebuilt.bootstrap_evidence.has_value());
+  EXPECT_TRUE(rebuilt.bootstrap_evidence->rebuild_results.empty());
+  EXPECT_TRUE(rebuilt.bootstrap_evidence->candidate_aggregate_health
+                  .native_projection_health.empty());
+  EXPECT_EQ(rebuilt.bootstrap_evidence->candidate_aggregate_health.state,
+            core::ProjectionHealthState::kHealthy);
+  const auto replay =
+      owner.RebuildProjectionBootstrap(RebuildRequest(accepted));
+  EXPECT_EQ(replay.canonical_empty_target, rebuilt.canonical_empty_target);
 
-  LogicalSceneOwner reopened(database_path, admission,
-                                    publication_reader);
-  const auto status =
-      reopened.ProjectionBootstrapStatus(ProjectionBootstrapStatusQueryDTO{
-          BootstrapId("bootstrap-alpha"), BootstrapGeneration(1U)});
-  ASSERT_TRUE(status.presence_valid());
-  EXPECT_EQ(status.state, ProjectionBootstrapStatusState::kAccepted);
-  EXPECT_EQ(status.canonical_empty_target, target);
-  const auto replay = reopened.BeginProjectionBootstrap(Intent(admission));
-  EXPECT_EQ(replay.canonical_empty_target, target);
-  ExpectExactCanonicalEmptySnapshot(replay, admission);
-
-  const auto absent =
-      reopened.ProjectionBootstrapStatus(ProjectionBootstrapStatusQueryDTO{
-          BootstrapId("bootstrap-foreign"), BootstrapGeneration(9U)});
-  EXPECT_TRUE(absent.presence_valid());
-  EXPECT_EQ(absent.state, ProjectionBootstrapStatusState::kAbsent);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ZeroNativeRebuildIsDurableIdempotentAndStatusComplete) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  ProjectionBootstrapAcceptedDTO accepted = [&] {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader);
-    auto value = owner.BeginProjectionBootstrap(Intent(admission));
-    const auto rebuilt =
-        owner.RebuildProjectionBootstrap(RebuildRequest(value));
-    Require(rebuilt.presence_valid(), "Rebuild result is invalid");
-    Require(rebuilt.bootstrap_evidence.has_value(),
-            "Rebuild result has no evidence");
-    EXPECT_TRUE(rebuilt.bootstrap_evidence->rebuild_results.empty());
-    EXPECT_TRUE(rebuilt.bootstrap_evidence->candidate_aggregate_health
-                    .native_projection_health.empty());
-    EXPECT_EQ(rebuilt.bootstrap_evidence->candidate_aggregate_health.state,
-              core::ProjectionHealthState::kHealthy);
-    const auto replay = owner.RebuildProjectionBootstrap(RebuildRequest(value));
-    EXPECT_EQ(replay.canonical_empty_target, rebuilt.canonical_empty_target);
-    owner.Close();
-    return value;
-  }();
-
-  LogicalSceneOwner reopened(database_path, admission,
-                                    publication_reader);
-  const auto status = reopened.ProjectionBootstrapStatus(
+  const auto status = owner.ProjectionBootstrapStatus(
       {accepted.bootstrap_id, accepted.bootstrap_generation});
   ASSERT_TRUE(status.presence_valid());
   EXPECT_EQ(status.state, ProjectionBootstrapStatusState::kReadyToPublish);
   ASSERT_TRUE(status.bootstrap_evidence.has_value());
   EXPECT_TRUE(status.bootstrap_evidence->rebuild_results.empty());
   EXPECT_TRUE(status.native_rebuild_observations.empty());
-  EXPECT_FALSE(reopened.ReadAccessStatus().scene_writes_open);
-  EXPECT_FALSE(reopened.ReadAccessStatus().projection_leases_open);
-  const auto integrity = reopened.VerifyIntegrity();
+  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
+  const auto integrity = owner.VerifyIntegrity();
   EXPECT_EQ(integrity.acceptance_row_count, 1);
   EXPECT_EQ(integrity.rebuild_row_count, 1);
   EXPECT_EQ(integrity.finalization_row_count, 0);
 }
 
 TEST(CanonicalEmptySceneOwner, NonzeroNativeBootstrapIsExplicitlyUnavailable) {
-  TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader);
+  LogicalSceneOwner owner(admission, publication_reader);
   auto intent = Intent(admission);
   intent.execution_host_bindings.push_back(ProjectionExecutionHostBindingDTO{
       core::CapabilityProviderBindingId("binding"),
@@ -1006,100 +839,83 @@ TEST(CanonicalEmptySceneOwner, NonzeroNativeBootstrapIsExplicitlyUnavailable) {
 }
 
 TEST(CanonicalEmptySceneOwner,
-     FinalizeRejectsStaleAndMismatchedHeadThenDurablyOpensGates) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
+     FinalizeRejectsStaleAndMismatchedHeadThenOpensGates) {
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  ActiveBundlePublicationReceiptDTO exact_receipt = [&] {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader);
-    const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
-    static_cast<void>(
-        owner.RebuildProjectionBootstrap(RebuildRequest(accepted)));
-    auto receipt = PublicationReceipt(accepted);
-    const auto finalize = FinalizeRequest(accepted, receipt);
+  LogicalSceneOwner owner(admission, publication_reader);
+  const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
+  static_cast<void>(owner.RebuildProjectionBootstrap(RebuildRequest(accepted)));
+  const auto receipt = PublicationReceipt(accepted);
+  const auto finalize = FinalizeRequest(accepted, receipt);
 
-    const auto stale = owner.FinalizeProjectionBootstrap(finalize);
-    Require(stale.presence_valid(), "stale Finalize result is invalid");
-    EXPECT_EQ(stale.state, ProjectionBootstrapFinalizeResultState::kStale);
-    EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-    EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
-    EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 0);
+  const auto stale = owner.FinalizeProjectionBootstrap(finalize);
+  ASSERT_TRUE(stale.presence_valid());
+  EXPECT_EQ(stale.state, ProjectionBootstrapFinalizeResultState::kStale);
+  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_FALSE(owner.ReadAccessStatus().projection_leases_open);
+  EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 0);
 
-    auto mismatched = receipt;
-    mismatched.durable_public_pointer_content_digest = Digest('d');
-    publication_reader.SetCurrent(mismatched);
-    const auto mismatch = owner.FinalizeProjectionBootstrap(finalize);
-    Require(mismatch.presence_valid(), "mismatched Finalize result is invalid");
-    EXPECT_EQ(mismatch.state, ProjectionBootstrapFinalizeResultState::kStale);
-    EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-    EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 0);
+  auto mismatched = receipt;
+  mismatched.durable_public_pointer_content_digest = Digest('d');
+  publication_reader.SetCurrent(mismatched);
+  const auto mismatch = owner.FinalizeProjectionBootstrap(finalize);
+  ASSERT_TRUE(mismatch.presence_valid());
+  EXPECT_EQ(mismatch.state, ProjectionBootstrapFinalizeResultState::kStale);
+  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 0);
 
-    publication_reader.SetCurrent(receipt);
-    const auto finalized = owner.FinalizeProjectionBootstrap(finalize);
-    Require(finalized.presence_valid(),
-            "successful Finalize result is invalid");
-    EXPECT_EQ(finalized.state,
-              ProjectionBootstrapFinalizeResultState::kFinalized);
-    EXPECT_EQ(finalized.publication_receipt, receipt);
-    const auto access = owner.ReadAccessStatus();
-    EXPECT_TRUE(access.scene_writes_open);
-    EXPECT_TRUE(access.projection_leases_open);
-    Require(access.active_projection.has_value(),
-            "finalized access has no active projection");
-    EXPECT_EQ(*access.active_projection, accepted.canonical_empty_target);
-    const auto snapshot = owner.ReadActiveSnapshot();
-    Require(snapshot.has_value(), "finalized owner has no active snapshot");
-    EXPECT_EQ(snapshot->shared()->identity(),
-              accepted.initialized_logical_scene.shared()->identity());
-    EXPECT_TRUE(snapshot->canonical_empty_for(
-        accepted.initialized_logical_scene.shared()->identity()));
-    EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 1);
+  publication_reader.SetCurrent(receipt);
+  const auto finalized = owner.FinalizeProjectionBootstrap(finalize);
+  ASSERT_TRUE(finalized.presence_valid());
+  EXPECT_EQ(finalized.state,
+            ProjectionBootstrapFinalizeResultState::kFinalized);
+  EXPECT_EQ(finalized.publication_receipt, receipt);
+  const auto access = owner.ReadAccessStatus();
+  EXPECT_TRUE(access.scene_writes_open);
+  EXPECT_TRUE(access.projection_leases_open);
+  ASSERT_TRUE(access.active_projection.has_value());
+  EXPECT_EQ(*access.active_projection, accepted.canonical_empty_target);
+  const auto snapshot = owner.ReadActiveSnapshot();
+  ASSERT_TRUE(snapshot.has_value());
+  EXPECT_EQ(snapshot->shared()->identity(),
+            accepted.initialized_logical_scene.shared()->identity());
+  EXPECT_TRUE(snapshot->canonical_empty_for(
+      accepted.initialized_logical_scene.shared()->identity()));
+  EXPECT_EQ(snapshot->shared()->revision,
+            receipt.request.candidate_projection_revision.scene_revision);
+  EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 1);
 
-    const auto observed =
-        owner.ObserveProjectionBootstrapPrerequisites(owner.fixed_query());
-    EXPECT_TRUE(observed.presence_valid());
-    EXPECT_EQ(
-        observed.state,
-        ProjectionBootstrapPrerequisiteState::kConflictingActiveProjection);
-    owner.Close();
-    return receipt;
-  }();
+  const auto observed =
+      owner.ObserveProjectionBootstrapPrerequisites(owner.fixed_query());
+  EXPECT_TRUE(observed.presence_valid());
+  EXPECT_EQ(observed.state,
+            ProjectionBootstrapPrerequisiteState::kConflictingActiveProjection);
 
+  // The recorded finalization answers status and replay without another
+  // publication read.
   publication_reader.Clear();
-  const auto calls_before_reopen = publication_reader.calls();
-  LogicalSceneOwner reopened(database_path, admission,
-                                    publication_reader);
-  const auto status = reopened.ProjectionBootstrapStatus(
+  const auto calls_before_replay = publication_reader.calls();
+  const auto status = owner.ProjectionBootstrapStatus(
       {BootstrapId("bootstrap-alpha"), BootstrapGeneration(1U)});
   ASSERT_TRUE(status.presence_valid());
   EXPECT_EQ(status.state, ProjectionBootstrapStatusState::kFinalized);
-  EXPECT_EQ(status.publication_receipt, exact_receipt);
-  EXPECT_TRUE(reopened.ReadAccessStatus().scene_writes_open);
-  EXPECT_TRUE(reopened.ReadAccessStatus().projection_leases_open);
-  const auto reopened_snapshot = reopened.ReadActiveSnapshot();
-  ASSERT_TRUE(reopened_snapshot.has_value());
-  EXPECT_EQ(reopened_snapshot->shared()->revision,
-            exact_receipt.request.candidate_projection_revision.scene_revision);
+  EXPECT_EQ(status.publication_receipt, receipt);
   ASSERT_TRUE(status.canonical_empty_target.has_value());
-  const auto replay = reopened.FinalizeProjectionBootstrap({
+  const auto replay = owner.FinalizeProjectionBootstrap({
       BootstrapId("bootstrap-alpha"),
       BootstrapGeneration(1U),
       *status.canonical_empty_target,
-      exact_receipt,
+      receipt,
   });
   EXPECT_EQ(replay.state, ProjectionBootstrapFinalizeResultState::kFinalized);
-  EXPECT_EQ(publication_reader.calls(), calls_before_reopen);
+  EXPECT_EQ(publication_reader.calls(), calls_before_replay);
 }
 
 TEST(CanonicalEmptySceneOwner,
      PublicationReadUncertaintyNeverOpensWritesOrLeases) {
-  TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader);
+  LogicalSceneOwner owner(admission, publication_reader);
   const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
   static_cast<void>(owner.RebuildProjectionBootstrap(RebuildRequest(accepted)));
   const auto finalize = FinalizeRequest(accepted, PublicationReceipt(accepted));
@@ -1127,319 +943,10 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(owner.VerifyIntegrity().finalization_row_count, 0);
 }
 
-TEST(CanonicalEmptySceneOwnerLifecycleGate,
-     ContendedStartupDeadlineReturnsWithoutOwnership) {
-  constexpr auto kTimeout = 50ms;
-  sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleLock held(
-      sqlite_lifecycle_internal::CanonicalEmptySceneStoreLifecycleMutex());
-  std::promise<void> start_promise;
-  const auto start = start_promise.get_future().share();
-  auto waiter = std::async(std::launch::async, [start] {
-    start.get();
-    const auto started = std::chrono::steady_clock::now();
-    auto attempted = sqlite_lifecycle_internal::
-        TryAcquireCanonicalEmptySceneStoreLifecycleLock(kTimeout);
-    return std::pair{attempted.owns_lock(),
-                     std::chrono::steady_clock::now() - started};
-  });
-  start_promise.set_value();
-
-  const auto [owns_lock, elapsed] = waiter.get();
-  held.unlock();
-  EXPECT_FALSE(owns_lock);
-  EXPECT_GE(elapsed, kTimeout);
-}
-
-TEST(CanonicalEmptySceneOwner, ConcurrentFirstOpenConvergesOneExactEmptyStore) {
-  TemporaryDirectory directory;
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  const auto database = directory.path() / "logical-scene.sqlite3";
-  std::promise<void> start_promise;
-  const auto start = start_promise.get_future().share();
-  std::barrier open_together(4);
-  std::vector<std::future<CanonicalEmptySceneStoreIntegrityReport>> openings;
-  openings.reserve(4U);
-  try {
-    for (std::size_t index = 0U; index < 4U; ++index) {
-      openings.push_back(std::async(std::launch::async, [&, index, start] {
-        start.get();
-        open_together.arrive_and_wait();
-        LogicalSceneOwner owner(database, admission, publication_reader);
-        const auto report = owner.VerifyIntegrity();
-        if (index % 2U == 0U) {
-          owner.Close();
-        }
-        return report;
-      }));
-    }
-  } catch (...) {
-    const auto launch_error = std::current_exception();
-    start_promise.set_exception(launch_error);
-    for (auto &opening : openings) {
-      try {
-        static_cast<void>(opening.get());
-      } catch (...) {
-      }
-    }
-    std::rethrow_exception(launch_error);
-  }
-  start_promise.set_value();
-
-  std::string schema_digest;
-  for (auto &opening : openings) {
-    const auto report = opening.get();
-    EXPECT_EQ(report.acceptance_row_count, 0);
-    EXPECT_EQ(report.rebuild_row_count, 0);
-    EXPECT_EQ(report.finalization_row_count, 0);
-    if (schema_digest.empty()) {
-      schema_digest = report.schema_artifact_digest;
-    } else {
-      EXPECT_EQ(report.schema_artifact_digest, schema_digest);
-    }
-  }
-  ExpectNoSqliteSidecars(database);
-  LogicalSceneOwner reopened(database, admission, publication_reader);
-  EXPECT_EQ(reopened.VerifyIntegrity().acceptance_row_count, 0);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     StartupRejectsSemanticRowCorruptionWithIntactSchema) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader);
-    static_cast<void>(owner.BeginProjectionBootstrap(Intent(admission)));
-    owner.Close();
-  }
-  ExecuteSql(
-      database_path,
-      "DROP TRIGGER canonical_empty_scene_acceptance_no_update;"
-      "UPDATE canonical_empty_scene_acceptance "
-      "SET scene_content_hash='sha256:"
-      "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';"
-      "CREATE TRIGGER IF NOT EXISTS "
-      "canonical_empty_scene_acceptance_no_update "
-      "BEFORE UPDATE ON canonical_empty_scene_acceptance BEGIN "
-      "SELECT RAISE(ABORT, 'canonical_empty_scene_acceptance is immutable');"
-      "END;");
-  EXPECT_THROW(
-      LogicalSceneOwner(database_path, admission, publication_reader),
-      LogicalSceneOwnerIntegrityError);
-}
-
-TEST(CanonicalEmptySceneOwner, StartupRejectsTheProvisionalV3PayloadContract) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader);
-    owner.Close();
-  }
-  ExecuteSql(database_path, "PRAGMA user_version = 3;");
-  EXPECT_THROW(
-      LogicalSceneOwner(database_path, admission, publication_reader),
-      LogicalSceneOwnerIntegrityError);
-}
-
-// One integer read from a closed test store.
-std::int64_t ReadStoreInteger(const std::filesystem::path &database_path,
-                              const std::string &sql) {
-  sqlite3 *database = nullptr;
-  Require(sqlite3_open_v2(database_path.c_str(), &database,
-                          SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
-                          nullptr) == SQLITE_OK,
-          "cannot open the test store");
-  sqlite3_stmt *statement = nullptr;
-  const bool read =
-      sqlite3_prepare_v2(database, sql.c_str(), -1, &statement, nullptr) ==
-          SQLITE_OK &&
-      sqlite3_step(statement) == SQLITE_ROW;
-  const auto value = read ? sqlite3_column_int64(statement, 0) : -1;
-  sqlite3_finalize(statement);
-  sqlite3_close(database);
-  Require(read, "test store query failed: " + sql);
-  return value;
-}
-
-std::int64_t CountStoreColumns(const std::filesystem::path &database_path,
-                               const std::string &table,
-                               const std::string &condition) {
-  return ReadStoreInteger(database_path,
-                          "SELECT count(*) FROM pragma_table_info('" + table +
-                              "') WHERE " + condition);
-}
-
-TEST(CanonicalEmptySceneOwner, EmptyFileIsInitializedAtTheCurrentKeyedSchema) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  EXPECT_EQ(kLogicalSceneStoreSchemaVersion, 12);
-  {
-    LogicalSceneOwner owner(database_path, admission, publication_reader);
-    const auto integrity = owner.VerifyIntegrity();
-    EXPECT_EQ(integrity.schema_id, kLogicalSceneStoreSchemaId);
-    EXPECT_EQ(integrity.schema_version, kLogicalSceneStoreSchemaVersion);
-    owner.Close();
-  }
-  EXPECT_EQ(ReadStoreInteger(database_path, "PRAGMA user_version"),
-            kLogicalSceneStoreSchemaVersion);
-  EXPECT_EQ(ReadStoreInteger(database_path, "PRAGMA application_id"),
-            kCanonicalEmptySceneSqliteApplicationId);
-  // A Scene request is identified by its 16-byte request key alone.
-  for (const std::string table :
-       {"logical_scene_transaction_intents", "logical_scene_request_outcomes"}) {
-    SCOPED_TRACE(table);
-    EXPECT_EQ(CountStoreColumns(database_path, table,
-                                "name='request_key' AND type='BLOB'"),
-              1);
-    EXPECT_EQ(CountStoreColumns(database_path, table,
-                                "name IN ('request_id','request_owner_epoch')"),
-              0);
-  }
-  EXPECT_EQ(CountStoreColumns(database_path, "logical_scene_history_state",
-                              "name LIKE 'request_%'"),
-            0);
-  EXPECT_EQ(CountStoreColumns(database_path,
-                              "logical_scene_maintenance_initialization_intents",
-                              "name='apply_id' AND type='INTEGER'"),
-            1);
-  // A store is fresh at every start: it holds no migration-result state.
-  EXPECT_EQ(ReadStoreInteger(
-                database_path,
-                "SELECT count(*) FROM sqlite_master WHERE name IN ("
-                "'logical_scene_maintenance_migration_state',"
-                "'logical_scene_migrated_structural_completions',"
-                "'logical_scene_migrated_active_execution_host_bindings')"),
-            0);
-  EXPECT_EQ(CountStoreColumns(database_path, "logical_scene_history_state",
-                              "name='compacted_structural_completion_count'"),
-            0);
-  EXPECT_EQ(CountStoreColumns(database_path, "logical_scene_owner_events",
-                              "name='structural_completion_sequence'"),
-            0);
-  LogicalSceneOwner reopened(database_path, admission, publication_reader);
-  EXPECT_EQ(reopened.VerifyIntegrity().schema_version,
-            kLogicalSceneStoreSchemaVersion);
-}
-
-TEST(CanonicalEmptySceneOwner, StoreOfAnotherSchemaVersionIsRefusedUnchanged) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  {
-    LogicalSceneOwner owner(database_path, admission, publication_reader);
-    owner.Close();
-  }
-  const auto file_bytes = [&] {
-    std::ifstream input(database_path, std::ios::binary);
-    std::ostringstream bytes;
-    bytes << input.rdbuf();
-    return bytes.str();
-  };
-  // The previous keyed-by-epoch format, an older upgrade source and a newer
-  // store are all refused, never converted.
-  for (const std::int64_t version :
-       {kLogicalSceneStoreSchemaVersion - 1, std::int64_t{9}, std::int64_t{2},
-        kLogicalSceneStoreSchemaVersion + 1}) {
-    SCOPED_TRACE(version);
-    ExecuteSql(database_path,
-               "PRAGMA user_version = " + std::to_string(version) + ";");
-    const auto before = file_bytes();
-    try {
-      LogicalSceneOwner refused(database_path, admission, publication_reader);
-      ADD_FAILURE() << "a store of another schema version was opened";
-    } catch (const LogicalSceneOwnerIntegrityError &error) {
-      const std::string message = error.what();
-      EXPECT_NE(message.find("schema version " + std::to_string(version)),
-                std::string::npos)
-          << message;
-      EXPECT_NE(message.find("not converted"), std::string::npos) << message;
-    }
-    EXPECT_EQ(file_bytes(), before);
-    EXPECT_EQ(ReadStoreInteger(database_path, "PRAGMA user_version"), version);
-  }
-}
-
-TEST(CanonicalEmptySceneOwner, StartupRejectsOversizedDatabaseImage) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader);
-    owner.Close();
-  }
-  std::filesystem::resize_file(
-      database_path,
-      static_cast<std::uintmax_t>(kMaximumSceneStoreDatabasePageImageBytes) +
-          1U);
-  EXPECT_THROW(
-      LogicalSceneOwner(database_path, admission, publication_reader),
-      LogicalSceneOwnerError);
-}
-
-TEST(CanonicalEmptySceneOwner, StartupRejectsOversizedWalResidue) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto wal_path = std::filesystem::path(database_path.string() + "-wal");
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader);
-    owner.Close();
-  }
-  {
-    std::ofstream wal(wal_path, std::ios::binary | std::ios::trunc);
-    ASSERT_TRUE(wal.good());
-  }
-  std::filesystem::resize_file(
-      wal_path, static_cast<std::uintmax_t>(kMaximumSceneStoreWalBytes) + 1U);
-  EXPECT_THROW(
-      LogicalSceneOwner(database_path, admission, publication_reader),
-      LogicalSceneOwnerError);
-}
-
-TEST(CanonicalEmptySceneOwner, RestartsExactEmptyInitializationResidue) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  sqlite3 *empty_database = nullptr;
-  ASSERT_EQ(sqlite3_open_v2(database_path.c_str(), &empty_database,
-                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
-                                SQLITE_OPEN_FULLMUTEX,
-                            nullptr),
-            SQLITE_OK);
-  ASSERT_NE(empty_database, nullptr);
-  ASSERT_EQ(sqlite3_close(empty_database), SQLITE_OK);
-
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  LogicalSceneOwner owner(database_path, admission, publication_reader);
-  const auto inventory = owner.VerifyIntegrity();
-  EXPECT_EQ(inventory.acceptance_row_count, 0);
-  EXPECT_EQ(inventory.rebuild_row_count, 0);
-  EXPECT_EQ(inventory.finalization_row_count, 0);
-  EXPECT_EQ(inventory.access.phase,
-            CanonicalEmptySceneBootstrapPhase::kInitialCommandFenced);
-  const auto accepted = owner.BeginProjectionBootstrap(Intent(admission));
-  ExpectExactCanonicalEmptySnapshot(accepted, admission);
-}
-
 TEST(CanonicalEmptySceneOwner, RejectsOverBoundBootstrapIdentifier) {
-  TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader);
+  LogicalSceneOwner owner(admission, publication_reader);
   EXPECT_THROW(
       owner.BeginProjectionBootstrap(Intent(
           admission, std::string(kMaximumSceneStoreIdentifierBytes + 1U, 'x'))),
@@ -1449,8 +956,7 @@ TEST(CanonicalEmptySceneOwner, RejectsOverBoundBootstrapIdentifier) {
 
 core::SceneTransactionRequestDTO
 AddBoxRequest(const ProjectionRevisionDTO &expected, const CellId &cell_id,
-              std::string request_id = "scene-request-add-box",
-              std::vector<core::SupportContactDTO> support_contacts = {}) {
+              std::string request_id = "scene-request-add-box") {
   core::Pose3DTO pose;
   pose.position_m = {0.25, -0.5, 0.75};
   return {
@@ -1465,10 +971,31 @@ AddBoxRequest(const ProjectionRevisionDTO &expected, const CellId &cell_id,
           core::BoxShapeDTO{{0.1, 0.2, 0.3}},
           pose,
           core::CellSceneFrameRefDTO{cell_id},
-          std::move(support_contacts),
       },
       core::AdmissionGeneration(1U),
   };
+}
+
+// Bytes of the mesh resource URI of AddLargeMeshRequest: three such objects
+// keep a Scene below kMaximumLogicalSceneSnapshotBytes, a fourth exceeds it,
+// and each request stays far below any request bound.
+constexpr std::size_t kLargeMeshUriBytes = 100U * 1024U;
+
+// An authored add of a captured mesh whose resource URI is kLargeMeshUriBytes
+// long, so its object dominates the Scene's encoding.
+core::SceneTransactionRequestDTO
+AddLargeMeshRequest(const ProjectionRevisionDTO &expected,
+                    const CellId &cell_id, const std::string &name) {
+  auto request =
+      AddBoxRequest(expected, cell_id, "scene-request-large-mesh-" + name);
+  auto &operation = std::get<core::AddObjectRequestDTO>(request.operation);
+  operation.scene_resource_id = core::SceneResourceId("large-mesh-" + name);
+  std::string uri = "package://manyforge_test/" + name + "/";
+  uri.resize(kLargeMeshUriBytes - 4U, 'm');
+  uri += ".stl";
+  operation.shape =
+      core::MeshShapeDTO{std::move(uri), {1.0, 1.0, 1.0}, Digest('e').value()};
+  return request;
 }
 
 core::PublicRequestContextDTO
@@ -1546,6 +1073,48 @@ TEST(LogicalSceneTransactionCodec, AttachGraspLostBoundIsOptionalAndRoundTrips) 
   refused(R"("detach":true,)", "");
   refused(R"("set_key":"part_lost")", R"("set_key":"")");
   refused(R"("detach":true)", R"("detach":"yes")");
+  // OD-372: a mounted component's carrier frame is named only when present.
+  EXPECT_EQ(keyed.find("carrier_component_id"), std::string::npos);
+  attach.carrier_component_id = core::ControllableComponentId("tube_holder");
+  const auto mounted = logical_scene_codec_internal::EncodeRequest(request);
+  EXPECT_NE(mounted.find(R"("carrier_component_id":"tube_holder")"), std::string::npos);
+  EXPECT_EQ(std::get<core::AttachCarriedObjectRequestDTO>(
+                DecodeCanonicalSceneTransactionRequest(mounted).operation)
+                .carrier_component_id,
+            attach.carrier_component_id);
+}
+
+TEST(LogicalSceneTransactionCodec, ScenePolicyCarriesNoCollisionRules) {
+  const ProjectionRevisionDTO expected{
+      core::RetainedBundleId(Digest('b').value()),
+      GraphRevision(Digest('c').value()),
+      core::SceneRevision{core::SceneId(Digest('d').value()), 1U, Digest('a')},
+  };
+  core::CollisionPolicySnapshot policy;
+  policy.revision = {1U, std::string(core::kCanonicalEmptyCollisionPolicyDigest)};
+  core::SceneTransactionRequestDTO request{
+      core::PublicRequestContextDTO{SceneRequestKey("scene-request-policy"),
+                                    "scene-owner-test"},
+      {},
+      expected,
+      core::SetCollisionPolicyRequestDTO{policy, policy.revision},
+      core::AdmissionGeneration(1U),
+  };
+  const auto encoded = logical_scene_codec_internal::EncodeRequest(request);
+  EXPECT_EQ(encoded.find("contact_rules"), std::string::npos);
+  EXPECT_EQ(encoded.find("support_contacts"), std::string::npos);
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(
+                DecodeCanonicalSceneTransactionRequest(encoded)),
+            encoded);
+
+  // Collision rules belong to one move; the Scene's policy cannot hold them.
+  std::get<core::SetCollisionPolicyRequestDTO>(request.operation)
+      .configured_policy.contact_rules = {core::CollisionPairContactRule{
+      {"scene/part/shape/0", "scene/table/shape/0"},
+      "lift",
+      core::CollisionReleaseRule{}}};
+  EXPECT_THROW(logical_scene_codec_internal::EncodeRequest(request),
+               std::invalid_argument);
 }
 
 TEST(LogicalSceneTransactionCodec, ObjectMassIsAbsentAtZeroAndPositiveWhenPresent) {
@@ -1573,7 +1142,7 @@ TEST(LogicalSceneTransactionCodec, ObjectMassIsAbsentAtZeroAndPositiveWhenPresen
   const auto &add = std::get<core::AddObjectRequestDTO>(request.operation);
   request.operation = core::UpsertObjectRequestDTO{
       add.scene_resource_id, add.shape, add.pose, add.frame_ref,
-      add.support_contacts, add.mass_kg};
+      add.mass_kg};
   const auto upsert = logical_scene_codec_internal::EncodeRequest(request);
   EXPECT_DOUBLE_EQ(std::get<core::UpsertObjectRequestDTO>(
                        DecodeCanonicalSceneTransactionRequest(upsert).operation)
@@ -1592,6 +1161,56 @@ TEST(LogicalSceneTransactionCodec, ObjectMassIsAbsentAtZeroAndPositiveWhenPresen
 }
 
 TEST(LogicalSceneTransactionCodec,
+     MeshContentDigestIsOptionalInRequestsAndAbsentFromTheDigestInput) {
+  const ProjectionRevisionDTO expected{
+      core::RetainedBundleId(Digest('b').value()),
+      GraphRevision(Digest('c').value()),
+      core::SceneRevision{core::SceneId(Digest('d').value()), 1U, Digest('a')},
+  };
+  auto request = AddBoxRequest(expected, CellId("cell-a"));
+  std::get<core::AddObjectRequestDTO>(request.operation).shape =
+      core::MeshShapeDTO{"meshes/part.stl", {1.0, 1.0, 1.0}, std::string{}};
+  // Absent digest: the Manager fills it before the owner sees the request.
+  const auto without = logical_scene_codec_internal::EncodeRequest(request);
+  EXPECT_EQ(without.find("mesh_content_digest"), std::string::npos);
+  const auto decoded_without = DecodeCanonicalSceneTransactionRequest(without);
+  EXPECT_TRUE(std::get<core::MeshShapeDTO>(
+                  std::get<core::AddObjectRequestDTO>(decoded_without.operation)
+                      .shape)
+                  .content_digest.empty());
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(decoded_without),
+            without);
+
+  auto filled = request;
+  std::get<core::MeshShapeDTO>(
+      std::get<core::AddObjectRequestDTO>(filled.operation).shape)
+      .content_digest = Digest('e').value();
+  const auto with = logical_scene_codec_internal::EncodeRequest(filled);
+  EXPECT_NE(with.find("\"mesh_content_digest\":\"" + Digest('e').value()),
+            std::string::npos);
+  const auto decoded_with = DecodeCanonicalSceneTransactionRequest(with);
+  EXPECT_EQ(std::get<core::MeshShapeDTO>(
+                std::get<core::AddObjectRequestDTO>(decoded_with.operation)
+                    .shape)
+                .content_digest,
+            Digest('e').value());
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(decoded_with), with);
+  // The digest input is request intent only: filled and unfilled match.
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequestDigestInput(filled),
+            logical_scene_codec_internal::EncodeRequestDigestInput(request));
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequestDigestInput(filled)
+                .find("mesh_content_digest"),
+            std::string::npos);
+
+  // A present digest must have the exact spelling.
+  auto invalid = with;
+  const auto at = invalid.find(Digest('e').value());
+  invalid.replace(at, Digest('e').value().size(), "sha256:E");
+  EXPECT_THROW(DecodeCanonicalSceneTransactionRequest(invalid),
+               std::invalid_argument);
+}
+
+TEST(LogicalSceneTransactionCodec,
      CanonicalInternalRequestRoundTripsAndRejectsWireDrift) {
   const ProjectionRevisionDTO expected{
       core::RetainedBundleId(Digest('b').value()),
@@ -1603,9 +1222,6 @@ TEST(LogicalSceneTransactionCodec,
       },
   };
   auto request = AddBoxRequest(expected, CellId("cell-a"));
-  std::get<core::AddObjectRequestDTO>(request.operation).support_contacts = {
-      core::SupportContactDTO{.support_object_id = "support-table"},
-  };
   request.attribution = {
       core::RequestTransportDTO::kHttp,
       core::RequestAssuranceDTO::kExternallyAuthenticated,
@@ -1633,13 +1249,6 @@ TEST(LogicalSceneTransactionCodec,
   EXPECT_EQ(
       std::get<core::AddObjectRequestDTO>(decoded.operation).scene_resource_id,
       core::SceneResourceId("scene-box"));
-  ASSERT_EQ(std::get<core::AddObjectRequestDTO>(decoded.operation)
-                .support_contacts.size(),
-            1U);
-  EXPECT_EQ(std::get<core::AddObjectRequestDTO>(decoded.operation)
-                .support_contacts.front()
-                .support_object_id,
-            "support-table");
   EXPECT_THROW(DecodeCanonicalSceneTransactionRequest(" " + encoded),
                std::invalid_argument);
   auto unknown_field = encoded;
@@ -1711,12 +1320,10 @@ TEST(LogicalSceneTransactionCodec,
 
 TEST(CanonicalEmptySceneOwner,
      ProgramTransactionResultLookupIsExactAndReadOnly) {
-  TemporaryDirectory directory("scene-program-result");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
   const auto active =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission)
           .canonical_empty_target;
@@ -1760,12 +1367,10 @@ TEST(CanonicalEmptySceneOwner,
 
 TEST(CanonicalEmptySceneOwner,
      StaleSceneRefusalPreservesAdmissionForTheFreshRequest) {
-  TemporaryDirectory directory("scene-stale-admission");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3", admission,
-                          publication_reader, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
   const auto active =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission)
           .canonical_empty_target;
@@ -1799,13 +1404,10 @@ TEST(CanonicalEmptySceneOwner,
      ProgramClaimsReconcileAfterLostAcquireOrReleaseReply) {
   for (const auto loss : {TestCellAdmissionPort::LostReply::kAcquire,
                           TestCellAdmissionPort::LostReply::kRelease}) {
-    TemporaryDirectory directory("scene-program-claim-reply");
     const auto admission = LoadAdmission();
     ControlledPublicationReader publication_reader;
     TestCellAdmissionPort cell_admission;
-    LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                   admission, publication_reader,
-                                   cell_admission);
+    LogicalSceneOwner owner(admission, publication_reader, cell_admission);
     const auto active =
         FinalizeCanonicalBootstrap(owner, publication_reader, admission)
             .canonical_empty_target;
@@ -1844,56 +1446,47 @@ TEST(CanonicalEmptySceneOwner,
 }
 
 TEST(CanonicalEmptySceneOwner,
-     InvalidProgramEvidenceNeverEntersDurableSceneState) {
-  TemporaryDirectory directory("scene-program-evidence");
+     InvalidProgramEvidenceNeverEntersSceneState) {
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  const auto path = directory.path() / "logical-scene.sqlite3";
-  {
-    LogicalSceneOwner owner(path, admission, publication_reader,
-                                   cell_admission);
-    const auto active =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
-    auto request =
-        AddBoxRequest(active, admission.cell_id(), "scene-program-add");
-    request.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
-        core::ProgramRunNumber(2U),
-        core::CellAdmissionClaimGeneration(9U),
-        "add",
-        core::NodeAttemptNumber(0U),
-        "scene.transaction"};
-    for (const auto attempt : {core::NodeAttemptNumber(0U),
-                               core::NodeAttemptNumber(kMaximumSafeCounter + 1U)}) {
-      request.program_node_evidence->node_attempt_id = attempt;
-      const auto rejected = owner.Commit(request);
-      ASSERT_FALSE(rejected.success);
-      ASSERT_TRUE(rejected.error.has_value());
-      EXPECT_EQ(rejected.error->code, "invalid_request");
-    }
-    request.program_node_evidence->node_attempt_id = core::NodeAttemptNumber(1U);
-    request.program_node_evidence->parent_program_cycle_claim_generation =
-        core::CellAdmissionClaimGeneration(0U);
-    EXPECT_FALSE(owner.Commit(request).success);
-    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 0);
-    EXPECT_EQ(owner.VerifyIntegrity().request_outcome_count, 0);
-    EXPECT_TRUE(cell_admission.Claims().empty());
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
+  const auto active =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  auto request =
+      AddBoxRequest(active, admission.cell_id(), "scene-program-add");
+  request.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      core::ProgramRunNumber(2U),
+      core::CellAdmissionClaimGeneration(9U),
+      "add",
+      core::NodeAttemptNumber(0U),
+      "scene.transaction"};
+  for (const auto attempt : {core::NodeAttemptNumber(0U),
+                             core::NodeAttemptNumber(kMaximumSafeCounter + 1U)}) {
+    request.program_node_evidence->node_attempt_id = attempt;
+    const auto rejected = owner.Commit(request);
+    ASSERT_FALSE(rejected.success);
+    ASSERT_TRUE(rejected.error.has_value());
+    EXPECT_EQ(rejected.error->code, "invalid_request");
   }
-  LogicalSceneOwner reopened(path, admission, publication_reader,
-                                    cell_admission);
-  EXPECT_TRUE(reopened.ReconcileAuthoredSceneAdmissionClaims().ok());
-  EXPECT_TRUE(reopened.GetSceneObjects().empty());
+  request.program_node_evidence->node_attempt_id = core::NodeAttemptNumber(1U);
+  request.program_node_evidence->parent_program_cycle_claim_generation =
+      core::CellAdmissionClaimGeneration(0U);
+  EXPECT_FALSE(owner.Commit(request).success);
+  EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 0);
+  EXPECT_EQ(owner.VerifyIntegrity().request_outcome_count, 0);
+  EXPECT_TRUE(cell_admission.Claims().empty());
+  EXPECT_TRUE(owner.ReconcileAuthoredSceneAdmissionClaims().ok());
+  EXPECT_TRUE(owner.GetSceneObjects().empty());
 }
 
 TEST(CanonicalEmptySceneOwner,
      StopBeforeProgramAdmissionIsExactAndHasNoEffect) {
-  TemporaryDirectory directory("scene-program-held");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
   const auto active =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission)
           .canonical_empty_target;
@@ -1932,8 +1525,7 @@ TEST(LogicalSceneTransactionCodec,
       AddBoxRequest(expected, CellId("cell-a"), "scene-request-upsert-box");
   const auto add = std::get<core::AddObjectRequestDTO>(upsert.operation);
   upsert.operation = core::UpsertObjectRequestDTO{
-      add.scene_resource_id, add.shape, add.pose, add.frame_ref,
-      add.support_contacts};
+      add.scene_resource_id, add.shape, add.pose, add.frame_ref};
   std::get<core::UpsertObjectRequestDTO>(upsert.operation).frame_ref =
       core::SceneResourceSceneFrameRefDTO{
           core::SceneResourceId("reference-object")};
@@ -1978,12 +1570,10 @@ TEST(LogicalSceneTransactionCodec,
 }
 
 TEST(CanonicalEmptySceneOwner, UpsertCreatesReplacesAndRecognizesAnExactNoOp) {
-  TemporaryDirectory directory("scene-upsert");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
   auto active = FinalizeCanonicalBootstrap(owner, publication_reader, admission)
                     .canonical_empty_target;
 
@@ -1991,8 +1581,7 @@ TEST(CanonicalEmptySceneOwner, UpsertCreatesReplacesAndRecognizesAnExactNoOp) {
       AddBoxRequest(active, admission.cell_id(), "scene-request-upsert-create");
   const auto add = std::get<core::AddObjectRequestDTO>(request.operation);
   request.operation = core::UpsertObjectRequestDTO{
-      add.scene_resource_id, add.shape, add.pose, add.frame_ref,
-      add.support_contacts};
+      add.scene_resource_id, add.shape, add.pose, add.frame_ref};
   const auto created = owner.Commit(request);
   ASSERT_TRUE(created.success);
   ASSERT_TRUE(created.committed_projection_revision.has_value());
@@ -2042,8 +1631,7 @@ TEST(CanonicalEmptySceneOwner, UpsertCreatesReplacesAndRecognizesAnExactNoOp) {
       relative_add.shape,
       relative_pose,
       core::SceneResourceSceneFrameRefDTO{
-          core::SceneResourceId("scene-box")},
-      relative_add.support_contacts};
+          core::SceneResourceId("scene-box")}};
   const auto relative_result = owner.Commit(relative);
   ASSERT_TRUE(relative_result.success)
       << (relative_result.error.has_value() ? relative_result.error->message
@@ -2068,12 +1656,10 @@ TEST(CanonicalEmptySceneOwner, UpsertCreatesReplacesAndRecognizesAnExactNoOp) {
 // higher number holds a state at least as new; access and snapshot are of one
 // state.
 TEST(CanonicalEmptySceneOwner, PublicationReadsAreNumberedInStateOrder) {
-  TemporaryDirectory directory("scene-publication-read");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                          admission, publication_reader, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
   const auto before = owner.ReadPublication();
   EXPECT_FALSE(before.snapshot.has_value());
   const auto active =
@@ -2103,13 +1689,10 @@ TEST(CanonicalEmptySceneOwner, PublicationReadsAreNumberedInStateOrder) {
 
 TEST(CanonicalEmptySceneOwner,
      ProgramResetRestorationUsesExactAuthorizationWithoutOpeningAuthoring) {
-  TemporaryDirectory directory("scene-program-reset");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader,
-                                 cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
   const auto active =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission)
           .canonical_empty_target;
@@ -2137,316 +1720,142 @@ TEST(CanonicalEmptySceneOwner,
 }
 
 TEST(CanonicalEmptySceneOwner,
-     ZeroNativeSceneCommitPublishesReplaysAndRestarts) {
-  TemporaryDirectory directory;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
+     ZeroNativeSceneCommitPublishesAndReplays) {
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
   ProjectionRevisionDTO committed_projection;
   std::optional<core::SceneTransactionRequestDTO> request;
-  {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader, cell_admission);
-    const auto accepted =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission);
-    request =
-        AddBoxRequest(accepted.canonical_empty_target, admission.cell_id());
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
+  const auto accepted =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+  request =
+      AddBoxRequest(accepted.canonical_empty_target, admission.cell_id());
 
-    const auto committed = owner.Commit(*request);
-    ASSERT_TRUE(committed.presence_valid());
-    ASSERT_TRUE(committed.success);
-    ASSERT_TRUE(committed.transaction_sequence.has_value());
-    ASSERT_TRUE(committed.committed_projection_revision.has_value());
-    ASSERT_TRUE(committed.update_status.has_value());
-    EXPECT_EQ(*committed.transaction_sequence, 1U);
-    EXPECT_EQ(*committed.update_status,
-              core::SceneUpdateStatusDTO::kGeometryChanged);
-    EXPECT_EQ(committed.projection_status,
-              core::SceneProjectionCommitStatusDTO::kCommitted);
-    EXPECT_EQ(
-        committed.committed_projection_revision->scene_revision.revision_id,
-        2U);
-    committed_projection = *committed.committed_projection_revision;
-    EXPECT_EQ(owner.CurrentProjectionRevision(), committed_projection);
+  const auto committed = owner.Commit(*request);
+  ASSERT_TRUE(committed.presence_valid());
+  ASSERT_TRUE(committed.success);
+  ASSERT_TRUE(committed.transaction_sequence.has_value());
+  ASSERT_TRUE(committed.committed_projection_revision.has_value());
+  ASSERT_TRUE(committed.update_status.has_value());
+  EXPECT_EQ(*committed.transaction_sequence, 1U);
+  EXPECT_EQ(*committed.update_status,
+            core::SceneUpdateStatusDTO::kGeometryChanged);
+  EXPECT_EQ(committed.projection_status,
+            core::SceneProjectionCommitStatusDTO::kCommitted);
+  EXPECT_EQ(
+      committed.committed_projection_revision->scene_revision.revision_id,
+      2U);
+  committed_projection = *committed.committed_projection_revision;
+  EXPECT_EQ(owner.CurrentProjectionRevision(), committed_projection);
 
-    const auto objects = owner.GetSceneObjects();
-    ASSERT_EQ(objects.size(), 1U);
-    EXPECT_EQ(objects.front().scene_resource_id,
-              core::SceneResourceId("scene-box"));
-    const auto state = owner.GetObjectState(core::SceneResourceId("scene-box"));
-    EXPECT_TRUE(state.exists);
-    EXPECT_FALSE(state.attached);
-    const auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
-    ASSERT_TRUE(pose.ok());
-    EXPECT_DOUBLE_EQ(pose.value().position_m.x_m, 0.25);
+  const auto objects = owner.GetSceneObjects();
+  ASSERT_EQ(objects.size(), 1U);
+  EXPECT_EQ(objects.front().scene_resource_id,
+            core::SceneResourceId("scene-box"));
+  const auto state = owner.GetObjectState(core::SceneResourceId("scene-box"));
+  EXPECT_TRUE(state.exists);
+  EXPECT_FALSE(state.attached);
+  const auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
+  ASSERT_TRUE(pose.ok());
+  EXPECT_DOUBLE_EQ(pose.value().position_m.x_m, 0.25);
 
-    auto relayed_request = *request;
-    relayed_request.attribution = {
-        core::RequestTransportDTO::kHttp,
-        core::RequestAssuranceDTO::kExternallyAuthenticated,
-        std::string("operator.7"),
-    };
-    const auto replay = owner.Commit(relayed_request);
-    ASSERT_TRUE(replay.success);
-    EXPECT_EQ(replay.replay_status,
-              core::RequestReplayStatusDTO::kReplayedExact);
-    EXPECT_EQ(replay.transaction_sequence, committed.transaction_sequence);
-    EXPECT_EQ(replay.committed_projection_revision,
-              committed.committed_projection_revision);
-
-    auto conflict = *request;
-    std::get<core::AddObjectRequestDTO>(conflict.operation)
-        .pose.position_m.x_m = 9.0;
-    const auto rejected = owner.Commit(conflict);
-    EXPECT_FALSE(rejected.success);
-    EXPECT_EQ(rejected.replay_status,
-              core::RequestReplayStatusDTO::kRequestIdConflict);
-    ASSERT_TRUE(rejected.error.has_value());
-    EXPECT_EQ(rejected.error->code, "request_id_conflict");
-
-    const auto integrity = owner.VerifyIntegrity();
-    EXPECT_EQ(integrity.transaction_intent_count, 1);
-    EXPECT_EQ(integrity.request_outcome_count, 1);
-    EXPECT_EQ(integrity.projection_attempt_count, 0);
-    EXPECT_EQ(integrity.projection_result_count, 0);
-    EXPECT_EQ(integrity.owner_event_count, 1);
-    EXPECT_FALSE(integrity.projection_desynchronized);
-    owner.Close();
-  }
-
-  LogicalSceneOwner reopened(database_path, admission,
-                                    publication_reader);
-  EXPECT_EQ(reopened.CurrentProjectionRevision(), committed_projection);
-  const auto snapshot = reopened.LogicalSnapshot();
-  ASSERT_EQ(snapshot->objects.size(), 1U);
-  EXPECT_EQ(snapshot->transaction_sequence, 1U);
-  ASSERT_TRUE(request.has_value());
-  const auto replay = reopened.Commit(*request);
+  auto relayed_request = *request;
+  relayed_request.attribution = {
+      core::RequestTransportDTO::kHttp,
+      core::RequestAssuranceDTO::kExternallyAuthenticated,
+      std::string("operator.7"),
+  };
+  const auto replay = owner.Commit(relayed_request);
   ASSERT_TRUE(replay.success);
-  EXPECT_EQ(replay.replay_status, core::RequestReplayStatusDTO::kReplayedExact);
-  EXPECT_EQ(replay.committed_projection_revision, committed_projection);
+  EXPECT_EQ(replay.replay_status,
+            core::RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replay.transaction_sequence, committed.transaction_sequence);
+  EXPECT_EQ(replay.committed_projection_revision,
+            committed.committed_projection_revision);
+
+  auto conflict = *request;
+  std::get<core::AddObjectRequestDTO>(conflict.operation)
+      .pose.position_m.x_m = 9.0;
+  const auto rejected = owner.Commit(conflict);
+  EXPECT_FALSE(rejected.success);
+  EXPECT_EQ(rejected.replay_status,
+            core::RequestReplayStatusDTO::kRequestIdConflict);
+  ASSERT_TRUE(rejected.error.has_value());
+  EXPECT_EQ(rejected.error->code, "request_id_conflict");
+
+  const auto integrity = owner.VerifyIntegrity();
+  EXPECT_EQ(integrity.transaction_intent_count, 1);
+  EXPECT_EQ(integrity.request_outcome_count, 1);
+  EXPECT_EQ(integrity.projection_attempt_count, 0);
+  EXPECT_EQ(integrity.projection_result_count, 0);
+  EXPECT_EQ(integrity.owner_event_count, 1);
+  EXPECT_FALSE(integrity.projection_desynchronized);
 }
 
 TEST(CanonicalEmptySceneOwner,
      RequestKeyReplaysItsRecordedOutcomeAndRefusesAnotherIntent) {
-  TemporaryDirectory directory("scene-request-key");
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
   std::optional<core::SceneTransactionRequestDTO> request;
   std::optional<core::SceneCommitResultDTO> committed;
-  {
-    LogicalSceneOwner owner(database_path, admission, publication_reader,
-                            cell_admission);
-    const auto active =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
-    request = AddBoxRequest(active, admission.cell_id(), "scene-keyed-add");
-    EXPECT_FALSE(owner.ReadCommitResult(*request).has_value());
-    committed = owner.Commit(*request);
-    ASSERT_TRUE(committed->success);
-    EXPECT_EQ(committed->request_key, request->request_context.request_key);
-    EXPECT_EQ(committed->replay_status,
-              core::RequestReplayStatusDTO::kAcceptedNew);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
+  const auto active =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  request = AddBoxRequest(active, admission.cell_id(), "scene-keyed-add");
+  EXPECT_FALSE(owner.ReadCommitResult(*request).has_value());
+  committed = owner.Commit(*request);
+  ASSERT_TRUE(committed->success);
+  EXPECT_EQ(committed->request_key, request->request_context.request_key);
+  EXPECT_EQ(committed->replay_status,
+            core::RequestReplayStatusDTO::kAcceptedNew);
 
-    // Same key, same digest: the recorded outcome, no second effect.
-    const auto replay = owner.Commit(*request);
-    ASSERT_TRUE(replay.success);
-    EXPECT_EQ(replay.request_key, request->request_context.request_key);
-    EXPECT_EQ(replay.replay_status,
-              core::RequestReplayStatusDTO::kReplayedExact);
-    EXPECT_EQ(replay.transaction_sequence, committed->transaction_sequence);
-    EXPECT_EQ(replay.committed_projection_revision,
-              committed->committed_projection_revision);
-    const auto looked_up = owner.ReadCommitResult(*request);
-    ASSERT_TRUE(looked_up.has_value());
-    EXPECT_EQ(looked_up->replay_status,
-              core::RequestReplayStatusDTO::kReplayedExact);
-    EXPECT_EQ(looked_up->transaction_sequence,
-              committed->transaction_sequence);
-
-    // Same key, different digest: the existing conflict code.
-    auto conflicting = *request;
-    std::get<core::AddObjectRequestDTO>(conflicting.operation)
-        .pose.position_m.x_m = 9.0;
-    const auto rejected = owner.Commit(conflicting);
-    EXPECT_FALSE(rejected.success);
-    EXPECT_EQ(rejected.request_key, request->request_context.request_key);
-    EXPECT_EQ(rejected.replay_status,
-              core::RequestReplayStatusDTO::kRequestIdConflict);
-    ASSERT_TRUE(rejected.error.has_value());
-    EXPECT_EQ(rejected.error->code, "request_id_conflict");
-    EXPECT_THROW(static_cast<void>(owner.ReadCommitResult(conflicting)),
-                 LogicalSceneOwnerConflictError);
-
-    // Another key is unknown.
-    auto other = *request;
-    other.request_context.request_key = SceneRequestKey("scene-keyed-other");
-    EXPECT_FALSE(owner.ReadCommitResult(other).has_value());
-    const auto integrity = owner.VerifyIntegrity();
-    EXPECT_EQ(integrity.transaction_intent_count, 1);
-    EXPECT_EQ(integrity.request_outcome_count, 1);
-    owner.Close();
-  }
-
-  // The outcome is stored under the key's 16 bytes.
-  const auto key_literal =
-      "x'" + core::RequestKeyText(request->request_context.request_key) + "'";
-  EXPECT_EQ(ReadStoreInteger(database_path,
-                             "SELECT count(*) FROM "
-                             "logical_scene_request_outcomes WHERE "
-                             "request_key=" + key_literal),
-            1);
-  EXPECT_EQ(ReadStoreInteger(database_path,
-                             "SELECT count(*) FROM "
-                             "logical_scene_transaction_intents WHERE "
-                             "request_key=" + key_literal +
-                                 " AND transaction_sequence=1"),
-            1);
-
-  // After a restart the key still replays the recorded outcome.
-  LogicalSceneOwner reopened(database_path, admission, publication_reader);
-  const auto replay = reopened.Commit(*request);
+  // Same key, same digest: the recorded outcome, no second effect.
+  const auto replay = owner.Commit(*request);
   ASSERT_TRUE(replay.success);
-  EXPECT_EQ(replay.replay_status, core::RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replay.request_key, request->request_context.request_key);
+  EXPECT_EQ(replay.replay_status,
+            core::RequestReplayStatusDTO::kReplayedExact);
   EXPECT_EQ(replay.transaction_sequence, committed->transaction_sequence);
   EXPECT_EQ(replay.committed_projection_revision,
             committed->committed_projection_revision);
-}
+  const auto looked_up = owner.ReadCommitResult(*request);
+  ASSERT_TRUE(looked_up.has_value());
+  EXPECT_EQ(looked_up->replay_status,
+            core::RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(looked_up->transaction_sequence,
+            committed->transaction_sequence);
 
-TEST(CanonicalEmptySceneOwner,
-     PortableSupportDeclarationsNormalizePersistAndProtectReferences) {
-  TemporaryDirectory directory("scene-support-declarations");
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto admission = LoadAdmission();
-  ControlledPublicationReader publication_reader;
-  TestCellAdmissionPort cell_admission;
-  ProjectionRevisionDTO projection;
-  {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader, cell_admission);
-    projection =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
+  // Same key, different digest: the existing conflict code.
+  auto conflicting = *request;
+  std::get<core::AddObjectRequestDTO>(conflicting.operation)
+      .pose.position_m.x_m = 9.0;
+  const auto rejected = owner.Commit(conflicting);
+  EXPECT_FALSE(rejected.success);
+  EXPECT_EQ(rejected.request_key, request->request_context.request_key);
+  EXPECT_EQ(rejected.replay_status,
+            core::RequestReplayStatusDTO::kRequestIdConflict);
+  ASSERT_TRUE(rejected.error.has_value());
+  EXPECT_EQ(rejected.error->code, "request_id_conflict");
+  EXPECT_THROW(static_cast<void>(owner.ReadCommitResult(conflicting)),
+               LogicalSceneOwnerConflictError);
 
-    for (const auto &support_id : {"support-a", "support-b"}) {
-      auto request =
-          AddBoxRequest(projection, admission.cell_id(),
-                        std::string("scene-request-add-") + support_id);
-      std::get<core::AddObjectRequestDTO>(request.operation).scene_resource_id =
-          core::SceneResourceId(support_id);
-      const auto result = owner.Commit(request);
-      ASSERT_TRUE(result.success);
-      projection = *result.committed_projection_revision;
-    }
-
-    core::SupportContactDTO bounded;
-    bounded.support_object_id = "support-b";
-    bounded.mode = core::CollisionContactPolicyMode::kBoundedPenetration;
-    bounded.max_contact_penetration_m = 0.002;
-    core::SupportContactDTO binary;
-    binary.support_object_id = "support-a";
-    binary.release_evidence_mode =
-        core::ContactReleaseEvidenceMode::kBinaryContact;
-    auto add_supported =
-        AddBoxRequest(projection, admission.cell_id(),
-                      "scene-request-add-supported", {bounded, binary});
-    const auto supported = owner.Commit(add_supported);
-    ASSERT_TRUE(supported.success);
-    projection = *supported.committed_projection_revision;
-
-    const auto snapshot = owner.LogicalSnapshot();
-    const auto object =
-        std::lower_bound(snapshot->objects.begin(), snapshot->objects.end(),
-                         core::SceneResourceId("scene-box"),
-                         [](const core::SceneObjectSnapshotDTO &candidate,
-                            const core::SceneResourceId &id) {
-                           return candidate.scene_resource_id < id;
-                         });
-    ASSERT_NE(object, snapshot->objects.end());
-    ASSERT_EQ(object->support_contacts.size(), 2U);
-    EXPECT_EQ(object->support_contacts[0].support_object_id, "support-a");
-    EXPECT_EQ(object->support_contacts[1].support_object_id, "support-b");
-    EXPECT_FALSE(object->support_contacts[0].enforce_max_start_penetration);
-    EXPECT_DOUBLE_EQ(object->support_contacts[0].release_tolerance_m, 0.0);
-    EXPECT_FALSE(
-        object->support_contacts[0].require_strictly_decreasing_penetration);
-    EXPECT_FALSE(object->support_contacts[1].require_separation_by_end);
-    EXPECT_DOUBLE_EQ(object->support_contacts[1].max_contact_penetration_m,
-                     0.002);
-
-    core::SceneTransactionRequestDTO remove_support{
-        SceneRequestContext("scene-request-remove-support", projection),
-        {},
-        projection,
-        core::RemoveObjectRequestDTO{core::SceneResourceId("support-a")},
-        core::AdmissionGeneration(1U),
-    };
-    const auto removal = owner.Commit(remove_support);
-    ASSERT_FALSE(removal.success);
-    ASSERT_TRUE(removal.error.has_value());
-    EXPECT_EQ(removal.error->code, "scene_object_state_conflict");
-    EXPECT_EQ(removal.error->details.at("reason"),
-              "support_contact_reference_exists");
-
-    auto missing = AddBoxRequest(
-        projection, admission.cell_id(), "scene-request-missing-support",
-        {core::SupportContactDTO{.support_object_id = "missing-support"}});
-    std::get<core::AddObjectRequestDTO>(missing.operation).scene_resource_id =
-        core::SceneResourceId("missing-dependent");
-    const auto missing_result = owner.Commit(missing);
-    ASSERT_FALSE(missing_result.success);
-    ASSERT_TRUE(missing_result.error.has_value());
-    EXPECT_EQ(missing_result.error->code, "missing_reference");
-
-    auto self = AddBoxRequest(
-        projection, admission.cell_id(), "scene-request-self-support",
-        {core::SupportContactDTO{.support_object_id = "self-supported"}});
-    std::get<core::AddObjectRequestDTO>(self.operation).scene_resource_id =
-        core::SceneResourceId("self-supported");
-    const auto self_result = owner.Commit(self);
-    ASSERT_FALSE(self_result.success);
-    ASSERT_TRUE(self_result.error.has_value());
-    EXPECT_EQ(self_result.error->code, "invalid_contact_policy");
-    EXPECT_EQ(self_result.error->details.at("reason"), "self_support_contact");
-
-    auto duplicate = AddBoxRequest(
-        projection, admission.cell_id(), "scene-request-duplicate-support",
-        {core::SupportContactDTO{.support_object_id = "support-a"},
-         core::SupportContactDTO{.support_object_id = "support-a"}});
-    std::get<core::AddObjectRequestDTO>(duplicate.operation).scene_resource_id =
-        core::SceneResourceId("duplicate-dependent");
-    const auto duplicate_result = owner.Commit(duplicate);
-    ASSERT_FALSE(duplicate_result.success);
-    ASSERT_TRUE(duplicate_result.error.has_value());
-    EXPECT_EQ(duplicate_result.error->details.at("reason"),
-              "duplicate_support_contact_pair");
-    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 3);
-    owner.Close();
-  }
-
-  LogicalSceneOwner reopened(database_path, admission,
-                                    publication_reader);
-  EXPECT_EQ(reopened.CurrentProjectionRevision(), projection);
-  const auto restored = reopened.LogicalSnapshot();
-  const auto object = std::find_if(
-      restored->objects.begin(), restored->objects.end(), [](const auto &row) {
-        return row.scene_resource_id == core::SceneResourceId("scene-box");
-      });
-  ASSERT_NE(object, restored->objects.end());
-  ASSERT_EQ(object->support_contacts.size(), 2U);
-  EXPECT_EQ(object->support_contacts.front().support_object_id, "support-a");
+  // Another key is unknown.
+  auto other = *request;
+  other.request_context.request_key = SceneRequestKey("scene-keyed-other");
+  EXPECT_FALSE(owner.ReadCommitResult(other).has_value());
+  const auto integrity = owner.VerifyIntegrity();
+  EXPECT_EQ(integrity.transaction_intent_count, 1);
+  EXPECT_EQ(integrity.request_outcome_count, 1);
 }
 
 TEST(CanonicalEmptySceneOwner, CommitsTheClosedPortableCollisionShapeSet) {
-  TemporaryDirectory directory("scene-shape-set");
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   auto projection = accepted.canonical_empty_target;
@@ -2455,7 +1864,7 @@ TEST(CanonicalEmptySceneOwner, CommitsTheClosedPortableCollisionShapeSet) {
       {"sphere", core::SphereShapeDTO{0.05}},
       {"cylinder", core::CylinderShapeDTO{0.04, 0.2}},
       {"mesh", core::MeshShapeDTO{"package://manyforge_test/fixture.stl",
-                                  {1.0, 1.0, 1.0}}},
+                                  {1.0, 1.0, 1.0}, Digest('e').value()}},
   };
   for (const auto &[name, shape] : shapes) {
     auto request = AddBoxRequest(projection, admission.cell_id(),
@@ -2475,12 +1884,42 @@ TEST(CanonicalEmptySceneOwner, CommitsTheClosedPortableCollisionShapeSet) {
       snapshot->objects[0].collision_shapes.front()));
   EXPECT_TRUE(std::holds_alternative<core::CylinderShapeDTO>(
       snapshot->objects[1].collision_shapes.front()));
-  EXPECT_TRUE(std::holds_alternative<core::MeshShapeDTO>(
+  ASSERT_TRUE(std::holds_alternative<core::MeshShapeDTO>(
       snapshot->objects[2].collision_shapes.front()));
+  EXPECT_EQ(std::get<core::MeshShapeDTO>(
+                snapshot->objects[2].collision_shapes.front())
+                .content_digest,
+            Digest('e').value());
   EXPECT_TRUE(std::holds_alternative<core::SphereShapeDTO>(
       snapshot->objects[3].collision_shapes.front()));
   EXPECT_EQ(snapshot->transaction_sequence, 4U);
   EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 4);
+
+  // The persisted shape requires the captured digest.
+  const auto snapshot_bytes = EncodeLogicalSceneSnapshot(*snapshot);
+  const std::string digest_member =
+      "\"mesh_content_digest\":\"" + Digest('e').value() + "\",";
+  const auto member_at = snapshot_bytes.find(digest_member);
+  ASSERT_NE(member_at, std::string::npos);
+  auto without_digest = snapshot_bytes;
+  without_digest.erase(member_at, digest_member.size());
+  EXPECT_THROW(static_cast<void>(DecodeLogicalSceneSnapshot(without_digest)),
+               std::invalid_argument);
+
+  // A mesh the Manager did not fill is a typed refusal.
+  auto unfilled = AddBoxRequest(projection, admission.cell_id(),
+                                "scene-request-shape-unfilled-mesh");
+  auto &unfilled_operation =
+      std::get<core::AddObjectRequestDTO>(unfilled.operation);
+  unfilled_operation.scene_resource_id = core::SceneResourceId("scene-unfilled");
+  unfilled_operation.shape = core::MeshShapeDTO{
+      "package://manyforge_test/fixture.stl", {1.0, 1.0, 1.0}, std::string{}};
+  const auto refused = owner.Commit(unfilled);
+  ASSERT_FALSE(refused.success);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->code, "scene_mesh_unavailable");
+  EXPECT_EQ(refused.error->details.at("resource_uri"),
+            "package://manyforge_test/fixture.stl");
 }
 
 core::PublicRequestContextDTO
@@ -2519,11 +1958,6 @@ public:
     }
   }
 
-  // The message of a refused or uncertain result; Reset keeps it.
-  void SetRejectionMessage(std::string message) {
-    rejection_message_ = std::move(message);
-  }
-
   void Reset(const ProjectionRevisionDTO &target, const Mode mode) {
     mode_ = mode;
     calls_ = 0U;
@@ -2535,6 +1969,16 @@ public:
     reject_next_rebuild_without_effect_ = false;
     rebuild_entered_ = nullptr;
     rebuild_release_ = nullptr;
+    apply_entered_ = nullptr;
+    apply_release_ = nullptr;
+    blocked_transaction_.reset();
+    next_preflight_rejection_.reset();
+    during_next_preflight_ = nullptr;
+    preflight_calls_ = 0U;
+    health_for_revision_calls_ = 0U;
+    health_calls_outside_preflight_ = 0U;
+    policy_calls_outside_preflight_ = 0U;
+    replay_checks_.clear();
     accepted_rebuild_binding_.reset();
     frame_resolution_error_.reset();
     resolved_model_instance_override_.reset();
@@ -2618,8 +2062,129 @@ public:
     rebuild_release_ = &release;
   }
 
+  void BlockNextApply(std::barrier<> &entered, std::barrier<> &release) {
+    apply_entered_ = &entered;
+    apply_release_ = &release;
+  }
+
+  // The transaction of the apply held by BlockNextApply, readable once its
+  // `entered` barrier was passed.
+  [[nodiscard]] const std::optional<core::SceneTransactionDTO> &
+  blocked_transaction() const noexcept {
+    return blocked_transaction_;
+  }
+
+  // Opt-in (OD-376): the next preflight call answers this typed refusal.
+  void RejectNextPreflight(core::ErrorDTO error) {
+    next_preflight_rejection_ = std::move(error);
+  }
+
+  // Opt-in: runs once inside the next preflight call, on the committing
+  // thread while the owner holds no lock, after this projection formed its
+  // answer and before the owner receives it (a change racing the answer).
+  void RunDuringNextPreflight(std::function<void()> action) {
+    during_next_preflight_ = std::move(action);
+  }
+
+  // OD-376: the Scene commit preflight calls, and the health and policy calls
+  // made outside one.
+  [[nodiscard]] std::size_t preflight_calls() const noexcept {
+    return preflight_calls_;
+  }
+  [[nodiscard]] std::size_t health_for_revision_calls() const noexcept {
+    return health_for_revision_calls_;
+  }
+  [[nodiscard]] std::size_t health_calls_outside_preflight() const noexcept {
+    return health_calls_outside_preflight_;
+  }
+  [[nodiscard]] std::size_t policy_calls_outside_preflight() const noexcept {
+    return policy_calls_outside_preflight_;
+  }
+
+  // What a projection replaying the owner's delta found (OD-376): the owner
+  // validates and digests the candidate once; this check replays the delta
+  // onto the owner's predecessor and compares it with the owner's digest.
+  struct ReplayCheck final {
+    bool applied{};
+    bool content_hash_matches{};
+    bool locally_valid{};
+    std::optional<core::LogicalSceneSnapshotDTO> result;
+    std::string error;
+  };
+
+  // Opt-in: each ApplyTransaction reads `owner`'s snapshot (the predecessor,
+  // readable because the owner lock is not held across the native apply).
+  void ReplayAgainst(const LogicalSceneOwner *owner) noexcept {
+    replay_owner_ = owner;
+  }
+
+  [[nodiscard]] const std::vector<ReplayCheck> &replay_checks() const noexcept {
+    return replay_checks_;
+  }
+
+  core::Result<core::SceneCommitPreflightDTO> CommitPreflight(
+      const ProjectionRevisionDTO &selected_revision,
+      const core::SceneTransactionDTO *transaction,
+      const core::LogicalSceneSnapshotDTO *candidate) const override {
+    ++preflight_calls_;
+    if (next_preflight_rejection_.has_value()) {
+      return core::Result<core::SceneCommitPreflightDTO>::Err(
+          *std::exchange(next_preflight_rejection_, std::nullopt));
+    }
+    class InPreflight final {
+    public:
+      explicit InPreflight(bool &flag) : flag_(flag) { flag_ = true; }
+      ~InPreflight() { flag_ = false; }
+      InPreflight(const InPreflight &) = delete;
+      InPreflight &operator=(const InPreflight &) = delete;
+
+    private:
+      bool &flag_;
+    };
+    auto answer = [&] {
+      const InPreflight scope(in_preflight_);
+      // What the port's default does.
+      return core::IPlannerSceneProjection::CommitPreflight(
+          selected_revision, transaction, candidate);
+    }();
+    if (auto action = std::exchange(during_next_preflight_, nullptr)) {
+      action();
+    }
+    return answer;
+  }
+
   core::ProjectionCommitResultDTO
   ApplyTransaction(const core::SceneTransactionDTO &transaction) override {
+    if (apply_entered_ != nullptr && apply_release_ != nullptr) {
+      auto *entered = std::exchange(apply_entered_, nullptr);
+      auto *release = std::exchange(apply_release_, nullptr);
+      blocked_transaction_ = transaction;
+      entered->arrive_and_wait();
+      release->arrive_and_wait();
+    }
+    if (replay_owner_ != nullptr) {
+      const auto predecessor = replay_owner_->LogicalSnapshot();
+      auto replayed =
+          core::ApplyResolvedSceneTransaction(*predecessor, transaction);
+      ReplayCheck check;
+      check.applied = replayed.ok();
+      if (replayed.ok()) {
+        try {
+          check.content_hash_matches =
+              core::logical_scene_identity::ComputeLogicalSceneContentHash(
+                  replayed.value()) ==
+              transaction.proposed_projection_revision.scene_revision
+                  .content_hash;
+        } catch (const std::exception &error) {
+          check.error = error.what();
+        }
+        check.locally_valid = replayed.value().locally_valid();
+        check.result = replayed.value();
+      } else {
+        check.error = replayed.error().message;
+      }
+      replay_checks_.push_back(std::move(check));
+    }
     ++calls_;
     transactions_.push_back(transaction);
     ++health_.source_sequence;
@@ -2743,7 +2308,8 @@ public:
           if constexpr (std::is_same_v<Selector,
                                        core::TargetCarrierSceneFrameRefDTO>) {
             return core::ResolvedComponentModelFrameDTO{
-                selector.controllable_component_id,
+                selector.frame_component_id.value_or(
+                    selector.controllable_component_id),
                 resolved_model_instance_override_.value_or(
                     core::ModelInstanceId("model.1")),
                 resolved_frame_role_override_.value_or(selector.frame_role_id),
@@ -2795,6 +2361,9 @@ public:
       const core::LogicalSceneSnapshotDTO &snapshot,
       const std::uint64_t effective_policy_revision_id) const override {
     ++policy_projection_calls_;
+    if (!in_preflight_) {
+      ++policy_calls_outside_preflight_;
+    }
     if (!snapshot.locally_valid() ||
         effective_policy_revision_id != snapshot.revision.revision_id) {
       return core::Result<core::CollisionPolicySnapshot>::Err(
@@ -2825,6 +2394,10 @@ public:
     // This fake has one exact model. Like native RevisionHandle, selecting its
     // retained product returns actual health, including a healthy predecessor
     // Scene revision during an ordinary in-place maintenance successor.
+    ++health_for_revision_calls_;
+    if (!in_preflight_) {
+      ++health_calls_outside_preflight_;
+    }
     if (!revision.valid() ||
         (health_.active_projection_revision.has_value() &&
          (health_.active_projection_revision->retained_bundle_id != revision.retained_bundle_id ||
@@ -2838,6 +2411,9 @@ public:
   }
 
   core::ProjectionHealthDTO ProjectionHealth() const override {
+    if (!in_preflight_) {
+      ++health_calls_outside_preflight_;
+    }
     return health_;
   }
 
@@ -2936,6 +2512,18 @@ private:
   bool reject_next_rebuild_without_effect_{};
   std::barrier<> *rebuild_entered_{nullptr};
   std::barrier<> *rebuild_release_{nullptr};
+  std::barrier<> *apply_entered_{nullptr};
+  std::barrier<> *apply_release_{nullptr};
+  std::optional<core::SceneTransactionDTO> blocked_transaction_;
+  mutable std::optional<core::ErrorDTO> next_preflight_rejection_;
+  mutable std::function<void()> during_next_preflight_;
+  mutable bool in_preflight_{false};
+  mutable std::size_t preflight_calls_{};
+  mutable std::size_t health_for_revision_calls_{};
+  mutable std::size_t health_calls_outside_preflight_{};
+  mutable std::size_t policy_calls_outside_preflight_{};
+  const LogicalSceneOwner *replay_owner_{nullptr};
+  std::vector<ReplayCheck> replay_checks_;
   std::optional<ProjectionExecutionHostBindingDTO>
       accepted_rebuild_binding_;
   std::size_t calls_{};
@@ -3066,6 +2654,14 @@ public:
       const std::uint64_t effective_policy_revision_id) const override {
     return projection_.ProjectEffectiveCollisionPolicy(snapshot,
                                                        effective_policy_revision_id);
+  }
+
+  core::Result<core::SceneCommitPreflightDTO> CommitPreflight(
+      const ProjectionRevisionDTO &selected_revision,
+      const core::SceneTransactionDTO *transaction,
+      const core::LogicalSceneSnapshotDTO *candidate) const override {
+    return projection_.CommitPreflight(selected_revision, transaction,
+                                       candidate);
   }
 
 private:
@@ -3382,7 +2978,6 @@ core::SceneObjectProviderEvidenceDTO StreamedPoseEvidence() {
 struct SceneAdoptionFixture final {
   TemporaryDirectory directory{"scene-adoption"};
   std::filesystem::path package_root{directory.path() / "packages"};
-  std::filesystem::path database_path{directory.path() / "logical-scene.sqlite3"};
   deployment::CanonicalEmptyRetainedBundleAdmission admission{PrepareAdoptionAdmission(package_root)};
   deployment::test::DurableLite6RetainedConsumerFixture predecessor{
       AdoptionProduct(package_root, admission.cell_id(), '1')};
@@ -3399,11 +2994,17 @@ struct SceneAdoptionFixture final {
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source{package_root};
   TestCellAdmissionPort cell_admission;
   TestAdoptionFence fence;
-  std::unique_ptr<LogicalSceneOwner> owner{
-      std::make_unique<LogicalSceneOwner>(database_path, admission, publication_reader,
-                                                bundle_source, resolver, cell_admission)};
+  std::unique_ptr<LogicalSceneOwner> owner;
 
-  SceneAdoptionFixture() {
+  // Without `claim_dependency` the owner has no cell-admission port.
+  explicit SceneAdoptionFixture(const bool claim_dependency = true)
+      : owner(claim_dependency
+                  ? std::make_unique<LogicalSceneOwner>(
+                        admission, publication_reader, bundle_source, resolver,
+                        cell_admission)
+                  : std::make_unique<LogicalSceneOwner>(
+                        admission, publication_reader, bundle_source,
+                        resolver)) {
     const auto current = FinalizeNativeCandidate(
         *owner, publication_reader, admission, *predecessor.bundle, predecessor_bindings);
     ResetProjections(predecessor_projections, current, FakePlannerSceneProjection::Mode::kCommit);
@@ -3490,46 +3091,41 @@ struct SceneAdoptionFixture final {
   }
 };
 
-TEST(CanonicalEmptySceneOwner, MaintenanceStatementsResetAndRebind) {
-  sqlite3 *database = nullptr;
-  ASSERT_EQ(sqlite3_open(":memory:", &database), SQLITE_OK);
-  logical_scene_owner_detail::PersistentStatementCache statements;
-  {
-    logical_scene_owner_detail::Statement query(database, "SELECT ?", &statements);
-    query.Bind(1, std::int64_t{7});
-    ASSERT_TRUE(query.Step());
-    EXPECT_EQ(query.Integer(0), 7);
-  }
-  {
-    logical_scene_owner_detail::Statement query(database, "SELECT ?", &statements);
-    query.Bind(1, std::int64_t{9});
-    ASSERT_TRUE(query.Step());
-    EXPECT_EQ(query.Integer(0), 9);
-    EXPECT_FALSE(query.Step());
-  }
-  statements.Clear();
-  EXPECT_EQ(sqlite3_close(database), SQLITE_OK);
-}
-
-TEST(CanonicalEmptySceneOwner, MaintenanceSnapshotCacheDropsOnRollback) {
+// OD-372: the arm holds an object on a frame of a tool mounted on it; the
+// attachment keeps the arm as holder and the tool's frame as carrier.
+TEST(CanonicalEmptySceneOwner, AttachOnAMountedToolFrameKeepsTheArmAsHolder) {
   SceneAdoptionFixture fixture;
-  const auto snapshot = *fixture.owner->LogicalSnapshot();
-  logical_scene_owner_detail::MaintenanceSnapshotCache cache;
-  cache.Store(1, false, "exact bytes", snapshot);
-  ASSERT_NE(cache.Find(1, false, "exact bytes"), nullptr);
-  EXPECT_EQ(cache.Find(1, false, "changed bytes"), nullptr);
-  sqlite3 *database = nullptr;
-  ASSERT_EQ(sqlite3_open(":memory:", &database), SQLITE_OK);
-  {
-    logical_scene_owner_detail::Transaction transaction(database, "BEGIN", &cache);
-    transaction.Commit();
-  }
-  ASSERT_NE(cache.Find(1, false, "exact bytes"), nullptr);
-  {
-    logical_scene_owner_detail::Transaction transaction(database, "BEGIN", &cache);
-  }
-  EXPECT_EQ(cache.Find(1, false, "exact bytes"), nullptr);
-  EXPECT_EQ(sqlite3_close(database), SQLITE_OK);
+  auto active = fixture.owner->CurrentProjectionRevision();
+  const auto added = fixture.owner->Commit(AddBoxRequest(active, fixture.admission.cell_id(), "mounted-add"));
+  ASSERT_TRUE(added.success);
+  ASSERT_TRUE(added.committed_projection_revision.has_value());
+  active = *added.committed_projection_revision;
+  for (auto &projection : fixture.predecessor_projections)
+    projection->SetFrameResolution(core::Pose3DTO{}, {});
+  core::AttachCarriedObjectRequestDTO operation{
+      core::CarriedObjectAttachmentId("attachment.1"), core::SceneResourceId("scene-box"),
+      core::ControllableComponentId("component.1"), core::CommandTargetId("arm"),
+      core::FrameRoleId("holder_rod"), {core::CollisionBodyRoleId("holder_rod")}, {}};
+  operation.carrier_component_id = core::ControllableComponentId("tube_holder");
+  core::SceneTransactionRequestDTO attach{
+      SceneRequestContext("mounted-attach", active), {}, active, operation, std::nullopt};
+  attach.expected_admission_generation = core::AdmissionGeneration(1U);
+  attach.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      core::ProgramRunNumber(2U), core::CellAdmissionClaimGeneration(9U),
+      "attach", core::NodeAttemptNumber(1U), "scene.carried_attachment"};
+  const auto attached = fixture.owner->Commit(attach);
+  ASSERT_TRUE(attached.success) << (attached.error.has_value() ? attached.error->message : "missing error");
+  const auto snapshot = fixture.owner->LogicalSnapshot();
+  ASSERT_EQ(snapshot->carried_object_attachments.size(), 1U);
+  const auto &attachment = snapshot->carried_object_attachments.front();
+  EXPECT_EQ(attachment.controllable_component_id, core::ControllableComponentId("component.1"));
+  EXPECT_EQ(attachment.command_target_id, core::CommandTargetId("arm"));
+  const auto *carrier = std::get_if<core::ComponentSceneFrameRefDTO>(&attachment.carrier_frame_ref);
+  ASSERT_NE(carrier, nullptr);
+  EXPECT_EQ(carrier->controllable_component_id, core::ControllableComponentId("tube_holder"));
+  EXPECT_EQ(carrier->frame_role_id, core::FrameRoleId("holder_rod"));
+  EXPECT_EQ(attachment.touch_body_roles,
+            (std::vector<core::CollisionBodyRoleId>{core::CollisionBodyRoleId("holder_rod")}));
 }
 
 void VerifyAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(
@@ -3669,10 +3265,6 @@ void VerifyAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(
   EXPECT_EQ(fixture.owner->CompleteMaintenanceInitialization(
                 {request.authority.owner.apply_id, request.authority.owner.apply_generation,
                  ready.target_projection_revision, ready.authoritative_snapshot_identity, publication}), completed);
-  fixture.owner.reset();
-  fixture.owner = std::make_unique<LogicalSceneOwner>(
-      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
-      fixture.resolver, fixture.cell_admission);
   EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), snapshot_bytes);
   EXPECT_EQ(fixture.owner->ReadMaintenanceInitialization(
                 {request.authority.owner.apply_id, request.authority.owner.apply_generation}),
@@ -3755,13 +3347,6 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), ready.target_projection_revision);
   EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), latest_bytes);
   ASSERT_NO_FATAL_FAILURE(stream_pose(0.40));  // streaming continues on the new Deployment
-
-  const auto after = fixture.owner->CurrentProjectionRevision();
-  fixture.owner.reset();
-  fixture.owner = std::make_unique<LogicalSceneOwner>(
-      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
-      fixture.resolver, fixture.cell_admission);
-  EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), after);
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -3876,13 +3461,9 @@ TEST(CanonicalEmptySceneOwner,
 
 TEST(CanonicalEmptySceneOwner,
      MissingClaimDependencyCannotAdmitQualifiedAdoption) {
-  SceneAdoptionFixture fixture;
+  SceneAdoptionFixture fixture(false);
   const auto request = fixture.CaptureConfigurationRequest();
   fixture.QualifyCandidate(request);
-  fixture.owner.reset();
-  fixture.owner = std::make_unique<LogicalSceneOwner>(
-      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
-      fixture.resolver);
   EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   EXPECT_FALSE(fixture.owner->ReadMaintenanceInitialization(
       {request.authority.owner.apply_id, request.authority.owner.apply_generation}).has_value());
@@ -4102,10 +3683,6 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_TRUE(fixture.owner->LogicalSnapshot()->objects.empty());
     EXPECT_EQ(fixture.owner->VerifyIntegrity().transaction_intent_count,
               no_op_between_applies ? 3 : 2);
-    fixture.owner.reset();
-    fixture.owner = std::make_unique<LogicalSceneOwner>(
-        fixture.database_path, fixture.admission, fixture.publication_reader,
-        fixture.bundle_source, fixture.resolver, fixture.cell_admission);
     EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), final_projection);
     EXPECT_TRUE(fixture.owner->LogicalSnapshot()->objects.empty());
     EXPECT_EQ(fixture.owner->LogicalSnapshot()->transaction_sequence,
@@ -4196,12 +3773,8 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_TRUE(removed.success);
   ASSERT_TRUE(removed.committed_projection_revision.has_value());
   const auto final_projection = *removed.committed_projection_revision;
-  // A full replay of the durable history (periodic reconciliation, restart).
+  // A full replay of the history (periodic reconciliation).
   EXPECT_NO_THROW(static_cast<void>(fixture.owner->VerifyIntegrity()));
-  fixture.owner.reset();
-  ASSERT_NO_THROW(fixture.owner = std::make_unique<LogicalSceneOwner>(
-      fixture.database_path, fixture.admission, fixture.publication_reader,
-      fixture.bundle_source, fixture.resolver, fixture.cell_admission));
   EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), final_projection);
   EXPECT_TRUE(fixture.owner->LogicalSnapshot()->objects.empty());
   EXPECT_EQ(fixture.owner->LogicalSnapshot()->transaction_sequence, 2U);
@@ -4618,7 +4191,7 @@ TEST(CanonicalEmptySceneOwner,
 }
 
 TEST(CanonicalEmptySceneOwner,
-     OriginalManagerLostCompletionResponseKeepsDurableCompletionAndParentHeld) {
+     OriginalManagerLostCompletionResponseKeepsCompletionAndParentHeld) {
   SceneAdoptionFixture fixture;
   const auto snapshot = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
   const auto request = fixture.CaptureConfigurationRequest();
@@ -4640,74 +4213,6 @@ TEST(CanonicalEmptySceneOwner,
       {request.authority.held_cell_claim.intent, request.authority.held_cell_claim, std::nullopt});
   ASSERT_TRUE(held.ok());
   EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
-  fixture.owner.reset();
-  fixture.owner = std::make_unique<LogicalSceneOwner>(
-      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
-      fixture.resolver, fixture.cell_admission);
-  fixture.fence.RefuseRemoteQueryAfter(100U);
-  EXPECT_EQ(fixture.owner->ReadMaintenanceInitialization(query), completed);
-  EXPECT_THROW(fixture.Complete(request, publication), LogicalSceneOwnerConflictError);
-  fixture.ExpectNoCandidateEffects();
-}
-
-TEST(CanonicalEmptySceneOwner,
-     LegacySameSceneMaintenanceCompletionAndReplayRemainOrdinary) {
-  SceneAdoptionFixture fixture;
-  auto request = fixture.CaptureConfigurationRequest();
-  fixture.QualifyCandidate(request);
-  const auto snapshot = fixture.owner->LogicalSnapshot();
-  const auto quote = [](const std::string &value) {
-    char *encoded = sqlite3_mprintf("%Q", value.c_str());
-    if (encoded == nullptr) {
-      throw std::bad_alloc();
-    }
-    std::string result(encoded);
-    sqlite3_free(encoded);
-    return result;
-  };
-  const auto columns = [&](const ProjectionRevisionDTO &projection) {
-    return quote(projection.retained_bundle_id.value()) + "," + quote(projection.graph_revision.value()) + "," +
-           quote(projection.scene_revision.scene_id.value()) + "," + std::to_string(projection.scene_revision.revision_id) + "," +
-           quote(projection.scene_revision.content_hash.value());
-  };
-  const ProjectionRevisionDTO target{request.candidate_retained_bundle.retained_bundle_id,
-                                     request.candidate_retained_bundle.cell_graph.graph_revision, snapshot->revision};
-  // The original v8 producer (ce29a2fd/a68a2189) stored unchanged Scene
-  // revisions and no Program baseline row. Populate that actual row shape
-  // in the closed store; the reopened owner reads it.
-  fixture.owner->Close();
-  std::string sql =
-      "BEGIN IMMEDIATE; INSERT INTO logical_scene_maintenance_initialization_intents("
-      "initialization_sequence,apply_id,apply_generation,predecessor_retained_bundle_id,predecessor_graph_revision,"
-      "predecessor_scene_id,predecessor_scene_revision_id,predecessor_scene_content_hash,target_retained_bundle_id,"
-      "target_graph_revision,target_scene_id,target_scene_revision_id,target_scene_content_hash,authoritative_snapshot_json,"
-      "native_binding_count,repaired_transaction_sequence) VALUES(2,250,1," +
-      columns(request.expected_active_projection_revision) + "," + columns(target) + "," +
-      quote(EncodeLogicalSceneSnapshot(*snapshot)) + "," + std::to_string(request.execution_host_bindings.size()) + ",NULL);";
-  for (std::size_t index = 0U; index < request.execution_host_bindings.size(); ++index) {
-    const auto &binding = request.execution_host_bindings[index];
-    sql += "INSERT INTO logical_scene_maintenance_initialization_bindings("
-           "initialization_sequence,binding_ordinal,provider_binding_id,provider_binding_revision,runtime_unit_id,runtime_epoch) "
-           "VALUES(2," + std::to_string(index) + "," + quote(binding.provider_binding_id.value()) + "," +
-           quote(binding.provider_binding_revision.value()) + "," + quote(binding.runtime_unit_id.value()) + "," +
-           quote(binding.runtime_epoch.value()) + ");";
-  }
-  sql += "INSERT INTO logical_scene_maintenance_initialization_results("
-         "initialization_sequence,state,first_error_code,first_error_message,effects_unknown) "
-         "VALUES(2,'initialized',NULL,NULL,0); COMMIT;";
-  ExecuteSql(fixture.database_path, sql);
-  fixture.owner = std::make_unique<LogicalSceneOwner>(
-      fixture.database_path, fixture.admission, fixture.publication_reader,
-      fixture.bundle_source, fixture.resolver, fixture.cell_admission);
-  request.authority.owner.apply_id = ApplyId(250U);
-  const auto publication = fixture.Publication(request);
-  fixture.publication_reader.SetCurrent(publication);
-  const core::ProjectionMaintenanceCompletionDTO completion{
-      ApplyId(250U), ApplyGeneration(1U), target, snapshot->identity(), publication};
-  const auto completed = fixture.owner->CompleteMaintenanceInitialization(completion);
-  EXPECT_EQ(completed.state, core::ProjectionMaintenanceInitializationState::kCompleted);
-  EXPECT_EQ(fixture.owner->CompleteMaintenanceInitialization(completion), completed);
-  EXPECT_EQ(*fixture.owner->LogicalSnapshot(), *snapshot);
   fixture.ExpectNoCandidateEffects();
 }
 
@@ -4773,9 +4278,8 @@ TEST(CanonicalEmptySceneOwner,
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, bundle_source,
-                                 resolver, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          resolver, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   const auto authored = owner.Commit(AddBoxRequest(
@@ -4794,15 +4298,15 @@ TEST(CanonicalEmptySceneOwner,
            core::ComponentSceneFrameRefDTO{
                core::ControllableComponentId("candidate-component"),
                core::ModelInstanceId("candidate-model"),
-               core::FrameRoleId("candidate-frame")},
-           {core::SupportContactDTO{.support_object_id = "wall"}}},
+               core::FrameRoleId("candidate-frame")}},
        core::AddObjectRequestDTO{
            core::SceneResourceId("mesh"),
-           core::MeshShapeDTO{"asset://fixture/mesh", {1.0, 1.0, 1.0}},
-           pose, core::CellSceneFrameRefDTO{admission.cell_id()}, {}},
+           core::MeshShapeDTO{"asset://fixture/mesh", {1.0, 1.0, 1.0},
+                              Digest('e').value()},
+           pose, core::CellSceneFrameRefDTO{admission.cell_id()}},
        core::AddObjectRequestDTO{
           core::SceneResourceId("wall"), core::BoxShapeDTO{{0.1, 0.2, 0.3}},
-          pose, core::CellSceneFrameRefDTO{admission.cell_id()}, {}}}};
+          pose, core::CellSceneFrameRefDTO{admission.cell_id()}}}};
   const auto provisional = owner.BeginMaintenanceInitialization(request);
   ASSERT_EQ(provisional.state,
             core::ProjectionMaintenanceInitializationState::kInitialized);
@@ -4847,10 +4351,6 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_EQ(snapshot->shared()->objects.size(), 3U);
   EXPECT_EQ(snapshot->shared()->objects.front().scene_resource_id.value(),
             "frame_object");
-  ASSERT_EQ(snapshot->shared()->objects.front().support_contacts.size(), 1U);
-  EXPECT_EQ(snapshot->shared()->objects.front().support_contacts.front()
-                .support_object_id,
-            "wall");
   const auto *placement = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
       &snapshot->shared()->objects.front().placement);
   ASSERT_NE(placement, nullptr);
@@ -4947,133 +4447,92 @@ TEST(CanonicalEmptySceneOwner,
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
   TestCellAdmissionPort cell_admission;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  const auto history = [&] {
-    sqlite3 *raw = nullptr;
-    Require(sqlite3_open_v2(database_path.c_str(), &raw, SQLITE_OPEN_READONLY,
-                            nullptr) == SQLITE_OK,
-            "cannot open the test store");
-    sqlite3_stmt *statement = nullptr;
-    Require(sqlite3_prepare_v2(
-                raw,
-                "SELECT count(*),min(initialization_sequence),"
-                "max(initialization_sequence),"
-                "(SELECT count(*) FROM "
-                "logical_scene_maintenance_initialization_bindings),"
-                "(SELECT count(*) FROM "
-                "logical_scene_maintenance_initialization_results),"
-                "(SELECT count(*) FROM logical_scene_initial_baseline_requests) "
-                "FROM logical_scene_maintenance_initialization_intents",
-                -1, &statement, nullptr) == SQLITE_OK &&
-                sqlite3_step(statement) == SQLITE_ROW,
-            "cannot read the maintenance history");
-    std::array<std::int64_t, 6> result{};
-    for (int column = 0; column < 6; ++column) {
-      result[static_cast<std::size_t>(column)] =
-          sqlite3_column_int64(statement, column);
-    }
-    sqlite3_finalize(statement);
-    sqlite3_close(raw);
-    return result;
-  };
   const auto apply_id = [](const std::size_t index) {
     return ApplyId(500U + static_cast<std::uint64_t>(index));
   };
   const std::size_t total = kMaximumMaintenanceInitializations + 8U;
   const auto last_completed = apply_id(total - 1U);
   const auto unsettled = apply_id(total);
-  {
-    LogicalSceneOwner owner(database_path, admission, publication_reader,
-                            bundle_source, resolver, cell_admission);
-    auto current =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
-    for (std::size_t index = 0U; index < total; ++index) {
-      if (index % 40U == 20U) {
-        // Resident Scene transactions interleave with the Applies; the fold
-        // at the bound compacts them, and later commits still succeed.
-        const auto authored = owner.Commit(AddBoxRequest(
-            current, admission.cell_id(),
-            "scene-request-eviction-" + std::to_string(index)));
-        ASSERT_TRUE(authored.success)
-            << index << " "
-            << (authored.error.has_value() ? authored.error->message : "");
-        current = *authored.committed_projection_revision;
-      }
-      const core::ProjectionMaintenanceInitializationRequestDTO request{
-          apply_id(index), ApplyGeneration(1U), current,
-          candidate.bundle->value(), bindings, {}};
-      const auto initialized = owner.BeginMaintenanceInitialization(request);
-      ASSERT_EQ(initialized.state,
-                core::ProjectionMaintenanceInitializationState::kInitialized)
-          << index;
-      const auto installed = owner.InstallInitialScene(request);
-      ASSERT_TRUE(installed.ready_for_publication()) << index;
-      const core::ActiveBundlePublicationReceiptDTO receipt{
-          core::ActiveBundlePublicationRequestDTO{
-              core::NamedApplyPublicationTransactionDTO{
-                  request.apply_id, request.apply_generation},
-              installed.target_projection_revision,
-              installed.target_projection_revision.retained_bundle_id,
-              installed.target_projection_revision.graph_revision,
-              ActiveBundlePublicationGeneration(index + 1U), Digest('d')},
-          ActiveBundlePublicationGeneration(index + 2U), Digest('f')};
-      publication_reader.SetCurrent(receipt);
-      const auto completed = owner.CompleteMaintenanceInitialization({
-          request.apply_id, request.apply_generation,
-          installed.target_projection_revision,
-          installed.authoritative_snapshot_identity, receipt});
-      ASSERT_EQ(completed.state,
-                core::ProjectionMaintenanceInitializationState::kCompleted)
-          << index;
-      current = completed.target_projection_revision;
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          resolver, cell_admission);
+  auto current =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  for (std::size_t index = 0U; index < total; ++index) {
+    if (index % 40U == 20U) {
+      // Resident Scene transactions interleave with the Applies; the fold
+      // at the bound compacts them, and later commits still succeed.
+      const auto authored = owner.Commit(AddBoxRequest(
+          current, admission.cell_id(),
+          "scene-request-eviction-" + std::to_string(index)));
+      ASSERT_TRUE(authored.success)
+          << index << " "
+          << (authored.error.has_value() ? authored.error->message : "");
+      current = *authored.committed_projection_revision;
     }
-    EXPECT_FALSE(owner.ReadMaintenanceInitialization({apply_id(0U),
-                                                      ApplyGeneration(1U)})
-                     .has_value());
-    EXPECT_EQ(owner.ReadMaintenanceInitialization({last_completed,
-                                                   ApplyGeneration(1U)})
-                  .value()
-                  .state,
-              core::ProjectionMaintenanceInitializationState::kCompleted);
-
-    // An unsettled (initialized, uncompleted) Apply is admitted at the bound
-    // and survives as the latest initialization.
-    const core::ProjectionMaintenanceInitializationRequestDTO pending{
-        unsettled, ApplyGeneration(1U), current, candidate.bundle->value(),
-        bindings, {}};
-    ASSERT_EQ(owner.BeginMaintenanceInitialization(pending).state,
-              core::ProjectionMaintenanceInitializationState::kInitialized);
-    EXPECT_EQ(owner.ReadMaintenanceInitialization({unsettled,
-                                                   ApplyGeneration(1U)})
-                  .value()
-                  .state,
-              core::ProjectionMaintenanceInitializationState::kInitialized);
-    owner.Close();
+    const core::ProjectionMaintenanceInitializationRequestDTO request{
+        apply_id(index), ApplyGeneration(1U), current,
+        candidate.bundle->value(), bindings, {}};
+    const auto initialized = owner.BeginMaintenanceInitialization(request);
+    ASSERT_EQ(initialized.state,
+              core::ProjectionMaintenanceInitializationState::kInitialized)
+        << index;
+    const auto installed = owner.InstallInitialScene(request);
+    ASSERT_TRUE(installed.ready_for_publication()) << index;
+    const core::ActiveBundlePublicationReceiptDTO receipt{
+        core::ActiveBundlePublicationRequestDTO{
+            core::NamedApplyPublicationTransactionDTO{
+                request.apply_id, request.apply_generation},
+            installed.target_projection_revision,
+            installed.target_projection_revision.retained_bundle_id,
+            installed.target_projection_revision.graph_revision,
+            ActiveBundlePublicationGeneration(index + 1U), Digest('d')},
+        ActiveBundlePublicationGeneration(index + 2U), Digest('f')};
+    publication_reader.SetCurrent(receipt);
+    const auto completed = owner.CompleteMaintenanceInitialization({
+        request.apply_id, request.apply_generation,
+        installed.target_projection_revision,
+        installed.authoritative_snapshot_identity, receipt});
+    ASSERT_EQ(completed.state,
+              core::ProjectionMaintenanceInitializationState::kCompleted)
+        << index;
+    current = completed.target_projection_revision;
   }
-  // The file holds the bounded rows after Close has drained the writer.
-  const auto bound =
-      static_cast<std::int64_t>(kMaximumMaintenanceInitializations);
-  const auto binding_count = static_cast<std::int64_t>(bindings.size());
-  const auto rows = history();
-  EXPECT_EQ(rows[0], bound);
-  EXPECT_EQ(rows[1], 10);
-  EXPECT_EQ(rows[2], static_cast<std::int64_t>(total + 1U));
-  EXPECT_EQ(rows[3], bound * binding_count);
-  EXPECT_EQ(rows[4], bound);
-  EXPECT_EQ(rows[5], bound);
-
-  // The evicted, folded store reopens, replays and validates.
-  LogicalSceneOwner restarted(database_path, admission, publication_reader,
-                              bundle_source, resolver, cell_admission);
-  EXPECT_NO_THROW(static_cast<void>(restarted.VerifyIntegrity()));
-  EXPECT_EQ(history()[0],
-            static_cast<std::int64_t>(kMaximumMaintenanceInitializations));
-  EXPECT_EQ(restarted.ReadMaintenanceInitialization({last_completed,
-                                                     ApplyGeneration(1U)})
+  EXPECT_FALSE(owner.ReadMaintenanceInitialization({apply_id(0U),
+                                                    ApplyGeneration(1U)})
+                   .has_value());
+  EXPECT_EQ(owner.ReadMaintenanceInitialization({last_completed,
+                                                 ApplyGeneration(1U)})
                 .value()
                 .state,
             core::ProjectionMaintenanceInitializationState::kCompleted);
+
+  // An unsettled (initialized, uncompleted) Apply is admitted at the bound
+  // and survives as the latest initialization.
+  const core::ProjectionMaintenanceInitializationRequestDTO pending{
+      unsettled, ApplyGeneration(1U), current, candidate.bundle->value(),
+      bindings, {}};
+  ASSERT_EQ(owner.BeginMaintenanceInitialization(pending).state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  EXPECT_EQ(owner.ReadMaintenanceInitialization({unsettled,
+                                                 ApplyGeneration(1U)})
+                .value()
+                .state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  // The history holds its bound: the newest initializations, the unsettled
+  // one included.
+  std::size_t resident = 0U;
+  for (std::size_t index = 0U; index <= total; ++index) {
+    const bool present = owner
+                             .ReadMaintenanceInitialization(
+                                 {apply_id(index), ApplyGeneration(1U)})
+                             .has_value();
+    EXPECT_EQ(present, index + kMaximumMaintenanceInitializations > total)
+        << index;
+    resident += present ? 1U : 0U;
+  }
+  EXPECT_EQ(resident, kMaximumMaintenanceInitializations);
+  EXPECT_NO_THROW(static_cast<void>(owner.VerifyIntegrity()));
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -5097,9 +4556,8 @@ TEST(CanonicalEmptySceneOwner,
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, bundle_source,
-                                 resolver, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          resolver, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   core::Pose3DTO pose;
@@ -5108,7 +4566,7 @@ TEST(CanonicalEmptySceneOwner,
       accepted.canonical_empty_target, candidate.bundle->value(), bindings,
       {core::AddObjectRequestDTO{
           core::SceneResourceId("fixture"), core::SphereShapeDTO{-0.1}, pose,
-          core::CellSceneFrameRefDTO{admission.cell_id()}, {}}}};
+          core::CellSceneFrameRefDTO{admission.cell_id()}}}};
   EXPECT_THROW(owner.BeginMaintenanceInitialization(invalid_geometry),
                std::invalid_argument);
   EXPECT_EQ(projections.front()->rebuild_calls(), 0U);
@@ -5121,8 +4579,7 @@ TEST(CanonicalEmptySceneOwner,
           core::ComponentSceneFrameRefDTO{
               core::ControllableComponentId("missing-component"),
               core::ModelInstanceId("missing-model"),
-              core::FrameRoleId("missing-frame")},
-          {}}}};
+              core::FrameRoleId("missing-frame")}}}};
   ASSERT_EQ(owner.BeginMaintenanceInitialization(request).state,
             core::ProjectionMaintenanceInitializationState::kInitialized);
   const auto failed = owner.InstallInitialScene(request);
@@ -5137,7 +4594,7 @@ TEST(CanonicalEmptySceneOwner,
 }
 
 TEST(CanonicalEmptySceneOwner,
-     InterruptedInitialSceneEffectReopensClosedWithoutReplaying) {
+     InterruptedInitialSceneEffectEndsClosedWithoutReplaying) {
   TemporaryDirectory directory("scene-initial-effect-interrupted");
   const auto package_root = directory.path() / "packages";
   CopyCanonicalEmptyPackage(package_root);
@@ -5146,57 +4603,45 @@ TEST(CanonicalEmptySceneOwner,
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
   const auto bindings = ExecutionHostBindings(candidate.bundle->value(),
-                                               "runtime-initial-interrupted");
+                                              "runtime-initial-interrupted");
   auto projections = MakeFakeProjections(bindings);
   FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
   ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
   TestCellAdmissionPort cell_admission;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  std::optional<core::ProjectionMaintenanceInitializationRequestDTO> request;
-  std::size_t rebuild_calls = 0U;
-  {
-    LogicalSceneOwner owner(database_path, admission,
-                                   publication_reader, bundle_source, resolver,
-                                   cell_admission);
-    const auto accepted =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission);
-    request.emplace(core::ProjectionMaintenanceInitializationRequestDTO{
-        ApplyId(404U), ApplyGeneration(1U),
-        accepted.canonical_empty_target, candidate.bundle->value(), bindings,
-        {core::AddObjectRequestDTO{
-            core::SceneResourceId("wall"), core::BoxShapeDTO{{0.1, 0.2, 0.3}},
-            core::Pose3DTO{}, core::CellSceneFrameRefDTO{admission.cell_id()},
-            {}}}});
-    ASSERT_EQ(owner.BeginMaintenanceInitialization(*request).state,
-              core::ProjectionMaintenanceInitializationState::kInitialized);
-    projections.front()->ThrowAfterNextRebuildEffect();
-    const auto interrupted = owner.InstallInitialScene(*request);
-    EXPECT_EQ(interrupted.state,
-              core::ProjectionMaintenanceInitializationState::kInterrupted);
-    EXPECT_TRUE(interrupted.effects_unknown);
-    EXPECT_FALSE(interrupted.ready_for_publication());
-    EXPECT_EQ(owner.InstallInitialScene(*request), interrupted);
-    rebuild_calls = projections.front()->rebuild_calls();
-    owner.Close();
-  }
-
-  LogicalSceneOwner reopened(database_path, admission,
-                                    publication_reader, bundle_source, resolver,
-                                    cell_admission);
-  const auto interrupted = reopened.ReadMaintenanceInitialization(
-      {request->apply_id, request->apply_generation});
-  ASSERT_TRUE(interrupted.has_value());
-  EXPECT_EQ(interrupted->state,
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          resolver, cell_admission);
+  const auto accepted =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+  const core::ProjectionMaintenanceInitializationRequestDTO request{
+      ApplyId(404U),
+      ApplyGeneration(1U),
+      accepted.canonical_empty_target,
+      candidate.bundle->value(),
+      bindings,
+      {core::AddObjectRequestDTO{
+          core::SceneResourceId("wall"), core::BoxShapeDTO{{0.1, 0.2, 0.3}},
+          core::Pose3DTO{}, core::CellSceneFrameRefDTO{admission.cell_id()}}}};
+  ASSERT_EQ(owner.BeginMaintenanceInitialization(request).state,
+            core::ProjectionMaintenanceInitializationState::kInitialized);
+  projections.front()->ThrowAfterNextRebuildEffect();
+  const auto interrupted = owner.InstallInitialScene(request);
+  EXPECT_EQ(interrupted.state,
             core::ProjectionMaintenanceInitializationState::kInterrupted);
-  EXPECT_TRUE(interrupted->effects_unknown);
-  EXPECT_FALSE(interrupted->ready_for_publication());
+  EXPECT_TRUE(interrupted.effects_unknown);
+  EXPECT_FALSE(interrupted.ready_for_publication());
+  const auto rebuild_calls = projections.front()->rebuild_calls();
+  EXPECT_EQ(owner.InstallInitialScene(request), interrupted);
+  EXPECT_EQ(owner.ReadMaintenanceInitialization(
+                {request.apply_id, request.apply_generation}),
+            std::optional{interrupted});
   // An ended initialization no longer holds the gates; the Scene stays at its
   // predecessor.
-  EXPECT_TRUE(reopened.ReadAccessStatus().scene_writes_open);
-  EXPECT_TRUE(reopened.ReadAccessStatus().projection_leases_open);
-  EXPECT_EQ(reopened.CurrentProjectionRevision(), request->expected_active_projection_revision);
-  EXPECT_EQ(reopened.InstallInitialScene(*request), *interrupted);
+  EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
+  EXPECT_TRUE(owner.ReadAccessStatus().projection_leases_open);
+  EXPECT_EQ(owner.CurrentProjectionRevision(),
+            request.expected_active_projection_revision);
   EXPECT_EQ(projections.front()->rebuild_calls(), rebuild_calls);
 }
 
@@ -5218,9 +4663,8 @@ TEST(CanonicalEmptySceneOwner,
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, bundle_source,
-                                 resolver, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          resolver, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   const core::ProjectionMaintenanceInitializationRequestDTO request{
@@ -5265,9 +4709,8 @@ TEST(CanonicalEmptySceneOwner,
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, bundle_source,
-                                 resolver, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          resolver, cell_admission);
   const auto predecessor = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle, bindings);
   const core::ProjectionMaintenanceInitializationRequestDTO request{
@@ -5310,9 +4753,8 @@ TEST(CanonicalEmptySceneOwner,
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, bundle_source,
-                                 resolver, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          resolver, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   const core::ProjectionMaintenanceInitializationRequestDTO request{
@@ -5371,9 +4813,8 @@ TEST(CanonicalEmptySceneOwner,
   auto &projection = *projections.front();
   FakePlannerSceneProjectionResolver projection_resolver(projection_clients);
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, bundle_source,
-                                 projection_resolver, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          projection_resolver, cell_admission);
   auto active = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle,
       native_bindings, 101U);
@@ -5764,8 +5205,7 @@ TEST(CanonicalEmptySceneOwner,
   }
   FakePlannerSceneProjectionResolver projection_resolver(projection_clients);
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                          admission, publication_reader, bundle_source,
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
                           projection_resolver, cell_admission);
   auto active = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle,
@@ -5839,9 +5279,9 @@ TEST(CanonicalEmptySceneOwner,
     return projection->ProjectionHealthForRevision(active);
   };
   const std::vector<RequiredSceneProjection> projections{
-      {robot_a, health(robot_a)},
-      {robot_b, health(robot_b)},
-      {gripper, health(gripper)}};
+      {robot_a, health(robot_a), robot_a->binding()},
+      {robot_b, health(robot_b), robot_b->binding()},
+      {gripper, health(gripper), gripper->binding()}};
   const core::SceneFrameResolutionSelectorDTO tcp{
       core::TargetCarrierSceneFrameRefDTO{
           core::ControllableComponentId("component.1"),
@@ -5923,9 +5363,8 @@ TEST(CanonicalEmptySceneOwner,
   FakePlannerSceneProjectionResolver projection_resolver(
       ProjectionClients(projections));
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, bundle_source,
-                                 projection_resolver, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          projection_resolver, cell_admission);
   const auto active = FinalizeNativeCandidate(
       owner, publication_reader, admission, *candidate.bundle,
       native_bindings, 103U);
@@ -5989,12 +5428,10 @@ TEST(CanonicalEmptySceneOwner,
 
 TEST(CanonicalEmptySceneOwner,
      SceneUpdatesClassifyNoOpFreshnessGeometryAndPolicyEpochs) {
-  TemporaryDirectory directory;
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                 admission, publication_reader, cell_admission);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
   const auto added = owner.Commit(
@@ -6142,156 +5579,144 @@ TEST(CanonicalEmptySceneOwner,
 
 TEST(CanonicalEmptySceneOwner,
      SceneOperationsTakeNoRevisionPrecondition) {
-  TemporaryDirectory directory("scene-no-revision-precondition");
-  const auto database = directory.path() / "logical-scene.sqlite3";
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
   ProjectionRevisionDTO older;
   ProjectionRevisionDTO active;
-  {
-    LogicalSceneOwner owner(database, admission, publication_reader,
-                            cell_admission);
-    const auto initial =
-        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-            .canonical_empty_target;
-    const auto first = owner.Commit(
-        AddBoxRequest(initial, admission.cell_id(), "scene-request-first"));
-    ASSERT_TRUE(first.success);
-    older = *first.committed_projection_revision;
-    auto second_request =
-        AddBoxRequest(older, admission.cell_id(), "scene-request-second");
-    std::get<core::AddObjectRequestDTO>(second_request.operation)
-        .scene_resource_id = core::SceneResourceId("scene-box-2");
-    const auto second = owner.Commit(second_request);
-    ASSERT_TRUE(second.success);
-    active = *second.committed_projection_revision;
-    ASSERT_GT(active.scene_revision.revision_id,
-              older.scene_revision.revision_id);
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
+  const auto initial =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  const auto first = owner.Commit(
+      AddBoxRequest(initial, admission.cell_id(), "scene-request-first"));
+  ASSERT_TRUE(first.success);
+  older = *first.committed_projection_revision;
+  auto second_request =
+      AddBoxRequest(older, admission.cell_id(), "scene-request-second");
+  std::get<core::AddObjectRequestDTO>(second_request.operation)
+      .scene_resource_id = core::SceneResourceId("scene-box-2");
+  const auto second = owner.Commit(second_request);
+  ASSERT_TRUE(second.success);
+  active = *second.committed_projection_revision;
+  ASSERT_GT(active.scene_revision.revision_id,
+            older.scene_revision.revision_id);
 
-    const auto request = [&](std::string request_id,
-                             const ProjectionRevisionDTO &expected,
-                             core::SceneOperationRequestDTO operation) {
-      return core::SceneTransactionRequestDTO{
-          SceneRequestContext(std::move(request_id), older),
-          {},
-          expected,
-          std::move(operation),
-          core::AdmissionGeneration(1U),
-      };
+  const auto request = [&](std::string request_id,
+                           const ProjectionRevisionDTO &expected,
+                           core::SceneOperationRequestDTO operation) {
+    return core::SceneTransactionRequestDTO{
+        SceneRequestContext(std::move(request_id), older),
+        {},
+        expected,
+        std::move(operation),
+        core::AdmissionGeneration(1U),
     };
-    const auto stale_code = [&](const core::SceneTransactionRequestDTO &value) {
-      const auto result = owner.Commit(value);
-      EXPECT_FALSE(result.success);
-      return result.error.has_value() ? result.error->code : std::string{};
-    };
-    const auto upsert_from = [&](std::string request_id,
-                                 const ProjectionRevisionDTO &expected,
-                                 const core::Pose3DTO &pose) {
-      auto upsert =
-          AddBoxRequest(expected, admission.cell_id(), std::move(request_id));
-      const auto add = std::get<core::AddObjectRequestDTO>(upsert.operation);
-      upsert.operation = core::UpsertObjectRequestDTO{
-          core::SceneResourceId("scene-box-2"), add.shape, pose, add.frame_ref,
-          add.support_contacts};
-      return upsert;
-    };
+  };
+  const auto stale_code = [&](const core::SceneTransactionRequestDTO &value) {
+    const auto result = owner.Commit(value);
+    EXPECT_FALSE(result.success);
+    return result.error.has_value() ? result.error->code : std::string{};
+  };
+  const auto upsert_from = [&](std::string request_id,
+                               const ProjectionRevisionDTO &expected,
+                               const core::Pose3DTO &pose) {
+    auto upsert =
+        AddBoxRequest(expected, admission.cell_id(), std::move(request_id));
+    const auto add = std::get<core::AddObjectRequestDTO>(upsert.operation);
+    upsert.operation = core::UpsertObjectRequestDTO{
+        core::SceneResourceId("scene-box-2"), add.shape, pose, add.frame_ref};
+    return upsert;
+  };
 
-    // Ordinary authoring takes no revision precondition either: the last
-    // arrival wins.
-    core::Pose3DTO authored;
-    authored.position_m = {0.25, 0.25, 0.25};
-    const auto authored_upsert = owner.Commit(
-        upsert_from("scene-request-older-upsert", older, authored));
-    ASSERT_TRUE(authored_upsert.success)
-        << (authored_upsert.error.has_value() ? authored_upsert.error->message
-                                              : "");
-    active = *authored_upsert.committed_projection_revision;
+  // Ordinary authoring takes no revision precondition either: the last
+  // arrival wins.
+  core::Pose3DTO authored;
+  authored.position_m = {0.25, 0.25, 0.25};
+  const auto authored_upsert = owner.Commit(
+      upsert_from("scene-request-older-upsert", older, authored));
+  ASSERT_TRUE(authored_upsert.success)
+      << (authored_upsert.error.has_value() ? authored_upsert.error->message
+                                            : "");
+  active = *authored_upsert.committed_projection_revision;
 
-    // Another Scene, graph or bundle is refused; the revision is not compared.
-    auto other_scene = older;
-    other_scene.scene_revision.scene_id = core::SceneId(Digest('e').value());
-    auto other_graph = older;
-    other_graph.graph_revision = core::GraphRevision(Digest('d').value());
-    auto other_bundle = older;
-    other_bundle.retained_bundle_id =
-        core::RetainedBundleId(Digest('c').value());
-    int foreign_index = 0;
-    for (const auto &foreign : {other_scene, other_graph, other_bundle}) {
-      EXPECT_EQ(stale_code(request(
-                    "scene-request-foreign-" + std::to_string(++foreign_index),
-                    foreign,
-                    core::RemoveObjectRequestDTO{
-                        core::SceneResourceId("scene-box")})),
-                "stale_revision");
-    }
-
-    // An older revision, one the owner has not reached, and the same revision
-    // with other content are all accepted.
-    auto ahead = active;
-    ahead.scene_revision.revision_id += 5U;
-    auto same_revision_other_content = active;
-    same_revision_other_content.scene_revision.content_hash = Digest('e');
-
-    core::Pose3DTO moved;
-    moved.position_m = {1.5, -0.5, 0.75};
-    const auto updated = owner.Commit(request(
-        "scene-request-older-update", older,
-        core::UpdateObjectPoseRequestDTO{
-            core::SceneResourceId("scene-box-2"), moved,
-            core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
-            false}));
-    ASSERT_TRUE(updated.success)
-        << (updated.error.has_value() ? updated.error->message : "");
-    EXPECT_EQ(updated.committed_projection_revision->scene_revision.revision_id,
-              active.scene_revision.revision_id + 1U);
-
-    // A Program scene node upsert is accepted the same way.
-    core::Pose3DTO declared;
-    declared.position_m = {1.25, -0.25, 0.5};
-    auto node_upsert =
-        upsert_from("scene-request-node-upsert", ahead, declared);
-    node_upsert.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
-        core::ProgramRunNumber(2U),
-        core::CellAdmissionClaimGeneration(9U),
-        "upsert",
-        core::NodeAttemptNumber(1U),
-        "scene.transaction"};
-    const auto node_upserted = owner.Commit(node_upsert);
-    ASSERT_TRUE(node_upserted.success)
-        << (node_upserted.error.has_value() ? node_upserted.error->message : "");
-
-    const auto removed = owner.Commit(request(
-        "scene-request-other-content-remove", same_revision_other_content,
-        core::RemoveObjectRequestDTO{core::SceneResourceId("scene-box")}));
-    ASSERT_TRUE(removed.success)
-        << (removed.error.has_value() ? removed.error->message : "");
-    active = *removed.committed_projection_revision;
-    const auto objects = owner.GetSceneObjects();
-    ASSERT_EQ(objects.size(), 1U);
-    EXPECT_EQ(objects.front().scene_resource_id,
-              core::SceneResourceId("scene-box-2"));
-    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 6);
-
-    // Exact replay of an accepted request is unchanged.
-    const auto replay = owner.Commit(request(
-        "scene-request-older-update", older,
-        core::UpdateObjectPoseRequestDTO{
-            core::SceneResourceId("scene-box-2"), moved,
-            core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
-            false}));
-    EXPECT_TRUE(replay.success);
-    EXPECT_EQ(replay.replay_status,
-              core::RequestReplayStatusDTO::kReplayedExact);
+  // Another Scene, graph or bundle is refused; the revision is not compared.
+  auto other_scene = older;
+  other_scene.scene_revision.scene_id = core::SceneId(Digest('e').value());
+  auto other_graph = older;
+  other_graph.graph_revision = core::GraphRevision(Digest('d').value());
+  auto other_bundle = older;
+  other_bundle.retained_bundle_id =
+      core::RetainedBundleId(Digest('c').value());
+  int foreign_index = 0;
+  for (const auto &foreign : {other_scene, other_graph, other_bundle}) {
+    EXPECT_EQ(stale_code(request(
+                  "scene-request-foreign-" + std::to_string(++foreign_index),
+                  foreign,
+                  core::RemoveObjectRequestDTO{
+                      core::SceneResourceId("scene-box")})),
+              "stale_revision");
   }
 
-  // The durable intents of requests naming another revision reconstruct after
-  // restart.
-  LogicalSceneOwner restarted(database, admission, publication_reader,
-                              cell_admission);
-  EXPECT_EQ(restarted.CurrentProjectionRevision(), active);
-  EXPECT_EQ(restarted.VerifyIntegrity().transaction_intent_count, 6);
-  const auto pose = restarted.GetObjectPose(core::SceneResourceId("scene-box-2"));
+  // An older revision, one the owner has not reached, and the same revision
+  // with other content are all accepted.
+  auto ahead = active;
+  ahead.scene_revision.revision_id += 5U;
+  auto same_revision_other_content = active;
+  same_revision_other_content.scene_revision.content_hash = Digest('e');
+
+  core::Pose3DTO moved;
+  moved.position_m = {1.5, -0.5, 0.75};
+  const auto updated = owner.Commit(request(
+      "scene-request-older-update", older,
+      core::UpdateObjectPoseRequestDTO{
+          core::SceneResourceId("scene-box-2"), moved,
+          core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
+          false}));
+  ASSERT_TRUE(updated.success)
+      << (updated.error.has_value() ? updated.error->message : "");
+  EXPECT_EQ(updated.committed_projection_revision->scene_revision.revision_id,
+            active.scene_revision.revision_id + 1U);
+
+  // A Program scene node upsert is accepted the same way.
+  core::Pose3DTO declared;
+  declared.position_m = {1.25, -0.25, 0.5};
+  auto node_upsert =
+      upsert_from("scene-request-node-upsert", ahead, declared);
+  node_upsert.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      core::ProgramRunNumber(2U),
+      core::CellAdmissionClaimGeneration(9U),
+      "upsert",
+      core::NodeAttemptNumber(1U),
+      "scene.transaction"};
+  const auto node_upserted = owner.Commit(node_upsert);
+  ASSERT_TRUE(node_upserted.success)
+      << (node_upserted.error.has_value() ? node_upserted.error->message : "");
+
+  const auto removed = owner.Commit(request(
+      "scene-request-other-content-remove", same_revision_other_content,
+      core::RemoveObjectRequestDTO{core::SceneResourceId("scene-box")}));
+  ASSERT_TRUE(removed.success)
+      << (removed.error.has_value() ? removed.error->message : "");
+  active = *removed.committed_projection_revision;
+  const auto objects = owner.GetSceneObjects();
+  ASSERT_EQ(objects.size(), 1U);
+  EXPECT_EQ(objects.front().scene_resource_id,
+            core::SceneResourceId("scene-box-2"));
+  EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 6);
+
+  // Exact replay of an accepted request is unchanged.
+  const auto replay = owner.Commit(request(
+      "scene-request-older-update", older,
+      core::UpdateObjectPoseRequestDTO{
+          core::SceneResourceId("scene-box-2"), moved,
+          core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
+          false}));
+  EXPECT_TRUE(replay.success);
+  EXPECT_EQ(replay.replay_status,
+            core::RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(owner.CurrentProjectionRevision(), active);
+  const auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box-2"));
   ASSERT_TRUE(pose.ok());
   EXPECT_DOUBLE_EQ(pose.value().position_m.x_m, 1.25);
 }
@@ -6317,15 +5742,13 @@ TEST(CanonicalEmptySceneOwner,
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
 
   {
-    TemporaryDirectory directory("scene-projection-commit");
     ControlledPublicationReader publication_reader;
     auto projections = MakeFakeProjections(native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                   admission, publication_reader, bundle_source,
-                                   projection_resolver, cell_admission);
+    LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                            projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, 104U);
@@ -6350,15 +5773,13 @@ TEST(CanonicalEmptySceneOwner,
   }
 
   {
-    TemporaryDirectory directory("scene-projection-rollback");
     ControlledPublicationReader publication_reader;
     auto projections = MakeFakeProjections(native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                   admission, publication_reader, bundle_source,
-                                   projection_resolver, cell_admission);
+    LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                            projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, 105U);
@@ -6382,15 +5803,13 @@ TEST(CanonicalEmptySceneOwner,
   }
 
   {
-    TemporaryDirectory directory("scene-projection-uncertain");
     ControlledPublicationReader publication_reader;
     auto projections = MakeFakeProjections(native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
-                                   admission, publication_reader, bundle_source,
-                                   projection_resolver, cell_admission);
+    LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                            projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *candidate.bundle,
         native_bindings, 106U);
@@ -6410,16 +5829,13 @@ TEST(CanonicalEmptySceneOwner,
   }
 
   {
-    TemporaryDirectory directory("scene-projection-partial");
     ControlledPublicationReader publication_reader;
     auto projections = MakeFakeProjections(two_robot_native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    LogicalSceneOwner owner(
-        directory.path() / "logical-scene.sqlite3", admission,
-        publication_reader, bundle_source, projection_resolver,
-        cell_admission);
+    LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                            projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *two_robot_candidate.bundle,
         two_robot_native_bindings, 107U);
@@ -6442,16 +5858,13 @@ TEST(CanonicalEmptySceneOwner,
   }
 
   {
-    TemporaryDirectory directory("scene-frame-multi-projection-errors");
     ControlledPublicationReader publication_reader;
     auto projections = MakeFakeProjections(two_robot_native_bindings);
     FakePlannerSceneProjectionResolver projection_resolver(
         ProjectionClients(projections));
     TestCellAdmissionPort cell_admission;
-    LogicalSceneOwner owner(
-        directory.path() / "logical-scene.sqlite3", admission,
-        publication_reader, bundle_source, projection_resolver,
-        cell_admission);
+    LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                            projection_resolver, cell_admission);
     const auto active = FinalizeNativeCandidate(
         owner, publication_reader, admission, *two_robot_candidate.bundle,
         two_robot_native_bindings, 108U);
@@ -6518,8 +5931,7 @@ public:
         projections_(MakeFakeProjections(bindings_)),
         resolver_(ProjectionClients(projections_)),
         bundle_source_(package_root_),
-        owner_(directory_.path() / "logical-scene.sqlite3", admission_,
-               publication_reader_, bundle_source_, resolver_,
+        owner_(admission_, publication_reader_, bundle_source_, resolver_,
                cell_admission_) {
     const auto active = FinalizeNativeCandidate(
         owner_, publication_reader_, admission_, *candidate_.bundle,
@@ -6543,29 +5955,9 @@ public:
                      FakePlannerSceneProjection::Mode::kCommit);
   }
 
-  void VerifyRestart() {
-    const auto expected = owner_.CurrentProjectionRevision();
-    const auto attachment =
-        owner_.LogicalSnapshot()->carried_object_attachments;
-    owner_.Close();
-    LogicalSceneOwner recovered(directory_.path() / "logical-scene.sqlite3",
-                                admission_, publication_reader_, bundle_source_,
-                                resolver_, cell_admission_);
-    EXPECT_EQ(recovered.CurrentProjectionRevision(), expected);
-    EXPECT_EQ(recovered.LogicalSnapshot()->carried_object_attachments,
-              attachment);
-    EXPECT_NO_THROW(recovered.VerifyIntegrity());
-  }
-
   [[nodiscard]] LogicalSceneOwner &owner() noexcept { return owner_; }
   [[nodiscard]] OwnedFakePlannerSceneProjections &projections() noexcept {
     return projections_;
-  }
-  // A fresh owner on the closed store.
-  [[nodiscard]] std::unique_ptr<LogicalSceneOwner> Reopen() {
-    return std::make_unique<LogicalSceneOwner>(
-        directory_.path() / "logical-scene.sqlite3", admission_,
-        publication_reader_, bundle_source_, resolver_, cell_admission_);
   }
   [[nodiscard]] const CellId &cell_id() const noexcept {
     return admission_.cell_id();
@@ -6782,7 +6174,7 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
                                       core::FrameRoleId("other_frame")});
   ASSERT_FALSE(foreign.success);
   EXPECT_EQ(foreign.error->code, "missing_reference");
-  scene.VerifyRestart();
+  EXPECT_NO_THROW(static_cast<void>(owner.VerifyIntegrity()));
 }
 
 TEST(CanonicalEmptySceneOwnerProviderFreshness,
@@ -6883,7 +6275,7 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   const auto moved = owner.LogicalSnapshot()->carried_object_attachments.front();
   EXPECT_DOUBLE_EQ(moved.pose_in_carrier_frame.position_m.x_m, 0.51);
   EXPECT_EQ(moved.grasp_lost_check, row.grasp_lost_check);
-  scene.VerifyRestart();
+  EXPECT_NO_THROW(static_cast<void>(owner.VerifyIntegrity()));
 }
 
 TEST(CanonicalEmptySceneOwnerProviderFreshness,
@@ -6898,6 +6290,20 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   ASSERT_TRUE(added.success);
   auto other_pose = owner.GetObjectPose(core::SceneResourceId("other-box"));
   ASSERT_TRUE(other_pose.ok());
+  // OD-378: three large meshes bring the Scene near
+  // kMaximumLogicalSceneSnapshotBytes; the fold at the transaction count
+  // still takes it.
+  for (const auto *name : {"fold-1", "fold-2", "fold-3"}) {
+    const auto large = owner.Commit(AddLargeMeshRequest(
+        owner.CurrentProjectionRevision(), scene.cell_id(), name));
+    ASSERT_TRUE(large.success)
+        << (large.error.has_value() ? large.error->message : "missing error");
+  }
+  const auto large_scene = owner.LogicalSnapshot();
+  const auto large_scene_bytes =
+      EncodeLogicalSceneSnapshot(*large_scene).size();
+  ASSERT_GT(large_scene_bytes, 3U * kLargeMeshUriBytes);
+  ASSERT_LT(large_scene_bytes, kMaximumLogicalSceneSnapshotBytes);
 
   // Compaction is transparent: every commit succeeds, the commit that
   // triggers it included.
@@ -6930,74 +6336,9 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   // The last commit compacted the resident history and then committed itself.
   EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 1);
   EXPECT_EQ(owner.VerifyIntegrity().request_outcome_count, 1);
-}
-
-TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     FileByteLimitFoldsTheHistoryBeforeItsCount) {
-  ProviderFreshnessScene scene;
-  auto &owner = scene.owner();
-  const auto budget =
-      static_cast<std::uint64_t>(kMaximumSceneStoreDatabasePageImageBytes) -
-      kSceneStoreReservedFileBytes;
-  // Refused transactions whose projection error is long fill the file bytes
-  // long before 256 transactions.
-  for (auto &projection : scene.projections()) {
-    projection->SetRejectionMessage(std::string(200U * 1024U, 'e'));
-  }
-  ResetProjections(scene.projections(), owner.CurrentProjectionRevision(),
-                   FakePlannerSceneProjection::Mode::kRollbackProven);
-  const auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
-  ASSERT_TRUE(pose.ok());
-  const auto move = [&](const std::size_t index) {
-    auto moved = pose.value();
-    moved.position_m.x_m += 0.001 * static_cast<double>(index + 1U);
-    return core::SceneTransactionRequestDTO{
-        core::PublicRequestContextDTO{
-            SceneRequestKey("scene-request-bytes-" + std::to_string(index)),
-            "scene-owner-test"},
-        {},
-        owner.CurrentProjectionRevision(),
-        core::UpdateObjectPoseRequestDTO{
-            core::SceneResourceId("scene-box"), moved,
-            core::CellSceneFrameRefDTO{scene.cell_id()},
-            scene.committed_evidence(), false},
-        std::nullopt,
-    };
-  };
-  const auto first = move(0U);
-  const auto refused = owner.Commit(first);
-  ASSERT_FALSE(refused.success);
-  ASSERT_TRUE(owner.ReadCommitResult(first).has_value());
-  std::size_t folded_at = 0U;
-  std::int64_t resident_before = 0;
-  for (std::size_t index = 1U; index < kMaximumLogicalSceneTransactions;
-       ++index) {
-    resident_before = owner.VerifyIntegrity().transaction_intent_count;
-    const auto result = owner.Commit(move(index));
-    ASSERT_FALSE(result.success) << index;
-    ASSERT_EQ(result.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
-    if (owner.VerifyIntegrity().transaction_intent_count == 1) {
-      folded_at = index;
-      break;
-    }
-  }
-  // The next transaction would not have fit: the history was folded with
-  // fewer than 256 resident transactions, and the bytes are within the limit.
-  ASSERT_NE(folded_at, 0U);
-  EXPECT_LT(resident_before,
-            static_cast<std::int64_t>(kMaximumLogicalSceneTransactions));
-  EXPECT_LE(owner.record_file_bytes(), budget);
-  // A folded outcome is no longer read: the result lookup answers nothing, and
-  // the request sent again is a new request (OD-218: accepted, documented).
-  EXPECT_FALSE(owner.ReadCommitResult(first).has_value());
-  const auto resent = owner.Commit(first);
-  EXPECT_EQ(resent.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
-
-  // Reopening rebuilds the same file bytes; every record reached the file.
-  const auto file_bytes = owner.record_file_bytes();
-  scene.VerifyRestart();
-  const auto reopened = scene.Reopen();
-  EXPECT_EQ(reopened->record_file_bytes(), file_bytes);
+  // The folded Scene keeps every object.
+  EXPECT_EQ(owner.LogicalSnapshot()->objects.size(),
+            large_scene->objects.size());
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -7016,7 +6357,6 @@ TEST(CanonicalEmptySceneOwner,
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
       package_root);
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
 
   SceneAdmissionClock clock;
   SceneAdmissionJournal journal;
@@ -7069,8 +6409,7 @@ TEST(CanonicalEmptySceneOwner,
 
   std::optional<ProjectionRevisionDTO> final_revision;
   std::optional<core::LogicalSceneSnapshotDTO> final_snapshot;
-  std::optional<core::SceneTransactionRequestDTO>
-      request_to_settle_after_restart;
+  std::optional<core::SceneTransactionRequestDTO> request_to_settle;
   std::optional<core::CellAdmissionClaimDTO> parent_claim;
   core::CellAdmissionClaimIntentDTO parent_intent{
       core::CellAdmissionClaimKindDTO::kProgramCycle,
@@ -7129,591 +6468,299 @@ TEST(CanonicalEmptySceneOwner,
       };
   std::optional<core::SceneTransactionRequestDTO> reused_external_request;
 
-  {
-    LogicalSceneOwner owner(database_path, admission, publication_reader,
-                            bundle_source, resolver, scene_admission);
-    auto active = FinalizeNativeCandidate(owner, publication_reader, admission,
-                                          *candidate.bundle, bindings,
-                                          111U);
-    ResetProjections(projections, active,
-                     FakePlannerSceneProjection::Mode::kCommit);
+  LogicalSceneOwner owner(admission, publication_reader, bundle_source,
+                          resolver, scene_admission);
+  auto active = FinalizeNativeCandidate(owner, publication_reader, admission,
+                                        *candidate.bundle, bindings,
+                                        111U);
+  ResetProjections(projections, active,
+                   FakePlannerSceneProjection::Mode::kCommit);
 
-    auto add = AddBoxRequest(active, admission.cell_id(),
-                             "scene-program-compaction-add");
-    add.expected_admission_generation =
-        cell_admission.GetAuthoringAdmission().admission_generation;
-    const auto added = owner.Commit(add);
-    ASSERT_TRUE(added.success)
-        << (added.error.has_value() ? added.error->message : "missing error");
+  auto add = AddBoxRequest(active, admission.cell_id(),
+                           "scene-program-compaction-add");
+  add.expected_admission_generation =
+      cell_admission.GetAuthoringAdmission().admission_generation;
+  const auto added = owner.Commit(add);
+  ASSERT_TRUE(added.success)
+      << (added.error.has_value() ? added.error->message : "missing error");
 
-    readiness.program_cycle_status = core::ProgramCycleStatusDTO{
-        2U, core::ProgramCycleStateDTO::kStarting, run_id, std::nullopt,
-        std::nullopt};
-    ASSERT_TRUE(cell_admission.UpdateCellAdmissionReadiness(readiness).ok());
-    parent_intent.expected_admission_generation =
-        cell_admission.GetAuthoringAdmission().admission_generation;
-    const auto acquired_parent =
-        cell_admission.AcquireCellAdmissionClaim(parent_intent);
-    ASSERT_TRUE(acquired_parent.ok()) << acquired_parent.error().message;
-    parent_claim = acquired_parent.value();
-    parent_generation = parent_claim->claim_generation;
-    readiness.program_cycle_status =
-        core::ProgramCycleStatusDTO{3U,
-                                    core::ProgramCycleStateDTO::kRunning,
-                                    run_id,
-                                    parent_claim->claim_generation,
-                                    std::nullopt};
-    ASSERT_TRUE(cell_admission.UpdateCellAdmissionReadiness(readiness).ok());
+  readiness.program_cycle_status = core::ProgramCycleStatusDTO{
+      2U, core::ProgramCycleStateDTO::kStarting, run_id, std::nullopt,
+      std::nullopt};
+  ASSERT_TRUE(cell_admission.UpdateCellAdmissionReadiness(readiness).ok());
+  parent_intent.expected_admission_generation =
+      cell_admission.GetAuthoringAdmission().admission_generation;
+  const auto acquired_parent =
+      cell_admission.AcquireCellAdmissionClaim(parent_intent);
+  ASSERT_TRUE(acquired_parent.ok()) << acquired_parent.error().message;
+  parent_claim = acquired_parent.value();
+  parent_generation = parent_claim->claim_generation;
+  readiness.program_cycle_status =
+      core::ProgramCycleStatusDTO{3U,
+                                  core::ProgramCycleStateDTO::kRunning,
+                                  run_id,
+                                  parent_claim->claim_generation,
+                                  std::nullopt};
+  ASSERT_TRUE(cell_admission.UpdateCellAdmissionReadiness(readiness).ok());
 
-    const auto initial_count = static_cast<std::size_t>(
-        owner.VerifyIntegrity().transaction_intent_count);
-    ASSERT_LT(initial_count, kMaximumLogicalSceneTransactions - 1U);
-    for (std::size_t index = initial_count;
-         index < kMaximumLogicalSceneTransactions - 1U; ++index) {
-      const auto request = make_pose_update(
-          owner,
-          SceneRequestKey("scene-program-compaction-pose-" +
-                          std::to_string(index)),
-          index + 1U);
-      const auto moved = owner.Commit(request);
-      ASSERT_TRUE(moved.success)
-          << index << " "
-          << (moved.error.has_value() ? moved.error->message : "missing error");
-      if (index == initial_count)
-        reused_external_request = request;
-    }
-    ASSERT_EQ(owner.VerifyIntegrity().transaction_intent_count,
-              static_cast<std::int64_t>(kMaximumLogicalSceneTransactions - 1U));
-
-    auto unknown_release =
-        make_pose_update(owner,
-                         SceneRequestKey("scene-program-compaction-release-unknown"),
-                         1001U);
-    scene_admission.FailNextRelease();
-    EXPECT_THROW(owner.Commit(unknown_release), std::runtime_error);
-    ASSERT_EQ(owner.VerifyIntegrity().transaction_intent_count,
-              static_cast<std::int64_t>(kMaximumLogicalSceneTransactions));
-    const auto unresolved = cell_admission.GetCellAdmissionRecoveryReceipt(
-        {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
-    ASSERT_TRUE(unresolved.ok());
-    ASSERT_EQ(unresolved.value().status,
-              core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
-    ASSERT_TRUE(unresolved.value().matched_claim.has_value());
-    const auto unknown_claim = *unresolved.value().matched_claim;
-    EXPECT_EQ(unknown_claim.intent, scene_claim_intent(unknown_release));
-
-    auto compaction_probe =
-        make_pose_update(owner, SceneRequestKey("scene-program-compaction-retry"),
-                         1002U);
-    const auto before_blocked_compaction = owner.VerifyIntegrity();
-    scene_admission.FailNextRelease();
-    const auto blocked = owner.Commit(compaction_probe);
-    ASSERT_FALSE(blocked.success);
-    ASSERT_TRUE(blocked.error.has_value());
-    EXPECT_EQ(blocked.error->code, "kernel_owner_unavailable");
-    const auto after_blocked_compaction = owner.VerifyIntegrity();
-    EXPECT_EQ(after_blocked_compaction.transaction_intent_count,
-              before_blocked_compaction.transaction_intent_count);
-    EXPECT_EQ(after_blocked_compaction.request_outcome_count,
-              before_blocked_compaction.request_outcome_count);
-    const auto still_held = cell_admission.GetCellAdmissionRecoveryReceipt(
-        {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
-    ASSERT_TRUE(still_held.ok());
-    EXPECT_EQ(still_held.value().status,
-              core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
-
-    const auto compaction_probe_intent = scene_claim_intent(compaction_probe);
-    journal.ObserveClaimReleaseThenAcquire(unknown_claim,
-                                           compaction_probe_intent);
-
-    // Compaction is transparent: the triggering request settles the held
-    // claim, prunes, and then continues. Settling
-    // advanced the admission generation; the request's own claim still names
-    // the older one, which is evidence only, so it commits without a refresh.
-    const auto revision_before_compaction = owner.CurrentProjectionRevision();
-    const auto cleanup_started = std::chrono::steady_clock::now();
-    const auto compacted = owner.Commit(compaction_probe);
-    const auto cleanup_elapsed =
-        std::chrono::steady_clock::now() - cleanup_started;
-    RecordProperty(
-        "scene_compaction_settlement_us",
-        std::chrono::duration_cast<std::chrono::microseconds>(cleanup_elapsed)
-            .count());
-    ASSERT_TRUE(compacted.success)
-        << (compacted.error.has_value() ? compacted.error->message
-                                        : "missing error");
-    EXPECT_EQ(compacted.replay_status,
-              core::RequestReplayStatusDTO::kAcceptedNew);
-    EXPECT_EQ(compacted.projection_status,
-              core::SceneProjectionCommitStatusDTO::kCommitted);
-    EXPECT_NE(owner.CurrentProjectionRevision(), revision_before_compaction);
-    const auto after_compaction = owner.VerifyIntegrity();
-    EXPECT_EQ(after_compaction.transaction_intent_count, 1);
-    EXPECT_EQ(after_compaction.request_outcome_count, 1);
-    ASSERT_TRUE(journal.observed_released_claim().has_value());
-    EXPECT_EQ(*journal.observed_released_claim(), unknown_claim);
-    ASSERT_TRUE(journal.observed_release().has_value());
-    const auto &recorded_release = *journal.observed_release();
-    EXPECT_EQ(recorded_release.owner_role, unknown_claim.intent.owner_role);
-    EXPECT_EQ(recorded_release.owner_transaction_id,
-              unknown_claim.intent.owner_transaction_id);
-    EXPECT_EQ(recorded_release.request_key, unknown_claim.intent.request_key);
-    EXPECT_EQ(recorded_release.acquired_admission_generation,
-              unknown_claim.acquired_admission_generation);
-    EXPECT_EQ(recorded_release.claim_generation,
-              unknown_claim.claim_generation);
-    ASSERT_TRUE(journal.observed_release_sequence().has_value());
-    ASSERT_TRUE(journal.observed_acquired_claim().has_value());
-    EXPECT_EQ(journal.observed_acquired_claim()->intent,
-              compaction_probe_intent);
-    ASSERT_TRUE(journal.observed_acquire_sequence().has_value());
-    EXPECT_LT(*journal.observed_release_sequence(),
-              *journal.observed_acquire_sequence());
-
-    const auto retired_old_receipt =
-        cell_admission.GetCellAdmissionRecoveryReceipt(
-            {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
-    ASSERT_TRUE(retired_old_receipt.ok());
-    EXPECT_EQ(retired_old_receipt.value().status,
-              core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
-    EXPECT_FALSE(retired_old_receipt.value().matched_claim.has_value());
-
-    // The next request reads the current admission generation and commits;
-    // its resend replays exactly.
-    const auto next = make_pose_update(
-        owner, SceneRequestKey("scene-program-compaction-next"), 1003U);
-    const auto committed_next = owner.Commit(next);
-    ASSERT_TRUE(committed_next.success)
-        << (committed_next.error.has_value() ? committed_next.error->message
-                                             : "missing error");
-    const auto exact_replay = owner.Commit(next);
-    ASSERT_TRUE(exact_replay.success);
-    EXPECT_EQ(exact_replay.replay_status,
-              core::RequestReplayStatusDTO::kReplayedExact);
-    EXPECT_EQ(exact_replay.transaction_sequence,
-              committed_next.transaction_sequence);
-
-    // A request ID whose outcome was pruned is evaluated as a new request
-    // against the latest scene.
-    ASSERT_TRUE(reused_external_request.has_value());
-    auto reused_id = make_pose_update(
-        owner, reused_external_request->request_context.request_key, 1004U);
-    EXPECT_EQ(reused_id.request_context.request_key,
-              reused_external_request->request_context.request_key);
-    const auto reused = owner.Commit(reused_id);
-    ASSERT_TRUE(reused.success)
-        << (reused.error.has_value() ? reused.error->message : "missing error");
-    const auto reused_claim = cell_admission.GetCellAdmissionRecoveryReceipt(
-        {scene_claim_intent(reused_id), std::nullopt, std::nullopt});
-    ASSERT_TRUE(reused_claim.ok());
-    EXPECT_EQ(reused_claim.value().status,
-              core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
-
-    const core::ComponentAttachmentRevision structural_revision(
-        "program-compaction-attachment-revision");
-    for (auto &participant : projections) {
-      participant->SetFrameResolution(
-          core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
-          {structural_revision});
-      participant->SetResolvedFrameRoleOverride(
-          core::FrameRoleId("asset_tool_frame"));
-    }
-    active = owner.CurrentProjectionRevision();
-    core::SceneTransactionRequestDTO attach{
-        core::PublicRequestContextDTO{
-            SceneRequestKey("scene-program-compaction-attach"),
-            "scene-owner-test"},
-        {},
-        active,
-        core::AttachCarriedObjectRequestDTO{
-            core::CarriedObjectAttachmentId("attachment.compaction"),
-            core::SceneResourceId("scene-box"),
-            core::ControllableComponentId("component.1"),
-            core::CommandTargetId("arm"),
-            core::FrameRoleId("tool_frame"),
-            {core::CollisionBodyRoleId("finger")},
-            {structural_revision}},
-        std::nullopt};
-    attach.expected_admission_generation =
-        cell_admission.GetAuthoringAdmission().admission_generation;
-    attach.program_node_evidence = node_evidence(
-        "attach", 1005U, "scene.carried_attachment");
-    const auto attached = owner.Commit(attach);
-    ASSERT_TRUE(attached.success)
-        << (attached.error.has_value() ? attached.error->message
-                                       : "missing error");
-    ASSERT_TRUE(attached.committed_projection_revision.has_value());
-    const auto after_attach = owner.LogicalSnapshot();
-    ASSERT_EQ(after_attach->carried_object_attachments.size(), 1U);
-    const auto attachment = after_attach->carried_object_attachments.front();
-
-    core::SceneTransactionRequestDTO detach{
-        core::PublicRequestContextDTO{
-            SceneRequestKey("scene-program-compaction-detach"),
-            "scene-owner-test"},
-        {},
-        *attached.committed_projection_revision,
-        core::DetachCarriedObjectAtCurrentPoseRequestDTO{
-            attachment.carried_object_attachment_id,
-            attachment.carried_object_attachment_revision,
-            attachment.scene_resource_id, attachment.controllable_component_id,
-            attachment.command_target_id},
-        std::nullopt};
-    detach.expected_admission_generation =
-        cell_admission.GetAuthoringAdmission().admission_generation;
-    detach.program_node_evidence = node_evidence(
-        "detach", 1006U, "scene.carried_attachment");
-    const auto detached = owner.Commit(detach);
-    ASSERT_TRUE(detached.success)
-        << (detached.error.has_value() ? detached.error->message
-                                       : "missing error");
-
-    auto restart_release_unknown = make_pose_update(
+  const auto initial_count = static_cast<std::size_t>(
+      owner.VerifyIntegrity().transaction_intent_count);
+  ASSERT_LT(initial_count, kMaximumLogicalSceneTransactions - 1U);
+  for (std::size_t index = initial_count;
+       index < kMaximumLogicalSceneTransactions - 1U; ++index) {
+    const auto request = make_pose_update(
         owner,
-        SceneRequestKey("scene-program-compaction-restart-release-unknown"),
-        1007U);
-    request_to_settle_after_restart = restart_release_unknown;
-    scene_admission.FailNextRelease();
-    EXPECT_THROW(owner.Commit(restart_release_unknown), std::runtime_error);
-    const auto held_across_restart =
-        cell_admission.GetCellAdmissionRecoveryReceipt(
-            {scene_claim_intent(restart_release_unknown), std::nullopt,
-             std::nullopt});
-    ASSERT_TRUE(held_across_restart.ok());
-    ASSERT_EQ(held_across_restart.value().status,
-              core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
-
-    final_revision = owner.CurrentProjectionRevision();
-    final_snapshot = *owner.LogicalSnapshot();
-    EXPECT_TRUE(final_snapshot->carried_object_attachments.empty());
-    EXPECT_EQ(final_snapshot->revision, final_revision->scene_revision);
-
-    const auto parent_receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
-        {parent_intent, *parent_claim, std::nullopt});
-    ASSERT_TRUE(parent_receipt.ok());
-    EXPECT_EQ(parent_receipt.value().status,
-              core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
-    EXPECT_EQ(cell_admission.GetAuthoringAdmission().authoring_allowed, false);
+        SceneRequestKey("scene-program-compaction-pose-" +
+                        std::to_string(index)),
+        index + 1U);
+    const auto moved = owner.Commit(request);
+    ASSERT_TRUE(moved.success)
+        << index << " "
+        << (moved.error.has_value() ? moved.error->message : "missing error");
+    if (index == initial_count)
+      reused_external_request = request;
   }
+  ASSERT_EQ(owner.VerifyIntegrity().transaction_intent_count,
+            static_cast<std::int64_t>(kMaximumLogicalSceneTransactions - 1U));
 
-  LogicalSceneOwner reopened(database_path, admission, publication_reader,
-                             bundle_source, resolver, scene_admission);
+  auto unknown_release =
+      make_pose_update(owner,
+                       SceneRequestKey("scene-program-compaction-release-unknown"),
+                       1001U);
+  scene_admission.FailNextRelease();
+  EXPECT_THROW(owner.Commit(unknown_release), std::runtime_error);
+  ASSERT_EQ(owner.VerifyIntegrity().transaction_intent_count,
+            static_cast<std::int64_t>(kMaximumLogicalSceneTransactions));
+  const auto unresolved = cell_admission.GetCellAdmissionRecoveryReceipt(
+      {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
+  ASSERT_TRUE(unresolved.ok());
+  ASSERT_EQ(unresolved.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+  ASSERT_TRUE(unresolved.value().matched_claim.has_value());
+  const auto unknown_claim = *unresolved.value().matched_claim;
+  EXPECT_EQ(unknown_claim.intent, scene_claim_intent(unknown_release));
+
+  auto compaction_probe =
+      make_pose_update(owner, SceneRequestKey("scene-program-compaction-retry"),
+                       1002U);
+  const auto before_blocked_compaction = owner.VerifyIntegrity();
+  scene_admission.FailNextRelease();
+  const auto blocked = owner.Commit(compaction_probe);
+  ASSERT_FALSE(blocked.success);
+  ASSERT_TRUE(blocked.error.has_value());
+  EXPECT_EQ(blocked.error->code, "kernel_owner_unavailable");
+  const auto after_blocked_compaction = owner.VerifyIntegrity();
+  EXPECT_EQ(after_blocked_compaction.transaction_intent_count,
+            before_blocked_compaction.transaction_intent_count);
+  EXPECT_EQ(after_blocked_compaction.request_outcome_count,
+            before_blocked_compaction.request_outcome_count);
+  const auto still_held = cell_admission.GetCellAdmissionRecoveryReceipt(
+      {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
+  ASSERT_TRUE(still_held.ok());
+  EXPECT_EQ(still_held.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+
+  const auto compaction_probe_intent = scene_claim_intent(compaction_probe);
+  journal.ObserveClaimReleaseThenAcquire(unknown_claim,
+                                         compaction_probe_intent);
+
+  // Compaction is transparent: the triggering request settles the held
+  // claim, prunes, and then continues. Settling
+  // advanced the admission generation; the request's own claim still names
+  // the older one, which is evidence only, so it commits without a refresh.
+  const auto revision_before_compaction = owner.CurrentProjectionRevision();
+  const auto cleanup_started = std::chrono::steady_clock::now();
+  const auto compacted = owner.Commit(compaction_probe);
+  const auto cleanup_elapsed =
+      std::chrono::steady_clock::now() - cleanup_started;
+  RecordProperty(
+      "scene_compaction_settlement_us",
+      std::chrono::duration_cast<std::chrono::microseconds>(cleanup_elapsed)
+          .count());
+  ASSERT_TRUE(compacted.success)
+      << (compacted.error.has_value() ? compacted.error->message
+                                      : "missing error");
+  EXPECT_EQ(compacted.replay_status,
+            core::RequestReplayStatusDTO::kAcceptedNew);
+  EXPECT_EQ(compacted.projection_status,
+            core::SceneProjectionCommitStatusDTO::kCommitted);
+  EXPECT_NE(owner.CurrentProjectionRevision(), revision_before_compaction);
+  const auto after_compaction = owner.VerifyIntegrity();
+  EXPECT_EQ(after_compaction.transaction_intent_count, 1);
+  EXPECT_EQ(after_compaction.request_outcome_count, 1);
+  ASSERT_TRUE(journal.observed_released_claim().has_value());
+  EXPECT_EQ(*journal.observed_released_claim(), unknown_claim);
+  ASSERT_TRUE(journal.observed_release().has_value());
+  const auto &recorded_release = *journal.observed_release();
+  EXPECT_EQ(recorded_release.owner_role, unknown_claim.intent.owner_role);
+  EXPECT_EQ(recorded_release.owner_transaction_id,
+            unknown_claim.intent.owner_transaction_id);
+  EXPECT_EQ(recorded_release.request_key, unknown_claim.intent.request_key);
+  EXPECT_EQ(recorded_release.acquired_admission_generation,
+            unknown_claim.acquired_admission_generation);
+  EXPECT_EQ(recorded_release.claim_generation,
+            unknown_claim.claim_generation);
+  ASSERT_TRUE(journal.observed_release_sequence().has_value());
+  ASSERT_TRUE(journal.observed_acquired_claim().has_value());
+  EXPECT_EQ(journal.observed_acquired_claim()->intent,
+            compaction_probe_intent);
+  ASSERT_TRUE(journal.observed_acquire_sequence().has_value());
+  EXPECT_LT(*journal.observed_release_sequence(),
+            *journal.observed_acquire_sequence());
+
+  const auto retired_old_receipt =
+      cell_admission.GetCellAdmissionRecoveryReceipt(
+          {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
+  ASSERT_TRUE(retired_old_receipt.ok());
+  EXPECT_EQ(retired_old_receipt.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown);
+  EXPECT_FALSE(retired_old_receipt.value().matched_claim.has_value());
+
+  // The next request reads the current admission generation and commits;
+  // its resend replays exactly.
+  const auto next = make_pose_update(
+      owner, SceneRequestKey("scene-program-compaction-next"), 1003U);
+  const auto committed_next = owner.Commit(next);
+  ASSERT_TRUE(committed_next.success)
+      << (committed_next.error.has_value() ? committed_next.error->message
+                                           : "missing error");
+  const auto exact_replay = owner.Commit(next);
+  ASSERT_TRUE(exact_replay.success);
+  EXPECT_EQ(exact_replay.replay_status,
+            core::RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(exact_replay.transaction_sequence,
+            committed_next.transaction_sequence);
+
+  // A request ID whose outcome was pruned is evaluated as a new request
+  // against the latest scene.
+  ASSERT_TRUE(reused_external_request.has_value());
+  auto reused_id = make_pose_update(
+      owner, reused_external_request->request_context.request_key, 1004U);
+  EXPECT_EQ(reused_id.request_context.request_key,
+            reused_external_request->request_context.request_key);
+  const auto reused = owner.Commit(reused_id);
+  ASSERT_TRUE(reused.success)
+      << (reused.error.has_value() ? reused.error->message : "missing error");
+  const auto reused_claim = cell_admission.GetCellAdmissionRecoveryReceipt(
+      {scene_claim_intent(reused_id), std::nullopt, std::nullopt});
+  ASSERT_TRUE(reused_claim.ok());
+  EXPECT_EQ(reused_claim.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+
+  const core::ComponentAttachmentRevision structural_revision(
+      "program-compaction-attachment-revision");
+  for (auto &participant : projections) {
+    participant->SetFrameResolution(
+        core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
+        {structural_revision});
+    participant->SetResolvedFrameRoleOverride(
+        core::FrameRoleId("asset_tool_frame"));
+  }
+  active = owner.CurrentProjectionRevision();
+  core::SceneTransactionRequestDTO attach{
+      core::PublicRequestContextDTO{
+          SceneRequestKey("scene-program-compaction-attach"),
+          "scene-owner-test"},
+      {},
+      active,
+      core::AttachCarriedObjectRequestDTO{
+          core::CarriedObjectAttachmentId("attachment.compaction"),
+          core::SceneResourceId("scene-box"),
+          core::ControllableComponentId("component.1"),
+          core::CommandTargetId("arm"),
+          core::FrameRoleId("tool_frame"),
+          {core::CollisionBodyRoleId("finger")},
+          {structural_revision}},
+      std::nullopt};
+  attach.expected_admission_generation =
+      cell_admission.GetAuthoringAdmission().admission_generation;
+  attach.program_node_evidence = node_evidence(
+      "attach", 1005U, "scene.carried_attachment");
+  const auto attached = owner.Commit(attach);
+  ASSERT_TRUE(attached.success)
+      << (attached.error.has_value() ? attached.error->message
+                                     : "missing error");
+  ASSERT_TRUE(attached.committed_projection_revision.has_value());
+  const auto after_attach = owner.LogicalSnapshot();
+  ASSERT_EQ(after_attach->carried_object_attachments.size(), 1U);
+  const auto attachment = after_attach->carried_object_attachments.front();
+
+  core::SceneTransactionRequestDTO detach{
+      core::PublicRequestContextDTO{
+          SceneRequestKey("scene-program-compaction-detach"),
+          "scene-owner-test"},
+      {},
+      *attached.committed_projection_revision,
+      core::DetachCarriedObjectAtCurrentPoseRequestDTO{
+          attachment.carried_object_attachment_id,
+          attachment.carried_object_attachment_revision,
+          attachment.scene_resource_id, attachment.controllable_component_id,
+          attachment.command_target_id},
+      std::nullopt};
+  detach.expected_admission_generation =
+      cell_admission.GetAuthoringAdmission().admission_generation;
+  detach.program_node_evidence = node_evidence(
+      "detach", 1006U, "scene.carried_attachment");
+  const auto detached = owner.Commit(detach);
+  ASSERT_TRUE(detached.success)
+      << (detached.error.has_value() ? detached.error->message
+                                     : "missing error");
+
+  auto last_release_unknown = make_pose_update(
+      owner,
+      SceneRequestKey("scene-program-compaction-last-release-unknown"),
+      1007U);
+  request_to_settle = last_release_unknown;
+  scene_admission.FailNextRelease();
+  EXPECT_THROW(owner.Commit(last_release_unknown), std::runtime_error);
+  const auto held_until_reconciled =
+      cell_admission.GetCellAdmissionRecoveryReceipt(
+          {scene_claim_intent(last_release_unknown), std::nullopt,
+           std::nullopt});
+  ASSERT_TRUE(held_until_reconciled.ok());
+  ASSERT_EQ(held_until_reconciled.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+
+  final_revision = owner.CurrentProjectionRevision();
+  final_snapshot = *owner.LogicalSnapshot();
+  EXPECT_TRUE(final_snapshot->carried_object_attachments.empty());
+  EXPECT_EQ(final_snapshot->revision, final_revision->scene_revision);
+
+  const auto parent_receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
+      {parent_intent, *parent_claim, std::nullopt});
+  ASSERT_TRUE(parent_receipt.ok());
+  EXPECT_EQ(parent_receipt.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+  EXPECT_EQ(cell_admission.GetAuthoringAdmission().authoring_allowed, false);
+
   const auto reconciliation_started = std::chrono::steady_clock::now();
-  const auto reconciled = reopened.ReconcileAuthoredSceneAdmissionClaims();
+  const auto reconciled = owner.ReconcileAuthoredSceneAdmissionClaims();
   const auto reconciliation_elapsed =
       std::chrono::steady_clock::now() - reconciliation_started;
-  RecordProperty("scene_restart_admission_settlement_us",
+  RecordProperty("scene_admission_settlement_us",
                  std::chrono::duration_cast<std::chrono::microseconds>(
                      reconciliation_elapsed)
                      .count());
   ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
   ASSERT_TRUE(final_revision.has_value());
   ASSERT_TRUE(final_snapshot.has_value());
-  EXPECT_EQ(reopened.CurrentProjectionRevision(), *final_revision);
-  const auto reopened_snapshot = reopened.LogicalSnapshot();
-  ASSERT_NE(reopened_snapshot, nullptr);
-  EXPECT_EQ(*reopened_snapshot, *final_snapshot);
-  EXPECT_TRUE(reopened_snapshot->carried_object_attachments.empty());
-  ASSERT_TRUE(request_to_settle_after_restart.has_value());
-  const auto settled_after_restart =
-      cell_admission.GetCellAdmissionRecoveryReceipt(
-          {scene_claim_intent(*request_to_settle_after_restart), std::nullopt,
-           std::nullopt});
-  ASSERT_TRUE(settled_after_restart.ok());
-  EXPECT_EQ(settled_after_restart.value().status,
+  EXPECT_EQ(owner.CurrentProjectionRevision(), *final_revision);
+  const auto head_snapshot = owner.LogicalSnapshot();
+  ASSERT_NE(head_snapshot, nullptr);
+  EXPECT_EQ(*head_snapshot, *final_snapshot);
+  EXPECT_TRUE(head_snapshot->carried_object_attachments.empty());
+  ASSERT_TRUE(request_to_settle.has_value());
+  const auto settled = cell_admission.GetCellAdmissionRecoveryReceipt(
+      {scene_claim_intent(*request_to_settle), std::nullopt, std::nullopt});
+  ASSERT_TRUE(settled.ok());
+  EXPECT_EQ(settled.value().status,
             core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
-  const auto parent_receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
-      {parent_intent, *parent_claim, std::nullopt});
-  ASSERT_TRUE(parent_receipt.ok());
-  EXPECT_EQ(parent_receipt.value().status,
+  const auto parent_receipt_after =
+      cell_admission.GetCellAdmissionRecoveryReceipt(
+          {parent_intent, *parent_claim, std::nullopt});
+  ASSERT_TRUE(parent_receipt_after.ok());
+  EXPECT_EQ(parent_receipt_after.value().status,
             core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
-}
-
-// A record writer whose thread is held inside a first record, on a separate
-// connection, until released.
-class BlockedRecordWriter final {
-public:
-  explicit BlockedRecordWriter(persistence::SqliteRecordWriterLimits limits =
-                                   persistence::kSqliteRecordWriterDefaultLimits)
-      : writer(limits) {
-    Require(sqlite3_open(":memory:", &gate_) == SQLITE_OK,
-            "cannot open the gate connection");
-    Require(sqlite3_create_function_v2(gate_, "gate", 0, SQLITE_UTF8, this,
-                                       &BlockedRecordWriter::Gate, nullptr,
-                                       nullptr, nullptr) == SQLITE_OK,
-            "cannot register the gate function");
-    const auto slot = writer.RegisterConnection(gate_, "gate", "SELECT 1");
-    auto entered = entered_.get_future();
-    persistence::SqliteRecord record;
-    record.Statement("SELECT gate()");
-    Require(writer.Post(slot, std::move(record)), "gate record was dropped");
-    entered.wait();
-  }
-  BlockedRecordWriter(const BlockedRecordWriter &) = delete;
-  BlockedRecordWriter &operator=(const BlockedRecordWriter &) = delete;
-  ~BlockedRecordWriter() {
-    ReleaseAndDrain();
-    sqlite3_close(gate_);
-  }
-
-  void ReleaseAndDrain() {
-    if (!released_) {
-      released_ = true;
-      release_.set_value();
-    }
-    writer.DrainAndStop();
-  }
-
-  persistence::SqliteRecordWriter writer;
-
-private:
-  static void Gate(sqlite3_context *context, int, sqlite3_value **) {
-    auto *self =
-        static_cast<BlockedRecordWriter *>(sqlite3_user_data(context));
-    self->entered_.set_value();
-    self->release_wait_.wait();
-    sqlite3_result_int(context, 1);
-  }
-
-  sqlite3 *gate_{};
-  std::promise<void> entered_;
-  std::promise<void> release_;
-  std::shared_future<void> release_wait_{release_.get_future().share()};
-  bool released_{};
-};
-
-// Drains the shared writer before the owner closes, also on an early return.
-class DrainBeforeOwnerCloses final {
-public:
-  explicit DrainBeforeOwnerCloses(BlockedRecordWriter &gate) : gate_(gate) {}
-  DrainBeforeOwnerCloses(const DrainBeforeOwnerCloses &) = delete;
-  DrainBeforeOwnerCloses &operator=(const DrainBeforeOwnerCloses &) = delete;
-  ~DrainBeforeOwnerCloses() { gate_.ReleaseAndDrain(); }
-
-private:
-  BlockedRecordWriter &gate_;
-};
-
-std::int64_t CountStoreRows(const std::filesystem::path &database_path,
-                            const std::string &table,
-                            const std::string &condition = "1") {
-  return ReadStoreInteger(database_path, "SELECT count(*) FROM " + table +
-                                             " WHERE " + condition);
-}
-
-TEST(CanonicalEmptySceneOwner,
-     ReadersCommitsAndAnApplyCompleteWhileTheWriterIsBlocked) {
-  TemporaryDirectory directory("scene-blocked-writer");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  const auto candidate = deployment::test::
-      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
-          package_root, admission.cell_id().value());
-  const auto bindings =
-      ExecutionHostBindings(candidate.bundle->value(), "runtime-blocked");
-  auto projections = MakeFakeProjections(bindings);
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-  TestCellAdmissionPort cell_admission;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  BlockedRecordWriter gate;
-  LogicalSceneOwner owner(database_path, admission, publication_reader,
-                          bundle_source, resolver, cell_admission,
-                          &gate.writer);
-  DrainBeforeOwnerCloses drain(gate);
-
-  auto current = FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-                     .canonical_empty_target;
-  EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
-  const auto request =
-      AddBoxRequest(current, admission.cell_id(), "blocked-writer-add");
-  const auto committed = owner.Commit(request);
-  ASSERT_TRUE(committed.success)
-      << (committed.error.has_value() ? committed.error->message : "");
-  current = *committed.committed_projection_revision;
-  EXPECT_EQ(owner.CurrentProjectionRevision(), current);
-  EXPECT_EQ(owner.LogicalSnapshot()->objects.size(), 1U);
-  const auto replay = owner.ReadCommitResult(request);
-  ASSERT_TRUE(replay.has_value());
-  EXPECT_EQ(replay->committed_projection_revision,
-            committed.committed_projection_revision);
-  EXPECT_EQ(owner.Commit(request).replay_status,
-            core::RequestReplayStatusDTO::kReplayedExact);
-
-  const core::ProjectionMaintenanceInitializationRequestDTO apply{
-      ApplyId(700U), ApplyGeneration(1U), current, candidate.bundle->value(),
-      bindings, {}};
-  ASSERT_EQ(owner.BeginMaintenanceInitialization(apply).state,
-            core::ProjectionMaintenanceInitializationState::kInitialized);
-  EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
-  const auto installed = owner.InstallInitialScene(apply);
-  ASSERT_TRUE(installed.ready_for_publication());
-  const core::ActiveBundlePublicationReceiptDTO receipt{
-      core::ActiveBundlePublicationRequestDTO{
-          core::NamedApplyPublicationTransactionDTO{apply.apply_id,
-                                                    apply.apply_generation},
-          installed.target_projection_revision,
-          installed.target_projection_revision.retained_bundle_id,
-          installed.target_projection_revision.graph_revision,
-          ActiveBundlePublicationGeneration(1U), Digest('d')},
-      ActiveBundlePublicationGeneration(2U), Digest('f')};
-  publication_reader.SetCurrent(receipt);
-  const auto completed = owner.CompleteMaintenanceInitialization(
-      {apply.apply_id, apply.apply_generation,
-       installed.target_projection_revision,
-       installed.authoritative_snapshot_identity, receipt});
-  ASSERT_EQ(completed.state,
-            core::ProjectionMaintenanceInitializationState::kCompleted);
-  EXPECT_EQ(owner.CurrentProjectionRevision(),
-            installed.target_projection_revision);
-  EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
-  EXPECT_EQ(owner.ReadMaintenanceInitialization(
-                {apply.apply_id, apply.apply_generation}),
-            std::optional{completed});
-  const auto integrity = owner.VerifyIntegrity();
-  EXPECT_EQ(integrity.finalization_row_count, 1);
-  EXPECT_EQ(integrity.transaction_intent_count, 1);
-  EXPECT_EQ(integrity.request_outcome_count, 1);
-  EXPECT_EQ(integrity.owner_event_count, 1);
-  // Nothing has reached the file yet; nothing was dropped.
-  EXPECT_EQ(CountStoreRows(database_path, "canonical_empty_scene_acceptance"),
-            0);
-  EXPECT_EQ(gate.writer.records_dropped(), 0U);
-
-  gate.ReleaseAndDrain();
-  EXPECT_EQ(gate.writer.records_not_written(), 0U);
-  owner.Close();
-  // Checked before the read-only counts below: a read-only connection
-  // cannot remove the sidecars it opens.
-  ExpectNoSqliteSidecars(database_path);
-  // Nothing was lost, so the writer left the mark clear.
-  EXPECT_EQ(CountStoreRows(database_path, "logical_scene_store_metadata",
-                           "records_lost=0"),
-            1);
-
-  EXPECT_EQ(CountStoreRows(database_path, "canonical_empty_scene_acceptance"),
-            1);
-  EXPECT_EQ(CountStoreRows(database_path, "canonical_empty_scene_rebuild"), 1);
-  EXPECT_EQ(
-      CountStoreRows(database_path, "canonical_empty_scene_finalization"), 1);
-  EXPECT_EQ(CountStoreRows(database_path, "logical_scene_transaction_intents",
-                           "transaction_sequence=" +
-                               std::to_string(*committed.transaction_sequence)),
-            1);
-  EXPECT_EQ(CountStoreRows(database_path, "logical_scene_transaction_intents"),
-            1);
-  EXPECT_EQ(CountStoreRows(database_path, "logical_scene_request_outcomes",
-                           "success=1 AND projection_status='committed'"),
-            1);
-  EXPECT_EQ(CountStoreRows(database_path, "logical_scene_owner_events"), 1);
-  EXPECT_EQ(CountStoreRows(database_path,
-                           "logical_scene_maintenance_initialization_intents",
-                           "apply_id=700"),
-            1);
-  EXPECT_EQ(CountStoreRows(database_path,
-                           "logical_scene_maintenance_initialization_bindings"),
-            static_cast<std::int64_t>(bindings.size()));
-  EXPECT_EQ(CountStoreRows(database_path,
-                           "logical_scene_maintenance_initialization_results",
-                           "state='initialized'"),
-            1);
-  EXPECT_EQ(
-      CountStoreRows(database_path, "logical_scene_initial_baseline_requests"),
-      1);
-  EXPECT_EQ(
-      CountStoreRows(database_path, "logical_scene_initial_baseline_intents"),
-      1);
-  EXPECT_EQ(CountStoreRows(database_path,
-                           "logical_scene_initial_baseline_results",
-                           "state='installed'"),
-            1);
-  EXPECT_EQ(CountStoreRows(database_path,
-                           "logical_scene_maintenance_initialization_completions",
-                           "expected_previous_publication_generation=1 AND "
-                           "publication_generation=2"),
-            1);
-
-  // The drained file reopens to the same answers.
-  LogicalSceneOwner reopened(database_path, admission, publication_reader,
-                             bundle_source, resolver, cell_admission);
-  EXPECT_EQ(reopened.CurrentProjectionRevision(),
-            installed.target_projection_revision);
-  EXPECT_EQ(reopened.ReadMaintenanceInitialization(
-                {apply.apply_id, apply.apply_generation}),
-            std::optional{completed});
-}
-
-TEST(CanonicalEmptySceneOwner, DroppedRecordsAreCountedAndAnswersUnchanged) {
-  TemporaryDirectory directory("scene-dropped-records");
-  const auto package_root = directory.path() / "packages";
-  CopyCanonicalEmptyPackage(package_root);
-  const auto admission = LoadAdmission(package_root);
-  auto projections = MakeFakeProjections({});
-  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
-  ControlledPublicationReader publication_reader;
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
-  TestCellAdmissionPort cell_admission;
-  const auto database_path = directory.path() / "logical-scene.sqlite3";
-  // One queued record fits; every later one is dropped while the writer is
-  // held.
-  BlockedRecordWriter gate(persistence::SqliteRecordWriterLimits{
-      1U, persistence::kSqliteRecordWriterDefaultLimits.maximum_bytes});
-  LogicalSceneOwner owner(database_path, admission, publication_reader,
-                          bundle_source, resolver, cell_admission,
-                          &gate.writer);
-  DrainBeforeOwnerCloses drain(gate);
-
-  // Begin is queued; Rebuild, Finalize and the commit's two records drop.
-  const auto active =
-      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
-          .canonical_empty_target;
-  const auto request = AddBoxRequest(active, admission.cell_id(), "dropped");
-  const auto committed = owner.Commit(request);
-  ASSERT_TRUE(committed.success)
-      << (committed.error.has_value() ? committed.error->message : "");
-  EXPECT_EQ(gate.writer.records_dropped(), 4U);
-  EXPECT_TRUE(owner.ReadAccessStatus().scene_writes_open);
-  EXPECT_EQ(owner.CurrentProjectionRevision(),
-            *committed.committed_projection_revision);
-  EXPECT_EQ(owner.LogicalSnapshot()->objects.size(), 1U);
-  EXPECT_EQ(owner.Commit(request).replay_status,
-            core::RequestReplayStatusDTO::kReplayedExact);
-  const auto integrity = owner.VerifyIntegrity();
-  EXPECT_EQ(integrity.acceptance_row_count, 1);
-  EXPECT_EQ(integrity.rebuild_row_count, 1);
-  EXPECT_EQ(integrity.finalization_row_count, 1);
-  EXPECT_EQ(integrity.transaction_intent_count, 1);
-  EXPECT_EQ(integrity.request_outcome_count, 1);
-
-  gate.ReleaseAndDrain();
-  EXPECT_EQ(gate.writer.records_not_written(), 0U);
-  owner.Close();
-  EXPECT_EQ(CountStoreRows(database_path, "canonical_empty_scene_acceptance"),
-            1);
-  EXPECT_EQ(CountStoreRows(database_path, "canonical_empty_scene_rebuild"), 0);
-  EXPECT_EQ(
-      CountStoreRows(database_path, "canonical_empty_scene_finalization"), 0);
-  EXPECT_EQ(CountStoreRows(database_path, "logical_scene_transaction_intents"),
-            0);
-}
-
-TEST(CanonicalEmptySceneOwner, StoreConnectionWritesWithSynchronousNormal) {
-  // The setting belongs to the connection, not the file, so the owner's own
-  // configuration step is read back on a connection it configures.
-  TemporaryDirectory directory("scene-synchronous");
-  sqlite3 *database = nullptr;
-  ASSERT_EQ(sqlite3_open_v2(
-                (directory.path() / "logical-scene.sqlite3").c_str(),
-                &database, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
-                nullptr),
-            SQLITE_OK);
-  logical_scene_owner_detail::ConfigureDurability(database);
-  EXPECT_EQ(logical_scene_owner_detail::ScalarInteger(database,
-                                                      "PRAGMA synchronous"),
-            1);
-  EXPECT_EQ(sqlite3_close(database), SQLITE_OK);
 }
 
 // OD-202: a failed Apply ends its own Scene adoption. (A) failed after its
@@ -7831,6 +6878,1249 @@ TEST(CanonicalEmptySceneOwner, FailedApplyEndsItsSceneAdoptionAndNewAdoptsTheEmp
     EXPECT_EQ(new_completed.state, core::ProjectionMaintenanceInitializationState::kCompleted);
     EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), new_ready.target_projection_revision);
   }
+}
+
+// A bounded wait for an owner call that must not block (OD-376): a
+// regression fails fast instead of hanging the suite.
+constexpr auto kOwnerCallBound = 10s;
+
+template <typename Value>
+[[nodiscard]] bool ReadyWithinBound(const std::future<Value> &future) {
+  return future.wait_for(kOwnerCallBound) == std::future_status::ready;
+}
+
+[[nodiscard]] std::string CommitError(const core::SceneCommitResultDTO &result) {
+  return result.error.has_value() ? result.error->message : "missing error";
+}
+
+// OD-376: per projection, a Commit makes one preflight call (health and,
+// unless the delta only moves an object, the candidate's effective policy)
+// and one native apply, and nothing else; an authored change acquires and
+// releases one admission claim directly, with no recovery lookup; a
+// runtime-owned change claims nothing.
+TEST(CanonicalEmptySceneOwner,
+     CommitMakesOnePreflightOneApplyAndOneClaimPairPerProjection) {
+  SceneAdoptionFixture fixture;
+  auto &owner = *fixture.owner;
+  auto &kernel = fixture.cell_admission;
+  const auto &projections = fixture.predecessor_projections;
+  ASSERT_FALSE(projections.empty());
+  const auto cell = fixture.admission.cell_id();
+  const auto acquires = kernel.acquire_calls();
+  const auto releases = kernel.release_calls();
+  const auto lookups = kernel.recovery_receipt_calls();
+  const auto expect_per_projection = [&](const std::size_t commits,
+                                         const std::size_t policies) {
+    for (const auto &projection : projections) {
+      EXPECT_EQ(projection->preflight_calls(), commits);
+      EXPECT_EQ(projection->calls(), commits);
+      EXPECT_EQ(projection->health_for_revision_calls(), commits);
+      EXPECT_EQ(projection->policy_projection_calls(), policies);
+      EXPECT_EQ(projection->health_calls_outside_preflight(), 0U);
+      EXPECT_EQ(projection->policy_calls_outside_preflight(), 0U);
+    }
+  };
+
+  const auto added = owner.Commit(AddBoxRequest(
+      owner.CurrentProjectionRevision(), cell, "od376-counted-add"));
+  ASSERT_TRUE(added.success) << CommitError(added);
+  expect_per_projection(1U, 1U);
+  EXPECT_EQ(kernel.acquire_calls(), acquires + 1U);
+  EXPECT_EQ(kernel.release_calls(), releases + 1U);
+  EXPECT_EQ(kernel.recovery_receipt_calls(), lookups);
+  EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
+
+  core::Pose3DTO pose;
+  pose.position_m = {0.30, -0.5, 0.75};
+  const core::SceneTransactionRequestDTO streamed{
+      core::PublicRequestContextDTO{SceneRequestKey("od376-counted-pose"),
+                                    "scene-owner-test"},
+      {},
+      owner.CurrentProjectionRevision(),
+      core::UpdateObjectPoseRequestDTO{
+          core::SceneResourceId("scene-box"), pose,
+          core::CellSceneFrameRefDTO{cell}, StreamedPoseEvidence(), false},
+      std::nullopt};
+  const auto moved = owner.Commit(streamed);
+  ASSERT_TRUE(moved.success) << CommitError(moved);
+  // A pose-only delta asks for health only.
+  expect_per_projection(2U, 1U);
+  EXPECT_EQ(kernel.acquire_calls(), acquires + 1U);
+  EXPECT_EQ(kernel.release_calls(), releases + 1U);
+  EXPECT_EQ(kernel.recovery_receipt_calls(), lookups);
+}
+
+// OD-376: the owner lock is not held across the native apply. While a Commit
+// is inside it, readers answer at once with the settled predecessor and open
+// gates, and a second Commit is refused as in progress without effect.
+TEST(CanonicalEmptySceneOwner, CommitHoldsNoOwnerLockAcrossTheNativeApply) {
+  SceneAdoptionFixture fixture;
+  auto &owner = *fixture.owner;
+  const auto cell = fixture.admission.cell_id();
+  const auto predecessor = owner.CurrentProjectionRevision();
+  const auto predecessor_snapshot = owner.LogicalSnapshot();
+  const auto first = AddBoxRequest(predecessor, cell, "od376-in-flight-first");
+  auto second = AddBoxRequest(predecessor, cell, "od376-in-flight-second");
+  std::get<core::AddObjectRequestDTO>(second.operation).scene_resource_id =
+      core::SceneResourceId("scene-second");
+
+  struct InFlightReads final {
+    std::string failure;
+    std::shared_ptr<const core::LogicalSceneSnapshotDTO> snapshot;
+    std::optional<ProjectionRevisionDTO> revision;
+    std::optional<CanonicalEmptySceneAccessStatus> access;
+    std::optional<LogicalScenePublicationRead> publication;
+    std::optional<core::LogicalSceneSnapshotRoot> active;
+    std::optional<core::SceneCommitResultDTO> overlapping;
+    std::optional<core::SceneCommitResultDTO> overlapping_stored;
+  };
+  std::barrier apply_entered(2);
+  std::barrier apply_release(2);
+  fixture.predecessor_projections.front()->BlockNextApply(apply_entered,
+                                                          apply_release);
+  auto committing =
+      std::async(std::launch::async, [&] { return owner.Commit(first); });
+  apply_entered.arrive_and_wait();
+
+  // The first Commit is inside its native apply. The reads run on another
+  // thread with a bounded wait, so the release below is always reached: else
+  // the blocked Commit would never end.
+  auto reading = std::async(std::launch::async, [&] {
+    InFlightReads reads;
+    try {
+      reads.snapshot = owner.LogicalSnapshot();
+      reads.revision = owner.CurrentProjectionRevision();
+      reads.access = owner.ReadAccessStatus();
+      reads.publication = owner.ReadPublication();
+      reads.active = owner.ReadActiveSnapshot();
+      reads.overlapping = owner.Commit(second);
+      reads.overlapping_stored = owner.ReadCommitResult(second);
+    } catch (const std::exception &error) {
+      reads.failure = error.what();
+    }
+    return reads;
+  });
+  const bool read_in_time = ReadyWithinBound(reading);
+  apply_release.arrive_and_wait();
+  const auto committed = committing.get();
+  const auto reads = reading.get();
+
+  EXPECT_TRUE(read_in_time) << "an in-flight read waited for the native apply";
+  EXPECT_TRUE(reads.failure.empty()) << reads.failure;
+  ASSERT_NE(reads.snapshot, nullptr);
+  EXPECT_EQ(*reads.snapshot, *predecessor_snapshot);
+  EXPECT_EQ(reads.revision, std::optional{predecessor});
+  ASSERT_TRUE(reads.access.has_value());
+  EXPECT_TRUE(reads.access->scene_writes_open);
+  EXPECT_TRUE(reads.access->projection_leases_open);
+  EXPECT_EQ(reads.access->active_projection, std::optional{predecessor});
+  ASSERT_TRUE(reads.publication.has_value());
+  EXPECT_TRUE(reads.publication->access.scene_writes_open);
+  ASSERT_TRUE(reads.publication->snapshot.has_value());
+  EXPECT_EQ(reads.publication->snapshot->shared()->revision,
+            predecessor.scene_revision);
+  ASSERT_TRUE(reads.active.has_value());
+  EXPECT_EQ(reads.active->shared()->revision, predecessor.scene_revision);
+  ASSERT_TRUE(reads.overlapping.has_value());
+  EXPECT_FALSE(reads.overlapping->success);
+  ASSERT_TRUE(reads.overlapping->error.has_value());
+  EXPECT_EQ(reads.overlapping->error->code, "stale_revision");
+  EXPECT_EQ(reads.overlapping->error->details.at("reason"),
+            "scene_commit_in_progress");
+  EXPECT_EQ(reads.overlapping->projection_status,
+            core::SceneProjectionCommitStatusDTO::kNotAttempted);
+  EXPECT_FALSE(reads.overlapping_stored.has_value());
+
+  ASSERT_TRUE(committed.success) << CommitError(committed);
+  ASSERT_TRUE(committed.committed_projection_revision.has_value());
+  const auto successor = *committed.committed_projection_revision;
+  EXPECT_NE(successor, predecessor);
+  EXPECT_EQ(owner.CurrentProjectionRevision(), successor);
+  const auto settled = owner.LogicalSnapshot();
+  EXPECT_EQ(settled->revision, successor.scene_revision);
+  EXPECT_EQ(settled->objects.size(), predecessor_snapshot->objects.size() + 1U);
+  const auto access = owner.ReadAccessStatus();
+  EXPECT_TRUE(access.scene_writes_open);
+  EXPECT_EQ(access.active_projection, std::optional{successor});
+  const auto publication = owner.ReadPublication();
+  ASSERT_TRUE(publication.snapshot.has_value());
+  EXPECT_EQ(publication.snapshot->shared()->revision, successor.scene_revision);
+  EXPECT_GT(publication.read_sequence, reads.publication->read_sequence);
+  EXPECT_FALSE(owner.ReadCommitResult(second).has_value());
+  for (const auto &projection : fixture.predecessor_projections) {
+    ASSERT_EQ(projection->calls(), 1U);
+    EXPECT_EQ(projection->transactions().front().request_key,
+              first.request_context.request_key);
+  }
+  EXPECT_TRUE(fixture.cell_admission.GetAuthoringAdmission().authoring_allowed);
+
+  // The refused request took no claim and left no result: resent, it commits.
+  const auto resent = owner.Commit(second);
+  EXPECT_TRUE(resent.success) << CommitError(resent);
+}
+
+// OD-376: a change that reaches the owner while a request is prepared
+// unlocked (here: while the last preflight answer is on its way) makes that
+// request stale. It is refused before its intent: no result, no admission
+// claim and no native effect.
+TEST(CanonicalEmptySceneOwner,
+     ConcurrentChangeDuringThePreflightIsRefusedAsStaleWithoutAClaim) {
+  SceneAdoptionFixture fixture;
+  auto &owner = *fixture.owner;
+  auto &kernel = fixture.cell_admission;
+  const auto cell = fixture.admission.cell_id();
+  const auto predecessor = owner.CurrentProjectionRevision();
+  const auto predecessor_objects = owner.LogicalSnapshot()->objects.size();
+  const auto integrity_before = owner.VerifyIntegrity();
+  const auto first = AddBoxRequest(predecessor, cell, "od376-concurrent-first");
+  auto inner = AddBoxRequest(predecessor, cell, "od376-concurrent-inner");
+  std::get<core::AddObjectRequestDTO>(inner.operation).scene_resource_id =
+      core::SceneResourceId("scene-inner");
+  const auto claims_before = kernel.Claims().size();
+  const auto acquires_before = kernel.acquire_calls();
+  const auto releases_before = kernel.release_calls();
+
+  // The inner Commit runs inside the outer one's last preflight call, once
+  // every projection answered healthy at the predecessor; it runs on another
+  // thread with a bounded wait.
+  std::future<core::SceneCommitResultDTO> inner_commit;
+  bool inner_in_time = false;
+  std::size_t preflights = 0U;
+  const auto projection_count = fixture.predecessor_projections.size();
+  for (const auto &projection : fixture.predecessor_projections) {
+    projection->RunDuringNextPreflight([&] {
+      if (++preflights != projection_count) {
+        return;
+      }
+      inner_commit =
+          std::async(std::launch::async, [&] { return owner.Commit(inner); });
+      inner_in_time = ReadyWithinBound(inner_commit);
+    });
+  }
+  const auto refused = owner.Commit(first);
+  ASSERT_TRUE(inner_commit.valid());
+  const auto inner_result = inner_commit.get();
+  EXPECT_TRUE(inner_in_time) << "a Commit waited for another one's preflight";
+
+  ASSERT_TRUE(inner_result.success) << CommitError(inner_result);
+  ASSERT_TRUE(inner_result.committed_projection_revision.has_value());
+  EXPECT_FALSE(refused.success);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->code, "stale_revision");
+  EXPECT_EQ(refused.error->details.at("reason"),
+            "scene_commit_concurrent_change");
+  EXPECT_EQ(refused.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
+  EXPECT_EQ(refused.projection_status,
+            core::SceneProjectionCommitStatusDTO::kNotAttempted);
+  EXPECT_FALSE(refused.committed_projection_revision.has_value());
+  EXPECT_FALSE(owner.ReadCommitResult(first).has_value());
+  // Only the inner request was recorded.
+  const auto integrity_after = owner.VerifyIntegrity();
+  EXPECT_EQ(integrity_after.transaction_intent_count,
+            integrity_before.transaction_intent_count + 1);
+  EXPECT_EQ(integrity_after.request_outcome_count,
+            integrity_before.request_outcome_count + 1);
+
+  // Only the inner request claimed admission; the refused one never did.
+  EXPECT_EQ(kernel.acquire_calls(), acquires_before + 1U);
+  EXPECT_EQ(kernel.release_calls(), releases_before + 1U);
+  const auto claims = kernel.Claims();
+  ASSERT_EQ(claims.size(), claims_before + 1U);
+  EXPECT_EQ(claims.back().intent.request_key,
+            inner.request_context.request_key);
+  EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
+
+  // Only the inner change took effect, natively too.
+  EXPECT_EQ(owner.CurrentProjectionRevision(),
+            *inner_result.committed_projection_revision);
+  const auto snapshot = owner.LogicalSnapshot();
+  ASSERT_EQ(snapshot->objects.size(), predecessor_objects + 1U);
+  const auto has_object = [&](const std::string_view id) {
+    return std::any_of(snapshot->objects.begin(), snapshot->objects.end(),
+                       [&](const core::SceneObjectSnapshotDTO &object) {
+                         return object.scene_resource_id ==
+                                core::SceneResourceId(std::string(id));
+                       });
+  };
+  EXPECT_TRUE(has_object("scene-inner"));
+  EXPECT_FALSE(has_object("scene-box"));
+  for (const auto &projection : fixture.predecessor_projections) {
+    ASSERT_EQ(projection->calls(), 1U);
+    EXPECT_EQ(projection->transactions().front().request_key,
+              inner.request_context.request_key);
+  }
+
+  // The same change, as a new request against the current Scene, commits.
+  auto renewed = first;
+  renewed.request_context.request_key =
+      SceneRequestKey("od376-concurrent-renewed");
+  renewed.expected_projection_revision = owner.CurrentProjectionRevision();
+  const auto committed = owner.Commit(renewed);
+  EXPECT_TRUE(committed.success) << CommitError(committed);
+  EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
+}
+
+// OD-376: the Commit is in flight from its intent, across its admission
+// claim: a Commit arriving then is refused as in progress without effect,
+// and readers see the settled predecessor.
+TEST(CanonicalEmptySceneOwner,
+     CommitInFlightAcrossTheAdmissionClaimRefusesASecondCommit) {
+  SceneAdoptionFixture fixture;
+  auto &owner = *fixture.owner;
+  auto &kernel = fixture.cell_admission;
+  const auto cell = fixture.admission.cell_id();
+  const auto predecessor = owner.CurrentProjectionRevision();
+  const auto predecessor_snapshot = owner.LogicalSnapshot();
+  const auto outer = AddBoxRequest(predecessor, cell, "od376-claim-outer");
+  auto inner = AddBoxRequest(predecessor, cell, "od376-claim-inner");
+  std::get<core::AddObjectRequestDTO>(inner.operation).scene_resource_id =
+      core::SceneResourceId("scene-inner");
+  const auto acquires_before = kernel.acquire_calls();
+
+  struct ClaimReads final {
+    std::string failure;
+    std::shared_ptr<const core::LogicalSceneSnapshotDTO> snapshot;
+    std::optional<ProjectionRevisionDTO> revision;
+    std::optional<CanonicalEmptySceneAccessStatus> access;
+    std::optional<core::SceneCommitResultDTO> inner;
+    std::optional<core::SceneCommitResultDTO> inner_stored;
+  };
+  std::future<ClaimReads> reading;
+  bool read_in_time = false;
+  kernel.RunBeforeNextAcquire([&] {
+    reading = std::async(std::launch::async, [&] {
+      ClaimReads reads;
+      try {
+        reads.snapshot = owner.LogicalSnapshot();
+        reads.revision = owner.CurrentProjectionRevision();
+        reads.access = owner.ReadAccessStatus();
+        reads.inner = owner.Commit(inner);
+        reads.inner_stored = owner.ReadCommitResult(inner);
+      } catch (const std::exception &error) {
+        reads.failure = error.what();
+      }
+      return reads;
+    });
+    read_in_time = ReadyWithinBound(reading);
+  });
+  const auto committed = owner.Commit(outer);
+  ASSERT_TRUE(reading.valid());
+  const auto reads = reading.get();
+
+  EXPECT_TRUE(read_in_time) << "a read waited for the admission claim";
+  EXPECT_TRUE(reads.failure.empty()) << reads.failure;
+  ASSERT_NE(reads.snapshot, nullptr);
+  EXPECT_EQ(*reads.snapshot, *predecessor_snapshot);
+  EXPECT_EQ(reads.revision, std::optional{predecessor});
+  ASSERT_TRUE(reads.access.has_value());
+  EXPECT_EQ(reads.access->active_projection, std::optional{predecessor});
+  ASSERT_TRUE(reads.inner.has_value());
+  EXPECT_FALSE(reads.inner->success);
+  ASSERT_TRUE(reads.inner->error.has_value());
+  EXPECT_EQ(reads.inner->error->code, "stale_revision");
+  EXPECT_EQ(reads.inner->error->details.at("reason"),
+            "scene_commit_in_progress");
+  EXPECT_EQ(reads.inner->projection_status,
+            core::SceneProjectionCommitStatusDTO::kNotAttempted);
+  EXPECT_FALSE(reads.inner_stored.has_value());
+
+  ASSERT_TRUE(committed.success) << CommitError(committed);
+  EXPECT_EQ(kernel.acquire_calls(), acquires_before + 1U);
+  EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_FALSE(owner.ReadCommitResult(inner).has_value());
+  for (const auto &projection : fixture.predecessor_projections) {
+    ASSERT_EQ(projection->calls(), 1U);
+    EXPECT_EQ(projection->transactions().front().request_key,
+              outer.request_context.request_key);
+  }
+
+  // The refused request left nothing: resent, it commits.
+  const auto resent = owner.Commit(inner);
+  EXPECT_TRUE(resent.success) << CommitError(resent);
+}
+
+// OD-376: the intent is recorded before the admission claim is acquired. A
+// refused claim, or one whose reply is lost, is the request's stored
+// outcome; a request whose intent cannot be recorded acquires no claim.
+TEST(CanonicalEmptySceneOwner, IntentPrecedesTheAdmissionClaim) {
+  for (const bool lost_reply : {false, true}) {
+    SCOPED_TRACE(lost_reply ? "lost acquire reply" : "refused claim");
+    const auto admission = LoadAdmission();
+    ControlledPublicationReader publication_reader;
+    TestCellAdmissionPort cell_admission;
+    LogicalSceneOwner owner(admission, publication_reader, cell_admission);
+    const auto active =
+        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+            .canonical_empty_target;
+    const auto request =
+        AddBoxRequest(active, admission.cell_id(), "od376-intent-first");
+    const ErrorDTO refusal =
+        lost_reply ? ErrorDTO{"kernel_owner_unavailable",
+                              "acquisition reply lost",
+                              {}}
+                   : ErrorDTO{"invalid_state_transition",
+                              "not started; held by Stop",
+                              {{"reason", "program_node_stop_fence_active"}}};
+    if (lost_reply) {
+      cell_admission.LoseNextReply(TestCellAdmissionPort::LostReply::kAcquire);
+    } else {
+      cell_admission.RejectNextClaim(refusal);
+    }
+    const auto integrity_before = owner.VerifyIntegrity();
+    const auto acquires_before = cell_admission.acquire_calls();
+    const auto claims_before = cell_admission.Claims().size();
+    // An acquire that never reached the Kernel answers authoring_not_ready,
+    // as before OD-376; the Kernel's own refusals pass through unchanged.
+    const ErrorDTO expected =
+        lost_reply ? ErrorDTO{"authoring_not_ready",
+                              "authored scene admission is unavailable: "
+                              "acquisition reply lost",
+                              {}}
+                   : refusal;
+    const auto refused = owner.Commit(request);
+    ASSERT_FALSE(refused.success);
+    EXPECT_EQ(refused.error, expected);
+    EXPECT_EQ(refused.replay_status,
+              core::RequestReplayStatusDTO::kAcceptedNew);
+    EXPECT_EQ(refused.projection_status,
+              core::SceneProjectionCommitStatusDTO::kNotAttempted);
+    EXPECT_EQ(cell_admission.acquire_calls(), acquires_before + 1U);
+    EXPECT_TRUE(owner.GetSceneObjects().empty());
+    EXPECT_EQ(owner.CurrentProjectionRevision(), active);
+
+    const auto stored = owner.ReadCommitResult(request);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_FALSE(stored->success);
+    EXPECT_EQ(stored->error, expected);
+    EXPECT_EQ(stored->projection_status,
+              core::SceneProjectionCommitStatusDTO::kNotAttempted);
+    const auto integrity_after = owner.VerifyIntegrity();
+    EXPECT_EQ(integrity_after.transaction_intent_count,
+              integrity_before.transaction_intent_count + 1);
+    EXPECT_EQ(integrity_after.request_outcome_count,
+              integrity_before.request_outcome_count + 1);
+    // A refused claim was never held; a lost reply leaves the Kernel holding
+    // it, so authoring stays closed until reconciliation settles it.
+    EXPECT_EQ(cell_admission.Claims().size(),
+              claims_before + (lost_reply ? 1U : 0U));
+    EXPECT_EQ(cell_admission.GetAuthoringAdmission().authoring_allowed,
+              !lost_reply);
+  }
+}
+
+// OD-378: a Commit whose resulting Scene would encode above
+// kMaximumLogicalSceneSnapshotBytes is refused `scene_too_large` before its
+// intent and before any admission claim: nothing is recorded.
+TEST(CanonicalEmptySceneOwner, SceneAboveItsSizeBoundIsRefusedBeforeItsIntent) {
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
+  auto active = FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+                    .canonical_empty_target;
+  for (const auto *name : {"limit-1", "limit-2", "limit-3"}) {
+    const auto added =
+        owner.Commit(AddLargeMeshRequest(active, admission.cell_id(), name));
+    ASSERT_TRUE(added.success) << CommitError(added);
+    ASSERT_TRUE(added.committed_projection_revision.has_value());
+    active = *added.committed_projection_revision;
+  }
+  const auto current_bytes =
+      EncodeLogicalSceneSnapshot(*owner.LogicalSnapshot()).size();
+  ASSERT_LT(current_bytes, kMaximumLogicalSceneSnapshotBytes);
+  ASSERT_GT(current_bytes + kLargeMeshUriBytes,
+            kMaximumLogicalSceneSnapshotBytes);
+  const auto over_bound =
+      AddLargeMeshRequest(active, admission.cell_id(), "limit-4");
+  const auto acquires_before = cell_admission.acquire_calls();
+  const auto claims_before = cell_admission.Claims();
+  const auto integrity_before = owner.VerifyIntegrity();
+  const auto refused = owner.Commit(over_bound);
+  ASSERT_FALSE(refused.success);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->code, "scene_too_large");
+  EXPECT_EQ(refused.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
+  EXPECT_EQ(refused.projection_status,
+            core::SceneProjectionCommitStatusDTO::kNotAttempted);
+  EXPECT_FALSE(refused.committed_projection_revision.has_value());
+  // No claim was taken and none is held.
+  EXPECT_EQ(cell_admission.acquire_calls(), acquires_before);
+  EXPECT_EQ(cell_admission.Claims(), claims_before);
+  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+  // Nothing was recorded; the Scene is unchanged.
+  const auto integrity_after = owner.VerifyIntegrity();
+  EXPECT_EQ(integrity_after.transaction_intent_count,
+            integrity_before.transaction_intent_count);
+  EXPECT_EQ(integrity_after.request_outcome_count,
+            integrity_before.request_outcome_count);
+  EXPECT_FALSE(owner.ReadCommitResult(over_bound).has_value());
+  EXPECT_EQ(owner.CurrentProjectionRevision(), active);
+  const auto head = owner.ReadActiveSnapshot();
+  ASSERT_TRUE(head.has_value());
+  EXPECT_EQ(head->shared()->revision, active.scene_revision);
+  EXPECT_EQ(head->shared()->objects.size(), 3U);
+
+  // A smaller change still commits on the unchanged head.
+  const auto small = owner.Commit(AddBoxRequest(
+      active, admission.cell_id(), "scene-request-after-too-large"));
+  ASSERT_TRUE(small.success) << CommitError(small);
+  ASSERT_TRUE(small.committed_projection_revision.has_value());
+  EXPECT_EQ(small.committed_projection_revision->scene_revision.revision_id,
+            active.scene_revision.revision_id + 1U);
+  EXPECT_EQ(owner.GetSceneObjects().size(), 4U);
+}
+
+// OD-378: an intent keeps the resolved operation and the proposed revision's
+// content hash; its candidate is the delta applied to the predecessor, and a
+// result of another content is an integrity failure.
+TEST(CanonicalEmptySceneOwner, SceneCandidateIsDerivedFromTheIntentsDelta) {
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
+  const auto active =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  const auto predecessor = owner.LogicalSnapshot();
+  const auto request =
+      AddBoxRequest(active, admission.cell_id(), "scene-request-derive");
+  const auto committed = owner.Commit(request);
+  ASSERT_TRUE(committed.success) << CommitError(committed);
+  ASSERT_TRUE(committed.transaction_sequence.has_value());
+  ASSERT_TRUE(committed.committed_projection_revision.has_value());
+  const auto successor = owner.LogicalSnapshot();
+  ASSERT_EQ(successor->objects.size(), 1U);
+  EXPECT_EQ(
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(*successor),
+      committed.committed_projection_revision->scene_revision.content_hash);
+
+  const logical_scene_owner_detail::SceneTransactionRecord record{
+      *committed.transaction_sequence,
+      request.request_context.request_key,
+      ContentDigest(manyforge::content_identity::sha256_digest(
+          logical_scene_codec_internal::EncodeRequestDigestInput(request))),
+      logical_scene_codec_internal::EncodeRequest(request),
+      active,
+      *committed.committed_projection_revision,
+      core::ResolvedUpsertSceneObjectDTO{successor->objects.front(),
+                                         std::nullopt},
+      core::SceneUpdateStatusDTO::kGeometryChanged,
+      0U,
+      0U,
+      {},
+  };
+  EXPECT_EQ(
+      logical_scene_owner_detail::DeriveSceneCandidate(*predecessor, record),
+      *successor);
+
+  auto wrong_hash = record;
+  wrong_hash.proposed.scene_revision.content_hash = Digest('f');
+  EXPECT_THROW(
+      static_cast<void>(logical_scene_owner_detail::DeriveSceneCandidate(
+          *predecessor, wrong_hash)),
+      LogicalSceneOwnerIntegrityError);
+}
+
+// OD-378: a successful Commit whose final claim release fails after its
+// success is recorded keeps the head at the committed revision, derived from
+// the recorded delta.
+TEST(CanonicalEmptySceneOwner, LostReleaseAfterASuccessKeepsTheCommittedHead) {
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  LogicalSceneOwner owner(admission, publication_reader, cell_admission);
+  const auto active =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  const auto request =
+      AddBoxRequest(active, admission.cell_id(), "scene-request-release-lost");
+  cell_admission.LoseNextReply(TestCellAdmissionPort::LostReply::kRelease);
+  EXPECT_THROW(static_cast<void>(owner.Commit(request)), std::runtime_error);
+  const auto recorded = owner.ReadCommitResult(request);
+  ASSERT_TRUE(recorded.has_value());
+  ASSERT_TRUE(recorded->success);
+  ASSERT_TRUE(recorded->committed_projection_revision.has_value());
+  const auto committed = *recorded->committed_projection_revision;
+  EXPECT_EQ(committed.scene_revision.revision_id,
+            active.scene_revision.revision_id + 1U);
+  const auto head = owner.ReadActiveSnapshot();
+  ASSERT_TRUE(head.has_value());
+  EXPECT_EQ(head->shared()->revision, committed.scene_revision);
+  ASSERT_EQ(head->shared()->objects.size(), 1U);
+  EXPECT_EQ(head->shared()->objects.front().scene_resource_id,
+            core::SceneResourceId("scene-box"));
+  EXPECT_EQ(core::logical_scene_identity::ComputeLogicalSceneContentHash(
+                *head->shared()),
+            committed.scene_revision.content_hash);
+  EXPECT_EQ(owner.CurrentProjectionRevision(), committed);
+
+  // Reconciliation settles the held claim; the next Commit builds on the head.
+  EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+  const auto reconciled = owner.ReconcileAuthoredSceneAdmissionClaims();
+  ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+  EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+  auto next = AddBoxRequest(committed, admission.cell_id(),
+                            "scene-request-after-release-lost");
+  std::get<core::AddObjectRequestDTO>(next.operation).scene_resource_id =
+      core::SceneResourceId("scene-box-2");
+  const auto followed = owner.Commit(next);
+  ASSERT_TRUE(followed.success) << CommitError(followed);
+  ASSERT_TRUE(followed.committed_projection_revision.has_value());
+  EXPECT_EQ(followed.committed_projection_revision->scene_revision.revision_id,
+            committed.scene_revision.revision_id + 1U);
+  EXPECT_EQ(owner.GetSceneObjects().size(), 2U);
+}
+
+// OD-376: a preflight call refused as a call (e.g. a transaction beyond the
+// transport bound) reaches the caller as its own typed refusal, before any
+// intent, claim or native apply.
+TEST(CanonicalEmptySceneOwner, PreflightRefusalReachesTheCallerAsItsTypedCode) {
+  SceneAdoptionFixture fixture;
+  auto &owner = *fixture.owner;
+  auto &kernel = fixture.cell_admission;
+  const auto predecessor = owner.CurrentProjectionRevision();
+  const auto request = AddBoxRequest(predecessor, fixture.admission.cell_id(),
+                                     "od376-preflight-refused");
+  const ErrorDTO bound_exceeded{
+      "native_projection_rpc_bound_exceeded",
+      "the Scene transaction exceeds the native projection transport bound",
+      {{"reason", "native_projection_rpc_bound_exceeded"}}};
+  fixture.predecessor_projections.front()->RejectNextPreflight(bound_exceeded);
+  const auto claims_before = kernel.Claims().size();
+  const auto acquires_before = kernel.acquire_calls();
+  const auto integrity_before = owner.VerifyIntegrity();
+
+  const auto refused = owner.Commit(request);
+  ASSERT_FALSE(refused.success);
+  EXPECT_EQ(refused.error, bound_exceeded);
+  EXPECT_EQ(refused.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
+  EXPECT_EQ(refused.projection_status,
+            core::SceneProjectionCommitStatusDTO::kNotAttempted);
+  EXPECT_FALSE(refused.committed_projection_revision.has_value());
+  EXPECT_FALSE(owner.ReadCommitResult(request).has_value());
+  EXPECT_EQ(kernel.acquire_calls(), acquires_before);
+  EXPECT_EQ(kernel.Claims().size(), claims_before);
+  EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
+  for (const auto &projection : fixture.predecessor_projections) {
+    EXPECT_EQ(projection->calls(), 0U);
+  }
+  const auto integrity_after = owner.VerifyIntegrity();
+  EXPECT_EQ(integrity_after.transaction_intent_count,
+            integrity_before.transaction_intent_count);
+  EXPECT_EQ(integrity_after.request_outcome_count,
+            integrity_before.request_outcome_count);
+  EXPECT_EQ(owner.CurrentProjectionRevision(), predecessor);
+
+  // The refusal left nothing: resent, the request commits.
+  const auto resent = owner.Commit(request);
+  EXPECT_TRUE(resent.success) << CommitError(resent);
+}
+
+// What an Apply-lane writer did while a Commit was held in its native apply.
+template <typename Written> struct WriterDuringAHeldCommit final {
+  std::optional<core::SceneCommitResultDTO> committed;
+  std::optional<Written> written;
+  bool waited_for_the_commit{};
+  std::string failure;
+};
+
+// Holds `commit` inside the native apply of `held`, then starts `writer`
+// (given the held transaction) on another thread and observes that it is
+// still waiting 50 ms later. The release is always reached.
+template <typename Commit, typename Writer>
+[[nodiscard]] auto RunWriterDuringAHeldCommit(FakePlannerSceneProjection &held,
+                                              Commit commit, Writer writer) {
+  using Written =
+      std::invoke_result_t<Writer &, const core::SceneTransactionDTO &>;
+  WriterDuringAHeldCommit<Written> observed;
+  std::barrier apply_entered(2);
+  std::barrier apply_release(2);
+  held.BlockNextApply(apply_entered, apply_release);
+  auto committing = std::async(std::launch::async, std::move(commit));
+  apply_entered.arrive_and_wait();
+  std::future<Written> writing;
+  try {
+    const auto blocked = held.blocked_transaction();
+    if (!blocked.has_value()) {
+      throw std::logic_error("the held native apply has no transaction");
+    }
+    writing = std::async(std::launch::async,
+                         [&writer, transaction = *blocked] {
+                           return writer(transaction);
+                         });
+    // An observation only: the writer is expected to wait for the Commit.
+    observed.waited_for_the_commit =
+        writing.wait_for(50ms) == std::future_status::timeout;
+  } catch (const std::exception &error) {
+    observed.failure = error.what();
+  }
+  apply_release.arrive_and_wait();
+  observed.committed.emplace(committing.get());
+  if (writing.valid()) {
+    if (!ReadyWithinBound(writing)) {
+      observed.failure += "the writer did not end after the Commit; ";
+    }
+    try {
+      observed.written.emplace(writing.get());
+    } catch (const std::exception &error) {
+      observed.failure += error.what();
+    }
+  }
+  return observed;
+}
+
+// OD-376 (B1): the Apply-lane writers (maintenance initialization, qualified
+// adoption Stage and Begin) wait while a Commit is in flight, then behave as
+// they would after that Commit: they succeed against its successor, and the
+// Commit is not refused.
+TEST(CanonicalEmptySceneOwner, ApplyLaneWritersWaitForAnInFlightCommit) {
+  {
+    SCOPED_TRACE("maintenance initialization");
+    SceneAdoptionFixture fixture;
+    auto &owner = *fixture.owner;
+    fixture.PrepareCandidateClients();
+    const auto integrity_before = owner.VerifyIntegrity();
+    const auto add = AddBoxRequest(owner.CurrentProjectionRevision(),
+                                   fixture.admission.cell_id(),
+                                   "od376-held-before-maintenance");
+    const auto observed = RunWriterDuringAHeldCommit(
+        *fixture.predecessor_projections.front(),
+        [&] { return owner.Commit(add); },
+        [&](const core::SceneTransactionDTO &held) {
+          // Expects the successor of the held Commit.
+          return owner.BeginMaintenanceInitialization({
+              ApplyId(300U),
+              ApplyGeneration(1U),
+              held.proposed_projection_revision,
+              fixture.candidate.bundle->value(),
+              fixture.candidate_bindings,
+          });
+        });
+    EXPECT_TRUE(observed.failure.empty()) << observed.failure;
+    EXPECT_TRUE(observed.waited_for_the_commit);
+    ASSERT_TRUE(observed.committed.has_value());
+    ASSERT_TRUE(observed.committed->success) << CommitError(*observed.committed);
+    ASSERT_TRUE(observed.written.has_value());
+    EXPECT_EQ(observed.written->state,
+              core::ProjectionMaintenanceInitializationState::kInitialized);
+    EXPECT_EQ(owner.ReadMaintenanceInitialization(
+                  {ApplyId(300U), ApplyGeneration(1U)}),
+              observed.written);
+    // The Commit's write precedes the maintenance window; none follows it.
+    EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+    const auto integrity_after = owner.VerifyIntegrity();
+    EXPECT_EQ(integrity_after.transaction_intent_count,
+              integrity_before.transaction_intent_count + 1);
+    EXPECT_EQ(integrity_after.request_outcome_count,
+              integrity_before.request_outcome_count + 1);
+    for (const auto &projection : fixture.predecessor_projections) {
+      EXPECT_EQ(projection->calls(), 1U);
+    }
+  }
+  {
+    SCOPED_TRACE("qualified adoption");
+    SceneAdoptionFixture fixture;
+    auto &owner = *fixture.owner;
+    const auto cell = fixture.admission.cell_id();
+    const auto added = owner.Commit(AddBoxRequest(
+        owner.CurrentProjectionRevision(), cell, "od376-adoption-add"));
+    ASSERT_TRUE(added.success) << CommitError(added);
+    // The Apply holds its claim from here: the held Commits are
+    // runtime-owned pose updates.
+    const auto request = fixture.CaptureConfigurationRequest();
+    fixture.PrepareCandidateClients();
+    const auto streamed_pose = [&](const std::string &name, const double x_m) {
+      core::Pose3DTO pose;
+      pose.position_m = {x_m, -0.5, 0.75};
+      return core::SceneTransactionRequestDTO{
+          core::PublicRequestContextDTO{SceneRequestKey(name),
+                                        "scene-owner-test"},
+          {},
+          owner.CurrentProjectionRevision(),
+          core::UpdateObjectPoseRequestDTO{
+              core::SceneResourceId("scene-box"), pose,
+              core::CellSceneFrameRefDTO{cell}, StreamedPoseEvidence(), false},
+          std::nullopt};
+    };
+    const auto integrity_before = owner.VerifyIntegrity();
+
+    const auto before_stage = streamed_pose("od376-held-before-stage", 0.30);
+    const auto staged = RunWriterDuringAHeldCommit(
+        *fixture.predecessor_projections.front(),
+        [&] { return owner.Commit(before_stage); },
+        [&](const core::SceneTransactionDTO &) {
+          return owner.StageOriginalManagerConfigurationAdoption(
+              request, fixture.fence, fixture.fence.OriginalAttemptQuery());
+        });
+    EXPECT_TRUE(staged.failure.empty()) << staged.failure;
+    EXPECT_TRUE(staged.waited_for_the_commit);
+    ASSERT_TRUE(staged.committed.has_value());
+    ASSERT_TRUE(staged.committed->success) << CommitError(*staged.committed);
+    ASSERT_TRUE(staged.committed->committed_projection_revision.has_value());
+    ASSERT_TRUE(staged.written.has_value());
+    ASSERT_EQ(staged.written->size(), request.execution_host_bindings.size());
+    const ProjectionRevisionDTO staged_target{
+        request.candidate_retained_bundle.retained_bundle_id,
+        request.candidate_retained_bundle.cell_graph.graph_revision,
+        staged.committed->committed_projection_revision->scene_revision};
+    for (const auto &row : *staged.written) {
+      EXPECT_TRUE(row.healthy_for_target(staged_target));
+    }
+
+    const auto before_begin = streamed_pose("od376-held-before-begin", 0.35);
+    const auto begun = RunWriterDuringAHeldCommit(
+        *fixture.predecessor_projections.front(),
+        [&] { return owner.Commit(before_begin); },
+        [&](const core::SceneTransactionDTO &) {
+          return fixture.Begin(request);
+        });
+    EXPECT_TRUE(begun.failure.empty()) << begun.failure;
+    EXPECT_TRUE(begun.waited_for_the_commit);
+    ASSERT_TRUE(begun.committed.has_value());
+    ASSERT_TRUE(begun.committed->success) << CommitError(*begun.committed);
+    ASSERT_TRUE(begun.committed->committed_projection_revision.has_value());
+    ASSERT_TRUE(begun.written.has_value());
+    ASSERT_TRUE(begun.written->ready_for_publication());
+    // Begin captured the Scene the held Commit produced.
+    EXPECT_EQ(begun.written->target_projection_revision.scene_revision,
+              begun.committed->committed_projection_revision->scene_revision);
+    EXPECT_FALSE(owner.ReadAccessStatus().scene_writes_open);
+    const auto integrity_after = owner.VerifyIntegrity();
+    EXPECT_EQ(integrity_after.transaction_intent_count,
+              integrity_before.transaction_intent_count + 2);
+    EXPECT_EQ(integrity_after.request_outcome_count,
+              integrity_before.request_outcome_count + 2);
+  }
+}
+
+// OD-376: the owner validates and digests the candidate once, and the native
+// projection applies only the owner's delta. Replaying that delta onto the
+// owner's predecessor (readable during the apply: no owner lock is held)
+// gives a valid snapshot with the owner's digest, equal to the one the owner
+// then publishes. This is the cross-check the owner no longer runs itself.
+TEST(CanonicalEmptySceneOwner, ProjectionReplaysTheOwnersValidatedDelta) {
+  SceneAdoptionFixture fixture;
+  auto &owner = *fixture.owner;
+  const auto &projections = fixture.predecessor_projections;
+  ASSERT_FALSE(projections.empty());
+  for (const auto &projection : projections) {
+    projection->ReplayAgainst(fixture.owner.get());
+    projection->SetFrameResolution(core::Pose3DTO{}, {});
+  }
+  const auto cell = fixture.admission.cell_id();
+  std::optional<core::SceneCommitResultDTO> last;
+  const auto commit_and_check =
+      [&](const core::SceneTransactionRequestDTO &request) {
+        std::vector<std::size_t> before;
+        for (const auto &projection : projections) {
+          before.push_back(projection->replay_checks().size());
+        }
+        last = owner.Commit(request);
+        ASSERT_TRUE(last->success) << CommitError(*last);
+        const auto settled = owner.LogicalSnapshot();
+        for (std::size_t index = 0U; index < projections.size(); ++index) {
+          const auto &checks = projections[index]->replay_checks();
+          ASSERT_EQ(checks.size(), before[index] + 1U);
+          const auto &check = checks.back();
+          EXPECT_TRUE(check.applied) << check.error;
+          EXPECT_TRUE(check.content_hash_matches) << check.error;
+          EXPECT_TRUE(check.locally_valid);
+          ASSERT_TRUE(check.result.has_value());
+          EXPECT_EQ(*check.result, *settled);
+        }
+      };
+
+  ASSERT_NO_FATAL_FAILURE(commit_and_check(AddBoxRequest(
+      owner.CurrentProjectionRevision(), cell, "od376-replay-add")));
+
+  auto upsert = AddBoxRequest(owner.CurrentProjectionRevision(), cell,
+                              "od376-replay-upsert");
+  const auto add = std::get<core::AddObjectRequestDTO>(upsert.operation);
+  upsert.operation = core::UpsertObjectRequestDTO{
+      add.scene_resource_id, add.shape, add.pose, add.frame_ref};
+  auto &replacement = std::get<core::UpsertObjectRequestDTO>(upsert.operation);
+  replacement.shape = core::SphereShapeDTO{0.4};
+  replacement.pose.position_m.x_m = 1.25;
+  ASSERT_NO_FATAL_FAILURE(commit_and_check(upsert));
+  EXPECT_EQ(last->update_status, core::SceneUpdateStatusDTO::kGeometryChanged);
+
+  const auto before_no_op = owner.CurrentProjectionRevision();
+  auto no_op = upsert;
+  no_op.request_context =
+      SceneRequestContext("od376-replay-upsert-no-op", before_no_op);
+  no_op.expected_projection_revision = before_no_op;
+  ASSERT_NO_FATAL_FAILURE(commit_and_check(no_op));
+  EXPECT_EQ(last->update_status, core::SceneUpdateStatusDTO::kNoOp);
+  EXPECT_EQ(last->committed_projection_revision, before_no_op);
+
+  core::Pose3DTO streamed_pose;
+  streamed_pose.position_m = {1.5, -0.5, 0.75};
+  ASSERT_NO_FATAL_FAILURE(commit_and_check(core::SceneTransactionRequestDTO{
+      core::PublicRequestContextDTO{SceneRequestKey("od376-replay-pose"),
+                                    "scene-owner-test"},
+      {},
+      owner.CurrentProjectionRevision(),
+      core::UpdateObjectPoseRequestDTO{
+          core::SceneResourceId("scene-box"), streamed_pose,
+          core::CellSceneFrameRefDTO{cell}, StreamedPoseEvidence(), false},
+      std::nullopt}));
+
+  auto configured = owner.LogicalSnapshot()->configured_collision_policy;
+  configured.policy_id = "strict-diagnostics";
+  const auto policy_revision = owner.CurrentProjectionRevision();
+  ASSERT_NO_FATAL_FAILURE(commit_and_check(core::SceneTransactionRequestDTO{
+      SceneRequestContext("od376-replay-policy", policy_revision),
+      {},
+      policy_revision,
+      core::SetCollisionPolicyRequestDTO{
+          configured,
+          owner.LogicalSnapshot()->configured_collision_policy.revision,
+      },
+      core::AdmissionGeneration(1U),
+  }));
+  EXPECT_EQ(owner.LogicalSnapshot()->configured_collision_policy.policy_id,
+            "strict-diagnostics");
+
+  // A carried object: attach (as AttachOnAMountedToolFrameKeepsTheArmAsHolder),
+  // its provider pose (a resolved upsert of the carried object), detach at
+  // the current pose, attach again and detach to a named pose.
+  const auto attach_request = [&](const std::string &name) {
+    core::AttachCarriedObjectRequestDTO operation{
+        core::CarriedObjectAttachmentId("attachment.1"),
+        core::SceneResourceId("scene-box"),
+        core::ControllableComponentId("component.1"),
+        core::CommandTargetId("arm"),
+        core::FrameRoleId("holder_rod"),
+        {core::CollisionBodyRoleId("holder_rod")},
+        {}};
+    operation.carrier_component_id =
+        core::ControllableComponentId("tube_holder");
+    const auto revision = owner.CurrentProjectionRevision();
+    core::SceneTransactionRequestDTO attach{
+        SceneRequestContext(name, revision), {}, revision, operation,
+        core::AdmissionGeneration(1U)};
+    attach.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+        core::ProgramRunNumber(2U), core::CellAdmissionClaimGeneration(9U),
+        "attach", core::NodeAttemptNumber(1U), "scene.carried_attachment"};
+    return attach;
+  };
+  ASSERT_NO_FATAL_FAILURE(commit_and_check(attach_request("od376-replay-attach")));
+  ASSERT_EQ(owner.LogicalSnapshot()->carried_object_attachments.size(), 1U);
+
+  core::Pose3DTO carried_pose;
+  carried_pose.position_m = {0.5, 0.25, 0.1};
+  ASSERT_NO_FATAL_FAILURE(commit_and_check(core::SceneTransactionRequestDTO{
+      core::PublicRequestContextDTO{SceneRequestKey("od376-replay-carried-pose"),
+                                    "scene-owner-test"},
+      {},
+      owner.CurrentProjectionRevision(),
+      core::UpdateObjectPoseRequestDTO{
+          core::SceneResourceId("scene-box"), carried_pose,
+          core::CellSceneFrameRefDTO{cell}, StreamedPoseEvidence(),
+          std::nullopt},
+      std::nullopt}));
+  for (const auto &projection : projections) {
+    ASSERT_FALSE(projection->transactions().empty());
+    const auto *carried = std::get_if<core::ResolvedUpsertSceneObjectDTO>(
+        &projection->transactions().back().resolved_operation);
+    ASSERT_NE(carried, nullptr);
+    EXPECT_TRUE(carried->attachment.has_value());
+  }
+
+  const auto detach_current_request = [&](const std::string &name) {
+    const auto attachment =
+        owner.LogicalSnapshot()->carried_object_attachments.front();
+    const auto revision = owner.CurrentProjectionRevision();
+    return core::SceneTransactionRequestDTO{
+        SceneRequestContext(name, revision),
+        {},
+        revision,
+        core::DetachCarriedObjectAtCurrentPoseRequestDTO{
+            attachment.carried_object_attachment_id,
+            attachment.carried_object_attachment_revision,
+            attachment.scene_resource_id, attachment.controllable_component_id,
+            attachment.command_target_id},
+        std::nullopt};
+  };
+  ASSERT_NO_FATAL_FAILURE(
+      commit_and_check(detach_current_request("od376-replay-detach-current")));
+  EXPECT_TRUE(owner.LogicalSnapshot()->carried_object_attachments.empty());
+
+  ASSERT_NO_FATAL_FAILURE(
+      commit_and_check(attach_request("od376-replay-reattach")));
+  {
+    const auto attachment =
+        owner.LogicalSnapshot()->carried_object_attachments.front();
+    const auto revision = owner.CurrentProjectionRevision();
+    ASSERT_NO_FATAL_FAILURE(commit_and_check(core::SceneTransactionRequestDTO{
+        SceneRequestContext("od376-replay-detach", revision),
+        {},
+        revision,
+        core::DetachCarriedObjectRequestDTO{
+            attachment.carried_object_attachment_id,
+            attachment.carried_object_attachment_revision,
+            core::Pose3DTO{{0.5, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}},
+            core::CellSceneFrameRefDTO{cell}},
+        std::nullopt}));
+  }
+  EXPECT_TRUE(owner.LogicalSnapshot()->carried_object_attachments.empty());
+
+  const auto remove_revision = owner.CurrentProjectionRevision();
+  ASSERT_NO_FATAL_FAILURE(commit_and_check(core::SceneTransactionRequestDTO{
+      SceneRequestContext("od376-replay-remove", remove_revision),
+      {},
+      remove_revision,
+      core::RemoveObjectRequestDTO{core::SceneResourceId("scene-box")},
+      core::AdmissionGeneration(1U)}));
+  const auto remaining = owner.LogicalSnapshot();
+  EXPECT_TRUE(std::none_of(
+      remaining->objects.begin(), remaining->objects.end(),
+      [](const core::SceneObjectSnapshotDTO &object) {
+        return object.scene_resource_id == core::SceneResourceId("scene-box");
+      }));
+}
+
+// OD-376 (S5): a pose-only delta (an existing cell-fixed object keeps its
+// shapes, mass and placement kind; only its pose or provider evidence
+// changes) cannot change the effective collision policy, so its preflight
+// asks for health only. Every other delta projects the policy once.
+TEST(CanonicalEmptySceneOwner, PoseOnlyDeltaSkipsThePolicyProjection) {
+  SceneAdoptionFixture fixture;
+  auto &owner = *fixture.owner;
+  const auto &projections = fixture.predecessor_projections;
+  ASSERT_FALSE(projections.empty());
+  for (const auto &projection : projections) {
+    projection->SetFrameResolution(core::Pose3DTO{}, {});
+  }
+  const auto cell = fixture.admission.cell_id();
+  const auto expect_policy_projections =
+      [&](const core::SceneTransactionRequestDTO &request,
+          const std::size_t policies) {
+        std::vector<std::pair<std::size_t, std::size_t>> before;
+        for (const auto &projection : projections) {
+          before.emplace_back(projection->preflight_calls(),
+                              projection->policy_projection_calls());
+        }
+        const auto result = owner.Commit(request);
+        ASSERT_TRUE(result.success) << CommitError(result);
+        for (std::size_t index = 0U; index < projections.size(); ++index) {
+          const auto &projection = *projections[index];
+          EXPECT_EQ(projection.preflight_calls() - before[index].first, 1U);
+          EXPECT_EQ(projection.policy_projection_calls() - before[index].second,
+                    policies);
+          EXPECT_EQ(projection.policy_calls_outside_preflight(), 0U);
+        }
+      };
+  const auto pose_at = [](const double x_m) {
+    core::Pose3DTO pose;
+    pose.position_m = {x_m, -0.5, 0.75};
+    return pose;
+  };
+  const auto pose_update =
+      [&](const std::string &name, const core::Pose3DTO &pose,
+          std::optional<core::SceneObjectProviderEvidenceDTO> evidence) {
+        const auto authored = !evidence.has_value();
+        return core::SceneTransactionRequestDTO{
+            core::PublicRequestContextDTO{SceneRequestKey(name),
+                                          "scene-owner-test"},
+            {},
+            owner.CurrentProjectionRevision(),
+            core::UpdateObjectPoseRequestDTO{
+                core::SceneResourceId("scene-box"), pose,
+                core::CellSceneFrameRefDTO{cell}, std::move(evidence),
+                std::nullopt},
+            authored ? std::optional{core::AdmissionGeneration(1U)}
+                     : std::nullopt};
+      };
+  const auto upsert = [&](const std::string &name,
+                          const core::CollisionShapeDTO &shape,
+                          const core::Pose3DTO &pose, const double mass_kg) {
+    auto request =
+        AddBoxRequest(owner.CurrentProjectionRevision(), cell, name);
+    const auto add = std::get<core::AddObjectRequestDTO>(request.operation);
+    request.operation = core::UpsertObjectRequestDTO{
+        add.scene_resource_id, shape, pose, add.frame_ref, mass_kg};
+    return request;
+  };
+  const core::CollisionShapeDTO box = core::BoxShapeDTO{{0.1, 0.2, 0.3}};
+
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      AddBoxRequest(owner.CurrentProjectionRevision(), cell, "od376-s5-add"),
+      1U));
+  // Pose-only: an authored move, provider evidence only (same pose), a
+  // provider move, and an upsert that keeps the shape and mass.
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      pose_update("od376-s5-authored-move", pose_at(0.30), std::nullopt), 0U));
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      pose_update("od376-s5-evidence-only", pose_at(0.30),
+                  StreamedPoseEvidence()),
+      0U));
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      pose_update("od376-s5-provider-move", pose_at(0.35),
+                  StreamedPoseEvidence()),
+      0U));
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      upsert("od376-s5-upsert-pose", box, pose_at(0.40), 0.0), 0U));
+  // Not pose-only: a changed shape or mass, a policy, an attach, a detach,
+  // a removal.
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      upsert("od376-s5-upsert-shape", core::SphereShapeDTO{0.2}, pose_at(0.40),
+             0.0),
+      1U));
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      upsert("od376-s5-upsert-mass", core::SphereShapeDTO{0.2}, pose_at(0.40),
+             2.0),
+      1U));
+  auto configured = owner.LogicalSnapshot()->configured_collision_policy;
+  configured.policy_id = "strict-diagnostics";
+  const auto policy_revision = owner.CurrentProjectionRevision();
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      core::SceneTransactionRequestDTO{
+          SceneRequestContext("od376-s5-policy", policy_revision),
+          {},
+          policy_revision,
+          core::SetCollisionPolicyRequestDTO{
+              configured,
+              owner.LogicalSnapshot()->configured_collision_policy.revision},
+          core::AdmissionGeneration(1U)},
+      1U));
+  core::AttachCarriedObjectRequestDTO attach_operation{
+      core::CarriedObjectAttachmentId("attachment.1"),
+      core::SceneResourceId("scene-box"),
+      core::ControllableComponentId("component.1"),
+      core::CommandTargetId("arm"),
+      core::FrameRoleId("holder_rod"),
+      {core::CollisionBodyRoleId("holder_rod")},
+      {}};
+  attach_operation.carrier_component_id =
+      core::ControllableComponentId("tube_holder");
+  const auto attach_revision = owner.CurrentProjectionRevision();
+  core::SceneTransactionRequestDTO attach{
+      SceneRequestContext("od376-s5-attach", attach_revision), {},
+      attach_revision, attach_operation, core::AdmissionGeneration(1U)};
+  attach.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+      core::ProgramRunNumber(2U), core::CellAdmissionClaimGeneration(9U),
+      "attach", core::NodeAttemptNumber(1U), "scene.carried_attachment"};
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(attach, 1U));
+  const auto attachment =
+      owner.LogicalSnapshot()->carried_object_attachments.front();
+  const auto detach_revision = owner.CurrentProjectionRevision();
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      core::SceneTransactionRequestDTO{
+          SceneRequestContext("od376-s5-detach", detach_revision),
+          {},
+          detach_revision,
+          core::DetachCarriedObjectAtCurrentPoseRequestDTO{
+              attachment.carried_object_attachment_id,
+              attachment.carried_object_attachment_revision,
+              attachment.scene_resource_id,
+              attachment.controllable_component_id,
+              attachment.command_target_id},
+          std::nullopt},
+      1U));
+  const auto remove_revision = owner.CurrentProjectionRevision();
+  ASSERT_NO_FATAL_FAILURE(expect_policy_projections(
+      core::SceneTransactionRequestDTO{
+          SceneRequestContext("od376-s5-remove", remove_revision),
+          {},
+          remove_revision,
+          core::RemoveObjectRequestDTO{core::SceneResourceId("scene-box")},
+          core::AdmissionGeneration(1U)},
+      1U));
+}
+
+// Documented behaviour (OD-218, OD-376): once the history is folded, a
+// request's stored result is no longer read. Sent again with the same key,
+// it is a new request, unless the Kernel refuses its admission as already
+// settled: that refusal is the request's outcome, stored for its key, and
+// nothing else changes.
+TEST(CanonicalEmptySceneOwner,
+     ResentRequestAfterTheFoldIsNewUnlessItsAdmissionIsSettled) {
+  SceneAdoptionFixture fixture;
+  auto &owner = *fixture.owner;
+  auto &kernel = fixture.cell_admission;
+  const auto cell = fixture.admission.cell_id();
+  const auto pose_at = [](const double x_m) {
+    core::Pose3DTO pose;
+    pose.position_m = {x_m, -0.5, 0.75};
+    return pose;
+  };
+  const auto upsert = [&](const std::string &name, const double x_m) {
+    auto request =
+        AddBoxRequest(owner.CurrentProjectionRevision(), cell, name);
+    const auto add = std::get<core::AddObjectRequestDTO>(request.operation);
+    request.operation = core::UpsertObjectRequestDTO{
+        add.scene_resource_id, add.shape, pose_at(x_m), add.frame_ref};
+    return request;
+  };
+  const auto expired = upsert("od376-fold-expired", 0.5);
+  const auto committed_expired = owner.Commit(expired);
+  ASSERT_TRUE(committed_expired.success) << CommitError(committed_expired);
+  const auto readmitted = upsert("od376-fold-readmitted", 0.25);
+  const auto committed_readmitted = owner.Commit(readmitted);
+  ASSERT_TRUE(committed_readmitted.success)
+      << CommitError(committed_readmitted);
+
+  // Runtime-owned pose updates fill the resident history until it folds (as
+  // HistoryCompactionIsTransparentToCallers).
+  const auto resident = static_cast<std::size_t>(
+      owner.VerifyIntegrity().transaction_intent_count);
+  ASSERT_LT(resident, kMaximumLogicalSceneTransactions);
+  for (std::size_t index = 0U;
+       index <= kMaximumLogicalSceneTransactions - resident; ++index) {
+    const auto moved = owner.Commit(core::SceneTransactionRequestDTO{
+        core::PublicRequestContextDTO{
+            SceneRequestKey("od376-fold-move-" + std::to_string(index)),
+            "scene-owner-test"},
+        {},
+        owner.CurrentProjectionRevision(),
+        core::UpdateObjectPoseRequestDTO{
+            core::SceneResourceId("scene-box"),
+            pose_at(1.0 + 0.001 * static_cast<double>(index + 1U)),
+            core::CellSceneFrameRefDTO{cell}, StreamedPoseEvidence(), false},
+        std::nullopt});
+    ASSERT_TRUE(moved.success) << index << " " << CommitError(moved);
+  }
+  ASSERT_EQ(owner.VerifyIntegrity().transaction_intent_count, 1);
+  EXPECT_FALSE(owner.ReadCommitResult(expired).has_value());
+  EXPECT_FALSE(owner.ReadCommitResult(readmitted).has_value());
+
+  // The Kernel refuses an admission it already settled.
+  const auto revision_before = owner.CurrentProjectionRevision();
+  const auto snapshot_before = owner.LogicalSnapshot();
+  const auto acquires_before = kernel.acquire_calls();
+  const ErrorDTO result_expired{
+      "request_result_expired",
+      "the request's admission is already settled",
+      {{"reason", "request_result_expired"}}};
+  kernel.RejectNextClaim(result_expired);
+  const auto refused = owner.Commit(expired);
+  ASSERT_FALSE(refused.success);
+  EXPECT_EQ(refused.error, result_expired);
+  EXPECT_EQ(refused.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
+  EXPECT_EQ(refused.projection_status,
+            core::SceneProjectionCommitStatusDTO::kNotAttempted);
+  EXPECT_EQ(kernel.acquire_calls(), acquires_before + 1U);
+  EXPECT_EQ(owner.CurrentProjectionRevision(), revision_before);
+  EXPECT_EQ(*owner.LogicalSnapshot(), *snapshot_before);
+  EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
+  const auto stored = owner.ReadCommitResult(expired);
+  ASSERT_TRUE(stored.has_value());
+  EXPECT_FALSE(stored->success);
+  EXPECT_EQ(stored->error, result_expired);
+
+  // A Kernel that admits it again: the resent request is new and commits.
+  kernel.AdmitSettledIntentsAgain();
+  const auto resent = owner.Commit(readmitted);
+  ASSERT_TRUE(resent.success) << CommitError(resent);
+  EXPECT_EQ(resent.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
+  EXPECT_EQ(kernel.acquire_calls(), acquires_before + 2U);
+  ASSERT_TRUE(resent.committed_projection_revision.has_value());
+  EXPECT_NE(*resent.committed_projection_revision, revision_before);
+  const auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
+  ASSERT_TRUE(pose.ok());
+  EXPECT_DOUBLE_EQ(pose.value().position_m.x_m, 0.25);
+  EXPECT_TRUE(kernel.GetAuthoringAdmission().authoring_allowed);
 }
 
 } // namespace

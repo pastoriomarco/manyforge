@@ -1,17 +1,10 @@
-api_version: manyforge.program.v3
-program_id: pick_and_place_ur10e_robotiq_demo
-program_revision: sha256:40ab2f7b8a921052c4565dac6176796da687f3c1e6718e5cdfdc024955b0e0ac
+api_version: manyforge.program.v4
+program_revision: sha256:ac3fe799659b07faea6763a993d4e7155fb6863f0c5936cd7deea58936895748
 program_profile: composable-cell-v1
-name: pick_and_place_ur10e_robotiq_demo
-description: Pick-and-place demo for the source-local UR10e and Robotiq 2F-140 model. It preserves the
-  approach, pick, carried-object, place, detach, retreat, and rest sequence together with the Robotiq
-  finger-joint coordinate semantics.
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
-  lanes:
-  - manyforge-only
   assistant: optional
   requires:
   - robotiq_2f_140_gripper

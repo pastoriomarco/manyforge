@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <functional>
 #include <future>
 #include <memory>
 #include <map>
@@ -88,6 +89,10 @@ public:
       const core::RuntimeCollisionQueryRequest &request) noexcept override {
     positions.assign(request.positions_rad.begin(), request.positions_rad.end());
     state_time = request.state_time_ns;
+    distance_mode = request.distance_request_mode;
+    distance_pairs.assign(request.selected_distance_pairs.begin(),
+                          request.selected_distance_pairs.end());
+    observation_.signed_clearance_m = signed_clearance;
     ++queries;
     {
       std::unique_lock lock(block_mutex);
@@ -123,6 +128,9 @@ public:
   std::vector<std::string> prepared_names;
   std::vector<double> positions;
   core::TimePoint state_time{};
+  core::CollisionDistanceRequestMode distance_mode{};
+  std::vector<core::CollisionPairId> distance_pairs;
+  std::optional<double> signed_clearance;
   std::size_t queries{};
   std::mutex block_mutex;
   std::condition_variable block_cv;
@@ -159,6 +167,7 @@ protected:
       if (selection_error) return core::Result<std::vector<core::CollisionBodyId>>::Err(*selection_error);
       return core::Result<std::vector<core::CollisionBodyId>>::Ok(selected_bodies);
     };
+    if (customize) customize(binding);
     auto made = GeometricContactInputProvider::Create(
         ingress, clock, scheduler, std::move(binding), 1U);
     ASSERT_TRUE(made.ok()) << made.error().message;
@@ -189,10 +198,13 @@ protected:
     auto world = std::make_shared<core::CollisionWorldSnapshot>();
     core::CollisionWorldBody endpoint_body{};
     endpoint_body.body_id = endpoint_body_id;
+    endpoint_body.owner_kind = core::CollisionOwnerKind::kComponentModelBody;
     core::CollisionWorldBody target_body{};
     target_body.body_id = kTarget;
+    target_body.owner_kind = core::CollisionOwnerKind::kSceneResource;
     core::CollisionWorldBody robot_body{};
     robot_body.body_id = kRobotBody;
+    robot_body.owner_kind = core::CollisionOwnerKind::kComponentModelBody;
     world->bodies = {std::move(endpoint_body), std::move(target_body)};
     if (endpoint_body_id != kRobotBody) world->bodies.push_back(std::move(robot_body));
     std::sort(world->bodies.begin(), world->bodies.end(),
@@ -262,7 +274,204 @@ protected:
   std::shared_ptr<core::IoSignalSubsystem> signals;
   std::shared_ptr<core::IoSignalIngress> ingress;
   std::unique_ptr<GeometricContactInputProvider> provider;
+  std::function<void(GeometricContactInputBinding &)> customize;
 };
+
+std::optional<bool> sample_value(core::IoSignalSubsystem &signals) {
+  const auto observed = signals.ReadSignal(kSignal).value();
+  if (!observed.latest_sample) return std::nullopt;
+  return observed.latest_sample->publication.value;
+}
+
+// OD-356: two selections (the robot's bodies against the target) with a
+// trip depth: true only while a selected pair penetrates deeper than it.
+TEST_F(GeometricContactInputProviderTest, SelectionsWithTripDepthFollowThePenetration) {
+  customize = [](GeometricContactInputBinding &binding) {
+    binding.contact_a = {core::CollisionRuleComponentSelection{
+        core::ControllableComponentId("robot.arm")}};
+    binding.contact_b = {core::CollisionRuleSceneObjectSelection{
+        core::SceneResourceId("fixture.target")}};
+    binding.trip_depth_m = 0.004;
+    binding.read_contact_bodies = nullptr;
+    binding.target_scene_resource_id = core::SceneResourceId(std::string{});
+  };
+  Build();
+  engine->signed_clearance = -0.003;
+  ASSERT_TRUE(provider->Resume(2).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  EXPECT_EQ(sample_value(*signals), std::optional<bool>(false));
+  EXPECT_EQ(engine->distance_mode, core::CollisionDistanceRequestMode::kSelectedCollidingPairs);
+  // The robot's tool and flange bodies against the target.
+  EXPECT_EQ(engine->distance_pairs.size(), 2U);
+
+  engine->signed_clearance = -0.005;
+  clock->set(110);
+  scheduler.advance_to(110, core::SchedulerPriority::Monitoring);
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  EXPECT_EQ(sample_value(*signals), std::optional<bool>(true));
+
+  // A colliding pair without a depth: unavailable, never false.
+  engine->signed_clearance.reset();
+  clock->set(120);
+  scheduler.advance_to(120, core::SchedulerPriority::Monitoring);
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  const auto observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kUnavailable);
+}
+
+// OD-363: a trip depth between two meshes the engine cannot measure is
+// unavailable with the engine's typed reason.
+TEST_F(GeometricContactInputProviderTest, MeshDepthFailuresAreUnavailableWithTheirReason) {
+  customize = [](GeometricContactInputBinding &binding) {
+    binding.contact_a = {core::CollisionRuleComponentSelection{
+        core::ControllableComponentId("robot.arm")}};
+    binding.contact_b = {core::CollisionRuleSceneObjectSelection{
+        core::SceneResourceId("fixture.target")}};
+    binding.trip_depth_m = 0.004;
+    binding.read_contact_bodies = nullptr;
+    binding.target_scene_resource_id = core::SceneResourceId(std::string{});
+  };
+  Build();
+  engine->status = core::RuntimeCollisionQueryStatus::kInconclusive;
+  engine->failure = core::RuntimeCollisionQueryFailureReason::kMeshNotClosed;
+  ASSERT_TRUE(provider->Resume(2).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  auto observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kUnavailable);
+  EXPECT_EQ(observed.latest_sample->publication.error->details.at("reason"), "mesh_not_closed");
+
+  engine->failure = core::RuntimeCollisionQueryFailureReason::kMeshDepthVertexCapReached;
+  clock->set(110);
+  scheduler.advance_to(110, core::SchedulerPriority::Monitoring);
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.latest_sample->publication.error->details.at("reason"),
+            "mesh_depth_vertex_cap_reached");
+}
+
+// OD-360: with a release depth the input has hysteresis like a real sensor:
+// true above the trip depth, still true between release and trip, false
+// only below the release depth.
+TEST_F(GeometricContactInputProviderTest, ReleaseDepthHoldsTheInputUntilBelowIt) {
+  customize = [](GeometricContactInputBinding &binding) {
+    binding.contact_a = {core::CollisionRuleComponentSelection{
+        core::ControllableComponentId("robot.arm")}};
+    binding.contact_b = {core::CollisionRuleSceneObjectSelection{
+        core::SceneResourceId("fixture.target")}};
+    binding.trip_depth_m = 0.004;
+    binding.release_depth_m = 0.002;
+    binding.read_contact_bodies = nullptr;
+    binding.target_scene_resource_id = core::SceneResourceId(std::string{});
+  };
+  Build();
+  core::TimePoint now = 100;
+  const auto sample_at = [&](double signed_clearance_m) {
+    engine->signed_clearance = signed_clearance_m;
+    now += 10;
+    // Keep the observed state fresh (the fixture's limit is 25).
+    const std::vector<std::string> arm{"arm_joint"}, finger{"finger_joint"};
+    const std::vector<double> arm_position{0.4}, finger_position{0.2}, velocity{0.0};
+    EXPECT_TRUE(motion->publish(core::ObservedRobotStateSourceKind::kJointState,
+                                arm, arm_position, velocity, now, now).published);
+    EXPECT_TRUE(gripper->publish(core::ObservedRobotStateSourceKind::kJointState,
+                                 finger, finger_position, velocity, now, now).published);
+    clock->set(now);
+    scheduler.advance_to(now, core::SchedulerPriority::Monitoring);
+    EXPECT_TRUE(ingress->Drain(8).ok());
+    return sample_value(*signals);
+  };
+  // Between release and trip before tripping: false.
+  engine->signed_clearance = -0.003;
+  ASSERT_TRUE(provider->Resume(2).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  EXPECT_EQ(sample_value(*signals), std::optional<bool>(false));
+  EXPECT_EQ(sample_at(-0.005), std::optional<bool>(true));   // above trip
+  EXPECT_EQ(sample_at(-0.003), std::optional<bool>(true));   // between: held
+  EXPECT_EQ(sample_at(-0.0025), std::optional<bool>(true));  // still held
+  EXPECT_EQ(sample_at(-0.001), std::optional<bool>(false));  // below release
+  EXPECT_EQ(sample_at(-0.003), std::optional<bool>(false));  // between: stays
+  EXPECT_EQ(sample_at(-0.005), std::optional<bool>(true));
+}
+
+// A release depth not below the trip depth, not above 0, or without a trip
+// depth is refused.
+TEST_F(GeometricContactInputProviderTest, ReleaseDepthMustBeBelowTheTripDepth) {
+  Build();
+  for (const auto &[trip, release] :
+       std::vector<std::pair<std::optional<double>, double>>{
+           {0.004, 0.004}, {0.004, 0.005}, {0.004, 0.0}, {std::nullopt, 0.002}}) {
+    auto binding = make_binding(kIncarnation, kEndpoint, publisher_, engine,
+                                {motion, gripper}, 25);
+    binding.trip_depth_m = trip;
+    binding.release_depth_m = release;
+    const auto made = GeometricContactInputProvider::Create(
+        ingress, clock, scheduler, std::move(binding), 1U);
+    ASSERT_FALSE(made.ok()) << release;
+    EXPECT_EQ(made.error().details.at("reason"), "configuration_invalid");
+  }
+}
+
+// An attached-object selection with nothing carried holds no pair: false.
+TEST_F(GeometricContactInputProviderTest, NothingCarriedIsFalse) {
+  customize = [](GeometricContactInputBinding &binding) {
+    binding.contact_a = {core::CollisionRuleAttachedObjectSelection{
+        core::ControllableComponentId("robot.arm")}};
+    binding.contact_b = {core::CollisionRuleSceneObjectSelection{
+        core::SceneResourceId("fixture.target")}};
+  };
+  Build();
+  ASSERT_TRUE(provider->Resume(2).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  EXPECT_EQ(sample_value(*signals), std::optional<bool>(false));
+  EXPECT_EQ(engine->queries, 0U);
+}
+
+// OD-371: a collision body by its role, and only the objects that body
+// carries (a spring slider and its load), are resolved in the world.
+TEST_F(GeometricContactInputProviderTest, ACollisionBodyAndWhatItCarriesResolveInTheWorld) {
+  const core::CollisionBodyId tube("scene/tube/shape/0");
+  const core::CollisionBodyId cap("scene/cap/shape/0");
+  customize = [&](GeometricContactInputBinding &binding) {
+    auto world = std::make_shared<core::CollisionWorldSnapshot>(
+        *binding.collision_publisher->snapshot());
+    for (const auto &[body_id, parent] : {std::pair{tube, kEndpoint}, std::pair{cap, kRobotBody}}) {
+      core::CollisionWorldBody carried{};
+      carried.body_id = body_id;
+      carried.owner_kind = core::CollisionOwnerKind::kSceneResource;
+      carried.parent_body_id = parent;
+      world->bodies.push_back(std::move(carried));
+    }
+    std::sort(world->bodies.begin(), world->bodies.end(),
+              [](const auto &a, const auto &b) { return a.body_id < b.body_id; });
+    auto bundle = std::make_shared<core::RuntimeCollisionQueryBundle>();
+    bundle->world = world;
+    bundle->lookup_order_valid = true;
+    binding.collision_publisher = std::make_shared<Publisher>(std::move(bundle));
+    const core::ControllableComponentId arm("robot.arm");
+    binding.contact_a = {
+        core::CollisionRuleCollisionBodySelection{{arm, core::CollisionBodyRoleId("tool")}},
+        core::CollisionRuleAttachedObjectSelection{arm, std::string("tool")}};
+    binding.contact_b = {core::CollisionRuleSceneObjectSelection{
+        core::SceneResourceId("fixture.target")}};
+    binding.trip_depth_m = 0.004;
+    binding.read_contact_bodies = nullptr;
+    binding.target_scene_resource_id = core::SceneResourceId(std::string{});
+  };
+  Build();
+  engine->signed_clearance = -0.005;
+  ASSERT_TRUE(provider->Resume(2).ok());
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  EXPECT_EQ(sample_value(*signals), std::optional<bool>(true));
+  // The tool body and the tube it carries against the target; not the
+  // flange or the cap the flange carries.
+  ASSERT_EQ(engine->distance_pairs.size(), 2U);
+  for (const auto &expected : {pair(kEndpoint), pair(tube)})
+    EXPECT_NE(std::find(engine->distance_pairs.begin(), engine->distance_pairs.end(), expected),
+              engine->distance_pairs.end());
+}
 
 TEST_F(GeometricContactInputProviderTest, ImmediateContactUsesBothReportedStatesAndAuthoredAge) {
   Build();

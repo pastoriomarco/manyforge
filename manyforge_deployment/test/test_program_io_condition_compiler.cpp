@@ -52,7 +52,8 @@ struct Context final {
       {"ready", "bool", true},         {"count", "int64", true},
       {"measured", "float64", true},   {"label", "string", true},
       {"node_outcome.pick", "string"}, {"interrupt_state.guard", "string"},
-      {"computed.answer", "int64"},    {"pose", "stored_pose", true}};
+      {"computed.answer", "int64"},    {"pose", "stored_pose", true},
+      {"motion_group_state.all", "string"}};
   std::vector<d::RetainedIoSignalConfiguration> signals;
 
   auto compile(const V &condition) const {
@@ -126,7 +127,8 @@ TEST(ProgramIoConditionCompilerTest,
                                           : V(1.0);
     const auto compiled = context.compile(compare(name, "==", value));
     const bool system = name.starts_with("node_outcome.") ||
-                        name.starts_with("interrupt_state.");
+                        name.starts_with("interrupt_state.") ||
+                        name.starts_with("motion_group_state.");
     if (!declaration.has_declared_initial && !system) {
       ASSERT_FALSE(compiled.ok());
       EXPECT_EQ(compiled.error().details.at("reason"),
@@ -347,6 +349,7 @@ TEST(ProgramIoConditionCompilerTest,
   Context context;
   for (const auto &[key, value] :
        {std::pair{"node_outcome.pick", "none"},
+        std::pair{"motion_group_state.all", "held"},
         std::pair{"interrupt_state.guard", "clear"},
         std::pair{"interrupt_state.guard", "pending"}}) {
     const auto condition = compare(key, "==", V(value));
@@ -365,7 +368,8 @@ TEST(ProgramIoConditionCompilerTest,
       EXPECT_TRUE(evaluate(*global.value().condition, {std::string(value)}));
     }
   }
-  for (const auto *key : {"node_outcome.absent", "interrupt_state.absent"}) {
+  for (const auto *key : {"node_outcome.absent", "interrupt_state.absent",
+                          "motion_group_state.absent"}) {
     const auto refused = context.compile(compare(key, "==", V("none")));
     ASSERT_FALSE(refused.ok());
     EXPECT_EQ(refused.error().details.at("reason"),
@@ -718,9 +722,10 @@ TEST(ProgramIoConditionCompilerTest, RealXArmControlBoxInputCompilesIntoAGlobalR
   auto tool_io = member("lite6_tool_io", "ufactory.lite6_tool_io", "tool_io").as_object();
   tool_io.emplace_back("active", V(false));
   auto intent = d::detail::parse_activation_deployment_intent(
-      V(Object{{"api_version", V("manyforge.deployment_intent.v2")},
-               {"deployment_artifact_id", V("machine")},
-               {"name", V("machine")},
+      V(Object{{"api_version", V("manyforge.deployment_intent.v3")},
+      {"collision_rules",
+       V(V::Array{V(Object{{"clearance_m", V(0.001)},
+                   {"rule_id", V("everything")}})})},
                {"attachments", V(V::Array{})},
                {"components",
                 V(V::Array{V(Object{{"component_id", V("lite6")},

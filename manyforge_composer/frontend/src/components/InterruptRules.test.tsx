@@ -98,7 +98,7 @@ describe('InterruptConditionEditor', () => {
       disabled={false} onCommit={vi.fn()} />);
     try {
       const parts = hinted.control('c none hint').children as unknown[];
-      expect(parts.filter((part) => typeof part === 'string').join('')).toContain('has no result yet in this Run');
+      expect(parts.filter((part) => typeof part === 'string').join('')).toContain('has no result yet for the current attempt');
     } finally { await hinted.unmount(); }
     const guarded = await render(<InterruptConditionEditor label="c" choices={[outcome]} disabled={false} onCommit={vi.fn()}
       value={{ all: [notCompleted, { compare: { operand: outcome.operand, op: '!=', value: 'none' } }] }} />);
@@ -165,7 +165,7 @@ async function mountDeployment(
 ) {
   const controller = {
     workspace: { draft: { document: {
-      api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell', name: 'Cell',
+      api_version: 'manyforge.deployment_intent.v3',
       components: [station], attachments: [], policies,
     } } },
     mutationAvailable: true,
@@ -467,7 +467,7 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
     const root = createRoot(host as unknown as Element);
     const controller = {
       workspace: { draft: { document: {
-        api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell', name: 'Cell',
+        api_version: 'manyforge.deployment_intent.v3',
         components: [mockOnly], attachments: [], policies: {},
       } } },
       mutationAvailable: true, busy: false, mutate: vi.fn(), updateMotionTargetLimit: vi.fn(),

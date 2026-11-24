@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_headless VERSION 0.3.1 LANGUAGES CXX)
+project(manyforge_headless VERSION 0.4.0 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -210,9 +210,22 @@ if(NOT TARGET manyforge::private_stream)
     EXCLUDE_FROM_ALL)
 endif()
 
+# The Apply preview reads the candidate's meshes with the collision engine's
+# own topology check (OD-363).
+if(NOT TARGET manyforge_mesh_topology)
+  add_subdirectory(
+    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_collision/mesh_topology"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_mesh_topology")
+endif()
+if(NOT TARGET manyforge_mesh_file_topology)
+  message(FATAL_ERROR
+    "manyforge_headless needs assimp for the Apply preview's mesh check")
+endif()
+
 add_executable(manyforge_manager_daemon src/manager_daemon.cpp
   src/application_process_supervisor.cpp)
 target_link_libraries(manyforge_manager_daemon PRIVATE
+  manyforge_mesh_file_topology
   manyforge::private_stream
   manyforge_headless_owner_publication
   manyforge::deployment_admission
@@ -814,6 +827,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_owner_publication PRIVATE
     manyforge_headless_owner_publication
     manyforge::deployment_admission
+    manyforge::scene_value_codec
     GTest::gtest_main)
   gtest_discover_tests(test_owner_publication
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})

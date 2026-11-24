@@ -339,7 +339,6 @@ TEST(RetainedCellRuntimeTest,
      ProductResealPreservesExactPhysicalProviderFactsAndStrictAliasOwnership) {
   const auto before = qualification_fixture::make_binding();
   auto value = before.value();
-  value.program_id = core::ProgramId("candidate.program");
   value.program_revision = core::ProgramRevision("candidate.program-revision");
   value.program_binding_id =
       core::ProgramBindingId("candidate.program-binding");
@@ -399,6 +398,59 @@ TEST(RetainedCellRuntimeTest,
     EXPECT_FALSE(retained_bindings_preserve_physical_owner_after_product_reseal(
         before, foreign.value()));
   }
+}
+
+// Two robots in one cell; the Apply replaces the tool on the other robot's
+// flange with a tool of another profile under the same component id. That
+// robot and its tool are replaced. This robot is retained, and its
+// direct-control binding lists every tool's TCPs in the cell, so only its
+// Program-wide frame and collision-body references change: the re-seal
+// keeps its controller (live: a dual-robot cell, Lite 6 retained while the UF850's tube
+// holder became a generated tool).
+TEST(RetainedCellRuntimeTest,
+     ProductResealKeepsTheRobotWhenAnotherRobotsToolIsReplaced) {
+  const core::ControllableComponentId peer_tool("tube_holder");
+  const auto with_peer_tool = [&](core::RuntimeParticipantBindingDTO value,
+                                  std::string_view model,
+                                  std::string_view frame_name,
+                                  std::string_view body_name) {
+    value.program_frame_bindings = value.frame_bindings;
+    value.program_frame_bindings.push_back(core::ProgramFrameBindingDTO{
+        {peer_tool, core::FrameRoleId("tcp")}, core::ModelInstanceId(std::string(model)),
+        core::ModelRevision(std::string(model) + ".revision"), std::string(frame_name)});
+    value.program_collision_body_bindings = {core::ProgramCollisionBodyBindingDTO{
+        {peer_tool, core::CollisionBodyRoleId("body")},
+        core::ModelInstanceId(std::string(model)),
+        core::ModelRevision(std::string(model) + ".revision"),
+        {std::string(body_name)}}};
+    auto sealed = core::verify_runtime_participant_binding(std::move(value));
+    if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+    return std::move(sealed.value());
+  };
+  const auto before =
+      with_peer_tool(qualification_fixture::make_binding().value(),
+                     "tube_holder.urdf", "tube_holder/tcp", "tube_holder/body");
+  auto candidate_value = qualification_fixture::make_binding().value();
+  candidate_value.retained_bundle_id = core::RetainedBundleId("candidate.bundle");
+  candidate_value.graph_revision = core::GraphRevision("candidate.graph");
+  candidate_value.program_binding_id =
+      core::ProgramBindingId("candidate.program-binding");
+  const auto candidate =
+      with_peer_tool(std::move(candidate_value), "tube_holder.generated",
+                     "tube_holder/generated_tcp", "tube_holder/generated_body");
+  ASSERT_NE(before.value().program_frame_bindings,
+            candidate.value().program_frame_bindings);
+  EXPECT_EQ(retained_product_reseal_physical_owner_difference(before, candidate), "");
+  EXPECT_TRUE(retained_bindings_preserve_physical_owner_after_product_reseal(
+      before, candidate));
+
+  // This robot's own frames are still physical facts.
+  auto own_value = candidate.value();
+  own_value.frame_bindings.front().compiled_frame_name = "foreign.base";
+  auto own = core::verify_runtime_participant_binding(std::move(own_value));
+  ASSERT_TRUE(own.ok()) << own.error().message;
+  EXPECT_EQ(retained_product_reseal_physical_owner_difference(before, own.value()),
+            "frame_bindings");
 }
 
 // A retained gripper passes the same check as a retained arm
@@ -587,7 +639,7 @@ TEST(RetainedCellRuntimeTest,
 }
 
 TEST(RetainedCellRuntimeTest,
-     ProgramResolverPreservesContactPoliciesAndFencesThePhysicalOwner) {
+     ProgramResolverPreservesCollisionRuleBodiesAndFencesThePhysicalOwner) {
   auto physical_value = qualification_fixture::make_binding().value();
   physical_value.collision_body_bindings = {
       {{physical_value.controllable_component_id, core::CollisionBodyRoleId("tool_collision")},
@@ -598,32 +650,26 @@ TEST(RetainedCellRuntimeTest,
       core::verify_runtime_participant_binding(std::move(physical_value));
   ASSERT_TRUE(physical_binding.ok()) << physical_binding.error().message;
   auto program_value = physical_binding.value().value();
-  program_value.program_id = core::ProgramId("program.with-contact-policy");
   program_value.program_revision =
-      core::ProgramRevision("contact-program-revision");
+      core::ProgramRevision("rules-program-revision");
   program_value.program_binding_id =
-      core::ProgramBindingId("contact-program-binding");
-  program_value.contact_grasp_bindings = {core::ProgramContactGraspBindingDTO{
-      core::ContactPolicyId("probe_contact_policy"),
-      core::ContactPolicyRevision("contact-policy-revision"),
-      core::RuntimeObjectId("trial.probe_object"),
-      {{{program_value.controllable_component_id, core::CollisionBodyRoleId("tool_collision")},
-        core::ModelRoleId("body"),
-        core::ModelInstanceId("robot.model"),
-        core::ModelRevision("model-revision"),
-        {core::make_component_collision_body_id(
-            program_value.controllable_component_id,
-            core::ModelInstanceId("robot.model"),
-            core::CollisionBodyRoleId("tool_collision"), 0U)}}},
-      core::ContactGraspEnvelopeDTO{0.002, 0.8}}};
+      core::ProgramBindingId("rules-program-binding");
+  program_value.collision_rule_bodies = {core::ProgramCollisionRuleBodyBindingDTO{
+      {program_value.controllable_component_id, core::CollisionBodyRoleId("tool_collision")},
+      core::ModelRoleId("body"),
+      core::ModelInstanceId("robot.model"),
+      core::ModelRevision("model-revision"),
+      {core::make_component_collision_body_id(
+          program_value.controllable_component_id,
+          core::ModelInstanceId("robot.model"),
+          core::CollisionBodyRoleId("tool_collision"), 0U)}}};
   const auto program_binding =
       core::verify_runtime_participant_binding(std::move(program_value));
   ASSERT_TRUE(program_binding.ok()) << program_binding.error().message;
   CellTestExecutionEngine engine;
   const auto physical = TestRegistration(physical_binding.value(), &engine);
   const core::OperationIntentDTO intent{
-      {core::TestRequestKey("request.contact-policy"), "test"},
-      program_binding.value().value().program_id,
+      {core::TestRequestKey("request.collision-rules"), "test"},
       program_binding.value().value().program_revision,
       program_binding.value().value().program_binding_id,
       core::ProgramRunNumber(111U),
@@ -641,8 +687,8 @@ TEST(RetainedCellRuntimeTest,
         {physical});
     return resolver(intent, 0U, {});
   };
-  // The ordinary first node carries the Program's policy catalog even when
-  // that node does not select a contact policy. It must keep the same owner.
+  // The ordinary first node carries the Program's collision-rule bodies even
+  // when that node has no rule. It must keep the same owner.
   const auto resolved = resolve(program_binding.value());
   ASSERT_TRUE(resolved.ok()) << resolved.error().message;
   EXPECT_EQ(resolved.value().engine, &engine);
@@ -673,7 +719,6 @@ TEST(RetainedCellRuntimeTest,
       core::verify_runtime_participant_binding(std::move(physical_value));
   ASSERT_TRUE(physical_binding.ok()) << physical_binding.error().message;
   auto program_value = physical_binding.value().value();
-  program_value.program_id = core::ProgramId("program.arm-only");
   program_value.program_revision = core::ProgramRevision("arm-only-revision");
   program_value.program_binding_id =
       core::ProgramBindingId("arm-only-program-binding");
@@ -685,7 +730,6 @@ TEST(RetainedCellRuntimeTest,
   const auto physical = TestRegistration(physical_binding.value(), &engine);
   const core::OperationIntentDTO intent{
       {core::TestRequestKey("request.arm-only"), "test"},
-      program_binding.value().value().program_id,
       program_binding.value().value().program_revision,
       program_binding.value().value().program_binding_id,
       core::ProgramRunNumber(130U),
@@ -743,7 +787,6 @@ TEST(RetainedCellRuntimeTest,
   const auto physical = TestRegistration(physical_binding.value(), &engine);
   const core::OperationIntentDTO intent{
       {core::TestRequestKey("request.fewer-frames"), "test"},
-      program_value.program_id,
       program_value.program_revision,
       program_value.program_binding_id,
       core::ProgramRunNumber(127U),
@@ -989,7 +1032,6 @@ TEST(RetainedCellRuntimeTest,
         {physical});
     const core::OperationIntentDTO intent{
         {core::TestRequestKey("request.resolver"), "test"},
-        binding.value().program_id,
         binding.value().program_revision,
         binding.value().program_binding_id,
         core::ProgramRunNumber(111U),

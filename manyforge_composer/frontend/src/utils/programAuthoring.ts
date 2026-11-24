@@ -16,6 +16,8 @@ import {
   INTERRUPT_NODE_OUTCOME_VALUES,
   INTERRUPT_STATE_NAMESPACE,
   INTERRUPT_STATE_VALUES,
+  MOTION_GROUP_STATE_NAMESPACE,
+  MOTION_GROUP_STATE_VALUES,
 } from './blackboardNamespaces';
 import { hasSourcesWithin } from './valuePaths';
 
@@ -36,9 +38,10 @@ export const INTERRUPT_MOTION_NODE_IDS = ['motion.move_until_signal', 'motion.pr
  * The keys a Draft's nodes may read: its declared keys plus the system-owned
  * outcome key `node_outcome.<instance_id>` of every motion node (the plain
  * motion nodes and the two interrupt nodes) and the
- * read-only `interrupt_state.<rule_id>` key of every known global rule.
- * All are declared by the Program validator, never
- * authored.
+ * read-only `interrupt_state.<rule_id>` key of every known global rule and
+ * the read-only `motion_group_state.<group_id>` key of `all` and of every
+ * execution group a node names. All are declared by the Program validator,
+ * never authored.
  */
 export function programBlackboardKeys(
   program: Pick<ProgramAuthoringDocument, 'blackboard' | 'forest'>,
@@ -47,8 +50,10 @@ export function programBlackboardKeys(
   const keys = [...(program.blackboard?.keys ?? [])];
   const motion: readonly string[] = AUTOMATIC_RETRY.nodeIds;
   const interrupt: readonly string[] = INTERRUPT_MOTION_NODE_IDS;
+  const groups = new Set<string>(['all']);
   const pending = [...(program.forest ?? [])];
   for (let node = pending.pop(); node !== undefined; node = pending.pop()) {
+    if (Array.isArray(node.execution_groups)) node.execution_groups.forEach((group) => groups.add(group));
     if (motion.includes(node.node_id) || interrupt.includes(node.node_id)) {
       const values = interrupt.includes(node.node_id)
         ? INTERRUPT_NODE_OUTCOME_VALUES : NODE_OUTCOME_VALUES;
@@ -61,6 +66,15 @@ export function programBlackboardKeys(
       });
     }
     pending.push(...node.children);
+  }
+  for (const group of groups) {
+    keys.push({
+      key: `${MOTION_GROUP_STATE_NAMESPACE}.${group}`,
+      type: 'string',
+      access: 'read',
+      persistence: 'run',
+      description: `State of motion group ${group}: ${MOTION_GROUP_STATE_VALUES.join(' | ')} (ready = waiting for Run, held = stopped)`,
+    });
   }
   for (const ruleId of new Set(globalRuleIds)) {
     keys.push({
@@ -81,7 +95,8 @@ const FORBIDDEN_DYNAMIC_PARAMETERS = new Set<string>([
   ...AUTOMATIC_RETRY.parameterIds,
   'preemption_priority',
   'preempted_result',
-  'contact_policy_id',
+  // Collision rules are literal rows; only a Scene object selection reads a key.
+  'collision_rules',
   'model_endpoint_alias',
   'prompt_template_id',
   // Interrupt rule fields of the two interrupt motion nodes.

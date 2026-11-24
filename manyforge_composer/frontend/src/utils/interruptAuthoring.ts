@@ -16,6 +16,8 @@ import {
   INTERRUPT_STATE_NAMESPACE,
   INTERRUPT_STATE_VALUES,
   isSystemKey,
+  MOTION_GROUP_STATE_NAMESPACE,
+  MOTION_GROUP_STATE_VALUES,
   NODE_OUTCOME_NAMESPACE,
   NODE_OUTCOME_NONE,
   NODE_OUTCOME_VALUES,
@@ -96,13 +98,15 @@ function keyChoice(key: BlackboardKeyDeclaration): ConditionOperandChoice | null
   const values = namespace === INTERRUPT_STATE_NAMESPACE ? INTERRUPT_STATE_VALUES
     : namespace === NODE_OUTCOME_NAMESPACE ? (key.description?.includes('no_signal_trip')
       ? INTERRUPT_NODE_OUTCOME_VALUES : NODE_OUTCOME_VALUES)
-      : undefined;
+      : namespace === MOTION_GROUP_STATE_NAMESPACE ? MOTION_GROUP_STATE_VALUES
+        : undefined;
   const operand = { key: key.key };
   // System keys are listed by the node or rule they belong to.
   const owner = key.key.slice(namespace.length + 1);
   const label = namespace === NODE_OUTCOME_NAMESPACE ? `${owner} (node outcome)`
     : namespace === INTERRUPT_STATE_NAMESPACE ? `${owner} (rule state)`
-      : `${key.key} (${key.type})`;
+      : namespace === MOTION_GROUP_STATE_NAMESPACE ? `${owner} (motion group state)`
+        : `${key.key} (${key.type})`;
   return {
     id: operandId(operand),
     operand,

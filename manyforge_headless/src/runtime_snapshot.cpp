@@ -636,6 +636,20 @@ ManagerStatusMirror::ViewerPoseSources() const {
                    sessions.last_valid->payload_json};
 }
 
+std::optional<std::string>
+ManagerStatusMirror::LogicalSceneActiveProjection() const {
+  const auto view = view_.load();
+  const auto &value = view->sections[kLogicalScene].last_valid;
+  if (value == nullptr)
+    return std::nullopt;
+  const auto *shown =
+      value->payload.find_object_member("access")->find_object_member(
+          "active_projection");
+  if (shown == nullptr || shown->is_null())
+    return std::nullopt;
+  return content_identity::canonical_json(*shown);
+}
+
 RuntimeSnapshotAggregator::RuntimeSnapshotAggregator(
     const ManagerStatusMirror &mirror, std::string projection_owner_id,
     std::string application_start_id, Clock projection_clock_ns)

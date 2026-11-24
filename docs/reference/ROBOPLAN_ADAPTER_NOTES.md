@@ -14,30 +14,29 @@ speed cap in Bounded Cartesian timing). See
 [`third_party/roboplan/README.md`](../../third_party/roboplan/README.md) for
 the source closure and what each patch does.
 
-## For users: support contacts
+## For users: collision rules
 
-When the robot picks an object that rests on a support (a table, a tray,
-the ground), the object and its support may touch or overlap slightly at the
-start of the lift. ManyForge allows that contact only while the carried object
-moves away from the support. It does this automatically for contacts it
-finds at the start of a motion. You can also declare a support explicitly for
-an object: select the object in the Composer **Scene** panel and use its
-**Support contacts** card, or add `metadata.support_contacts` to the object in
-the Program's `scene`:
+How close two parts may come, and which parts may touch, is set by collision
+rules: cell rules in the Deployment and move rules on motion nodes
+([Collision rules](../authoring/COLLISION_RULES.md)). When the robot picks an
+object that rests on a support (a table, a tray, the ground), the object and
+its support may touch at the start of the lift. ManyForge allows that contact
+by itself while the carried object moves away from the support. An object
+that starts with some overlap, or a place that ends on a surface, needs a
+rule on that move, for example on the lift:
 
 ```yaml
-metadata:
-  support_contacts:
-    - support_object_id: ground
-      release_evidence_mode: signed_penetration
-      enforce_max_start_penetration: true
-      max_start_penetration_m: 0.03
+collision_rules:
+  - rule_id: lift_from_ground
+    a: [{kind: attached_object, component_id: lite_gripper}]
+    b: [{kind: scene_object, scene_resource_id: ground}]
+    release: {max_start_penetration_m: 0.03}
 ```
 
-A support contact is not a general "ignore this collision" switch. Any other
-collision, a new contact, or the object going back into its support still
-fails validation. The modes and fields are described in
-[Support contacts](#support-contacts) below.
+A rule is not a general "ignore this collision" switch. It holds exactly its
+pairs; any other collision still fails validation. How the values are
+evaluated is described in [Contact and release rules](#contact-and-release-rules)
+below.
 
 An object row may also set `metadata.mass_kg` (kg, 0 to 1000). The mass is
 added to the robot's controller payload while the object is attached; it is 0
@@ -48,15 +47,15 @@ when absent.
 RoboPlan checks every planned path's start, goal, edges and shortcuts against
 the retained planner scene and collision policy, keeping the collision
 clearance. Before dispatch, `manyforge_collision`, ManyForge's own collision
-engine, validates every cached trajectory, every fresh one whose move has an
-active contact policy (support contacts, or the move's contact grasp: pairs
-the planner switches off, see below) and, by default, every other fresh one
+engine, validates every cached trajectory, every fresh one whose move has a
+contact or release rule (pairs the planner switches off, see below) and, by
+default, every other fresh one
 too (`collision_evidence=pre_dispatch_validation`). That check covers the
 trajectory's timed waypoints only, with the same clearance; it samples nothing
 between them. A cache hit skips planning, not validation, and a refused
 trajectory, cached or fresh, is re-planned within the authoritative-validation
 attempts. The robot's Deployment can turn the check off for fresh plans
-without a contact policy (**Check fresh plans before dispatch**,
+without a contact or release rule (**Check fresh plans before dispatch**,
 `collision_check_fresh_plans`, default on, `kDefaultCollisionCheckFreshPlans`;
 cell context, so changing it restarts nothing): such a plan is then dispatched
 on the planner's check (`collision_evidence=planning`), and changes to the
@@ -64,30 +63,36 @@ scene after planning are caught by the runtime checks during motion. Limit check
 trajectory. Runtime monitoring runs in the same engine against the published
 collision world and policy and decides whether a running motion is stopped.
 
-**Clearance.** Planned and validated moves keep at least the robot's
-Deployment **Collision clearance** (`collision_clearance_m`, default 1 mm,
-`kDefaultCollisionClearanceM`) from the obstacles their collision policy does
-not allow them to touch. It also covers the executed spline's small deviation
-from the planned path between waypoints. A motion's own `clearance_m`
-(0 to 0.05 m) replaces it for that move; 0 turns it off (contact-only checks).
-IK, the runtime monitor and the lookahead check use no clearance.
+**Clearance.** Planned and validated moves keep, for every pair, the
+clearance of the collision rule that holds the pair. The Deployment's first
+rule (**Everything else: clearance**, default 1 mm,
+`kDefaultCollisionClearanceM`) holds every pair of a robot body or carried
+object and a Scene object. It also covers the executed spline's small
+deviation from the planned path between waypoints. A motion's own row without
+selections (0 to 0.05 m) replaces it for that move; 0 turns it off
+(contact-only checks). Rules with selections set the clearance of exactly
+their pairs, robot against robot included. IK, the runtime monitor and the
+lookahead check use no clearance.
 
 Validation stays strict in these cases:
 
-- robot links against world objects are always checked;
-- a carried object against world objects is checked, except for a support
-  contact that satisfies its release or bounded-penetration rule;
-- a carried object against robot links is checked, except for the links its
-  attachment declares as touch links.
+- robot links against world objects are always checked, except for the pairs
+  of a contact rule;
+- a carried object against world objects is checked, except for the pairs of a
+  contact or release rule and the automatic release at the start of a move;
+- a carried object against robot links is checked, except for the collision
+  bodies its attach node lists as `touch_bodies`.
 
 ## Planner block
 
-Joint and pose goals are planned with RoboPlan's RRT. Each robot's Deployment
-runtime configuration sets the default (the Deployment editor's **Planner
-search**, **Planner optimize**, **Planner N**, **Collision check step** and
-**Planner node budget**); a motion node's optional `planner` parameter
-overrides single members for that move (unset members keep the Deployment's).
-Cartesian paths do not search and ignore it.
+Joint goals and joint pose moves are planned with RoboPlan's RRT. Each
+robot's Deployment runtime configuration sets the default (the Deployment
+editor's **Planner search**, **Planner optimize**, **Planner N**, **Collision
+check step** and **Planner node budget**); a motion node's optional `planner`
+parameter overrides single members for that move (unset members keep the
+Deployment's). Cartesian paths and linear pose moves do not search: Follow
+Cartesian path ignores the block, and a linear pose move refuses a `planner`
+parameter.
 
 | Member | Deployment field | Values (default) |
 | --- | --- | --- |
@@ -107,6 +112,44 @@ refused trajectory uses the finer of `collision_check_step_rad` and 0.01 rad.
 ## Cartesian paths
 
 A Follow Cartesian path move traces straight segments between its waypoints.
+
+**Linear pose moves.** Move to pose, Move until signal and Probe search have a
+`motion_type`: `joint` (default) solves IK for the goal and plans in joint
+space, so the tool does not move on a line; `linear` moves the tool on the
+straight line from where the move starts to the goal. The planning step takes
+the tool pose by forward kinematics from the start state it plans from (the
+robot's observed state when the move is planned, also when a stopped move is
+resumed), so no waypoint is authored for the start. The line is planned
+exactly as a two-waypoint Cartesian path below: RoboPlan's Cartesian planner
+follows it within the move's tolerances, with no collision-avoiding deviation
+and no joint-space fallback. A line that cannot be followed fails with the
+Cartesian errors (for example `cartesian_path_tolerance_exceeded` or
+`cartesian_tracking_stalled`); collisions are checked as for every Cartesian
+path (see [Who decides collisions](#who-decides-collisions)). A linear move takes
+`max_translation_step_m`, `max_rotation_step_rad`, `max_angular_speed_rad_s`,
+`max_linear_acceleration_mps2`, `max_angular_acceleration_rad_s2` and
+`cartesian_timing` with Follow Cartesian path's defaults; a joint move refuses
+them, and a linear move refuses `planner`. A relative Move to pose
+(`target_reference`, `offset_reference`) resolves its goal as a joint one
+does.
+
+A linear move that takes over a robot that is still moving is joined to the
+running motion like a joint move: the line is planned from the switch point,
+and a quintic connector runs from the robot's moving state onto the line. The
+connector is accepted only when it is proven within the robot's joint
+position, velocity, acceleration (and set jerk) limits, as for joint moves,
+and when every sampled connector pose, plus the motion still possible between
+samples, lies within the move's `translation_tol_m` and `rotation_tol_rad` of
+a pose on the line (position and orientation interpolated at one parameter).
+Otherwise planning returns `native_moving_cartesian_blend_proof_unavailable`
+and the takeover falls back to a spring-back or a Stop, after which the line
+starts from rest (see [Motion takeover planning
+budget](#motion-takeover-planning-budget)). The joined trajectory starts with
+the running motion's prefix, so it carries no Cartesian waypoint milestones or
+fidelity metrics. A Follow Cartesian path never takes over a robot that is
+still moving: the Kernel refuses it at admission with
+`cartesian_path_moving_takeover_refused`, and the running motion continues
+(see [Interrupts](../authoring/INTERRUPTS.md)).
 
 **Corners.** A waypoint's corner is exact by default: the tool stops there
 when the path turns by more than about 10° (RoboPlan's corner tolerance), or
@@ -148,7 +191,7 @@ translation and rotation tolerances; a path that cannot be held fails with
 The TCP speed limit is checked on the active TCP only and is never raised by
 ManyForge (the robot controller enforces its own limit at that TCP).
 
-- **Joint and pose goals:** timed by the robot's Deployment `motion_timing`
+- **Joint goals and joint pose moves:** timed by the robot's Deployment `motion_timing`
   (Deployment editor **Motion timing**, default `smooth`; one value per
   robot, no per-move override):
 
@@ -158,8 +201,9 @@ ManyForge (the robot controller enforces its own limit at that TCP).
   | `fast` | TOPP-RA times the path within the nominal acceleration share, with a per-grid-point path-speed bound that holds the active TCP at 0.98 of its linear speed limit (`kTcpSpeedTargetFraction`, patch 0016). Only the stretches near the limit slow down; the acceleration switches abruptly there (Lite 6 peak joint jerk in the hundreds to thousands of rad/s³ without jerk limits). |
 
 - **`time_optimal` Cartesian paths:** the `fast` bound on TOPP-RA's grid, for
-  both the linear and the angular TCP limit (patch 0018). Cartesian paths
-  follow `cartesian_timing` only; `motion_timing` does not apply to them.
+  both the linear and the angular TCP limit (patch 0018). Cartesian paths and
+  linear pose moves follow `cartesian_timing` only; `motion_timing` does not
+  apply to them.
 - **Check:** for joint and pose goals and `time_optimal` paths, the TCP speed
   is checked at the trajectory samples only. With the bound inside TOPP-RA, a
   sample above the limit stretches the whole trajectory uniformly back to the
@@ -199,18 +243,19 @@ scene changes:
 
 1. it adds every collision geometry to the scene;
 2. it disables, with `Scene::setCollisions(a, b, false)`, the pairs that the
-   effective ManyForge collision policy allows: fixed-object overlap pairs,
-   touch-link pairs and support-contact pairs (pairs the composed SRDF
+   Scene's collision policy allows: fixed-object overlap pairs and the grip
+   pairs of the current attachments (pairs the composed SRDF
    disables, including mount exclusions, are never checked; see
    [Mount collision exclusions](#mount-collision-exclusions));
 3. it places each geometry in its frame (see the next section).
 
-The pairs of the active contact-grasp policy for the current operation travel
-with each plan and IK request, like the clearance margins (per-pair margins,
-RoboPlan patch 0015). The worker switches them off for that request with
+The pairs of the move's contact and release rules travel with each plan and
+IK request, like the clearance margins (per-pair margins, RoboPlan patch
+0015). The worker switches them off for that request with
 `Scene::setCollisionPairsActive` (RoboPlan patch 0017) and switches the
-previous request's pairs back on, so a contact-policy change keeps the worker,
-the pair order and the margins.
+previous request's pairs back on, so a change of rules keeps the worker, the
+pair order and the margins. Depth limits and the end-of-move fraction are not
+planning constraints: pre-dispatch validation decides them.
 
 ### Frame-relative placement
 
@@ -260,57 +305,75 @@ overlap should not make the robot's state invalid, because neither object
 moves.
 
 This is a general ManyForge collision-policy rule, not a RoboPlan setting.
-When the effective collision policy is projected for a logical-scene revision
-(`RetainedCollisionWorldProjector::project_effective_policy`), ManyForge adds
-these pairs to `allowed_static_static_pairs`:
+The effective collision policy names the static bodies of the collision world
+(`static_body_ids`), and two static bodies are never checked against each
+other: one rule by body class, as MoveIt's default allowed-collision entries
+are, not a list of pairs. When the effective collision policy is projected for
+a logical-scene revision
+(`RetainedCollisionWorldProjector::project_effective_policy`), the static
+bodies are:
 
-- every pair of collision shapes between two fixed (not carried) scene
-  objects;
-- every pair between a fixed scene object and a static component body, that
-  is, a robot or equipment body that no moving joint carries (a robot base or
-  pedestal, for example).
+- every collision shape of a fixed (not carried) scene object;
+- every static component body, that is, a robot or equipment body that no
+  moving joint carries (a robot base or pedestal, for example).
 
-The policy is recomputed for each logical-scene revision. When an object is
-attached to the robot it is carried, not fixed, so its pairs are checked
-again; when it is released it becomes fixed again. Robot-link and carried-
-object pairs are never added to this list. `manyforge_collision` and the
-planner scene use the same effective policy.
+The list grows with the number of bodies, not of pairs: 200 fixed objects are
+200 entries. The policy is recomputed for each logical-scene revision. When an
+object is attached to the robot it is carried, not static, so its pairs are
+checked again; when it is released it becomes fixed again. A static body
+against a moving robot link, a carried object or a runtime object is always
+checked. `manyforge_collision` and the planner scene never check a pair of two
+static bodies, since neither belongs to the moving group; a validation or
+monitor result that reports one classifies it `allowed_static_static`.
 
-## Support contacts
+## Contact and release rules
 
-A support contact applies only while the object is carried. Before the attach
-step the object and its support are both fixed, so their contact is covered by
-the fixed-object rule and an approach motion does not have to separate them.
+At admission the execution kernel resolves the Deployment's cell rules and the
+move's rules against the move's collision world, once
+(`resolve_collision_rules`). The result has two parts: the clearance margins
+(pair, clearance, rule) that the planner and the validation queries use, and
+the pairs under a contact or release rule (pair, rule, value), which the kernel
+installs into the move's collision policy next to the Scene projector's
+static bodies and grip pairs. A pair that two cell rules with selections
+or two move rules hold is refused (`collision_rules_overlap`); a selection
+that names nothing in the world is refused
+(`collision_rule_selection_unresolved`), except `attached_object`, which may
+be empty.
 
-Support contacts reach the collision policy in two ways:
+The execution host resolves a cell rule's `collision_body` and `model_group`
+selections to the physical collision bodies of the cell before the kernel
+sees them: a model group selects the bodies whose links its expanded SRDF
+group (as the component's command target uses it) holds. The Manager checks
+cell rules for overlapping pairs again when it previews and applies a
+Deployment (`cell_collision_rules_overlap`, by link, with carried objects and
+Scene objects as symbols), and lists the rule changes in the Apply impact's
+`collision_rules`.
 
-- **Declared:** `metadata.support_contacts` on the carried object names a
-  `support_object_id` and the mode fields below. The projector expands it to
-  every shape pair of the object and the support.
-- **Discovered:** the execution kernel finds contacts between a carried
-  object and a fixed scene object at the start of a motion and adds them as
-  support contacts with default fields (`execution_kernel.cpp`,
-  `discover_dynamic_carried_start_contacts` and
-  `dynamic_carried_start_contact_pairs`). It does this before planning, from the
-  observed start state, and again after a failed validation, from the
-  trajectory's first waypoint, before validating once more. Declared entries
-  take precedence for the same pair. The defaults are strict: contact at the
-  start is allowed only as touching (zero start penetration), and the pair must
-  separate monotonically and stay separated. Discovery fails the motion if
-  declared plus discovered contacts would exceed 64 pairs.
+A rule on a carried object applies only while the object is carried. Before
+the attach step the object and its support are both fixed, so their contact is
+covered by the fixed-object rule and an approach motion does not have to
+separate them.
 
-`mode` selects the rule. Authored files accept `contact_release` (the
-default) and `bounded_penetration`. The Composer card names the choices
-**Precise release**, **Lightweight release** and **Bounded contact**;
-**Contact process** is shown as reserved and is not accepted.
+**Automatic start release.** The execution kernel finds contacts between a
+carried object and a fixed scene object at the start of a motion and adds them
+as release pairs with default settings (`execution_kernel.cpp`,
+`discover_dynamic_carried_start_contacts` and
+`dynamic_carried_start_contact_pairs`; rule id `automatic_start_release`). It
+does this before planning, from the observed start state, and again after a
+failed validation, from the trajectory's first waypoint, before validating
+once more. A pair that a contact or release rule already holds is left to
+that rule. The defaults are strict: contact at the start is allowed only as
+touching (zero start penetration), and the pair must separate monotonically
+and stay separated. Discovery fails the motion if authored plus discovered
+release pairs would exceed 64 pairs.
 
-### `contact_release`
+### `release`
 
 - the pair may be in collision at the first validation waypoint;
 - start contact only makes the pair eligible for release; it does not assume
   the next motion will separate it;
-- no other collision pair is allowed because of the support contact, and no
-  new colliding pair may appear;
+- a pair that starts clear may not come into contact, and no other collision
+  pair is allowed because of the rule;
 - with `require_separation_by_end: true` (default) the pair must be separated
   at the final waypoint;
 - with `allow_recontact: false` (default) contact after the first separation
@@ -322,7 +385,7 @@ default) and `bounded_penetration`. The Composer card names the choices
 
 `release_evidence_mode` selects how progress is proved:
 
-- `signed_penetration` (default, **Precise release**): for each allowed pair
+- `signed_penetration` (default, **Precise release**): for each rule pair
   that is colliding, the engine measures penetration depth.
   `release_tolerance_m` (default 1e-5) is the allowed worsening between
   samples, `min_release_progress_m` (default 0) the required total reduction
@@ -332,33 +395,43 @@ default) and `bounded_penetration`. The Composer card names the choices
   measures no depth. The depth fields do not apply: leave them unset or
   neutral; other values are rejected.
 
-### `bounded_penetration`
+### `contact`
 
-**Bounded contact** allows the named pair while its penetration stays within
-`max_contact_penetration_m`, including a pair that first collides later in the
-trajectory. The pair does not have to separate. Unexpected pairs, or the named
-pair beyond its bound, still fail. The release fields do not apply.
+- With `end_from_fraction: 0` the pair may collide at any sample of the move,
+  including the first, and does not have to separate. With
+  `max_penetration_m` every colliding sample must stay within that depth;
+  without it the depth is not checked.
+- With an `end_from_fraction` above 0 (0.8 when the rule gives none) the pair
+  may collide only from that fraction of
+  the move on: a collision at the first sample (`initial_sample_in_contact`)
+  or before the fraction (`grasp_contact_before_terminal_window`) is refused.
+  The fraction is taken from the path's own fractions when the trajectory has
+  them, else from the sample index.
+- A depth above the limit is refused with `contact_penetration_exceeded`
+  (rule, pair, depth, limit). Unexpected pairs still fail.
 
 ### Validation and monitoring
 
-The same policy is used for pre-dispatch validation and for runtime
-monitoring. Signed distance is requested only for selected pairs that are
-already reported colliding; missing or non-finite required depth fails closed
-as an inconclusive result.
+The same pairs and values are used for pre-dispatch validation and for runtime
+monitoring. Signed distance is requested only for pairs whose rule needs it (a
+depth limit, or a precise release) and that are already reported colliding;
+missing or non-finite required depth fails closed as an inconclusive result.
 
 The runtime monitor starts after the trajectory has passed validation and
 execution has begun. Its default tick is 50 ms (20 Hz,
 `ExecutionKernelConfig::collision_monitor_period_ns`); a Deployment can set
 another value with its **Collision monitor period**
 (`collision_monitor_period_ms`). It is not a grace
-period for support contacts: the first observation initializes each pair's
+period for release pairs: the first observation initializes each pair's
 state, then precise release enforces its start bound and penetration progress,
-lightweight release enforces pair-set progress, and bounded contact enforces
-the depth bound.
+lightweight release enforces pair-set progress, and a contact rule with a
+limit enforces the depth. The monitor does not apply `end_from_fraction`; the
+look-ahead check applies it together with the depth.
 
-Support contacts are narrower than touch links. Touch links name robot links
-that a carried object may touch while grasped. Support contacts name world
-objects that the carried object must leave. Using touch links to hide a
+Rules on a carried object and its support are narrower than the attach node's
+`touch_bodies`. `touch_bodies` name gripper bodies that a carried object may
+touch while grasped. A release or contact rule names a world object that the
+carried object must leave or may rest on. Using `touch_bodies` to hide a
 support collision would remove real carried-object collisions from the check.
 
 ## Robot collision geometry
@@ -386,8 +459,8 @@ spring_back_planning (planning cap 400 ms · prep 534 of 500 ms)".
 
 - Validation checks trajectory waypoints; there is no continuous
   (swept-volume) collision check.
-- Signed depth is computed only for precise release and bounded contact, and
-  only for colliding pairs.
+- Signed depth is computed only for precise release and for contact rules
+  with a depth limit, and only for colliding pairs.
 - Performance depends on projection and publication of the collision world
   plus the ManyForge engine; RoboPlan's own checks cannot admit a dispatch.
 
@@ -397,22 +470,22 @@ spring_back_planning (planning cap 400 ms · prep 534 of 500 ms)".
 |---|---|
 | RoboPlan pin and carried patches | `third_party/roboplan/README.md`, `third_party/roboplan/patches.sha256`, `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`) |
 | Planner block types and ranges | `manyforge_core/include/manyforge_core/types/planner_settings.hpp`, `manyforge_roboplan/include/manyforge_roboplan/roboplan_planner_options.hpp` |
-| Robot runtime defaults (planner block, clearance, check step, fresh-plan check, Cartesian timing, Real Stop lead-in, TCP offset sync; C++ and the GUI's "Default") | `manyforge_core/resources/robot_defaults.tsv`, generated by `manyforge_core/tools/generate_robot_defaults.py` (`scripts/regen.py`) |
+| Robot and cell runtime defaults (planner block, clearance, check step, fresh-plan check, Cartesian timing, Real Stop lead-in, TCP offset sync; C++ and the GUI's "Default") | `manyforge_core/resources/robot_defaults.tsv`, generated by `manyforge_core/tools/generate_robot_defaults.py` (`scripts/regen.py`) |
 | RRT, best_of_n, Cartesian timing and TCP time-scaling | `manyforge_roboplan/src/roboplan_candidate_computer.cpp` (`densify_cartesian_path`, `prepare_candidate_time_law`) |
+| Linear pose moves (start pose by FK, two-waypoint line) | `manyforge_core/include/manyforge_core/types/motion_spec.hpp` (`LinearPoseMotionDTO`, `linear_pose_path`), `manyforge_roboplan/src/roboplan_candidate_computer.cpp` (`compute`) |
 | Pre-dispatch validation and the fresh-plan check setting | `manyforge_core/src/execution_kernel.cpp` (`collision_check_fresh_plans`, `collision_checked_by_planning`) |
 | Mount collision exclusions | `manyforge_deployment/src/cell_composition.cpp`, `compose_cell_occurrences` |
-| Effective collision policy (fixed-object pairs, touch links, declared support contacts) | `manyforge_roboplan/src/retained_collision_world_projector.cpp`, `RetainedCollisionWorldProjector::project_effective_policy` |
+| Scene collision policy (static bodies, grip pairs of the attachments) | `manyforge_roboplan/src/retained_collision_world_projector.cpp`, `RetainedCollisionWorldProjector::project_effective_policy` |
+| Collision rule types, resolution at admission | `manyforge_core/include/manyforge_core/types/collision_rule.hpp`, `manyforge_core/include/manyforge_core/collision/collision_rule_resolver.hpp` (`resolve_collision_rules`) |
 | Static component bodies | `manyforge_collision/src/manyforge_collision_engine.cpp`, `select_retained_static_component_bodies` |
 | Allowed pairs sent to the worker | `manyforge_roboplan/src/process_contained_candidate_client.cpp`, `project_worker_model`, `native_contact_pairs` |
 | Planner scene build, `setCollisions`, frame-relative placement, per-request contact pairs | `manyforge_roboplan/src/roboplan_candidate_worker_main.cpp`, `make_scene`, `apply_contact_pairs` |
 | Start/goal `hasCollisions` checks | `manyforge_roboplan/src/roboplan_candidate_computer.cpp` |
 | Start-contact discovery | `manyforge_core/src/execution_kernel.cpp`, `discover_dynamic_carried_start_contacts`, `with_dynamic_carried_start_contacts` |
-| Support-contact types and defaults | `manyforge_core/include/manyforge_core/types/collision.hpp` (`SupportContactPolicyEntry`), `manyforge_core/include/manyforge_core/types/scene_edit.hpp` (`SupportContactDTO`) |
-| Authored `metadata.support_contacts` parsing | `manyforge_deployment/src/initial_scene_projection.cpp` |
-| Support-contact field validation | `manyforge_scene/src/logical_scene_owner_transactions.cpp` |
-| Release and bounded-contact evaluation | `manyforge_core/src/collision_policy_evaluator.cpp` |
+| Contact and release values and defaults | `manyforge_core/include/manyforge_core/types/collision.hpp` (`CollisionContactRule`, `CollisionReleaseRule`, `CollisionPairContactRule`) |
+| Release and contact evaluation | `manyforge_core/src/collision_policy_evaluator.cpp` |
 | Monitor period | `manyforge_core/include/manyforge_core/execution_kernel.hpp` |
-| Composer card | `manyforge_composer/frontend/src/components/ProgramSupportContactEditor.tsx` |
+| Composer rule table | `manyforge_composer/frontend/src/components/CollisionRulesTable.tsx` |
 | Example | `examples/sim_lite6_foundationpose_trocar_pick.scenario/program.yaml` |
 
 ## Upstream simplifications

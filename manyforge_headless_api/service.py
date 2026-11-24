@@ -16,6 +16,8 @@ import rfc8785
 from starlette.responses import JSONResponse
 
 from manyforge_behavior.node_environment import build_node_environment
+from manyforge_behavior.model_source_capture import SceneMeshPathError, read_scene_mesh
+from manyforge_behavior.project_paths import ProjectPathRule
 from manyforge_behavior.skill_loader import default_skills_dir, load_skill_catalog
 
 from .assistant_instruments import (
@@ -26,8 +28,10 @@ from .assistant_instruments import (
 from .activity_history import (
     apply_record,
     component_action_record,
+    program_node_attempt_record,
     program_reset_record,
     record_activity,
+    scene_change_record,
 )
 from .client import MAX_HTTP_RESPONSE_BYTES
 from .execution import ExecutionPort
@@ -40,6 +44,7 @@ from .models import (
     ProgramReferenceValidationRequest,
     CallerAttributionRequest,
     ApplyOutcomeRequest,
+    ProgramNodeAttemptBatchRequest,
     ProgramResetOutcomeRequest,
     IoSignalReadRequest,
     ManagerApplyRequest,
@@ -123,7 +128,6 @@ PROGRAM_NODE_PREVIEW_CHECK = "trajectory_planned_and_collision_validated"
 _PROGRAM_NODE_PREVIEW_IDENTITY_KEYS = (
     "request_key",
     "program_run_id",
-    "program_id",
     "program_revision",
     "program_binding_id",
     "node_instance_id",
@@ -471,6 +475,7 @@ class HeadlessService:
         activation_preparer: Any | None = None,
         *,
         application_start_id: str,
+        scene_mesh_allowed_roots: Sequence[str] = (),
     ) -> None:
         # The one ``A`` check and the one Headless key minter (minter 5).
         self.admission = RequestAdmission(application_start_id)
@@ -480,6 +485,9 @@ class HeadlessService:
         self.program_runner = program_runner
         self.cell_admission = cell_admission
         self.activation_preparer = activation_preparer
+        # The allowed folders of API scene-call meshes (MANYFORGE_FS_ROOTS).
+        # The project path rule over the allowed folders (OD-335).
+        self.project_paths = ProjectPathRule(scene_mesh_allowed_roots)
         # The motion-attention projection the Kernel acknowledged holding
         # (OperatorAlarmAttentionPublisher.kernel_held_attention); None in a
         # composition without the publisher.
@@ -1179,15 +1187,18 @@ class HeadlessService:
     ) -> dict[str, Any]:
         return self._execution().get_runtime_scale_control(selector)
 
-    def runtime(self) -> dict[str, Any]:
+    def _runtime_snapshot(self) -> dict[str, Any]:
         snapshot = self.core.runtime_snapshot()
         if snapshot.get("schema_version") != RUNTIME_SNAPSHOT_VERSION:
             raise HeadlessApiError(
                 "headless_runtime_projection_invalid",
                 "runtime snapshot version is unsupported",
             )
+        return snapshot
+
+    def runtime(self) -> dict[str, Any]:
         # Headless-owned condition: available without querying Program Runner.
-        return {**snapshot, **self.initial_scene_status()}
+        return {**self._runtime_snapshot(), **self.initial_scene_status()}
 
     def component_overview_facts(
         self,
@@ -1261,7 +1272,8 @@ class HeadlessService:
         return self.manager.resolve_scene_resources(request)
 
     def _source_section(self, name: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        runtime = self.runtime()
+        # Sections and projection generation only: one native snapshot.
+        runtime = self._runtime_snapshot()
         sections = runtime.get("sections")
         section = sections.get(name) if isinstance(sections, dict) else None
         if not isinstance(section, dict):
@@ -1500,7 +1512,6 @@ class HeadlessService:
                 "node_environment_digest",
                 "owner_id",
                 "program_binding_id",
-                "program_id",
                 "program_revision",
                 "retained_bundle_id",
                 "scenario_id",
@@ -1537,7 +1548,6 @@ class HeadlessService:
                 "graph_revision",
                 "node_environment_digest",
                 "program_binding_id",
-                "program_id",
                 "program_revision",
                 "retained_bundle_id",
                 "scenario_id",
@@ -1751,7 +1761,6 @@ class HeadlessService:
         except ProgramBindingTransportError as error:
             raise HeadlessApiError("program_applied_selection_invalid", "native core returned an invalid Applied origin") from error
         expected_fields = {
-            "deployment_artifact_id",
             "deployment_revision",
             "executable",
             "graph_revision",
@@ -1759,7 +1768,6 @@ class HeadlessService:
             "non_executable",
             "program",
             "program_binding_id",
-            "program_id",
             "program_revision",
             "record_digest",
             "retained_bundle_id",
@@ -1772,22 +1780,19 @@ class HeadlessService:
             or type(executable) is not bool
             or (projection.get("program_binding_id") is None) is executable
             or (
-                projection.get("program_id") is None
+                projection.get("program_revision") is None
                 and (
-                    executable or projection.get("program_revision") is not None
+                    executable
                     or projection.get("non_executable") is not None
                     or projection.get("program") is not None
                 )
             )
             or (
-                projection.get("program_id") is not None
+                projection.get("program_revision") is not None
                 and (
                     (projection.get("non_executable") is None) is not executable
                     or (projection.get("program") is None) is not executable
                 )
-            )
-            or not _bounded_text(
-                projection.get("deployment_artifact_id"), maximum_bytes=256
             )
             or not isinstance(projection.get("deployment_revision"), str)
             or not _sha256_identity(projection["deployment_revision"])
@@ -1853,13 +1858,13 @@ class HeadlessService:
                         committed["record_digest"])
             applied = self.program_applied_status()
             if (committed["scene_initialization"] == "initialize"
-                and applied["program_id"] is None
+                and applied["program_revision"] is None
                 and applied["record_digest"] == identity[2]):
                 self._clear_empty_applied(identity)
                 return
             if (
                 committed["scene_initialization"] != "initialize"
-                or applied["program_id"] is None
+                or applied["program_revision"] is None
                 or applied["record_digest"] != committed["record_digest"]
             ):
                 # A committed empty Apply whose Applied Program does not
@@ -2242,7 +2247,6 @@ class HeadlessService:
             "node_policy_digest",
             "owner_identities",
             "program_binding_id",
-            "program_id",
             "program_revision",
             "program_run_id",
             "retained_bundle_id",
@@ -2309,7 +2313,6 @@ class HeadlessService:
             or type(capture.get("program_run_id")) is not int
             or not 1 <= capture["program_run_id"] <= 9_007_199_254_740_991
             or not _bounded_text(capture.get("scenario_id"), maximum_bytes=128)
-            or not _bounded_text(capture.get("program_id"), maximum_bytes=512)
             or any(
                 not _sha256_identity(capture.get(field_name))
                 for field_name in (
@@ -2721,6 +2724,12 @@ class HeadlessService:
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
+    def program_runtime_blackboard_values(self, program_run_id: int) -> dict[str, Any]:
+        try:
+            return self._program_runner().runtime_blackboard_values(program_run_id)
+        except ProgramRunnerClientError as error:
+            raise self._runner_error(error) from error
+
     def program_node_correction_preview(
         self,
         program_run_id: int,
@@ -2836,7 +2845,6 @@ class HeadlessService:
             or not isinstance(target, dict)
             or intent.request_context.request_key != request.request_key
             or intent.program_run_id != program_run_id
-            or intent.program_id != request.program_id
             or intent.program_revision != request.program_revision
             or intent.program_binding_id != request.program_binding_id
             or intent.expected_retained_bundle_id != built["retained_bundle_id"]
@@ -2978,7 +2986,9 @@ class HeadlessService:
         return _assistant_instruments().compose_index(projection)
 
     def scene(self) -> dict[str, Any]:
-        runtime = self.runtime()
+        # One native snapshot: the Scene read needs neither the initial-Scene
+        # condition nor the committed activation `runtime()` adds.
+        runtime = self._runtime_snapshot()
         sections = runtime["sections"]
         return {
             "schema_version": "manyforge.scene_projection.v2",
@@ -3276,6 +3286,21 @@ class HeadlessService:
             body["outcome"], body["error"], body["reset"]
         ))
 
+    def record_program_node_attempts(
+        self, request: ProgramNodeAttemptBatchRequest
+    ) -> dict[str, Any]:
+        """Finished Program node attempts into History, one event each
+        (``activity_history``, OD-375)."""
+
+        recorded = sum(
+            record_activity(self.core, program_node_attempt_record(attempt))
+            for attempt in request.model_dump(mode="json")["attempts"]
+        )
+        return {
+            "schema_version": "manyforge.program_node_attempt_record.v1",
+            "recorded": recorded,
+        }
+
     def manager_deployment_candidate_preview(
         self, request: ManagerDeploymentCandidatePreviewRequest
     ) -> dict[str, Any]:
@@ -3289,8 +3314,6 @@ class HeadlessService:
         )
         if (
             prepared is None
-            or prepared.get("deployment_artifact_id")
-            != request.deployment_artifact_id
             or prepared.get("deployment_revision") != request.deployment_revision
             or prepared.get("retained_bundle_id")
             != request.candidate_retained_bundle_id
@@ -3396,6 +3419,7 @@ class HeadlessService:
                 captured_input_digest=request.captured_input_digest,
                 deployment=request.deployment,
                 model_source_closure=request.model_source_closure,
+                scene_mesh_closure=request.scene_mesh_closure,
                 program=request.program,
             )
         except HeadlessApiError as error:
@@ -3514,6 +3538,7 @@ class HeadlessService:
         request: SceneTransactionRequest,
         attribution: TrustedAttribution,
     ) -> dict[str, Any]:
+        started_ns = time.monotonic_ns()
         authored = request.operation.kind in {
             "add_object",
             "upsert_object",
@@ -3544,16 +3569,127 @@ class HeadlessService:
                 "invalid_request",
                 "runtime scene mutation cannot carry Program Reset authorization",
             )
-        disconnects = self._manager_status_disconnects_now()
-        response = self.manager.commit_scene_transaction(
-            request,
-            trusted_principal_id=attribution.principal_id,
-        )
+        try:
+            captured = self._api_scene_mesh_capture(request)
+            disconnects = self._manager_status_disconnects_now()
+            if captured is None:
+                response = self.manager.commit_scene_transaction(
+                    request,
+                    trusted_principal_id=attribution.principal_id,
+                    mesh_content_digest=None,
+                )
+            else:
+                # Store and commit are one step for content collection: the
+                # shared content writer hold spans both, so the stored mesh
+                # cannot be collected before the committed Scene names it.
+                value, uri = captured
+                assert self.activation_preparer is not None
+                with self.activation_preparer.content_writer_hold():
+                    response = self.manager.commit_scene_transaction(
+                        request,
+                        trusted_principal_id=attribution.principal_id,
+                        mesh_content_digest=self.activation_preparer.store_scene_mesh(
+                            value, resource_uri=uri
+                        ),
+                    )
+        except HeadlessApiError as error:
+            self._record_scene_change(request, attribution, started_ns, None, error)
+            raise
+        self._record_scene_change(request, attribution, started_ns, response, None)
         if response.get("ok") is True:
             self._await_scene_publication(
                 response["committed_projection_revision"], disconnects
             )
         return response
+
+    def _record_scene_change(
+        self,
+        request: SceneTransactionRequest,
+        attribution: TrustedAttribution,
+        started_ns: int,
+        response: dict[str, Any] | None,
+        raised: HeadlessApiError | None,
+    ) -> None:
+        """One History event per scene change outside a Program node attempt
+        (OD-375, OD-378): every caller's, the Program Runner's own initial-scene
+        preparation, a Program Reset's reload and the empty-Apply clear. A
+        Program node's change is in its node attempt event; a replayed retry
+        changed nothing."""
+
+        if request.program_node_evidence is not None or (
+            response is not None and response.get("replay_status") == "replayed_exact"
+        ):
+            return
+        if raised is not None:
+            outcome, error = "failed", {
+                "code": raised.code, "message": str(raised), "details": raised.details,
+            }
+        elif response.get("ok") is True:
+            outcome, error = "succeeded", None
+        else:
+            outcome = (
+                "unknown"
+                if response.get("projection_status") == "failed_projection_uncertain"
+                else "refused"
+            )
+            error = response.get("error")
+        operation = request.operation
+        record_activity(self.core, scene_change_record(operation.kind, outcome, error, {
+            "scene_resource_id": getattr(operation, "scene_resource_id", None)
+            or getattr(operation, "expected_scene_resource_id", None),
+            "source_label": request.request_context.source_label,
+            "principal_id": attribution.principal_id,
+            "duration_ms": (time.monotonic_ns() - started_ns) / 1e6,
+            "scene_revision_id": response["committed_projection_revision"][
+                "scene_revision"]["revision_id"] if outcome == "succeeded" else None,
+        }))
+
+    def _api_scene_mesh_capture(
+        self, request: SceneTransactionRequest
+    ) -> tuple[bytes, str] | None:
+        """Capture the mesh of an object an API scene call adds (OD-335).
+
+        A Program node commit or a Program Reset re-commit sends no digest:
+        the Manager fills it from the active Apply's captured meshes. Any
+        other add/upsert of a mesh object reads the mesh once under the
+        scene-mesh path rule (relative to the active Apply's Scenario project
+        folder); the caller stores it content-addressed in the activation
+        store and commits it under one content writer hold. Returns the bytes
+        and the URI, or None when nothing is captured.
+        """
+
+        operation = request.operation
+        if (
+            request.program_node_evidence is not None
+            or request.program_reset_scene_authorization is not None
+            or operation.kind not in {"add_object", "upsert_object"}
+            or operation.shape.type != "mesh"
+        ):
+            return None
+        uri = operation.shape.mesh_resource_uri
+        if self.activation_preparer is None:
+            raise HeadlessApiError(
+                "scene_mesh_unavailable",
+                f"Scene mesh {uri!r} cannot be captured: activation "
+                "preparation is not configured",
+            )
+        try:
+            project_path = self.program_applied_status()["origin"]["project_path"]
+        except HeadlessApiError as error:
+            raise HeadlessApiError(
+                "scene_mesh_unavailable",
+                f"Scene mesh {uri!r} cannot be captured: no active Apply names "
+                "a Scenario project folder",
+            ) from error
+        try:
+            _path, value = read_scene_mesh(
+                uri,
+                project_folder=project_path,
+                paths=self.project_paths,
+            )
+        except SceneMeshPathError as error:
+            raise HeadlessApiError(error.code, str(error)) from error
+        return value, uri
 
     def scene_runtime_owner(self) -> dict[str, Any]:
         return self.manager.scene_runtime_owner()
@@ -3583,7 +3719,10 @@ class HeadlessService:
         or on shutdown. Tick silence does not end it: a commit that held the
         Manager's loop leaves the mirror "not answering" when its reply
         arrives, while the section frames, sent before the reply, still come.
-        No time limit: each mirror change wakes the check."""
+        No time limit: each mirror change wakes the check. The counter is read
+        before the mirror, so a change after the read wakes the wait. The
+        mirror is read lock-free (OD-378): its logical scene's last valid
+        value, whatever its freshness."""
 
         lineage = (
             committed["retained_bundle_id"],
@@ -3595,12 +3734,9 @@ class HeadlessService:
             with self._manager_status:
                 seen = self._manager_status_changes
                 gone = self._manager_status_disconnects != disconnects
-            section = self.core.runtime_snapshot()["sections"]["logical_scene"]
-            # Null before the Manager's bootstrap publication, or with no
+            # None before the Manager's bootstrap publication, or with no
             # value yet: not yet shown.
-            shown = ((section.get("payload") or {}).get("access") or {}).get(
-                "active_projection"
-            )
+            shown = self.core.logical_scene_active_projection()
             if shown is not None:
                 if (
                     shown["retained_bundle_id"],
@@ -3618,10 +3754,12 @@ class HeadlessService:
     def scene_transaction_status(
         self, request: SceneTransactionRequest
     ) -> dict[str, Any]:
+        # The request digest leaves out mesh content: a lookup captures nothing.
         return self.manager.scene_transaction_status(request)
 
     def health(self) -> dict[str, Any]:
-        runtime = self.runtime()
+        # `complete` and `reasons` only: one native snapshot.
+        runtime = self._runtime_snapshot()
         alarms = self.core.alarm_snapshot(limit=0, states=())
         historian = self.core.historian_health()
         try:

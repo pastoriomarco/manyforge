@@ -33,7 +33,7 @@ namespace manyforge::roboplan_backend {
          left.frame_bindings == right.frame_bindings && left.resources == right.resources &&
          left.collision_body_bindings == right.collision_body_bindings &&
          left.runtime_unit_epochs == right.runtime_unit_epochs &&
-         right.contact_grasp_bindings.empty() &&
+         right.collision_rule_bodies.empty() &&
          left_path.control_domain_id == right_path.control_domain_id &&
          left_path.control_domain_revision == right_path.control_domain_revision &&
          left_path.control_interface_contract_id == right_path.control_interface_contract_id &&
@@ -65,15 +65,20 @@ retained_product_reseal_physical_owner_difference(
   auto after = candidate.value();
   // These fields describe the authored Program/product seal, not the physical
   // controller. The resolved model, frame, resource, route, provider and
-  // runtime-unit facts remain byte-for-byte equal below. Contact/grasp
-  // templates are consumed by admitted Program operations and do not alter
-  // the retained controller itself.
-  after.program_id = before.program_id;
+  // runtime-unit facts remain byte-for-byte equal below. The
+  // collision-rule body bindings are consumed by admitted Program operations
+  // and do not alter the retained controller itself. Neither do the
+  // Program-wide frame and collision-body references (motion reference
+  // projection only): a robot's direct-control Program lists every tool's
+  // TCPs in the cell, so another robot's tool change alters them. The
+  // Kernel's retained-registration check holds them as product seal too.
   after.program_revision = before.program_revision;
   after.program_binding_id = before.program_binding_id;
   after.retained_bundle_id = before.retained_bundle_id;
   after.graph_revision = before.graph_revision;
-  after.contact_grasp_bindings = before.contact_grasp_bindings;
+  after.collision_rule_bodies = before.collision_rule_bodies;
+  after.program_frame_bindings = before.program_frame_bindings;
+  after.program_collision_body_bindings = before.program_collision_body_bindings;
 
   if (after.controllable_component_id != before.controllable_component_id)
     return "controllable_component_id";

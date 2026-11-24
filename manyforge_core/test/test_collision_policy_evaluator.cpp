@@ -1,15 +1,19 @@
 // Unit tests for the CollisionPolicyEvaluator: free-space default,
-// static-static filtering, support-contact state machine (start / continued
-// / separated / recontact violation), touch-link allowances, and the
-// diagnostic-incomplete fail-closed rule.
+// static-static filtering, the contact state machine of tracked contact-rule
+// pairs (start / continued / separated / recontact violation), touch-link
+// allowances, contact-rule kinds, and the diagnostic-incomplete fail-closed
+// rule.
 
 #include <manyforge_core/collision/collision_policy_evaluator.hpp>
+
+#include "collision_rule_test_helpers.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace manyforge::core {
@@ -71,41 +75,75 @@ TEST(CollisionPolicyEvaluator, NoObservedPairsAccepts) {
 
 // --- Static-static filtering -----------------------------------------------
 
-TEST(CollisionPolicyEvaluator, StaticStaticAllowedWhenListed) {
+TEST(CollisionPolicyEvaluator, TwoStaticBodiesAreNeverChecked) {
   auto snapshot = make_free_space_policy();
-  const auto p = pair("scene/fixture_a/shape/0",
-                      "scene/fixture_b/shape/0");
-  snapshot.allowed_static_static_pairs.push_back(p);
+  const std::string base =
+      "component/ur10e/model/ur10e_model/body/base/collision/0";
+  const std::string fixture_a = "scene/fixture_a/shape/0";
+  const std::string fixture_b = "scene/fixture_b/shape/0";
+  snapshot.static_body_ids = {base, fixture_a, fixture_b};
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
-  auto out = ev.classify({p}, rev(2, "world-r2"));
-  ASSERT_EQ(out.pairs.size(), 1u);
-  EXPECT_EQ(out.pairs[0].classification,
-            CollisionPairClassification::kAllowedStaticStatic);
+  // Fixed x fixed and static component body x fixed: one rule by class.
+  auto out = ev.classify({pair(fixture_a, fixture_b), pair(base, fixture_b)},
+                         rev(2, "world-r2"));
+  ASSERT_EQ(out.pairs.size(), 2u);
+  for (const auto& entry : out.pairs) {
+    EXPECT_EQ(entry.classification,
+              CollisionPairClassification::kAllowedStaticStatic);
+  }
   EXPECT_TRUE(out.decision.accepted);
 }
 
-TEST(CollisionPolicyEvaluator,
-     StaticStaticAllowanceDoesNotMaskUnrelatedCollisions) {
+TEST(CollisionPolicyEvaluator, StaticBodyAgainstAMovingBodyIsStillChecked) {
   auto snapshot = make_free_space_policy();
-  const auto allowed = pair("scene/fixture_a/shape/0",
-                            "scene/fixture_b/shape/0");
-  const auto unrelated = pair(
-      "component/ur10e/model/ur10e_model/body/wrist/collision/0",
-      "scene/cheese_box/shape/0");
-  snapshot.allowed_static_static_pairs.push_back(allowed);
+  const std::string fixture_a = "scene/fixture_a/shape/0";
+  const std::string fixture_b = "scene/fixture_b/shape/0";
+  snapshot.static_body_ids = {fixture_a, fixture_b};
+  const auto allowed = pair(fixture_a, fixture_b);
+  const auto moving = pair(
+      "component/ur10e/model/ur10e_model/body/wrist/collision/0", fixture_a);
+  // A carried object is never static, whatever it touches.
+  const auto carried = pair("scene/cheese_box/shape/0", fixture_b);
   CollisionPolicyEvaluator ev(std::move(snapshot));
 
-  auto out = ev.classify({allowed, unrelated}, rev(2, "world-r2"));
-  ASSERT_EQ(out.pairs.size(), 2u);
+  auto out = ev.classify({allowed, moving, carried}, rev(2, "world-r2"));
+  ASSERT_EQ(out.pairs.size(), 3u);
   const auto* allowed_entry = find_pair(out.pairs, allowed);
-  const auto* unrelated_entry = find_pair(out.pairs, unrelated);
+  const auto* moving_entry = find_pair(out.pairs, moving);
+  const auto* carried_entry = find_pair(out.pairs, carried);
   ASSERT_NE(allowed_entry, nullptr);
-  ASSERT_NE(unrelated_entry, nullptr);
+  ASSERT_NE(moving_entry, nullptr);
+  ASSERT_NE(carried_entry, nullptr);
   EXPECT_EQ(allowed_entry->classification,
             CollisionPairClassification::kAllowedStaticStatic);
-  EXPECT_EQ(unrelated_entry->classification,
+  EXPECT_EQ(moving_entry->classification,
             CollisionPairClassification::kBlockingCollision);
+  EXPECT_EQ(carried_entry->classification,
+            CollisionPairClassification::kBlockingCollision);
+  EXPECT_FALSE(out.decision.accepted);
+}
+
+TEST(CollisionPolicyEvaluator, ManyFixedObjectsNeedNoPairList) {
+  // 200 cell-fixed objects: 200 static bodies, not 19900 pairs.
+  auto snapshot = make_free_space_policy();
+  for (int index = 0; index < 200; ++index) {
+    snapshot.static_body_ids.push_back(
+        "scene/fixed_" + std::to_string(1000 + index).substr(1U) + "/shape/0");
+  }
+  ASSERT_TRUE(std::is_sorted(snapshot.static_body_ids.begin(),
+                             snapshot.static_body_ids.end()));
+  const auto first = snapshot.static_body_ids.front();
+  const auto last = snapshot.static_body_ids.back();
+  CollisionPolicyEvaluator ev(std::move(snapshot));
+
+  auto out = ev.classify(
+      {pair(first, last),
+       pair("component/ur10e/model/ur10e_model/body/wrist/collision/0", last)},
+      rev(2, "world-r2"));
+  ASSERT_EQ(out.pairs.size(), 2u);
+  EXPECT_EQ(find_pair(out.pairs, pair(first, last))->classification,
+            CollisionPairClassification::kAllowedStaticStatic);
   EXPECT_FALSE(out.decision.accepted);
 }
 
@@ -151,39 +189,105 @@ TEST(CollisionPolicyEvaluator,
   EXPECT_FALSE(out.decision.accepted);
 }
 
-TEST(ContactGraspPolicy,
-     ExactOwnerResolvedBodyDoesNotMatchSameRoleOnAnotherComponent) {
-  ContactGraspPolicyEntry policy;
-  policy.policy_id = "contact_grasp.bound.test";
-  policy.selected_object_id = "part";
-  policy.allowed_robot_links = {
-      "component/tool_a/model/gripper/body/finger_left/collision/0"};
-  policy.max_penetration_m = 0.002;
-  policy.terminal_window_start_fraction = 0.75;
+TEST(ContactRuleKind, FollowsTheRuleValue) {
+  const auto p = pair("component/tool_a/model/gripper/body/finger_left/collision/0",
+                      "scene/part/shape/0");
+  const auto release = testing::release_rule(p);
+  const auto bounded = testing::contact_rule(p, 0.002);
+  const auto free_contact = testing::contact_rule(p);
+  const auto windowed = testing::contact_rule(p, std::nullopt, 0.8);
+  const auto windowed_limited = testing::contact_rule(p, 0.002, 0.8);
 
-  EXPECT_TRUE(contact_grasp_pair_matches(
-      pair("component/tool_a/model/gripper/body/finger_left/collision/0",
-           "scene/part/shape/0"),
-      policy));
-  EXPECT_FALSE(contact_grasp_pair_matches(
-      pair("component/tool_b/model/gripper/body/finger_left/collision/0",
-           "scene/part/shape/0"),
-      policy));
+  EXPECT_EQ(contact_rule_kind(release), ContactRuleKind::kRelease);
+  EXPECT_EQ(contact_rule_kind(bounded), ContactRuleKind::kBoundedContact);
+  EXPECT_EQ(contact_rule_kind(free_contact), ContactRuleKind::kFreeContact);
+  EXPECT_EQ(contact_rule_kind(windowed), ContactRuleKind::kWindowedContact);
+  EXPECT_EQ(contact_rule_kind(windowed_limited), ContactRuleKind::kWindowedContact);
+
+  EXPECT_TRUE(contact_rule_is_tracked(release));
+  EXPECT_TRUE(contact_rule_is_tracked(bounded));
+  EXPECT_FALSE(contact_rule_is_tracked(free_contact));
+  EXPECT_FALSE(contact_rule_is_tracked(windowed));
+
+  // A signed distance is needed only for a depth limit or signed release
+  // evidence.
+  EXPECT_TRUE(contact_rule_needs_signed_distance(release));
+  EXPECT_TRUE(contact_rule_needs_signed_distance(bounded));
+  EXPECT_FALSE(contact_rule_needs_signed_distance(free_contact));
+  EXPECT_FALSE(contact_rule_needs_signed_distance(windowed));
+  EXPECT_TRUE(contact_rule_needs_signed_distance(windowed_limited));
+  auto binary = testing::release_rule(p);
+  testing::release_of(binary).release_evidence_mode =
+      ContactReleaseEvidenceMode::kBinaryContact;
+  EXPECT_FALSE(contact_rule_needs_signed_distance(binary));
 }
 
-// --- Support-contact state machine -----------------------------------------
+TEST(ContactRuleKind, SelectedDistancePairsAreThePairsThatNeedADepth) {
+  const auto finger = pair("component/tool_a/model/gripper/body/finger_left/collision/0",
+                           "scene/part/shape/0");
+  const auto palm = pair("component/tool_a/model/gripper/body/palm/collision/0",
+                         "scene/part/shape/0");
+  const auto table = pair("scene/part/shape/0", "scene/table/shape/0");
+  const auto wall = pair("scene/part/shape/0", "scene/wall/shape/0");
+  auto policy = make_free_space_policy();
+  testing::add_contact_rule(policy, testing::contact_rule(finger, 0.002, 0.8));
+  testing::add_contact_rule(policy, testing::contact_rule(palm));
+  testing::add_contact_rule(policy, testing::release_rule(table));
+  auto binary = testing::release_rule(wall);
+  testing::release_of(binary) = CollisionReleaseRule{
+      ContactReleaseEvidenceMode::kBinaryContact, false, 0.0, 0.0, 0.0, true, false, false};
+  testing::add_contact_rule(policy, std::move(binary));
 
-CollisionPolicySnapshot make_support_contact_policy(
+  std::vector<CollisionPairId> expected{finger, table};
+  std::sort(expected.begin(), expected.end());
+  EXPECT_EQ(build_selected_collision_distance_pairs(policy), expected);
+  EXPECT_EQ(tracked_contact_rule_count(policy), 2u);
+}
+
+TEST(CollisionPolicyEvaluator, WholeMoveContactWithoutLimitIsAllowedAtEverySample) {
+  const auto p = pair("component/tool_a/model/gripper/body/finger_left/collision/0",
+                      "scene/part/shape/0");
+  auto policy = make_free_space_policy();
+  testing::add_contact_rule(policy, testing::contact_rule(p));
+  CollisionPolicyEvaluator evaluator(std::move(policy));
+
+  for (int sample = 0; sample < 3; ++sample) {
+    const auto out = evaluator.classify({p}, rev(2, "world-r2"));
+    ASSERT_EQ(out.pairs.size(), 1u);
+    EXPECT_EQ(out.pairs.front().classification,
+              CollisionPairClassification::kAllowedContactRule);
+    EXPECT_TRUE(out.decision.accepted);
+  }
+  // No contact state is tracked for it.
+  EXPECT_TRUE(evaluator.support_contact_state().empty());
+}
+
+TEST(CollisionPolicyEvaluator, WindowedContactStaysBlockingForTheSurfaceToDecide) {
+  const auto p = pair("component/tool_a/model/gripper/body/finger_left/collision/0",
+                      "scene/part/shape/0");
+  auto policy = make_free_space_policy();
+  testing::add_contact_rule(policy, testing::contact_rule(p, 0.002, 0.8));
+  CollisionPolicyEvaluator evaluator(std::move(policy));
+
+  const auto out = evaluator.classify({p}, rev(2, "world-r2"));
+  ASSERT_EQ(out.pairs.size(), 1u);
+  EXPECT_EQ(out.pairs.front().classification,
+            CollisionPairClassification::kBlockingCollision);
+  EXPECT_FALSE(out.decision.accepted);
+}
+
+// --- Contact state machine of tracked rules ---------------------------------
+
+CollisionPolicySnapshot make_release_policy(
     const CollisionPairId& p, bool allow_recontact) {
   auto s = make_free_space_policy();
   s.policy_id = "pick_with_object";
   s.revision.revision_id = 5;
-  SupportContactPolicyEntry entry;
-  entry.pair = p;
-  entry.max_start_penetration_m = 1e-3;
-  entry.require_separation_by_end = true;
-  entry.allow_recontact = allow_recontact;
-  s.support_contacts.push_back(std::move(entry));
+  auto entry = testing::release_rule(p);
+  testing::release_of(entry).max_start_penetration_m = 1e-3;
+  testing::release_of(entry).require_separation_by_end = true;
+  testing::release_of(entry).allow_recontact = allow_recontact;
+  testing::add_contact_rule(s, std::move(entry));
   return s;
 }
 
@@ -191,7 +295,7 @@ TEST(CollisionPolicyEvaluator, SupportContactStartAllowedThenContinued) {
   const auto p = pair("scene/cheese_box/shape/0",
                       "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
-      make_support_contact_policy(p, /*allow_recontact=*/false));
+      make_release_policy(p, /*allow_recontact=*/false));
 
   auto first = ev.classify({p}, rev(2, "world-r2"));
   ASSERT_EQ(first.pairs.size(), 1u);
@@ -210,7 +314,7 @@ TEST(CollisionPolicyEvaluator, SupportContactSeparationEmitsSeparatedEntry) {
   const auto p = pair("scene/cheese_box/shape/0",
                       "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
-      make_support_contact_policy(p, /*allow_recontact=*/false));
+      make_release_policy(p, /*allow_recontact=*/false));
 
   ev.classify({p}, rev(2, "world-r2"));         // start
   ev.classify({p}, rev(2, "world-r2"));         // continued
@@ -227,7 +331,7 @@ TEST(CollisionPolicyEvaluator,
   const auto p = pair("scene/cheese_box/shape/0",
                       "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
-      make_support_contact_policy(p, /*allow_recontact=*/false));
+      make_release_policy(p, /*allow_recontact=*/false));
 
   ev.classify({p}, rev(2, "world-r2"));         // start
   ev.classify({}, rev(2, "world-r2"));          // separated
@@ -244,7 +348,7 @@ TEST(CollisionPolicyEvaluator, SupportContactRecontactAllowedWhenPolicySays) {
   const auto p = pair("scene/cheese_box/shape/0",
                       "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
-      make_support_contact_policy(p, /*allow_recontact=*/true));
+      make_release_policy(p, /*allow_recontact=*/true));
 
   ev.classify({p}, rev(2, "world-r2"));         // start
   ev.classify({}, rev(2, "world-r2"));          // separated
@@ -260,7 +364,7 @@ TEST(CollisionPolicyEvaluator, ResetClearsSupportContactStateMachine) {
   const auto p = pair("scene/cheese_box/shape/0",
                       "scene/table/shape/0");
   CollisionPolicyEvaluator ev(
-      make_support_contact_policy(p, /*allow_recontact=*/false));
+      make_release_policy(p, /*allow_recontact=*/false));
 
   ev.classify({p}, rev(2, "world-r2"));         // start
   ev.classify({}, rev(2, "world-r2"));          // separated
@@ -276,18 +380,17 @@ TEST(CollisionPolicyEvaluator, ResetClearsSupportContactStateMachine) {
 
 TEST(ContactReleaseTransition,
      BinaryContactUsesPresenceOnlyAndAllowsContactPlateaus) {
-  SupportContactPolicyEntry policy;
-  policy.pair = pair("scene/part/shape/0", "scene/table/shape/0");
-  policy.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
-  policy.enforce_max_start_penetration = false;
-  policy.release_tolerance_m = 0.0;
-  policy.min_release_progress_m = 0.0;
-  policy.require_strictly_decreasing_penetration = false;
+  auto policy = testing::release_rule(pair("scene/part/shape/0", "scene/table/shape/0"));
+  testing::release_of(policy).release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  testing::release_of(policy).enforce_max_start_penetration = false;
+  testing::release_of(policy).release_tolerance_m = 0.0;
+  testing::release_of(policy).min_release_progress_m = 0.0;
+  testing::release_of(policy).require_strictly_decreasing_penetration = false;
 
   ContactReleaseEvaluationState state;
   EXPECT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = true, .signed_clearance_m = std::nullopt},
+                  {.in_contact = true, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                   state)
                   .accepted());
   EXPECT_TRUE(state.started_in_contact);
@@ -296,7 +399,7 @@ TEST(ContactReleaseTransition,
 
   EXPECT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = true, .signed_clearance_m = std::nullopt},
+                  {.in_contact = true, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                   state)
                   .accepted());
   EXPECT_TRUE(state.in_contact);
@@ -304,7 +407,7 @@ TEST(ContactReleaseTransition,
 
   EXPECT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = false, .signed_clearance_m = std::nullopt},
+                  {.in_contact = false, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                   state)
                   .accepted());
   EXPECT_TRUE(state.separated);
@@ -312,22 +415,22 @@ TEST(ContactReleaseTransition,
 }
 
 TEST(ContactReleaseTransition, BinaryContactRejectsNewPairAndRecontact) {
-  SupportContactPolicyEntry policy;
-  policy.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
-  policy.enforce_max_start_penetration = false;
-  policy.release_tolerance_m = 0.0;
-  policy.min_release_progress_m = 0.0;
-  policy.require_strictly_decreasing_penetration = false;
+  auto policy = testing::release_rule();
+  testing::release_of(policy).release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  testing::release_of(policy).enforce_max_start_penetration = false;
+  testing::release_of(policy).release_tolerance_m = 0.0;
+  testing::release_of(policy).min_release_progress_m = 0.0;
+  testing::release_of(policy).require_strictly_decreasing_penetration = false;
 
   ContactReleaseEvaluationState initially_clear;
   ASSERT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = false, .signed_clearance_m = std::nullopt},
+                  {.in_contact = false, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                   initially_clear)
                   .accepted());
   EXPECT_EQ(advance_contact_release_sample(
                 policy,
-                {.in_contact = true, .signed_clearance_m = std::nullopt},
+                {.in_contact = true, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                 initially_clear)
                 .failure,
             ContactReleaseTransitionFailure::kNewContactAfterClearStart);
@@ -335,17 +438,17 @@ TEST(ContactReleaseTransition, BinaryContactRejectsNewPairAndRecontact) {
   ContactReleaseEvaluationState released;
   ASSERT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = true, .signed_clearance_m = std::nullopt},
+                  {.in_contact = true, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                   released)
                   .accepted());
   ASSERT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = false, .signed_clearance_m = std::nullopt},
+                  {.in_contact = false, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                   released)
                   .accepted());
   EXPECT_EQ(advance_contact_release_sample(
                 policy,
-                {.in_contact = true, .signed_clearance_m = std::nullopt},
+                {.in_contact = true, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                 released)
                 .failure,
             ContactReleaseTransitionFailure::kRecontactAfterRelease);
@@ -353,20 +456,20 @@ TEST(ContactReleaseTransition, BinaryContactRejectsNewPairAndRecontact) {
 
 TEST(ContactReleaseTransition,
      SignedPenetrationNeedsMetricOnlyWhilePairIsColliding) {
-  SupportContactPolicyEntry policy;
-  policy.max_start_penetration_m = 0.1;
+  auto policy = testing::release_rule();
+  testing::release_of(policy).max_start_penetration_m = 0.1;
 
   ContactReleaseEvaluationState state;
   ASSERT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = true, .signed_clearance_m = -0.04},
+                  {.in_contact = true, .signed_clearance_m = -0.04, .path_steps = std::nullopt},
                   state)
                   .accepted());
   EXPECT_DOUBLE_EQ(*state.initial_depth_m, 0.04);
 
   EXPECT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = false, .signed_clearance_m = std::nullopt},
+                  {.in_contact = false, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                   state)
                   .accepted());
   EXPECT_TRUE(state.separated);
@@ -375,7 +478,7 @@ TEST(ContactReleaseTransition,
   ContactReleaseEvaluationState missing;
   EXPECT_EQ(advance_contact_release_sample(
                 policy,
-                {.in_contact = true, .signed_clearance_m = std::nullopt},
+                {.in_contact = true, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                 missing)
                 .failure,
             ContactReleaseTransitionFailure::
@@ -384,13 +487,13 @@ TEST(ContactReleaseTransition,
 
 TEST(ContactReleaseTransition,
      SignedPenetrationUsesCollisionPresenceAndRejectsContradictoryMetric) {
-  SupportContactPolicyEntry policy;
-  policy.max_start_penetration_m = 0.1;
+  auto policy = testing::release_rule();
+  testing::release_of(policy).max_start_penetration_m = 0.1;
 
   ContactReleaseEvaluationState touching;
   EXPECT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = true, .signed_clearance_m = 0.0},
+                  {.in_contact = true, .signed_clearance_m = 0.0, .path_steps = std::nullopt},
                   touching)
                   .accepted());
   EXPECT_TRUE(touching.started_in_contact);
@@ -399,7 +502,7 @@ TEST(ContactReleaseTransition,
   ContactReleaseEvaluationState contradictory;
   EXPECT_EQ(advance_contact_release_sample(
                 policy,
-                {.in_contact = true, .signed_clearance_m = 0.001},
+                {.in_contact = true, .signed_clearance_m = 0.001, .path_steps = std::nullopt},
                 contradictory)
                 .failure,
             ContactReleaseTransitionFailure::
@@ -408,29 +511,27 @@ TEST(ContactReleaseTransition,
 
 TEST(ContactReleaseTransition,
      BoundedPenetrationAllowsAppearanceRecontactAndFinalContact) {
-  SupportContactPolicyEntry policy;
-  policy.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  policy.max_contact_penetration_m = 0.005;
+  auto policy = testing::contact_rule({}, 0.005);
 
   ContactReleaseEvaluationState state;
   EXPECT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = false, .signed_clearance_m = std::nullopt},
+                  {.in_contact = false, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                   state)
                   .accepted());
   EXPECT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = true, .signed_clearance_m = -0.004},
+                  {.in_contact = true, .signed_clearance_m = -0.004, .path_steps = std::nullopt},
                   state)
                   .accepted());
   EXPECT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = false, .signed_clearance_m = std::nullopt},
+                  {.in_contact = false, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                   state)
                   .accepted());
   EXPECT_TRUE(advance_contact_release_sample(
                   policy,
-                  {.in_contact = true, .signed_clearance_m = -0.003},
+                  {.in_contact = true, .signed_clearance_m = -0.003, .path_steps = std::nullopt},
                   state)
                   .accepted());
   EXPECT_TRUE(state.in_contact);
@@ -439,74 +540,69 @@ TEST(ContactReleaseTransition,
 
 TEST(ContactReleaseTransition,
      BoundedPenetrationRejectsInvalidTypedThreshold) {
-  SupportContactPolicyEntry policy;
-  policy.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  policy.max_contact_penetration_m = -0.001;
+  auto policy = testing::contact_rule({}, -0.001);
   ContactReleaseEvaluationState state;
 
   const auto result = advance_contact_release_sample(
-      policy, {.in_contact = false, .signed_clearance_m = std::nullopt}, state);
+      policy, {.in_contact = false, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt}, state);
 
   EXPECT_EQ(result.failure,
             ContactReleaseTransitionFailure::kInvalidPolicy);
   EXPECT_FALSE(state.initialized);
 }
 
-TEST(ContactReleaseTransition,
-     SharedHelperRejectsModeScopedFieldMixturesBeforeStateMutation) {
-  SupportContactPolicyEntry bounded;
-  bounded.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  bounded.max_contact_penetration_m = 0.005;
-  bounded.release_tolerance_m = 0.002;
-  ContactReleaseEvaluationState bounded_state;
-  EXPECT_FALSE(support_contact_policy_entry_valid(bounded));
-  EXPECT_EQ(advance_contact_release_sample(
-                bounded,
-                {.in_contact = true, .signed_clearance_m = -0.001},
-                bounded_state)
-                .failure,
-            ContactReleaseTransitionFailure::kInvalidPolicy);
-  EXPECT_FALSE(bounded_state.initialized);
-
-  SupportContactPolicyEntry signed_release;
-  signed_release.max_contact_penetration_m = 0.001;
-  ContactReleaseEvaluationState release_state;
-  EXPECT_FALSE(support_contact_policy_entry_valid(signed_release));
-  EXPECT_EQ(advance_contact_release_sample(
-                signed_release,
-                {.in_contact = false, .signed_clearance_m = std::nullopt},
-                release_state)
-                .failure,
-            ContactReleaseTransitionFailure::kInvalidPolicy);
-  EXPECT_FALSE(release_state.initialized);
-
-  SupportContactPolicyEntry binary;
-  binary.release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
-  binary.enforce_max_start_penetration = false;
-  binary.release_tolerance_m = 0.0;
-  binary.require_strictly_decreasing_penetration = false;
-  binary.min_release_progress_m = 0.001;
+TEST(ContactReleaseTransition, InvalidRuleValuesAreRefusedBeforeStateMutation) {
+  // A release with binary evidence admits only the default or the neutral
+  // signed-only fields.
+  auto binary = testing::release_rule();
+  testing::release_of(binary).release_evidence_mode = ContactReleaseEvidenceMode::kBinaryContact;
+  testing::release_of(binary).enforce_max_start_penetration = false;
+  testing::release_of(binary).release_tolerance_m = 0.0;
+  testing::release_of(binary).require_strictly_decreasing_penetration = false;
+  testing::release_of(binary).min_release_progress_m = 0.001;
   ContactReleaseEvaluationState binary_state;
-  EXPECT_FALSE(support_contact_policy_entry_valid(binary));
+  EXPECT_FALSE(contact_rule_valid(binary));
   EXPECT_EQ(advance_contact_release_sample(
                 binary,
-                {.in_contact = false, .signed_clearance_m = std::nullopt},
+                {.in_contact = false, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                 binary_state)
                 .failure,
             ContactReleaseTransitionFailure::kInvalidPolicy);
   EXPECT_FALSE(binary_state.initialized);
+
+  auto negative_release = testing::release_rule();
+  testing::release_of(negative_release).release_tolerance_m = -0.001;
+  EXPECT_FALSE(contact_rule_valid(negative_release));
+
+  EXPECT_FALSE(contact_rule_valid(testing::contact_rule({}, -0.001)));
+  EXPECT_FALSE(contact_rule_valid(testing::contact_rule({}, 0.001, 1.5)));
+  EXPECT_FALSE(contact_rule_valid(testing::contact_rule({}, std::nullopt, -0.1)));
+  EXPECT_TRUE(contact_rule_valid(testing::contact_rule()));
+  EXPECT_TRUE(contact_rule_valid(testing::contact_rule({}, 0.0, 0.0)));
+  EXPECT_TRUE(contact_rule_valid(testing::release_rule()));
+}
+
+TEST(ContactReleaseTransition, UntrackedContactRulesAreNotStateMachineInput) {
+  // Whole-move contact without a limit and windowed contact have no tracked
+  // state; the state machine refuses them without changing state.
+  for (const auto& rule : {testing::contact_rule(), testing::contact_rule({}, 0.002, 0.8)}) {
+    ContactReleaseEvaluationState state;
+    EXPECT_EQ(advance_contact_release_sample(
+                  rule, {.in_contact = true, .signed_clearance_m = -0.001, .path_steps = std::nullopt}, state)
+                  .failure,
+              ContactReleaseTransitionFailure::kInvalidPolicy);
+    EXPECT_FALSE(state.initialized);
+  }
 }
 
 TEST(ContactReleaseTransition,
      BoundedPenetrationRequiresMetricAndEnforcesEveryContactSample) {
-  SupportContactPolicyEntry policy;
-  policy.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  policy.max_contact_penetration_m = 0.005;
+  auto policy = testing::contact_rule({}, 0.005);
 
   ContactReleaseEvaluationState missing;
   EXPECT_EQ(advance_contact_release_sample(
                 policy,
-                {.in_contact = true, .signed_clearance_m = std::nullopt},
+                {.in_contact = true, .signed_clearance_m = std::nullopt, .path_steps = std::nullopt},
                 missing)
                 .failure,
             ContactReleaseTransitionFailure::
@@ -514,13 +610,99 @@ TEST(ContactReleaseTransition,
 
   ContactReleaseEvaluationState over_bound;
   const auto result = advance_contact_release_sample(
-      policy, {.in_contact = true, .signed_clearance_m = -0.006},
+      policy, {.in_contact = true, .signed_clearance_m = -0.006, .path_steps = std::nullopt},
       over_bound);
   EXPECT_EQ(result.failure,
             ContactReleaseTransitionFailure::
-                kContactPenetrationExceedsPolicy);
+                kContactPenetrationExceeded);
   ASSERT_TRUE(result.penetration_depth_m);
   EXPECT_DOUBLE_EQ(*result.penetration_depth_m, 0.006);
+}
+
+TEST(ContactReleaseTransition, GroupedSpringPairKeepsItsDepthLimitButNotItsOwnStep) {
+  // OD-371: a pair of a grouped spring is not a spring on its own; the rule's
+  // step is checked over all its pairs (spring_group_step_violations).
+  auto policy = testing::contact_rule({}, 0.010);
+  testing::contact_of(policy).max_compression_step_m = 0.002;
+  testing::contact_of(policy).spring_group =
+      CollisionSpringGroup{ControllableComponentId("holder"), "holder_rod", {0.0, 0.0, 1.0}};
+  ContactReleaseEvaluationState state;
+  EXPECT_TRUE(advance_contact_release_sample(
+                  policy, {.in_contact = false, .signed_clearance_m = 0.002, .path_steps = std::nullopt},
+                  state)
+                  .accepted());
+  EXPECT_TRUE(advance_contact_release_sample(
+                  policy, {.in_contact = true, .signed_clearance_m = -0.003, .path_steps = 1.0},
+                  state)
+                  .accepted());
+  EXPECT_EQ(advance_contact_release_sample(
+                policy, {.in_contact = true, .signed_clearance_m = -0.011, .path_steps = 1.0},
+                state)
+                .failure,
+            ContactReleaseTransitionFailure::kContactPenetrationExceeded);
+}
+
+TEST(ContactReleaseTransition, SpringRefusesACompressionJumpButAllowsSmoothPressing) {
+  // OD-356: a spring of 10 mm stroke whose depth may grow 2 mm per step.
+  auto policy = testing::contact_rule({}, 0.010);
+  testing::contact_of(policy).max_compression_step_m = 0.002;
+
+  ContactReleaseEvaluationState smooth;
+  for (const double depth : {0.0, 0.0015, 0.003, 0.0045, 0.006, 0.006, 0.004}) {
+    EXPECT_TRUE(advance_contact_release_sample(
+                    policy,
+                    {.in_contact = depth > 0.0,
+                     .signed_clearance_m = depth > 0.0 ? std::optional<double>(-depth)
+                                                       : std::optional<double>(0.01),
+                     .path_steps = 1.0},
+                    smooth)
+                    .accepted());
+  }
+
+  ContactReleaseEvaluationState step;
+  EXPECT_TRUE(advance_contact_release_sample(
+                  policy, {.in_contact = true, .signed_clearance_m = -0.001, .path_steps = 1.0},
+                  step)
+                  .accepted());
+  EXPECT_EQ(advance_contact_release_sample(
+                policy, {.in_contact = true, .signed_clearance_m = -0.0035, .path_steps = 1.0},
+                step)
+                .failure,
+            ContactReleaseTransitionFailure::kContactCompressionStepExceeded);
+
+  // First touch of a step face: from clear to 3 mm deep in one sample.
+  ContactReleaseEvaluationState face;
+  EXPECT_TRUE(advance_contact_release_sample(
+                  policy, {.in_contact = false, .signed_clearance_m = 0.002, .path_steps = std::nullopt}, face)
+                  .accepted());
+  EXPECT_EQ(advance_contact_release_sample(
+                policy, {.in_contact = true, .signed_clearance_m = -0.003, .path_steps = 1.0},
+                face)
+                .failure,
+            ContactReleaseTransitionFailure::kContactCompressionStepExceeded);
+
+  // Two steps apart the limit doubles; an unknown spacing is not checked.
+  ContactReleaseEvaluationState spaced;
+  EXPECT_TRUE(advance_contact_release_sample(
+                  policy, {.in_contact = true, .signed_clearance_m = -0.001, .path_steps = std::nullopt}, spaced)
+                  .accepted());
+  EXPECT_TRUE(advance_contact_release_sample(
+                  policy, {.in_contact = true, .signed_clearance_m = -0.0045, .path_steps = 2.0},
+                  spaced)
+                  .accepted());
+  EXPECT_TRUE(advance_contact_release_sample(
+                  policy, {.in_contact = true, .signed_clearance_m = -0.0095, .path_steps = std::nullopt}, spaced)
+                  .accepted());
+}
+
+TEST(ContactReleaseTransition, SpringStepLimitNeedsTheStroke) {
+  auto policy = testing::contact_rule({}, std::nullopt);
+  testing::contact_of(policy).max_compression_step_m = 0.002;
+  EXPECT_FALSE(contact_rule_valid(policy));
+  testing::contact_of(policy).max_penetration_m = 0.01;
+  EXPECT_TRUE(contact_rule_valid(policy));
+  testing::contact_of(policy).max_compression_step_m = 0.0;
+  EXPECT_FALSE(contact_rule_valid(policy));
 }
 
 TEST(CollisionPolicyEvaluator,
@@ -528,10 +710,8 @@ TEST(CollisionPolicyEvaluator,
   const auto p = pair(
       "component/arm/model/arm_model/body/tool/collision/0",
       "scene/part/shape/0");
-  auto snapshot = make_support_contact_policy(p, /*allow_recontact=*/false);
-  snapshot.support_contacts.front().mode =
-      CollisionContactPolicyMode::kBoundedPenetration;
-  snapshot.support_contacts.front().max_contact_penetration_m = 0.005;
+  auto snapshot = make_release_policy(p, /*allow_recontact=*/false);
+  snapshot.contact_rules.front().value = CollisionContactRule{0.005, 0.0, std::nullopt};
   CollisionPolicyEvaluator evaluator(std::move(snapshot));
 
   EXPECT_TRUE(evaluator.classify({p}, rev(2, "world-r2")).decision.accepted);
@@ -548,7 +728,7 @@ TEST(CollisionPolicyEvaluator,
   const auto p = pair("scene/cheese_box/shape/0",
                       "scene/table/shape/0");
   auto snapshot = std::make_shared<CollisionPolicySnapshot>(
-      make_support_contact_policy(p, /*allow_recontact=*/false));
+      make_release_policy(p, /*allow_recontact=*/false));
   auto index = build_collision_policy_index(*snapshot);
   CollisionPolicyEvaluator first(snapshot, index);
   CollisionPolicyEvaluator second(snapshot, index);
@@ -640,106 +820,31 @@ TEST(CollisionPolicyEvaluator,
   EXPECT_FALSE(out.pairs[1].is_first_failure);
 }
 
-// --- Collision clearance: per-pair margins from the policy ----------------
+// --- Collision clearance: the margin list names its rules -----------------
 
-CollisionWorldBody clearance_body(const std::string& id, CollisionOwnerKind owner,
-                                  std::optional<CollisionBodyId> parent = std::nullopt) {
-  CollisionWorldBody body;
-  body.body_id = id;
-  body.owner_kind = owner;
-  body.parent_body_id = std::move(parent);
-  body.frame_id = "world";
-  return body;
-}
+TEST(CollisionClearanceMargins, PairLookupGivesMarginAndRuleId) {
+  const auto wrist_wall = pair("component/arm/model/arm_model/body/wrist/collision/0",
+                               "scene/wall/shape/0");
+  const auto wrist_tray = pair("component/arm/model/arm_model/body/wrist/collision/0",
+                               "scene/tray/shape/0");
+  const auto unlisted = pair("component/arm/model/arm_model/body/base/collision/0",
+                             "scene/wall/shape/0");
+  CollisionClearanceMargins margins;
+  margins.rule_ids = {"everything", "wrist_near_tray"};
+  margins.pairs = {CollisionPairMargin{wrist_tray, 0.005, 1U},
+                   CollisionPairMargin{wrist_wall, 0.001, 0U}};
+  ASSERT_TRUE(std::is_sorted(
+      margins.pairs.begin(), margins.pairs.end(),
+      [](const CollisionPairMargin& a, const CollisionPairMargin& b) { return a.pair < b.pair; }));
 
-TEST(CollisionClearanceMargins, MarginFollowsTheContactPolicies) {
-  // A pair the contact policy allows to touch keeps margin 0;
-  // every other robot <-> environment pair gets the move's clearance. The
-  // move's target object is not exempt by itself.
-  const std::string base = "component/arm/model/arm_model/body/base/collision/0";
-  const std::string wrist = "component/arm/model/arm_model/body/wrist/collision/0";
-  const std::string fingers = "component/arm/model/arm_model/body/fingers/collision/0";
-  const std::string carried = "scene/part/shape/0";
-  const std::string table = "scene/table/shape/0";
-  const std::string wall = "scene/wall/shape/0";
-  const std::string tray = "scene/tray/shape/0";
-  const std::string target = "scene/graspable/shape/0";
-  const std::string runtime_box = "runtime_object/box/shape/0";
-  CollisionWorldSnapshot world;
-  world.bodies = {
-      clearance_body(base, CollisionOwnerKind::kComponentModelBody),
-      clearance_body(fingers, CollisionOwnerKind::kComponentModelBody),
-      clearance_body(wrist, CollisionOwnerKind::kComponentModelBody),
-      clearance_body(runtime_box, CollisionOwnerKind::kRuntimeObject),
-      clearance_body(target, CollisionOwnerKind::kSceneResource),
-      clearance_body(carried, CollisionOwnerKind::kSceneResource, wrist),
-      clearance_body(table, CollisionOwnerKind::kSceneResource),
-      clearance_body(tray, CollisionOwnerKind::kSceneResource),
-      clearance_body(wall, CollisionOwnerKind::kSceneResource),
-  };
-  auto policy = make_free_space_policy();
-  policy.allowed_static_static_pairs = {pair(base, table)};   // static
-  policy.allowed_touch_link_pairs = {pair(fingers, carried)};  // touch link
-  SupportContactPolicyEntry support;
-  support.pair = pair(carried, table);                         // support contact
-  policy.support_contacts = {support};
-  ContactGraspPolicyEntry grasp;
-  grasp.policy_id = "grasp_tray";
-  grasp.selected_object_id = "tray";
-  grasp.allowed_robot_links = {fingers};                       // grasp target contact
-  grasp.max_penetration_m = 0.002;
-  policy.contact_grasps = {grasp};
-
-  const auto margins = build_collision_clearance_margins(world, policy, "grasp_tray", 0.003);
-  ASSERT_NE(margins, nullptr);
-  EXPECT_DOUBLE_EQ(margins->margin_m, 0.003);
-  std::vector<CollisionPairId> expected{
-      pair(base, runtime_box),    pair(base, target),     pair(base, tray),
-      pair(base, wall),           pair(fingers, runtime_box), pair(fingers, target),
-      pair(fingers, table),       pair(fingers, wall),    pair(wrist, runtime_box),
-      pair(wrist, target),        pair(wrist, table),     pair(wrist, tray),
-      pair(wrist, wall),          pair(carried, runtime_box), pair(carried, target),
-      pair(carried, tray),        pair(carried, wall)};
-  std::sort(expected.begin(), expected.end());
-  std::vector<CollisionPairId> actual;
-  for (const auto& entry : margins->pairs) {
-    actual.push_back(entry.pair);
-    EXPECT_DOUBLE_EQ(entry.margin_m, 0.003);
-  }
-  EXPECT_EQ(actual, expected);
-  EXPECT_TRUE(std::is_sorted(actual.begin(), actual.end()));
-
-  // An allowed contact keeps margin 0 (its penetration tolerance stays with
-  // the policy evaluator); the normal pair next to it gets the clearance.
-  EXPECT_DOUBLE_EQ(margins->margin_for(pair(fingers, tray)), 0.0);     // grasp contact
-  EXPECT_DOUBLE_EQ(margins->margin_for(pair(wrist, tray)), 0.003);     // normal pair
-  EXPECT_DOUBLE_EQ(margins->margin_for(pair(base, table)), 0.0);       // static
-  EXPECT_DOUBLE_EQ(margins->margin_for(pair(fingers, carried)), 0.0);  // touch link
-  EXPECT_DOUBLE_EQ(margins->margin_for(pair(carried, table)), 0.0);    // support contact
-  EXPECT_DOUBLE_EQ(margins->margin_for(pair(fingers, target)), 0.003); // target, no policy
-  EXPECT_DOUBLE_EQ(margins->margin_for(pair(base, wrist)), 0.0);       // self
-  EXPECT_DOUBLE_EQ(margins->margin_for(pair(table, wall)), 0.0);       // environment only
-
-  // Without the active grasp the grasp pair is a normal pair; a per-move
-  // clearance is used as given.
-  const auto without_grasp = build_collision_clearance_margins(world, policy, "", 0.0015);
-  ASSERT_NE(without_grasp, nullptr);
-  EXPECT_DOUBLE_EQ(without_grasp->margin_m, 0.0015);
-  EXPECT_DOUBLE_EQ(without_grasp->margin_for(pair(fingers, tray)), 0.0015);
-  EXPECT_DOUBLE_EQ(without_grasp->margin_for(pair(wrist, runtime_box)), 0.0015);
-}
-
-TEST(CollisionClearanceMargins, ZeroClearanceOrNoEnvironmentMeansNoMargins) {
-  CollisionWorldSnapshot world;
-  world.bodies = {
-      clearance_body("component/arm/model/arm_model/body/wrist/collision/0",
-                     CollisionOwnerKind::kComponentModelBody),
-      clearance_body("scene/wall/shape/0", CollisionOwnerKind::kSceneResource)};
-  EXPECT_EQ(build_collision_clearance_margins(world, make_free_space_policy(), "", 0.0),
-            nullptr);
-  world.bodies.pop_back();
-  EXPECT_EQ(build_collision_clearance_margins(world, make_free_space_policy(), "", 0.003),
-            nullptr);
+  EXPECT_DOUBLE_EQ(margins.margin_for(wrist_tray), 0.005);
+  EXPECT_EQ(margins.rule_id_for(wrist_tray), "wrist_near_tray");
+  EXPECT_DOUBLE_EQ(margins.margin_for(wrist_wall), 0.001);
+  EXPECT_EQ(margins.rule_id_for(wrist_wall), "everything");
+  // A pair that is not listed keeps margin 0 and names no rule.
+  EXPECT_DOUBLE_EQ(margins.margin_for(unlisted), 0.0);
+  EXPECT_TRUE(margins.rule_id_for(unlisted).empty());
+  EXPECT_EQ(margins.find(unlisted), nullptr);
 }
 
 }  // namespace

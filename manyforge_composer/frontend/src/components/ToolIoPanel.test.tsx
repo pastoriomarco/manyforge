@@ -239,7 +239,7 @@ function cellSource(state: CellState) {
 describe('ToolIoPanel', () => {
   const stationTarget = { component_id: 'station', command_target_id: 'io' };
   const binding = {
-    api_version: 'manyforge.program_binding.v3',
+    api_version: 'manyforge.program_binding.v4',
     program_binding_id: BINDING_ID,
     retained_bundle_id: 'bundle.1',
     target_bindings: [{

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <string>
 #include <string_view>
@@ -12,6 +13,14 @@ namespace manyforge::component_manager::detail {
 
 inline constexpr std::size_t kMaximumNativeProjectionRpcPacketBytes =
     256U * 1024U;
+
+/// Thrown by the codec when a collection exceeds its entry bound or a packet
+/// its byte bound. Both endpoints refuse the one request with
+/// `native_projection_rpc_bound_exceeded`; neither process ends.
+class NativeProjectionRpcBoundExceeded final : public std::invalid_argument {
+public:
+  using std::invalid_argument::invalid_argument;
+};
 
 struct NativeProjectionPrepareRequest final {
   manyforge::core::ProjectionExecutionHostBindingDTO execution_host_binding;
@@ -95,6 +104,30 @@ struct NativeProjectionEffectivePolicyRequest final {
   }
 };
 
+/// One Scene commit preflight (OD-376): the health for the selected model
+/// and, given the owner's transaction, its candidate's effective collision
+/// policy. The candidate itself never crosses: the host applies the owner's
+/// resolved delta to its own predecessor.
+struct NativeProjectionCommitPreflightRequest final {
+  manyforge::core::ProjectionExecutionHostBindingDTO execution_host_binding;
+  manyforge::core::ProjectionRevisionDTO selected_projection_revision;
+  std::optional<manyforge::core::SceneTransactionDTO> transaction{};
+
+  [[nodiscard]] bool valid() const noexcept {
+    return execution_host_binding.valid() &&
+           selected_projection_revision.valid();
+  }
+};
+
+/// Absent `effective_policy`: no transaction, or the projection is not healthy
+/// at its predecessor.
+struct NativeProjectionCommitPreflightResult final {
+  manyforge::core::ProjectionHealthDTO health;
+  std::optional<std::variant<manyforge::core::CollisionPolicySnapshot,
+                             manyforge::core::ErrorDTO>>
+      effective_policy{};
+};
+
 struct NativeProjectionRetainResult final {
   manyforge::core::ProjectionLeaseBindingDTO projection_binding;
 };
@@ -112,7 +145,8 @@ using NativeProjectionRpcRequest =
                  NativeProjectionRetainRequest,
                  NativeProjectionReleaseRequest,
                  NativeProjectionSceneFrameRequest,
-                 NativeProjectionEffectivePolicyRequest>;
+                 NativeProjectionEffectivePolicyRequest,
+                 NativeProjectionCommitPreflightRequest>;
 
 struct NativeProjectionRpcFailure final {
   manyforge::core::ErrorDTO error;
@@ -127,7 +161,8 @@ using NativeProjectionRpcResponse =
                  NativeProjectionRetainResult,
                  NativeProjectionReleaseResult,
                  manyforge::core::SceneFrameResolutionReceiptDTO,
-                 manyforge::core::CollisionPolicySnapshot>;
+                 manyforge::core::CollisionPolicySnapshot,
+                 NativeProjectionCommitPreflightResult>;
 
 [[nodiscard]] std::string
 EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request);
@@ -136,6 +171,10 @@ DecodeNativeProjectionRpcRequest(std::string_view bytes);
 
 [[nodiscard]] std::string
 EncodeNativeProjectionRpcResponse(const NativeProjectionRpcResponse &response);
+/// The response, or, when it exceeds a codec bound, the typed refusal
+/// `native_projection_rpc_bound_exceeded` of this one request.
+[[nodiscard]] std::string EncodeNativeProjectionRpcResponseOrRefusal(
+    const NativeProjectionRpcResponse &response);
 [[nodiscard]] NativeProjectionRpcResponse
 DecodeNativeProjectionRpcResponse(std::string_view bytes);
 

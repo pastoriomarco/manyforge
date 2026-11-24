@@ -50,7 +50,7 @@ export function programDocumentStates(
       title: draft === 'incomplete'
         ? `Program Draft: incomplete. ${workspace?.draft.diagnostics[0]?.message ?? 'Complete it before Save or Apply.'}`
         : draft === 'modified'
-          ? 'Program Draft: modified (Scene edits included). Your edits are not saved to the file; Save writes them to the Scenario.'
+          ? 'Program Draft: modified (Scene edits included). Your edits are not saved to the file; Save writes them to the Scenario once they are applied.'
           : 'Program Draft: no unsaved edits.',
     },
     {
@@ -143,7 +143,7 @@ export function deploymentDocumentStates(
       letter: 'D',
       state: differsFromSaved ? 'modified' : 'draft',
       title: differsFromSaved
-        ? 'Deployment Draft: modified. Your edits are not saved to the file; Save writes them to the Scenario.'
+        ? 'Deployment Draft: modified. Your edits are not saved to the file; Save writes them to the Scenario once they are applied.'
         : 'Deployment Draft: no unsaved edits.',
     },
     {

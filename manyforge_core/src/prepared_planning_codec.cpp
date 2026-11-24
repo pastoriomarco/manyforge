@@ -743,8 +743,24 @@ CanonicalValue motion_value(const ResolvedMotionSpecDTO& m) {
                                  {"resources", ids(x.resources)},
                                  {"joint_names", strings(x.joint_names)},
                                  {"positions_rad", numbers(x.positions_rad)}})}});
-        else if constexpr (std::is_same_v<X, PoseGoalDTO>)
-          return CanonicalValue(CanonicalValue::Object{{"pose_goal", pose_value(x.goal)}});
+        else if constexpr (std::is_same_v<X, PoseGoalDTO>) {
+          if (!x.linear)
+            return CanonicalValue(CanonicalValue::Object{{"pose_goal", pose_value(x.goal)}});
+          const auto& l = *x.linear;
+          CanonicalValue::Object linear{
+              {"goal", pose_value(x.goal)},
+              {"max_translation_step_m", CanonicalValue(l.max_translation_step_m)},
+              {"max_rotation_step_rad", CanonicalValue(l.max_rotation_step_rad)},
+              {"max_angular_speed_rad_s", CanonicalValue(l.max_angular_speed_rad_s)},
+              {"max_linear_acceleration_mps2", CanonicalValue(l.max_linear_acceleration_mps2)},
+              {"max_angular_acceleration_rad_s2",
+               CanonicalValue(l.max_angular_acceleration_rad_s2)}};
+          if (l.speed_mode)
+            linear.emplace_back("speed_mode",
+                                CanonicalValue(std::string(cartesian_speed_mode_name(*l.speed_mode))));
+          return CanonicalValue(CanonicalValue::Object{
+              {"linear_pose_goal", CanonicalValue(std::move(linear))}});
+        }
         else if constexpr (std::is_same_v<X, CartesianPathDTO>) {
           CanonicalValue::Array w;
           for (const auto& p : x.waypoints) w.push_back(pose_value(p));
@@ -780,6 +796,24 @@ ResolvedMotionSpecDTO get_motion(const CanonicalValue& v) {
                                 get_numbers(member(*x, "positions_rad"))};
   }
   if (const auto* x = v.find_object_member("pose_goal")) return PoseGoalDTO{get_pose(*x)};
+  if (const auto* x = v.find_object_member("linear_pose_goal")) {
+    exact(*x, {"goal", "max_translation_step_m", "max_rotation_step_rad",
+               "max_angular_speed_rad_s", "max_linear_acceleration_mps2",
+               "max_angular_acceleration_rad_s2"},
+          {"speed_mode"});
+    const auto* speed_mode = x->find_object_member("speed_mode");
+    LinearPoseMotionDTO linear{number(member(*x, "max_translation_step_m")),
+                               number(member(*x, "max_rotation_step_rad")),
+                               std::nullopt,
+                               number(member(*x, "max_angular_speed_rad_s")),
+                               number(member(*x, "max_linear_acceleration_mps2")),
+                               number(member(*x, "max_angular_acceleration_rad_s2"))};
+    if (speed_mode) {
+      linear.speed_mode = parse_cartesian_speed_mode(text(*speed_mode));
+      if (!linear.speed_mode) fail("cartesian_speed_mode_invalid");
+    }
+    return PoseGoalDTO{get_pose(member(*x, "goal")), linear};
+  }
   if (const auto* x = v.find_object_member("cartesian_path")) {
     const auto* speed_mode = x->find_object_member("speed_mode");
     if (speed_mode)
@@ -989,7 +1023,6 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
   CanonicalValue::Object f{
       {"operation_id", CanonicalValue(static_cast<double>(r.operation_id.value()))},
       {"participant_id", OperationParticipantIdValue(r.participant_id)},
-      {"program_id", CanonicalValue(r.program_id.value())},
       {"program_revision", CanonicalValue(r.program_revision.value())},
       {"program_binding_id", CanonicalValue(r.program_binding_id.value())},
       {"move_id", CanonicalValue(r.move_id.value())},
@@ -1063,8 +1096,6 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
             {"node_instance_id", CanonicalValue(r.action_span->node_instance_id)},
             {"node_attempt_id", CanonicalValue(r.action_span->node_attempt_id)},
             {"parent_node_attempt_id", CanonicalValue(r.action_span->parent_node_attempt_id)}}));
-  if (r.contact_policy_id)
-    f.emplace_back("contact_policy_id", CanonicalValue(*r.contact_policy_id));
   // Manual work has no run.
   if (r.program_run_id)
     f.emplace_back("program_run_id",
@@ -1075,16 +1106,14 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
 }
 PlanRequestDTO get_plan_request(const CanonicalValue& v) {
   const bool ha = v.find_object_member("action_span") != nullptr;
-  const bool hc = v.find_object_member("contact_policy_id") != nullptr;
   const bool hm = v.find_object_member("moving_replacement") != nullptr;
   const bool hr = v.find_object_member("program_run_id") != nullptr;
   if (object(v).size() !=
-      46U + (ha ? 1U : 0U) + (hc ? 1U : 0U) + (hm ? 1U : 0U) + (hr ? 1U : 0U))
+      45U + (ha ? 1U : 0U) + (hm ? 1U : 0U) + (hr ? 1U : 0U))
     fail("plan_request_member_count_invalid");
   PlanRequestDTO r{
       OperationNumber(safe_unsigned(member(v, "operation_id"), true)),
       participant_id_from(member(v, "participant_id")),
-      ProgramId(text(member(v, "program_id"))),
       ProgramRevision(text(member(v, "program_revision"))),
       ProgramBindingId(text(member(v, "program_binding_id"))),
       std::nullopt,
@@ -1129,7 +1158,6 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
       TolerancesDTO{0.0, 0.0, 0.0},
       SpeedProfileDTO{},
       PlannerOverrideDTO{},
-      std::nullopt,
       {},
       1.0,
       0U,
@@ -1142,7 +1170,6 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
       nullptr};
   r.operation_id = OperationNumber(safe_unsigned(member(v, "operation_id"), true));
   r.participant_id = participant_id_from(member(v, "participant_id"));
-  r.program_id = ProgramId(text(member(v, "program_id")));
   r.program_revision = ProgramRevision(text(member(v, "program_revision")));
   r.program_binding_id = ProgramBindingId(text(member(v, "program_binding_id")));
   if (hr) r.program_run_id = ProgramRunNumber(safe_unsigned(member(v, "program_run_id"), true));
@@ -1219,7 +1246,6 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
       get_ids<ComponentAttachmentRevision>(member(v, "component_attachment_revisions"));
   r.carried_object_attachment_revisions =
       get_ids<CarriedObjectAttachmentRevision>(member(v, "carried_object_attachment_revisions"));
-  if (hc) r.contact_policy_id = text(member(v, "contact_policy_id"));
   if (ha) {
     const auto& a = member(v, "action_span");
     exact(a, {"action_source", "action_span_id", "program_run_id", "node_instance_id",

@@ -26,6 +26,11 @@ class ExecutionCorrelationTracker {
   void clear_program_run_and_action_span();
 
   std::string move_id() const;
+  /// The id of the active move's contact or release rule when it has exactly
+  /// one; stamped as `collision_rule_id` on the kernel's events and snapshots.
+  void set_collision_rule_id(std::string collision_rule_id);
+  void clear_collision_rule_id();
+  std::string collision_rule_id() const;
   std::optional<ActionSpanDTO> action_span() const;
   std::optional<ResolvedExecutionBindingDTO> resolved_binding() const;
 
@@ -35,6 +40,9 @@ class ExecutionCorrelationTracker {
  private:
   mutable std::mutex move_id_mutex_;
   std::string move_id_;
+
+  mutable std::mutex collision_rule_id_mutex_;
+  std::string collision_rule_id_;
 
   mutable std::mutex program_run_id_mutex_;
   std::optional<ProgramRunNumber> program_run_id_;

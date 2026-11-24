@@ -29,10 +29,8 @@ function controller(
         revision: 1,
         document: {
           api_version: 'manyforge.deployment.v1',
-          deployment_artifact_id: 'cell-a',
           deployment_revision: digest,
           cell_id: 'cell-a',
-          name: 'Cell A',
           graph: {
             control_bindings: [{ control_binding_id: 'arm_binding', control_binding_revision: digest,
               controllable_component_id: 'robot', command_target_id: 'arm', capability_id: 'execution.trajectory.execute' }],
@@ -53,7 +51,6 @@ function controller(
                   open_state_ref: 'open',
                   closed_state_ref: 'closed',
                   command_duration_s: 0.8,
-                  touch_links: ['finger_link'],
                   mount_frame: 'tool0',
                   attach_frame: 'tool0',
                   tcp_frame: 'tool0',
@@ -92,7 +89,6 @@ function controller(
             }],
           },
         },
-        deploymentArtifactId: 'cell-a',
         deploymentRevision: digest,
         graphRevision: digest,
         differsFromSaved: false,
@@ -130,13 +126,13 @@ function controller(
     updateControlledStop: vi.fn(),
     updateMotionTargetLimit: vi.fn(),
     revert: vi.fn(),
-    save: vi.fn(),
-    saveAs: vi.fn(),
     discard: vi.fn(),
     applyDraft: vi.fn(),
     applyConfirmedScope: vi.fn(),
     revertConfirmedScope: vi.fn(),
     addComponents: vi.fn(),
+    removeComponent: vi.fn(),
+    replaceTool: vi.fn(),
     previewApply: vi.fn(),
     confirmApply: vi.fn(async () => null),
     cancelApplyConfirmation: vi.fn(),
@@ -244,7 +240,7 @@ async function mountGripper(
     sourceRow.controllable_component_id = 'lite_gripper';
     const model = { urdf: { project_path: 'model.urdf' }, package_roots: {} };
     value.workspace!.draft.document = {
-      api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
+      api_version: 'manyforge.deployment_intent.v3',
       components: [
         { component_id: 'lite6_robot', component_profile_id: 'lite6_v0', model_source: model, target_settings: {},
           root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
@@ -431,7 +427,7 @@ describe('DeploymentFocusedEditor', () => {
     'retains the existing row fields for %s', async (kind) => {
       const mounted = await mountGripper(kind);
       try {
-        expect(Object.keys(mounted.sourceRow)).toHaveLength(13);
+        expect(Object.keys(mounted.sourceRow)).toHaveLength(12);
         await mounted.setDuration(0.25);
         await mounted.update();
         expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
@@ -677,7 +673,7 @@ describe('DeploymentFocusedEditor', () => {
   // writing adds the field, Reset to default removes it. The GUI holds no default.
   function robotDocument(configuration: Record<string, JsonValue>): Record<string, JsonValue> {
     return {
-      api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
+      api_version: 'manyforge.deployment_intent.v3',
       components: [{
         component_id: 'robot', component_profile_id: 'ufactory.lite6', lane: 'real', frame_prefix: 'robot/',
         model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
@@ -736,13 +732,36 @@ describe('DeploymentFocusedEditor', () => {
   });
 
   it('resets a set field to its default by removing it from the Draft', async () => {
-    const mounted = await mountEffective({ collision_clearance_m: 0.004 }, {
-      [key('collision_clearance_m')]: { value: 0.004, default: 0.0001, set: true },
+    const mounted = await mountEffective({ collision_check_step_rad: 0.02 }, {
+      [key('collision_check_step_rad')]: { value: 0.02, default: 0.05, set: true },
     });
     try {
-      expect(mounted.find((props) => props.type === 'number' && props.max === 0.05).value).toBe('0.004');
-      await act(() => mounted.find((props) => props['aria-label'] === 'Reset Collision clearance to default').onClick?.());
-      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith([...settingsPath, 'collision_clearance_m'], 'remove');
+      expect(mounted.find((props) => props.type === 'number' && props.max === 0.2).value).toBe('0.02');
+      await act(() => mounted.find((props) => props['aria-label'] === 'Reset Collision check step to default').onClick?.());
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith([...settingsPath, 'collision_check_step_rad'], 'remove');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('edits the cell collision rules as one top-level list', async () => {
+    const document = { ...robotDocument({}), collision_rules: [{ rule_id: 'everything', clearance_m: 0.001 }] };
+    const mounted = await mountEffective({}, {}, document);
+    try {
+      const everything = () => mounted.find((props) => props['aria-label'] === 'Everything else clearance');
+      expect(everything().value).toBe('0.001');
+      // The Deployment's first rule is required: an empty or out-of-range clearance is not written.
+      // A typed edit happens in a focused input; an unfocused value change is an owner observation.
+      const focus = () => act(() => (everything().onFocus as ((event: unknown) => void) | undefined)?.({}));
+      for (const refused of ['', '0.06']) {
+        await focus();
+        await act(() => everything().onChange?.({ target: { value: refused } }));
+        await act(() => (everything().onBlur as () => void)());
+      }
+      expect(mounted.value.mutate).not.toHaveBeenCalled();
+      await focus();
+      await act(() => everything().onChange?.({ target: { value: '0.002' } }));
+      await act(() => (everything().onBlur as () => void)());
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['collision_rules'], 'set', [{ rule_id: 'everything', clearance_m: 0.002 }]);
     } finally { await mounted.unmount(); }
   });
 
@@ -781,7 +800,7 @@ describe('DeploymentFocusedEditor', () => {
 
   it('edits a point-cloud source: required topic and source frame, limits with effective values', async () => {
     const sensorDocument = {
-      api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
+      api_version: 'manyforge.deployment_intent.v3',
       components: [{
         component_id: 'front_points', component_profile_id: 'manyforge.pointcloud_source',
         target_settings: {},
@@ -909,7 +928,7 @@ describe('DeploymentFocusedEditor', () => {
     // author `configuration.lifecycle_command_timeout_s`; blank removes it.
     const value = controller();
     value.workspace!.draft.document = {
-      api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
+      api_version: 'manyforge.deployment_intent.v3',
       components: [{
         component_id: 'llm', component_profile_id: 'ai_model_v0', target_settings: {},
         configuration: {
@@ -996,9 +1015,7 @@ describe('DeploymentFocusedEditor', () => {
   it('renders authored intent without requiring a compiled graph projection', () => {
     const value = controller();
     value.workspace!.draft.document = {
-      api_version: 'manyforge.deployment_intent.v2',
-      deployment_artifact_id: 'cell-a',
-      name: 'Cell A',
+      api_version: 'manyforge.deployment_intent.v3',
       components: [{
         component_id: 'robot',
         component_profile_id: 'robot_native_v1',
@@ -1394,7 +1411,7 @@ describe('DeploymentFocusedEditor', () => {
           sourceKind: 'model_role', coordinateKind: 'linear_m', unit: 'm',
           minPosition: 0, maxPosition: 0.04,
           openStateRef: 'open', closedStateRef: 'closed', commandDurationS: 0.8,
-          touchLinks: ['finger_link'], mountFrame: 'tool0', attachFrame: 'tool0',
+          gripBodyLinks: ['finger_link'], mountFrame: 'tool0', attachFrame: 'tool0',
           tcpFrame: 'tool0', auxiliaryFrames: [], mimicFollowers: [],
           namedPresets: [
             { name: 'closed', masterPosition: 0, coordinates: [] },

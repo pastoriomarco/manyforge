@@ -35,7 +35,6 @@ _DIGEST_B = "sha256:" + "b" * 64
 def _capture() -> dict[str, object]:
     return {
         "program_run_id": 1,
-        "program_id": "program.1",
         "program_revision": _DIGEST_A,
         "program_binding_id": _DIGEST_B,
         "retained_bundle_id": _DIGEST_A,
@@ -884,6 +883,68 @@ def test_f6a_program_stop_failure_hold_offers_retry_continue_and_reset() -> None
     assert _continue_action(exhausted)["enabled"] is True
 
 
+def test_clean_collision_stop_failure_hold_offers_retry_and_continue() -> None:
+    """OD-373 (A): a collision Stop contained cleanly ends Stopped; its failure
+    hold offers the Kernel's replan from the stopped state as Retry (bounded
+    by max_retries) and Continue. A collision Stop that was not clean keeps
+    neither: Continue waits for a close the Kernel does not grant."""
+
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    held = _intervention()
+    held.reason_code = "execution_aborted"
+    held.owner_assessment = {
+        **held.owner_assessment,
+        "allowed_actions": ["replan_from_stopped_state", "reset_cycle"],
+        "eligible_close": True,
+        "execution_state": "Stopped",
+        "recovery_class": "runtime_collision",
+        "retry_admissible": True,
+        "status": "retry_ready",
+    }
+    policy = {"allow_intervention": True, "max_retries": 1}
+    offer = controls.recovery_offer(
+        cycle_generation=6, application_start_id="3f9a000000000001", intervention=held, policy=policy
+    )
+    actions = {row["action_id"]: row for row in offer["actions"]}
+    assert actions["replan_from_stopped_state"]["enabled"] is True
+    assert _continue_action(offer)["enabled"] is True
+    assert offer["recovery_class"] == "runtime_collision"
+    controls.note_retry("move.1")  # The one allowed Retry is used.
+    exhausted = controls.recovery_offer(
+        cycle_generation=6, application_start_id="3f9a000000000001", intervention=held, policy=policy
+    )
+    retry = next(
+        row for row in exhausted["actions"] if row["action_id"] == "replan_from_stopped_state"
+    )
+    assert retry["enabled"] is False
+    assert retry["disabled_reason_code"] == "recovery_retry_limit_reached"
+    assert _continue_action(exhausted)["enabled"] is True
+
+    escalated = _intervention()
+    escalated.identity = SimpleNamespace(
+        program_run_id=1, node_instance_id="move.2", node_attempt_id=2
+    )
+    escalated.owner_assessment = {
+        **escalated.owner_assessment,
+        "allowed_actions": ["reset_cycle"],
+        "eligible_close": False,
+        "execution_state": "InterventionRequired",
+        "recovery_class": "runtime_collision",
+        "status": "reset_required",
+    }
+    not_clean = controls.recovery_offer(
+        cycle_generation=6,
+        application_start_id="3f9a000000000001",
+        intervention=escalated,
+        policy=policy,
+    )
+    assert all(
+        row["action_id"] != "replan_from_stopped_state" for row in not_clean["actions"]
+    )
+    assert _continue_action(not_clean)["enabled"] is False
+    assert _continue_action(not_clean)["disabled_reason_code"] == "recovery_close_not_eligible"
+
+
 def test_each_held_node_keeps_its_own_stable_offer() -> None:
     controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
     first = _intervention()
@@ -903,3 +964,87 @@ def test_each_held_node_keeps_its_own_stable_offer() -> None:
     # Publishing the other hold does not churn this hold's offer revision.
     assert offer(first)["offer_revision"] == one["offer_revision"]
     assert offer(second)["offer_revision"] == two["offer_revision"]
+
+
+def _question(**changes) -> MappingProxyType:
+    """An open operator question as the run owner publishes it (OD-342)."""
+    question = {
+        "node_instance_id": "ask_bin_full",
+        "node_attempt_id": 41,
+        "message": "Bin is full. Empty it, then choose.",
+        "severity": "warning",
+        "options": (
+            MappingProxyType(
+                {"option_id": "continue", "label": "Bin emptied, continue", "result": "success"}
+            ),
+            MappingProxyType(
+                {"option_id": "abort", "label": "Abort this cycle", "result": "failure"}
+            ),
+        ),
+        "hold_motion_group_ids": ("left_arm",),
+    }
+    question.update(changes)
+    return MappingProxyType(question)
+
+
+def test_operator_question_offer_is_stable_and_shares_the_offer_revision() -> None:
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+
+    def ask(question, *, cycle_generation: int = 6):
+        return controls.operator_question_offer(
+            cycle_generation=cycle_generation,
+            application_start_id="3f9a000000000001",
+            question=question,
+        )
+
+    offer = ask(_question())
+    assert offer == {
+        "schema_version": "manyforge.program_operator_question.v1",
+        "offer_id": offer["offer_id"],
+        "offer_revision": 1,
+        "program_run_id": 1,
+        "node_instance_id": "ask_bin_full",
+        "node_attempt_id": 41,
+        "message": "Bin is full. Empty it, then choose.",
+        "severity": "warning",
+        "options": [
+            {"option_id": "continue", "label": "Bin emptied, continue", "result": "success"},
+            {"option_id": "abort", "label": "Abort this cycle", "result": "failure"},
+        ],
+        "hold_motion_group_ids": ["left_arm"],
+    }
+    assert offer["offer_id"].startswith("sha256:") and len(offer["offer_id"]) == 71
+    # An unchanged question keeps its offer id and revision.
+    assert ask(_question()) == offer
+    # A caller cannot change the retained offer.
+    offer["options"].clear()
+    assert ask(_question())["options"]
+
+    changed = ask(_question(message="Bin is still full."))
+    assert changed["offer_revision"] == 2
+    assert changed["offer_id"] != offer["offer_id"]
+    # A new attempt is a new question.
+    retried = ask(_question(message="Bin is still full.", node_attempt_id=42))
+    assert retried["offer_revision"] == 3
+    assert retried["node_attempt_id"] == 42
+
+    # Recovery offers advance the same revision counter.
+    recovery = controls.recovery_offer(
+        cycle_generation=6,
+        application_start_id="3f9a000000000001",
+        intervention=_intervention(),
+        policy=_policy(),
+    )
+    assert recovery is not None and recovery["offer_revision"] == 4
+    other = ask(_question(node_instance_id="ask_tools"))
+    assert other["offer_revision"] == 5
+    assert other["offer_id"] != offer["offer_id"]
+    # Publishing another question does not churn this one.
+    assert ask(_question(message="Bin is still full.", node_attempt_id=42)) == retried
+
+    # The cycle generation fences the offer.
+    fenced = ask(
+        _question(message="Bin is still full.", node_attempt_id=42), cycle_generation=7
+    )
+    assert fenced["offer_revision"] == 6
+    assert fenced["offer_id"] != retried["offer_id"]

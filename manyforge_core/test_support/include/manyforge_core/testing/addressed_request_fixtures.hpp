@@ -32,7 +32,6 @@ inline ResolvedExecutionBindingDTO make_test_execution_binding(
       OperationNumber(1001U),
       OperationParticipantId{OperationNumber(1001U), 1U},
       ControllerGoalId{OperationNumber(1001U), 1U, 1U},
-      ProgramId("program:test"),
       ProgramRevision("program-revision:test"),
       ProgramBindingId("program-binding:test"),
       program_run_id,
@@ -226,7 +225,6 @@ inline PlanRequestDTO make_test_plan_request(std::string move_id, ResolvedMotion
   auto state = make_test_controlled_state(binding, start_positions_rad);
   return PlanRequestDTO{binding.operation_id,
                         binding.participant_id,
-                        binding.program_id,
                         binding.program_revision,
                         binding.program_binding_id,
                         binding.program_run_id,
@@ -266,7 +264,6 @@ inline PlanRequestDTO make_test_plan_request(std::string move_id, ResolvedMotion
                         TolerancesDTO{},
                         SpeedProfileDTO{},
                         PlannerOverrideDTO{},
-                        std::nullopt,
                         {},
                         5.0,
                         0U,

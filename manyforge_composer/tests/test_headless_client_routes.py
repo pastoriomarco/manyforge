@@ -69,7 +69,6 @@ def _binding_for_program(program: dict[str, Any]) -> dict[str, Any]:
     binding.update(
         {
             "program_binding_id": "sha256:" + "0" * 64,
-            "program_id": program["program_id"],
             "program_revision": program["program_revision"],
             "retained_bundle_id": "sha256:" + "4" * 64,
             "graph_revision": "sha256:" + "5" * 64,
@@ -79,7 +78,7 @@ def _binding_for_program(program: dict[str, Any]) -> dict[str, Any]:
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v3",
+        api_version="manyforge.program_binding.v4",
     )
     return binding
 
@@ -196,7 +195,6 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
             "applied_record_digest": digest_c,
             "scenario_id": "cell-pick",
             "source_document_digest": digest_a,
-            "program_id": "pick",
             "program_revision": digest_b,
             "program_binding_id": digest_c,
             "retained_bundle_id": digest_a,
@@ -843,7 +841,6 @@ def _without_authoring_owner_calls(
 
 def test_headless_http_client_rejects_rehashed_malformed_binding_ingress() -> None:
     program = {
-        "program_id": "fixture",
         "program_revision": "sha256:" + "a" * 64,
     }
     binding = _binding_for_program(program)
@@ -852,12 +849,11 @@ def test_headless_http_client_rejects_rehashed_malformed_binding_ingress() -> No
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v3",
+        api_version="manyforge.program_binding.v4",
     )
     projection = {
         "program_binding": binding,
         "program_binding_id": binding["program_binding_id"],
-        "program_id": binding["program_id"],
         "program_revision": binding["program_revision"],
         "retained_bundle_id": binding["retained_bundle_id"],
         "graph_revision": binding["graph_revision"],
@@ -921,6 +917,39 @@ def test_composer_passes_a_run_failure_record_through_unchanged() -> None:
         raw.close()
     assert response.status_code == 200
     assert response.json() == failed
+
+
+def test_composer_forwards_the_run_key_values_read_with_its_start():
+    values = {
+        "schema_version": "manyforge.program_runtime_blackboard_values.v1",
+        "owner_id": "runner.1",
+        "program_run_id": 1,
+        "run_revision": 2,
+        "node_status_revision": 3,
+        "keys": [{"key": "count", "type": "int64", "value_state": "value", "value": 2}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/program/runs/1/blackboard-values"
+        assert request.url.params["application_start_id"] == _A
+        return httpx.Response(200, json=values, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=client)
+        state.authoring_admission = None
+        response = TestClient(create_app(state)).get(
+            "/api/program/runs/1/blackboard-values", params={"application_start_id": _A}
+        )
+    finally:
+        raw.close()
+    assert response.status_code == 200
+    assert response.json() == values
 
 
 def _caller() -> dict[str, Any]:
@@ -1584,7 +1613,6 @@ def test_composer_preview_and_handover_routes_are_strict_stateless_forwarders(
             "source_label": "composer_ui",
         },
         "application_start_id": _A,
-        "program_id": "manyforge.direct_control.gripper",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "b" * 64,
         "program_run_id": None,
@@ -1722,6 +1750,7 @@ def test_composer_runtime_scene_transaction_omits_authoring_fences(
                 **body,
                 "operation": {
                     **body["operation"],
+                    "carrier_component_id": None,
                     "grasp_lost_bound": None,
                     "on_grasp_lost": None,
                 },
@@ -1784,7 +1813,7 @@ def test_program_scene_and_viewer_draft_edits_have_no_runtime_effect(
     assert not any(request["path"] == "/api/scene/transactions" for request in requests)
 
 
-def test_composer_rejects_draft_and_save_during_an_active_run(
+def test_composer_rejects_draft_edit_during_an_active_run(
     headless_client,
     tmp_path: Path,
 ) -> None:
@@ -1838,7 +1867,6 @@ def test_composer_rejects_draft_and_save_during_an_active_run(
     )
 
     with client:
-        saved = client.post("/api/program/save", json=body)
         mutated = client.post(
             "/api/program/draft/mutations",
             json={
@@ -1848,8 +1876,6 @@ def test_composer_rejects_draft_and_save_during_an_active_run(
             },
         )
 
-    assert saved.status_code == 409, saved.text
-    assert saved.json()["detail"]["code"] == "authoring_not_ready"
     assert mutated.status_code == 409, mutated.text
     assert mutated.json()["detail"]["code"] == "authoring_not_ready"
     assert (
@@ -1888,7 +1914,7 @@ def test_new_program_rotates_fenced_draft_without_disk_or_headless_mutation(
     assert workspace["draft"]["draftRevision"] == 1
     assert workspace["draft"]["program"] is None
     assert workspace["draft"]["candidateAvailable"] is False
-    assert workspace["draft"]["authoring"]["name"] == "Untitled Program"
+    assert "name" not in workspace["draft"]["authoring"]
     assert workspace["draft"]["authoring"]["forest"] == []
     assert workspace["draft"]["diagnostics"][0]["code"] == (
         "authoring_forest_root_count"
@@ -2244,7 +2270,6 @@ def test_composer_forwards_the_node_correction_preview_as_a_strict_query(
         "request_key": _key(0x7),
         "application_start_id": _A,
         "program_run_id": 7,
-        "program_id": "lite6_program",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "a" * 64,
         "node_instance_id": "move_to_pick",
@@ -2361,8 +2386,9 @@ def test_close_detach_rechecks_concurrent_deployment_edit_under_shared_serialize
                 "schema_version": "manyforge.composer_deployment_draft_state.v2",
                 "draft_id": identity.deployment_draft_id,
                 "draft_revision": identity.deployment_draft_revision + 1,
-                "document": {"api_version": "manyforge.deployment_intent.v2", "deployment_artifact_id": "changed",
-                    "name": "Concurrent Deployment edit", "components": [], "attachments": [], "policies": {}},
+                "document": {"api_version": "manyforge.deployment_intent.v3",
+                    "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
+                    "components": [], "attachments": [], "policies": {}},
                 "saved_path": None, "saved_document": None,
             })
             # A real ordinary Deployment Draft edit takes this serializer, but

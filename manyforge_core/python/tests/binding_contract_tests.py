@@ -63,10 +63,8 @@ _ZERO_DIGEST = "sha256:" + ("0" * 64)
 _CANONICAL_EMPTY_INPUT = json.dumps(
     {
         "api_version": "manyforge.deployment.v1",
-        "deployment_artifact_id": "c1_build_authority",
         "deployment_revision": _ZERO_DIGEST,
         "cell_id": "c1_build_authority_cell",
-        "name": "C1 build authority",
         "catalogs": {"records": []},
         "graph": {
             "runtime_units": [],
@@ -86,16 +84,14 @@ _CANONICAL_EMPTY_NORMALIZED = (
     '{"api_version":"manyforge.deployment.v1",'
     '"capability_provider_bindings":[],"catalogs":{"records":[]},'
     '"cell_id":"c1_build_authority_cell",'
-    '"deployment_artifact_id":"c1_build_authority",'
     '"deployment_revision":"sha256:'
-    '7b1480ba7bc20044f194dbbcc48f0f1d08fe16b469a46ca79b7c409419d11f2d",'
+    '2b2ddbd2632ac30ce1ef06b528e84815678c36ff83496feb011d99ea54826f41",'
     '"desired_control_configurations":[],"graph":'
     '{"component_attachments":[],"control_bindings":[],"control_domains":[],'
-    '"controllable_components":[],"model_instances":[],"runtime_units":[]},'
-    '"name":"C1 build authority"}'
+    '"controllable_components":[],"model_instances":[],"runtime_units":[]}}'
 )
 _EXPECTED_DEPLOYMENT_REVISION = (
-    "sha256:7b1480ba7bc20044f194dbbcc48f0f1d08fe16b469a46ca79b7c409419d11f2d"
+    "sha256:2b2ddbd2632ac30ce1ef06b528e84815678c36ff83496feb011d99ea54826f41"
 )
 _EXPECTED_GRAPH_REVISION = (
     "sha256:e933b3c39ee2c8fe1e1f0f5c8133826d277e5664ff5448093624d5e348030704"
@@ -124,11 +120,8 @@ _EXPECTED_PROPERTIES: dict[str, tuple[str, ...]] = {
         "assistant_was_present",
         "catalog_records",
         "cell_id",
-        "deployment_artifact_id",
         "deployment_revision",
-        "description",
         "graph",
-        "name",
         "normalized_authored_canonical_json",
         "normalized_authored_graph_canonical_json",
     ),
@@ -292,6 +285,7 @@ _EXPECTED_ENUMS = {
         "kChainLink": 2,
         "kDirectJoint": 1,
         "kDirectLink": 0,
+        "kJointChildLink": 5,
         "kSubgroup": 4,
     },
     "UrdfCoordinateKind": {
@@ -1489,7 +1483,6 @@ def _compiler_observation(values: dict[str, Any]) -> dict[str, Any]:
     applicability = values["applicability"]
     compiler = values["compiler"]
     return {
-        "deployment_artifact_id": deployment.deployment_artifact_id.value,
         "deployment_revision": deployment.deployment_revision.value,
         "cell_id": graph.cell_id.value,
         "graph_revision": graph.graph_revision.value,
@@ -1520,7 +1513,6 @@ def _compiler_observation(values: dict[str, Any]) -> dict[str, Any]:
 
 def _expected_compiler_observation() -> dict[str, Any]:
     return {
-        "deployment_artifact_id": "c1_build_authority",
         "deployment_revision": _EXPECTED_DEPLOYMENT_REVISION,
         "cell_id": "c1_build_authority_cell",
         "graph_revision": _EXPECTED_GRAPH_REVISION,

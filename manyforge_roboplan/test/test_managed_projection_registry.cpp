@@ -6,6 +6,7 @@
 #include <latch>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -349,8 +350,8 @@ TEST(ManagedProjectionRegistry,
 
 TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
   namespace detail = component_manager::detail;
-  // Frozen MFNPRPC5/tag-2 request, independent of codec writers.
-  static constexpr char legacy_bytes[] = "MFNPRPC5\x02"
+  // Frozen MFNPRPC7/tag-2 request, independent of codec writers.
+  static constexpr char legacy_bytes[] = "MFNPRPC7\x02"
                                          "\x00\x00\x00\x05"
                                          "arm-a"
                                          "\x00\x00\x00\x0e"
@@ -368,9 +369,9 @@ TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
       std::get<detail::NativeProjectionHealthQuery>(ordinary_decoded);
   EXPECT_EQ(plain.execution_host_binding, ordinary.execution_host_binding);
   EXPECT_FALSE(plain.selected_projection_revision.has_value());
-  // The string-Apply-id version 4 is refused like an unknown magic.
+  // An earlier version is refused like an unknown magic.
   auto old_version = legacy;
-  old_version[7] = '4';
+  old_version[7] = '6';
   EXPECT_THROW(static_cast<void>(
                    detail::DecodeNativeProjectionRpcRequest(old_version)),
                std::invalid_argument);
@@ -430,6 +431,141 @@ TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
   EXPECT_THROW(
       static_cast<void>(detail::DecodeNativeProjectionRpcResponse(canonical)),
       std::invalid_argument);
+}
+
+TEST(NativeProjectionRpcCodec, EffectivePolicyCarriesStaticBodiesNotPairs) {
+  namespace detail = component_manager::detail;
+  // OD-376: 200 cell-fixed objects and a static robot base are 201 static
+  // bodies. Their 20100 static pairs once exceeded the codec's entry bound.
+  core::CollisionPolicySnapshot policy;
+  policy.revision = {2U, "sha256:" + std::string(64U, 'e')};
+  policy.static_body_ids.push_back(
+      "component/arm/model/arm.model/body/base/collision/0");
+  for (int index = 0; index < 200; ++index) {
+    policy.static_body_ids.push_back("scene/fixed-" +
+                                     std::to_string(1000 + index).substr(1U) +
+                                     "/shape/0");
+  }
+  policy.allowed_touch_link_pairs = {
+      {"component/arm/model/arm.model/body/tcp/collision/0",
+       "scene/part/shape/0"}};
+  const detail::NativeProjectionRpcResponse response{policy};
+  const auto decoded = detail::DecodeNativeProjectionRpcResponse(
+      detail::EncodeNativeProjectionRpcResponse(response));
+  ASSERT_TRUE(std::holds_alternative<core::CollisionPolicySnapshot>(decoded));
+  EXPECT_EQ(std::get<core::CollisionPolicySnapshot>(decoded), policy);
+}
+
+TEST(NativeProjectionRpcCodec, ABoundBreachRefusesTheOneRequest) {
+  namespace detail = component_manager::detail;
+  // 4097 static bodies exceed the entry bound of one list: the execution host
+  // answers this request with a typed refusal and keeps running.
+  core::CollisionPolicySnapshot policy;
+  policy.revision = {2U, "sha256:" + std::string(64U, 'e')};
+  for (int index = 0; index < 4097; ++index) {
+    policy.static_body_ids.push_back("scene/fixed-" +
+                                     std::to_string(10000 + index).substr(1U) +
+                                     "/shape/0");
+  }
+  const detail::NativeProjectionRpcResponse oversized{policy};
+  EXPECT_THROW(static_cast<void>(
+                   detail::EncodeNativeProjectionRpcResponse(oversized)),
+               detail::NativeProjectionRpcBoundExceeded);
+  const auto refusal = detail::DecodeNativeProjectionRpcResponse(
+      detail::EncodeNativeProjectionRpcResponseOrRefusal(oversized));
+  const auto *failure =
+      std::get_if<detail::NativeProjectionRpcFailure>(&refusal);
+  ASSERT_NE(failure, nullptr);
+  EXPECT_EQ(failure->error.code, "native_projection_rpc_bound_exceeded");
+
+  // Within the bound the same call encodes the response itself.
+  policy.static_body_ids.pop_back();
+  const detail::NativeProjectionRpcResponse bounded{policy};
+  EXPECT_EQ(detail::EncodeNativeProjectionRpcResponseOrRefusal(bounded),
+            detail::EncodeNativeProjectionRpcResponse(bounded));
+
+  // A request beyond the packet byte bound is refused the same way.
+  EXPECT_THROW(static_cast<void>(detail::EncodeNativeProjectionRpcRequest(
+                   detail::NativeProjectionHealthQuery{Binding(
+                       std::string(detail::kMaximumNativeProjectionRpcPacketBytes,
+                                   'a'))})),
+               detail::NativeProjectionRpcBoundExceeded);
+}
+
+TEST(NativeProjectionRpcCodec, CommitPreflightRoundTripsWithoutACandidate) {
+  namespace detail = component_manager::detail;
+  const std::string digest = "sha256:" + std::string(64U, 'e');
+  const core::SceneTransactionDTO transaction{
+      core::RequestKey::Make(core::RequestKeyClass::kHttpClient, 0U, 1U, 2U),
+      {},
+      4U,
+      SelectedRevision(),
+      SelectedRevision(),
+      core::ContentDigest(digest),
+      core::ResolvedRemoveSceneObjectDTO{core::SceneResourceId("part")},
+      std::nullopt};
+  for (const auto &selected :
+       {detail::NativeProjectionCommitPreflightRequest{Binding("arm-a"),
+                                                       SelectedRevision()},
+        detail::NativeProjectionCommitPreflightRequest{
+            Binding("arm-a"), SelectedRevision(), transaction}}) {
+    const auto encoded = detail::EncodeNativeProjectionRpcRequest(selected);
+    const auto decoded = detail::DecodeNativeProjectionRpcRequest(encoded);
+    const auto &typed =
+        std::get<detail::NativeProjectionCommitPreflightRequest>(decoded);
+    EXPECT_EQ(typed.execution_host_binding, selected.execution_host_binding);
+    EXPECT_EQ(typed.selected_projection_revision,
+              selected.selected_projection_revision);
+    EXPECT_EQ(typed.transaction, selected.transaction);
+    EXPECT_EQ(detail::EncodeNativeProjectionRpcRequest(decoded), encoded);
+  }
+  auto invalid = detail::NativeProjectionCommitPreflightRequest{
+      Binding("arm-a"), SelectedRevision()};
+  invalid.selected_projection_revision.graph_revision = core::GraphRevision("");
+  EXPECT_THROW(
+      static_cast<void>(detail::EncodeNativeProjectionRpcRequest(invalid)),
+      std::invalid_argument);
+
+  const core::ProjectionHealthDTO health{
+      Binding("arm-a"), 7U, core::ProjectionHealthState::kHealthy,
+      SelectedRevision(), 3U, core::ContentDigest(digest), std::nullopt};
+  core::CollisionPolicySnapshot policy;
+  policy.policy_id = "free_space";
+  policy.revision = {3U, digest};
+  policy.static_body_ids = {"body-a", "body-b"};
+  const core::ErrorDTO refusal{"invariant_violation", "delta does not apply",
+                               {{"reason", "native_projection_resolved_delta_mismatch"}}};
+  using PolicyResult =
+      std::optional<std::variant<core::CollisionPolicySnapshot, core::ErrorDTO>>;
+  for (const auto &effective_policy :
+       {PolicyResult{}, PolicyResult{policy}, PolicyResult{refusal}}) {
+    const detail::NativeProjectionCommitPreflightResult result{
+        health, effective_policy};
+    const auto encoded = detail::EncodeNativeProjectionRpcResponse(result);
+    const auto decoded = detail::DecodeNativeProjectionRpcResponse(encoded);
+    const auto &typed =
+        std::get<detail::NativeProjectionCommitPreflightResult>(decoded);
+    EXPECT_EQ(typed.health.execution_host_binding,
+              health.execution_host_binding);
+    EXPECT_EQ(typed.health.active_projection_revision,
+              health.active_projection_revision);
+    EXPECT_EQ(typed.effective_policy, effective_policy);
+    EXPECT_EQ(detail::EncodeNativeProjectionRpcResponse(decoded), encoded);
+  }
+}
+
+TEST(ManagedProjectionRegistry, CommitPreflightRefusesAnUnpreparedBinding) {
+  std::latch entered(1);
+  ManagedProjectionRegistry registry(
+      ManagedProjectionRegistryConfig{"/nonexistent-package", {},
+                                      "/nonexistent-run", "native-unit",
+                                      "epoch-1", std::nullopt},
+      std::make_unique<GatedAssetSource>(entered, std::shared_future<void>{}),
+      [] { return std::int64_t{1'000}; }, [] {});
+  EXPECT_THROW(static_cast<void>(registry.Dispatch(
+                   component_manager::detail::NativeProjectionCommitPreflightRequest{
+                       Binding("arm-a"), SelectedRevision()})),
+               std::runtime_error);
 }
 
 } // namespace

@@ -29,19 +29,19 @@ import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import {
   MotionControlSettings,
+  ProgramKeysPanel,
   ProgramTransportControls,
   type DraftGroupVisibility,
 } from './ProgramRuntimePanel';
-import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import type { ReferenceSelectorFacts } from '../utils/referenceValidation';
 import { programFrameReferenceChoices } from '../utils/programReferenceChoices';
-import { ProgramSupportContactEditor } from './ProgramSupportContactEditor';
 import { ObjectPoseSourceCard } from './ObjectPoseSourceCard';
 import { DraftInputResetProvider } from './common/DraftInputs';
 import { CarriedObjectPoseCard } from './CarriedObjectPoseCard';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import { RobotControlPanelView } from './RobotControlPanel';
 import { ToolIoPanel } from './ToolIoPanel';
+import { MeshResourceBrowser } from './MeshResourceBrowser';
 import { OverlayPanel } from './OverlayPanel';
 import { useGizmoSettings } from './common/GizmoControls';
 import type { GizmoController } from './common/GizmoControls';
@@ -95,7 +95,6 @@ import {
 import { verifiedAppliedGraphHasNoModels, viewerModelPresentation } from '../state/viewerModelReadiness';
 import type {
   JsonValue,
-  FileBrowserResponse,
   CarriedObjectAttachment,
   LogicalSceneObject,
   LogicalScenePose,
@@ -104,6 +103,7 @@ import type {
   ProgramDocument,
   ProgramFrameReference,
   ProgramSceneResource,
+  ProgramViewerDefaultView,
   ProgramViewerMetadata,
   SceneUrdfManifest,
   SceneRuntimePoseSource,
@@ -148,6 +148,8 @@ interface SceneAuthoringWorkspaceProps {
   /** The Deployment Draft owner: an object's pose-source link is stored there. */
   deploymentController: DeploymentWorkspaceController;
   programRuntime: ProgramRuntimeController;
+  /** Opens a key's declaration in the Program tab (the Keys panel's Edit initial). */
+  onEditKeyInitial?: (key: string) => void;
   /** Current Headless authoring admission; unknown leaves existing behavior unchanged. */
   authoringAdmissionAllowed?: boolean | null;
   robotControl: RobotControlController;
@@ -178,7 +180,6 @@ type SceneSelection =
 type SceneWorkspaceTool =
   | 'hierarchy'
   | 'program'
-  | 'contacts'
   | 'current'
   | 'sources'
   | 'viewer';
@@ -279,7 +280,6 @@ function programScenePreviewObject(resource: ProgramSceneResource): LogicalScene
       },
     },
     provider_evidence: null,
-    support_contacts: [],
   };
 }
 
@@ -593,81 +593,16 @@ function SceneHierarchy({
   );
 }
 
-function MeshResourceBrowser({
-  onSelect,
-}: {
-  onSelect: (resourceUri: string) => void;
-}) {
-  const [path, setPath] = useState<string | undefined>(undefined);
-  const [state, setState] = useState<
-    { kind: 'loading' }
-    | { kind: 'ready'; data: FileBrowserResponse }
-    | { kind: 'error'; message: string }
-  >({ kind: 'loading' });
-  useEffect(() => {
-    const controller = new AbortController();
-    setState({ kind: 'loading' });
-    void api.files.browse('mesh', path, controller.signal).then((data) => {
-      setState({ kind: 'ready', data });
-    }).catch((error: unknown) => {
-      if (!controller.signal.aborted) {
-        setState({
-          kind: 'error',
-          message: error instanceof Error ? error.message : 'Mesh directory unavailable.',
-        });
-      }
-    });
-    return () => controller.abort();
-  }, [path]);
-  const choose = (entryPath: string, roots: string[]) => {
-    const root = [...roots]
-      .sort((left, right) => right.length - left.length)
-      .find((candidate) => (
-        entryPath === candidate || entryPath.startsWith(`${candidate}/`)
-      ));
-    onSelect(root === undefined
-      ? entryPath
-      : entryPath.slice(root.length).replace(/^\/+/, ''));
-  };
-  return (
-    <div
-      className="scene-mesh-browser"
-      onPointerDownCapture={(event) => event.preventDefault()}
-    >
-      {state.kind === 'loading' && <span className="muted">Reading approved mesh files…</span>}
-      {state.kind === 'error' && <span className="scene-commit-error inline-message severity-error" role="alert">{state.message}</span>}
-      {state.kind === 'ready' && (
-        <>
-          <div className="scene-mesh-browser-path">
-            <button
-              type="button"
-              disabled={state.data.parentPath === null}
-              onClick={() => setPath(state.data.parentPath ?? undefined)}
-            >Up</button>
-            <code>{state.data.currentPath}</code>
-          </div>
-          <div className="scene-mesh-browser-entries">
-            {state.data.entries.map((entry) => (
-              <button
-                type="button"
-                key={entry.path}
-                onClick={() => {
-                  if (entry.entryType === 'directory') setPath(entry.path);
-                  else choose(entry.path, state.data.roots);
-                }}
-              >
-                <span>{entry.entryType === 'directory' ? 'DIR' : 'MESH'}</span>
-                <strong>{entry.name}</strong>
-              </button>
-            ))}
-            {state.data.entries.length === 0 && (
-              <span className="muted">No compatible meshes in this directory.</span>
-            )}
-          </div>
-        </>
-      )}
-    </div>
-  );
+/** A picked mesh's path relative to the allowed folder that holds it. */
+function meshPathInRoot(entryPath: string, roots: string[]): string {
+  const root = [...roots]
+    .sort((left, right) => right.length - left.length)
+    .find((candidate) => (
+      entryPath === candidate || entryPath.startsWith(`${candidate}/`)
+    ));
+  return root === undefined
+    ? entryPath
+    : entryPath.slice(root.length).replace(/^\/+/, '');
 }
 
 function SceneShapeFields({
@@ -806,8 +741,8 @@ function SceneShapeFields({
           </button>
           {meshBrowserOpen && (
             <MeshResourceBrowser
-              onSelect={(resourceUri) => {
-                onChange({ ...shape, mesh_resource_uri: resourceUri });
+              onSelect={(entryPath, roots) => {
+                onChange({ ...shape, mesh_resource_uri: meshPathInRoot(entryPath, roots) });
                 setMeshBrowserOpen(false);
               }}
             />
@@ -1101,9 +1036,9 @@ export function ProgramSceneEditor({
   const dirty = committed !== null && selected !== null
     && JSON.stringify(committed) !== JSON.stringify(selected);
   const stagedError = programSceneResourceError(staged);
-  // Support contacts and the mass have their own fields; the rest of the metadata is shown raw.
+  // The mass has its own field; the rest of the metadata is shown raw.
   const metadataEntries = Object.entries(staged?.metadata ?? {})
-    .filter(([key]) => key !== 'support_contacts' && key !== 'mass_kg');
+    .filter(([key]) => key !== 'mass_kg');
   const otherMetadata = metadataEntries.length === 0 ? null : Object.fromEntries(metadataEntries);
   // Robot and tool frames the object can be placed in: the referenced components' frames.
   const frameOptions = useMemo(() => programFrameReferenceChoices(selectorFacts)
@@ -1378,14 +1313,6 @@ export function ProgramSceneEditor({
               <ObjectPoseSourceCard controller={deploymentController} sceneResourceId={staged.scene_resource_id} />
             </DraftInputResetProvider>
           )}
-          <ProgramSupportContactEditor
-            program={program}
-            draftRevision={draftRevision}
-            busy={busy}
-            busyReason={busyReason}
-            mutate={mutate}
-            supportedObjectId={staged.scene_resource_id}
-          />
           <details className="dcard">
             <summary>Roles and metadata</summary>
             <dl>
@@ -1748,9 +1675,11 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   objectAxesSelectionKeys,
   onObjectAxesVisibleIdsChange,
   onAxesSizesCommit,
+  onDefaultViewCommit,
   motionPreview,
   programController,
   programRuntime,
+  onEditKeyInitial,
   authoringAdmissionAllowed,
   robotControl,
   correctionGhost,
@@ -1799,9 +1728,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
   objectAxesSelectionKeys: ReadonlySet<string>;
   onObjectAxesVisibleIdsChange: (ids: string[], draftPreview: boolean) => void;
   onAxesSizesCommit: (frameSizeM: number, objectSizeM: number) => void;
+  onDefaultViewCommit: (view: ProgramViewerDefaultView | null) => void;
   motionPreview: MotionPreviewReceipt | null;
   programController: ProgramWorkspaceController;
   programRuntime: ProgramRuntimeController;
+  /** Opens a key's declaration in the Program tab (the Keys panel's Edit initial). */
+  onEditKeyInitial?: (key: string) => void;
   authoringAdmissionAllowed?: boolean | null;
   robotControl: RobotControlController;
   correctionGhost: CorrectionGhost | null;
@@ -2508,6 +2440,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       objectAxesRows={objectAxesRows}
       onObjectAxesVisibleIdsChange={changeObjectAxesVisibleIds}
       onAxesSizesCommit={onAxesSizesCommit}
+      onDefaultViewCommit={onDefaultViewCommit}
       robotControlSurface={(
         <>
           <DraftScenePreviewNotice
@@ -2538,6 +2471,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           motionComponentIds={motionComponentIds}
         />
       )}
+      keysControlSurface={<ProgramKeysPanel enabled={runtimeEnabled} controller={programRuntime} onEditInitial={onEditKeyInitial} />}
       robotControlBlocked={robotControl.state.phase === 'blocked'}
       robotMotionActive={robotControlHasActiveOperation(robotControl.state)}
       objectControlSurface={objectControlSurface(objectsEditable)}
@@ -2598,6 +2532,7 @@ export function SceneAuthoringWorkspace({
   programController,
   deploymentController,
   programRuntime,
+  onEditKeyInitial,
   authoringAdmissionAllowed,
   robotControl,
   correctionGhost = null,
@@ -2999,14 +2934,13 @@ export function SceneAuthoringWorkspace({
           </section>
           {selectedObject !== null && (
             <details className="dcard">
-              <summary>Ownership, contacts, and collision metadata</summary>
+              <summary>Ownership and collision metadata</summary>
               <dl>
                 <div><dt>Placement</dt><dd>{selectedObject.placement.kind.replaceAll('_', ' ')}</dd></div>
                 <div><dt>Ownership</dt><dd>{selectedObject.provider_evidence === null
                   ? 'Logical-scene owner'
                   : 'External provider'}</dd></div>
                 <div><dt>Shapes</dt><dd>{selectedObject.collision_shapes.map((shape) => shape.type).join(', ') || 'none'}</dd></div>
-                <div><dt>Support contacts</dt><dd>{selectedObject.support_contacts.length}</dd></div>
               </dl>
             </details>
           )}
@@ -3120,6 +3054,15 @@ export function SceneAuthoringWorkspace({
           });
         }
       }}
+      onDefaultViewCommit={(view) => {
+        if (program === null || !programController.mutationAvailable) return;
+        void programController.mutate('viewer_draft_replace', {
+          viewer: programViewerMetadata({
+            ...viewerPresentationDraftFromProgram(program.viewer),
+            defaultView: view,
+          }) as unknown as JsonValue,
+        });
+      }}
       onAxesSizesCommit={(frameSizeM, objectSizeM) => {
         if (program === null || !programController.mutationAvailable) return;
         const presentation = viewerPresentationDraftFromProgram(program.viewer);
@@ -3134,6 +3077,7 @@ export function SceneAuthoringWorkspace({
       motionPreview={previewGhost}
       programController={programController}
       programRuntime={programRuntime}
+      onEditKeyInitial={onEditKeyInitial}
       authoringAdmissionAllowed={authoringAdmissionAllowed}
       robotControl={robotControl}
       correctionGhost={correctionGhost}
@@ -3160,7 +3104,6 @@ export function SceneAuthoringWorkspace({
             {([
               ['hierarchy', 'Hierarchy'],
               ['program', 'Program scene'],
-              ['contacts', 'Contact policies'],
               ['current', 'Current scene'],
               ['sources', 'Sources'],
               ['viewer', 'Viewer'],
@@ -3256,7 +3199,6 @@ export function SceneAuthoringWorkspace({
         )}
 
         {(activeSceneTool === 'program'
-          || activeSceneTool === 'contacts'
           || activeSceneTool === 'viewer')
           && program === null && (
           <div className="panel-state">
@@ -3265,16 +3207,6 @@ export function SceneAuthoringWorkspace({
           </div>
         )}
         {activeSceneTool === 'program' && renderProgramSceneEditor()}
-        {activeSceneTool === 'contacts' && program !== null && (
-          <ProgramContactPolicyEditor
-            program={program}
-            selectorFacts={selectorFacts}
-            draftRevision={draftRevision}
-            busy={draftEditBlocked}
-            busyReason={draftEditBlockReason}
-            mutate={programController.mutate}
-          />
-        )}
         {activeSceneTool === 'viewer' && program !== null && (
           <ViewerMetadataEditor
             program={program}

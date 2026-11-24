@@ -196,7 +196,6 @@ ResolvedParticipantStopStageDTO Stage(std::size_t index, Nominal nominal = Nomin
           operation,
           OperationRevision(1U),
           participant,
-          ProgramId("program.direct"),
           ProgramRevision("program-revision"),
           ProgramBindingId("program-binding"),
           ProgramRunNumber(106U),

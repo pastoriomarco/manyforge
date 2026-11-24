@@ -256,7 +256,9 @@ export function ScenarioActionControls({
       });
       return;
     }
-    void resetApply.confirm('deployment', preview.scope, previewAction).then((refusal) => {
+    void resetApply.confirm(
+      'deployment', preview.scope, previewAction, preview.collision_rules.map((row) => row.rule_id),
+    ).then((refusal) => {
       if (refusal !== null && expectation !== null) initialScene?.drop(expectation);
       if (refusal === null) {
         setApplyRefusal(null);

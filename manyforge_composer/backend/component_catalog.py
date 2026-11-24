@@ -23,6 +23,21 @@ a ready row under the model id's last segment (without a sensor's ``topic`` and
 ``source_frame_id`` or the assistant's model and profile, which the Add panel
 asks for); they have no lane, so their profile facts' ``lanes`` are empty.
 
+Passive tools (a ``kind: tool`` model without a ``gripper`` section, e.g. the
+generic ``manyforge.passive_tool``, OD-336) come from their models too: one
+``tool`` entry per model with a ready row under the model family id, whose
+model source is the model's own files; a project points it at its own URDF,
+meshes and TCP. The Tool made from parameters (``manyforge.tool``, OD-357) is
+one of them: its ready row holds its starter parameters inline (the model
+folder's ``new_tool.tool.yaml``), edited on its component page. They have no
+lane and are mounted like every tool.
+
+Owner-less model-form I/O devices (an ``io_device`` with ``lanes`` that no
+machine names as a member, e.g. a PLC's bank) come from their models too: one
+``io_device`` entry per model with a ready row under the model id's last
+segment on the Mock lane. They run on every lane (Mock and Isaac: the host's
+Mock I/O), so their profile facts' ``lanes`` are Mock, Isaac and the model's.
+
 Nothing here compiles or changes a Draft: the Add component Draft route adds
 the rows (and a tool's attachment row), and the Apply compiler checks them.
 """
@@ -30,6 +45,7 @@ the rows (and a tool's attachment row), and the Apply compiler checks them.
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import cache
 import json
 import logging
 from pathlib import Path
@@ -43,6 +59,7 @@ from manyforge_behavior.canonical_artifact import (
     load_strict_json_yaml_bytes,
 )
 
+from .deployment_defaults import default_collision_rules
 from .deployment_intent import (
     DEPLOYMENT_INTENT_API_VERSION,
     DeploymentIntentError,
@@ -54,6 +71,9 @@ from .deployment_intent import (
 
 _LOGGER = logging.getLogger(__name__)
 _REPOSITORY = Path(__file__).resolve().parents[2]
+# The Tool made from parameters (OD-357) and the parameters it starts from.
+GENERATED_TOOL_PROFILE_ID = "manyforge.tool"
+GENERATED_TOOL_STARTER = "new_tool.tool.yaml"
 _EXAMPLES = _REPOSITORY / "examples"
 _MAINTAINED = _REPOSITORY / "manyforge_deployment/resources/maintained"
 _SOURCES = _MAINTAINED / "maintained_deployment_sources.v1.json"
@@ -125,13 +145,34 @@ def _descriptor(path: str) -> dict[str, Any]:
     return yaml.safe_load((_REPOSITORY / path).read_text(encoding="utf-8"))
 
 
+@cache
+def tool_profile_ids() -> frozenset[str]:
+    """The component models that are tools (``kind: tool``): the only ones a
+    Deployment Draft may hold unmounted (OD-366)."""
+
+    sources = json.loads(_SOURCES.read_text(encoding="utf-8"))
+    return frozenset(
+        model["id"]
+        for family_row in sources["model_families"]
+        if "component_descriptor" in family_row
+        and (model := _descriptor(family_row["component_descriptor"])).get("kind") == "tool"
+    )
+
+
+def profile_facts() -> dict[str, dict[str, Any]]:
+    """Every component model's catalog facts (``componentProfiles``)."""
+
+    return _profiles()[2]
+
+
 def _arm_row(
     model: dict[str, Any], family_row: dict[str, Any], project_root: Path | None,
     component_id: str,
 ) -> dict[str, Any]:
     """A machine's arm member row from its model, as a new robot is added:
-    the model's sources, an identity base pose, its default joints and TCP
-    speed, its measured-joints stream, all under its default id. Without
+    the model's sources, an identity base pose, its default joints, TCP
+    speed and controlled Stop, its measured-joints stream, all under its
+    default id. Without
     `owner`, `role` and lane."""
 
     source = family_row["source"]
@@ -151,9 +192,36 @@ def _arm_row(
         "target_settings": {"arm": {
             "maximum_tcp_linear_speed_mps": defaults.get(
                 "maximum_tcp_linear_speed_mps", model["limits"]["max_tcp_linear_speed_mps"]),
+            # The arm's controlled Stop: the model's per-joint deceleration,
+            # the rest as every maintained example sets it.
+            "controlled_stop": {
+                "stop_mode": "soft_on_path",
+                "deceleration_time_s": 1.0,
+                "jerk_limits_enabled": True,
+                "allow_natural_completion_on_short_path": True,
+                "per_joint_limits": [
+                    {"source_joint_name": joint,
+                     "max_deceleration_rad_s2": defaults["controlled_stop_max_deceleration_rad_s2"],
+                     "settle_velocity_threshold_rad_s": 0.01}
+                    for joint in model["roles"]["joints"]["arm_joints"]
+                ],
+            },
         }},
         "configuration": {
             "runtime_kind": "ros2_control",
+            # The fault Stop a runtime collision Stop uses (without it the
+            # Stop cancels the goal and is never retried, OD-373): the
+            # controlled Stop's mode and per-joint deceleration.
+            "default_fault_stop_profile": {
+                "profile_id": "fault_soft_on_path",
+                "stop_mode": "soft_on_path",
+                "deceleration_time_s": 1.0,
+                "per_joint_max_deceleration_rad_s2": {
+                    joint: defaults["controlled_stop_max_deceleration_rad_s2"]
+                    for joint in model["roles"]["joints"]["arm_joints"]
+                },
+                "require_backend_confirmation": True,
+            },
             "runtime_configuration": {
                 "component_streams": [
                     {"budget_ns": 250000000, "controllable_component_id": component_id,
@@ -239,6 +307,56 @@ def _lane_free_models(sources: dict[str, Any]) -> list[tuple[str, dict[str, Any]
     )
 
 
+# The lanes where the host's Mock I/O serves a model-form I/O device.
+_MOCK_IO_LANES = ("isaac", "mock")
+
+
+def _owner_less_io_models(sources: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """(descriptor path, descriptor) of every model-form I/O device that no
+    machine model names as a member, by id."""
+
+    descriptors = [(path, _descriptor(path)) for path in sources.get("component_models", [])]
+    members = {
+        member["model"]
+        for _path, descriptor in descriptors
+        if descriptor.get("kind") == "machine"
+        for member in descriptor.get("members", [])
+    }
+    return sorted(
+        ((path, descriptor) for path, descriptor in descriptors
+         if descriptor.get("kind") == "io_device" and "lanes" in descriptor
+         and descriptor["id"] not in members),
+        key=lambda item: item[1]["id"],
+    )
+
+
+def _owner_less_io_entries(sources: dict[str, Any]) -> list[dict[str, Any]]:
+    """One `io_device` entry per owner-less model-form I/O device: its ready
+    row (default id the model id's last segment) on the Mock lane."""
+
+    entries = []
+    for path, model in _owner_less_io_models(sources):
+        component_id = model["id"].rsplit(".", 1)[-1]
+        entries.append({
+            "entryId": f"model/{model['id']}",
+            "kind": "io_device",
+            "componentId": component_id,
+            "componentProfileId": model["id"],
+            "modelFamilyId": None,
+            "tags": [],
+            "lane": "mock",
+            "description": model["title"],
+            "sources": [path],
+            "components": [{
+                "component_id": component_id,
+                "component_profile_id": model["id"],
+                "configuration": {},
+                "lane": "mock",
+            }],
+        })
+    return entries
+
+
 def _lane_free_entries(sources: dict[str, Any]) -> list[dict[str, Any]]:
     """One ordinary catalog entry per lane-free model: its ready row (default
     id the model id's last segment, runtime_kind its kind) without the
@@ -267,6 +385,73 @@ def _lane_free_entries(sources: dict[str, Any]) -> list[dict[str, Any]]:
             }],
         })
     return entries
+
+
+def _passive_tool_entries(
+    sources: dict[str, Any], project_root: Path | None, model_facts: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """One ``tool`` entry per passive tool model (no ``gripper`` section): its
+    ready row under the model family id with the model's own sources, no lane
+    and no streams; the Add panel mounts it on a robot's ``flange``."""
+
+    entries = []
+    for family_row in sources["model_families"]:
+        if "component_descriptor" not in family_row:
+            continue
+        path = family_row["component_descriptor"]
+        model = _descriptor(path)
+        if model.get("kind") != "tool" or "gripper" in model:
+            continue
+        family = family_row["model_family_id"]
+        source = family_row["source"]
+        # The package folder: the resource root less the prefix's own path
+        # (`package://passive_tool/` names the model folder itself).
+        package, _, inner = (
+            source["accepted_package_uri_prefix"].removeprefix("package://").partition("/")
+        )
+        package_root = source["resource_root"].rstrip("/")
+        if inner.rstrip("/"):
+            package_root = package_root.removesuffix("/" + inner.rstrip("/"))
+        model_source: dict[str, Any] = {
+            "urdf": {"project_path": source["urdf_path"]},
+            "srdf": {"project_path": source["srdf_path"]},
+            "package_roots": {package: {"project_path": package_root}},
+        }
+        if model["id"] == GENERATED_TOOL_PROFILE_ID:
+            starter = _REPOSITORY / source["resource_root"] / GENERATED_TOOL_STARTER
+            model_source = {"parameters": yaml.safe_load(starter.read_text(encoding="utf-8"))}
+        row = {
+            "component_id": family,
+            "component_profile_id": model["id"],
+            "frame_prefix": "",
+            "model_source": model_source,
+            "target_settings": {},
+            "configuration": {
+                "runtime_kind": "ros2_control",
+                "runtime_configuration": {"component_streams": []},
+            },
+        }
+        # Validated as mounted: the Add panel writes its real mount row.
+        mount = {
+            "parent": {"component_id": "catalog_robot", "interface": "flange"},
+            "child": {"component_id": family, "interface": "mount"},
+        }
+        [located] = _located_rows(
+            [row], [mount], scenario_root=_REPOSITORY, project_root=project_root
+        )
+        entries.append({
+            "entryId": f"model/{model['id']}",
+            "kind": "tool",
+            "componentId": family,
+            "componentProfileId": model["id"],
+            "modelFamilyId": family,
+            "tags": model_facts.get(model["id"], {}).get("tags", []),
+            "lane": None,
+            "description": model["title"],
+            "sources": [path],
+            "components": [located],
+        })
+    return sorted(entries, key=lambda entry: entry["componentProfileId"])
 
 
 def _model_payload(family_row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -314,6 +499,33 @@ def _tcp_targets(component_type: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(targets, key=lambda target: target["commandTargetId"])
 
 
+def _collision_body_targets(component_type: dict[str, Any]) -> list[dict[str, Any]]:
+    """The command targets with collision bodies: the body ids a TCP's
+    `contact_bodies` and a collision rule can name, the contact bodies of
+    each model TCP, and the target's grip body (the gripper body a carried
+    object is held by), when it has one."""
+
+    targets = []
+    for target in component_type.get("command_targets", []):
+        bodies = sorted(
+            role["collision_body_role_id"]
+            for role in target.get("collision_body_roles", [])
+        )
+        if not bodies:
+            continue
+        targets.append({
+            "commandTargetId": target["command_target_id"],
+            "collisionBodyRoleIds": bodies,
+            "tcpContactBodyRoleIds": {
+                role["frame_role_id"]: sorted(role.get("contact_body_role_ids", []))
+                for role in target.get("frame_roles", [])
+                if role.get("tcp") is True
+            },
+            "gripBodyRoleId": target.get("grip_body_role_id"),
+        })
+    return sorted(targets, key=lambda target: target["commandTargetId"])
+
+
 def _has_motion_target(component_type: dict[str, Any]) -> bool | None:
     targets = component_type.get("command_targets")
     if not isinstance(targets, list):
@@ -333,6 +545,13 @@ def _has_motion_target(component_type: dict[str, Any]) -> bool | None:
 _MODEL_FREE_PROFILES = ("ai_model_v0", "io_device_v0", "pose_source_v0")
 
 
+def _title(descriptor: dict[str, Any]) -> dict[str, str]:
+    """The model's readable title (`component.yaml` `title`), when it declares one."""
+
+    title = descriptor.get("title")
+    return {"title": title} if isinstance(title, str) and title else {}
+
+
 def _profiles() -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]]]:
     """Every component model, model -> model family, model -> type facts.
 
@@ -340,8 +559,9 @@ def _profiles() -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]]]:
     (``component_descriptor``), keyed by the descriptor's ``id``. The facts
     of a model are its lanes (``lanes.<lane>`` of its descriptor), its
     component type's tags, the ids of its attachment interfaces (a robot's
-    ``flange``), its targets with TCPs and, when its model asset defines one,
-    the model's payload (read-only package data).
+    ``flange``), its targets with TCPs, its targets with collision bodies and,
+    when its model asset defines one, the model's payload (read-only package
+    data).
     """
 
     sources = json.loads(_SOURCES.read_text(encoding="utf-8"))
@@ -361,6 +581,7 @@ def _profiles() -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]]]:
             continue  # no component type generated yet: no facts to offer
         component_type = json.loads(path.read_text(encoding="utf-8"))
         model_facts: dict[str, Any] = {
+            **_title(descriptor),
             "lanes": sorted(descriptor.get("lanes") or {}),
             "tags": sorted(component_type.get("tags", [])),
             "attachmentInterfaces": sorted(
@@ -375,6 +596,7 @@ def _profiles() -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]]]:
                 for target in component_type.get("command_targets", [])
                 if isinstance(target.get("frame_roles"), list)
             ], key=lambda target: target["commandTargetId"]),
+            "collisionBodyTargets": _collision_body_targets(component_type),
         }
         has_motion_target = _has_motion_target(component_type)
         if has_motion_target is not None:
@@ -383,9 +605,19 @@ def _profiles() -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]]]:
         if payload is not None:
             model_facts["payload"] = payload
         facts[model] = model_facts
+    # An owner-less model-form I/O device: its own lanes plus Mock I/O's.
+    for _path, descriptor in _owner_less_io_models(sources):
+        facts[descriptor["id"]] = {
+            **_title(descriptor),
+            "lanes": sorted({*descriptor["lanes"], *_MOCK_IO_LANES}),
+            "tags": [],
+            "attachmentInterfaces": [],
+            "tcpTargets": [],
+        }
     # Lane-free models have no model family, component type or lane.
     for _path, descriptor in _lane_free_models(sources):
         facts[descriptor["id"]] = {
+            **_title(descriptor),
             "lanes": [],
             "tags": [],
             "attachmentInterfaces": [],
@@ -410,10 +642,9 @@ def _located_rows(
 
     intent = {
         "api_version": DEPLOYMENT_INTENT_API_VERSION,
-        "deployment_artifact_id": "component_catalog",
-        "name": "component catalog",
         "components": rows,
         "attachments": attachments,
+        "collision_rules": default_collision_rules(),
         "policies": {},
     }
     if project_root is not None:
@@ -456,6 +687,10 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
             ):
                 continue
             intent = validate_deployment_intent(document, source=source)
+            # The entry describes its example by the Scenario's one description.
+            description = load_strict_json_yaml_bytes(
+                (scenario_root / "scenario.yaml").read_bytes(), source=source
+            )["description"]
         except (OSError, StrictArtifactError, DeploymentIntentError) as error:
             _LOGGER.warning(
                 "component_catalog_source_skipped",
@@ -464,13 +699,6 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
             continue
         rows = {row["component_id"]: row for row in intent["components"]}
         machine_rows = _machine_rows(rows)
-        compatibility = intent.get("compatibility")
-        lane = (
-            compatibility.get("lane")
-            if isinstance(compatibility, dict)
-            and isinstance(compatibility.get("lane"), str)
-            else None
-        )
         for component_id, row in rows.items():
             members = _assembly(component_id, rows)
             # A machine is added whole, from its machine entry.
@@ -501,8 +729,9 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
                 "componentProfileId": profile,
                 "modelFamilyId": family,
                 "tags": tags,
-                "lane": lane,
-                "description": intent.get("description"),
+                # The entry's own placement lane, as for the model entries.
+                "lane": row.get("lane"),
+                "description": description,
                 "sources": [source],
                 "components": located,
             }
@@ -516,6 +745,8 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
         ),
     )
     sources = json.loads(_SOURCES.read_text(encoding="utf-8"))
+    ordered += _passive_tool_entries(sources, destination, model_facts)
+    ordered += _owner_less_io_entries(sources)
     ordered += _lane_free_entries(sources)
     offered = {entry["componentProfileId"] for entry in ordered}
     # One entry per machine model (owner plus member rows).

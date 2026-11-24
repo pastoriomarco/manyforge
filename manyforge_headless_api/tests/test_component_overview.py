@@ -96,7 +96,6 @@ def _facts() -> dict[str, Any]:
     applied = {
         "graph_revision": graph,
         "retained_bundle_id": bundle,
-        "program_id": "pick",
         "scenario_id": "cell-pick",
         "source": {
             "source_owner_id": "program-owner",

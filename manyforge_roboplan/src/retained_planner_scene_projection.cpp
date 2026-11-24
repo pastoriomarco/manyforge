@@ -455,27 +455,17 @@ RetainedPlannerSceneProjection::ApplyTransaction(
                    "transaction predecessor",
                    "native_projection_predecessor_unavailable");
   }
-  const auto candidate =
+  auto candidate =
       core::ApplyResolvedSceneTransaction(*logical_snapshot_, transaction);
   if (!candidate.ok()) {
     return invalid(candidate.error().message,
                    "native_projection_resolved_delta_mismatch");
   }
 
-  auto candidate_snapshot =
-      std::make_shared<const core::LogicalSceneSnapshotDTO>(candidate.value());
-  if (const auto *policy = std::get_if<core::ResolvedCollisionPolicyDTO>(
-          &transaction.resolved_operation)) {
-    const auto derived = projector_.project_effective_policy(
-        *candidate_snapshot, policy->effective_policy.revision.revision_id);
-    if (!derived.ok() || derived.value() != policy->effective_policy) {
-      return invalid(derived.ok()
-                         ? "owner-supplied effective collision policy differs "
-                           "from the exact retained projection"
-                         : derived.error().message,
-                     "native_projection_effective_policy_mismatch");
-    }
-  }
+  // The owner resolved any effective policy through this projection's
+  // CommitPreflight; it is not derived again here.
+  auto candidate_snapshot = std::make_shared<const core::LogicalSceneSnapshotDTO>(
+      std::move(candidate.value()));
   auto next_health = health_;
   if (next_health.source_sequence ==
       std::numeric_limits<std::uint64_t>::max()) {
@@ -515,24 +505,20 @@ RetainedPlannerSceneProjection::ApplyTransaction(
       next_health,
       std::nullopt,
   };
-  auto next_records = transaction_records_;
-  if (next_records.size() >= config_.transaction_replay_capacity) {
-    next_records.erase(next_records.begin());
-  }
-  next_records.emplace(transaction.transaction_sequence,
-                       TransactionRecord{transaction, success});
-
   if (!no_native_change) {
     // The collision world is rebuilt lazily by its next consumer.
     next_health.projection_content_digest =
         projection_digest(*candidate_snapshot);
     success.resulting_health = next_health;
-    next_records.at(transaction.transaction_sequence).result = success;
   }
 
+  if (transaction_records_.size() >= config_.transaction_replay_capacity) {
+    transaction_records_.erase(transaction_records_.begin());
+  }
+  transaction_records_.emplace(transaction.transaction_sequence,
+                               TransactionRecord{transaction, success});
   logical_snapshot_ = std::move(candidate_snapshot);
   health_ = std::move(next_health);
-  transaction_records_.swap(next_records);
   if (!no_native_change) {
     scene_change_.fetch_add(1U, std::memory_order_acq_rel);
   }
@@ -1229,6 +1215,46 @@ RetainedPlannerSceneProjection::ProjectEffectiveCollisionPolicy(
   }
   return projector_.project_effective_policy(logical_scene,
                                              effective_policy_revision_id);
+}
+
+core::Result<core::SceneCommitPreflightDTO>
+RetainedPlannerSceneProjection::CommitPreflight(
+    const core::ProjectionRevisionDTO &selected_revision,
+    const core::SceneTransactionDTO *transaction,
+    const core::LogicalSceneSnapshotDTO *) const {
+  core::SceneCommitPreflightDTO result{
+      ProjectionHealthForRevision(selected_revision), std::nullopt};
+  if (transaction != nullptr) {
+    result.effective_policy = CommitCandidatePolicy(*transaction);
+  }
+  return core::Result<core::SceneCommitPreflightDTO>::Ok(std::move(result));
+}
+
+std::optional<core::Result<core::CollisionPolicySnapshot>>
+RetainedPlannerSceneProjection::CommitCandidatePolicy(
+    const core::SceneTransactionDTO &transaction) const {
+  std::shared_ptr<const core::LogicalSceneSnapshotDTO> predecessor;
+  {
+    std::lock_guard lock(mutex_);
+    if (!health_.healthy_for_target(transaction.prior_projection_revision) ||
+        !logical_snapshot_ ||
+        logical_snapshot_->revision !=
+            transaction.prior_projection_revision.scene_revision) {
+      return std::nullopt;
+    }
+    predecessor = logical_snapshot_;
+  }
+  // The snapshot is immutable and the projector fixed: no lock is needed.
+  const auto candidate =
+      core::ApplyResolvedSceneTransaction(*predecessor, transaction);
+  if (!candidate.ok()) {
+    return projection_error<core::CollisionPolicySnapshot>(
+        candidate.error().message,
+        "native_projection_resolved_delta_mismatch");
+  }
+  return projector_.project_effective_policy(
+      candidate.value(),
+      transaction.proposed_projection_revision.scene_revision.revision_id);
 }
 
 std::shared_ptr<const core::LogicalSceneSnapshotDTO>

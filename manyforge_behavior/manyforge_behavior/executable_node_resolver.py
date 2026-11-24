@@ -44,6 +44,7 @@ from manyforge_behavior.nodes.v2_owner import (
     InterruptMotionTaskAdapter,
     MotionTaskAdapter,
 )
+from manyforge_behavior.nodes.operator import MotionStopGroups, OperatorRequestChoice
 from manyforge_behavior.nodes.v2_pure import (
     GeometryCheckPoseBounds,
     GeometryCheckPoseDistance,
@@ -112,6 +113,9 @@ class NodeAdapterBuildContext:
     # leaves the tick (Scene nodes, the output writes, Set TCP, pick/place
     # planning) use it.
     run_sender: RunSender | None = None
+    # The captured Program's execution selections (group id -> node ids),
+    # read by the Program's own motion-group Stop.
+    execution_selections: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -562,6 +566,40 @@ _PURE_BUILDERS: Final[Mapping[str, NodeAdapterBuilder]] = MappingProxyType(
         "geometry_check_pose_bounds_v1": _pure_leaf(GeometryCheckPoseBounds),
     }
 )
+def _operator_choice(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
+    return OperatorRequestChoice(
+        name=context.name,
+        parameters=context.parameters,
+        value_sources=context.value_sources,
+        input_resolver=_required_input_resolver(context),
+        attempt_source=_required_attempt_source(context),
+        audit_sink=context.audit_sink,
+    )
+
+
+def _motion_stop_groups(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
+    if context.operator_stop_state is None:
+        raise ValueError("a motion-group Stop requires the run's operator Stop state")
+    return MotionStopGroups(
+        name=context.name,
+        parameters=context.parameters,
+        value_sources=context.value_sources,
+        input_resolver=_required_input_resolver(context),
+        attempt_source=_required_attempt_source(context),
+        audit_sink=context.audit_sink,
+        operator_stop_state=context.operator_stop_state,
+        execution_selections=context.execution_selections,
+    )
+
+
+# Nodes the Program run owner serves itself (no owner port): the operator
+# question and the Program's own motion-group Stop.
+_RUN_OWNER_BUILDERS: Final[Mapping[tuple[str, str], NodeAdapterBuilder]] = MappingProxyType(
+    {
+        ("operator_request_choice_v1", "orchestration.operator"): _operator_choice,
+        ("motion_stop_groups_v1", "orchestration.selection_stop"): _motion_stop_groups,
+    }
+)
 _OWNER_NEUTRAL_APIS: Final = frozenset(
     {
         "geometry.compare",
@@ -640,6 +678,11 @@ def _definition_for(
             None,
             (),
         )
+    run_owner_builder = _RUN_OWNER_BUILDERS.get(
+        (row.implementation_id, entry.execution.owner_api)
+    )
+    if run_owner_builder is not None:
+        return _AdapterDefinition(row, run_owner_builder, None, None, ())
     pure_builder = _PURE_BUILDERS.get(row.implementation_id)
     if pure_builder is not None:
         if entry.execution.owner_api not in _OWNER_NEUTRAL_APIS:

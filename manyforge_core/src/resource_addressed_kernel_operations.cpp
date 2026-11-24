@@ -1017,7 +1017,6 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
         operation_id,
         operation_revision,
         participant_id,
-        intent.program_id,
         intent.program_revision,
         intent.program_binding_id,
         intent.program_run_id,
@@ -1050,8 +1049,8 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
             ? resolved.value().default_fault_stop_profile
             : std::optional<MotionInterruptStopProfileDTO>{},
         binding, resolved.value().retained_default_stop_limits, resolved.value().stop_node_category,
-        operation_id, operation_revision, participant_id, intent.program_id,
-        intent.program_revision, intent.program_binding_id, intent.program_run_id);
+        operation_id, operation_revision, participant_id, intent.program_revision,
+        intent.program_binding_id, intent.program_run_id);
     if (!made_fault_stop_plan.ok()) {
       return Result<OperationAcceptedDTO>::Err(made_fault_stop_plan.error());
     }
@@ -1686,7 +1685,6 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
           operation_id,
           operation_revision,
           participant_id,
-          intent.program_id,
           intent.program_revision,
           intent.program_binding_id,
           intent.program_run_id,
@@ -1711,8 +1709,8 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
               ? registration.default_fault_stop_profile
               : std::optional<MotionInterruptStopProfileDTO>{},
           binding, registration.retained_default_stop_limits, registration.stop_node_category,
-          operation_id, operation_revision, participant_id, intent.program_id,
-          intent.program_revision, intent.program_binding_id, intent.program_run_id);
+          operation_id, operation_revision, participant_id, intent.program_revision,
+          intent.program_binding_id, intent.program_run_id);
       if (!fault_stop_plan.ok()) {
         return Result<OperationAcceptedDTO>::Err(fault_stop_plan.error());
       }
@@ -2390,6 +2388,12 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
               "operation_effect_in_flight");
     }
     reset_already_terminal = terminal(active_operation->state.state);
+    // OD-370 (A): a held failure that never crossed the dispatch barrier
+    // (e.g. pre-dispatch collision validation rejected it) still owns each
+    // motion participant's prepared inner execution. Reset retires it through
+    // the same no-motion certified reset as a Stop-cancelled preparation.
+    const bool failed_preparation_retirement =
+        control == OperationControlKind::kReset && active_operation->held_without_physical_effect();
     if (current_revision.value() >= kMaximumKernelJsonInteger) {
       return reject<OperationControlAcceptedDTO>("operation revision space is exhausted",
                                                  "operation_revision_exhausted",
@@ -2414,8 +2418,9 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
                  !participant.permanent_preparation_no_effect() && participant.subordinate_id != 0U &&
                  (participant.prepared_dispatch_released ||
                   (participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
-                   participant.stop_cancelled_pre_dispatch &&
-                   active_operation->state.stop_event_id.has_value()))) {
+                   ((participant.stop_cancelled_pre_dispatch &&
+                     active_operation->state.stop_event_id.has_value()) ||
+                    failed_preparation_retirement)))) {
         targets.push_back(ControlTarget{participant_state.participant_id,
                                         participant.engine,
                                         participant.subordinate_id,
@@ -3112,7 +3117,7 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
   const auto bounded = [](const auto& id) {
     return !id.empty() && id.value().size() <= 128U && id.value().find('\0') == std::string::npos;
   };
-  if (!capture.program_run_id.nonzero() || !bounded(capture.program_id) ||
+  if (!capture.program_run_id.nonzero() ||
       !bounded(capture.program_revision) || !bounded(capture.program_binding_id) ||
       !bounded(capture.retained_bundle_id) || !bounded(capture.graph_revision) ||
       !capture.claim_generation.nonzero() || capture.table == nullptr || !capture.binding ||
@@ -3122,7 +3127,6 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
                         "program_execution_capture_invalid", ErrorCode::kInvalidRequest);
   }
   if (capture.binding->program_binding_id != capture.program_binding_id ||
-      capture.binding->program_id != capture.program_id ||
       capture.binding->program_revision != capture.program_revision ||
       capture.binding->retained_bundle_id != capture.retained_bundle_id ||
       capture.binding->graph_revision != capture.graph_revision) {
@@ -3234,6 +3238,7 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
   }
   std::vector<std::uint16_t> stopping(node_count, 0U);
   std::vector<std::uint16_t> failed(node_count, 0U);
+  std::vector<std::uint32_t> held_by_program_node(node_count, 0U);
   std::vector<std::uint64_t> selected_nodes((node_count + 63U) / 64U, 0U);
   std::vector<std::uint64_t> subtree_marks((node_count + 63U) / 64U, 0U);
   auto shared_capture = std::make_shared<const ProgramRunExecutionCaptureDTO>(std::move(capture));
@@ -3272,6 +3277,7 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
       run.hold.node_hold = std::move(node_hold);
       run.hold.stopping = std::move(stopping);
       run.hold.failed = std::move(failed);
+      run.hold.held_by_program_node = std::move(held_by_program_node);
       run.hold.selected_nodes = std::move(selected_nodes);
       // The previous run's scratch is freed after the lock (moved out).
       hold_subtree_scratch_.swap(subtree_marks);
@@ -3285,8 +3291,7 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
   }
   // Large immutable tables are compared and released outside Stop ordering.
   const auto& candidate = *shared_capture;
-  if (previous->program_id != candidate.program_id ||
-      previous->program_binding_id != candidate.program_binding_id ||
+  if (previous->program_binding_id != candidate.program_binding_id ||
       (previous->binding != candidate.binding &&
        (!previous->binding || !candidate.binding || *previous->binding != *candidate.binding)) ||
       (previous->table != candidate.table && *previous->table != *candidate.table)) {
@@ -3510,8 +3515,7 @@ Result<void> ResourceAddressedExecutionKernel::validate_program_execution_scope_
                         "program_execution_capture_missing", ErrorCode::kInvalidStateTransition);
   }
   const auto& capture = *claim->capture;
-  if (capture.program_id != intent.program_id ||
-      capture.program_revision != intent.program_revision ||
+  if (capture.program_revision != intent.program_revision ||
       capture.program_binding_id != intent.program_binding_id ||
       capture.graph_revision != intent.expected_graph_revision ||
       capture.retained_bundle_id != intent.expected_retained_bundle_id) {
@@ -3871,11 +3875,21 @@ bool ResourceAddressedExecutionKernel::apply_stop_hold_locked(const StopRequest&
   auto& hold = run.hold;
   std::uint8_t change = 0U;
   if (run.capture) {
+    // OD-342: a Program node's own group Stop names it on the holds it
+    // raises (stopped_by: program), as a rule's `hold` names the rule.
+    std::uint32_t program_holder = 0U;
+    if (groups && request.held_by_program_node != nullptr) {
+      const auto& nodes = run.capture->table->nodes;
+      const auto requester = captured_node_index(nodes, *request.held_by_program_node);
+      if (requester < nodes.size()) program_holder = static_cast<std::uint32_t>(requester + 1U);
+    }
     // G3 join: a node only rises from running to held; ready stays ready.
     for (std::size_t index = 0U; index < hold.node_hold.size(); ++index) {
       if (hold.node_hold[index] != RunNodeHold::kRunning) continue;
       if (groups && !node_bit(hold.selected_nodes, index)) continue;
       hold.node_hold[index] = RunNodeHold::kHeld;
+      if (index < hold.held_by_program_node.size())
+        hold.held_by_program_node[index] = program_holder;
       change |= static_cast<std::uint8_t>(StopHoldChange::kNodes);
     }
     if (applied == StopKind::kRuleHold && request.held_by_rule != nullptr &&
@@ -3985,10 +3999,17 @@ ProgramExecutionScopeStateDTO ResourceAddressedExecutionKernel::program_executio
   result.frozen = run.hold.frozen;
   if (run.hold.frozen_by.nonzero()) result.frozen_by = run.hold.frozen_by;
   result.all_groups_held = run.hold.all_groups_held;
+  // node_hold is allocated at capture: empty without one.
   for (std::size_t index = 0U; index < run.hold.node_hold.size(); ++index) {
     const auto state = node_display_state_locked(run, static_cast<std::uint32_t>(index));
-    if (state != ProgramNodeHoldStateDTO::kRunning)
+    if (state != ProgramNodeHoldStateDTO::kRunning) {
       result.held_nodes.push_back({static_cast<std::uint32_t>(index), state});
+      const auto holder = index < run.hold.held_by_program_node.size()
+                              ? run.hold.held_by_program_node[index]
+                              : 0U;
+      if (holder != 0U)
+        result.program_held_nodes.push_back({static_cast<std::uint32_t>(index), holder - 1U});
+    }
   }
   return result;
 }
@@ -4079,6 +4100,8 @@ ProgramExecutionSelectionAcceptedDTO ResourceAddressedExecutionKernel::stop_prog
   stop_request.source_label = request.request_context.source_label;
   stop_request.reason = "Program node selection";
   stop_request.attribution_rank = StopAttribution{StopAttributionClass::kOperator, 0, 0U};
+  if (request.stopped_by_node_instance_id.has_value())
+    stop_request.held_by_program_node = &*request.stopped_by_node_instance_id;
   if (request.node_instance_id.has_value() || request.group_ids.empty() ||
       request.group_ids.size() > kMaxProgramExecutionGroups)
     stop_request.preset_widen = StopWidenReason::kMalformed;
@@ -4200,7 +4223,11 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_
     return Result<ProgramExecutionScopeStateDTO>::Err(std::move(*refusal));
   }
   // Run and Resume are one release: Ready and Held nodes become running.
-  for (const auto index : selection.value()) run.hold.node_hold[index] = RunNodeHold::kRunning;
+  for (const auto index : selection.value()) {
+    run.hold.node_hold[index] = RunNodeHold::kRunning;
+    // A released node is no longer the Program's Stop (OD-342).
+    if (index < run.hold.held_by_program_node.size()) run.hold.held_by_program_node[index] = 0U;
+  }
   run.hold.held_by_rule.reset();
   ++hold_revision_;
   fence_facts_changed = true;

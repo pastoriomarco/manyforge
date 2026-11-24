@@ -1,11 +1,15 @@
 """Backend-owned Deployment defaults and effective values."""
 
-from manyforge_composer.backend.deployment_defaults import effective_fields, with_defaults
+from manyforge_composer.backend.deployment_defaults import (
+    default_collision_rules,
+    effective_fields,
+    with_defaults,
+)
 
 
 def _document() -> dict:
     return {
-        "api_version": "manyforge.deployment_intent.v2",
+        "api_version": "manyforge.deployment_intent.v3",
         "components": [
             {
                 "component_id": "lite6_robot",
@@ -53,7 +57,9 @@ def test_effective_values_name_value_default_and_whether_set() -> None:
     }
     assert fields[f"{runtime}.planner_rng_seed"]["set"] is False
     assert fields[f"{runtime}.collision_check_step_rad"]["default"] == 0.05
-    assert fields[f"{runtime}.collision_clearance_m"]["default"] == 0.001
+    # The cell clearance is the Deployment's first collision rule, not a
+    # per-robot field.
+    assert f"{runtime}.collision_clearance_m" not in fields
     # robot_defaults.tsv: the fresh-plan pre-dispatch check is on by default.
     assert fields[f"{runtime}.collision_check_fresh_plans"] == {
         "value": True, "default": True, "set": False,
@@ -88,6 +94,11 @@ def test_effective_values_name_value_default_and_whether_set() -> None:
     mock = "components.3.configuration.runtime_configuration"
     assert f"{mock}.execution_tick_hz" in fields
     assert f"{mock}.stop_lead_in_anchor" not in fields
+
+
+def test_a_new_deployment_starts_with_the_first_collision_rule_alone() -> None:
+    # robot_defaults.tsv (table `cell`): 1 mm for every robot x environment pair.
+    assert default_collision_rules() == [{"rule_id": "everything", "clearance_m": 0.001}]
 
 
 def test_no_document_has_no_fields() -> None:
@@ -176,7 +187,7 @@ def test_takeover_planning_budget_defaults_to_four_fifths_of_the_total() -> None
 
 def _sensor_document(runtime: dict) -> dict:
     return {
-        "api_version": "manyforge.deployment_intent.v2",
+        "api_version": "manyforge.deployment_intent.v3",
         "components": [{
             "component_id": "front_points",
             "component_profile_id": "manyforge.pointcloud_source",

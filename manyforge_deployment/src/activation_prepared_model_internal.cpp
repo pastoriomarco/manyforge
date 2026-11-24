@@ -1,14 +1,18 @@
 #include "activation_prepared_model_internal.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
 
+#include <manyforge_core/types/component_type.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/content_identity.hpp>
@@ -150,6 +154,18 @@ artifact_rows(const std::vector<PreparedModelSourceArtifact> &artifacts) {
   return CanonicalValue(std::move(rows));
 }
 
+// A model without SRDF (a passive tool's own URDF, OD-336) leaves
+// `srdf_logical_uri` out: the model-asset format's optional, absent field.
+[[nodiscard]] CanonicalValue expanded_source(
+    const std::string &urdf_uri, const std::optional<std::string> &srdf_uri,
+    const std::vector<PreparedModelSourceArtifact> &artifacts) {
+  CanonicalValue::Object source{{"urdf_logical_uri", CanonicalValue(urdf_uri)}};
+  if (srdf_uri.has_value())
+    source.emplace_back("srdf_logical_uri", CanonicalValue(*srdf_uri));
+  source.emplace_back("artifacts", artifact_rows(artifacts));
+  return CanonicalValue(std::move(source));
+}
+
 [[nodiscard]] CanonicalValue normalized_model_asset_candidate(
     std::string_view model_asset_id, const CanonicalValue &semantics,
     const std::vector<PreparedModelSourceArtifact> &artifacts, bool has_srdf) {
@@ -164,12 +180,9 @@ artifact_rows(const std::vector<PreparedModelSourceArtifact> &artifacts) {
       {"instance_cardinality",
        member(semantics, "instance_cardinality", "semantics")},
       {"expanded_source",
-       CanonicalValue(CanonicalValue::Object{
-           {"urdf_logical_uri", CanonicalValue(urdf_uri)},
-           {"srdf_logical_uri",
-            has_srdf ? CanonicalValue(srdf_uri) : CanonicalValue(nullptr)},
-           {"artifacts", artifact_rows(artifacts)},
-       })},
+       expanded_source(urdf_uri, has_srdf ? std::optional<std::string>(srdf_uri)
+                                          : std::nullopt,
+                       artifacts)},
       {"root_frame_role_id",
        member(semantics, "root_frame_role_id", "semantics")},
       {"frame_role_bindings",
@@ -202,6 +215,74 @@ artifact_rows(const std::vector<PreparedModelSourceArtifact> &artifacts) {
       .normalized_root();
 }
 
+// OD-336: a passive tool (a tool model without a `gripper` section) is the
+// project's own model, so its mass and centre of mass come from its URDF:
+// the `<inertial>` of every link, summed, the centre of mass in the root
+// link (the mount) through the joint origins. No inertial is no payload
+// (0 kg), as for every other tool.
+[[nodiscard]] bool is_passive_tool(const ActivationComponentProfile &profile) {
+  const auto *kind = profile.model_descriptor.find_object_member("kind");
+  return kind != nullptr && kind->is_string() && kind->as_string() == "tool" &&
+         profile.model_descriptor.find_object_member("gripper") == nullptr;
+}
+
+[[nodiscard]] std::array<double, 3> origin_point(const UrdfOriginIr &origin,
+                                                 const std::array<double, 3> &point) {
+  // R = Rz(yaw) Ry(pitch) Rx(roll), as URDF.
+  const auto &[roll, pitch, yaw] = origin.rpy_rad;
+  const double cr = std::cos(roll), sr = std::sin(roll);
+  const double cp = std::cos(pitch), sp = std::sin(pitch);
+  const double cy = std::cos(yaw), sy = std::sin(yaw);
+  const double x = point[0], y = point[1], z = point[2];
+  return {cy * cp * x + (cy * sp * sr - sy * cr) * y + (cy * sp * cr + sy * sr) * z +
+              origin.xyz_m[0],
+          sy * cp * x + (sy * sp * sr + cy * cr) * y + (sy * sp * cr - cy * sr) * z +
+              origin.xyz_m[1],
+          -sp * x + cp * sr * y + cp * cr * z + origin.xyz_m[2]};
+}
+
+[[nodiscard]] std::optional<CanonicalValue> urdf_payload(const UrdfDocumentIr &urdf,
+                                                         std::string_view root_link) {
+  std::map<std::string, const UrdfJointIr *, std::less<>> parent_joint;
+  for (const auto &joint : urdf.joints) parent_joint.emplace(joint.child_link_name, &joint);
+  double mass = 0.0;
+  std::array<double, 3> moment{0.0, 0.0, 0.0};
+  for (const auto &link : urdf.links) {
+    if (!link.inertial.has_value() || link.inertial->mass_kg <= 0.0) continue;
+    auto point = link.inertial->origin.xyz_m;
+    std::string_view current = link.name;
+    for (std::size_t steps = 0U; current != root_link; ++steps) {
+      const auto joint = parent_joint.find(current);
+      if (joint == parent_joint.end() || steps > urdf.joints.size())
+        fail("passive tool link " + link.name + " is not under its mount " +
+             std::string(root_link));
+      point = origin_point(joint->second->origin, point);
+      current = joint->second->parent_link_name;
+    }
+    mass += link.inertial->mass_kg;
+    for (std::size_t axis = 0U; axis < 3U; ++axis)
+      moment[axis] += link.inertial->mass_kg * point[axis];
+  }
+  if (mass <= 0.0) return std::nullopt;
+  return CanonicalValue(CanonicalValue::Object{
+      {"center_of_mass_m",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(moment[0] / mass),
+                                            CanonicalValue(moment[1] / mass),
+                                            CanonicalValue(moment[2] / mass)})},
+      {"mass_kg", CanonicalValue(mass)},
+  });
+}
+
+[[nodiscard]] std::string root_link_name(const CanonicalValue &semantics) {
+  const auto &root_role =
+      text(member(semantics, "root_frame_role_id", "semantics"), "root frame role");
+  for (const auto &row : array(member(semantics, "frame_role_bindings", "semantics"),
+                               "frame role bindings"))
+    if (text(member(row, "frame_role_id", "frame role binding"), "frame role") == root_role)
+      return text(member(row, "source_link_name", "frame role binding"), "root link");
+  fail("semantics bind no root frame role link");
+}
+
 [[nodiscard]] std::string source_store_key(std::string_view digest) {
   if (!is_sha256_digest(digest)) {
     fail("source artifact does not carry one SHA-256 identity");
@@ -209,9 +290,7 @@ artifact_rows(const std::vector<PreparedModelSourceArtifact> &artifacts) {
   return "sha256/" + std::string(digest.substr(7U));
 }
 
-} // namespace
-
-ActivationPreparedModel qualify_activation_prepared_model(
+[[nodiscard]] ActivationPreparedModel qualify_model_once(
     std::string_view model_asset_id, const CanonicalValue &semantics,
     std::string_view expected_package_uri_prefix,
     std::string_view canonical_preparation_receipt,
@@ -313,6 +392,138 @@ ActivationPreparedModel qualify_activation_prepared_model(
           std::move(preparation)};
 }
 
+} // namespace
+
+std::optional<CanonicalValue> passive_tool_urdf_payload(const UrdfDocumentIr &urdf,
+                                                        std::string_view root_link) {
+  return urdf_payload(urdf, root_link);
+}
+
+std::optional<CanonicalValue>
+default_collision_semantics(const CanonicalValue &semantics,
+                            const UrdfDocumentIr &urdf) {
+  const auto &bindings =
+      array(member(semantics, "collision_body_role_bindings", "semantics"),
+            "collision body role bindings");
+  const auto links_of = [](const CanonicalValue &row) -> const auto & {
+    return array(member(row, "source_link_names", "collision body role binding"),
+                 "collision body role binding links");
+  };
+  std::set<std::string, std::less<>> covered;
+  for (const auto &row : bindings)
+    for (const auto &link : links_of(row))
+      covered.insert(text(link, "collision body link"));
+  std::set<std::string, std::less<>> links;
+  for (const auto &link : urdf.links)
+    if (!link.collisions.empty() && !covered.contains(link.name))
+      links.insert(link.name);
+  if (links.empty()) return std::nullopt;
+
+  CanonicalValue::Array rows;
+  for (const auto &row : bindings) {
+    if (text(member(row, "collision_body_role_id", "collision body role binding"),
+             "collision body role") != core::kDefaultCollisionBodyRoleId) {
+      rows.push_back(row);
+      continue;
+    }
+    for (const auto &link : links_of(row))
+      links.insert(text(link, "collision body link"));
+  }
+  CanonicalValue::Array names;
+  for (const auto &name : links) names.emplace_back(name);
+  rows.emplace_back(CanonicalValue::Object{
+      {"collision_body_role_id",
+       CanonicalValue(std::string(core::kDefaultCollisionBodyRoleId))},
+      {"source_link_names", CanonicalValue(std::move(names))},
+  });
+  std::sort(rows.begin(), rows.end(), [](const auto &left, const auto &right) {
+    return left.find_object_member("collision_body_role_id")->as_string() <
+           right.find_object_member("collision_body_role_id")->as_string();
+  });
+  auto result = object(semantics, "semantics");
+  for (auto &[name, value] : result)
+    if (name == "collision_body_role_bindings") value = CanonicalValue(std::move(rows));
+  return CanonicalValue(std::move(result));
+}
+
+CanonicalValue without_absent_optional_bodies(
+    const CanonicalValue &semantics,
+    const std::vector<std::string> &optional_collision_body_role_ids,
+    const UrdfDocumentIr *urdf) {
+  if (optional_collision_body_role_ids.empty()) return semantics;
+  const auto present = [&](const CanonicalValue &row) {
+    if (urdf == nullptr) return false;
+    for (const auto &link :
+         array(member(row, "source_link_names", "collision body role binding"),
+               "collision body role binding links")) {
+      const auto &name = text(link, "collision body link");
+      if (std::any_of(urdf->links.begin(), urdf->links.end(),
+                      [&](const auto &value) { return value.name == name; }))
+        return true;
+    }
+    return false;
+  };
+  CanonicalValue::Array rows;
+  for (const auto &row :
+       array(member(semantics, "collision_body_role_bindings", "semantics"),
+             "collision body role bindings")) {
+    const auto &role = text(
+        member(row, "collision_body_role_id", "collision body role binding"),
+        "collision body role");
+    if (std::find(optional_collision_body_role_ids.begin(),
+                  optional_collision_body_role_ids.end(),
+                  role) == optional_collision_body_role_ids.end() ||
+        present(row))
+      rows.push_back(row);
+  }
+  auto result = object(semantics, "semantics");
+  for (auto &[name, value] : result)
+    if (name == "collision_body_role_bindings") value = CanonicalValue(std::move(rows));
+  return CanonicalValue(std::move(result));
+}
+
+std::vector<std::string>
+optional_collision_body_role_ids(const CanonicalValue &model_descriptor) {
+  std::vector<std::string> result;
+  if (!model_descriptor.is_object()) return result;
+  const auto *roles = model_descriptor.find_object_member("roles");
+  const auto *optional =
+      roles == nullptr ? nullptr : roles->find_object_member("optional_collision_bodies");
+  if (optional == nullptr) return result;
+  for (const auto &role : array(*optional, "roles.optional_collision_bodies"))
+    result.push_back(text(role, "roles.optional_collision_bodies[]"));
+  return result;
+}
+
+ActivationPreparedModel qualify_activation_prepared_model(
+    std::string_view model_asset_id, const CanonicalValue &semantics,
+    std::string_view expected_package_uri_prefix,
+    std::string_view canonical_preparation_receipt,
+    std::string_view original_urdf_bytes,
+    std::optional<std::string_view> original_srdf_bytes,
+    std::vector<PreparedModelSourceArtifact> artifacts,
+    const std::vector<std::string> &optional_collision_body_role_ids) {
+  // First without the optional bodies, to read the model's links.
+  const auto first = without_absent_optional_bodies(
+      semantics, optional_collision_body_role_ids, nullptr);
+  auto model = qualify_model_once(
+      model_asset_id, first, expected_package_uri_prefix,
+      canonical_preparation_receipt, original_urdf_bytes, original_srdf_bytes,
+      std::move(artifacts));
+  const auto &urdf = model.verified_asset.source_ir().urdf();
+  // OD-352 A1: an optional body binds only when the model has its links.
+  auto prepared = without_absent_optional_bodies(
+      semantics, optional_collision_body_role_ids, &urdf);
+  // OD-350: collision links no binding covers join `default_collision`.
+  if (auto with_default = default_collision_semantics(prepared, urdf))
+    prepared = std::move(*with_default);
+  if (canonical_json(prepared) == canonical_json(first)) return model;
+  return qualify_model_once(
+      model_asset_id, prepared, expected_package_uri_prefix,
+      canonical_preparation_receipt, original_urdf_bytes, original_srdf_bytes,
+      std::move(model.source_artifacts));
+}
+
 std::vector<ActivationPreparedModel> qualify_activation_prepared_models(
     const ActivationDeploymentIntent &intent,
     const std::vector<ActivationComponentProfile> &profiles,
@@ -411,15 +622,39 @@ std::vector<ActivationPreparedModel> qualify_activation_prepared_models(
 
     const auto &semantics =
         member(profile.model_family, "semantics", "model family");
-    result.push_back(qualify_activation_prepared_model(
+    const auto receipt = canonical_json(source.preparation_receipt);
+    const auto srdf_bytes = component.model_source->srdf.has_value()
+                                ? std::optional<std::string_view>(
+                                      component.model_source->srdf->bytes)
+                                : std::nullopt;
+    const auto optional =
+        optional_collision_body_role_ids(profile.model_descriptor);
+    auto model = qualify_activation_prepared_model(
         profile.model_asset_id, semantics, profile.accepted_package_uri_prefix,
-        canonical_json(source.preparation_receipt),
-        component.model_source->urdf.bytes,
-        component.model_source->srdf.has_value()
-            ? std::optional<std::string_view>(
-                  component.model_source->srdf->bytes)
-            : std::nullopt,
-        std::move(artifacts)));
+        receipt, component.model_source->urdf.bytes, srdf_bytes,
+        std::move(artifacts), optional);
+    // A passive tool's payload is read from its verified URDF, then sealed
+    // into its model asset like a family payload.
+    std::optional<CanonicalValue> payload;
+    if (is_passive_tool(profile) && semantics.find_object_member("payload") == nullptr)
+      payload = urdf_payload(model.verified_asset.source_ir().urdf(),
+                             root_link_name(semantics));
+    if (!payload.has_value()) {
+      result.push_back(std::move(model));
+      continue;
+    }
+    // Merged with the optional and default collision bindings: requalified
+    // in one pass.
+    const auto &urdf = model.verified_asset.source_ir().urdf();
+    const auto bodies = without_absent_optional_bodies(semantics, optional, &urdf);
+    auto with_payload = object(
+        default_collision_semantics(bodies, urdf).value_or(bodies), "semantics");
+    with_payload.emplace_back("payload", std::move(*payload));
+    result.push_back(qualify_activation_prepared_model(
+        profile.model_asset_id, CanonicalValue(std::move(with_payload)),
+        profile.accepted_package_uri_prefix, receipt,
+        component.model_source->urdf.bytes, srdf_bytes,
+        std::move(model.source_artifacts)));
   }
   if (!prepared.empty()) {
     fail("prepared model set contains an unused component");

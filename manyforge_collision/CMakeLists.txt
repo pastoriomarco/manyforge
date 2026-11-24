@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_collision VERSION 0.3.1 LANGUAGES CXX)
+project(manyforge_collision VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -79,8 +79,14 @@ if(NOT TARGET manyforge_core)
   unset(_MANYFORGE_COLLISION_BUILD_TESTING)
 endif()
 
+# The mesh closed/orientation check (OD-363), shared with the Manager.
+if(NOT TARGET manyforge_mesh_topology)
+  add_subdirectory(mesh_topology)
+endif()
+
 add_library(manyforge_collision
   src/manyforge_collision_engine.cpp
+  src/mesh_depth.cpp
 )
 
 target_include_directories(manyforge_collision PUBLIC
@@ -89,6 +95,7 @@ target_include_directories(manyforge_collision PUBLIC
 )
 
 target_link_libraries(manyforge_collision
+  manyforge_mesh_topology
   manyforge_core
   Eigen3::Eigen
   pinocchio::pinocchio

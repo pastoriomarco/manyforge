@@ -21,6 +21,8 @@ from typing import Any, TYPE_CHECKING
 from manyforge_behavior.node_environment import NodeEnvironment, build_node_environment
 from manyforge_behavior.canonical_artifact import canonical_json_bytes
 from manyforge_behavior.program import Program, ProgramValidationError
+from manyforge_behavior.model_source_capture import capture_program_scene_meshes
+from manyforge_behavior.project_paths import ProjectPathRule
 from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.program_binding_projection import (
     validate_prepared_activation_origin,
@@ -40,14 +42,18 @@ from .authoring_admission import (
     AuthoringOperationError,
     AuthoringMutationEnvelope,
     headless_client_http_exception,
+    refused_before_effect,
 )
 from .application_identity import new_request_key
+from .security import normalize_allowed_roots
 from .apply_orchestration import ApplyCommands, apply_step_source
 from .authoring_forest import from_program
 from .authoring_identity import canonical_digest
 from .deployment_intent import (
+    DEPLOYMENT_INTENT_API_VERSION,
     DeploymentIntentError,
     rebase_deployment_intent_sources,
+    unmounted_component_ids,
 )
 from .assistant_mode_client import AssistantContextCache
 from .assistant_provider_client import AssistantProviderHttpClient
@@ -77,11 +83,9 @@ RUNTIME_UNAVAILABLE_MESSAGE = (
 _CURRENT_SCENARIO_FIELDS = (
     "scenario_id",
     "source_document_digest",
-    "deployment_artifact_id",
     "deployment_revision",
     "retained_bundle_id",
     "graph_revision",
-    "program_id",
     "program_revision",
     "program_outcome",
 )
@@ -91,7 +95,6 @@ _PROGRAM_NON_EXECUTABLE_OUTCOME_FIELDS = frozenset(
         "affected_nodes",
         "api_version",
         "graph_revision",
-        "program_id",
         "program_revision",
         "retained_bundle_id",
         "unresolved_targets",
@@ -100,7 +103,6 @@ _PROGRAM_NON_EXECUTABLE_OUTCOME_FIELDS = frozenset(
 _PROGRAM_UNRESOLVED_TARGET_FIELDS = frozenset({"target", "reason", "detail"})
 _APPLIED_PROGRAM_STATUS_FIELDS = frozenset(
     {
-        "deployment_artifact_id",
         "deployment_revision",
         "executable",
         "graph_revision",
@@ -108,7 +110,6 @@ _APPLIED_PROGRAM_STATUS_FIELDS = frozenset(
         "non_executable",
         "program",
         "program_binding_id",
-        "program_id",
         "program_revision",
         "record_digest",
         "retained_bundle_id",
@@ -178,17 +179,17 @@ _PREPARED_ACTIVATION_FIELDS = (
     "prepared_activation_id",
     "origin",
     "captured_input_digest",
-    "deployment_artifact_id",
     "deployment_revision",
     "retained_bundle_id",
     "graph_revision",
-    "program_id",
     "program_revision",
     # Bound binding id or named non-executable result; part of the
     # confirmation digest, so a changed Program impact is a stale confirmation.
     "program_outcome",
     "node_environment_digest",
     "assistant_mode",
+    # The captured Program scene meshes (OD-335).
+    "scene_meshes",
 )
 _LOGGER = logging.getLogger(__name__)
 # F-6b (item 40): process-lifetime diagnostics of the rare
@@ -260,8 +261,6 @@ class ComposerState:
         program: Program | None = None,
         program_source_path: str | None = None,
         allowed_fs_roots: list[str] | None = None,
-        allowed_program_write_roots: list[str] | None = None,
-        allowed_deployment_write_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
         assistant_client: AssistantProviderHttpClient | None = None,
     ) -> None:
@@ -292,16 +291,6 @@ class ComposerState:
         # successful Load or New. Shown to the GUI through /api/health.
         self.startup_scenario_notice: dict[str, str] | None = None
         self.allowed_fs_roots = list(allowed_fs_roots or [])
-        self.allowed_program_write_roots = (
-            None
-            if allowed_program_write_roots is None
-            else list(allowed_program_write_roots)
-        )
-        self.allowed_deployment_write_roots = (
-            None
-            if allowed_deployment_write_roots is None
-            else list(allowed_deployment_write_roots)
-        )
         # This application start's `A` (``--application-start-id``): Composer's
         # own requests carry it; a browser's requests carry the browser's.
         self.application_start_id = application_start_id
@@ -365,8 +354,7 @@ class ComposerState:
             raise ValueError("publication has no typed Program outcome")
         kind = outcome.get("kind")
         if kind == "no_program":
-            if (set(outcome) != {"kind"} or publication.get("program_id") is not None
-                    or publication.get("program_revision") is not None):
+            if set(outcome) != {"kind"} or publication.get("program_revision") is not None:
                 raise ValueError("no_program must not carry Program identity")
             return ("no_program", "")
         if kind == "bound":
@@ -384,7 +372,6 @@ class ComposerState:
             not isinstance(detail, dict)
             or set(detail) != _PROGRAM_NON_EXECUTABLE_OUTCOME_FIELDS
             or detail.get("api_version") != "manyforge.program-binding-outcome.v2"
-            or detail.get("program_id") != publication.get("program_id")
             or detail.get("program_revision") != publication.get("program_revision")
             or detail.get("retained_bundle_id")
             != publication.get("retained_bundle_id")
@@ -466,11 +453,10 @@ class ComposerState:
         executable = status["executable"]
         binding_id = status.get("program_binding_id")
         non_executable = status.get("non_executable")
-        no_program = status.get("program_id") is None
+        no_program = status.get("program_revision") is None
         if no_program:
             if (executable or binding_id is not None or non_executable is not None
-                    or status.get("program") is not None
-                    or status.get("program_revision") is not None):
+                    or status.get("program") is not None):
                 raise ValueError("no_program Applied status is contradictory")
             outcome: dict[str, Any] = {"kind": "no_program"}
         elif executable:
@@ -498,18 +484,16 @@ class ComposerState:
         projection = {
             name: status.get(name)
             for name in (
-                "deployment_artifact_id",
                 "deployment_revision",
                 "retained_bundle_id",
                 "graph_revision",
-                "program_id",
                 "program_revision",
             )
         }
         if (
             any(not isinstance(value, str) or not value
                 for name, value in projection.items()
-                if not (no_program and name in {"program_id", "program_revision"}))
+                if not (no_program and name == "program_revision"))
             or not _is_sha256_identity(projection["deployment_revision"])
             or not _is_sha256_identity(projection["retained_bundle_id"])
             or not _is_sha256_identity(projection["graph_revision"])
@@ -574,6 +558,7 @@ class ComposerState:
             "deployment": deepcopy(deployment),
             "program_authoring": deepcopy(intent.get("program_authoring")),
             "model_source_closure": deepcopy(intent["model_source_closure"]),
+            "scene_mesh_closure": deepcopy(intent["scene_mesh_closure"]),
             "source_document_digest": intent["source_document_digest"],
             "scenario_id": intent["scenario_id"],
             "scenario_project_path": intent["project_path"],
@@ -594,8 +579,6 @@ class ComposerState:
         application_start_id: int,
         program_path: str | None,
         allowed_fs_roots: list[str] | None = None,
-        allowed_program_write_roots: list[str] | None = None,
-        allowed_deployment_write_roots: list[str] | None = None,
         headless_client: "HeadlessHttpClient | None" = None,
     ) -> "ComposerState":
         node_environment = build_node_environment()
@@ -617,8 +600,6 @@ class ComposerState:
             program=program,
             program_source_path=resolved_program,
             allowed_fs_roots=allowed_fs_roots,
-            allowed_program_write_roots=allowed_program_write_roots,
-            allowed_deployment_write_roots=allowed_deployment_write_roots,
             headless_client=headless_client,
         )
 
@@ -642,6 +623,29 @@ class ComposerState:
 
         path = self.scenario_document_path
         return None if path is None else canonical_project_path(path)
+
+    @property
+    def project_paths(self) -> ProjectPathRule:
+        """The one project path rule over the allowed folders (OD-335):
+        Program scene meshes and Deployment model sources alike."""
+
+        return ProjectPathRule(normalize_allowed_roots(self.allowed_fs_roots))
+
+    def capture_scene_mesh_closure(
+        self, program: dict[str, Any] | None, *, project_path: str
+    ) -> dict[str, Any]:
+        """Capture the Program's scene meshes for one activation (OD-335).
+
+        Relative mesh URIs resolve against the activation's Scenario project
+        folder; every mesh must lie inside the allowed folders. Raises
+        ``SceneMeshPathError``.
+        """
+
+        return capture_program_scene_meshes(
+            program,
+            project_folder=project_path,
+            paths=self.project_paths,
+        )
 
     @property
     def deployment_source_project_path(self) -> str | None:
@@ -1196,6 +1200,27 @@ class ComposerState:
         """
 
         assert self.headless_client is not None
+        deployment = intent["deployment"]
+        unmounted = (
+            unmounted_component_ids(deployment)
+            if deployment.get("api_version") == DEPLOYMENT_INTENT_API_VERSION
+            else []
+        )
+        if unmounted:
+            # The cell never holds a floating tool (OD-366): refused before
+            # preparation, so Preview, Apply and Load all say why.
+            code = "deployment_tool_unmounted"
+            message = (
+                f"Tool {unmounted[0]} is not mounted: mount it on a robot or "
+                "remove it before Apply."
+            )
+            if claim is None:
+                raise refused_before_effect(409, {
+                    "code": code,
+                    "message": message,
+                    "details": {"component_ids": unmounted},
+                })
+            raise AuthoringOperationError(code, message)
         if claim is None and self.authoring_admission is not None:
             # The preparation waits for open admission: settle first a claim
             # a lost answer left with this process.
@@ -1214,6 +1239,9 @@ class ComposerState:
                         "deployment": deepcopy(intent["deployment"]),
                         "model_source_closure": deepcopy(
                             intent["model_source_closure"]
+                        ),
+                        "scene_mesh_closure": deepcopy(
+                            intent["scene_mesh_closure"]
                         ),
                         "program": deepcopy(intent["program"]),
                         "expected_admission_generation": intent[
@@ -1270,9 +1298,6 @@ class ComposerState:
                     "retained_bundle_id"
                 ],
                 "candidate_graph_revision": prepared_activation["graph_revision"],
-                "deployment_artifact_id": prepared_activation[
-                    "deployment_artifact_id"
-                ],
                 "deployment_revision": prepared_activation["deployment_revision"],
                 "expected_current": {
                     "graph_revision": current_graph,
@@ -1344,9 +1369,6 @@ class ComposerState:
                 "request_key": intent["request_key"],
                 "application_start_id": intent["application_start_id"],
                 "source_label": "manyforge_composer_deployment_apply",
-                "deployment_artifact_id": prepared_activation[
-                    "deployment_artifact_id"
-                ],
                 "deployment_revision": prepared_activation["deployment_revision"],
                 "expected_current": receipt["expected_current"],
                 "reject_if_affected_busy": True,

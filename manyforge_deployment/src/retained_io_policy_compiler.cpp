@@ -113,8 +113,7 @@ compile_retained_io_policies(const ProgramBindingContract *program,
       throw std::invalid_argument("global_interrupt_program_binding_missing");
     if (program) {
       const auto &bound = binding->value();
-      if (bound.program_id != program->value().program_id ||
-          bound.program_revision != program->value().program_revision ||
+      if (bound.program_revision != program->value().program_revision ||
           bound.node_environment != program->value().node_environment ||
           bound.retained_bundle_id != retained_bundle.retained_bundle_id() ||
           bound.graph_revision !=
@@ -153,7 +152,9 @@ compile_retained_io_policies(const ProgramBindingContract *program,
           const auto &name = key->second;
           const bool system =
               name == "node_outcome" || name.starts_with("node_outcome.") ||
-              name == "interrupt_state" || name.starts_with("interrupt_state.");
+              name == "interrupt_state" || name.starts_with("interrupt_state.") ||
+              name == "motion_group_state" ||
+              name.starts_with("motion_group_state.");
           if (!system) {
             const auto rule_id = member(rule, "rule_id").as_string();
             failure.details.emplace("condition_reason", reason->second);

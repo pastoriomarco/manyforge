@@ -18,6 +18,7 @@
 
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/closed_schema.hpp"
+#include "manyforge_deployment/collision_rule_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/runtime_contract_registry.hpp"
 #include "verified_retained_bundle_internal.hpp"
@@ -1550,8 +1551,7 @@ CanonicalValue empty_host_configuration() {
 }
 
 CanonicalValue empty_host_deployment(
-    const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference,
-    std::string_view deployment_id, std::string_view name) {
+    const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference) {
   using Object = CanonicalValue::Object;
   using Array = CanonicalValue::Array;
   const auto *profile = runtime_profile_reference.find_object_member("record_id");
@@ -1562,10 +1562,8 @@ CanonicalValue empty_host_deployment(
   }
   return CanonicalValue(Object{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
-      {"deployment_artifact_id", CanonicalValue(std::string(deployment_id))},
       {"deployment_revision", CanonicalValue("sha256:" + std::string(64U, '0'))},
       {"cell_id", CanonicalValue(cell_id.value())},
-      {"name", CanonicalValue(std::string(name))},
       {"catalogs", CanonicalValue(Object{{"records", CanonicalValue(Array{runtime_profile_reference})}})},
       {"graph", CanonicalValue(Object{
           {"runtime_units", CanonicalValue(Array{CanonicalValue(Object{
@@ -2110,7 +2108,17 @@ require_configuration(const RetainedBundle &retained_bundle,
       optional_number("runtime_dynamic_body_max_age_cap_ms");
   result.validation_collision_workers =
       optional_uint32("validation_collision_workers");
-  result.collision_clearance_m = optional_number("collision_clearance_m");
+  if (const auto found = unit.configuration.find("collision_rules");
+      found != unit.configuration.end()) {
+    try {
+      result.collision_rules = decode_cell_collision_rules(
+          detail::canonical_from_json(found->second), "collision_rules");
+    } catch (const CollisionRuleCodecError &error) {
+      throw RetainedBundleError(
+          std::string("ros2_control runtime configuration has invalid ") +
+          error.what());
+    }
+  }
   result.collision_check_step_rad = optional_number("collision_check_step_rad");
   if (const auto found = unit.configuration.find("collision_check_fresh_plans");
       found != unit.configuration.end()) {

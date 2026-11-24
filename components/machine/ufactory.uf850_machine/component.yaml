@@ -3,7 +3,7 @@
 # owner holds the connection, the driver process, the controller error
 # register and power; its members are the arm and the I/O banks. One machine,
 # one lane: every member runs on the owner's lane.
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: machine
 id: ufactory.uf850_machine
 version: 1.0.0

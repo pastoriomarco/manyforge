@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <manyforge_core/types/typed_error.hpp>
@@ -64,9 +66,10 @@ Value SignalUser(std::string component, std::string signal) {
 }
 
 Value Intent(Array components) {
-  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v2")},
-                      {"deployment_artifact_id", Value("machine")},
-                      {"name", Value("machine")},
+  return Value(Object{{"api_version", Value("manyforge.deployment_intent.v3")},
+      {"collision_rules",
+       Value(Array{Value(Object{{"clearance_m", Value(0.001)},
+                   {"rule_id", Value("everything")}})})},
                       {"attachments", Value(Array{})},
                       {"components", Value(std::move(components))},
                       {"policies", Value(Object{})}});
@@ -334,6 +337,251 @@ TEST(ActivationMachine, IoMembersExpandToOrdinaryIoDeviceRowsPerLane) {
     EXPECT_EQ(row.find_object_member("device_address_ref") != nullptr, lane == "real");
     EXPECT_TRUE(machines.front().type.value().command_targets.empty());
   }
+}
+
+// OD-356: an I/O member row may carry `mock_inputs`; the parse keeps them
+// for the member's signal expansion.
+TEST(ActivationMachine, AnIoMemberRowKeepsItsMockInputs) {
+  auto member = IoMember("lite6_robot_controller_io", "ufactory.lite6_controller_io",
+                         "controller_io");
+  auto row = member.as_object();
+  row.emplace_back("mock_inputs", Value(Array{}));
+  const auto intent = detail::parse_activation_deployment_intent(
+      Intent(Array{Owner("mock"), Value(std::move(row))}), {});
+  ASSERT_EQ(intent.components.size(), 2U);
+  ASSERT_NE(intent.components[1].configuration.find_object_member("mock_inputs"), nullptr);
+}
+
+// OD-356: an I/O member's input follows geometry on Mock and Isaac (a
+// geometric-contact provider); on Real the physical input is read.
+TEST(ActivationMachine, AMockInputFromGeometryBecomesAGeometricContactInput) {
+  const auto selection = [](const char *kind, const char *key, const char *id) {
+    return Value(Object{{"kind", Value(kind)}, {key, Value(id)}});
+  };
+  const auto behaviour = Value(Array{Value(Object{
+      {"signal_name", Value("CI0")},
+      {"geometric_contact",
+       Value(Object{{"robot_component_id", Value("lite6_robot")},
+                    {"a", Value(Array{selection("attached_object", "component_id", "lite_gripper")})},
+                    {"b", Value(Array{selection("scene_object", "scene_resource_id", "endplate")})},
+                    {"trip_depth_m", Value(0.004)},
+                    {"release_depth_m", Value(0.003)}})}})});
+  for (const std::string lane : {"real", "mock", "isaac"}) {
+    auto intent = Machine(lane);
+    intent.components[2].configuration = Value(Object{{"mock_inputs", behaviour}});
+    const auto profiles = Resolve(intent);
+    detail::expand_activation_machine_members(intent, profiles);
+    const auto &signals = intent.components[2]
+                              .configuration.find_object_member("runtime_configuration")
+                              ->find_object_member("io_signals")
+                              ->as_array();
+    for (const auto &row : signals) {
+      const auto &name = row.find_object_member("signal_name")->as_string();
+      const auto &provider = *row.find_object_member("provider");
+      const auto &profile = provider.find_object_member("profile")->as_string();
+      if (name != "CI0") {
+        EXPECT_NE(profile, "geometric_contact") << name;
+        continue;
+      }
+      if (lane == "real") {
+        EXPECT_EQ(profile, "component_adapter");
+        continue;
+      }
+      EXPECT_EQ(profile, "geometric_contact") << lane;
+      EXPECT_EQ(provider.find_object_member("robot_component_id")->as_string(), "lite6_robot");
+      EXPECT_EQ(provider.find_object_member("trip_depth_m")->as_number(), 0.004);
+      EXPECT_EQ(provider.find_object_member("release_depth_m")->as_number(), 0.003);
+      EXPECT_EQ(provider.find_object_member("a")->as_array().size(), 1U);
+      EXPECT_EQ(row.find_object_member("update_mode")->as_string(), "sampled");
+      const auto &freshness = *row.find_object_member("freshness");
+      EXPECT_EQ(freshness.find_object_member("mode")->as_string(), "sample_age");
+      EXPECT_EQ(freshness.find_object_member("maximum_age_ns")->as_number(), 1e9);
+    }
+  }
+
+  // An output, an unknown input, or a missing selection is refused.
+  for (const auto &bad : {Value(Array{Value(Object{{"signal_name", Value("CO0")},
+                                                   {"geometric_contact", Value(Object{})}})}),
+                          Value(Array{Value(Object{{"signal_name", Value("TI9")},
+                                                   {"geometric_contact", Value(Object{})}})}),
+                          Value(Array{Value(Object{
+                              {"signal_name", Value("CI1")},
+                              {"geometric_contact",
+                               Value(Object{{"robot_component_id", Value("lite6_robot")}})}})})}) {
+    auto intent = Machine("mock");
+    intent.components[2].configuration = Value(Object{{"mock_inputs", bad}});
+    const auto profiles = Resolve(intent);
+    EXPECT_EQ(Code([&] { detail::expand_activation_machine_members(intent, profiles); }),
+              "io_mock_input_invalid");
+  }
+}
+
+// OD-371: an input that follows a generated tool's spring slider compiles to
+// the geometric-contact provider: the slider body and the objects it carries
+// against `b`, on the robot the tool is mounted on, with the slider's trip
+// and release depths.
+TEST(ActivationMachine, AMockInputFollowsASpringSlider) {
+  const auto mounted = [](detail::ActivationDeploymentIntent &intent,
+                          std::vector<detail::ActivationComponentProfile> &profiles) {
+    detail::ActivationDeploymentComponent tool{};
+    tool.component_id = "tube_holder";
+    tool.component_profile_id = "manyforge.tool";
+    tool.target_settings = Value(Object{});
+    tool.configuration = Value(Object{});
+    intent.components.push_back(std::move(tool));
+    detail::ActivationComponentProfile profile{};
+    profile.component_id = "tube_holder";
+    profile.runtime_kind = detail::ActivationRuntimeKind::kRos2Control;
+    detail::GeneratedToolComponent generated;
+    generated.collision_bodies["holder_rod"] = {"tool_holder_rod"};
+    generated.spring_sliders.push_back({.element_id = "holder_rod",
+                                        .axis = {0.0, 0.0, 1.0},
+                                        .stroke_m = 0.020,
+                                        .trip_depth_m = 0.0095,
+                                        .release_depth_m = 0.009,
+                                        .max_compression_step_m = 0.002});
+    profile.generated_tool = std::move(generated);
+    profiles.push_back(std::move(profile));
+    intent.attachments = Value(Array{Value(Object{
+        {"child", Value(Object{{"component_id", Value("tube_holder")},
+                               {"interface", Value("mount")}})},
+        {"parent", Value(Object{{"component_id", Value("lite6_robot")},
+                                {"interface", Value("flange")}})}})});
+  };
+  const auto endplate = Value(Array{Value(Object{{"kind", Value("scene_object")},
+                                                 {"scene_resource_id", Value("endplate")}})});
+  const auto row = [&](const char *tool, const char *element) {
+    return Value(Object{
+        {"signal_name", Value("CI0")},
+        {"spring_slider",
+         Value(Object{{"component_id", Value(tool)}, {"element_id", Value(element)}})},
+        {"b", endplate},
+        {"maximum_sample_age_ms", Value(500.0)}});
+  };
+
+  auto intent = Machine("mock");
+  intent.components[2].configuration =
+      Value(Object{{"mock_inputs", Value(Array{row("tube_holder", "holder_rod")})}});
+  auto profiles = Resolve(intent);
+  mounted(intent, profiles);
+  detail::expand_activation_machine_members(intent, profiles);
+  const auto &signals = intent.components[2]
+                            .configuration.find_object_member("runtime_configuration")
+                            ->find_object_member("io_signals")
+                            ->as_array();
+  const auto input = std::find_if(signals.begin(), signals.end(), [](const Value &signal) {
+    return signal.find_object_member("signal_name")->as_string() == "CI0";
+  });
+  ASSERT_NE(input, signals.end());
+  const auto &provider = *input->find_object_member("provider");
+  EXPECT_EQ(provider.find_object_member("profile")->as_string(), "geometric_contact");
+  EXPECT_EQ(provider.find_object_member("robot_component_id")->as_string(), "lite6_robot");
+  EXPECT_EQ(provider.find_object_member("trip_depth_m")->as_number(), 0.0095);
+  EXPECT_EQ(provider.find_object_member("release_depth_m")->as_number(), 0.009);
+  EXPECT_EQ(*provider.find_object_member("b"), endplate);
+  EXPECT_EQ(*provider.find_object_member("a"),
+            Value(Array{Value(Object{{"kind", Value("collision_body")},
+                                     {"component_id", Value("tube_holder")},
+                                     {"collision_body_id", Value("holder_rod")}}),
+                        Value(Object{{"kind", Value("attached_object")},
+                                     {"component_id", Value("tube_holder")},
+                                     {"collision_body_role_id", Value("holder_rod")}})}));
+  EXPECT_EQ(input->find_object_member("freshness")
+                ->find_object_member("maximum_age_ns")
+                ->as_number(),
+            5e8);
+
+  // An unknown component, a component that is not a generated tool, an
+  // element that is not a spring slider, and an unmounted tool are refused.
+  for (const auto &[tool, element, reason, mount] :
+       {std::tuple{"no_tool", "holder_rod", "tool_unknown", true},
+        std::tuple{"lite6_robot", "holder_rod", "tool_not_generated", true},
+        std::tuple{"tube_holder", "body", "element_not_spring_slider", true},
+        std::tuple{"tube_holder", "holder_rod", "tool_not_mounted", false}}) {
+    auto refused = Machine("mock");
+    refused.components[2].configuration =
+        Value(Object{{"mock_inputs", Value(Array{row(tool, element)})}});
+    auto refused_profiles = Resolve(refused);
+    mounted(refused, refused_profiles);
+    if (!mount) refused.attachments = Value(Array{});
+    try {
+      detail::expand_activation_machine_members(refused, refused_profiles);
+      ADD_FAILURE() << reason;
+    } catch (const c::TypedError &error) {
+      EXPECT_EQ(error.code(), "io_mock_input_invalid");
+      EXPECT_EQ(error.details().at("reason"), reason);
+      EXPECT_EQ(error.details().at("tool_component_id"), tool);
+      EXPECT_EQ(error.details().at("element_id"), element);
+    }
+  }
+
+  // Exactly one form per row.
+  auto both = row("tube_holder", "holder_rod").as_object();
+  both.emplace_back("geometric_contact", Value(Object{}));
+  auto refused = Machine("mock");
+  refused.components[2].configuration =
+      Value(Object{{"mock_inputs", Value(Array{Value(std::move(both))})}});
+  auto refused_profiles = Resolve(refused);
+  mounted(refused, refused_profiles);
+  EXPECT_EQ(Code([&] { detail::expand_activation_machine_members(refused, refused_profiles); }),
+            "io_mock_input_invalid");
+}
+
+// An owner-less model-form I/O device (OD-327): a row of its own with its
+// lane, no owner or role; real signals carry its family's lane keys and each
+// signal's index; Mock and Isaac get the host's Mock I/O.
+TEST(ActivationMachine, AnOwnerLessIoBankExpandsWithItsFamilysKeysAndIndexes) {
+  for (const std::string lane : {"real", "mock", "isaac"}) {
+    auto intent = detail::parse_activation_deployment_intent(
+        Intent(Array{Value(Object{{"component_id", Value("plc_io")},
+                                  {"component_profile_id", Value("manyforge.io_bank_64x64")},
+                                  {"lane", Value(lane)},
+                                  {"configuration", Value(Object{})}})}),
+        {});
+    const auto profiles = Resolve(intent);
+    ASSERT_EQ(profiles.size(), 1U);
+    EXPECT_FALSE(profiles.front().owner_component_id.has_value());
+    detail::expand_activation_machine_members(intent, profiles);
+    const auto &runtime =
+        *intent.components.front().configuration.find_object_member("runtime_configuration");
+    const auto &devices = runtime.find_object_member("io_provider_devices")->as_array();
+    ASSERT_EQ(devices.size(), 1U);
+    EXPECT_EQ(devices.front().as_object().size(), 1U);  // its id only
+    const auto &signals = runtime.find_object_member("io_signals")->as_array();
+    ASSERT_EQ(signals.size(), 128U);  // I0-I63, Q0-Q63
+    for (const auto &row : signals) {
+      const auto &name = row.find_object_member("signal_name")->as_string();
+      const bool output = row.find_object_member("direction")->as_string() == "output";
+      const auto &provider = *row.find_object_member("provider");
+      const auto &profile = provider.find_object_member("profile")->as_string();
+      if (lane != "real") {
+        EXPECT_EQ(profile, output ? "mock_output" : "mock");
+        continue;
+      }
+      EXPECT_EQ(profile, "component_adapter");
+      EXPECT_EQ(provider.find_object_member("adapter")->as_string(), "ros_io_bank");
+      EXPECT_EQ(provider.find_object_member("rate_hz")->as_number(), 200.0);
+      EXPECT_EQ(provider.find_object_member("index")->as_number(),
+                std::stod(name.substr(1)));
+      EXPECT_EQ(provider.find_object_member("input_maximum_age_ms"), nullptr);
+      if (!output) {
+        EXPECT_EQ(row.find_object_member("freshness")
+                      ->find_object_member("maximum_age_ns")
+                      ->as_number(),
+                  5e7);
+      }
+    }
+  }
+}
+
+TEST(ActivationMachine, AMachinesIoBankIsNotAnOwnerLessDevice) {
+  auto intent = detail::parse_activation_deployment_intent(
+      Intent(Array{Value(Object{{"component_id", Value("io")},
+                                {"component_profile_id", Value("ufactory.lite6_controller_io")},
+                                {"lane", Value("mock")},
+                                {"configuration", Value(Object{})}})}),
+      {});
+  EXPECT_EQ(Code([&] { (void)Resolve(intent); }), "deployment_machine_part_without_machine");
 }
 
 } // namespace

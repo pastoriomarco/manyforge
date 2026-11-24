@@ -244,6 +244,21 @@ TEST(ManagedRuntimeCompositionRefusal, LeavingComponentWithAFailedDisableDoesNot
   EXPECT_FALSE(host_detail::LeavingComponentRefusesApply(faulted));
 }
 
+// OD-370 (B): an Apply that keeps an owner whose Kernel is not Idle is
+// refused before any effect, typed, and known to have changed nothing.
+TEST(ManagedRuntimeCompositionRefusal, KeptOwnerNotIdleRefusesTheApplyWithoutEffect) {
+  const auto refusal = host_detail::KeptOwnerNotIdleApplyRefusal(
+      "lite6_arm", core::ErrorDTO{"invalid_state_transition",
+                                  "Collision resources can change only while the Kernel is Idle",
+                                  {{"reason", "collision_resource_kernel_not_idle"}}});
+  EXPECT_EQ(refusal.code, "apply_requires_idle_kept_component");
+  EXPECT_EQ(refusal.details,
+            (std::map<std::string, std::string>{
+                {"component_id", "lite6_arm"},
+                {"kernel_reason", "collision_resource_kernel_not_idle"},
+                {"effect", "none"}}));
+}
+
 // An unresolved site address is typed and names its component; the
 // composition refusal keeps its code and that component.
 TEST(ManagedRuntimeCompositionRefusal, SiteAddressRefusalKeepsCodeAndComponent) {
@@ -606,7 +621,7 @@ MakeAdapter(NativeFixture &fixture, const std::filesystem::path &target_root,
       fixture.execution_state_root.path(), fixture.execution_run_root.path(),
       fixture.bundle_source, fixture.artifact_source,
       std::string(contract::kOperatingSystem),
-      std::string(contract::kLaunchEnvironmentContract), {}, {}, std::nullopt,
+      std::string(contract::kLaunchEnvironmentContract), {}, std::nullopt,
       [active] { return active; });
 }
 
@@ -2327,7 +2342,6 @@ TEST(RetainedExecutionHostUnitAdapter,
       graph.graph_revision,
       component_manager::ManagerApplyPreparedActivationDTO{
           digest,
-          bundle.value().deployment_artifact_id,
           bundle.value().deployment_revision,
           core::ProgramBindingId(std::string(kIntentDigest)),
           core::ContentDigest(std::string(kOtherDigest)),
@@ -3432,7 +3446,7 @@ TEST(RetainedExecutionHostUnitAdapter,
         fixture.execution_state_root.path(), fixture.execution_run_root.path(),
         fixture.bundle_source, fixture.artifact_source,
         std::string(contract::kOperatingSystem),
-        std::string(contract::kLaunchEnvironmentContract), {}, {},
+        std::string(contract::kLaunchEnvironmentContract), {},
         std::move(site));
     EXPECT_EQ(adapter.EnsureRunning(*fixture.query).state(),
               component_manager::ProcessPresenceState::kPresent);

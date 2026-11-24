@@ -80,7 +80,7 @@ def _program(*extra: dict[str, Any]) -> Program:
         deepcopy(document),
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, _CATALOG)
 

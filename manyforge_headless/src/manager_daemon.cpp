@@ -19,6 +19,9 @@
 #include <manyforge_deployment/initial_scene_projection.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
+#include <manyforge_deployment/cell_collision_rule_members.hpp>
+#include <manyforge_deployment/model_source.hpp>
+#include <manyforge_collision/mesh_file_topology.hpp>
 #include <manyforge_deployment/activation_content_collection.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_contract.hpp>
@@ -58,12 +61,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -125,10 +130,11 @@ constexpr std::string_view kProgramRunnerLivenessPolicyId =
 constexpr std::string_view kProgramRunnerLivenessPolicyRevision = "1";
 constexpr std::size_t kMaximumProgramRunnerLivenessPacketBytes = 16U * 1024U;
 constexpr std::size_t kMaximumKernelStopResponseBytes = 1024U * 1024U;
-constexpr std::size_t kMaximumCommandBytes =
-    2U * scene::kMaximumLogicalSceneTransactionBytes + 8U * 1024U;
+// A scene request packet plus its envelope.
+constexpr std::size_t kMaximumCommandBytes = 264U * 1024U;
+// The largest scene the owner commits plus its response envelope.
 constexpr std::size_t kMaximumResponseBytes =
-    3U * scene::kMaximumLogicalSceneTransactionBytes + 16U * 1024U;
+    scene::kMaximumLogicalSceneSnapshotBytes + 16U * 1024U;
 constexpr std::size_t kMaximumCommandIdentityBytes = 256U;
 constexpr std::size_t kMaximumScenePoseQueryResources = 128U;
 constexpr std::uint64_t kMaximumPoseObservationLifetimeNs =
@@ -293,42 +299,6 @@ void RequireDisjointDirectories(const std::filesystem::path &left,
   Require(mismatch.first != canonical_left.end() &&
               mismatch.second != canonical_right.end(),
           std::string(labels) + " must be disjoint directory trees");
-}
-
-void RequirePathOutsideDirectory(const std::filesystem::path &path,
-                                 const std::filesystem::path &directory,
-                                 const std::string_view labels) {
-  std::error_code error;
-  const auto canonical_parent =
-      std::filesystem::canonical(path.parent_path(), error);
-  Require(!error, std::string(labels) + " parent is unavailable");
-  const auto canonical_path = canonical_parent / path.filename();
-  const auto canonical_directory = std::filesystem::canonical(directory, error);
-  Require(!error, std::string(labels) + " directory is unavailable");
-  const auto mismatch =
-      std::mismatch(canonical_directory.begin(), canonical_directory.end(),
-                    canonical_path.begin(), canonical_path.end());
-  Require(mismatch.first != canonical_directory.end() &&
-              mismatch.second != canonical_path.end(),
-          std::string(labels) +
-              " must be disjoint from disposable run storage");
-}
-
-std::filesystem::path ProspectiveDatabasePath(std::filesystem::path path,
-                                              const std::string_view label) {
-  Require(!path.empty() && path.has_filename() && path.filename() != "." &&
-              path.filename() != "..",
-          std::string(label) + " path is invalid");
-  static_cast<void>(ExistingPrivateDirectory(path.parent_path(),
-                                             std::string(label) + " parent"));
-  const auto status = std::filesystem::symlink_status(path);
-  Require(!std::filesystem::is_symlink(status),
-          std::string(label) + " path cannot be a symlink");
-  return path;
-}
-
-std::filesystem::path DatabasePath(std::filesystem::path path) {
-  return ProspectiveDatabasePath(std::move(path), "logical-scene database");
 }
 
 std::filesystem::path InstalledTargetRoot() {
@@ -508,11 +478,7 @@ struct DaemonConfig final {
   std::filesystem::path manager_run_root;
   std::filesystem::path execution_state_root;
   std::filesystem::path execution_run_root;
-  std::filesystem::path logical_scene_database;
   std::filesystem::path program_runner_liveness_socket;
-  /// Optional approved root for relative Program scene meshes. The execution
-  /// host adapter opens it once; empty means relative meshes fail closed.
-  std::filesystem::path scene_asset_root;
   /// Optional generic machine site document (`manyforge.site.v1`).
   std::optional<std::filesystem::path> site_settings_path;
   /// `manyforge.application_processes.v1`, written by the launcher.
@@ -595,7 +561,6 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
 }
 
 struct DeploymentCandidateReceipt final {
-  core::DeploymentArtifactId deployment_artifact_id;
   core::DeploymentRevision deployment_revision;
   core::ContentDigest prepared_activation_id;
   core::RetainedBundleId candidate_retained_bundle_id;
@@ -635,7 +600,6 @@ struct ManagerCommand final {
   std::optional<core::RequestKey> request_key{};
   std::optional<std::string> source_label{};
   std::optional<core::SceneTransactionRequestDTO> scene_transaction{};
-  std::optional<core::DeploymentArtifactId> deployment_artifact_id{};
   std::optional<core::DeploymentRevision> deployment_revision{};
   std::optional<core::RetainedBundleId> expected_current_retained_bundle_id{};
   std::optional<core::GraphRevision> expected_current_graph_revision{};
@@ -707,8 +671,6 @@ DeploymentCandidateReceiptPayload(const DeploymentCandidateReceipt &receipt) {
        CanonicalValue(receipt.candidate_graph_revision.value())},
       {"candidate_retained_bundle_id",
        CanonicalValue(receipt.candidate_retained_bundle_id.value())},
-      {"deployment_artifact_id",
-       CanonicalValue(receipt.deployment_artifact_id.value())},
       {"deployment_revision",
        CanonicalValue(receipt.deployment_revision.value())},
       {"expected_admission_generation",
@@ -749,15 +711,13 @@ DeploymentCandidateReceiptValue(const DeploymentCandidateReceipt &receipt) {
 
 DeploymentCandidateReceipt
 RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 11U, "deployment candidate receipt");
+  RequireExactObjectSize(value, 10U, "deployment candidate receipt");
   Require(RequiredString(value, "schema_version") ==
               "manyforge.manager_deployment_candidate_receipt.v3",
           "deployment candidate receipt schema is unsupported");
   const auto &expected = RequiredMember(value, "expected_current");
   RequireExactObjectSize(expected, 2U, "deployment candidate expected current");
   DeploymentCandidateReceipt receipt{
-      core::DeploymentArtifactId(
-          RequiredString(value, "deployment_artifact_id")),
       core::DeploymentRevision(RequiredString(value, "deployment_revision")),
       core::ContentDigest(RequiredString(value, "prepared_activation_id")),
       core::RetainedBundleId(
@@ -799,7 +759,7 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
           "Apply prepared activation schema is unsupported (only " +
               std::string(deployment::kPreparedActivationInputSchemaVersion) +
               "; launch-time Program parameter overrides were removed)");
-  RequireExactObjectSize(value, 13U, "Apply prepared activation");
+  RequireExactObjectSize(value, 12U, "Apply prepared activation");
   const auto captured_input_digest =
       RequiredString(value, "captured_input_digest");
   const auto deployment_revision = RequiredString(value, "deployment_revision");
@@ -820,10 +780,9 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
   const bool no_program = outcome_kind == "no_program";
   if (no_program) {
     RequireExactObjectSize(program_outcome, 1U, "Apply Program outcome");
-    Require(RequiredMember(value, "program_id").is_null() &&
-                RequiredMember(value, "program_revision").is_null() &&
+    Require(RequiredMember(value, "program_revision").is_null() &&
                 RequiredString(value, "assistant_mode") == "optional",
-            "no_program must have no Program identities");
+            "no_program must have no Program identity");
   } else if (outcome_kind == "bound") {
     RequireExactObjectSize(program_outcome, 2U, "Apply Program outcome");
     const auto binding_id = RequiredString(program_outcome, "program_binding_id");
@@ -844,8 +803,7 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
              error.what());
       }
     }();
-    Require(outcome.program_id.value() == RequiredString(value, "program_id") &&
-                outcome.program_revision.value() ==
+    Require(outcome.program_revision.value() ==
                     RequiredString(value, "program_revision") &&
                 outcome.retained_bundle_id.value() ==
                     RequiredString(value, "retained_bundle_id") &&
@@ -866,14 +824,11 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
   static_cast<void>(deployment::parse_prepared_activation_origin(
       RequiredMember(value, "origin")));
   if (!no_program) {
-    static_cast<void>(RequiredString(value, "program_id"));
     Require(core::IsExactLowercaseSha256Digest(RequiredString(value, "program_revision")),
             "Apply Program revision is not canonical");
   }
   return {
       core::ContentDigest(captured_input_digest),
-      core::DeploymentArtifactId(
-          RequiredString(value, "deployment_artifact_id")),
       core::DeploymentRevision(deployment_revision),
       std::move(program_binding_id),
       core::ContentDigest(prepared_activation_id),
@@ -906,6 +861,46 @@ bool PreparedActivationIsStoredExactly(
   }
   return content_identity::canonical_json(CanonicalValue(std::move(summary))) ==
          activation.canonical_receipt_json;
+}
+
+CanonicalValue PreparedReceipt(
+    const component_manager::ManagerApplyPreparedActivationDTO &activation) {
+  return content_identity::parse_canonical_json(
+      activation.canonical_receipt_json,
+      {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
+       4096U});
+}
+
+/// The scene meshes one Apply captured: resource URI to content digest, the
+/// `scene_meshes` of its prepared receipt (verified by the preparer and at
+/// acceptance: exactly its Program's meshes, each stored in the activation
+/// raw-artifact store).
+using SceneMeshTable = std::map<std::string, std::string, std::less<>>;
+
+SceneMeshTable ReceiptSceneMeshes(const CanonicalValue &receipt) {
+  const auto &rows = RequiredMember(receipt, "scene_meshes");
+  Require(rows.is_array(), "prepared receipt scene_meshes must be an array");
+  SceneMeshTable table;
+  for (const auto &row : rows.as_array()) {
+    table.emplace(RequiredString(row, "resource_uri", 4096U),
+                  RequiredString(row, "content_digest"));
+  }
+  return table;
+}
+
+/// The captured content of one scene mesh URI; refused when its Apply did
+/// not capture it.
+const std::string &CapturedSceneMeshDigest(const SceneMeshTable &table,
+                                           const std::string &resource_uri) {
+  const auto found = table.find(resource_uri);
+  if (found == table.end()) {
+    throw core::TypedError(
+        "scene_mesh_unavailable",
+        "scene mesh " + resource_uri +
+            " was not captured: the active Apply holds no content for it",
+        {{"resource_uri", resource_uri}});
+  }
+  return found->second;
 }
 
 std::optional<std::string> OptionalString(const CanonicalValue &root,
@@ -1528,7 +1523,7 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
           "command api_version is unsupported");
   const auto command = RequiredString(root, "command");
   if (command == "deployment_candidate_preview") {
-    RequireExactObjectSize(root, 9U, "deployment candidate preview command");
+    RequireExactObjectSize(root, 8U, "deployment candidate preview command");
     const auto deployment_revision =
         RequiredString(root, "deployment_revision");
     Require(core::IsExactLowercaseSha256Digest(deployment_revision),
@@ -1537,8 +1532,6 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     RequireExactObjectSize(expected, 2U, "candidate preview expected_current");
     ManagerCommand result{
         .kind = CommandKind::kDeploymentCandidatePreview,
-        .deployment_artifact_id = core::DeploymentArtifactId(
-            RequiredString(root, "deployment_artifact_id")),
         .deployment_revision = core::DeploymentRevision(deployment_revision),
         .expected_current_retained_bundle_id = core::RetainedBundleId(
             RequiredString(expected, "retained_bundle_id")),
@@ -1691,11 +1684,9 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     }
   }
   Require(command == "apply", "command kind is unsupported");
-  RequireExactObjectSize(root, 13U, "Apply command");
+  RequireExactObjectSize(root, 12U, "Apply command");
   const auto request_key = RequiredRequestKey(root, "request_key");
   auto source_label = RequiredString(root, "source_label");
-  const auto deployment_artifact_id =
-      RequiredString(root, "deployment_artifact_id");
   const auto deployment_revision = RequiredString(root, "deployment_revision");
   Require(core::IsExactLowercaseSha256Digest(deployment_revision),
           "Apply deployment_revision must be canonical SHA-256");
@@ -1712,8 +1703,6 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   ManagerCommand result{.kind = CommandKind::kApply,
                         .request_key = request_key,
                         .source_label = std::move(source_label)};
-  result.deployment_artifact_id =
-      core::DeploymentArtifactId(deployment_artifact_id);
   result.deployment_revision = core::DeploymentRevision(deployment_revision);
   // Explicit acceptance of a destructive preview impact; null when
   // the caller accepts none.
@@ -2348,7 +2337,9 @@ CanonicalValue DeploymentApplyImpact(
     const deployment::RetainedBundle &candidate,
     const std::filesystem::path &activation_root,
     const core::ContentDigest &prepared_activation_id,
-    const deployment::SiteFacts &site_facts) {
+    const deployment::SiteFacts &site_facts, CanonicalValue collision_rules,
+    const std::function<CanonicalValue(const deployment::PreparedActivationInput &)>
+        &mesh_depth_reports) {
   const auto delta =
       deployment::derive_apply_component_delta(current, candidate, site_facts);
   Require(!activation_root.empty(),
@@ -2394,11 +2385,13 @@ CanonicalValue DeploymentApplyImpact(
   destructive = destructive || outcome.has_value();
   return CanonicalValue(CanonicalValue::Object{
       {"attachment_changed_components", CanonicalValue(std::move(attachments))},
+      {"collision_rules", std::move(collision_rules)},
       {"component_delta_digest",
        CanonicalValue(deployment::DigestApplyComponentDelta(delta).value())},
       {"components", CanonicalValue(std::move(components))},
       {"destructive", CanonicalValue(destructive)},
       {"detached_components", CanonicalValue(std::move(detached))},
+      {"mesh_depth_reports", mesh_depth_reports(*prepared)},
       {"program",
        CanonicalValue(CanonicalValue::Object{
            {"executable", CanonicalValue(prepared->program_binding_id().has_value())},
@@ -2407,9 +2400,6 @@ CanonicalValue DeploymentApplyImpact(
                 ? content_identity::parse_canonical_json(
                       deployment::EncodeProgramNonExecutableOutcome(*outcome))
                 : CanonicalValue(nullptr)},
-           {"program_id", prepared->program_id().has_value()
-                              ? CanonicalValue(prepared->program_id()->value())
-                              : CanonicalValue(nullptr)},
            {"program_revision",
             prepared->program_revision().has_value()
                 ? CanonicalValue(prepared->program_revision()->value())
@@ -2488,8 +2478,6 @@ CanonicalValue ApplyPreparedActivationValue(
   return CanonicalValue(CanonicalValue::Object{
       {"captured_input_digest",
        CanonicalValue(activation.captured_input_digest.value())},
-      {"deployment_artifact_id",
-       CanonicalValue(activation.deployment_artifact_id.value())},
       {"deployment_revision",
        CanonicalValue(activation.deployment_revision.value())},
       // Null exactly for a prepared non-executable Program.
@@ -2714,10 +2702,7 @@ public:
   [[nodiscard]] std::vector<core::AddObjectRequestDTO> initial_scene(
       const component_manager::ManagerApplyPreparedActivationDTO &activation,
       const deployment::RetainedBundle &bundle) const {
-    const auto receipt = content_identity::parse_canonical_json(
-        activation.canonical_receipt_json,
-        {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
-         4096U});
+    const auto receipt = PreparedReceipt(activation);
     const auto required = [&](std::string_view key) {
       const auto *field = receipt.find_object_member(key);
       if (field == nullptr || !field->is_string() ||
@@ -2742,8 +2727,6 @@ public:
         required("retained_bundle_id") != bundle.retained_bundle_id().value() ||
         required("graph_revision") !=
             bundle.value().cell_graph.graph_revision.value() ||
-        required("deployment_artifact_id") !=
-            activation.deployment_artifact_id.value() ||
         required("deployment_revision") !=
             activation.deployment_revision.value()) {
       throw std::invalid_argument(
@@ -2779,7 +2762,6 @@ public:
     }
     const auto read_program = [&](const std::filesystem::path &root) {
       return deployment::FilesystemVerifiedProgramSource(root).get_verified(
-          core::ProgramId(required("program_id")),
           core::ProgramRevision(required("program_revision")), bundle);
     };
     auto program = activation_root_.has_value()
@@ -2811,8 +2793,11 @@ public:
         throw std::invalid_argument(
             "Apply initial Scene outcome is not non-executable");
       }
-      return deployment::project_resolved_initial_scene(
-          *program, *outcome.resolved_references, bundle.value().cell_graph.cell_id);
+      return WithCapturedSceneMeshes(
+          deployment::project_resolved_initial_scene(
+              *program, *outcome.resolved_references,
+              bundle.value().cell_graph.cell_id),
+          receipt);
     }
     const auto &catalog_root = activation_root_.has_value() ? *activation_root_ : package_root_;
     const deployment::FilesystemVerifiedCatalogArtifactSource catalog(catalog_root);
@@ -2832,8 +2817,24 @@ public:
       throw std::invalid_argument(
           "Apply initial Scene Program or binding is not retained");
     }
-    return deployment::project_bound_initial_scene(
-        *program, *binding, bundle.value().cell_graph.cell_id);
+    return WithCapturedSceneMeshes(
+        deployment::project_bound_initial_scene(
+            *program, *binding, bundle.value().cell_graph.cell_id),
+        receipt);
+  }
+
+  /// Every initial-Scene mesh gets the content the applied receipt captured.
+  [[nodiscard]] static std::vector<core::AddObjectRequestDTO>
+  WithCapturedSceneMeshes(std::vector<core::AddObjectRequestDTO> objects,
+                          const CanonicalValue &receipt) {
+    const auto table = ReceiptSceneMeshes(receipt);
+    for (auto &object : objects) {
+      if (auto *mesh = std::get_if<core::MeshShapeDTO>(&object.shape)) {
+        mesh->content_digest =
+            CapturedSceneMeshDigest(table, mesh->resource_uri);
+      }
+    }
+    return objects;
   }
 
   [[nodiscard]] std::shared_ptr<const deployment::RetainedBundle> get_verified(
@@ -2967,6 +2968,166 @@ public:
            {"frame_role_id", carrier.frame_role_id.value()},
            {"model_instance_id", carrier.model_instance_id.value()}}));
     }
+  }
+
+  /// The cell collision rule changes of applying `candidate` over `current`
+  /// (the impact's `collision_rules`), resolved against each bundle's model
+  /// map. Two candidate rules that hold one pair are refused with
+  /// admission's typed error (`collision_rules_overlap`).
+  [[nodiscard]] core::Result<CanonicalValue> CellCollisionRuleChanges(
+      const deployment::RetainedBundle &current,
+      const deployment::RetainedBundle &candidate) const {
+    using Reply = core::Result<CanonicalValue>;
+    const auto facts = [&](const deployment::RetainedBundle &bundle) {
+      const auto &maps = bundle.value().compiled_products.symbol_role_maps;
+      if (maps.size() != 1U) return deployment::CellCollisionFacts{};
+      const auto model_map =
+          deployment::FilesystemVerifiedRetainedModelMapSource(package_root_, activation_root_)
+              .get_verified({bundle.retained_bundle_id(), maps.front().product_id});
+      Require(model_map.has_value(),
+              "Deployment impact retained model map is unavailable");
+      return deployment::cell_collision_facts(*model_map);
+    };
+    const auto candidate_rules = deployment::bundle_cell_collision_rules(candidate);
+    const auto candidate_facts = facts(candidate);
+    if (auto overlap = deployment::cell_collision_rules_overlap(candidate_rules, candidate_facts))
+      return Reply::Err(std::move(*overlap));
+    return Reply::Ok(deployment::cell_collision_rule_changes(
+        deployment::bundle_cell_collision_rules(current), facts(current), candidate_rules,
+        candidate_facts));
+  }
+
+  /// The impact's `mesh_depth_reports` (OD-363): each cell rule with a depth
+  /// and each trip depth of `candidate` that selects a mesh that is not
+  /// closed. The meshes are read as the engine reads them: the planning
+  /// model's link collision meshes and the prepared Scene meshes, through the
+  /// engine's own topology check. Only the selected meshes are read.
+  [[nodiscard]] CanonicalValue CellMeshDepthReports(
+      const deployment::RetainedBundle &candidate,
+      const deployment::PreparedActivationInput &prepared) const {
+    const auto rules = deployment::bundle_cell_collision_rules(candidate);
+    const auto io_signals =
+        deployment::ResolveRetainedIoSignalCatalog(candidate.value().cell_graph);
+    Require(io_signals.ok(), "Deployment impact I/O signals are unresolved");
+    deployment::CellCollisionFacts facts;
+    std::optional<deployment::VerifiedRetainedPlanningModel> model;
+    const auto &products = candidate.value().compiled_products;
+    if (products.symbol_role_maps.size() == 1U) {
+      const auto model_map =
+          deployment::FilesystemVerifiedRetainedModelMapSource(package_root_, activation_root_)
+              .get_verified({candidate.retained_bundle_id(),
+                             products.symbol_role_maps.front().product_id});
+      Require(model_map.has_value(), "Deployment impact retained model map is unavailable");
+      facts = deployment::cell_collision_facts(*model_map);
+      // The installed package wins; a previewed candidate is read from the
+      // activation store (as for the model map).
+      model = deployment::FilesystemVerifiedRetainedPlanningModelSource(package_root_,
+                                                                        activation_root_)
+                  .get_verified(deployment::RetainedPlanningModelQuery{
+                      candidate.retained_bundle_id(),
+                      products.planning_collision_model.product_id});
+      Require(model.has_value(), "Deployment impact retained planning model is unavailable");
+    }
+
+    // Every mesh of the candidate, by link and by Scene object.
+    struct Mesh {
+      std::string uri;
+      std::string_view bytes;
+      std::array<double, 3> scale;
+    };
+    std::map<std::string, std::vector<Mesh>> link_meshes;
+    std::map<std::string, std::vector<Mesh>> scene_meshes;
+    if (model.has_value()) {
+      const auto documents =
+          deployment::parse_model_documents_for_projection(model->urdf_bytes(), std::nullopt);
+      for (const auto &link : documents.urdf.links) {
+        for (const auto &collision : link.collisions) {
+          const auto *mesh = std::get_if<deployment::UrdfMeshGeometryIr>(&collision.geometry);
+          if (mesh == nullptr) continue;
+          const auto resource = std::find_if(
+              model->resources().begin(), model->resources().end(),
+              [&](const auto &candidate_resource) {
+                return candidate_resource.logical_uri() == mesh->logical_uri;
+              });
+          if (resource == model->resources().end()) continue;
+          link_meshes[link.name].push_back({mesh->logical_uri, resource->bytes(), mesh->scale});
+        }
+      }
+    }
+    const auto &closure = prepared.closure();
+    // Every initial-Scene mesh object of the Program, read from its `scene`
+    // rows (optional in the Program contract): its id and mesh path are all
+    // the report needs, and its captured content.
+    if (closure.program != nullptr) {
+      const auto &root = closure.program->normalized_program_root();
+      const auto *scene = root.is_object() ? root.find_object_member("scene") : nullptr;
+      if (scene != nullptr && scene->is_array()) {
+        for (const auto &row : scene->as_array()) {
+          const auto *id = row.is_object() ? row.find_object_member("scene_resource_id") : nullptr;
+          const auto *shape = row.is_object() ? row.find_object_member("shape") : nullptr;
+          if (id == nullptr || !id->is_string() || shape == nullptr || !shape->is_object())
+            continue;
+          const auto *type = shape->find_object_member("type");
+          const auto *uri = shape->find_object_member("mesh_resource_uri");
+          if (type == nullptr || !type->is_string() || type->as_string() != "mesh" ||
+              uri == nullptr || !uri->is_string())
+            continue;
+          std::array<double, 3> scale{1.0, 1.0, 1.0};
+          if (const auto *values = shape->find_object_member("mesh_scale");
+              values != nullptr && values->is_array() && values->as_array().size() == 3U) {
+            for (std::size_t axis = 0; axis < 3U; ++axis) {
+              const auto &value = values->as_array()[axis];
+              if (value.is_number()) scale[axis] = value.as_number();
+            }
+          }
+          const auto captured = std::find_if(
+              prepared.scene_meshes().begin(), prepared.scene_meshes().end(),
+              [&](const auto &mesh) { return mesh.resource_uri == uri->as_string(); });
+          if (captured == prepared.scene_meshes().end()) continue;
+          const auto artifact = std::find_if(
+              closure.raw_artifacts.begin(), closure.raw_artifacts.end(),
+              [&](const auto &raw) { return raw.content_digest == captured->content_digest; });
+          if (artifact == closure.raw_artifacts.end()) continue;
+          scene_meshes[id->as_string()].push_back({uri->as_string(), artifact->bytes, scale});
+        }
+      }
+    }
+
+    // First the meshes the depths select (every mesh counted as open), then
+    // only those are read.
+    deployment::CellOpenMeshes selected;
+    for (const auto &entry : link_meshes) selected.links[entry.first] = {};
+    for (const auto &entry : scene_meshes) selected.scene_objects[entry.first] = {};
+    const auto selected_rows =
+        deployment::cell_mesh_depth_reports(rules, io_signals.value(), facts, selected);
+    const auto open_uri = [](const std::vector<Mesh> &meshes) -> std::optional<std::string> {
+      for (const auto &mesh : meshes) {
+        const auto dot = mesh.uri.find_last_of('.');
+        std::string hint = dot == std::string::npos ? std::string{} : mesh.uri.substr(dot + 1U);
+        std::transform(hint.begin(), hint.end(), hint.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const auto topology = collision::read_mesh_topology(mesh.bytes, hint, mesh.scale);
+        // A mesh assimp cannot read fails at Apply; it is not reported here.
+        if (topology.has_value() && !topology->closed) return mesh.uri;
+      }
+      return std::nullopt;
+    };
+    deployment::CellOpenMeshes open;
+    std::set<std::string> read_links;
+    std::set<std::string> read_scene_objects;
+    for (const auto &row : selected_rows.as_array()) {
+      const auto &member = *row.find_object_member("member");
+      if (member.find_object_member("kind")->as_string() == "link") {
+        const auto &link = member.find_object_member("link")->as_string();
+        if (!read_links.insert(link).second) continue;
+        if (auto uri = open_uri(link_meshes.at(link))) open.links[link] = std::move(*uri);
+      } else {
+        const auto &id = member.find_object_member("scene_resource_id")->as_string();
+        if (!read_scene_objects.insert(id).second) continue;
+        if (auto uri = open_uri(scene_meshes.at(id))) open.scene_objects[id] = std::move(*uri);
+      }
+    }
+    return deployment::cell_mesh_depth_reports(rules, io_signals.value(), facts, open);
   }
 
 private:
@@ -3129,7 +3290,7 @@ public:
                 std::string(
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
-            config_.activation_root, config_.scene_asset_root,
+            config_.activation_root,
             site_settings_document_,
             // The Manager's current publication head, read by fence requests
             // after construction.
@@ -3142,10 +3303,9 @@ public:
               return std::move(head.value());
             }),
         stores_(config_.manager_state_root, admission_, &record_writer_),
-        scene_owner_(config_.logical_scene_database, admission_,
-                     stores_.active_bundle_publication_store(),
+        scene_owner_(admission_, stores_.active_bundle_publication_store(),
                      verified_package_, execution_host_adapter_,
-                     execution_host_adapter_, &record_writer_),
+                     execution_host_adapter_),
         original_manager_scene_maintenance_(scene_owner_, execution_host_adapter_),
         scene_runtime_pose_projector_(
             scene_owner_, admission_.cell_id(),
@@ -3220,8 +3380,8 @@ public:
     // A stop signal that came before the fd was published.
     if (g_stop_requested != 0) execution_host_adapter_.AbandonExchanges();
     try {
-      // Checked as soon as the stores and the Scene owner it reads are open,
-      // before any process is started (OD-242).
+      // Checked as soon as the stores it reads are open, before any process
+      // is started (OD-242).
       RefuseAPreviousRun();
       // S3: the Manager is the one supervisor of the application. Its listed
       // processes start now, from the main thread, with `A`, in list order
@@ -3530,8 +3690,8 @@ public:
 
 private:
   /// The one shutdown point of the stores: write every queued record, then
-  /// close the scene store, the Apply journal, the publication store and the
-  /// bootstrap journal. Called only once nothing posts any more. The drain has
+  /// close the Apply journal, the publication store and the bootstrap
+  /// journal. Called only once nothing posts any more. The drain has
   /// no time limit (OD-187 (1)): it ends when the queue is written; a second
   /// stop request does not cut it. A close failure is ignored, as the
   /// stores' destructors ignore it.
@@ -3546,7 +3706,6 @@ private:
       } catch (...) {
       }
     };
-    close_store(scene_owner_);
     close_store(stores_.apply_journal());
     close_store(stores_.active_bundle_publication_store());
     close_store(stores_.bootstrap_journal());
@@ -3683,18 +3842,6 @@ private:
                                    "candidate/runtime capabilities");
       }
     }
-    config.logical_scene_database =
-        DatabasePath(std::move(config.logical_scene_database));
-    const std::array<const std::filesystem::path *, 1U> durable_paths{
-        &config.logical_scene_database};
-    const std::array<const std::filesystem::path *, 2U> run_roots{
-        &config.manager_run_root, &config.execution_run_root};
-    for (const auto *durable_path : durable_paths) {
-      for (const auto *run_root : run_roots) {
-        RequirePathOutsideDirectory(*durable_path, *run_root,
-                                    "Manager durable path/run capability");
-      }
-    }
     if (!config.program_runner_liveness_socket.empty()) {
       Require(config.program_runner_liveness_socket.is_absolute() &&
                   config.program_runner_liveness_socket.has_filename(),
@@ -3736,12 +3883,17 @@ private:
     return now;
   }
 
-  // A Manager state that already holds a scene or an Apply belongs to a
-  // previous run: every start begins from an empty current/ directory
-  // (OD-122 (2), (8)), so it is refused with a typed start-up error, never
-  // recovered.
+  // A Manager state that already holds a bootstrap, a publication or an
+  // Apply belongs to a previous run: every start begins from an empty
+  // current/ directory (OD-122 (2), (8)), so it is refused with a typed
+  // start-up error, never recovered. Empty here is exactly what the
+  // canonical-empty bootstrap's Begin requires (OD-242, OD-378).
   void RefuseAPreviousRun() {
-    if (!scene_owner_.ReadAccessStatus().active_projection.has_value() &&
+    const auto inventory = stores_.StartupInventory();
+    if (inventory.bootstrap_journal.phase ==
+            component_manager::ManagerBootstrapJournalPhase::kEmpty &&
+        inventory.active_bundle_publication.receipt_count == 0 &&
+        inventory.active_bundle_publication.current_generation.value() == 0U &&
         stores_.apply_journal().ReadStatusInventory().empty()) {
       return;
     }
@@ -3906,6 +4058,7 @@ private:
 
   PublicationGenerations PublishActiveRuntime(
       component_manager::ManagerActiveRuntimeConvergenceResult runtime) {
+    RefreshActiveSceneMeshes(runtime.plan.active_publication);
     const bool kernel_apply_available = HasConvergedKernelApplyOwner(runtime);
     {
       // The Apply progression lane publishes transitions from these.
@@ -5407,9 +5560,84 @@ private:
     }
   }
 
+  /// The durable intent of the Apply that installed `publication`; none for
+  /// a bootstrap publication.
+  [[nodiscard]] std::optional<component_manager::PersistedManagerApplyIntent>
+  ActiveApplyIntent(const core::ActiveBundlePublicationReceiptDTO &publication) {
+    const auto *named = std::get_if<core::NamedApplyPublicationTransactionDTO>(
+        &publication.request.transaction_ref);
+    if (named == nullptr)
+      return std::nullopt;
+    auto intent = stores_.apply_journal().ReadIntent(named->apply_id,
+                                                     named->apply_generation);
+    Require(intent.has_value(), "active publication has no durable Apply intent");
+    return intent;
+  }
+
+  /// Keep the active Apply's captured scene meshes in memory for
+  /// `publication`: the journal is read once per new publication (an Apply
+  /// installed, or the publication found at start), never per scene commit.
+  void RefreshActiveSceneMeshes(
+      const core::ActiveBundlePublicationReceiptDTO &publication) {
+    const auto generation = publication.publication_generation.value();
+    if (active_scene_meshes_.load(std::memory_order_acquire)
+            ->publication_generation >= generation)
+      return;
+    auto next = std::make_shared<ActiveSceneMeshes>();
+    next->publication_generation = generation;
+    if (const auto intent = ActiveApplyIntent(publication))
+      next->table =
+          ReceiptSceneMeshes(PreparedReceipt(intent->intent.prepared_activation));
+    std::shared_ptr<const ActiveSceneMeshes> installed = std::move(next);
+    auto current = active_scene_meshes_.load(std::memory_order_acquire);
+    while (current->publication_generation < generation &&
+           !active_scene_meshes_.compare_exchange_weak(
+               current, installed, std::memory_order_acq_rel,
+               std::memory_order_acquire)) {
+    }
+  }
+
+  /// Give the mesh shape of an add_object/upsert_object request its captured
+  /// content. Without a digest it is the active Apply's capture of that URI,
+  /// read from memory; a supplied digest (a mesh captured when an API scene
+  /// call added it) must name a stored blob.
+  void ResolveSceneMeshContent(core::SceneTransactionRequestDTO &transaction) {
+    core::CollisionShapeDTO *shape = nullptr;
+    if (auto *add = std::get_if<core::AddObjectRequestDTO>(&transaction.operation))
+      shape = &add->shape;
+    else if (auto *upsert =
+                 std::get_if<core::UpsertObjectRequestDTO>(&transaction.operation))
+      shape = &upsert->shape;
+    auto *mesh = shape == nullptr ? nullptr : std::get_if<core::MeshShapeDTO>(shape);
+    if (mesh == nullptr)
+      return;
+    if (mesh->content_digest.empty()) {
+      mesh->content_digest = CapturedSceneMeshDigest(
+          active_scene_meshes_.load(std::memory_order_acquire)->table,
+          mesh->resource_uri);
+      return;
+    }
+    std::error_code error;
+    if (config_.activation_root.empty() ||
+        !core::IsExactLowercaseSha256Digest(mesh->content_digest) ||
+        std::filesystem::symlink_status(
+            config_.activation_root / "raw-artifacts" / "sha256" /
+                (mesh->content_digest.substr(7U) + ".blob"),
+            error)
+                .type() != std::filesystem::file_type::regular) {
+      throw core::TypedError(
+          "scene_mesh_unavailable",
+          "scene mesh " + mesh->resource_uri + " content " +
+              mesh->content_digest + " is not stored in the activation",
+          {{"content_digest", mesh->content_digest},
+           {"resource_uri", mesh->resource_uri}});
+    }
+  }
+
   /// Delete activation-root content no live configuration references (its
   /// stores are bounded and refuse when full). Live are the current
-  /// publication's bundle, Program and binding and the bundle it replaced.
+  /// publication's bundle, Program and binding, the bundle it replaced and
+  /// the scene meshes of the active Apply and the current logical Scene.
   /// Runs once when the Apply lane starts and after each successful Apply, on
   /// that lane: Applies progress one at a time there, so no publication
   /// changes underneath. A failure is logged; the content stays until the
@@ -5425,28 +5653,37 @@ private:
     };
     try {
       const auto publication = plan_source_.ReadCurrentPlan().active_publication;
-      deployment::ActiveActivationContent active{
+      RefreshActiveSceneMeshes(publication);
+      deployment::ActiveActivationContent configured{
           {publication.request.candidate_retained_bundle_id}, std::nullopt,
-          std::nullopt};
-      if (const auto *named = std::get_if<core::NamedApplyPublicationTransactionDTO>(
-              &publication.request.transaction_ref)) {
-        const auto intent = stores_.apply_journal().ReadIntent(
-            named->apply_id, named->apply_generation);
-        Require(intent.has_value(), "active publication has no durable Apply intent");
-        active.retained_bundle_ids.push_back(
+          std::nullopt, {}};
+      if (const auto intent = ActiveApplyIntent(publication)) {
+        configured.retained_bundle_ids.push_back(
             intent->intent.expected_active_projection_revision.retained_bundle_id);
         const auto &prepared = intent->intent.prepared_activation;
-        active.program_binding_id = prepared.program_binding_id;
-        const auto receipt = content_identity::parse_canonical_json(
-            prepared.canonical_receipt_json,
-            {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
-             4096U});
+        configured.program_binding_id = prepared.program_binding_id;
+        const auto receipt = PreparedReceipt(prepared);
         if (const auto *revision = receipt.find_object_member("program_revision");
             revision != nullptr && revision->is_string())
-          active.program_revision = core::ProgramRevision(revision->as_string());
+          configured.program_revision = core::ProgramRevision(revision->as_string());
       }
+      // The scene meshes are read only once the collection holds the writer
+      // lock exclusively: a mesh Headless stored and committed under its
+      // shared hold is then already named by the logical Scene.
+      const auto live = [&] {
+        auto active = configured;
+        for (const auto &[uri, digest] :
+             active_scene_meshes_.load(std::memory_order_acquire)->table)
+          active.scene_mesh_digests.emplace_back(digest);
+        // A mesh an API scene call added is named only by the logical Scene.
+        for (const auto &object : scene_owner_.LogicalSnapshot()->objects)
+          for (const auto &shape : object.collision_shapes)
+            if (const auto *mesh = std::get_if<core::MeshShapeDTO>(&shape))
+              active.scene_mesh_digests.emplace_back(mesh->content_digest);
+        return active;
+      };
       const auto collected = deployment::collect_unreferenced_activation_content(
-          config_.activation_root, active, activation_content_references_);
+          config_.activation_root, live, activation_content_references_);
       // One line per run, also when nothing is removed or a preparation
       // deferred it: its duration is time this lane holds the writer lock.
       std::cerr << "Manager activation content collection: "
@@ -6380,8 +6617,7 @@ private:
       }
       switch (command.kind) {
       case CommandKind::kDeploymentCandidatePreview: {
-        Require(command.deployment_artifact_id.has_value() &&
-                    command.deployment_revision.has_value() &&
+        Require(command.deployment_revision.has_value() &&
                     command.candidate_retained_bundle_id.has_value() &&
                     command.candidate_graph_revision.has_value() &&
                     command.prepared_activation_id.has_value() &&
@@ -6443,11 +6679,24 @@ private:
                                                error.details));
             return false;
           }
+          auto collision_rules = verified_package_.CellCollisionRuleChanges(
+              *current_bundle, *candidate_bundle);
+          if (!collision_rules.ok()) {
+            const auto &error = collision_rules.error();
+            TrySendResponse(client.get(), DetailedErrorResponse(
+                                               error.code, error.message,
+                                               error.details));
+            return false;
+          }
           auto impact = DeploymentApplyImpact(
               *current_bundle, *candidate_bundle, config_.activation_root,
-              *command.prepared_activation_id, site_facts_);
+              *command.prepared_activation_id, site_facts_,
+              std::move(collision_rules.value()),
+              [&](const deployment::PreparedActivationInput &prepared) {
+                return verified_package_.CellMeshDepthReports(*candidate_bundle,
+                                                              prepared);
+              });
           DeploymentCandidateReceipt receipt{
-              *command.deployment_artifact_id,
               *command.deployment_revision,
               *command.prepared_activation_id,
               *command.candidate_retained_bundle_id,
@@ -6484,8 +6733,7 @@ private:
         return false;
       }
       case CommandKind::kApply: {
-        Require(command.deployment_artifact_id.has_value() &&
-                    command.deployment_revision.has_value() &&
+        Require(command.deployment_revision.has_value() &&
                     command.expected_current_retained_bundle_id.has_value() &&
                     command.expected_current_graph_revision.has_value() &&
                     command.request_key.has_value() &&
@@ -6506,9 +6754,7 @@ private:
                   : command.parent_authoring_claim->intent
                         .expected_admission_generation;
           if (!existing.has_value() &&
-              (candidate_receipt.deployment_artifact_id !=
-                   *command.deployment_artifact_id ||
-               candidate_receipt.deployment_revision !=
+              (candidate_receipt.deployment_revision !=
                    *command.deployment_revision ||
                candidate_receipt.expected_current_retained_bundle_id !=
                    *command.expected_current_retained_bundle_id ||
@@ -6518,8 +6764,6 @@ private:
                    receipt_admission_generation ||
                candidate_receipt.prepared_activation_id !=
                    command.prepared_activation->prepared_activation_id ||
-               command.prepared_activation->deployment_artifact_id !=
-                   *command.deployment_artifact_id ||
                command.prepared_activation->deployment_revision !=
                    *command.deployment_revision)) {
             TrySendResponse(
@@ -6596,9 +6840,24 @@ private:
                       command, host_continuity.error()));
               return false;
             }
+            // Two cell rules holding one pair are refused at Apply too.
+            auto collision_rules = verified_package_.CellCollisionRuleChanges(
+                *current_bundle, *candidate_bundle);
+            if (!collision_rules.ok()) {
+              TrySendResponse(
+                  client.get(),
+                  ApplyKnownNoEffectDetailedErrorResponse(
+                      command, collision_rules.error()));
+              return false;
+            }
             auto impact = DeploymentApplyImpact(
                 *current_bundle, *candidate_bundle, config_.activation_root,
-                candidate_receipt.prepared_activation_id, site_facts_);
+                candidate_receipt.prepared_activation_id, site_facts_,
+                std::move(collision_rules.value()),
+                [&](const deployment::PreparedActivationInput &prepared) {
+                  return verified_package_.CellMeshDepthReports(*candidate_bundle,
+                                                                prepared);
+                });
             if (DeploymentApplyImpactDigest(impact) !=
                 candidate_receipt.impact_digest) {
               TrySendResponse(
@@ -6628,7 +6887,6 @@ private:
               {
                   core::PublicRequestContextDTO{*command.request_key,
                                                 *command.source_label},
-                  *command.deployment_artifact_id,
                   *command.deployment_revision,
                   *command.expected_current_retained_bundle_id,
                   *command.expected_current_graph_revision,
@@ -6729,13 +6987,13 @@ private:
       case CommandKind::kSceneCommit: {
         Require(command.scene_transaction.has_value(),
                 "decoded scene command lacks its transaction");
-        const auto detached = DetachedHolder(*command.scene_transaction);
+        auto transaction = *command.scene_transaction;
+        ResolveSceneMeshContent(transaction);
+        const auto detached = DetachedHolder(transaction);
         const auto result = detail::CommitSceneWithAdmissionObservation(
-            scene_owner_, *command.scene_transaction,
-            scene_admission_reconciled_);
+            scene_owner_, transaction, scene_admission_reconciled_);
         if (result.success) {
-          ClearCarriedObjectLostAfterCommit(*command.scene_transaction,
-                                            detached);
+          ClearCarriedObjectLostAfterCommit(transaction, detached);
           // The durable scene result remains authoritative if this projection
           // write fails. Periodic reconciliation republishes it, and exact
           // request replay returns the same owner result without a second
@@ -6748,6 +7006,8 @@ private:
       case CommandKind::kSceneTransactionStatus: {
         Require(command.scene_transaction.has_value(),
                 "Scene result lookup lacks its request");
+        // The request digest leaves out mesh content, so a lookup needs no
+        // capture: it names the request, not the content its commit resolved.
         const auto result =
             scene_owner_.ReadCommitResult(*command.scene_transaction);
         TrySendResponse(
@@ -7301,6 +7561,17 @@ private:
   // Apply progression lane only: the references the activation content
   // collection already read (empty at start, so the first one reads all).
   deployment::ActivationContentReferences activation_content_references_;
+  /// The active Apply's captured scene meshes (URI to content digest), kept
+  /// in memory: set when a publication is installed or found at start, read
+  /// by scene commits and content collection without touching the journal
+  /// (OD-118). Replaced whole, never mutated; a newer publication generation
+  /// always wins.
+  struct ActiveSceneMeshes final {
+    std::uint64_t publication_generation{0U};
+    SceneMeshTable table;
+  };
+  std::atomic<std::shared_ptr<const ActiveSceneMeshes>> active_scene_meshes_{
+      std::make_shared<const ActiveSceneMeshes>()};
   // Main thread only: the last late-host episode that got its Stop.
   // LogExecutionHostLateReply: the outstanding exchange seen at the last
   // tick, and the one logged (main thread only).
@@ -7359,10 +7630,8 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   bool manager_run = false;
   bool execution_state = false;
   bool execution_run = false;
-  bool scene = false;
   bool program_runner_liveness = false;
   bool period = false;
-  bool scene_asset = false;
   bool site_settings = false;
   bool processes = false;
   for (int index = 1; index < argc; index += 2) {
@@ -7390,16 +7659,10 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     } else if (option == "--execution-run-root" && !execution_run) {
       config.execution_run_root = value;
       execution_run = true;
-    } else if (option == "--logical-scene-database" && !scene) {
-      config.logical_scene_database = value;
-      scene = true;
     } else if (option == "--program-runner-liveness-socket" &&
                !program_runner_liveness) {
       config.program_runner_liveness_socket = value;
       program_runner_liveness = true;
-    } else if (option == "--scene-asset-root" && !scene_asset) {
-      config.scene_asset_root = value;
-      scene_asset = true;
     } else if (option == "--site-settings" && !site_settings) {
       Require(!value.empty(), "--site-settings requires one explicit path");
       config.site_settings_path = value;
@@ -7417,10 +7680,10 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   }
   Require(
       install && manager && manager_run && execution_state && execution_run &&
-          scene && processes,
+          processes,
       "--install-root, --manager-state-root, --manager-run-root, "
-      "--execution-state-root, --execution-run-root, "
-      "--logical-scene-database and --application-processes are required");
+      "--execution-state-root, --execution-run-root and "
+      "--application-processes are required");
   return config;
 }
 

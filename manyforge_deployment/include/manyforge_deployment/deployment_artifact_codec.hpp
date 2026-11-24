@@ -38,23 +38,12 @@ class RevisionVerifiedDeploymentArtifact final {
   RevisionVerifiedDeploymentArtifact& operator=(
       const RevisionVerifiedDeploymentArtifact&) noexcept = default;
 
-  [[nodiscard]] const core::DeploymentArtifactId& deployment_artifact_id()
-      const noexcept {
-    return data_->deployment_artifact_id;
-  }
   [[nodiscard]] const core::DeploymentRevision& deployment_revision()
       const noexcept {
     return data_->deployment_revision;
   }
   [[nodiscard]] const core::CellId& cell_id() const noexcept {
     return data_->cell_id;
-  }
-  [[nodiscard]] const std::string& name() const noexcept {
-    return data_->name;
-  }
-  [[nodiscard]] const std::optional<std::string>& description()
-      const noexcept {
-    return data_->description;
   }
   [[nodiscard]] const std::vector<core::CatalogRecordRefDTO>& catalog_records()
       const noexcept {
@@ -91,31 +80,23 @@ class RevisionVerifiedDeploymentArtifact final {
  private:
   struct Data final {
     Data(
-        core::DeploymentArtifactId deployment_artifact_id_in,
         core::DeploymentRevision deployment_revision_in,
-        core::CellId cell_id_in, std::string name_in,
-        std::optional<std::string> description_in,
+        core::CellId cell_id_in,
         std::vector<core::CatalogRecordRefDTO> catalog_records_in,
         const GraphRevisionVerifiedCellGraph& graph_in,
         const RevisionVerifiedDeploymentApplicabilityInputs&
             applicability_inputs_in,
         CanonicalValue normalized_authored_root_in)
-        : deployment_artifact_id(std::move(deployment_artifact_id_in)),
-          deployment_revision(std::move(deployment_revision_in)),
+        : deployment_revision(std::move(deployment_revision_in)),
           cell_id(std::move(cell_id_in)),
-          name(std::move(name_in)),
-          description(std::move(description_in)),
           catalog_records(std::move(catalog_records_in)),
           graph(graph_in),
           applicability_inputs(applicability_inputs_in),
           normalized_authored_root(
               std::move(normalized_authored_root_in)) {}
 
-    core::DeploymentArtifactId deployment_artifact_id;
     core::DeploymentRevision deployment_revision;
     core::CellId cell_id;
-    std::string name;
-    std::optional<std::string> description;
     std::vector<core::CatalogRecordRefDTO> catalog_records;
     GraphRevisionVerifiedCellGraph graph;
     RevisionVerifiedDeploymentApplicabilityInputs applicability_inputs;
@@ -123,18 +104,14 @@ class RevisionVerifiedDeploymentArtifact final {
   };
 
   RevisionVerifiedDeploymentArtifact(
-      core::DeploymentArtifactId deployment_artifact_id,
       core::DeploymentRevision deployment_revision, core::CellId cell_id,
-      std::string name, std::optional<std::string> description,
       std::vector<core::CatalogRecordRefDTO> catalog_records,
       const GraphRevisionVerifiedCellGraph& graph,
       const RevisionVerifiedDeploymentApplicabilityInputs&
           applicability_inputs,
       CanonicalValue normalized_authored_root)
       : data_(std::make_shared<const Data>(
-            std::move(deployment_artifact_id),
             std::move(deployment_revision), std::move(cell_id),
-            std::move(name), std::move(description),
             std::move(catalog_records), graph, applicability_inputs,
             std::move(normalized_authored_root))) {}
 

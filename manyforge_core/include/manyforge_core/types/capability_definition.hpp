@@ -15,7 +15,7 @@ namespace manyforge::core {
 inline constexpr std::string_view kCapabilityDefinitionApiVersion =
     "manyforge.capability_definition.v1";
 inline constexpr std::string_view kBuiltinCapabilityDefinitionRegistryDigest =
-    "sha256:a8cd4531c38c0e4dafcc44193968bdbc25a4fe9036c711c190b4dcd896701794";
+    "sha256:df3c8b452f834d5b0b5ce01a8217da78d3c682d9bc6fbb02d2e6387cc0b042ab";
 
 enum class CapabilityScope : std::uint8_t {
   kCellGlobal = 0,
@@ -241,8 +241,8 @@ inline constexpr auto kBuiltinCapabilityDefinitionRegistry =
          "sha256:ea0a625d949b1287de5b1eb0ed1e9d400d927f86c62c00b63c69898bdc58da36",
          CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
-        {"execution.interrupt.contact_policy",
-         "sha256:91fa92a90ddf807623ae9a42a97c37cd4d9628b1961e572b28a928e0da4dd98d",
+        {"execution.interrupt.contact_rule",
+         "sha256:eb10016601843c51b459405b87ec3af2bcd378741fb158f143a66f084f9c2588",
          CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
         {"io.gpio.set_output",

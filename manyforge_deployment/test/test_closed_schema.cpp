@@ -735,7 +735,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde");
+          "4c1a934edc63d9da5eac2d1aef76d86142fcb797950a12306009e028d551c3fa");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -804,18 +804,6 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
                 &entry);
-    } else if (entry.record_kind() == core::CatalogRecordKind::kContactPolicy) {
-      ++qualified_count;
-      EXPECT_EQ(entry.qualification(), CatalogSchemaQualification::kQualified);
-      ASSERT_NE(entry.compiled_schema(), nullptr);
-      EXPECT_EQ(
-          entry.compiled_schema()->schema_revision().value(),
-          "sha256:"
-          "f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33");
-      EXPECT_EQ(registry.find_qualified_catalog_schema(
-                    entry.record_kind(), entry.schema_id(),
-                    entry.compiled_schema()->schema_revision()),
-                &entry);
     } else if (entry.record_kind() ==
                core::CatalogRecordKind::kProviderManifest) {
       ++qualified_count;
@@ -841,7 +829,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                                        "0000000000000000000000000")),
               nullptr);
   }
-  EXPECT_EQ(qualified_count, 10U);
+  EXPECT_EQ(qualified_count, 9U);
   EXPECT_EQ(registry.qualification_registry_digest().value(),
             sha256_digest(canonical_json(registry.normalized_projection())));
   EXPECT_NE(
@@ -927,7 +915,7 @@ TEST(ClosedSchema, IoComponentWrapperUsesSharedRowsAndMaterializesDeviceLimit) {
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "500cfe739120003e06057cdf78a94f006eb4fc4ef157a7f55f70ab4d1aa45b1d"));
+          "829e709117459cc5378ec20ceda9e3ea7ac6d1e8dda1d1798f9a1373ef9acc39"));
   ASSERT_NE(schema, nullptr);
   const auto source = parse_strict_json_model_yaml(R"({
     "io_signals":[
@@ -982,7 +970,7 @@ TEST(ClosedSchema, IoComponentWrapperRefusesEmptySignalsMultipleDevicesAndMotion
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "500cfe739120003e06057cdf78a94f006eb4fc4ef157a7f55f70ab4d1aa45b1d"));
+          "829e709117459cc5378ec20ceda9e3ea7ac6d1e8dda1d1798f9a1373ef9acc39"));
   ASSERT_NE(schema, nullptr);
   const std::string signal = R"({"controllable_component_id":"device.io",
     "command_target_id":"gpio","resource_role_id":"lamp","signal_name":"lamp",
@@ -1248,7 +1236,7 @@ TEST(ClosedSchema, EveryPackagedYamlResourcePassesStrictUniqueKeyIngress) {
         << relative_path;
     ++parsed_count;
   }
-  EXPECT_EQ(parsed_count, 20U);
+  EXPECT_EQ(parsed_count, 19U);
 }
 
 TEST(ClosedSchema,
@@ -1401,7 +1389,6 @@ TEST(ClosedSchema,
     if (built.record_kind() == core::CatalogRecordKind::kCapabilityDefinition ||
         built.record_kind() == core::CatalogRecordKind::kCommandSchema ||
         built.record_kind() == core::CatalogRecordKind::kComponentType ||
-        built.record_kind() == core::CatalogRecordKind::kContactPolicy ||
         built.record_kind() ==
             core::CatalogRecordKind::kControlInterfaceContract ||
         built.record_kind() == core::CatalogRecordKind::kControllerTopology ||
@@ -1431,14 +1418,8 @@ TEST(ClosedSchema,
                  core::CatalogRecordKind::kComponentType) {
         expected_revision =
             "sha256:"
-            "d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde";
+            "4c1a934edc63d9da5eac2d1aef76d86142fcb797950a12306009e028d551c3fa";
         expected_path = "catalog/manyforge.component_type.v1.yaml";
-      } else if (built.record_kind() ==
-                 core::CatalogRecordKind::kContactPolicy) {
-        expected_revision =
-            "sha256:"
-            "f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33";
-        expected_path = "catalog/manyforge.contact_policy.v1.yaml";
       } else if (built.record_kind() ==
                  core::CatalogRecordKind::kControlInterfaceContract) {
         expected_revision =
@@ -1508,7 +1489,6 @@ TEST(ClosedSchema,
       "catalog/manyforge.capability_definition.v1.yaml",
       "catalog/manyforge.command_schema.v1.yaml",
       "catalog/manyforge.component_type.v1.yaml",
-      "catalog/manyforge.contact_policy.v1.yaml",
       "catalog/manyforge.control_interface_contract.v1.yaml",
       "catalog/manyforge.controller_topology.v1.yaml",
       "catalog/manyforge.model_asset.v1.yaml",

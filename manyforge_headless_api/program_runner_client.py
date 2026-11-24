@@ -99,6 +99,8 @@ class ProgramRunnerPort(Protocol):
 
     def runtime_controls(self, program_run_id: int) -> dict[str, Any]: ...
 
+    def runtime_blackboard_values(self, program_run_id: int) -> dict[str, Any]: ...
+
     def runtime_control_action(
         self, program_run_id: int, suffix: str, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
@@ -368,6 +370,11 @@ class ProgramRunnerHttpClient:
     def runtime_controls(self, program_run_id: int) -> dict[str, Any]:
         return self._request(
             "GET", f"{self._run_path(program_run_id)}/runtime-controls"
+        )
+
+    def runtime_blackboard_values(self, program_run_id: int) -> dict[str, Any]:
+        return self._request(
+            "GET", f"{self._run_path(program_run_id)}/blackboard-values"
         )
 
     def runtime_control_action(

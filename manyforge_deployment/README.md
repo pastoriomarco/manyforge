@@ -142,7 +142,7 @@ The command always performs a fresh Release build, selects only
 `linux-amd64` or `linux-arm64` from the generated compiler-build manifest, and
 rejects a non-Release or unsupported target before reading or writing a golden.
 
-Maintained `manyforge.program.v3` sources use the C++ authoring target
+Maintained `manyforge.program.v4` sources use the C++ authoring target
 `manyforge_program_revision` for their opaque identities. After editing one
 Program, run:
 
@@ -151,9 +151,9 @@ manyforge_program_revision --update --input examples/pick_and_place.program.yaml
 manyforge_program_revision --check --input examples/pick_and_place.program.yaml
 ```
 
-`--update` regenerates embedded contact-policy revisions first and then the
-enclosing `program_revision`, while preserving the human-authored YAML apart
-from those plain digest fields. This command computes and checks identities; it
+`--update` regenerates the `program_revision`, while preserving the
+human-authored YAML apart from that plain digest field. This command computes
+and checks the identity; it
 does not replace the qualified Program/catalog validator or grant runtime
 admission to a merely parseable source.
 

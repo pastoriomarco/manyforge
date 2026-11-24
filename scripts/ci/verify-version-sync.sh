@@ -63,6 +63,7 @@ for cmake_pkg in \
     manyforge_xarm_control \
     manyforge_isaac_adapter \
     manyforge_perception_interfaces \
+    manyforge_io_interfaces \
     manyforge_perception_provider; do
     check "${cmake_pkg} CMakeLists.txt" "$(extract_cmake_version "${REPO_ROOT}/${cmake_pkg}/CMakeLists.txt")"
 done
@@ -104,6 +105,7 @@ for pkg in \
     manyforge_xarm_control \
     manyforge_isaac_adapter \
     manyforge_perception_interfaces \
+    manyforge_io_interfaces \
     manyforge_perception_provider; do
     check "${pkg} package.xml" "$(extract_rospkg_version "${REPO_ROOT}/${pkg}/package.xml")"
 done

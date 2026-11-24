@@ -374,8 +374,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.package_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-program-artifact-root-fd") {
       config.program_artifact_root_fd = ParseFileDescriptor(value);
-    } else if (option == "--manyforge-managed-scene-asset-root-fd") {
-      config.scene_asset_root_fd = ParseFileDescriptor(value);
+    } else if (option == "--manyforge-managed-scene-content-root-fd") {
+      config.scene_content_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-site-settings") {
       config.site_settings = LoadManagedSiteSettings(value);
     } else if (option == "--manyforge-managed-manager-run-root") {
@@ -438,16 +438,16 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
               program_artifact_flags >= 0 &&
               (program_artifact_flags & FD_CLOEXEC) == 0,
           "managed package-root descriptor is not a retained directory");
-  if (config.scene_asset_root_fd.has_value()) {
-    struct stat scene_asset_status {};
-    const int scene_asset_flags =
-        ::fcntl(*config.scene_asset_root_fd, F_GETFD);
-    Require(*config.scene_asset_root_fd == kManagedSceneAssetRootFd &&
-                ::fstat(*config.scene_asset_root_fd, &scene_asset_status) ==
+  if (config.scene_content_root_fd.has_value()) {
+    struct stat scene_content_status {};
+    const int scene_content_flags =
+        ::fcntl(*config.scene_content_root_fd, F_GETFD);
+    Require(*config.scene_content_root_fd == kManagedSceneContentRootFd &&
+                ::fstat(*config.scene_content_root_fd, &scene_content_status) ==
                     0 &&
-                S_ISDIR(scene_asset_status.st_mode) && scene_asset_flags >= 0 &&
-                (scene_asset_flags & FD_CLOEXEC) == 0,
-            "managed scene-asset root descriptor is not an inherited "
+                S_ISDIR(scene_content_status.st_mode) && scene_content_flags >= 0 &&
+                (scene_content_flags & FD_CLOEXEC) == 0,
+            "managed scene content root descriptor is not an inherited "
             "directory");
   }
   config.package_root = std::filesystem::path("/proc/self/fd") /

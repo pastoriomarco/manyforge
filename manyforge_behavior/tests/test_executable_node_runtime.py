@@ -81,7 +81,7 @@ def _identified(document: dict[str, Any]) -> dict[str, Any]:
         result,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return result
 
@@ -332,7 +332,6 @@ def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapt
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="scenario.test",
         source_document_digest=_DIGEST_A,
-        program_id=program.program_id,
         program_revision=program.program_revision,
         program_binding_id=binding_id,
         retained_bundle_id=_DIGEST_B,
@@ -365,8 +364,10 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     resolver = build_executable_node_resolver(environment)
     dispositions = resolver.dispositions
 
-    assert len(dispositions) == len(environment.registry.rows) == 51  # + rules.set_active, io.clear_outside_change
-    assert sum(item.adapter_build_qualified for item in dispositions) == 51
+    # + rules.set_active, io.clear_outside_change, operator.request_choice,
+    # motion.stop_groups
+    assert len(dispositions) == len(environment.registry.rows) == 53
+    assert sum(item.adapter_build_qualified for item in dispositions) == 53
     assert sum(not item.adapter_build_qualified for item in dispositions) == 0
     assert all(
         (
@@ -388,6 +389,9 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     owners = {item.row.node_id: item.owner_port_name for item in dispositions}
     assert owners["io.check_input"] == owners["io.get_input"] == "io_signals"
     assert owners["io.wait_for_input"] == "io_watches"
+    # The Program run owner serves these itself: no owner port.
+    assert owners["operator.request_choice"] is None
+    assert owners["motion.stop_groups"] is None
 
 
 def _deferred_adapters(source: str) -> dict[str, tuple[str, ...]]:
@@ -1337,6 +1341,92 @@ def test_relative_target_reference_presence_counts_a_whole_value_source() -> Non
     )
 
 
+def _pose_move(**parameters: Any) -> dict[str, Any]:
+    return _leaf(
+        "motion.move_to_pose",
+        "move",
+        target=target("ur5_robot", "arm"),
+        base_frame=frame("ur5_robot", "base"),
+        tcp_endpoint={"kind": "current"},
+        goal={"position_m": [0.3, 0.0, 0.2], "orientation": {"rpy_deg": [180.0, 0.0, 0.0]}},
+        **parameters,
+    )
+
+
+_LINE_SETTINGS = {
+    "max_translation_step_m": 0.002,
+    "max_rotation_step_rad": 0.02,
+    "max_angular_speed_rad_s": 0.4,
+    "max_linear_acceleration_mps2": 0.3,
+    "max_angular_acceleration_rad_s2": 1.0,
+    "cartesian_timing": "time_optimal",
+}
+
+
+def test_pose_move_motion_type_defaults_to_joint_and_accepts_linear() -> None:
+    # OD-341: existing pose moves stay joint moves; linear takes the line settings.
+    _two_robot_program([], _pose_move())
+    _two_robot_program([], _pose_move(planner={"search": "rrt"}))
+    _two_robot_program([], _pose_move(
+        motion_type="joint",
+        collision_rules=[{"rule_id": "everything_else", "clearance_m": 0.002}],
+    ))
+    _two_robot_program([], _pose_move(motion_type="linear", **_LINE_SETTINGS))
+    # Shared settings keep their meaning in both modes.
+    _two_robot_program([], _pose_move(
+        motion_type="linear", velocity_scale=0.5,
+        collision_rules=[{"rule_id": "everything_else", "clearance_m": 0.002}],
+        max_tcp_linear_speed_mps=0.1, translation_tol_m=0.001, automatic_retries=0,
+    ))
+    relative = _relative_move({"type": "cell_frame"})
+    relative["parameters"]["motion_type"] = "linear"
+    _two_robot_program([], relative)
+
+
+@pytest.mark.parametrize("name", sorted(_LINE_SETTINGS))
+def test_joint_pose_move_refuses_each_linear_setting(name: str) -> None:
+    for motion_type in ({}, {"motion_type": "joint"}):
+        with pytest.raises(ProgramValidationError, match="applies only to linear moves"):
+            _two_robot_program([], _pose_move(**motion_type, **{name: _LINE_SETTINGS[name]}))
+
+
+@pytest.mark.parametrize("name", ["translation_tol_m", "rotation_tol_rad"])
+def test_linear_pose_move_refuses_a_zero_tolerance(name: str) -> None:
+    _two_robot_program([], _pose_move(**{name: 0.0}))  # a joint move keeps 0
+    with pytest.raises(ProgramValidationError, match="must be above 0 for a linear move"):
+        _two_robot_program([], _pose_move(motion_type="linear", **{name: 0.0}))
+    _two_robot_program([], _pose_move(motion_type="linear", **{name: 0.001}))
+
+
+def test_linear_pose_move_refuses_the_joint_planner() -> None:
+    with pytest.raises(ProgramValidationError, match="applies only to joint moves"):
+        _two_robot_program([], _pose_move(motion_type="linear", planner={"search": "rrt"}))
+
+
+@pytest.mark.parametrize(
+    "node_id", ["motion.move_to_pose", "motion.move_until_signal", "motion.probe_search"]
+)
+def test_pose_move_settings_follow_motion_type_also_from_a_value_source(node_id: str) -> None:
+    from manyforge_behavior import program as program_module
+
+    check = program_module._validate_node_cross_fields  # noqa: SLF001
+    check(node_id, {"motion_type": "linear", **_LINE_SETTINGS}, sourced=frozenset(),
+          path="n", context=None)
+    check(node_id, {"planner": {"search": "rrt"}}, sourced=frozenset(), path="n", context=None)
+    with pytest.raises(ProgramValidationError, match=r"n\.parameters\.max_translation_step_m"):
+        check(node_id, {}, sourced=frozenset({"max_translation_step_m"}), path="n", context=None)
+    with pytest.raises(ProgramValidationError, match=r"n\.parameters\.planner"):
+        check(node_id, {"motion_type": "linear"}, sourced=frozenset({"planner"}), path="n",
+              context=None)
+
+
+def test_pose_move_motion_type_is_a_literal() -> None:
+    node = _pose_move()
+    node["value_sources"] = {"motion_type": {"kind": "blackboard_key", "reference": "mode"}}
+    with pytest.raises(ProgramValidationError, match="cannot dynamically select"):
+        _two_robot_program([], node)
+
+
 def test_persistent_keys_require_the_register() -> None:
     program = Program.from_dict(
         _identified(
@@ -1490,7 +1580,7 @@ def test_all_maintained_program_node_forms_execute_through_the_closed_runner() -
             for path in (_ROOT / "examples").glob("*.program.yaml")
             if not path.name.startswith("ur5e_lite6_wall_")
             and path.read_text(encoding="utf-8").startswith(
-                "api_version: manyforge.program.v3\n"
+                "api_version: manyforge.program.v4\n"
             )
         )
     )
@@ -1723,6 +1813,8 @@ def test_every_cancellable_leaf_adapter_reports_interrupted_and_no_other_does() 
                 attempt_source=ProgramRunAttemptSource(7),
                 ports=_ports(),
                 program_clock=ProgramClock(),
+                # The run's Stop state, as every run passes it.
+                operator_stop_state=OperatorMotionStopState({"leaf": ()}),
             ),
         )
         reports = isinstance(adapter, InterruptedOutcome) and adapter.cancellable
@@ -1744,6 +1836,7 @@ def test_every_cancellable_leaf_adapter_reports_interrupted_and_no_other_does() 
         "motion.move_until_signal",
         "motion.probe_search",
         "motion.set_tcp",
+        "operator.request_choice",
         "planning.plan_pick_sequence",
         "planning.plan_place_sequence",
         "simulation.reset",
@@ -4296,7 +4389,6 @@ def _planning_adapter(task: _PlanningPort, sender: _ManualSender, **context: Any
                 "selected_object_id": "graspable",
                 "tool_position": {"kind": "named_preset", "name": "closed"},
                 "output_key": "planning.pick_plan",
-                "contact_policy_id": "grasp",
             },
             input_resolver=NodeAttemptInputResolver(
                 program=program,

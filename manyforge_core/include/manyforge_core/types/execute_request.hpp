@@ -1,6 +1,6 @@
 #pragma once
 
-#include <manyforge_core/types/program_contact_envelope.hpp>
+#include <manyforge_core/types/collision_rule.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -34,7 +34,6 @@ struct ResolvedExecutionBindingDTO final {
   OperationNumber operation_id;
   OperationParticipantId participant_id;
   ControllerGoalId controller_goal_id;
-  ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
   /// Absent exactly for intrinsic direct-control (manual) work.
@@ -89,23 +88,6 @@ struct ResolvedExecutionBindingDTO final {
                          const ResolvedExecutionBindingDTO&) = default;
 };
 
-/// Owner-resolved contact-grasp template plus one public runtime-object
-/// selection. Together with the enclosing `ResolvedExecutionBindingDTO` this
-/// is the complete immutable effective binding; the execution engine validates
-/// it against one retained scene projection before installing an ephemeral
-/// collision-policy entry.
-struct ResolvedContactGraspBindingDTO final {
-  ContactPolicyId contact_policy_id;
-  ContactPolicyRevision contact_policy_revision;
-  RuntimeObjectId runtime_object_id;
-  SceneResourceId selected_object_id;
-  std::vector<CollisionBodyId> allowed_robot_body_ids;
-  ContactZoneEnvelopeDTO envelope{ContactGraspEnvelopeDTO{}};
-
-  friend bool operator==(const ResolvedContactGraspBindingDTO&,
-                         const ResolvedContactGraspBindingDTO&) = default;
-};
-
 /// Immutable input used by the focused reference resolver to capture all
 /// kinematic views needed by one relative-motion request. Capture happens once
 /// during admission; subsequent reference resolution performs no mutable
@@ -138,7 +120,7 @@ struct ProgramFrameResolutionContextDTO final {
 
   [[nodiscard]] bool valid() const noexcept {
     const bool envelope_valid =
-        !binding.program_id.empty() && !binding.program_revision.empty() &&
+        !binding.program_revision.empty() &&
         !binding.program_binding_id.empty() &&
         !binding.retained_bundle_id.empty() && !binding.graph_revision.empty() &&
         !binding.target.component_id.empty() && !binding.target.command_target_id.empty() &&
@@ -228,10 +210,6 @@ struct ExecuteRequestDTO {
   /// `ReferenceDTO::kRuntimeObject`. Empty unless this request names a runtime
   /// object; callers cannot rely on string equality with SceneResourceId.
   std::vector<RuntimeObjectReferenceBindingDTO> runtime_object_bindings;
-  /// Present only when `contact_policy_id` selected a Program-Binding-owned
-  /// geometry-only contact-grasp template. Public callers cannot populate the
-  /// compiled body ids carried by this value.
-  std::optional<ResolvedContactGraspBindingDTO> resolved_contact_grasp;
   /// Per-move bindings that arm `scope_kind == kMove` interrupt
   /// policies for exactly this execute request. Atomic with dispatch: the kernel arms scopes
   /// after planning and validation pass and immediately before
@@ -246,12 +224,10 @@ struct ExecuteRequestDTO {
   /// Empty means the caller has no span context; the kernel does not mint
   /// behavior-node attempts.
   std::optional<ActionSpanDTO> action_span;
-  /// Effective concrete contact-policy binding for this move. Empty means
-  /// free-space validation/execution.
-  std::string contact_policy_id;
-  /// The motion's collision clearance (MotionParticipantIntentDTO); absent
-  /// means the kernel's `collision_clearance_m`.
-  std::optional<double> clearance_m;
+  /// The move's collision rules after admission: collision bodies and TCP
+  /// contact bodies are ids of the retained collision world. Public callers
+  /// cannot populate those ids. Empty keeps the cell rules.
+  std::vector<CollisionRule> collision_rules;
   /// Owner-resolved scale captured atomically with execution admission. This
   /// prevents a prior operation's participant-local scale from leaking into a
   /// newly dispatched operation before the first focused-port update.

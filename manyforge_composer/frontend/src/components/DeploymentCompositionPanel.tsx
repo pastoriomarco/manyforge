@@ -385,6 +385,7 @@ export function DeploymentCompositionPanel({
                 controller={deploymentController}
                 scope="cell"
                 sourceModel={sourceModel}
+                componentProfiles={catalog?.componentProfiles}
                 motionDescriptors={motionDescriptors}
                 stopChains={stopChains}
                 gripperDescriptors={gripperDescriptors}

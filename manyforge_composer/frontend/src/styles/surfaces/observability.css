@@ -989,3 +989,31 @@
   color: var(--mf-text-neutral-57);
   font-weight: 500;
 }
+
+.program-key-values-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.program-key-values-table th,
+.program-key-values-table td {
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid var(--mf-border-neutral-19);
+  text-align: left;
+  vertical-align: top;
+}
+
+.program-key-values-table th {
+  color: var(--mf-text-neutral-57);
+  font-weight: 500;
+}
+
+.program-key-values-table td:last-child {
+  overflow-wrap: anywhere;
+}
+
+/* The viewer's Keys panel: key values, the runtime write and stored values, stacked. */
+.program-keys-panel {
+  display: grid;
+  gap: 0.6rem;
+}

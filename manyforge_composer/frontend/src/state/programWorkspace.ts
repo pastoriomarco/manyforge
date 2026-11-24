@@ -15,8 +15,6 @@ export type ProgramWorkspaceActionName =
   | 'load_scenario_document'
   | 'new_scenario_document'
   | 'export_scenario_document'
-  | 'save'
-  | 'save_as'
   | 'save_scenario_document';
 
 export type ProgramWorkspaceState =

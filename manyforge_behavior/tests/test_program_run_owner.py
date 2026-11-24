@@ -210,7 +210,7 @@ def test_owner_captures_values_before_later_writes_without_changing_status_wire(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     admission = _admission_for_program(
         admission, Program.from_dict(document, admission.environment.catalog), []
@@ -229,11 +229,12 @@ def test_owner_captures_values_before_later_writes_without_changing_status_wire(
     assert snapshot.state is ProgramRunState.SUCCEEDED
     run.value_store.write("recorded_value", False)
     record = owner.take_diagnostic(run_id)
-    # The motion node's system-owned outcome key is captured like any key.
+    # The system-owned outcome and group state keys are captured like any key.
     assert record["blackboard"] == {
         "active_tcp/ur5_robot/arm": {
             "target": {"component_id": "ur5_robot", "command_target_id": "arm"},
             "frame": {"component_id": "ur5_robot", "frame_id": "tcp"}},
+        "motion_group_state.all": "running",
         "node_outcome.move_to_pick": "completed",
         "recorded_value": True,
     }
@@ -529,6 +530,11 @@ class _ScopePort:
         self.selection_release_block_reason: str | None = None
         # The rule whose `hold` holds the run (Kernel scope field).
         self.stopped_by_rule_id: str | None = None
+        # OD-342: held node index -> the index of the Program node whose own
+        # Stop raised its hold (the selected groups' nodes), as the Kernel does.
+        self.program_holds: dict[int, int] = {}
+        self.node_ids: list[str] = []
+        self.group_members: dict[str, set[str]] = {}
         self.attention_refusal: ProgramSelectionReleaseRejectedError | None = None
         # Kernel stand-in for the per-node resource test: a node is refused
         # only while an alarm gates one of its own target resources.
@@ -541,19 +547,30 @@ class _ScopePort:
         self.halt_refusal: ProgramSelectionReleaseRejectedError | None = None
 
     def bind(self, context: ProgramRunPortContext) -> None:
-        pending = [context.program["tree"]]
+        pending = [(context.program["tree"], ())]
         self.node_count = 0
+        self.node_ids = []
+        self.group_members = {"all": set()}
         while pending:
-            node = pending.pop()
+            node, inherited = pending.pop()
             self.node_count += 1
-            pending.extend(node.get("children", ()))
+            self.node_ids.append(node["instance_id"])
+            authored = node.get("execution_groups", "inherit")
+            groups = (
+                inherited if authored == "inherit" else () if authored == "all" else tuple(authored)
+            )
+            self.group_members["all"].add(node["instance_id"])
+            for group in groups:
+                self.group_members.setdefault(group, set()).add(node["instance_id"])
+            pending.extend((child, groups) for child in node.get("children", ()))
+        self.node_ids.sort()
 
     def unbind(self, _program_run_id: str) -> None:
         pass
 
     def execution_scope(self, program_run_id: int) -> Mapping[str, Any]:
         return {
-            "schema_version": "manyforge.program_execution_scope.v3",
+            "schema_version": "manyforge.program_execution_scope.v4",
             "claim_generation": 1,
             "program_run_id": program_run_id,
             "hold_revision": self.hold_revision,
@@ -583,10 +600,25 @@ class _ScopePort:
             "selection_release_block_reason": self.selection_release_block_reason,
             "stopped_by": "rule" if self.stopped_by_rule_id else None,
             "rule_id": self.stopped_by_rule_id,
+            "program_held_nodes": (
+                [[index, holder] for index, holder in sorted(self.program_holds.items())]
+                if self.held
+                else []
+            ),
         }
 
     def stop_selection(self, request):
         self.last_selection_stop = request
+        # Like the Kernel: only the holds a Stop raises name its Program node.
+        requester = request.get("stopped_by_node_instance_id")
+        if not self.held and not self.ready and requester is not None:
+            selected = set().union(
+                *(self.group_members.get(group, ()) for group in request["group_ids"])
+            )
+            self.program_holds = {
+                self.node_ids.index(node): self.node_ids.index(requester)
+                for node in selected
+            }
         self.request_stop(
             request["program_run_id"],
             bytes.fromhex(request["request_context"]["request_key"]),
@@ -629,6 +661,7 @@ class _ScopePort:
         self.release_requests += 1
         self.held = False
         self.ready = False
+        self.program_holds = {}
         self.hold_revision += 1
         self._events.append("scope_stop_release")
         return self.execution_scope(request["program_run_id"])
@@ -812,7 +845,6 @@ def _fixture(
         graph_revision=_DIGEST_C,
         program_binding={
             "program_binding_id": _DIGEST_A,
-            "program_id": program.program_id,
             "program_revision": program.program_revision,
             "retained_bundle_id": _DIGEST_B,
             "graph_revision": _DIGEST_C,
@@ -926,7 +958,7 @@ def _program_with_policies(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, admission.environment.catalog)
 
@@ -957,7 +989,6 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
     assert task.starts == 0
     assert started.capture.scenario_id == "ur5-pick-place"
     assert started.capture.source_document_digest == _DIGEST_A
-    assert started.capture.program_id == admission.program.program_id
     assert started.capture.program_revision == admission.program.program_revision
     assert started.capture.program_binding_id == _DIGEST_A
     assert started.capture.retained_bundle_id == _DIGEST_B
@@ -1129,7 +1160,6 @@ def test_start_binds_exact_client_context_before_tree_construction() -> None:
     assert started.capture.program_run_id == 7
     assert context.program_run_id == started.capture.program_run_id
     assert context.program_binding_id == admission.program_binding_id
-    assert context.program_binding["program_id"] == admission.program.program_id
     assert _plain(context.program) == admission.program.to_dict()
     assert context.assistant_projection is None
 
@@ -1600,7 +1630,7 @@ def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_
             return {
                 "ok": True,
                 "scope": {
-                    "schema_version": "manyforge.program_execution_scope.v3",
+                    "schema_version": "manyforge.program_execution_scope.v4",
                     "program_run_id": program_run_id,
                     "claim_generation": 1,
                     "hold_revision": len(self.stop_states),
@@ -1611,6 +1641,7 @@ def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_
                     "selection_release_block_reason": None,
                     "stopped_by": None,
                     "rule_id": None,
+                    "program_held_nodes": [],
                     "frozen": "program_end" if self.stop_states else "none",
                     "frozen_by": len(self.stop_states) or None,
                     "all_groups_held": False,
@@ -2012,6 +2043,8 @@ def test_failure_pause_stops_all_program_motion_once() -> None:
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
     assert scope.stop_requests == 1
     assert scope.last_selection_stop["group_ids"] == ["all"]
+    # The runner's own failure-pause Stop names no Program node.
+    assert "stopped_by_node_instance_id" not in scope.last_selection_stop
     pause_key = bytes.fromhex(scope.last_selection_stop["request_context"]["request_key"])
     assert key_class(pause_key) is KeyClass.INTERNAL
     assert key_origin(pause_key) == Minter.RUNNER
@@ -2543,7 +2576,7 @@ def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence
             document,
             own_field="program_revision",
             identity_domain="program-revision",
-            api_version="manyforge.program.v3",
+            api_version="manyforge.program.v4",
         )
         admission = _admission_for_program(
             admission, Program.from_dict(document, admission.environment.catalog), []
@@ -2880,12 +2913,12 @@ def test_explicit_stop_recaptures_a_lost_reply_through_the_native_scope():
 
     def read_program_execution_scope(program_run_id):
         return {"ok": True, "scope": {
-            "schema_version": "manyforge.program_execution_scope.v3",
+            "schema_version": "manyforge.program_execution_scope.v4",
             "claim_generation": 1, "program_run_id": program_run_id,
             "hold_revision": kernel["hold_revision"], "ready_node_indices": [],
             "held_node_indices": [], "stopping_node_indices": list(kernel["stopping"]),
             "faulted_node_indices": [], "selection_release_block_reason": None,
-            "stopped_by": None, "rule_id": None, "frozen": "program_end",
+            "stopped_by": None, "rule_id": None, "program_held_nodes": [], "frozen": "program_end",
             "frozen_by": len(sent) or None, "all_groups_held": False}}
 
     def lost(body):
@@ -3689,6 +3722,118 @@ def test_motion_stop_with_zero_local_tasks_waits_for_scope_certificate():
     assert task.starts == 0  # Status and logical Resume never create a task.
 
 
+def _group_states(owner: ProgramRunOwner, run_id: int) -> dict[str, tuple[str, str]]:
+    """Each group's (runtime-controls state, motion_group_state key value)."""
+
+    store = owner.value_store(run_id)
+    return {
+        group["group_id"]: (
+            group["state"],
+            store.read(f"motion_group_state.{group['group_id']}"),
+        )
+        for group in owner.execution_selection_controls(run_id)["groups"]
+    }
+
+
+def test_motion_group_state_key_follows_run_stop_resume_and_run_end():
+    """OD-339: the key holds exactly the runtime controls' group state."""
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    scope.ready = True
+    scope.node_count = 3
+    run_id = owner.start(admission).capture.program_run_id
+    # Run start: written from the run's first facts, before any tick.
+    assert _group_states(owner, run_id) == {"all": ("ready", "ready")}
+    owner.start_motion(
+        run_id,
+        expected_hold_revision=owner.execution_selection_controls(run_id)[
+            "hold_revision"
+        ],
+        request_key=_key(),
+    )
+    _tick_end(owner, run_id)
+    assert _group_states(owner, run_id) == {"all": ("running", "running")}
+
+    scope.state = ProgramRunScopeState.ACTIVE
+    request = scope.request_stop
+
+    def accepted(*args):
+        request(*args)
+        return ProgramRunScopeSnapshot(run_id, ProgramRunScopeState.ACTIVE, 0)
+
+    scope.request_stop = accepted
+    owner.stop_motion(run_id, stop_request_key=_key())
+    _tick_end(owner, run_id)
+    assert _group_states(owner, run_id) == {"all": ("stopping", "stopping")}
+    scope.state = ProgramRunScopeState.SETTLED
+    owner.advance_once(run_id)
+    assert _group_states(owner, run_id) == {"all": ("held", "held")}
+    owner.resume_motion(
+        run_id, request_key=_key(), expected_hold_revision=scope.hold_revision
+    )
+    _tick_end(owner, run_id)
+    assert _group_states(owner, run_id) == {"all": ("running", "running")}
+
+    # The run ends (Stop all): no current run, as in the runtime controls.
+    assert _stop(owner, run_id).state is not ProgramRunState.RUNNING
+    _tick_end(owner, run_id)
+    assert _group_states(owner, run_id) == {"all": ("unavailable", "unavailable")}
+
+
+def test_a_halt_shows_its_groups_stopping_then_held():
+    """OD-339: Halting is `stopping`, Halted is `held` (every node), in the
+    runtime controls and the key alike; Run/Resume stay unavailable."""
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    scope.ready = True
+    scope.node_count = 3
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    assert _halt(owner, run_id).state is ProgramRunState.HALTING
+    _tick_end(owner, run_id)
+    assert _group_states(owner, run_id) == {"all": ("stopping", "stopping")}
+    assert owner.reconcile_halting(run_id).state is ProgramRunState.HALTED
+    _tick_end(owner, run_id)
+    assert _group_states(owner, run_id) == {"all": ("held", "held")}
+    group = owner.execution_selection_controls(run_id)["groups"][0]
+    assert group["held_node_count"] == group["node_count"]
+    assert group["ordinary_held_node_count"] is None
+    assert not group["start_allowed"] and not group["stop_allowed"]
+    assert group["start_unavailable_reason"] == "program_run_not_running"
+    # Execute after Halt: never-started work waits for Run again.
+    assert owner.resume_halt(run_id).state is ProgramRunState.RUNNING
+    owner.advance_once(run_id)
+    assert _group_states(owner, run_id) == {"all": ("ready", "ready")}
+
+
+def test_a_halt_with_a_faulted_stop_shows_the_fault():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_OperatorStopTaskPort,
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    _halted_with_a_faulted_node(owner, scope, run_id)
+    scope.held = True  # The Kernel scope names the faulted nodes.
+    owner.refresh_selection_scope(run_id)
+    _tick_end(owner, run_id)
+    assert _group_states(owner, run_id) == {"all": ("faulted", "faulted")}
+    _stop(owner, run_id)
+
+
+def test_motion_group_state_key_is_read_only_for_the_operator():
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    with pytest.raises(ProgramRunOwnerError, match="not writable"):
+        owner.write_runtime_blackboard(
+            run_id, key="motion_group_state.all", value="held", request_key=_key()
+        )
+
+
 @pytest.mark.parametrize("failure", ["lost_reply", "unchanged_reply", "new_stop"])
 def test_selected_resume_keeps_cleanup_once_across_release_failure(failure):
     interventions = ProgramInterventionRegistry(maximum_retained_runs=1)
@@ -3921,7 +4066,7 @@ def test_parallel_stop_records_both_attempts_before_halt_recovery() -> None:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     admission = _admission_for_program(admission, program, [])
@@ -3981,7 +4126,7 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     admission = _admission_for_program(
@@ -4092,7 +4237,7 @@ def _timed_admission(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     return _admission_for_program(
@@ -5005,12 +5150,10 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
         "scenario_id": admission.scenario_id,
         "project_path": admission.project_path,
         "source_document_digest": admission.source_document_digest,
-        "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "d" * 64,
         "retained_bundle_id": admission.retained_bundle_id,
         "graph_revision": admission.graph_revision,
         "program_binding_id": admission.program_binding_id,
-        "program_id": program.program_id,
         "program_revision": program.program_revision,
         "node_environment_digest": environment.environment_digest,
         "assistant_mode": "forbidden",
@@ -5035,7 +5178,6 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
         },
         "program_binding": {
             "program_binding_id": admission.program_binding_id,
-            "program_id": program.program_id,
             "program_revision": program.program_revision,
             "retained_bundle_id": admission.retained_bundle_id,
             "graph_revision": admission.graph_revision,
@@ -5196,16 +5338,16 @@ def test_applied_selection_refuses_an_older_catalog_selector(monkeypatch) -> Non
     )
     selection = _scenario_selection(admission)
     catalog = admission.environment.catalog
-    # The shipped catalog is 3.0.0; emulate a later compatible minor so this
-    # still exercises an older same-major selector instead of inventing 3.-1.0.
-    monkeypatch.setattr(type(catalog), "content_version", property(lambda _: "3.1.0"))
+    # The shipped catalog is 4.0.0; emulate a later compatible minor so this
+    # still exercises an older same-major selector instead of inventing 4.-1.0.
+    monkeypatch.setattr(type(catalog), "content_version", property(lambda _: "4.1.0"))
     older = selection["program"]
-    older["catalog"]["content_version"] = "3.0.0"
+    older["catalog"]["content_version"] = "4.0.0"
     older["program_revision"] = compute_content_identity(
         older,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     selection["program_revision"] = older["program_revision"]
     selection["program_binding"]["program_revision"] = older["program_revision"]
@@ -5364,7 +5506,7 @@ def _timer_with_sourced_duration_admission(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     return _admission_for_program(
@@ -5510,7 +5652,7 @@ def _pausing_move(admission: ProgramRunAdmission) -> ProgramRunAdmission:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     return _admission_for_program(
@@ -5703,7 +5845,7 @@ def _program_dwell_admission(admission, policy="hold"):
     document["tree"] = {"node_id":"gripper.command_position","instance_id":"command",
         "parameters":{"target":{"component_id":"tool.1","command_target_id":"gripper.command"},"position":{"kind":"linear_m","value_m":0.008}},"operator_stop_policy":policy,"children":[]}
     document["program_revision"] = compute_content_identity(document,own_field="program_revision",
-        identity_domain="program-revision",api_version="manyforge.program.v3")
+        identity_domain="program-revision",api_version="manyforge.program.v4")
     program = Program.from_dict(document,admission.environment.catalog)
     return _admission_for_program(admission,program,[row.to_dict() for row in program_node_policies(program)])
 
@@ -5996,7 +6138,7 @@ def test_f6a_program_requested_stop_runs_the_fallback_recovery_motion() -> None:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     admission = _admission_for_program(
         admission, Program.from_dict(document, admission.environment.catalog), []
@@ -6161,7 +6303,7 @@ def _two_group_holds(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     program = Program.from_dict(document, admission.environment.catalog)
     rows = [row.to_dict() for row in program_node_policies(program)]
@@ -6202,6 +6344,51 @@ def test_every_held_node_is_its_own_hold_with_its_operation_failure_row() -> Non
     assert 1 < rows[0]["operator_facing_run_revision"] <= paused.run_revision
     assert rows[1]["operator_facing_run_revision"] == rows[0]["operator_facing_run_revision"]
     assert {key: rows[0][key] for key in _OPERATION_FACT} == _OPERATION_FACT
+    _stop(owner, run_id)
+
+
+@pytest.mark.parametrize("scope_value", [None, "own_groups"])
+def test_groups_stopped_by_a_failure_hold_show_held(scope_value) -> None:
+    """OD-339: the groups a failure pause stopped are `held` in the runtime
+    controls and the key; Retry of one hold releases only its groups."""
+    owner, _task, scope, interventions, run_id, _paused = _two_group_holds(
+        scope_value
+    )
+    _tick_end(owner, run_id)
+    assert _group_states(owner, run_id) == {
+        "all": ("held", "held"),
+        "arm": ("held", "held"),
+        "tools": ("held", "held"),
+    }
+    arm = _hold(interventions, run_id, "arm_move")
+    owner.retry_failure_pause(
+        run_id,
+        node_attempt_id=arm.identity.node_attempt_id,
+        action=None,
+        request_key=_key(),
+        reason=None,
+    )
+    assert scope.last_selection_release["group_ids"] == ["arm"]
+    # The Kernel keeps the other hold's group stopped (this stand-in releases
+    # every node, so its scope read names the node that stays held).
+    run = owner._entry(run_id).run  # noqa: SLF001
+    tool_index = run._scope_node_ids.index("tool_move")  # noqa: SLF001
+    released_read = scope.execution_scope
+
+    def tools_still_held(program_run_id):
+        read = dict(released_read(program_run_id))
+        read["held_node_indices"] = [tool_index]
+        return read
+
+    scope.execution_scope = tools_still_held
+    scope.hold_revision += 1
+    owner.refresh_selection_scope(run_id)
+    _tick_end(owner, run_id)
+    assert _group_states(owner, run_id) == {
+        "all": ("mixed", "mixed"),
+        "arm": ("running", "running"),
+        "tools": ("held", "held"),
+    }
     _stop(owner, run_id)
 
 
@@ -8003,3 +8190,507 @@ def test_the_kernels_refusal_in_the_admission_window_reaches_the_caller():
     assert refused.value.details == details
     _on_tick(host, lambda: host.stop_run(run_id))
     host.shutdown()
+
+
+# OD-342: the operator question (Ask operator) and the Program's own
+# motion-group Stop (Stop motion groups).
+
+_ASK_OPTIONS = (
+    {"option_id": "continue", "label": "Bin emptied, continue", "result": "success"},
+    {"option_id": "abort", "label": "Abort this cycle", "result": "failure"},
+)
+
+
+def _ask_node(
+    instance_id: str = "ask",
+    *,
+    hold_motion: list[str] | None = None,
+    execution_groups: list[str] | None = None,
+    output_key: str | None = None,
+    stop_policy: str | None = "continue",
+) -> dict[str, Any]:
+    """An Ask operator leaf. `continue` keeps it ticking while the fake
+    Kernel scope (which holds every node on any Stop) holds it."""
+    parameters: dict[str, Any] = {
+        "message": "Bin is full. Empty it, then choose.",
+        "severity": "warning",
+        "options": [dict(option) for option in _ASK_OPTIONS],
+    }
+    if hold_motion is not None:
+        parameters["hold_motion"] = hold_motion
+    if output_key is not None:
+        parameters["output_key"] = output_key
+    node: dict[str, Any] = {
+        "node_id": "operator.request_choice",
+        "instance_id": instance_id,
+        "parameters": parameters,
+        "children": [],
+    }
+    if stop_policy is not None:
+        node["operator_stop_policy"] = stop_policy
+    if execution_groups is not None:
+        node["execution_groups"] = execution_groups
+    return node
+
+
+def _stop_groups_node(
+    groups: list[str], *, execution_groups: list[str] | None = None
+) -> dict[str, Any]:
+    node: dict[str, Any] = {
+        "node_id": "motion.stop_groups",
+        "instance_id": "stop",
+        "parameters": {"groups": groups},
+        "children": [],
+        "operator_stop_policy": "continue",
+    }
+    if execution_groups is not None:
+        node["execution_groups"] = execution_groups
+    return node
+
+
+def _set_count_node(*, execution_groups: list[str] | None = None) -> dict[str, Any]:
+    node: dict[str, Any] = {
+        "node_id": "logic.set_value",
+        "instance_id": "set_count",
+        "parameters": {"key": "count", "value": 5},
+        "children": [],
+        "operator_stop_policy": "continue",
+    }
+    if execution_groups is not None:
+        node["execution_groups"] = execution_groups
+    return node
+
+
+def _operator_admission(
+    admission: ProgramRunAdmission,
+    children: list[dict[str, Any]],
+    *,
+    groups: Sequence[str] = (),
+) -> ProgramRunAdmission:
+    document = admission.program.to_dict()
+    document["blackboard"] = {
+        "namespaces": [],
+        # Canonical-sorted by key.
+        "keys": [
+            {
+                "key": "answer",
+                "type": "string",
+                "access": "read_write",
+                "persistence": "run",
+            },
+            {
+                "key": "count",
+                "type": "int64",
+                "access": "read_write",
+                "persistence": "run",
+                "initial": 0,
+            },
+        ],
+    }
+    document["tree"] = {
+        "node_id": "parallel",
+        "instance_id": "parallel",
+        "parameters": {"success_policy": "all"},
+        "children": children,
+    }
+    if groups:
+        document["execution_groups"] = {
+            group: {"execution_policy": "independent"} for group in groups
+        }
+    else:
+        document.pop("execution_groups", None)
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v4",
+    )
+    program = Program.from_dict(document, admission.environment.catalog)
+    return _admission_for_program(
+        admission, program, [row.to_dict() for row in program_node_policies(program)]
+    )
+
+
+def _operator_run(children: list[dict[str, Any]], *, groups: Sequence[str] = ()):
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    run_id = owner.start(
+        _operator_admission(admission, children, groups=groups)
+    ).capture.program_run_id
+    return owner, scope, run_id
+
+
+def _authored(owner: ProgramRunOwner, run_id: int, instance_id: str):
+    return owner._runs[run_id].run._authored_nodes[instance_id]  # noqa: SLF001
+
+
+def _group_rows(owner: ProgramRunOwner, run_id: int) -> dict[str, dict[str, Any]]:
+    return {
+        row["group_id"]: row
+        for row in owner.read_selection_controls(run_id)[1]["groups"]
+    }
+
+
+def _until_terminal(owner: ProgramRunOwner, run_id: int) -> ProgramRunSnapshot:
+    for _ in range(10):
+        snapshot = owner.advance_once(run_id)
+        if snapshot.state in {
+            ProgramRunState.SUCCEEDED,
+            ProgramRunState.FAILED,
+            ProgramRunState.STOPPED,
+        }:
+            return snapshot
+    raise AssertionError(f"run did not end: {snapshot.state}")
+
+
+def test_ask_operator_stops_its_hold_motion_groups_with_its_attempt_key() -> None:
+    owner, scope, run_id = _operator_run(
+        [
+            _ask_node(hold_motion=["arm"], execution_groups=["arm"]),
+            _set_count_node(execution_groups=["tools"]),
+        ],
+        groups=("arm", "tools"),
+    )
+    ask = _authored(owner, run_id, "ask")
+    # The Kernel's reply to the first Stop is lost.
+    scope.state = ProgramRunScopeState.UNKNOWN
+    owner.advance_once(run_id)
+
+    assert scope.stop_requests == 1
+    assert scope.last_selection_stop["group_ids"] == ["arm"]
+    first_key = bytes.fromhex(
+        scope.last_selection_stop["request_context"]["request_key"]
+    )
+    assert key_class(first_key) is KeyClass.INTERNAL
+    assert key_origin(first_key) == Minter.RUNNER
+    attempt = ask._identity.node_attempt_id  # noqa: SLF001
+    assert owner._runs[run_id].run.program_stop_requests() == (  # noqa: SLF001
+        ("ask", attempt, ("arm",), first_key),
+    )
+    # Not confirmed: no attribution yet.
+    assert _group_rows(owner, run_id)["arm"]["stopped_by"] is None
+
+    # The next tick sends the same Stop again with the same key; accepted.
+    scope.state = ProgramRunScopeState.SETTLED
+    owner.advance_once(run_id)
+    assert scope.stop_requests == 2
+    assert scope.last_selection_stop["group_ids"] == ["arm"]
+    assert scope.last_selection_stop["request_context"]["request_key"] == first_key.hex()
+    assert owner._runs[run_id].run.program_stop_requests() == ()  # noqa: SLF001
+
+    # Accepted once: never sent again.
+    owner.advance_once(run_id)
+    assert scope.stop_requests == 2
+    events = [
+        event
+        for event in owner.take_node_history_events(run_id)
+        if event["kind"] == "program_motion_groups_stopped"
+    ]
+    assert events == [
+        {
+            "kind": "program_motion_groups_stopped",
+            "node_instance_id": "ask",
+            "node_attempt_id": attempt,
+            "group_ids": ["arm"],
+        }
+    ]
+    _stop(owner, run_id)
+
+
+def test_a_program_stop_attributes_the_held_group_until_it_is_released() -> None:
+    owner, scope, run_id = _operator_run(
+        [
+            _ask_node(hold_motion=["arm"], execution_groups=["arm"]),
+            _set_count_node(execution_groups=["tools"]),
+        ],
+        groups=("arm", "tools"),
+    )
+    before = _group_rows(owner, run_id)
+    assert {
+        group: (row["stopped_by"], row["stopped_by_node_instance_id"])
+        for group, row in before.items()
+    } == {"all": (None, None), "arm": (None, None), "tools": (None, None)}
+
+    owner.advance_once(run_id)
+    # The Kernel records the attribution: the request names the node.
+    assert scope.last_selection_stop["stopped_by_node_instance_id"] == "ask"
+    rows = _group_rows(owner, run_id)
+    assert rows["arm"]["stopped_by"] == "program"
+    assert rows["arm"]["stopped_by_node_instance_id"] == "ask"
+    for other in ("all", "tools"):
+        assert rows[other]["stopped_by"] is None
+        assert rows[other]["stopped_by_node_instance_id"] is None
+    # The group's motion_group_state key (OD-339) shows the Program's Stop
+    # like any Stop: from the same row state.
+    assert rows["arm"]["state"] in {"stopping", "held", "mixed"}
+    assert owner.value_store(run_id).read("motion_group_state.arm") == rows["arm"]["state"]
+    # Unchanged while the group stays held.
+    owner.advance_once(run_id)
+    assert _group_rows(owner, run_id)["arm"]["stopped_by_node_instance_id"] == "ask"
+
+    # The operator's Run releases the group: the attribution ends with it.
+    controls = owner.execution_selection_controls(run_id)
+    assert _group_rows(owner, run_id)["arm"]["resume_allowed"] is True
+    owner.resume_motion(
+        run_id,
+        expected_hold_revision=controls["hold_revision"],
+        request_key=_key(),
+        group_id="arm",
+    )
+    _tick_end(owner, run_id)
+    released = _group_rows(owner, run_id)["arm"]
+    assert released["stopped_by"] is None
+    assert released["stopped_by_node_instance_id"] is None
+    # The node never stops the group again for the same attempt.
+    stops = scope.stop_requests
+    owner.advance_once(run_id)
+    assert scope.stop_requests == stops
+    assert _group_rows(owner, run_id)["arm"]["stopped_by"] is None
+    _stop(owner, run_id)
+
+
+@pytest.mark.parametrize(
+    ("option_id", "terminal"),
+    [("continue", ProgramRunState.SUCCEEDED), ("abort", ProgramRunState.FAILED)],
+)
+def test_the_operator_answer_ends_the_question_node_as_its_option_says(
+    option_id: str, terminal: ProgramRunState
+) -> None:
+    owner, scope, run_id = _operator_run([_ask_node(output_key="answer")])
+    assert owner.operator_questions(run_id) == ()
+    owner.advance_once(run_id)
+    # No hold_motion: no Stop.
+    assert scope.stop_requests == 0
+
+    [question] = owner.operator_questions(run_id)
+    ask = _authored(owner, run_id, "ask")
+    attempt = ask._identity.node_attempt_id  # noqa: SLF001
+    assert _plain(question) == {
+        "node_instance_id": "ask",
+        "node_attempt_id": attempt,
+        "message": "Bin is full. Empty it, then choose.",
+        "severity": "warning",
+        "options": [dict(option) for option in _ASK_OPTIONS],
+        "hold_motion_group_ids": [],
+    }
+    requested = [
+        event
+        for event in owner.take_node_history_events(run_id)
+        if event["kind"] == "program_operator_choice_requested"
+    ]
+    assert requested == [
+        {
+            "kind": "program_operator_choice_requested",
+            "node_instance_id": "ask",
+            "node_attempt_id": attempt,
+            "severity": "warning",
+            "message": "Bin is full. Empty it, then choose.",
+            "option_ids": ["continue", "abort"],
+            "hold_motion_group_ids": [],
+        }
+    ]
+    # No timeout: the question stays open over ticks.
+    for _ in range(3):
+        assert owner.advance_once(run_id).node_statuses["ask"] == "running"
+    assert len(owner.operator_questions(run_id)) == 1
+
+    def answer(**changes: Any):
+        values = {
+            "node_instance_id": "ask",
+            "node_attempt_id": attempt,
+            "option_id": option_id,
+            **changes,
+        }
+        return owner.answer_operator_question(run_id, **values)
+
+    for wrong in (
+        {"node_attempt_id": attempt + 1},
+        {"option_id": "retry"},
+        {"node_instance_id": "parallel"},
+        {"node_instance_id": "missing"},
+    ):
+        with pytest.raises(ProgramRunOwnerError) as refused:
+            answer(**wrong)
+        assert refused.value.code == "cycle_recovery_offer_stale"
+
+    revision = owner.read(run_id).run_revision
+    chosen = answer()
+    assert _plain(chosen) == next(
+        option for option in _ASK_OPTIONS if option["option_id"] == option_id
+    )
+    assert owner.read(run_id).run_revision > revision
+    # Answered once: a second answer is stale.
+    with pytest.raises(ProgramRunOwnerError) as again:
+        answer()
+    assert again.value.code == "cycle_recovery_offer_stale"
+    _tick_end(owner, run_id)
+    assert owner.operator_questions(run_id) == ()
+
+    # The node ends on its next tick.
+    run = owner._runs[run_id].run  # noqa: SLF001
+    ended = owner.advance_once(run_id)
+    assert ended.node_statuses["ask"] == (
+        "success" if terminal is ProgramRunState.SUCCEEDED else "failure"
+    )
+    assert run.value_store.read("answer") == option_id
+    if terminal is ProgramRunState.FAILED:
+        assert ask.failure_reason_code == "operator_choice_failed"
+        assert ask.failure_message == "The operator chose Abort this cycle"
+        assert ask.failure_details is None
+    else:
+        assert ask.failure_reason_code is None
+    assert _until_terminal(owner, run_id).state is terminal
+
+
+def test_the_tree_keeps_ticking_while_a_question_is_open() -> None:
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    started = host.start_run(
+        _operator_admission(admission, [_ask_node(), _set_count_node()])
+    )
+    run_id = started.capture.program_run_id
+    try:
+        for _ in range(4):
+            snapshot = host.advance_ready_once()[0]
+            if snapshot.node_statuses.get("set_count") == "success":
+                break
+        # Only the question's branch waits.
+        assert snapshot.node_statuses["set_count"] == "success"
+        assert snapshot.node_statuses["ask"] == "running"
+        assert snapshot.state is ProgramRunState.RUNNING
+        assert owner._runs[run_id].run.value_store.read("count") == 5  # noqa: SLF001
+        [question] = owner.operator_questions(run_id)
+
+        # Answered through the run's tick (no Kernel effect).
+        chosen = _on_tick(
+            host,
+            lambda: host.answer_operator_question(
+                run_id,
+                node_instance_id="ask",
+                node_attempt_id=question["node_attempt_id"],
+                option_id="continue",
+            ),
+        )
+        assert chosen["option_id"] == "continue"
+        assert scope.stop_requests == 0
+        for _ in range(10):
+            if owner.read(run_id).state is ProgramRunState.SUCCEEDED:
+                break
+            host.advance_ready_once()
+        assert owner.read(run_id).state is ProgramRunState.SUCCEEDED
+        assert scope.stop_requests == 0
+    finally:
+        host.shutdown()
+
+
+def test_stop_motion_groups_succeeds_once_its_stop_is_accepted_and_settled() -> None:
+    owner, scope, run_id = _operator_run(
+        [_stop_groups_node(["arm"], execution_groups=["arm"])], groups=("arm",)
+    )
+    stop = _authored(owner, run_id, "stop")
+    # Unconfirmed: still running, sent again with the same key.
+    scope.state = ProgramRunScopeState.UNKNOWN
+    assert owner.advance_once(run_id).node_statuses["stop"] == "running"
+    key = scope.last_selection_stop["request_context"]["request_key"]
+    assert scope.last_selection_stop["group_ids"] == ["arm"]
+    # Accepted, the selected node still stopping.
+    scope.state = ProgramRunScopeState.ACTIVE
+    assert owner.advance_once(run_id).node_statuses["stop"] == "running"
+    assert scope.stop_requests == 2
+    assert scope.last_selection_stop["request_context"]["request_key"] == key
+    assert owner.advance_once(run_id).node_statuses["stop"] == "running"
+    assert _group_rows(owner, run_id)["arm"]["stopped_by_node_instance_id"] == "stop"
+
+    # Settled: the node succeeds; the group stays held (until Run).
+    scope.state = ProgramRunScopeState.SETTLED
+    settled = owner.advance_once(run_id)
+    assert settled.node_statuses["stop"] == "success"
+    assert stop.failure_reason_code is None
+    assert scope.stop_requests == 2
+    assert scope.release_requests == 0
+    assert any(
+        event["kind"] == "program_motion_groups_stopped"
+        and event["node_instance_id"] == "stop"
+        and event["group_ids"] == ["arm"]
+        for event in owner.take_node_history_events(run_id)
+    )
+
+
+def test_stop_motion_groups_fails_when_a_selected_stop_ends_uncontained() -> None:
+    owner, scope, run_id = _operator_run(
+        [_stop_groups_node(["all"], execution_groups=["arm"])], groups=("arm",)
+    )
+    stop = _authored(owner, run_id, "stop")
+    scope.state = ProgramRunScopeState.ACTIVE
+    assert owner.advance_once(run_id).node_statuses["stop"] == "running"
+    assert scope.last_selection_stop["group_ids"] == ["all"]
+    # The accepted Stop ends faulted.
+    scope.state = ProgramRunScopeState.UNKNOWN
+    failed = owner.advance_once(run_id)
+    assert failed.node_statuses["stop"] == "failure"
+    assert stop.failure_reason_code == "motion_group_stop_failed"
+
+
+def test_a_program_stop_ends_an_open_question_as_interrupted() -> None:
+    owner, scope, run_id = _operator_run([_ask_node(output_key="answer")])
+    owner.advance_once(run_id)
+    [question] = owner.operator_questions(run_id)
+    ask = _authored(owner, run_id, "ask")
+
+    stopped = _stop(owner, run_id)
+
+    assert stopped.state is ProgramRunState.STOPPED
+    assert stopped.node_statuses["ask"] == "interrupted"
+    assert ask.outcome == "interrupted"
+    assert owner._runs[run_id].run.operator_questions() == ()  # noqa: SLF001
+    _tick_end(owner, run_id)
+    assert owner.operator_questions(run_id) == ()
+    with pytest.raises(ProgramRunOwnerError) as refused:
+        owner.answer_operator_question(
+            run_id,
+            node_instance_id="ask",
+            node_attempt_id=question["node_attempt_id"],
+            option_id="continue",
+        )
+    assert refused.value.code == "cycle_recovery_offer_stale"
+
+
+def test_an_ask_holding_all_motion_completes_only_after_the_operators_run() -> None:
+    """With `all` the node is itself held by its Stop (default leaf policy
+    `hold`): the answer is recorded, the node ends after the Run."""
+    owner, scope, run_id = _operator_run(
+        [_ask_node(hold_motion=["all"], stop_policy=None, output_key="answer")]
+    )
+    owner.advance_once(run_id)
+    assert scope.last_selection_stop["group_ids"] == ["all"]
+    rows = _group_rows(owner, run_id)
+    assert (rows["all"]["stopped_by"], rows["all"]["stopped_by_node_instance_id"]) == (
+        "program",
+        "ask",
+    )
+    [question] = owner.operator_questions(run_id)
+    assert _plain(question["hold_motion_group_ids"]) == ["all"]
+    owner.answer_operator_question(
+        run_id,
+        node_instance_id="ask",
+        node_attempt_id=question["node_attempt_id"],
+        option_id="continue",
+    )
+    # Held by its own Stop: it does not end on the answer.
+    for _ in range(2):
+        assert owner.advance_once(run_id).node_statuses["ask"] == "running"
+    assert owner.operator_questions(run_id) == ()
+    assert scope.stop_requests == 1  # Accepted once, never sent again.
+
+    controls = owner.execution_selection_controls(run_id)
+    assert _group_rows(owner, run_id)["all"]["resume_allowed"] is True
+    owner.resume_motion(
+        run_id,
+        expected_hold_revision=controls["hold_revision"],
+        request_key=_key(),
+    )
+    assert _until_terminal(owner, run_id).state is ProgramRunState.SUCCEEDED
+    assert owner._runs[run_id].run.value_store.read("answer") == "continue"  # noqa: SLF001

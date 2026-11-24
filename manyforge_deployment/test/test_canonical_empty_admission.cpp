@@ -44,8 +44,6 @@ using namespace std::chrono_literals;
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 constexpr std::string_view kFixedCellId = "c1_build_authority_cell";
-constexpr std::string_view kFixedDeploymentArtifactId =
-    "c1_build_authority";
 
 static_assert(std::is_final_v<CanonicalEmptyRetainedBundleAdmission>);
 static_assert(!std::is_aggregate_v<
@@ -63,7 +61,6 @@ static_assert(!std::is_move_assignable_v<
 static_assert(!std::is_constructible_v<
               CanonicalEmptyRetainedBundleAdmission,
               core::ContentDigest, core::CellId,
-              core::DeploymentArtifactId,
               core::DeploymentRevision, core::GraphRevision,
               core::RetainedBundleId, core::ContentDigest,
               core::ContentDigest, core::ContentDigest,
@@ -106,6 +103,17 @@ class ScopedTrustedRoot final {
   inline static std::atomic<std::uint64_t> sequence_{0U};
   std::filesystem::path path_;
 };
+
+// The fixed golden is identified by its content (OD-369): a ROS package for
+// the golden's own cell id is another deployment and is admitted as such.
+TEST(CanonicalEmptyAdmission, RosPackageForTheGoldenCellIsNotTheFixedGolden) {
+  ScopedTrustedRoot root("ros-golden-cell");
+  const core::CellId cell("c1_build_authority_cell");
+  const auto profile = detail::ros2_control_execution_runtime_profile_document();
+  const auto admission = detail::generate_ros_empty_package(root.path(), cell, profile);
+  EXPECT_EQ(admission.retained_bundle().value().cell_graph.cell_id, cell);
+  EXPECT_EQ(admission.retained_bundle().value().cell_graph.runtime_units.size(), 1U);
+}
 
 TEST(CanonicalEmptyAdmission, RosBootstrapOwnsInfrastructureWithoutAScenario) {
   ScopedTrustedRoot root("ros-infrastructure");
@@ -453,8 +461,6 @@ enum class ChildLoadResult : int {
       const auto admission = source.load_verified();
       const bool valid =
           admission.cell_id().value() == kFixedCellId &&
-          admission.deployment_artifact_id().value() ==
-              kFixedDeploymentArtifactId &&
           admission.retained_bundle_id() ==
               admission.retained_bundle().retained_bundle_id();
       ::_exit(valid ? 0 : 1);
@@ -521,9 +527,6 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
       admission.api_version(), kCanonicalEmptyAdmissionApiVersion);
   EXPECT_EQ(admission.cell_id().value(), kFixedCellId);
   EXPECT_EQ(
-      admission.deployment_artifact_id().value(),
-      kFixedDeploymentArtifactId);
-  EXPECT_EQ(
       admission.retained_bundle_id(),
       admission.retained_bundle().retained_bundle_id());
   EXPECT_EQ(
@@ -551,7 +554,7 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
 
   const CanonicalValue record =
       parse_strict_json_model_yaml(admission.canonical_bytes()).root();
-  EXPECT_EQ(record.as_object().size(), 10U);
+  EXPECT_EQ(record.as_object().size(), 9U);
   EXPECT_EQ(
       canonical_json(record), admission.canonical_bytes());
   EXPECT_EQ(
@@ -592,8 +595,6 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
   const FilesystemCanonicalEmptyRetainedBundleSource source(base_path());
   const auto admission = source.load_verified();
   const auto& bundle = admission.retained_bundle().value();
-  EXPECT_EQ(bundle.deployment_artifact_id.value(),
-            kFixedDeploymentArtifactId);
   EXPECT_EQ(bundle.cell_graph.cell_id.value(), kFixedCellId);
   EXPECT_TRUE(bundle.cell_graph.runtime_units.empty());
   EXPECT_TRUE(bundle.cell_graph.model_instances.empty());
@@ -766,8 +767,6 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
       Substitution{"api_version",
                    "manyforge.canonical_empty_admission.v2"},
       Substitution{"cell_id", "caller_selected_cell"},
-      Substitution{"deployment_artifact_id",
-                   "caller_selected_deployment"},
       Substitution{"deployment_revision", all_f_digest},
       Substitution{"graph_revision", all_f_digest},
       Substitution{"retained_bundle_id", all_f_digest},

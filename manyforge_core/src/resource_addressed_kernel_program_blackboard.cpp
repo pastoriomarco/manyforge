@@ -42,8 +42,7 @@ std::optional<IoConditionValueKind> declared_kind(const std::string& type) {
 }
 
 bool context_valid(const AppliedProgramBlackboardContextDTO& context) {
-  if (context.program_id.empty() ||
-      context.program_revision.empty() || context.program_binding_id.empty() ||
+  if (context.program_revision.empty() || context.program_binding_id.empty() ||
       context.retained_bundle_id.empty() || context.graph_revision.empty() ||
       !context.active_publication_generation.nonzero() ||
       context.active_publication_generation.value() > kMaximumKernelJsonInteger ||
@@ -52,7 +51,6 @@ bool context_valid(const AppliedProgramBlackboardContextDTO& context) {
     return false;
   const auto& binding = *context.program_binding;
   if (binding.program_binding_id != context.program_binding_id ||
-      binding.program_id != context.program_id ||
       binding.program_revision != context.program_revision ||
       binding.retained_bundle_id != context.retained_bundle_id ||
       binding.graph_revision != context.graph_revision)
@@ -85,7 +83,7 @@ bool context_valid(const AppliedProgramBlackboardContextDTO& context) {
 bool same_context(const AppliedProgramBlackboardContextDTO& left,
                   const AppliedProgramBlackboardContextDTO& right) {
   return left.active_publication_generation == right.active_publication_generation &&
-         left.program_id == right.program_id && left.program_revision == right.program_revision &&
+         left.program_revision == right.program_revision &&
          left.program_binding_id == right.program_binding_id &&
          left.retained_bundle_id == right.retained_bundle_id &&
          left.graph_revision == right.graph_revision &&
@@ -220,7 +218,6 @@ bool ResourceAddressedExecutionKernel::program_blackboard_scope_current_locked(
         capture->program_run_id != *scope.program_run_id ||
         capture->claim_generation != *scope.claim_generation ||
         capture->program_binding_id != actual_binding.program_binding_id ||
-        capture->program_id != actual_binding.program_id ||
         capture->program_revision != actual_binding.program_revision ||
         capture->retained_bundle_id != actual_binding.retained_bundle_id ||
         capture->graph_revision != actual_binding.graph_revision)
@@ -252,7 +249,7 @@ Result<void> ResourceAddressedExecutionKernel::ValidatePendingProgramBlackboardS
     ActiveBundlePublicationGeneration publication,
     const std::shared_ptr<IIoSignalService>& expected_service) {
   if (!publication.nonzero() || publication.value() > kMaximumKernelJsonInteger ||
-      candidate.program_binding_id.empty() || candidate.program_id.empty() ||
+      candidate.program_binding_id.empty() ||
       candidate.program_revision.empty() || candidate.retained_bundle_id.empty() ||
       candidate.graph_revision.empty() ||
       scope.program_run_id.has_value() != scope.claim_generation.has_value() ||

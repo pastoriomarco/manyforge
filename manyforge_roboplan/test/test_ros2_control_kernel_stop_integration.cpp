@@ -110,7 +110,6 @@ private:
 
 [[nodiscard]] core::RuntimeParticipantBinding FixtureBinding() {
   core::RuntimeParticipantBindingDTO value{
-      core::ProgramId("program.ros2_control.stop_qualification"),
       core::ProgramRevision("program-revision"),
       core::ProgramBindingId("program-binding"),
       core::RetainedBundleId("bundle"),
@@ -806,7 +805,6 @@ private:
     PlanRequestDTO plan_request{
         request.binding.operation_id,
         request.binding.participant_id,
-        request.binding.program_id,
         request.binding.program_revision,
         request.binding.program_binding_id,
         request.binding.program_run_id,
@@ -846,9 +844,6 @@ private:
         request.tolerances,
         request.speed_profile,
         request.planner,
-        request.contact_policy_id.empty()
-            ? std::nullopt
-            : std::optional<std::string>{request.contact_policy_id},
         request.per_resource_dynamics_limits,
         request.timeouts.planning_timeout_s,
         0U,
@@ -876,12 +871,6 @@ private:
     decision.action = CollisionDecisionAction::kDispatch;
     decision.collision_world_revision = world;
 
-    std::optional<PreparedContactPolicyRefDTO> contact_policy;
-    if (request.resolved_contact_grasp) {
-      contact_policy = PreparedContactPolicyRefDTO{
-          request.resolved_contact_grasp->contact_policy_id,
-          request.resolved_contact_grasp->contact_policy_revision};
-    }
     PreparedMotionExecutionDTO payload{
         MoveId(request.move_id),
         plan_request,
@@ -897,7 +886,7 @@ private:
                  std::vector<double>(trajectory.joint_names.size(), 0.5),
                  std::vector<double>(trajectory.joint_names.size(), 0.0), 0.1}},
          world, CollisionPolicyRevision{1U, Sha('d')}, decision},
-        std::move(contact_policy),
+        request.collision_rules,
         request.speed_profile.max_tcp_linear_speed_mps,
         authority.deployment_maximum_tcp_linear_speed_mps,
         {},
@@ -921,7 +910,6 @@ private:
         request.binding.operation_id,
         authority.operation_revision,
         request.binding.participant_id,
-        binding.program_id,
         binding.program_revision,
         binding.program_binding_id,
         request.binding.program_run_id,
@@ -1052,7 +1040,6 @@ MotionOperation(const core::RuntimeParticipantBinding &binding,
       std::nullopt,
       std::nullopt,
       joint_goal,
-      std::nullopt,
       std::move(dynamics),
       {},
       {}};
@@ -1062,7 +1049,6 @@ MotionOperation(const core::RuntimeParticipantBinding &binding,
   std::vector<core::OperationParticipantIntentDTO> participants{participant};
   return {Context(suffix == "1" ? std::string("execute.ros2_control.stop")
                                  : "execute.ros2_control.stop." + suffix),
-          value.program_id,
           value.program_revision,
           value.program_binding_id,
           // Its own run per operation ("1" and "epoch2" here); the test makes

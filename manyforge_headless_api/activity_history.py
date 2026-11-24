@@ -1,11 +1,14 @@
-"""History records of component actions, Apply and Program Reset terminals.
+"""History records of component actions, Apply and Program Reset terminals,
+Program node attempts and scene changes.
 
 One event per finished component action (whoever asked for it), one per
 Scenario Load / New, Deployment Apply / Revert and Program Apply / Revert
-terminal, and one per Program Reset terminal (OD-305). Each record carries the typed outcome and error code; ``message``
-is the History list's display line, built here from those typed fields. The
-native historian validates the record and stores it in the existing bounded
-History (no store of its own).
+terminal, one per Program Reset terminal (OD-305), one per finished Program
+node attempt and one per scene change made outside a Program node
+(OD-375, OD-378). Each record carries the typed outcome and error code;
+``message`` is the History list's display line, built here from those typed
+fields. The native historian validates the record and stores it in the
+existing bounded History (no store of its own).
 """
 
 from __future__ import annotations
@@ -13,6 +16,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 import logging
 from typing import Any, Final
+
+import rfc8785
+
+from manyforge_behavior.failure_details import MAX_FAILURE_DETAILS_BYTES
 
 SCHEMA_VERSION: Final = "manyforge.activity_event.v1"
 APPLY_KINDS: Final = frozenset({
@@ -24,6 +31,21 @@ PROGRAM_RESET_FIELDS: Final = (
     "reload_initial_scene", "reset_robot_position", "program_run_id",
     "program_revision", "applied_record_digest", "scene_revision_id",
     "scene_content_hash", "cause_code",
+)
+PROGRAM_NODE_ATTEMPT_OUTCOMES: Final = frozenset({
+    "succeeded", "failed", "interrupted", "stopped", "preempted",
+})
+# A node attempt carries its typed error only when it failed or was interrupted.
+PROGRAM_NODE_ATTEMPT_ERROR_OUTCOMES: Final = frozenset({"failed", "interrupted"})
+PROGRAM_NODE_ATTEMPT_FIELDS: Final = (
+    "program_run_id", "node_instance_id", "node_attempt_id", "started_at_wall",
+    "finished_at_ns", "finished_at_wall", "duration_ms", "scene_operation",
+    "scene_resource_id",
+)
+SCENE_CHANGE_OUTCOMES: Final = frozenset({"succeeded", "refused", "failed", "unknown"})
+SCENE_CHANGE_FIELDS: Final = (
+    "scene_resource_id", "source_label", "principal_id", "duration_ms",
+    "scene_revision_id",
 )
 # The host's `component_action_interrupted_by_stop` failure reads as interrupted.
 INTERRUPTED_CODE: Final = "component_action_interrupted_by_stop"
@@ -44,6 +66,22 @@ def _error(error: Any) -> dict[str, str] | None:
     return {
         name: _bounded(error[name]) for name in _ERROR_FIELDS if error.get(name)
     }
+
+
+def _typed_error(error: Any) -> dict[str, Any] | None:
+    """A typed error with its structured details, kept when they fit the run
+    records' failure-details bound."""
+
+    typed = _error(error)
+    details = error.get("details") if typed is not None else None
+    if isinstance(details, Mapping) and details:
+        try:
+            fits = len(rfc8785.dumps(dict(details))) <= MAX_FAILURE_DETAILS_BYTES
+        except (rfc8785.CanonicalizationError, TypeError, ValueError):
+            fits = False
+        if fits:
+            typed["details"] = dict(details)
+    return typed
 
 
 def _words(identifier: str) -> str:
@@ -153,26 +191,104 @@ def program_reset_record(
     }
 
 
-def record_activity(core: Any, record: dict[str, Any]) -> None:
-    """Hand one record to the historian; History is never the action's result."""
+def _duration(duration_ms: float) -> str:
+    return f"{duration_ms:.0f} ms" if duration_ms < 1000 else f"{duration_ms / 1000:.2f} s"
+
+
+def _scene_target(operation: str | None, resource_id: str | None) -> str:
+    return " ".join(part for part in (
+        _words(operation) if operation else None, resource_id) if part)
+
+
+def program_node_attempt_record(facts: Mapping[str, Any]) -> dict[str, Any]:
+    """One finished Program node attempt: its run, instance, attempt, start,
+    duration and typed result; for a scene node also the scene operation
+    and object it changed."""
+
+    outcome = facts["outcome"]
+    typed = (
+        _typed_error(facts.get("error"))
+        if outcome in PROGRAM_NODE_ATTEMPT_ERROR_OUTCOMES
+        else None
+    )
+    attempt = {name: facts.get(name) for name in PROGRAM_NODE_ATTEMPT_FIELDS}
+    parts = [
+        _line(f"Node {attempt['node_instance_id']} ({facts['node_id']})", outcome, typed),
+        f"run {attempt['program_run_id']} attempt {attempt['node_attempt_id']}",
+        _duration(attempt["duration_ms"]),
+    ]
+    if target := _scene_target(attempt["scene_operation"], attempt["scene_resource_id"]):
+        parts.append(target)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "program_node_attempt",
+        "subject": facts["node_id"],
+        "action": None,
+        "outcome": outcome,
+        "error": typed,
+        "components": [],
+        "message": _bounded(" · ".join(parts), 4096),
+        "attempt": attempt,
+    }
+
+
+def scene_change_record(
+    operation_kind: str, outcome: str, error: Any, scene_change: Mapping[str, Any]
+) -> dict[str, Any]:
+    """One scene change outside a Program node (GUI, assistant, MCP, any HTTP
+    caller, the Program runner's own preparation and clears): the object, the
+    caller, the time it took and the scene revision it committed."""
+
+    typed = _typed_error(error) if outcome != "succeeded" else None
+    facts = {name: scene_change.get(name) for name in SCENE_CHANGE_FIELDS}
+    parts = [_line(
+        f"Scene {_scene_target(operation_kind, facts['scene_resource_id'])}", outcome, typed
+    )]
+    if facts["source_label"]:
+        parts.append(facts["source_label"])
+    parts.append(_duration(facts["duration_ms"]))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "scene_change",
+        "subject": operation_kind,
+        "action": None,
+        "outcome": outcome,
+        "error": typed,
+        "components": [],
+        "message": _bounded(" · ".join(parts), 4096),
+        "scene_change": facts,
+    }
+
+
+def record_activity(core: Any, record: dict[str, Any]) -> bool:
+    """Hand one record to the historian; History is never the action's result.
+    True when the historian took it."""
 
     try:
-        core.record_activity(record)
+        return core.record_activity(record).get("recorded") is True
     except Exception:  # noqa: BLE001 - a lost History line never fails the action
         _LOGGER.warning(
             "activity_history_record_failed",
             extra={"kind": record.get("kind"), "subject": record.get("subject")},
             exc_info=True,
         )
+        return False
 
 
 __all__ = [
     "APPLY_KINDS",
+    "PROGRAM_NODE_ATTEMPT_ERROR_OUTCOMES",
+    "PROGRAM_NODE_ATTEMPT_FIELDS",
+    "PROGRAM_NODE_ATTEMPT_OUTCOMES",
     "PROGRAM_RESET_FIELDS",
     "PROGRAM_RESET_OUTCOMES",
+    "SCENE_CHANGE_FIELDS",
+    "SCENE_CHANGE_OUTCOMES",
     "SCHEMA_VERSION",
     "apply_record",
     "component_action_record",
+    "program_node_attempt_record",
     "program_reset_record",
     "record_activity",
+    "scene_change_record",
 ]

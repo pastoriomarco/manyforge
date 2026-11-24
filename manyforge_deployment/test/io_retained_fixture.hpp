@@ -314,11 +314,9 @@ materialize_boolean_io_retained_fixture(
   }
   CanonicalValue source(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
-      {"deployment_artifact_id", CanonicalValue("io.fixture")},
       {"deployment_revision",
        CanonicalValue(std::string(fixture::kZeroDigest))},
       {"cell_id", CanonicalValue("io.cell")},
-      {"name", CanonicalValue("Boolean I/O only")},
       {"catalogs", detail::encode_deployment_catalogs(records)},
       {"desired_control_configurations",
        CanonicalValue(CanonicalValue::Array{})},

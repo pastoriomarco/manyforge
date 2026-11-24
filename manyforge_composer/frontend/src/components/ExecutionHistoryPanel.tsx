@@ -400,7 +400,7 @@ export function ExecutionHistoryPanel({
           {([
             ['channel', 'Exact component / channel'],
             ['actionSpanId', 'Action span'], ['nodeInstanceId', 'Node instance'],
-            ['interventionSessionId', 'Intervention'], ['contactPolicyId', 'Contact policy'],
+            ['interventionSessionId', 'Intervention'], ['collisionRuleId', 'Collision rule'],
             ['incidentId', 'Incident'], ['conditionId', 'Condition'],
           ] as const).map(([key, label]) => (
             <label key={key}><span>{label}</span>

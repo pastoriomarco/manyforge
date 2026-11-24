@@ -31,10 +31,11 @@ class SqliteRecordWriter;
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.h1a.v24";
+    "manyforge.internal.component-manager.apply-journal.h1a.v25";
+/// v25: no Deployment artifact id (OD-369).
 /// v24: metadata `records_lost`, set by the record writer when records of this
 /// start were not written.
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 24;
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 25;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -110,7 +111,6 @@ public:
 /// binding identity and the captured source-closure digest.
 struct ManagerApplyPreparedActivationDTO final {
   manyforge::core::ContentDigest captured_input_digest;
-  manyforge::core::DeploymentArtifactId deployment_artifact_id;
   manyforge::core::DeploymentRevision deployment_revision;
   /// The candidate Program binding, or absent exactly when the prepared
   /// activation's typed Program outcome is non-executable. The receipt

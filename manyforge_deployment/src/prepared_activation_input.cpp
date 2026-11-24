@@ -220,7 +220,87 @@ parse_artifacts(const CanonicalValue &value, const std::string_view label,
   return found->bytes;
 }
 
+void collect_scene_mesh_uris(const CanonicalValue &value,
+                             std::set<std::string> &uris) {
+  if (const auto *members = std::get_if<CanonicalValue::Object>(&value.storage())) {
+    const auto *type = value.find_object_member("type");
+    const auto *uri = value.find_object_member("mesh_resource_uri");
+    if (type != nullptr && type->is_string() && type->as_string() == "mesh" &&
+        uri != nullptr && uri->is_string()) {
+      uris.insert(uri->as_string());
+    }
+    for (const auto &[name, child] : *members) {
+      static_cast<void>(name);
+      collect_scene_mesh_uris(child, uris);
+    }
+  } else if (const auto *items =
+                 std::get_if<CanonicalValue::Array>(&value.storage())) {
+    for (const auto &child : *items) collect_scene_mesh_uris(child, uris);
+  }
+}
+
+/// `scene_meshes`: rows sorted by URI, each naming a carried raw artifact of
+/// exactly that digest and size.
+[[nodiscard]] std::vector<PreparedSceneMesh>
+parse_scene_meshes(const CanonicalValue &value,
+                   const std::vector<PreparedActivationArtifact> &raw_artifacts) {
+  const auto &rows = array(value, "scene_meshes");
+  if (rows.size() > kMaxPreparedArtifactCount) {
+    fail("scene_meshes exceeds the prepared-artifact count bound");
+  }
+  std::vector<PreparedSceneMesh> result;
+  result.reserve(rows.size());
+  for (std::size_t index = 0U; index < rows.size(); ++index) {
+    const auto row_label = "scene_meshes[" + std::to_string(index) + "]";
+    require_exact_fields(rows[index],
+                         {"byte_size", "content_digest", "resource_uri"},
+                         row_label);
+    const auto &uri =
+        text(member(rows[index], "resource_uri"), "scene_meshes.resource_uri");
+    if (uri.size() > 4096U) fail(row_label + " resource_uri exceeds its bound");
+    if (!result.empty() && uri <= result.back().resource_uri) {
+      fail("scene_meshes are not uniquely sorted by resource_uri");
+    }
+    const auto &digest = text(member(rows[index], "content_digest"),
+                              "scene_meshes.content_digest");
+    require_digest(digest, "scene_meshes.content_digest");
+    const auto byte_size =
+        size_value(member(rows[index], "byte_size"), row_label + ".byte_size");
+    if (std::none_of(raw_artifacts.begin(), raw_artifacts.end(),
+                     [&](const auto &artifact) {
+                       return artifact.content_digest.value() == digest &&
+                              artifact.bytes.size() == byte_size;
+                     })) {
+      fail(row_label + " (" + uri +
+           ") names no carried raw artifact of its digest and size");
+    }
+    result.push_back({uri, core::ContentDigest(digest), byte_size});
+  }
+  return result;
+}
+
 } // namespace
+
+std::vector<std::string>
+program_scene_mesh_uris(const CanonicalValue &normalized_program) {
+  std::set<std::string> uris;
+  collect_scene_mesh_uris(normalized_program, uris);
+  return {uris.begin(), uris.end()};
+}
+
+CanonicalValue prepared_scene_meshes_value(std::vector<PreparedSceneMesh> meshes) {
+  std::ranges::sort(meshes, {}, &PreparedSceneMesh::resource_uri);
+  CanonicalValue::Array rows;
+  rows.reserve(meshes.size());
+  for (auto &mesh : meshes) {
+    rows.emplace_back(CanonicalValue::Object{
+        {"byte_size", CanonicalValue(static_cast<double>(mesh.byte_size))},
+        {"content_digest", CanonicalValue(mesh.content_digest.value())},
+        {"resource_uri", CanonicalValue(std::move(mesh.resource_uri))},
+    });
+  }
+  return CanonicalValue(std::move(rows));
+}
 
 core::Result<PreparedActivationProgramOutcomeDTO>
 parse_prepared_activation_program_outcome(const CanonicalValue &prepared) {
@@ -258,13 +338,11 @@ parse_prepared_activation_program_outcome(const CanonicalValue &prepared) {
   if (kind.value() == "no_program") {
     if (!outcome->is_object() || outcome->as_object().size() != 1U)
       return invalid("inconsistent no_program outcome");
-    for (const auto field : {"program_id", "program_revision"}) {
-      const auto *value = prepared.find_object_member(field);
-      if (!value)
-        return Reply::Err(missing(field));
-      if (!value->is_null())
-        return invalid("inconsistent no_program outcome");
-    }
+    const auto *revision = prepared.find_object_member("program_revision");
+    if (!revision)
+      return Reply::Err(missing("program_revision"));
+    if (!revision->is_null())
+      return invalid("inconsistent no_program outcome");
     return Reply::Ok({});
   }
   if (kind.value() == "bound") {
@@ -281,7 +359,6 @@ parse_prepared_activation_program_outcome(const CanonicalValue &prepared) {
   try {
     auto decoded = DecodeProgramNonExecutableOutcome(canonical_json(*encoded));
     const std::pair<std::string_view, std::string_view> fields[] = {
-        {"program_id", decoded.program_id.value()},
         {"program_revision", decoded.program_revision.value()},
         {"retained_bundle_id", decoded.retained_bundle_id.value()},
         {"graph_revision", decoded.graph_revision.value()}};
@@ -337,28 +414,28 @@ PreparedActivationInput::PreparedActivationInput(
     core::ContentDigest prepared_activation_id,
     PreparedScenarioOrigin origin,
     core::ContentDigest captured_input_digest,
-    core::DeploymentArtifactId deployment_artifact_id,
     core::DeploymentRevision deployment_revision,
     core::RetainedBundleId retained_bundle_id,
-    core::GraphRevision graph_revision, std::optional<core::ProgramId> program_id,
+    core::GraphRevision graph_revision,
     std::optional<core::ProgramRevision> program_revision,
     std::optional<core::ProgramBindingId> program_binding_id,
     std::optional<ProgramNonExecutableOutcomeDTO> program_outcome,
     core::ContentDigest node_environment_digest, std::string assistant_mode,
+    std::vector<PreparedSceneMesh> scene_meshes,
     CanonicalValue normalized_root,
     VerifiedPreparedActivationClosure closure)
     : prepared_activation_id_(std::move(prepared_activation_id)),
       origin_(std::move(origin)),
       captured_input_digest_(std::move(captured_input_digest)),
-      deployment_artifact_id_(std::move(deployment_artifact_id)),
       deployment_revision_(std::move(deployment_revision)),
       retained_bundle_id_(std::move(retained_bundle_id)),
-      graph_revision_(std::move(graph_revision)), program_id_(std::move(program_id)),
+      graph_revision_(std::move(graph_revision)),
       program_revision_(std::move(program_revision)),
       program_binding_id_(std::move(program_binding_id)),
       program_outcome_(std::move(program_outcome)),
       node_environment_digest_(std::move(node_environment_digest)),
       assistant_mode_(std::move(assistant_mode)),
+      scene_meshes_(std::move(scene_meshes)),
       normalized_root_(std::move(normalized_root)), closure_(std::move(closure)) {}
 
 PreparedActivationInput
@@ -381,10 +458,9 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   require_exact_fields(
       value,
       {"activation_payload", "assistant_mode", "captured_input_digest",
-       "deployment_artifact_id", "deployment_revision", "graph_revision",
-       "node_environment_digest", "prepared_activation_id",
-       "program_id", "program_outcome", "program_revision",
-       "retained_bundle_id", "origin", "schema_version"},
+       "deployment_revision", "graph_revision", "node_environment_digest",
+       "prepared_activation_id", "program_outcome", "program_revision",
+       "retained_bundle_id", "origin", "scene_meshes", "schema_version"},
       "prepared activation input");
   const auto &schema = text(member(value, "schema_version"), "schema_version");
   if (schema != kPreparedActivationInputSchemaVersion) {
@@ -410,9 +486,8 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   const bool no_program = outcome_kind == "no_program";
   if (no_program) {
     require_exact_fields(outcome_value, {"kind"}, "program_outcome");
-    if (!member(value, "program_id").is_null() ||
-        !member(value, "program_revision").is_null()) {
-      fail("no_program must not carry Program identities");
+    if (!member(value, "program_revision").is_null()) {
+      fail("no_program must not carry a Program identity");
     }
   } else if (outcome_kind == "bound") {
     require_exact_fields(outcome_value, {"kind", "program_binding_id"},
@@ -438,10 +513,8 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   require_digest(deployment_revision, "deployment_revision");
   require_digest(retained_bundle_id, "retained_bundle_id");
   require_digest(graph_revision, "graph_revision");
-  std::optional<core::ProgramId> program_id;
   std::optional<core::ProgramRevision> program_revision;
   if (!no_program) {
-    program_id = core::ProgramId(text(member(value, "program_id"), "program_id"));
     const auto &revision = text(member(value, "program_revision"), "program_revision");
     require_digest(revision, "program_revision");
     program_revision = core::ProgramRevision(revision);
@@ -474,8 +547,6 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   auto bundle = detail::RetainedBundleReloadAuthority::reload(
       canonical_json(member(payload, "retained_bundle")));
   if (bundle == nullptr || bundle->retained_bundle_id().value() != retained_bundle_id ||
-      bundle->value().deployment_artifact_id.value() !=
-          text(member(value, "deployment_artifact_id"), "deployment_artifact_id") ||
       bundle->value().deployment_revision.value() != deployment_revision ||
       bundle->value().cell_graph.graph_revision.value() != graph_revision ||
       bundle->value().catalogs.node_environment.environment_digest.value() !=
@@ -490,6 +561,25 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   auto catalog_artifacts = parse_artifacts(
       member(payload, "catalog_artifacts"),
       "activation_payload.catalog_artifacts", artifact_bytes_total);
+  auto scene_meshes =
+      parse_scene_meshes(member(value, "scene_meshes"), raw_artifacts);
+  // Exactly the carried Program's meshes are captured (none for no_program).
+  {
+    std::vector<std::string> captured_uris;
+    captured_uris.reserve(scene_meshes.size());
+    for (const auto &mesh : scene_meshes) captured_uris.push_back(mesh.resource_uri);
+    if (captured_uris != program_scene_mesh_uris(member(payload, "program"))) {
+      fail("prepared activation scene_meshes differ from the carried Program's "
+           "scene meshes");
+    }
+  }
+  const bool only_scene_mesh_artifacts = std::all_of(
+      raw_artifacts.begin(), raw_artifacts.end(), [&](const auto &artifact) {
+        return std::any_of(scene_meshes.begin(), scene_meshes.end(),
+                           [&](const auto &mesh) {
+                             return mesh.content_digest == artifact.content_digest;
+                           });
+      });
   std::optional<VerifiedRetainedModelMap> model_map;
   if (!bundle->value().compiled_products.symbol_role_maps.empty()) {
     const auto &map_product =
@@ -508,7 +598,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   } else if (!bundle->value().cell_graph.controllable_components.empty() ||
              !bundle->value().cell_graph.model_instances.empty() ||
              program_binding_id.has_value() || (!no_program && !program_outcome.has_value()) ||
-             (!no_program && !raw_artifacts.empty())) {
+             (!no_program && !only_scene_mesh_artifacts)) {
     fail("prepared activation may omit model data only for an empty candidate "
          "with no executable Program");
   }
@@ -521,7 +611,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   } else {
     program = verify_program_binding_contract(
         canonical_json(member(payload, "program")), *bundle, model_map, catalog_source);
-    if (program == nullptr || program->value().program_id != *program_id ||
+    if (program == nullptr ||
         program->value().program_revision != *program_revision) {
       fail("prepared activation Program differs from its summary");
     }
@@ -536,7 +626,6 @@ parse_prepared_activation_input(const CanonicalValue &value) {
                                               *bundle, *model_map, catalog_source);
     if (binding == nullptr ||
         binding->program_binding_id().value() != *program_binding_id ||
-        binding->value().program_id != program->value().program_id ||
         binding->value().program_revision != program->value().program_revision) {
       fail("prepared activation Program binding differs from its summary");
     }
@@ -545,7 +634,6 @@ parse_prepared_activation_input(const CanonicalValue &value) {
       fail("no_program must not carry a Program binding");
     }
   } else if (!binding_value.is_null() ||
-             program_outcome->program_id != program->value().program_id ||
              program_outcome->program_revision !=
                  program->value().program_revision ||
              program_outcome->retained_bundle_id !=
@@ -569,18 +657,16 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   return PreparedActivationInput(
       core::ContentDigest(prepared_id), std::move(origin),
       core::ContentDigest(captured_digest),
-      core::DeploymentArtifactId(text(member(value, "deployment_artifact_id"),
-                                      "deployment_artifact_id")),
       core::DeploymentRevision(deployment_revision),
       core::RetainedBundleId(retained_bundle_id),
       core::GraphRevision(graph_revision),
-      std::move(program_id), std::move(program_revision),
+      std::move(program_revision),
       program_binding_id.has_value()
           ? std::optional(core::ProgramBindingId(*program_binding_id))
           : std::nullopt,
       std::move(program_outcome),
-      core::ContentDigest(node_environment_digest), assistant_mode, value,
-      std::move(closure));
+      core::ContentDigest(node_environment_digest), assistant_mode,
+      std::move(scene_meshes), value, std::move(closure));
 }
 
 } // namespace manyforge::deployment

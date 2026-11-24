@@ -35,7 +35,7 @@ function controller(attachments: JsonValue[], dual: Record<string, JsonValue> = 
       draft: {
         id: 'draft', revision: 1,
         document: {
-          api_version: 'manyforge.deployment_intent.v2',
+          api_version: 'manyforge.deployment_intent.v3',
           components: [
             { component_id: 'robot', component_profile_id: 'arm_v0' },
             { component_id: 'hand', component_profile_id: 'gripper_v0' },

@@ -55,7 +55,7 @@ export function deploymentArmControlledStop(
   targetId: string,
 ): DeploymentArmControlledStop | null {
   if (!document) return null;
-  if (document.api_version === 'manyforge.deployment_intent.v2') {
+  if (document.api_version === 'manyforge.deployment_intent.v3') {
     const component = (Array.isArray(document.components) ? document.components : [])
       .map(object).find((row) => row?.component_id === componentId);
     return stopFromParameters(object(object(object(component?.target_settings)?.[targetId])?.controlled_stop));

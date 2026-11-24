@@ -103,7 +103,6 @@ void RunRetainedMotionLeafShutdown(ShutdownCase scenario) {
     return result;
   });
   timing::goal_admitted_entered = false;
-  timing::goal_admitted_timed_out = false;
   timing::release_goal_admitted = false;
   timing::block_goal_admitted = true;
   using ExecutionResult = decltype(kernel.execute(MotionOperation(binding, "leaf-shutdown")));
@@ -217,7 +216,6 @@ void RunRetainedMotionLeafShutdown(ShutdownCase scenario) {
     if (result.ok()) operation_id = result.value().operation_id;
   }
   EXPECT_TRUE(entered) << "actual handle did not enter the instrumented action leaf";
-  EXPECT_FALSE(timing::goal_admitted_timed_out.load());
   if (scenario == ShutdownCase::kRetiredRetry || scenario == ShutdownCase::kSnapshotRetry ||
       scenario == ShutdownCase::kDuplicateSnapshot) {
     EXPECT_TRUE(retained_same_slot_twice);

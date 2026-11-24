@@ -20,7 +20,7 @@ from manyforge_composer.backend.scenario_artifacts import (
 def _document():
     return build_scenario_document(
         scenario_id="cell", name="cell", description="",
-        program_draft={"api_version": "manyforge.program.v3"},
+        program_draft={"api_version": "manyforge.program.v4"},
         deployment_draft=None, manyforge_version="test", last_known_status="unknown",
     )
 
@@ -32,7 +32,7 @@ def test_two_member_project_round_trip_and_save(tmp_path):
     assert {p.name for p in target.iterdir()} == {"program.yaml", "deployment.yaml", "scenario.yaml"}
     loaded, _, _ = capture_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
     assert loaded == document
-    updated = {"api_version": "manyforge.program.v3", "program_id": "changed"}
+    updated = {"api_version": "manyforge.program.v4", "program_profile": "changed"}
     loaded, _, _ = save_scenario_member(str(target), "program_draft", updated, allowed_roots=[str(tmp_path)])
     manifest = json.loads((target / "scenario.yaml").read_text())
     assert loaded["program_draft"] == updated
@@ -53,7 +53,7 @@ def test_old_authoring_version_refused_with_typed_error():
 
 
 def test_program_format_refusal_preserves_details_through_scenario_http_error():
-    original = ProgramFormatUnsupported("manyforge.program.v2", "manyforge.program.v3")
+    original = ProgramFormatUnsupported("manyforge.program.v3", "manyforge.program.v4")
     error = ScenarioArtifactError(original.code, str(original), details=original.details)
     response_error = scenario_artifact_http_exception(error)
     assert response_error.detail["code"] == "program_format_unsupported"

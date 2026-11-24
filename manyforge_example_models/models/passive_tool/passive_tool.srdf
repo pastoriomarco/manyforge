@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<!--
+  ManyForge generic passive tool (OD-336): no groups, no states. The robot
+  name, which a project's own SRDF must share with its URDF, and the tip
+  touching the body by design.
+-->
+<robot name="passive_tool">
+  <disable_collisions link1="passive_tool_body" link2="passive_tool_tip" reason="Adjacent"/>
+</robot>

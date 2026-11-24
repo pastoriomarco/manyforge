@@ -2,8 +2,8 @@
   "api_version": "manyforge.provider_manifest.v1",
   "offered_capabilities": [
     {
-      "capability_definition_revision": "sha256:91fa92a90ddf807623ae9a42a97c37cd4d9628b1961e572b28a928e0da4dd98d",
-      "capability_id": "execution.interrupt.contact_policy",
+      "capability_definition_revision": "sha256:eb10016601843c51b459405b87ec3af2bcd378741fb158f143a66f084f9c2588",
+      "capability_id": "execution.interrupt.contact_rule",
       "required_endpoint_role_ids": []
     },
     {
@@ -14,5 +14,5 @@
   ],
   "provider_contracts": [],
   "provider_manifest_id": "manyforge.provider.execution_core",
-  "provider_manifest_revision": "sha256:82ab7aa7fa881bec4c18c5326cc89b3a88761a54e75dda110791d469ebf3fc29"
+  "provider_manifest_revision": "sha256:8a8012c9fd41decdf2576ec4766038b0b7de03c43c96b4bdd195fe35fc3d9e43"
 }

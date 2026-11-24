@@ -1,14 +1,11 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [],
     "tags": [
       "dual-robot",
@@ -16,7 +13,6 @@
       "ur5e"
     ]
   },
-  "description": "Two independent joint trajectories in the UR5e + Lite6 wall cell, in separate control groups for the isolation case.",
   "execution_groups": {
     "lite6_arm": {
       "execution_policy": "independent"
@@ -170,7 +166,6 @@
       }
     }
   ],
-  "name": "ur5e_lite6_wall_isolation",
   "parameters": [
     {
       "constraints": {
@@ -221,7 +216,6 @@
     }
   ],
   "positions": {},
-  "program_id": "ur5e_lite6_wall_isolation",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

@@ -33,7 +33,6 @@ def _client_binding() -> dict[str, object]:
     binding.update(
         {
             "program_binding_id": "sha256:" + "0" * 64,
-            "program_id": "fixture",
             "program_revision": "sha256:" + "a" * 64,
             "retained_bundle_id": "sha256:" + "b" * 64,
             "graph_revision": "sha256:" + "c" * 64,
@@ -43,7 +42,7 @@ def _client_binding() -> dict[str, object]:
         binding,
         own_field="program_binding_id",
         identity_domain="program-binding-id",
-        api_version="manyforge.program_binding.v3",
+        api_version="manyforge.program_binding.v4",
     )
     return binding
 
@@ -54,7 +53,6 @@ def _client_applied() -> dict[str, object]:
         "assistant_mode": "forbidden",
         "assistant_projection": None,
         "baseline_program_binding_id": "sha256:" + "d" * 64,
-        "deployment_artifact_id": "cell-a",
         "deployment_revision": "sha256:" + "e" * 64,
         "graph_revision": binding["graph_revision"],
         "node_environment_digest": binding["node_environment"]["environment_digest"],
@@ -64,12 +62,10 @@ def _client_applied() -> dict[str, object]:
         }],
         "preparation_digest": "sha256:" + "f" * 64,
         "program": {
-            "program_id": "fixture",
             "program_revision": "sha256:" + "a" * 64,
         },
         "program_binding": binding,
         "program_binding_id": binding["program_binding_id"],
-        "program_id": "fixture",
         "program_revision": "sha256:" + "a" * 64,
         "retained_bundle_id": binding["retained_bundle_id"],
         "source_document_digest": "sha256:" + "1" * 64,
@@ -869,6 +865,7 @@ def test_command_calls_bound_only_the_connection_and_reads_keep_their_limit() ->
         for path in commands:
             client.request("POST", path, body={})
         client.request("GET", "/api/cycle/status")
+        client.program_runtime_blackboard_values(3, application_start_id="3f9a0000000000a1")
         client.request("POST", "/api/program/runs/3/node-correction-previews", body={})
         client.request("POST", "/api/program/runs/3/motion-stop", body={})
     finally:
@@ -878,6 +875,7 @@ def test_command_calls_bound_only_the_connection_and_reads_keep_their_limit() ->
         assert timeout["read"] is None and timeout["write"] is None, path
         assert timeout["connect"] == 7.0, path
     for key in (("GET", "/api/cycle/status"),
+                ("GET", "/api/program/runs/3/blackboard-values"),
                 ("POST", "/api/program/runs/3/node-correction-previews"),
                 ("POST", "/api/program/runs/3/motion-stop")):
         assert timeouts[key]["read"] is not None, key
@@ -903,4 +901,26 @@ def test_the_prepared_activation_is_read_by_its_digest() -> None:
         raw.close()
     assert [(r.method, r.url.path) for r in requests] == [
         ("GET", f"/api/activation-preparations/{digest}")
+    ]
+
+
+def test_a_control_command_carries_its_upstream_receipt_time() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"receipt": {}}, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test", transport=httpx.MockTransport(handler)
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        client.submit_control_command({}, received_monotonic_ns=123_456_789)
+        client.submit_control_command({})
+    finally:
+        raw.close()
+    assert [r.headers.get("x-manyforge-received-monotonic-ns") for r in requests] == [
+        "123456789",
+        None,
     ]

@@ -1,18 +1,22 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <variant>
 #include <vector>
 
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/geometry.hpp>
 #include <manyforge_core/types/robot_defaults.generated.hpp>
 #include <manyforge_core/types/robot_state.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 
 namespace manyforge::core {
 
@@ -81,7 +85,7 @@ enum class CollisionPairClassification {
   kSupportContactSeparated,
   kSupportContactRecontactViolation,
   kAllowedTouchLink,
-  kAllowedContactGrasp,
+  kAllowedContactRule,
   kDiagnosticIncomplete,
 };
 
@@ -203,14 +207,16 @@ enum class CollisionDistanceRequestMode {
   return "unknown";
 }
 
-/// Collision settings (Deployment `collision_clearance_m` and
-/// `collision_check_step_rad`; their defaults kDefaultCollisionClearanceM and
+/// Collision settings (the Deployment's `collision_rules` and
+/// `collision_check_step_rad`; the defaults kDefaultCollisionClearanceM and
 /// kDefaultCollisionCheckStepRad are in manyforge_core/resources/robot_defaults.tsv).
-/// - Clearance: a validated or planned move keeps at least this from every
-///   body its collision policy does not allow it to touch; 1 mm by default
-///   (it also covers the executed spline's deviation from the planned chords).
-///   0 disables it: contact-only checks. A motion's own `clearance_m` replaces
-///   it for that move, within [0, kMaxCollisionClearanceM].
+/// - Clearance: a validated or planned move keeps at least its rule's
+///   clearance from every body its rules do not allow it to touch. The
+///   Deployment's first rule holds every robot x environment pair, 1 mm by
+///   default (it also covers the executed spline's deviation from the planned
+///   chords); 0 disables it: contact-only checks. A motion's own row without
+///   selections replaces that value for the move. Every clearance is within
+///   [0, kMaxCollisionClearanceM].
 /// - Check step: the joint-space distance (Euclidean, as RoboPlan's
 ///   `collision_check_step_size`) between two collision-checked
 ///   configurations of the planner's first attempt. Pre-dispatch validation
@@ -231,30 +237,47 @@ inline constexpr double kCollisionRetryCheckStepRad = 0.01;
 }
 
 /// Collision clearance (coal security margin) of one canonical logical pair.
+/// `rule_index` names the collision rule that set it, in
+/// CollisionClearanceMargins::rule_ids.
 struct CollisionPairMargin {
   CollisionPairId pair;
   double margin_m = 0.0;
+  std::uint32_t rule_index = 0U;
 
   friend bool operator==(const CollisionPairMargin&,
                          const CollisionPairMargin&) = default;
 };
 
-/// Collision clearance for one move: two bodies of a listed pair closer than
-/// its margin collide. Pairs not listed keep margin 0. `margin_m` is the
-/// move's clearance the list was derived from (reported with a clearance
-/// refusal). Immutable once built and shared by every query of the move.
+/// Clearance half of one move's resolved collision-rule table: two bodies of
+/// a listed pair closer than its margin collide. Pairs not listed keep margin
+/// 0. Built once at admission by `resolve_collision_rules`; immutable and
+/// shared by every query of the move.
 struct CollisionClearanceMargins {
-  double margin_m = 0.0;
-  /// Sorted by pair, unique, every margin in (0, margin_m].
+  /// Sorted by pair, unique, every margin in (0, kMaxCollisionClearanceM].
   std::vector<CollisionPairMargin> pairs;
+  /// Ids of the rules the listed margins come from.
+  std::vector<std::string> rule_ids;
 
-  [[nodiscard]] double margin_for(const CollisionPairId& pair) const noexcept {
+  [[nodiscard]] const CollisionPairMargin* find(const CollisionPairId& pair) const noexcept {
     const auto found = std::lower_bound(
         pairs.begin(), pairs.end(), pair,
         [](const CollisionPairMargin& entry, const CollisionPairId& selected) {
           return entry.pair < selected;
         });
-    return found != pairs.end() && found->pair == pair ? found->margin_m : 0.0;
+    return found != pairs.end() && found->pair == pair ? &*found : nullptr;
+  }
+
+  [[nodiscard]] double margin_for(const CollisionPairId& pair) const noexcept {
+    const auto* entry = find(pair);
+    return entry != nullptr ? entry->margin_m : 0.0;
+  }
+
+  /// Rule id of a listed pair; empty for a pair that is not listed.
+  [[nodiscard]] std::string_view rule_id_for(const CollisionPairId& pair) const noexcept {
+    const auto* entry = find(pair);
+    return entry != nullptr && entry->rule_index < rule_ids.size()
+               ? std::string_view{rule_ids[entry->rule_index]}
+               : std::string_view{};
   }
 };
 
@@ -387,26 +410,7 @@ struct CollisionResult {
   std::size_t evaluated_distance_pair_count = 0;
 };
 
-/// Contact-policy mode for entries in CollisionPolicySnapshot::support_contacts.
-///
-/// kContactRelease is the production mode for configured release-set
-/// transitions: initially present pairs must satisfy the authored evidence and
-/// final-separation rules, while an initially absent configured pair may not
-/// become a new active contact later in the trajectory.
-/// kBoundedPenetration has no initial-contact prerequisite: the declared pair
-/// may first collide at any sample, persist, disappear, reappear, or remain at
-/// trajectory end, but every colliding sample must remain within
-/// max_contact_penetration_m.
-/// kContactProcess is reserved for future force/controller-backed contact-rich
-/// applications and intentionally fails closed until sensing envelopes and
-/// adapter freshness gates are implemented.
-enum class CollisionContactPolicyMode {
-  kContactRelease,
-  kBoundedPenetration,
-  kContactProcess,
-};
-
-/// Evidence used to prove a contact-release policy.
+/// Evidence used to prove a release rule.
 ///
 /// Presentation surfaces may label these values "Precise" and "Lightweight",
 /// but authored and published contracts use the durable semantic names below.
@@ -415,16 +419,61 @@ enum class ContactReleaseEvidenceMode {
   kBinaryContact,
 };
 
-/// One entry in CollisionPolicySnapshot::support_contacts.
-struct SupportContactPolicyEntry {
-  CollisionPairId pair;
-  CollisionContactPolicyMode mode =
-      CollisionContactPolicyMode::kContactRelease;
+/// `end_from_fraction` of a `contact` rule that does not give one.
+inline constexpr double kDefaultContactEndFromFraction = 0.8;
+/// `max_compression_step_m` a spring element declares when it gives none.
+inline constexpr double kDefaultMaxCompressionStepM = 0.002;
+/// Largest tool travel between two validation samples of a move with a
+/// spring rule (OD-356).
+inline constexpr double kSpringSampleTravelM = 0.001;
+
+/// The spring slider a contact rule belongs to (OD-371): the slider element
+/// `element_id` of generated tool `component_id`, whose rule holds the slider
+/// body and the objects it carries against side `b`.
+struct CollisionSpringGroup {
+  ControllableComponentId component_id;
+  std::string element_id;
+  /// The slider's axis, a unit vector in the slider link's frame.
+  std::array<double, 3> axis{};
+
+  friend bool operator==(const CollisionSpringGroup&,
+                         const CollisionSpringGroup&) = default;
+};
+
+/// Value `contact` of a collision rule: the pair may touch.
+struct CollisionContactRule {
+  /// Deepest penetration allowed at any colliding sample. Absent: the depth
+  /// is not checked.
+  std::optional<double> max_penetration_m;
+  /// In [0, 1]. Above 0: the pair may touch only from this fraction of the
+  /// move on; contact at the first sample or before the fraction is refused.
+  /// 0: the pair may touch during the whole move, from the first sample.
+  double end_from_fraction = kDefaultContactEndFromFraction;
+  /// A spring (OD-356): the deepest increase of the penetration between two
+  /// consecutive samples, at most kSpringSampleTravelM of tool travel apart
+  /// while in contact. Absent: no spring, the increase is not checked. Set
+  /// only together with `max_penetration_m` (the spring's stroke).
+  std::optional<double> max_compression_step_m;
+  /// A spring slider and its carried objects as one spring (OD-371): the
+  /// rule's compression is the deepest penetration over all its pairs, and
+  /// `max_penetration_m` and the step limit apply to that one value, with one
+  /// previous depth per rule. Absent: each pair is checked on its own. Set
+  /// only together with `max_compression_step_m`.
+  std::optional<CollisionSpringGroup> spring_group{};
+
+  /// True when the pair may touch during the whole move.
+  [[nodiscard]] bool whole_move() const noexcept { return !(end_from_fraction > 0.0); }
+
+  friend bool operator==(const CollisionContactRule&,
+                         const CollisionContactRule&) = default;
+};
+
+/// Value `release` of a collision rule: a pair in contact at the start of the
+/// move must separate. A pair that starts clear may not come into contact.
+struct CollisionReleaseRule {
   ContactReleaseEvidenceMode release_evidence_mode =
       ContactReleaseEvidenceMode::kSignedPenetration;
-  /// Initial penetration envelope for kContactRelease with signed evidence.
-  /// Other modes keep these release-only fields neutral after typed-boundary
-  /// canonicalization; arbitrary mode-scoped mixtures fail core admission.
+  /// Initial penetration limit, with signed evidence.
   bool enforce_max_start_penetration = true;
   double max_start_penetration_m = 0.0;
   /// Numeric tolerance for monotonic release checks. A later sample may be
@@ -434,36 +483,43 @@ struct SupportContactPolicyEntry {
   /// require_strictly_decreasing_penetration is true and the pair has not
   /// reached separation. Zero means any reduction beyond tolerance.
   double min_release_progress_m = 0.0;
-  /// Maximum penetration permitted at every colliding sample when `mode` is
-  /// kBoundedPenetration. Other policy modes keep this neutral at zero.
-  double max_contact_penetration_m = 0.0;
-  /// kContactRelease trajectory-end obligation. Canonical bounded entries keep
-  /// this false and permit final contact within their cap.
   bool require_separation_by_end = true;
-  /// kContactRelease net-progress obligation. Canonical bounded entries keep
-  /// this false.
   bool require_strictly_decreasing_penetration = true;
   bool allow_recontact = false;
 
-  friend bool operator==(const SupportContactPolicyEntry&,
-                         const SupportContactPolicyEntry&) = default;
+  friend bool operator==(const CollisionReleaseRule&,
+                         const CollisionReleaseRule&) = default;
 };
 
-/// Geometry-only grasp-contact policy for detached pick approaches.
-///
-/// This is intentionally narrower than contact_process. It allows only the
-/// configured robot gripper links to contact one selected detached object, and
-/// only in the terminal portion of a trajectory. Post-attach contact is handled
-/// by attached-object touch links, not by this policy.
-struct ContactGraspPolicyEntry {
-  std::string policy_id;
-  std::string selected_object_id;
-  std::vector<std::string> allowed_robot_links;
-  double max_penetration_m = 0.0;
-  double terminal_window_start_fraction = 0.8;
+using CollisionContactRuleValue =
+    std::variant<CollisionContactRule, CollisionReleaseRule>;
 
-  friend bool operator==(const ContactGraspPolicyEntry&,
-                         const ContactGraspPolicyEntry&) = default;
+/// Rule id of the release the kernel adds by itself for a carried object
+/// found touching a free Scene object at the first waypoint.
+inline constexpr std::string_view kAutomaticStartReleaseRuleId =
+    "automatic_start_release";
+
+/// Contact half of one move's resolved collision-rule table: one canonical
+/// pair that a `contact` or `release` rule holds, with the rule's id and
+/// value. Pairs under a `clearance_m` rule are in CollisionClearanceMargins.
+struct CollisionPairContactRule {
+  CollisionPairId pair;
+  std::string rule_id;
+  CollisionContactRuleValue value{CollisionContactRule{}};
+  /// The rule's side `a` selected `pair.body_b` (false: `pair.body_a`). Set
+  /// by the rule resolver; it names the side a spring's published
+  /// compression shifts (OD-358).
+  bool side_a_is_body_b = false;
+
+  [[nodiscard]] const CollisionContactRule* contact() const noexcept {
+    return std::get_if<CollisionContactRule>(&value);
+  }
+  [[nodiscard]] const CollisionReleaseRule* release() const noexcept {
+    return std::get_if<CollisionReleaseRule>(&value);
+  }
+
+  friend bool operator==(const CollisionPairContactRule&,
+                         const CollisionPairContactRule&) = default;
 };
 
 /// Policy-revision twin of CollisionWorldRevision.
@@ -482,27 +538,45 @@ struct CollisionPolicyRevision {
 /// policy edit creates a new revision and cannot mutate an already running
 /// move's effective policy.
 struct CollisionPolicySnapshot {
-  /// Application-level identifier, e.g. "free_space", "pick_with_object".
-  /// Defaults to "free_space" which classifies any unallowed collision as
-  /// kBlockingCollision.
+  /// Application-level identifier. Defaults to "free_space" which classifies
+  /// any unallowed collision as kBlockingCollision.
   std::string policy_id = "free_space";
 
   CollisionPolicyRevision revision;
 
-  /// Pairs that may overlap because both bodies are static. The policy resolver
-  /// must derive this list from the active CollisionWorldRevision; the evaluator
-  /// treats the snapshot as authoritative.
-  std::vector<CollisionPairId> allowed_static_static_pairs;
+  /// The bodies that never move in the policy's collision world: every shape
+  /// of a cell-fixed Scene object (a carried object is never one) and every
+  /// component body no dynamic coordinate moves. Sorted, unique. Two of them
+  /// are never checked against each other (kAllowedStaticStatic): one rule by
+  /// body class, not a pair list. The Scene projector derives the list from
+  /// the logical scene and the retained model; the evaluator trusts it.
+  std::vector<CollisionBodyId> static_body_ids;
 
-  /// Explicit pair-level touch-link allowances (typically
-  /// attached-object <-> parent-link contacts).
+  /// Grip pairs of the current attachments (carried object <-> the attach
+  /// node's `touch_bodies`), valid until detach. Not rules: no depth check.
   std::vector<CollisionPairId> allowed_touch_link_pairs;
 
-  std::vector<SupportContactPolicyEntry> support_contacts;
+  /// Pairs under a `contact` or `release` collision rule of the move, sorted
+  /// by pair and unique. Empty in the Scene projector's base policy; the
+  /// kernel installs the move's resolved rules at admission.
+  std::vector<CollisionPairContactRule> contact_rules;
 
-  /// Declared contact_grasp policies. At validation time the execute request's
-  /// concrete contact_policy_id selects at most one of these entries.
-  std::vector<ContactGraspPolicyEntry> contact_grasps;
+  [[nodiscard]] const CollisionPairContactRule* contact_rule_for(
+      const CollisionPairId& pair) const noexcept {
+    const auto found = std::lower_bound(
+        contact_rules.begin(), contact_rules.end(), pair,
+        [](const CollisionPairContactRule& entry, const CollisionPairId& selected) {
+          return entry.pair < selected;
+        });
+    return found != contact_rules.end() && found->pair == pair ? &*found : nullptr;
+  }
+
+  /// True when both bodies of `pair` are static bodies: the pair is never
+  /// checked. Two binary searches, no allocation.
+  [[nodiscard]] bool static_pair(const CollisionPairId& pair) const noexcept {
+    return std::binary_search(static_body_ids.begin(), static_body_ids.end(), pair.body_a) &&
+           std::binary_search(static_body_ids.begin(), static_body_ids.end(), pair.body_b);
+  }
 
   /// When true, missing diagnostic fields produce kDiagnosticIncomplete;
   /// when false, the evaluator classifies opportunistically with the
@@ -625,7 +699,7 @@ struct CollisionEngineCapabilityDescriptor {
   /// whose bounded response is to reject changed snapshots without allocation.
   std::uint64_t runtime_query_snapshot_change_qualified_wcet_ns = 0;
   /// Free-form notes — e.g. "octree collision not yet supported",
-  /// "support-contact requires policy snapshot attached".
+  /// "release rules require the policy snapshot attached".
   std::vector<std::string> known_unsupported_cases;
   /// Diagnostic geometry queries enumerate colliding pairs without applying
   /// policy exemptions. Absent evidence must not be displayed as clear.

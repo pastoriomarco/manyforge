@@ -23,6 +23,7 @@ import type {
   CycleRecoveryActionId,
   CycleRecoveryOffer,
   PersistentKeyValues,
+  ProgramOperatorQuestion,
   ProgramRuntimeControlProjection,
   ProgramGroupRuntimeScaleState,
   ProgramCycleStatus,
@@ -310,6 +311,9 @@ function controlsKey(value: ProgramRuntimeControlProjection | null): string {
       + (value.recoveryHolds ?? []).map((hold) => (
         `${hold.offer.offerId}@${hold.offer.offerRevision}`
       )).join(',') + ':'
+      + (value.operatorQuestions ?? []).map((question) => (
+        `${question.offerId}@${question.offerRevision}`
+      )).join(',') + ':'
       + JSON.stringify(value.executionSelections);
 }
 
@@ -323,6 +327,24 @@ function offerWithId(
   return value?.recoveryHolds.find((hold) => hold.offer.offerId === offerId)?.offer ?? null;
 }
 
+/** The open operator question with this offer ID. */
+function questionWithId(
+  value: ProgramRuntimeControlProjection | null,
+  offerId: string,
+): ProgramOperatorQuestion | null {
+  return (value?.operatorQuestions ?? []).find((question) => question.offerId === offerId) ?? null;
+}
+
+/** The current revision of a recovery offer or an operator question, by its offer ID. */
+function offerRevisionWithId(
+  value: ProgramRuntimeControlProjection | null,
+  offerId: string,
+): number | null {
+  return offerWithId(value, offerId)?.offerRevision
+    ?? questionWithId(value, offerId)?.offerRevision
+    ?? null;
+}
+
 export function controlPendingAfterProjection(
   pending: string | null,
   previous: ProgramRuntimeControlProjection | null,
@@ -333,14 +355,14 @@ export function controlPendingAfterProjection(
   if (run !== null && ['stopped', 'succeeded', 'failed'].includes(run.state)) {
     return null;
   }
-  // `recovery:<offer id>:<action id>` is pending until that offer's revision
-  // changes or the owner retires it (offer IDs are digests and contain a
-  // colon; action IDs do not).
+  // `recovery:<offer id>:<action id>` is pending until that offer's (or
+  // operator question's) revision changes or the owner retires it (offer IDs
+  // are digests and contain a colon; action and option IDs do not).
   const offerId = pending.slice('recovery:'.length, pending.lastIndexOf(':'));
-  const expected = offerWithId(previous, offerId);
-  const current = offerWithId(observed, offerId);
+  const expected = offerRevisionWithId(previous, offerId);
+  const current = offerRevisionWithId(observed, offerId);
   if (expected === null) return pending;
-  return current === null || current.offerRevision !== expected.offerRevision
+  return current === null || current !== expected
     ? null
     : pending;
 }
@@ -1763,6 +1785,39 @@ export function useProgramRuntime(
     );
   }, [composerRefusalReason, performRuntimeControl, state.controlPending, state.controls]);
 
+  /**
+   * Answers one open operator question with one of its options, only while
+   * that exact question revision is current. It goes as a recovery action
+   * (the option ID is the action); answering produces no motion.
+   */
+  const answerOperatorQuestion = useCallback((
+    target: Pick<ProgramOperatorQuestion, 'offerId' | 'offerRevision'>,
+    optionId: string,
+  ) => {
+    const question = questionWithId(state.controls, target.offerId);
+    if (
+      question === null || question.offerRevision !== target.offerRevision
+      || !question.options.some((option) => option.optionId === optionId)
+      || state.controlPending !== null
+      // The answer lets the Program go on: the Composer refuses it, like
+      // Retry, while Draft edits are unapplied or an assistant turn runs.
+      || composerRefusalReason !== null
+    ) return;
+    const body = {
+      source_label: 'operator_ui',
+      offer_id: question.offerId,
+      offer_revision: question.offerRevision,
+      action_id: optionId,
+      reason: 'operator answered a Program question',
+    } satisfies Record<string, JsonValue>;
+    void performRuntimeControl(
+      `recovery:${question.offerId}:${optionId}`,
+      'execution_recovery',
+      body,
+      'The answer was rejected.',
+    );
+  }, [composerRefusalReason, performRuntimeControl, state.controlPending, state.controls]);
+
   /** Resolves to null when written, otherwise to why the write was refused. */
   const writeRuntimeBlackboard = useCallback((
     key: string,
@@ -1834,6 +1889,15 @@ export function useProgramRuntime(
       },
     };
   }, [runnerRows]);
+
+  // Read-only: a run's current key values, read under the current start.
+  const readRunKeyValues = useCallback((programRunId: number, signal?: AbortSignal) => {
+    const start = currentStart.current;
+    if (start === null) {
+      return Promise.reject(new Error('Execution owner identity is unavailable.'));
+    }
+    return api.programs.runKeyValues(programRunId, start, signal);
+  }, []);
 
   const stageManualResult = useCallback((
     outcome: 'succeeded' | 'failed',
@@ -1917,11 +1981,14 @@ export function useProgramRuntime(
     resumeHalt,
     reset,
     applyRecoveryAction,
+    answerOperatorQuestion,
     writeRuntimeBlackboard,
     persistentValues,
+    readRunKeyValues,
     stageManualResult,
   }), [
     active,
+    answerOperatorQuestion,
     applicationStartId,
     applyRecoveryAction,
     dismissError,
@@ -1935,6 +2002,7 @@ export function useProgramRuntime(
     cellLatch,
     composerRefusalReason,
     persistentValues,
+    readRunKeyValues,
     refresh,
     reset,
     run,

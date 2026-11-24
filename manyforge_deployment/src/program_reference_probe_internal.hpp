@@ -140,6 +140,7 @@ resolve_target_frame_associations(
     std::span<const core::ProgramFrameReferenceDTO> frame_references,
     const core::ComponentTypeCommandTargetDTO& target_type,
     const CompositionTargetResolution& target,
+    const core::CellGraphDTO& graph,
     const VerifiedRetainedModelMap& model_map,
     std::span<const core::ProgramFrameBindingDTO> frames);
 [[nodiscard]] std::vector<RobotTcp> compile_robot_tcps(

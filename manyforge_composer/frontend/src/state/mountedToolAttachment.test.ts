@@ -100,8 +100,7 @@ const LOGICAL_SCENE_PAYLOAD: Record<string, unknown> = {
           "provider_manifest_revision": "sha256:352903171f0341c0f5c018fd2a363eb7b3a69ecdb3180dbc41772ad86908ec60",
           "provider_source_epoch": "sha256:33266401dce90e4524148c09b3ed1874dfe934b90e1b1e9cac819e87d68351f7"
         },
-        "scene_resource_id": "isaac_cheese_box",
-        "support_contacts": []
+        "scene_resource_id": "isaac_cheese_box"
       },
       {
         "collision_shapes": [
@@ -133,8 +132,7 @@ const LOGICAL_SCENE_PAYLOAD: Record<string, unknown> = {
           }
         },
         "provider_evidence": null,
-        "scene_resource_id": "isaac_small_klt",
-        "support_contacts": []
+        "scene_resource_id": "isaac_small_klt"
       }
     ],
     "policy_epoch": 5,

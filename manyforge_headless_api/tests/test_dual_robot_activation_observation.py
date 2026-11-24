@@ -17,8 +17,7 @@ APPLY = {
     "apply_id": 7, "apply_generation": 2, "request_key": "ab" * 16,
     "state": "succeeded", "ok": True, "candidate_projection_revision": CANDIDATE,
     "failure_acknowledgement": "unavailable",
-    "prepared_activation": {"deployment_artifact_id": "deployment-id",
-                            "deployment_revision": "deployment", "program_binding_id": "binding"},
+    "prepared_activation": {"deployment_revision": "deployment", "program_binding_id": "binding"},
 }
 
 
@@ -37,7 +36,7 @@ def _sample():
         "selected": {"scenarioId": "scenario", "deploymentRevision": "deployment",
                      "activationOrder": {"retainedBundleId": "bundle", "graphRevision": "graph"}},
         "program": {"origin": {"kind": "scenario", "scenario_id": "scenario"},
-                    "deployment_artifact_id": "deployment-id", "program_binding_id": "binding",
+                    "program_binding_id": "binding",
                     "deployment_revision": "deployment", "retained_bundle_id": "bundle",
                     "graph_revision": "graph"},
     }
@@ -167,7 +166,7 @@ def _predecessor(sample):
                        "apply_generation": publication["transaction"]["apply_generation"],
                        "candidate_projection_revision": deepcopy(publication["projection_revision"]),
                        "prepared_activation": {field: program[field] for field in (
-                           "deployment_artifact_id", "deployment_revision", "program_binding_id")}}
+                           "deployment_revision", "program_binding_id")}}
     return {"source": deepcopy(sample["manager"]["source"]),
             "publication": publication, "apply_status": prior_apply,
             "managerApplied": deepcopy(sample["selected"]), "applied_status": program}
@@ -216,7 +215,7 @@ def test_distinct_captured_predecessor_channels_can_converge_independently():
                             "activationOrder": {"retainedBundleId": "previous-bundle",
                                                 "graphRevision": "previous-graph"}}
     previous["program"] = {"origin": {"kind": "scenario", "scenario_id": "previous-scenario"},
-                           "deployment_artifact_id": "previous-deployment-id", "program_binding_id": "previous-binding",
+                           "program_binding_id": "previous-binding",
                            "deployment_revision": "previous-deployment",
                            "retained_bundle_id": "previous-bundle", "graph_revision": "previous-graph"}
     partial = deepcopy(previous)

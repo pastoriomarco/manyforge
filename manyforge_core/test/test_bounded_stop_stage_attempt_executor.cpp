@@ -60,7 +60,6 @@ constexpr std::uint32_t kCaptureAge = 10U;
                                      operation_id,
                                      operation_revision,
                                      participant_id,
-                                     ProgramId("program.fixture"),
                                      ProgramRevision("program.revision"),
                                      ProgramBindingId("program.binding"),
                                      ProgramRunNumber(106U),

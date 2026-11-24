@@ -17,6 +17,7 @@
 
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
+#include <manyforge_core/types/component_type.hpp>
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/initial_scene_projection.hpp>
@@ -232,10 +233,8 @@ make_program_root(const RetainedBundle &bundle,
         })};
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.program.v2")},
-      {"program_id", CanonicalValue("binding_compiler_program")},
       {"program_revision", CanonicalValue(std::string(kZeroDigest))},
       {"program_profile", CanonicalValue("composable-cell-v1")},
-      {"name", CanonicalValue("Binding compiler fixture")},
       {"catalog",
        CanonicalValue(CanonicalValue::Object{
            {"api_version", CanonicalValue("manyforge.node_catalog.v3")},
@@ -269,41 +268,29 @@ make_program_root(const RetainedBundle &bundle,
   });
 }
 
-/// A v3 Program over the exact Lite gripper and its collision body.
+/// A v4 Program whose move has one collision rule over the Lite gripper's
+/// collision body.
 [[nodiscard]] CanonicalValue
-make_gripper_program_root(const RetainedBundle &bundle) {
+make_collision_rule_program_root(const RetainedBundle &bundle) {
   manyforge::deployment::test::ProgramOptions options;
   options.catalog_content_version = bundle.value().catalogs.node_environment.content_version;
-  options.include_contact_grasp = true;
-  auto root = manyforge::deployment::test::make_program_root(options);
-  auto policy = root.find_object_member("contact_policies")->as_array().front();
-  auto zones = policy.find_object_member("zones")->as_array();
-  auto zone = zones.front();
-  auto pairs = zone.find_object_member("body_pairs")->as_array();
-  auto pair = pairs.front();
-  auto body_a = *pair.find_object_member("body_a");
-  const auto replace = [](CanonicalValue object, std::string_view name, CanonicalValue value) {
-    auto fields = object.as_object();
-    for (auto &[key, selected] : fields) if (key == name) { selected = std::move(value); return CanonicalValue(std::move(fields)); }
-    fields.emplace_back(std::string(name), std::move(value));
-    return CanonicalValue(std::move(fields));
-  };
-  body_a = replace(body_a, "body", CanonicalValue(CanonicalValue::Object{
-      {"component_id", CanonicalValue(std::string(kLiteGripperComponentId))},
-      {"collision_body_id", CanonicalValue("gripper_collision")}}));
-  pair = replace(pair, "body_a", std::move(body_a));
-  pairs.front() = std::move(pair);
-  zone = replace(zone, "body_pairs", CanonicalValue(std::move(pairs)));
-  zones.front() = std::move(zone);
-  policy = replace(policy, "zones", CanonicalValue(std::move(zones)));
-  policy = replace(policy, "version", CanonicalValue(compute_content_identity(
-      policy, ContentIdentitySpec{"catalog-record-revision/contact_policy", "manyforge.contact_policy.v1", "version"})));
-  root = replace(root, "contact_policies", CanonicalValue(CanonicalValue::Array{std::move(policy)}));
-  root = replace(root, "tree", manyforge::deployment::parse_strict_json_model_yaml(R"({
-      "node_id":"gripper.command_position","instance_id":"close","children":[],
-      "parameters":{"target":{"component_id":"lite_gripper","command_target_id":"gripper"},
-      "position":{"kind":"named_preset","name":"closed"}}})").root());
-  return manyforge::deployment::test::with_program_revision(manyforge::deployment::normalize_program_authoring(root));
+  auto fields = manyforge::deployment::test::make_program_root(options).as_object();
+  for (auto &[key, value] : fields) {
+    if (key != "tree") continue;
+    value = manyforge::deployment::parse_strict_json_model_yaml(R"({
+      "node_id":"motion.move_to_joint_target","instance_id":"lift","children":[],
+      "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},
+        "base_frame":{"component_id":"lite6_robot","frame_id":"base"},
+        "tcp_endpoint":{"kind":"current"},"goal":[{"joint_name":"joint1","position_rad":0.0}],
+        "collision_rules":[
+          {"rule_id":"lift_off",
+           "a":[{"kind":"collision_body","component_id":"lite_gripper",
+                 "collision_body_id":"gripper_collision"}],
+           "b":[{"kind":"scene_objects"}],
+           "release":{"max_start_penetration_m":0.002}}]}})").root();
+  }
+  return manyforge::deployment::test::with_program_revision(
+      manyforge::deployment::normalize_program_authoring(CanonicalValue(std::move(fields))));
 }
 
 [[nodiscard]] std::string
@@ -417,7 +404,6 @@ TEST(ProgramBindingCompilerTest,
   const auto contract = verify_program_binding_contract(direct_motion_program(*context.bundle), *context.bundle, context.model_map, catalog);
   const auto binding = compile_program_binding(*contract, *context.bundle, context.model_map, catalog);
   ASSERT_NE(binding, nullptr);
-  EXPECT_EQ(binding->value().program_id, contract->value().program_id);
   EXPECT_EQ(binding->value().program_revision, contract->value().program_revision);
   EXPECT_EQ(binding->value().retained_bundle_id, context.bundle->retained_bundle_id());
   // The arm's maintained TCP inventory carries the mounted gripper's `tcp`
@@ -522,8 +508,6 @@ TEST(ProgramBindingCompilerTest,
   ASSERT_NE(second, nullptr);
   EXPECT_EQ(first->program_binding_id(), second->program_binding_id());
   EXPECT_EQ(first->canonical_bytes(), second->canonical_bytes());
-  EXPECT_EQ(first->value().program_id.value(),
-            manyforge::deployment::kDirectControlMotionProgramId);
   EXPECT_TRUE(manyforge::deployment::is_sha256_digest(
       first->value().program_revision.value()));
   EXPECT_EQ(first->value().retained_bundle_id,
@@ -560,7 +544,7 @@ TEST(ProgramBindingCompilerTest,
                          [](const auto &row) { return row.resource_role_id.value() == "joints"; }),
             target.resource_role_bindings.end());
   EXPECT_FALSE(target.collision_body_references.empty());
-  EXPECT_TRUE(first->value().contact_grasp_bindings.empty());
+  EXPECT_TRUE(first->value().collision_rule_bodies.empty());
 
   std::vector<std::string> capabilities;
   for (const auto &capability : target.capability_bindings) {
@@ -752,6 +736,108 @@ TEST(ProgramBindingCompilerTest, DirectDefaultTcpKeepsDeclaredAlias) {
   EXPECT_EQ(reloaded->value(), binding->value());
 }
 
+// OD-350: every model-bearing target declares `default_collision`; a model
+// whose collision links are all covered binds none. Direct control takes its
+// collision bodies from the composed target, so the unbound default is absent.
+[[nodiscard]] BindingCompilerContext load_context(
+    const std::filesystem::path &root,
+    const std::shared_ptr<const RetainedBundle> &materialized) {
+  const FilesystemVerifiedRetainedBundleSource bundle_source(root);
+  auto bundle = bundle_source.get_verified(materialized->retained_bundle_id());
+  if (bundle == nullptr ||
+      bundle->value().compiled_products.symbol_role_maps.size() != 1U)
+    throw std::logic_error("test retained bundle has no sole model map");
+  const FilesystemVerifiedRetainedModelMapSource map_source(root);
+  auto map = map_source.get_verified(RetainedModelMapQuery{
+      bundle->retained_bundle_id(),
+      bundle->value().compiled_products.symbol_role_maps.front().product_id});
+  if (!map) throw std::logic_error("test could not reload retained model map");
+  return {std::move(bundle), std::move(*map)};
+}
+
+void expect_no_default_collision_body(const manyforge::deployment::ProgramBinding &binding) {
+  ASSERT_EQ(binding.value().target_bindings.size(), 1U);
+  const auto &bodies = binding.value().target_bindings.front().collision_body_references;
+  EXPECT_FALSE(bodies.empty());
+  for (const auto &body : bodies)
+    EXPECT_NE(body.collision_body_id.value(), manyforge::core::kDefaultCollisionBodyRoleId);
+}
+
+void map_gripper_with_default_collision(CanonicalValue::Object &members) {
+  manyforge::deployment::test::map_lite_gripper_only_component(members);
+  const auto with_default = [](CanonicalValue target) {
+    auto fields = target.as_object();
+    for (auto &[key, value] : fields) {
+      if (key != "collision_body_roles") continue;
+      auto rows = value.as_array();
+      rows.insert(rows.begin(), CanonicalValue(CanonicalValue::Object{
+          {"collision_body_role_id",
+           CanonicalValue(std::string(manyforge::core::kDefaultCollisionBodyRoleId))},
+          {"model_role_id", CanonicalValue("gripper_model")},
+          {"asset_collision_body_role_id",
+           CanonicalValue(std::string(manyforge::core::kDefaultCollisionBodyRoleId))},
+      }));
+      value = CanonicalValue(std::move(rows));
+    }
+    return CanonicalValue(std::move(fields));
+  };
+  for (auto &[name, value] : members) {
+    if (name != "command_targets") continue;
+    auto targets = value.as_array();
+    for (auto &target : targets) target = with_default(std::move(target));
+    value = CanonicalValue(std::move(targets));
+  }
+}
+
+TEST(ProgramBindingCompilerTest, DirectMotionOmitsAnUnboundDefaultCollisionBody) {
+  ScopedTrustedRoot root;
+  const auto materialized =
+      manyforge::deployment::test::materialize_lite6_retained_consumer_fixture_from(
+          root.path(),
+          manyforge::deployment::test::make_lite6_ros2_control_observed_consumer_retention_fixture(
+              false, false, "flange", false, false, false, true));
+  const auto context = load_context(root.path(), materialized.bundle);
+  FilesystemCatalogArtifactStore catalog(root.path());
+  const auto binding = compile_direct_control_motion_program_binding(
+      manyforge::core::ControllableComponentId(std::string(kLite6ControllableComponentId)),
+      manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId)),
+      *context.bundle, context.model_map, catalog);
+  ASSERT_NE(binding, nullptr);
+  expect_no_default_collision_body(*binding);
+  const auto inventory = compile_direct_control_program_binding_inventory(
+      *context.bundle, context.model_map, catalog);
+  ASSERT_EQ(inventory.motion.size(), 1U);
+  EXPECT_EQ(inventory.motion.front().binding->canonical_bytes(), binding->canonical_bytes());
+}
+
+TEST(ProgramBindingCompilerTest, DirectGripperOmitsAnUnboundDefaultCollisionBody) {
+  ScopedTrustedRoot root;
+  const auto structural =
+      manyforge::deployment::test::make_lite_gripper_structural_retention_fixture();
+  const auto materialized =
+      manyforge::deployment::test::materialize_lite6_retained_consumer_fixture_from(
+          root.path(),
+          manyforge::deployment::test::make_lite6_controllable_retention_fixture(
+              false, false, 1U, {}, false, true, "resource", true, {}, {}, false,
+              true, std::nullopt, kLite6ArmTargetId, std::nullopt, std::nullopt, {},
+              true, {}, "manyforge.provider.ros2_control", true, true, &structural,
+              manyforge::deployment::test::map_lite_gripper_only_graph, false,
+              "pneumatic", std::nullopt, "commanded",
+              map_gripper_with_default_collision));
+  const auto context = load_context(root.path(), materialized.bundle);
+  FilesystemCatalogArtifactStore catalog(root.path());
+  const auto binding = compile_direct_control_gripper_program_binding(
+      manyforge::core::ControllableComponentId(std::string(kLiteGripperComponentId)),
+      manyforge::core::CommandTargetId(std::string(kLite6GripperTargetId)),
+      *context.bundle, context.model_map, catalog);
+  ASSERT_NE(binding, nullptr);
+  expect_no_default_collision_body(*binding);
+  const auto inventory = compile_direct_control_program_binding_inventory(
+      *context.bundle, context.model_map, catalog);
+  ASSERT_EQ(inventory.gripper.size(), 1U);
+  EXPECT_EQ(inventory.gripper.front().binding->canonical_bytes(), binding->canonical_bytes());
+}
+
 // A declared frame role binds as itself only; a default TCP named
 // otherwise (`cup_center`, or a tool's `flange`) has no `tcp` name.
 TEST(ProgramBindingCompilerTest, DeclaredFrameRolesBindUnderTheirOwnNameOnly) {
@@ -882,8 +968,6 @@ TEST(ProgramBindingCompilerTest,
   ASSERT_NE(second, nullptr);
   EXPECT_EQ(first->program_binding_id(), second->program_binding_id());
   EXPECT_EQ(first->canonical_bytes(), second->canonical_bytes());
-  EXPECT_EQ(first->value().program_id.value(),
-            manyforge::deployment::kDirectControlGripperProgramId);
   EXPECT_TRUE(manyforge::deployment::is_sha256_digest(
       first->value().program_revision.value()));
   ASSERT_EQ(first->value().target_bindings.size(), 1U);
@@ -906,7 +990,7 @@ TEST(ProgramBindingCompilerTest,
             manyforge::core::kGripperPositionCommandSchemaRevision);
   ASSERT_EQ(target.resource_role_bindings.size(), 1U);
   ASSERT_EQ(target.resource_role_bindings.front().resource_ids.size(), 1U);
-  EXPECT_TRUE(first->value().contact_grasp_bindings.empty());
+  EXPECT_TRUE(first->value().collision_rule_bodies.empty());
 }
 
 TEST(ProgramBindingCompilerTest,
@@ -969,7 +1053,7 @@ TEST(ProgramBindingCompilerTest, RejectsLegacyProgramBeforeBinding) {
     EXPECT_EQ(error.code(), "program_format_unsupported");
     ASSERT_TRUE(error.unsupported_format());
     EXPECT_EQ(error.unsupported_format()->actual_api_version, "manyforge.program.v2");
-    EXPECT_EQ(error.unsupported_format()->supported_api_version, "manyforge.program.v3");
+    EXPECT_EQ(error.unsupported_format()->supported_api_version, "manyforge.program.v4");
   }
 }
 
@@ -1189,6 +1273,29 @@ TEST(ProgramBindingCompilerTest, TcpSelectorsFollowTheRunTimeRuleAtValidation) {
   EXPECT_EQ(unmounted, (std::multiset<std::string>{"tcp_tool_not_mounted@unmounted"}));
 }
 
+// OD-372: on the arm target the attach node accepts the mounted gripper's TCP
+// (the arm's kinematics places it) and the gripper's touch bodies; a gripper
+// that is not mounted on the arm is refused.
+TEST(ProgramBindingCompilerTest, AttachOnArmTargetAcceptsAMountedToolFrame) {
+  using namespace tcp_validation;
+  const std::string attach =
+      R"({"node_id":"scene.attach_carried_object","instance_id":"attach","children":[],)"
+      R"("parameters":{"scene_resource_id":"part",)"
+      R"("target":{"component_id":"lite6_robot","command_target_id":"arm"},)"
+      R"("carrier_frame_ref":{"component_id":"lite_gripper","frame_id":"tcp"},)"
+      R"("touch_bodies":[{"component_id":"lite_gripper","collision_body_id":"gripper_collision"}]}})";
+  const auto not_mounted = [](const std::multiset<std::string> &codes) {
+    return codes.count("frame_not_mounted@attach") + codes.count("collision_body_not_mounted@attach");
+  };
+  ScopedTrustedRoot root;
+  EXPECT_EQ(not_mounted(Diagnose(root.path(), "examples/mock_lite6_pick_and_place.scenario", attach)),
+            0U);
+  ScopedTrustedRoot unmounted_root;
+  const auto unmounted = Diagnose(unmounted_root.path(), {}, attach, true);
+  EXPECT_EQ(unmounted.count("frame_not_mounted@attach"), 1U);
+  EXPECT_EQ(unmounted.count("collision_body_not_mounted@attach"), 1U);
+}
+
 // Gripper status reads the owner's command state: a valve-only pneumatic
 // gripper has one; one whose valves are mapped I/O writes has none.
 TEST(ProgramBindingCompilerTest, GripperStatusNeedsAnOwnerCommandState) {
@@ -1366,7 +1473,7 @@ TEST(ProgramBindingCompilerTest, ReadbackRejectsForgedNonExecutableOutcome) {
   const auto program = manyforge::deployment::test::make_pneumatic_program_contract(product, root.path());
   // This is untrusted outcome data, not an unvalidated Program contract.
   const manyforge::deployment::ProgramNonExecutableOutcomeDTO claim{
-      program->value().program_id, program->value().program_revision,
+      program->value().program_revision,
       product.bundle->retained_bundle_id(), product.bundle->value().cell_graph.graph_revision,
       {{{manyforge::core::ControllableComponentId("lite_gripper"),
          manyforge::core::CommandTargetId("gripper")},
@@ -1456,7 +1563,6 @@ TEST(ProgramBindingCompilerTest, NoProgramReadbackProvesAbsenceWithoutInventingA
   payload = with_member(payload, "program", CanonicalValue(nullptr));
   payload = with_member(payload, "program_binding", CanonicalValue(nullptr));
   auto value = with_member(bound.normalized_root(), "activation_payload", payload);
-  value = with_member(value, "program_id", CanonicalValue(nullptr));
   value = with_member(value, "program_revision", CanonicalValue(nullptr));
   value = with_member(value, "program_outcome", CanonicalValue(CanonicalValue::Object{
       {"kind", CanonicalValue("no_program")},
@@ -1464,7 +1570,6 @@ TEST(ProgramBindingCompilerTest, NoProgramReadbackProvesAbsenceWithoutInventingA
   const auto prepared = manyforge::deployment::parse_prepared_activation_input(reidentify(value));
   EXPECT_EQ(prepared.closure().program, nullptr);
   EXPECT_EQ(prepared.closure().program_binding, nullptr);
-  EXPECT_FALSE(prepared.program_id().has_value());
   EXPECT_FALSE(prepared.program_revision().has_value());
   EXPECT_FALSE(prepared.program_outcome().has_value());
   EXPECT_NO_THROW(manyforge::deployment::verify_prepared_program_outcome(prepared));
@@ -1491,11 +1596,10 @@ TEST(ProgramBindingCompilerTest, NoProgramReadbackProvesAbsenceWithoutInventingA
   EXPECT_THROW(static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
       reidentify(with_member(value, "activation_payload", legacy_payload)))),
       manyforge::deployment::PreparedActivationInputError);
-  for (const auto field : {"program_id", "program_revision"}) {
-    EXPECT_THROW(static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
-        reidentify(with_member(value, field, *bound.normalized_root().find_object_member(field))))),
-        manyforge::deployment::PreparedActivationInputError);
-  }
+  EXPECT_THROW(static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
+      reidentify(with_member(value, "program_revision",
+                             *bound.normalized_root().find_object_member("program_revision"))))),
+      manyforge::deployment::PreparedActivationInputError);
   EXPECT_THROW(static_cast<void>(manyforge::deployment::parse_prepared_activation_input(
       reidentify(with_member(value, "schema_version", CanonicalValue("manyforge.prepared_activation_input.v3"))))),
       manyforge::deployment::PreparedActivationInputError);
@@ -1518,7 +1622,6 @@ TEST(ProgramBindingCompilerTest, AssemblesANoProgramActivationWithoutAProgramClo
   EXPECT_EQ(prepared.closure().program_binding, nullptr);
   EXPECT_TRUE(prepared.closure().catalog_artifacts.empty());
   EXPECT_TRUE(prepared.closure().retained_model_map.has_value());
-  EXPECT_FALSE(prepared.program_id().has_value());
   EXPECT_FALSE(prepared.program_revision().has_value());
   EXPECT_FALSE(prepared.program_binding_id().has_value());
   EXPECT_FALSE(prepared.program_outcome().has_value());
@@ -1566,6 +1669,74 @@ TEST(ProgramBindingCompilerTest,
                manyforge::deployment::PreparedActivationInputError);
 }
 
+TEST(ProgramBindingCompilerTest, ProgramSceneMeshUrisAreEveryMeshShapeOfTheProgram) {
+  // The initial Scene and Scene-node shape parameters alike; sorted, unique.
+  const auto program = manyforge::deployment::parse_strict_json_model_yaml(R"({
+      "nodes":[{"parameters":{"shape":{"mesh_resource_uri":"/abs/a.obj","type":"mesh"}}},
+               {"parameters":{"shape":{"mesh_resource_uri":"b/part.obj","type":"mesh"}}},
+               {"type":"mesh"}],
+      "scene":[{"shape":{"mesh_resource_uri":"b/part.obj","mesh_scale":[1,1,1],"type":"mesh"}},
+               {"shape":{"box_dimensions_m":[1,1,1],"type":"box"}},
+               {"shape":{"mesh_resource_uri":"../c.obj","type":"box"}}]})").root();
+  EXPECT_EQ(manyforge::deployment::program_scene_mesh_uris(program),
+            (std::vector<std::string>{"/abs/a.obj", "b/part.obj"}));
+  EXPECT_TRUE(
+      manyforge::deployment::program_scene_mesh_uris(CanonicalValue(nullptr)).empty());
+}
+
+TEST(ProgramBindingCompilerTest,
+     ReadbackRequiresSceneMeshesToBeCarriedArtifactsOfTheProgramsMeshes) {
+  namespace d = manyforge::deployment;
+  ScopedTrustedRoot root;
+  const auto product = make_pneumatic_product(root.path());
+  const auto bound = prepare_v3(root.path(), product, "gripper");
+  // The pneumatic Program names no mesh: nothing is captured.
+  EXPECT_TRUE(bound.scene_meshes().empty());
+  EXPECT_EQ(*bound.normalized_root().find_object_member("scene_meshes"),
+            CanonicalValue(CanonicalValue::Array{}));
+  ASSERT_FALSE(bound.closure().raw_artifacts.empty());
+  const auto &carried = bound.closure().raw_artifacts.front();
+  const auto digest = carried.content_digest.value();
+  const auto size = static_cast<double>(carried.bytes.size());
+  const auto row = [](std::string uri, std::string content_digest,
+                      double byte_size) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"byte_size", CanonicalValue(byte_size)},
+        {"content_digest", CanonicalValue(std::move(content_digest))},
+        {"resource_uri", CanonicalValue(std::move(uri))},
+    });
+  };
+  const auto refused = [&](CanonicalValue::Array rows, std::string_view reason) {
+    try {
+      static_cast<void>(d::parse_prepared_activation_input(reidentify(
+          with_member(bound.normalized_root(), "scene_meshes",
+                      CanonicalValue(std::move(rows))))));
+      ADD_FAILURE() << "scene_meshes accepted; expected: " << reason;
+    } catch (const d::PreparedActivationInputError &error) {
+      EXPECT_NE(std::string(error.what()).find(reason), std::string::npos)
+          << error.what();
+    }
+  };
+  refused({row("b.obj", digest, size), row("a.obj", digest, size)},
+          "not uniquely sorted by resource_uri");
+  refused({row("a.obj", digest, size), row("a.obj", digest, size)},
+          "not uniquely sorted by resource_uri");
+  refused({row("a.obj", "sha256:" + std::string(64U, 'f'), size)},
+          "names no carried raw artifact");
+  refused({row("a.obj", digest, size + 1.0)}, "names no carried raw artifact");
+  // A carried artifact of the right size, but the Program names no such mesh.
+  refused({row("a.obj", digest, size)},
+          "differ from the carried Program's scene meshes");
+  // The field is required.
+  auto without = bound.normalized_root().as_object();
+  std::erase_if(without, [](const auto &member) {
+    return member.first == "scene_meshes";
+  });
+  EXPECT_THROW(static_cast<void>(d::parse_prepared_activation_input(
+                   reidentify(CanonicalValue(std::move(without))))),
+               d::PreparedActivationInputError);
+}
+
 TEST(ProgramBindingCompilerTest,
      ReadbackRejectsANonExecutableOutcomeForgedOverABindableProgram) {
   ScopedTrustedRoot root;
@@ -1575,7 +1746,7 @@ TEST(ProgramBindingCompilerTest,
   const auto program = manyforge::deployment::test::make_pneumatic_program_contract(product, root.path());
   // Construct an untrusted claimed outcome, never an unvalidated contract.
   const manyforge::deployment::ProgramNonExecutableOutcomeDTO claim{
-      program->value().program_id, program->value().program_revision,
+      program->value().program_revision,
       product.bundle->retained_bundle_id(), product.bundle->value().cell_graph.graph_revision,
       {{ {manyforge::core::ControllableComponentId("lite_gripper"),
            manyforge::core::CommandTargetId("gripper")},
@@ -2290,8 +2461,6 @@ TEST(ProgramBindingCompilerTest,
   EXPECT_TRUE(direct.motion.empty());
   EXPECT_TRUE(direct.gripper.empty());
   ASSERT_EQ(direct.io.size(), 1U);
-  EXPECT_EQ(direct.io.front()->value().program_id.value(),
-            manyforge::deployment::kDirectControlIoProgramId);
   ASSERT_EQ(direct.io.front()->value().target_bindings.size(), 1U);
   EXPECT_TRUE(direct.io.front()
                   ->value()
@@ -2335,57 +2504,36 @@ TEST(ProgramBindingCompilerTest,
   }
 }
 
-TEST(ProgramBindingCompilerTest, CompilesPortableReleaseWithoutChangingItsEnvelope) {
+TEST(ProgramBindingCompilerTest, CompilesTheCollisionBodiesOfNodeRules) {
   ScopedTrustedRoot root;
-  const auto context = make_context(root.path(), true, false, false, true);
-  auto program = make_gripper_program_root(*context.bundle);
-  auto policies = program.find_object_member("contact_policies")->as_array();
-  auto policy = policies.front();
-  auto zones = policy.find_object_member("zones")->as_array();
-  auto zone = zones.front().as_object();
-  std::erase_if(zone, [](const auto& field) {
-    return field.first == "max_penetration_m" ||
-           field.first == "terminal_window_start_fraction";
-  });
-  zone.emplace_back("release_evidence_mode", CanonicalValue("signed_penetration"));
-  zone.emplace_back("max_start_penetration_m", CanonicalValue(0.002));
-  zones.front() = CanonicalValue(std::move(zone));
-  policy = with_member(policy, "mode", CanonicalValue("contact_release"));
-  policy = with_member(policy, "zones", CanonicalValue(std::move(zones)));
-  policy = with_member(policy, "version", CanonicalValue(compute_content_identity(
-      policy, ContentIdentitySpec{.identity_domain = "catalog-record-revision/contact_policy",
-                                  .api_version = "manyforge.contact_policy.v1",
-                                  .own_field = "version"})));
-  policies.front() = policy;
-  program = with_member(program, "contact_policies", CanonicalValue(std::move(policies)));
-  program = with_member(program, "program_revision", CanonicalValue(compute_content_identity(
-      program, ContentIdentitySpec{.identity_domain = "program-revision",
-                                   .api_version = "manyforge.program.v3",
-                                   .own_field = "program_revision"})));
+  // The maintained Lite6 product: the arm `lite6_robot` with the mounted
+  // `lite_gripper` that the Program's rule names.
+  const auto context = make_maintained_motion_context(root.path());
+  const auto program = make_collision_rule_program_root(*context.bundle);
   FilesystemCatalogArtifactStore catalog_store(root.path());
   const auto contract = verify_program_binding_contract(canonical_json(program), *context.bundle, context.model_map, catalog_store);
-  ASSERT_EQ(contract->value().contact_grasp_templates.size(), 1U);
-  const auto& release = std::get<manyforge::core::ContactReleaseEnvelopeDTO>(
-      contract->value().contact_grasp_templates.front().envelope);
-  EXPECT_DOUBLE_EQ(release.max_start_penetration_m, 0.002);
-  EXPECT_TRUE(release.require_separation_by_end);
-  EXPECT_TRUE(release.require_strictly_decreasing_penetration);
-  EXPECT_FALSE(release.allow_recontact);
+  ASSERT_EQ(contract->value().collision_rule_bodies.size(), 1U);
+  EXPECT_EQ(contract->value().collision_rule_bodies.front().component_id.value(),
+            kLiteGripperComponentId);
+  EXPECT_EQ(contract->value().collision_rule_bodies.front().collision_body_id.value(),
+            "gripper_collision");
   const auto binding = compile_program_binding(
       *contract, *context.bundle, context.model_map, catalog_store);
-  ASSERT_EQ(binding->value().contact_grasp_bindings.size(), 1U);
-  const auto& bound = binding->value().contact_grasp_bindings.front();
-  EXPECT_EQ(bound.envelope, contract->value().contact_grasp_templates.front().envelope);
-  EXPECT_EQ(bound.runtime_object_id.value(), "selected_object");
-  ASSERT_EQ(bound.allowed_body_bindings.size(), 1U);
-  EXPECT_EQ(bound.allowed_body_bindings.front().body.component_id.value(), kLiteGripperComponentId);
-  const auto& body = bound.allowed_body_bindings.front();
-  EXPECT_EQ(body.body.collision_body_id.value(), "gripper_collision");
+  ASSERT_EQ(binding->value().collision_rule_bodies.size(), 1U);
+  const auto& body = binding->value().collision_rule_bodies.front();
+  EXPECT_EQ(body.body, contract->value().collision_rule_bodies.front());
+  EXPECT_FALSE(body.model_role_id.has_value());
   ASSERT_FALSE(body.collision_body_ids.empty());
   for (std::size_t index = 0; index < body.collision_body_ids.size(); ++index)
     EXPECT_EQ(body.collision_body_ids[index], manyforge::core::make_component_collision_body_id(
         body.body.component_id, body.model_instance_id,
         manyforge::core::CollisionBodyRoleId(body.body.collision_body_id.value()), index));
+  // The rule body is also an ordinary collision-body binding.
+  EXPECT_NE(std::find_if(binding->value().collision_body_bindings.begin(),
+                         binding->value().collision_body_bindings.end(),
+                         [&](const auto& row) { return row.reference == body.body; }),
+            binding->value().collision_body_bindings.end());
+  EXPECT_NE(binding->canonical_bytes().find("\"collision_rule_bodies\""), std::string::npos);
   EXPECT_EQ(manyforge::deployment::reload_verified_program_binding(
                 binding->canonical_bytes(), *context.bundle, context.model_map, catalog_store)->value(),
             binding->value());

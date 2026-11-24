@@ -196,8 +196,6 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(CommissionedStopInterfaceId);
   MANYFORGE_BIND_STRONG_STRING(CommissionedStopInterfaceRevision);
   MANYFORGE_BIND_STRONG_STRING(StopInvocationLaneId);
-  MANYFORGE_BIND_STRONG_STRING(ContactPolicyId);
-  MANYFORGE_BIND_STRONG_STRING(ContactPolicyRevision);
 
   MANYFORGE_BIND_STRONG_STRING(ProviderInstanceId);
   MANYFORGE_BIND_STRONG_STRING(ProviderManifestId);
@@ -209,7 +207,6 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(ExternalResourceAlias);
   MANYFORGE_BIND_STRONG_STRING(SiteOverlayValueRef);
 
-  MANYFORGE_BIND_STRONG_STRING(DeploymentArtifactId);
   MANYFORGE_BIND_STRONG_STRING(DeploymentRevision);
   MANYFORGE_BIND_STRONG_STRING(ProductId);
   MANYFORGE_BIND_STRONG_STRING(ProductContractId);
@@ -228,7 +225,6 @@ void register_strong_identity_bindings(py::module_& module) {
   MANYFORGE_BIND_STRONG_STRING(CommandSchemaRevision);
   MANYFORGE_BIND_STRONG_STRING(CommandOptionId);
   MANYFORGE_BIND_STRONG_STRING(ChannelRoleId);
-  MANYFORGE_BIND_STRONG_STRING(ProgramId);
   MANYFORGE_BIND_STRONG_STRING(ProgramRevision);
   MANYFORGE_BIND_STRONG_STRING(ProgramBindingId);
   MANYFORGE_BIND_STRONG_STRING(MoveId);

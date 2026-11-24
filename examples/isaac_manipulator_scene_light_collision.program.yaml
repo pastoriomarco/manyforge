@@ -1,17 +1,10 @@
-api_version: manyforge.program.v3
-program_id: isaac_manipulator_scene_light_collision
-program_revision: sha256:865d9a81f783fbbb864b81daf2cb16e17f70d29b217932bf64fb8eef47604b18
+api_version: manyforge.program.v4
+program_revision: sha256:9f8704d06f57976c63f93f2e2d8afe9758b6d01404eee0ef1368348e0ba1cc91
 program_profile: composable-cell-v1
-name: isaac_manipulator_scene_light_collision
-description: Retained Isaac UR10e runtime-collision scenario. It starts from the exact light-scene geometry,
-  removes the declared probe wall before planning, then re-inserts that wall concurrently with command
-  execution so the Manager-owned collision and Stop path can be observed without a supervisor fallback.
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
-  lanes:
-  - isaac-sim
   assistant: forbidden
   requires:
   - robotiq_2f_140_gripper
@@ -25,7 +18,7 @@ scene:
 - scene_resource_id: isaac_cheese_box
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj
     mesh_scale:
     - 1.0
     - 1.0
@@ -47,7 +40,7 @@ scene:
 - scene_resource_id: isaac_small_klt
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj
     mesh_scale:
     - 1.0
     - 1.0
@@ -67,7 +60,7 @@ scene:
 - scene_resource_id: isaac_small_klt_01
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj
     mesh_scale:
     - 1.0
     - 1.0
@@ -87,7 +80,7 @@ scene:
 - scene_resource_id: isaac_soup_can
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj
     mesh_scale:
     - 1.0
     - 1.0
@@ -107,7 +100,7 @@ scene:
 - scene_resource_id: isaac_table_low_327
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj
     mesh_scale:
     - 1.0
     - 1.5

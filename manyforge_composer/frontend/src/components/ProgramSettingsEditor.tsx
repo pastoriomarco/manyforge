@@ -17,7 +17,6 @@ import {
   type ProgramMotionValues,
 } from '../utils/programAuthoring';
 
-const LANES = ['manyforge-only', 'isaac-sim', 'real-robot'] as const;
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 
 interface ProgramSettingsEditorProps {
@@ -53,10 +52,10 @@ function parseIdentifierList(value: string, label: string): string[] {
 function initialCompatibility(program: ProgramAuthoringDocument) {
   const compatibility = program.compatibility ?? {};
   return {
-    lanes: stringList(compatibility.lanes),
+    // A Program that names no assistant disposition is shown (and saved) as Optional.
     assistant: typeof compatibility.assistant === 'string'
       ? compatibility.assistant
-      : '',
+      : 'optional',
     requires: stringList(compatibility.requires).join(', '),
     tags: stringList(compatibility.tags).join(', '),
   };
@@ -94,14 +93,12 @@ export function ProgramSettingsEditor({
   const appliedMotion = motionConfiguration.available
     ? motionConfiguration.configuration.values
     : null;
-  const [name, setName] = useState(program.name);
-  const [description, setDescription] = useState(program.description ?? '');
   const [compatibility, setCompatibility] = useState(() => initialCompatibility(program));
   const [executionGroups, setExecutionGroups] = useState(
     () => independentExecutionGroups(program),
   );
   const [error, setError] = useState<string | null>(null);
-  const [errorTarget, setErrorTarget] = useState('program-settings-name');
+  const [errorTarget, setErrorTarget] = useState('program-settings-requires');
   const [motion, setMotion] = useState<MotionDefaults | null>(appliedMotion);
   const [motionHistory, setMotionHistory] = useState<MotionHistory | null>(null);
   const [motionRedo, setMotionRedo] = useState<MotionHistory | null>(null);
@@ -112,12 +109,10 @@ export function ProgramSettingsEditor({
   const [motionError, setMotionError] = useState<string | null>(null);
 
   useEffect(() => {
-    setName(program.name);
-    setDescription(program.description ?? '');
     setCompatibility(initialCompatibility(program));
     setExecutionGroups(independentExecutionGroups(program));
     setError(null);
-    setErrorTarget('program-settings-name');
+    setErrorTarget('program-settings-requires');
     setMotion(appliedMotion);
     setMotionConflict(null);
     setMotionError(null);
@@ -138,10 +133,7 @@ export function ProgramSettingsEditor({
     ? appliedBinding
     : null;
   const original = useMemo(() => initialCompatibility(program), [program]);
-  const dirty = name.trim() !== program.name
-    || description.trim() !== (program.description ?? '')
-    || JSON.stringify([...compatibility.lanes].sort()) !== JSON.stringify([...original.lanes].sort())
-    || compatibility.assistant !== original.assistant
+  const dirty = compatibility.assistant !== original.assistant
     || compatibility.requires !== original.requires
     || compatibility.tags !== original.tags
     || executionGroups !== independentExecutionGroups(program);
@@ -157,8 +149,6 @@ export function ProgramSettingsEditor({
   const submit = () => {
     if (busy || !dirty) return;
     try {
-      if (!name.trim()) throw new Error('Program name is required.');
-      const lanes = LANES.filter((lane) => compatibility.lanes.includes(lane));
       const requires = parseIdentifierList(compatibility.requires, 'Requirements');
       const tags = parseIdentifierList(compatibility.tags, 'Tags');
       const groups = parseIdentifierList(
@@ -166,8 +156,7 @@ export function ProgramSettingsEditor({
         'Execution groups',
       );
       const nextCompatibility: Record<string, JsonValue> = {};
-      if (lanes.length > 0) nextCompatibility.lanes = lanes;
-      if (compatibility.assistant) nextCompatibility.assistant = compatibility.assistant;
+      nextCompatibility.assistant = compatibility.assistant;
       if (requires.length > 0) nextCompatibility.requires = requires;
       if (tags.length > 0) nextCompatibility.tags = tags;
       const preservedDeferredGroups = Object.fromEntries(
@@ -179,8 +168,6 @@ export function ProgramSettingsEditor({
         ]),
       ) as Record<string, JsonValue>;
       onMutate('program_draft_update_settings', {
-        name: name.trim(),
-        description: description.trim(),
         program_profile: program.program_profile,
         compatibility: nextCompatibility,
         execution_groups: {
@@ -196,32 +183,27 @@ export function ProgramSettingsEditor({
       const message = caught instanceof Error ? caught.message : 'Program settings are invalid.';
       setError(message);
       setErrorTarget(
-        message.startsWith('Requirements')
-          ? 'program-settings-requires'
-          : message.startsWith('Tags')
-            ? 'program-settings-tags'
-            : message.startsWith('Execution groups')
-              ? 'program-settings-execution-groups'
-            : 'program-settings-name',
+        message.startsWith('Tags')
+          ? 'program-settings-tags'
+          : message.startsWith('Execution groups')
+            ? 'program-settings-execution-groups'
+            : 'program-settings-requires',
       );
     }
   };
   const guardInvalidTab = (event: KeyboardEvent<HTMLFormElement>) => {
     if (event.key !== 'Tab') return;
     try {
-      if (!name.trim()) throw new Error('Program name is required.');
       parseIdentifierList(compatibility.requires, 'Requirements');
       parseIdentifierList(compatibility.tags, 'Tags');
       parseIdentifierList(executionGroups, 'Execution groups');
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'Program settings are invalid.';
-      const target = message.startsWith('Requirements')
-        ? 'program-settings-requires'
-        : message.startsWith('Tags')
-          ? 'program-settings-tags'
-          : message.startsWith('Execution groups')
-            ? 'program-settings-execution-groups'
-          : 'program-settings-name';
+      const target = message.startsWith('Tags')
+        ? 'program-settings-tags'
+        : message.startsWith('Execution groups')
+          ? 'program-settings-execution-groups'
+          : 'program-settings-requires';
       event.preventDefault();
       setError(message);
       setErrorTarget(target);
@@ -327,12 +309,10 @@ export function ProgramSettingsEditor({
           <button
             type="button"
             onClick={() => {
-              setName(program.name);
-              setDescription(program.description ?? '');
               setCompatibility(initialCompatibility(program));
               setExecutionGroups(independentExecutionGroups(program));
               setError(null);
-              setErrorTarget('program-settings-name');
+              setErrorTarget('program-settings-requires');
             }}
           >
             Discard edit
@@ -350,18 +330,9 @@ export function ProgramSettingsEditor({
       <section className={`dcard${identityDiagnostic ? ' backend-invalid' : ''}`} title={identityDiagnostic?.message}>
         <h3>Identity</h3>
         <dl>
-          <div><dt>Program ID</dt><dd><code>{program.program_id}</code></dd></div>
           <div><dt>Profile</dt><dd><code>{program.program_profile}</code></dd></div>
           <div><dt>Catalog</dt><dd><code>{program.catalog.content_version}</code></dd></div>
         </dl>
-        <label>
-          Name
-          <input id="program-settings-name" value={name} disabled={busy} aria-invalid={error !== null && errorTarget === 'program-settings-name'} title={errorTarget === 'program-settings-name' ? error ?? undefined : undefined} onChange={(event) => setName(event.target.value)} />
-        </label>
-        <label>
-          Description
-          <textarea rows={3} value={description} disabled={busy} onChange={(event) => setDescription(event.target.value)} />
-        </label>
       </section>
 
       <section className="dcard">
@@ -525,25 +496,6 @@ export function ProgramSettingsEditor({
 
       <section className={`dcard${compatibilityDiagnostic ? ' backend-invalid' : ''}`} title={compatibilityDiagnostic?.message}>
         <h3>Portable compatibility</h3>
-        <fieldset className="dchecks">
-          <legend>Supported lanes</legend>
-          {LANES.map((lane) => (
-            <label key={lane}>
-              <input
-                type="checkbox"
-                checked={compatibility.lanes.includes(lane)}
-                disabled={busy}
-                onChange={(event) => setCompatibility((current) => ({
-                  ...current,
-                  lanes: event.target.checked
-                    ? [...current.lanes, lane]
-                    : current.lanes.filter((item) => item !== lane),
-                }))}
-              />
-              {lane}
-            </label>
-          ))}
-        </fieldset>
         <label>
           Assistant
           <select
@@ -554,7 +506,6 @@ export function ProgramSettingsEditor({
               assistant: event.target.value,
             }))}
           >
-            <option value="">Not specified</option>
             <option value="required">Required</option>
             <option value="optional">Optional</option>
             <option value="forbidden">Forbidden</option>

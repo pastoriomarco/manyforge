@@ -23,13 +23,8 @@ catalog_schemas:
     qualification: qualified
   - record_kind: component_type
     schema_id: manyforge.component_type.v1
-    schema_revision: sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde
+    schema_revision: sha256:4c1a934edc63d9da5eac2d1aef76d86142fcb797950a12306009e028d551c3fa
     relative_path: catalog/manyforge.component_type.v1.yaml
-    qualification: qualified
-  - record_kind: contact_policy
-    schema_id: manyforge.contact_policy.v1
-    schema_revision: sha256:f7adb173ef71d9de9011c85a19224cace5e721918fb1659fcada6ab93901ad33
-    relative_path: catalog/manyforge.contact_policy.v1.yaml
     qualification: qualified
   - record_kind: control_interface_contract
     schema_id: manyforge.control_interface_contract.v1
@@ -75,7 +70,7 @@ value_schemas:
     relative_path: value/manyforge.value_schema.runtime.empty.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.io_provider_execution.v1
-    schema_revision: sha256:500cfe739120003e06057cdf78a94f006eb4fc4ef157a7f55f70ab4d1aa45b1d
+    schema_revision: sha256:829e709117459cc5378ec20ceda9e3ea7ac6d1e8dda1d1798f9a1373ef9acc39
     relative_path: value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.pose_source.v2
@@ -83,6 +78,6 @@ value_schemas:
     relative_path: value/manyforge.value_schema.runtime.pose_source.v2.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-    schema_revision: sha256:b37e963e21f9c72c47f713d7bc6b5f24fb680e2126d0f29e4cc4ed86fc9155ba
+    schema_revision: sha256:d64c2c161977740644788fb1962c89b00777c38d3a592020fc916c4e7600de21
     relative_path: value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
     qualification: qualified

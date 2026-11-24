@@ -58,6 +58,7 @@
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_component_manager/site_settings.hpp>
 #include <manyforge_component_manager/execution_host_exit.hpp>
+#include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/execution_interrupt_support.hpp>
@@ -1166,14 +1167,14 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     require_source_link(authored_configuration->mount_frame, "mount frame");
     require_source_link(authored_configuration->attach_frame, "attach frame");
     require_source_link(authored_configuration->tcp_frame, "TCP frame");
-    for (const auto &link : authored_configuration->touch_links) {
-      require_source_link(link, "touch link");
+    for (const auto &link : authored_configuration->grip_body_links) {
+      require_source_link(link, "grip body link");
     }
     for (const auto &frame : authored_configuration->auxiliary_frames) {
       require_source_link(frame, "auxiliary frame");
     }
   }
-  CanonicalValue::Array touch_links;
+  CanonicalValue::Array grip_body_links;
   CanonicalValue::Array auxiliary_frames;
   std::optional<std::string> description;
   std::optional<std::string> actuation_kind;
@@ -1194,9 +1195,9 @@ CanonicalNullableText(const std::optional<std::string> &value) {
     mount_frame = authored_configuration->mount_frame;
     attach_frame = authored_configuration->attach_frame;
     tcp_frame = authored_configuration->tcp_frame;
-    touch_links.reserve(authored_configuration->touch_links.size());
-    for (const auto &link : authored_configuration->touch_links) {
-      touch_links.emplace_back(link);
+    grip_body_links.reserve(authored_configuration->grip_body_links.size());
+    for (const auto &link : authored_configuration->grip_body_links) {
+      grip_body_links.emplace_back(link);
     }
     auxiliary_frames.reserve(authored_configuration->auxiliary_frames.size());
     for (const auto &frame : authored_configuration->auxiliary_frames) {
@@ -1241,6 +1242,7 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       {"description", CanonicalNullableText(description)},
       {"grasp_confirmation_policy",
        CanonicalValue(actuation_kind == "pneumatic" ? "not_required" : "binding_feedback_required")},
+      {"grip_body_links", CanonicalValue(std::move(grip_body_links))},
       {"mimic_followers", CanonicalValue(std::move(followers))},
       {"max_position", gripper_limits.has_value()
                            ? CanonicalValue(gripper_limits->upper_position)
@@ -1267,7 +1269,6 @@ CanonicalNullableText(const std::optional<std::string> &value) {
           {"component_id", CanonicalValue(gripper.controllable_component_id.value())},
           {"command_target_id", CanonicalValue(gripper.command_target_id.value())}})},
       {"tcp_frame", CanonicalNullableText(tcp_frame)},
-      {"touch_links", CanonicalValue(std::move(touch_links))},
       {"transport_kind", CanonicalValue("resolved_binding")},
       {"unit", CanonicalValue(coordinate_kind == std::string_view("angular_rad")
                                   ? "rad"
@@ -1551,9 +1552,11 @@ CanonicalNullableText(const std::optional<std::string> &value) {
          !(view.io_provider_drivers && !view.io_provider_drivers->empty());
 }
 
-[[nodiscard]] std::map<core::ControllableComponentId, const Composition *>
+// The cell's owner views by component: one per component, except a tool
+// with several gripper targets, which has one view per target.
+[[nodiscard]] std::multimap<core::ControllableComponentId, const Composition *>
 IndexNativeComponentCompositions(const Composition &cell) {
-  std::map<core::ControllableComponentId, const Composition *> result;
+  std::multimap<core::ControllableComponentId, const Composition *> result;
   const auto include = [&](const Composition &composition) {
     const bool io = composition.io_provider_drivers && !composition.io_provider_drivers->empty();
     Require(composition.component_runtime_identity() != nullptr &&
@@ -1590,9 +1593,14 @@ IndexNativeComponentCompositions(const Composition &cell) {
       Require(actual == expected && std::adjacent_find(actual.begin(), actual.end()) == actual.end(),
               "I/O driver group omits or repeats an actual component domain");
     }
-    Require(result.emplace(composition.controllable_component_id,
-                           &composition).second,
+    const auto [first, last] = result.equal_range(composition.controllable_component_id);
+    Require(std::all_of(first, last, [&](const auto &row) {
+              return composition.gripper_runtime && row.second->gripper_runtime &&
+                     row.second->gripper_runtime->binding().value().command_target_id !=
+                         composition.gripper_runtime->binding().value().command_target_id;
+            }),
             "native cell contains duplicate component runtime owners");
+    result.emplace(composition.controllable_component_id, &composition);
   };
   include(cell);
   for (const auto &participant : cell.participant_compositions) {
@@ -1893,14 +1901,17 @@ struct CompositionBuildInput final {
   // Present only for a Manager-selected Apply composition. The startup
   // (current) composition has no Apply delta.
   std::optional<deployment::ApplyComponentDeltaDTO> managed_component_delta{};
-  std::map<core::ControllableComponentId, RetainedComponentSnapshot>
+  // One per kept owner view: a tool with several gripper targets has one
+  // per target (`RetainedComponentSnapshot::gripper_target`).
+  std::multimap<core::ControllableComponentId, RetainedComponentSnapshot>
       retained_component_snapshots{};
   // The selected package root may be either retained descriptor in a managed
   // child. Candidate workers receive whichever exact root was selected as FD 6.
   std::optional<int> retained_package_root_fd{};
-  // Manager-opened scene-asset root (managed FD 9), shared by the collision
-  // model and the candidate worker. Absent: relative scene meshes fail closed.
-  std::optional<int> scene_asset_root_fd{};
+  // Manager-opened scene content (activation) root (managed FD 9), shared by
+  // the collision model and the candidate worker. Absent: scene meshes fail
+  // closed.
+  std::optional<int> scene_content_root_fd{};
   std::string controller_request_context{};
   std::vector<std::shared_ptr<RetainedPlannerSceneProjection>> required_projection_pins{};
   std::optional<core::NamedApplyPublicationTransactionDTO> origin_named_apply{};
@@ -1925,6 +1936,13 @@ struct CompositionBuildInput final {
   ComponentIoUpdateSink io_updates{};
   std::function<core::Result<std::shared_ptr<void>>(const std::string &)>
       enter_transport_effect{};
+  // The host's stable reference to the installed cell's observed-state
+  // sources; every robot's Kernel and planner keep it.
+  std::shared_ptr<core::CellModelStateHandle> cell_model_state{};
+  // With `selected_component_id`: the gripper target this view owns. A
+  // component may have several gripper targets (a generated tool has one
+  // per jaw pair); each is a view of its own with its own gripper runtime.
+  std::optional<core::CommandTargetId> selected_gripper_target{};
 };
 
 [[nodiscard]] core::CellAdmissionSettlementValidator BuildOwnerSettlementValidator() {
@@ -1980,6 +1998,10 @@ template <typename PhysicalBindingInput>
           if (input.selected_component_id.has_value() &&
               target.component().controllable_component_id !=
                   *input.selected_component_id)
+            continue;
+          if (capability_id == "tool.gripper.command" &&
+              input.selected_gripper_target.has_value() &&
+              entry.target.command_target_id != *input.selected_gripper_target)
             continue;
           Require(selected == nullptr,
                   "native composition selection has multiple matching targets");
@@ -2494,9 +2516,18 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
               input.status_program_binding == nullptr &&
               input.bundle != nullptr,
           "retained native component view is not a managed physical target");
-  const auto predecessor = input.retained_component_snapshots.find(
-      *input.selected_component_id);
-  Require(predecessor != input.retained_component_snapshots.end() &&
+  // The view's own snapshot: of a tool with several gripper targets, the
+  // selected target's.
+  const auto candidates =
+      input.retained_component_snapshots.equal_range(*input.selected_component_id);
+  auto predecessor = std::find_if(candidates.first, candidates.second, [&](const auto &row) {
+    return !row.second.gripper_target.has_value() ||
+           !input.selected_gripper_target.has_value() ||
+           *row.second.gripper_target == *input.selected_gripper_target;
+  });
+  Require(predecessor != candidates.second &&
+              (std::next(candidates.first) == candidates.second ||
+               input.selected_gripper_target.has_value()) &&
               (predecessor->second.runtime != nullptr ||
                predecessor->second.gripper_runtime != nullptr) &&
               predecessor->second.stage != nullptr,
@@ -2618,6 +2649,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
         physical.status_gripper_target);
     composition->gripper_runtime = predecessor->second.gripper_runtime;
     composition->ros2_control_runtime_handle = predecessor->second.ros2_control_runtime_handle;
+    composition->measured_joint_state_lane = predecessor->second.measured_joint_state_lane;
     composition->component_adapter = predecessor->second.component_adapter;
     CarryRetainedMembership(*composition, predecessor->second);
     // The retained gripper keeps its controller process, as a retained arm does.
@@ -2778,6 +2810,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
           "retained ROS component has no physical handle owner");
   composition->ros2_control_runtime_handle =
       predecessor->second.ros2_control_runtime_handle;
+  composition->measured_joint_state_lane = predecessor->second.measured_joint_state_lane;
   composition->component_adapter = predecessor->second.component_adapter;
   CarryRetainedMembership(*composition, predecessor->second);
   composition->StageRobotTcpReader();
@@ -3568,55 +3601,88 @@ void AdoptRos2ControlComponentAdapters(Composition &composition,
   return result;
 }
 
-/// The adapter of a real-lane I/O member (its
-/// signals are `component_adapter` rows): made by its owner's family with the
-/// owner's handle from the arm composition that built the owner, and its
-/// declared signals and bank as its row (`{adapter, bank, inputs, outputs}`).
-/// From the member's build input only: its device row and its signal
-/// rows; with its owner's handle and family (the owner's fingerprint is in
-/// the member's spec).
-[[nodiscard]] ComponentAdapters MakeIoMemberAdapter(
+/// The adapter of a real-lane model-form I/O device (its signals are
+/// `component_adapter` rows): a machine's member is made by its owner's
+/// family with the owner's handle from the composition that built the owner;
+/// an owner-less device (OD-327) by the family its rows name (`adapter`).
+/// Its row is the model's lane row as its signal rows carry it, plus its
+/// declared signals: `{adapter, <lane keys>, inputs: [name], outputs: [name]}`,
+/// and `indexes: {name: index}` when the signals declare their index. The
+/// lane keys are the family's (the xArm's `bank`, the bank's `rate_hz`); the
+/// host only checks that every signal carries the same ones.
+/// From the device's build input only: its device row and its signal rows.
+[[nodiscard]] ComponentAdapters MakeIoDeviceAdapter(
     const ComponentBuildInput &build, std::shared_ptr<void> owner_handle,
-    const ComponentAdapterFamily &owner_family) {
+    const ComponentAdapterFamily *owner_family) {
   const auto &spec = build.spec;
   const auto &input = build.host;
   const auto &id = spec.controllable_component_id.value();
-  Require(spec.io_device && spec.io_device->owner_component_id && spec.io_device->member_role,
-          "I/O component " + id + " has machine signals but no owner");
+  Require(spec.io_device.has_value(), "I/O component " + id + " has adapter signals but no device row");
   const auto &device = *spec.io_device;
-  Require(owner_handle != nullptr, "I/O member " + id + " has no owner built with a lane adapter");
-  std::vector<deployment::RetainedIoSignalConfiguration> rows;
-  for (const auto &row : spec.io_signals)
-    if (row.provider.profile == deployment::kComponentAdapterIoProfile) rows.push_back(row);
-  std::optional<std::string> bank;
+  const bool member = device.owner_component_id.has_value();
+  Require(member == device.member_role.has_value() && member == (owner_family != nullptr),
+          "I/O component " + id + " names an owner without its role or family");
+  Require(!member || owner_handle != nullptr,
+          "I/O member " + id + " has no owner built with a lane adapter");
+  std::optional<std::map<std::string, CanonicalValue, std::less<>>> lane_keys;
   CanonicalValue::Array inputs;
   CanonicalValue::Array outputs;
-  for (const auto &row : rows) {
-    const auto found = row.provider.adapter_fields.find("bank");
-    const auto *named = found == row.provider.adapter_fields.end()
-                            ? nullptr
-                            : std::get_if<std::string>(&found->second.value);
-    Require(named != nullptr && (!bank || *bank == *named),
-            "I/O member " + id + " signals name no single bank");
-    bank = *named;
+  CanonicalValue::Object indexes;
+  for (const auto &row : spec.io_signals) {
+    if (row.provider.profile != deployment::kComponentAdapterIoProfile) continue;
+    const auto &name = row.descriptor.signal_id.name;
+    std::map<std::string, CanonicalValue, std::less<>> keys;
+    for (const auto &[key, field] : row.provider.adapter_fields) {
+      std::optional<CanonicalValue> scalar;
+      if (const auto *text = std::get_if<std::string>(&field.value)) scalar = CanonicalValue(*text);
+      else if (const auto *number = std::get_if<double>(&field.value)) scalar = CanonicalValue(*number);
+      else if (const auto *flag = std::get_if<bool>(&field.value)) scalar = CanonicalValue(*flag);
+      Require(scalar.has_value(), "I/O component " + id + " signal " + name +
+                                      " has a non-scalar adapter field " + key);
+      // The signal's own key; every other key is its lane row's.
+      if (key == "index") indexes.emplace_back(name, std::move(*scalar));
+      else keys.emplace(key, std::move(*scalar));
+    }
+    const auto same = [&](const auto &other) {
+      return std::equal(keys.begin(), keys.end(), other.begin(), other.end(),
+                        [](const auto &left, const auto &right) {
+                          return left.first == right.first &&
+                                 content_identity::canonical_json(left.second) ==
+                                     content_identity::canonical_json(right.second);
+                        });
+    };
+    Require(!lane_keys || same(*lane_keys),
+            "I/O component " + id + " signals name no single lane row");
+    lane_keys = std::move(keys);
     (row.descriptor.direction == core::IoSignalDirection::kInput ? inputs : outputs)
-        .emplace_back(CanonicalValue(row.descriptor.signal_id.name));
+        .emplace_back(CanonicalValue(name));
   }
-  Require(bank.has_value(), "I/O member " + id + " has no signals");
+  Require(lane_keys.has_value(), "I/O component " + id + " has no signals");
   ComponentLane lane;
   lane.lane = "real";
-  lane.row.adapter = std::string(owner_family.family);
-  lane.row.adapter_keys.emplace("bank", *bank);
-  lane.value = CanonicalValue(CanonicalValue::Object{
-      {"adapter", CanonicalValue(lane.row.adapter)},
-      {"bank", CanonicalValue(*bank)},
-      {"inputs", CanonicalValue(std::move(inputs))},
-      {"outputs", CanonicalValue(std::move(outputs))}});
+  if (member) {
+    lane.row.adapter = std::string(owner_family->family);
+  } else {
+    const auto found = lane_keys->find("adapter");
+    Require(found != lane_keys->end() && found->second.is_string(),
+            "I/O component " + id + " names no adapter family");
+    lane.row.adapter = found->second.as_string();
+  }
+  CanonicalValue::Object value{{"adapter", CanonicalValue(lane.row.adapter)},
+                               {"inputs", CanonicalValue(std::move(inputs))},
+                               {"outputs", CanonicalValue(std::move(outputs))}};
+  for (const auto &[key, field] : *lane_keys) {
+    if (key == "adapter") continue;
+    lane.row.adapter_keys.emplace(key, LaneScalarText(field));
+    value.emplace_back(key, field);
+  }
+  if (!indexes.empty()) value.emplace_back("indexes", CanonicalValue(std::move(indexes)));
+  lane.value = CanonicalValue(std::move(value));
   ComponentAdapterContext context{device.controllable_component_id,
                                   lane.lane,
                                   lane.row,
                                   lane.value,
-                                  *device.member_role,
+                                  member ? *device.member_role : std::string{},
                                   std::move(owner_handle),
                                   controller_runtime_namespace(id),
                                   {},
@@ -4187,6 +4253,13 @@ struct ToolLaunch final {
   ToolLaunch result;
   auto &config = result.config;
   config.node_name = "manyforge_ros2_control_execution_backend";
+  // A component's gripper targets share its namespace; with several, each
+  // target's backend node carries the target id.
+  if (std::count_if(configuration.gripper_target_configurations.begin(),
+                    configuration.gripper_target_configurations.end(), [&](const auto &row) {
+                      return row.controllable_component_id == value.controllable_component_id;
+                    }) > 1)
+    config.node_name += "_" + value.command_target_id.value();
   config.node_namespace = controller_runtime_namespace(value.controllable_component_id.value());
   config.executor_thread_count = 3U;
   if (tool.no_output) {
@@ -4367,7 +4440,11 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
       SceneFrameCoordinateAuthority(*input.bundle, binding)));
   auto frames = RetainedSceneFrameResolver::create_verified(input.collision_shared_model, *input.bundle,
       input.model_map, *model, local, input.runtime_epoch, std::move(frame_sources),
-      input.selected_component_id);
+      input.selected_component_id,
+      // This view provides its own gripper target's state only.
+      input.selected_component_id.has_value()
+          ? std::optional<core::CommandTargetId>(value.command_target_id)
+          : std::nullopt);
   auto composition = std::make_unique<Composition>(value.controllable_component_id, input.bundle,
       input.status_program, input.status_program_binding, nullptr, physical.gripper_program,
       std::nullopt, binding, std::nullopt, CanonicalValue(nullptr), std::move(descriptor),
@@ -4586,12 +4663,12 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   if (publisher == nullptr) {
     const auto &group =
         direct_control_motion_binding.value().value().model_groups.front();
-    // The retained package root is not a scene-mesh root: relative scene
-    // meshes resolve only below the separately approved scene-asset root.
+    // The retained package root is not a scene-mesh root: scene meshes are
+    // read only from the separate scene content root by digest.
     collision_model = collision::ManyForgeCollisionEngine::load_shared_model(
         "manyforge_i6_execution_host", stage.loader_urdf_path(),
         stage.srdf_path(), stage.package_paths(), group.compiled_group_name,
-        input.scene_asset_root_fd);
+        input.scene_content_root_fd);
     auto collision_projector = RetainedCollisionWorldProjector::create_verified(
         collision_model, *input.bundle, input.model_map, *retained_model);
     const auto logical_scene =
@@ -4626,15 +4703,12 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           ProcessContainedCandidateClientConfig{
               .worker_executable = input.candidate_worker,
               .require_retained_projection = true,
-              .scene_asset_root_fd = input.scene_asset_root_fd,
+              .scene_content_root_fd = input.scene_content_root_fd,
               .retained_package_root_fd = input.retained_package_root_fd,
-              // The worker must load exactly the scene-mesh bytes this
-              // composition's collision model loaded (or first pinned).
-              .scene_mesh_content_digest =
-                  [collision_model](const std::string &uri) {
-                    return collision::ManyForgeCollisionEngine::
-                        scene_mesh_content_digest(collision_model, uri);
-                  }});
+              // The planner sees the other components of the cell where
+              // they are observed when each request is made.
+              .cell_model_state = input.cell_model_state,
+              .clock = input.shared_clock});
   Require(candidate_client->requires_retained_projection(),
           "production native planner must consume the exact retained scene "
           "projection");
@@ -4713,6 +4787,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   runtime_input.planner_model_map = input.model_map;
   runtime_input.control_binding_representatives =
       std::move(control_binding_representatives);
+  runtime_input.cell_model_state = input.cell_model_state;
   // The arm's channels and its render-only measured source share one wake.
   runtime_input.observation_wake =
       input.observation_wake != nullptr
@@ -4939,7 +5014,14 @@ BuildSingleProductComposition(CompositionBuildInput input) {
         *retained_runtime_configuration.validation_collision_workers);
     kernel_config.validation_collision_workers_declared = true;
   }
-  kernel_config.collision_clearance_m = planner_settings.collision_clearance_m;
+  // The Deployment's collision rules, with each collision body resolved to
+  // its bodies in this product's collision world.
+  auto cell_collision_rules =
+      target_resolver->ResolveCellCollisionRules(planner_settings.collision_rules);
+  Require(cell_collision_rules.ok(),
+          cell_collision_rules.ok() ? std::string{}
+                                    : cell_collision_rules.error().message);
+  kernel_config.collision_rules = std::move(cell_collision_rules.value());
   kernel_config.collision_check_fresh_plans = planner_settings.collision_check_fresh_plans;
   RetainedExecutionHostConfig runtime_config{
       core::CacheConfig{},
@@ -5500,12 +5582,32 @@ BuildProductComposition(CompositionBuildInput input) {
   for (const auto& sensor : sensors) io_component_ids.push_back(sensor.controllable_component_id);
   for (const auto& machine : armless_machines)
     io_component_ids.push_back(machine.controllable_component_id);
+  // A passive tool (OD-336: a tool component with no control binding, so no
+  // target to drive and no lane) is a standalone component like a sensor:
+  // its own view, with the host's passive adapter.
+  std::vector<core::ControllableComponentId> passive_tools;
+  {
+    const auto& graph = input.bundle->value().cell_graph;
+    for (const auto& component : graph.controllable_components) {
+      const bool tool = std::any_of(component.model_role_bindings.begin(),
+          component.model_role_bindings.end(), [](const auto& binding) {
+            return binding.model_role_id.value() == "tool_model";
+          });
+      const bool bound = std::any_of(graph.control_bindings.begin(),
+          graph.control_bindings.end(), [&](const auto& binding) {
+            return binding.controllable_component_id == component.controllable_component_id;
+          });
+      if (tool && !bound) passive_tools.push_back(component.controllable_component_id);
+    }
+  }
+  std::sort(passive_tools.begin(), passive_tools.end());
+  for (const auto& tool : passive_tools) io_component_ids.push_back(tool);
   std::sort(io_component_ids.begin(), io_component_ids.end());
   io_component_ids.erase(std::unique(io_component_ids.begin(), io_component_ids.end()), io_component_ids.end());
   // Each view's component is built from its build input only.
   const auto site_facts = component_manager::SiteFactsOf(input.site_settings);
   const auto with_io_bindings = [bindings = inventory.io,
-      sensors, armless_machines, site_facts, host = ComponentBuildHostOf(input),
+      sensors, armless_machines, passive_tools, site_facts, host = ComponentBuildHostOf(input),
       bundle = input.bundle, package_root = input.package_root,
       model_map = input.model_map, artifact_root = input.program_artifact_root,
       snapshots = input.retained_component_snapshots,
@@ -5591,9 +5693,19 @@ BuildProductComposition(CompositionBuildInput input) {
                                        view->component_adapter};
         continue;
       }
+      // A passive tool keeps its adapter; it has no process or streams.
+      if (std::binary_search(passive_tools.begin(), passive_tools.end(),
+                             view->controllable_component_id)) {
+        view->component_adapter = previous != snapshots.end()
+                                      ? previous->second.component_adapter
+                                      : std::make_shared<PassiveComponentAdapter>();
+        Require(view->component_adapter != nullptr, "retained passive tool lost its adapter");
+        continue;
+      }
       // An I/O member carries its owner and role; on the real
       // lane (`component_adapter` signals) its owner's family serves it
-      // through the owner's connection, with no generic I/O driver.
+      // through the owner's connection, an owner-less device's own family
+      // serves it; no generic I/O driver.
       const auto& device = spec.io_device;
       if (device && device->owner_component_id) {
         view->owner_id = device->owner_component_id;
@@ -5606,24 +5718,30 @@ BuildProductComposition(CompositionBuildInput input) {
         if (previous != snapshots.end()) {
           view->component_adapter = previous->second.component_adapter;
           view->adapter_transport_consumers = previous->second.adapter_transport_consumers;
+        } else if (!device->owner_component_id) {
+          // An owner-less device (OD-327): its own family, its own entities.
+          auto made = MakeIoDeviceAdapter(component, nullptr, nullptr);
+          view->component_adapter = std::move(made.component);
+          if (made.ros_transport_consumer)
+            view->adapter_transport_consumers.emplace_back(
+                view->controllable_component_id.value(), std::move(made.ros_transport_consumer));
         } else {
           // Its owner's view, which built the owner with a lane adapter.
           const Composition* owner = nullptr;
-          if (device->owner_component_id)
-            for (const auto* candidate : views)
-              if (candidate->owner_component &&
-                  candidate->owner_component->component_id == *device->owner_component_id)
-                owner = candidate;
+          for (const auto* candidate : views)
+            if (candidate->owner_component &&
+                candidate->owner_component->component_id == *device->owner_component_id)
+              owner = candidate;
           Require(owner != nullptr && owner->owner_handle != nullptr && owner->owner_family != nullptr,
                   "I/O member " + view->controllable_component_id.value() +
                       " has no owner built with a lane adapter");
-          auto made = MakeIoMemberAdapter(component, owner->owner_handle, *owner->owner_family);
+          auto made = MakeIoDeviceAdapter(component, owner->owner_handle, owner->owner_family);
           view->component_adapter = std::move(made.component);
           if (made.ros_transport_consumer)
             view->adapter_transport_consumers.emplace_back(
                 view->controllable_component_id.value(), std::move(made.ros_transport_consumer));
         }
-        Require(view->component_adapter != nullptr, "retained I/O member lost its adapter");
+        Require(view->component_adapter != nullptr, "retained I/O device lost its adapter");
         continue;
       }
       auto drivers = MakeIoProviderDrivers(
@@ -5676,9 +5794,17 @@ BuildProductComposition(CompositionBuildInput input) {
   };
   const auto motion_component_ids = sorted_component_ids(
       inventory.motion, "execution.trajectory.execute");
-  const auto gripper_component_ids =
-      sorted_component_ids(inventory.gripper, "tool.gripper.command");
-  if (motion_component_ids.empty() && gripper_component_ids.empty()) {
+  // One gripper owner per gripper target, by component and target: a
+  // component may have several (a generated tool, one per jaw pair).
+  std::vector<core::ProgramTargetReferenceDTO> gripper_targets;
+  gripper_targets.reserve(inventory.gripper.size());
+  for (const auto &entry : inventory.gripper)
+    gripper_targets.push_back(entry.target);
+  std::sort(gripper_targets.begin(), gripper_targets.end());
+  Require(std::adjacent_find(gripper_targets.begin(), gripper_targets.end()) ==
+              gripper_targets.end(),
+          "native direct-control inventory repeats a gripper target");
+  if (motion_component_ids.empty() && gripper_targets.empty()) {
     Require(!io_component_ids.empty() && input.runtime_unit_id &&
                 input.shared_clock && input.shared_scheduler,
             "I/O-only composition requires its qualified domains and actual managed shared owner");
@@ -5693,7 +5819,8 @@ BuildProductComposition(CompositionBuildInput input) {
   // the complete immutable retained model, with the same source/asset checks.
   if (motion_component_ids.empty() && input.collision_shared_model == nullptr) {
     auto selected = input;
-    selected.selected_component_id = gripper_component_ids.front();
+    selected.selected_component_id = gripper_targets.front().component_id;
+    selected.selected_gripper_target = gripper_targets.front().command_target_id;
     const auto physical = ResolveNativePhysicalBindings(selected, inventory);
     Require(!physical.motion && physical.gripper &&
                 physical.gripper->value().model_groups.size() == 1U &&
@@ -5717,7 +5844,7 @@ BuildProductComposition(CompositionBuildInput input) {
         "manyforge_ros_scalar_cell", stage->loader_urdf_path(),
         stage->srdf_path(), stage->package_paths(),
         physical.gripper->value().model_groups.front().compiled_group_name,
-        input.scene_asset_root_fd);
+        input.scene_content_root_fd);
     // Keep the loader's private asset tree alive with this existing shared
     // model. The pair retires the model before its stage; no projection or
     // state authority is created, and retained component scene stages stay put.
@@ -5730,13 +5857,13 @@ BuildProductComposition(CompositionBuildInput input) {
         collision::ManyForgeCollisionEngine::SharedModelPtr(
             std::move(lifetime), model_pointer);
   }
-  if (motion_component_ids.empty() && gripper_component_ids.size() == 1U) {
-    input.selected_component_id = gripper_component_ids.front();
-    if (input.retained_component_snapshots.contains(gripper_component_ids.front()))
+  if (motion_component_ids.empty() && gripper_targets.size() == 1U) {
+    input.selected_component_id = gripper_targets.front().component_id;
+    if (input.retained_component_snapshots.contains(gripper_targets.front().component_id))
       return with_io_bindings(BuildRetainedProductComposition(std::move(input)));
     return with_io_bindings(BuildSingleProductComposition(std::move(input)));
   }
-  if (motion_component_ids.size() == 1U && gripper_component_ids.empty()) {
+  if (motion_component_ids.size() == 1U && gripper_targets.empty()) {
     input.selected_component_id = motion_component_ids.front();
     if (input.retained_component_snapshots.contains(
             motion_component_ids.front()))
@@ -5752,24 +5879,35 @@ BuildProductComposition(CompositionBuildInput input) {
           input.status_program_binding == nullptr,
       "multi-robot native composition requires the managed shared-owner path");
 
-  auto component_ids = motion_component_ids;
-  component_ids.insert(component_ids.end(), gripper_component_ids.begin(), gripper_component_ids.end());
-  std::sort(component_ids.begin(), component_ids.end());
-  component_ids.erase(std::unique(component_ids.begin(), component_ids.end()), component_ids.end());
+  // One view per owner: an arm (no gripper target), or one gripper target.
+  // A component is an arm or a tool, so the two sets name different
+  // components; a tool with several gripper targets has one view per target.
+  std::vector<std::pair<core::ControllableComponentId,
+                        std::optional<core::CommandTargetId>>> owners;
+  for (const auto &component_id : motion_component_ids)
+    owners.emplace_back(component_id, std::nullopt);
+  for (const auto &target : gripper_targets)
+    owners.emplace_back(target.component_id, target.command_target_id);
+  std::sort(owners.begin(), owners.end());
   // Preserve the existing motion root when present; independent scalar
   // components add owners without changing any arm's local runtime.
   if (!motion_component_ids.empty()) {
-    const auto first_motion = std::find(component_ids.begin(), component_ids.end(), motion_component_ids.front());
-    std::rotate(component_ids.begin(), first_motion, std::next(first_motion));
+    const auto first_motion = std::find_if(owners.begin(), owners.end(), [&](const auto &owner) {
+      return owner.first == motion_component_ids.front();
+    });
+    std::rotate(owners.begin(), first_motion, std::next(first_motion));
   }
 
+  std::vector<core::ControllableComponentId> component_ids;
+  for (const auto &owner : owners) component_ids.push_back(owner.first);
   std::vector<std::unique_ptr<Composition>> compositions;
-  compositions.reserve(component_ids.size());
+  compositions.reserve(owners.size());
   if (input.observation_wake == nullptr)
     input.observation_wake = std::make_shared<RetainedObservationWake>();
-  for (const auto &component_id : component_ids) {
+  for (const auto &[component_id, gripper_target] : owners) {
     auto selected = input;
     selected.selected_component_id = component_id;
+    selected.selected_gripper_target = gripper_target;
     const auto projection =
         selected.component_planner_scene_projections.find(component_id);
     if (projection != selected.component_planner_scene_projections.end()) {
@@ -5799,6 +5937,11 @@ BuildProductComposition(CompositionBuildInput input) {
     else
       compositions.push_back(
           BuildSingleProductComposition(std::move(selected)));
+    // A component has one lifecycle adapter: the view of its first gripper
+    // target carries it, the views of its further targets none.
+    if (compositions.size() > 1U &&
+        compositions[compositions.size() - 2U]->controllable_component_id == component_id)
+      compositions.back()->component_adapter.reset();
   }
 
   std::vector<core::ProgramBindingId> intrinsic_direct_bindings;
@@ -5888,6 +6031,14 @@ BuildProductComposition(CompositionBuildInput input) {
     std::vector<RetainedSceneFrameStateSourceInput> state_sources;
     for (const auto &source : collected)
       state_sources.push_back(source.frame_source);
+    // The same sources place every component of the cell in each robot's
+    // collision checks and planning; a component's state is stale exactly
+    // while the host's stream registry classifies it stream-stale.
+    primary->cell_model_state_sources = host_detail::CellModelStateSourcesOf(
+        collected, [health = host_component_stream_health()](
+                       const core::ControllableComponentId &component) {
+          return health->Watch(component);
+        });
     auto cell_frame_resolver = RetainedSceneFrameResolver::create_verified(
         input.collision_shared_model, *input.bundle, input.model_map,
         *retained_model, *input.runtime_unit_id, input.runtime_epoch,
@@ -5948,17 +6099,29 @@ void RequireRetainedCandidateOwners(
     const std::vector<core::ControllableComponentId> &retained) {
   const auto old = IndexNativeComponentCompositions(predecessor);
   const auto next = IndexNativeComponentCompositions(candidate);
+  // Each view of a retained component (one per gripper target of a tool
+  // with several) is its predecessor's view of the same owner.
   for (const auto &component_id : retained) {
-    const auto previous = old.find(component_id);
-    const auto selected = next.find(component_id);
-    Require(previous != old.end() && selected != next.end() &&
-                previous->second->component_runtime_identity() != nullptr &&
-                previous->second->component_runtime_identity() ==
-                    selected->second->component_runtime_identity() &&
-                (!(selected->second->runtime || selected->second->gripper_runtime) ||
-                 (selected->second->scene_frame_resolver != nullptr &&
-                  !selected->second->candidate_component_registrations.empty())),
+    const auto previous = old.equal_range(component_id);
+    const auto selected = next.equal_range(component_id);
+    Require(selected.first != selected.second &&
+                std::distance(previous.first, previous.second) ==
+                    std::distance(selected.first, selected.second),
             "retained native owner differs from the planned predecessor");
+    for (auto view = selected.first; view != selected.second; ++view) {
+      const auto *candidate_view = view->second;
+      const auto prior = std::find_if(previous.first, previous.second, [&](const auto &row) {
+        return row.second->owner_key() == candidate_view->owner_key();
+      });
+      Require(prior != previous.second &&
+                  prior->second->component_runtime_identity() != nullptr &&
+                  prior->second->component_runtime_identity() ==
+                      candidate_view->component_runtime_identity() &&
+                  (!(candidate_view->runtime || candidate_view->gripper_runtime) ||
+                   (candidate_view->scene_frame_resolver != nullptr &&
+                    !candidate_view->candidate_component_registrations.empty())),
+              "retained native owner differs from the planned predecessor");
+    }
   }
 }
 
@@ -5967,8 +6130,14 @@ void ResealRetainedCandidateOwners(
     const HostApplySelection &request, const std::vector<core::ControllableComponentId> &retained,
     core::IResourceOperationAdmissionGate &admission_gate) {
   auto next = IndexNativeComponentCompositions(candidate);
+  std::vector<const Composition *> views;
   for (const auto &component_id : retained) {
-    auto &view = *next.at(component_id);
+    const auto range = next.equal_range(component_id);
+    Require(range.first != range.second, "retained native owner is absent");
+    for (auto row = range.first; row != range.second; ++row) views.push_back(row->second);
+  }
+  for (const auto *selected_view : views) {
+    auto &view = *selected_view;
     Require(admission_gate.exact_fence_is_held(
                 request.configuration_fence_id,
                 request.configuration_fence_scope),
@@ -6047,16 +6216,23 @@ void RefreshRetainedCandidateCollision(
     Composition &candidate,
     const HostApplySelection &request, const std::vector<core::ControllableComponentId> &retained,
     core::IResourceOperationAdmissionGate &admission_gate) {
-  std::map<core::ControllableComponentId, Composition *> selected;
+  // The retained components' views: one per gripper target of a tool with
+  // several.
+  std::multimap<core::ControllableComponentId, Composition *> selected;
+  std::set<std::pair<core::ControllableComponentId, std::string>> owners{candidate.owner_key()};
   selected.emplace(candidate.controllable_component_id, &candidate);
   for (auto &component : candidate.participant_compositions) {
-    Require(component != nullptr &&
-                selected.emplace(component->controllable_component_id,
-                                 component.get()).second,
+    Require(component != nullptr && owners.insert(component->owner_key()).second,
             "retained native collision candidate repeats an owner");
+    selected.emplace(component->controllable_component_id, component.get());
   }
+  std::vector<std::multimap<core::ControllableComponentId, Composition *>::iterator> retained_views;
   for (const auto &component_id : retained) {
-    const auto found = selected.find(component_id);
+    const auto range = selected.equal_range(component_id);
+    if (range.first == range.second) retained_views.push_back(selected.end());
+    for (auto row = range.first; row != range.second; ++row) retained_views.push_back(row);
+  }
+  for (const auto found : retained_views) {
     Require(found != selected.end() &&
                 found->second->component_runtime_identity() != nullptr,
             "retained native collision owner is absent");
@@ -6121,7 +6297,7 @@ void RefreshRetainedCandidateCollision(
 // in-process scene with its kinematics, validator and collision projector,
 // and each model-backed state projector; a motion controller's planner and
 // Kernel also take the candidate's planner settings (seed, collision step,
-// clearance). The candidate composition owns the
+// collision rules). The candidate composition owns the
 // stage whose files the replacement worker loads. Collision resources were
 // installed just before; this completes one coherent model generation and
 // reads it back before admission can reopen. A failure is rethrown as the
@@ -6131,16 +6307,23 @@ void RefreshRetainedCandidateModels(
     const HostApplySelection &request, const std::vector<core::ControllableComponentId> &retained,
     core::IResourceOperationAdmissionGate &admission_gate,
     core::IClock &clock) {
-  std::map<core::ControllableComponentId, Composition *> selected;
+  // The retained components' views: one per gripper target of a tool with
+  // several.
+  std::multimap<core::ControllableComponentId, Composition *> selected;
+  std::set<std::pair<core::ControllableComponentId, std::string>> owners{candidate.owner_key()};
   selected.emplace(candidate.controllable_component_id, &candidate);
   for (auto &component : candidate.participant_compositions) {
-    Require(component != nullptr &&
-                selected.emplace(component->controllable_component_id,
-                                 component.get()).second,
+    Require(component != nullptr && owners.insert(component->owner_key()).second,
             "retained native model candidate repeats an owner");
+    selected.emplace(component->controllable_component_id, component.get());
   }
+  std::vector<std::multimap<core::ControllableComponentId, Composition *>::iterator> retained_views;
   for (const auto &component_id : retained) {
-    const auto found = selected.find(component_id);
+    const auto range = selected.equal_range(component_id);
+    if (range.first == range.second) retained_views.push_back(selected.end());
+    for (auto row = range.first; row != range.second; ++row) retained_views.push_back(row);
+  }
+  for (const auto found : retained_views) {
     Require(found != selected.end(),
             "retained native model owner is absent");
     auto &view = *found->second;
@@ -6188,8 +6371,15 @@ void RefreshRetainedCandidateModels(
       if (!settings.ok())
         Fail("retained native planner rejected the candidate planner settings: " +
              settings.error().message);
-      view.runtime->participant_engine->set_collision_clearance_m(
-          view.candidate_planner_settings->collision_clearance_m);
+      Require(view.target_resolver != nullptr,
+              "retained native planner has no collision-rule resolver");
+      auto cell_collision_rules = view.target_resolver->ResolveCellCollisionRules(
+          view.candidate_planner_settings->collision_rules);
+      if (!cell_collision_rules.ok())
+        Fail("retained native Kernel rejected the candidate collision rules: " +
+             cell_collision_rules.error().message);
+      view.runtime->participant_engine->set_collision_rules(
+          std::move(cell_collision_rules.value()));
       view.runtime->participant_engine->set_collision_check_fresh_plans(
           view.candidate_planner_settings->collision_check_fresh_plans);
       view.candidate_planner_settings.reset();
@@ -6244,9 +6434,9 @@ PhysicalControlBindings(const Composition &composition) {
 [[nodiscard]] std::vector<core::RuntimeParticipantExecutionRegistration>
 NativeCellComponentRegistrations(const Composition &cell) {
   std::vector<core::RuntimeParticipantExecutionRegistration> result;
-  std::set<core::ControllableComponentId> owners;
+  std::set<std::pair<core::ControllableComponentId, std::string>> owners;
   const auto append = [&](const Composition &view) {
-    Require(owners.insert(view.controllable_component_id).second,
+    Require(owners.insert(view.owner_key()).second,
             "native cell repeats a component registration owner");
     auto rows = view.component_registrations();
     Require(!rows.empty() || (view.io_provider_drivers &&
@@ -6642,10 +6832,10 @@ void PrepareGripperMeasuredSourceAfterRouteOpen(
     const Composition &composition, const core::ControllableComponentId &component) noexcept {
   try {
     const auto views = IndexNativeComponentCompositions(composition);
-    const auto found = views.find(component);
-    if (found != views.end() && found->second && !found->second->runtime &&
-        found->second->gripper_runtime)
-      PrepareGripperMeasuredSource(component, *found->second);
+    const auto [first, last] = views.equal_range(component);
+    for (auto found = first; found != last; ++found)
+      if (found->second && !found->second->runtime && found->second->gripper_runtime)
+        PrepareGripperMeasuredSource(component, *found->second);
   } catch (const std::exception &error) {
     try { std::cerr << "manyforge measured gripper source preparation failed: " << error.what() << '\n'; }
     catch (...) {}
@@ -6922,7 +7112,7 @@ struct ManagedBootstrapStopProduct final {
       request.component_delta,
       {},
       ManagedPackageRootDescriptor(config, candidate_package_root),
-      config.scene_asset_root_fd,
+      config.scene_content_root_fd,
       "Apply=" + std::to_string(request.apply_id.value()) +
           " generation=" + std::to_string(request.apply_generation.value()),
   };
@@ -6969,13 +7159,14 @@ void RefreshRetainedPublicationView(
       peer->required_projection_pins.clear();
     cell.required_projection_pins = std::move(replacement_pins);
   };
-  std::map<core::ControllableComponentId, Composition *> components;
+  // By component: one view each, or a tool's views, one per gripper target.
+  std::multimap<core::ControllableComponentId, Composition *> components;
+  std::set<std::pair<core::ControllableComponentId, std::string>> owners{cell.owner_key()};
   components.emplace(cell.controllable_component_id, &cell);
   for (auto &peer : cell.participant_compositions) {
-    Require(peer != nullptr &&
-                components.emplace(peer->controllable_component_id,
-                                   peer.get()).second,
+    Require(peer != nullptr && owners.insert(peer->owner_key()).second,
             "retained native publication has duplicate component owners");
+    components.emplace(peer->controllable_component_id, peer.get());
   }
   if (projections.empty()) {
     // No component advertises a native planner projection. Scene revision is
@@ -6992,10 +7183,11 @@ void RefreshRetainedPublicationView(
     replace_pins();
     return;
   }
-  const auto projected_components = std::count_if(components.begin(), components.end(), [](const auto& row) {
-    return row.second->runtime || row.second->gripper_runtime;
-  });
-  Require(static_cast<std::size_t>(projected_components) == projections.size(),
+  std::set<core::ControllableComponentId> projected_components;
+  for (const auto &row : components)
+    if (row.second->runtime || row.second->gripper_runtime)
+      projected_components.insert(row.first);
+  Require(projected_components.size() == projections.size(),
           "retained native publication projection set changed components");
   // First validate the entire candidate set. A failed validation does not
   // re-anchor even one planner; any later effect still runs under admission.
@@ -7127,7 +7319,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   const ManagedProjectionRegistryConfig projection_config{
       config.package_root,       config.program_artifact_root,
       config.execution_run_root, config.runtime_unit_id,
-      ApplicationStartIdText(config.application_start_id),      config.scene_asset_root_fd};
+      ApplicationStartIdText(config.application_start_id),      config.scene_content_root_fd};
   // The registry outlives the follower; disconnect before follower teardown.
   struct ProjectionSnapshotWake final {
     std::mutex mutex;
@@ -7472,10 +7664,20 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         }
         installed_adapter_transport_membership.store(std::move(adapters));
         auto retained = std::make_shared<InstalledRetainedTransportMembership>();
+        // One entry per component (its transport and its lifecycle are the
+        // component's): the views of a tool with several gripper targets
+        // share their handle, and the lookups by component find that one.
         const auto include_retained = [&](const Composition &view) {
-          if (view.ros2_control_runtime_handle)
-            retained->entries.push_back({view.controllable_component_id.value(),
-                view.ros2_control_runtime_handle, view.gripper_runtime});
+          if (!view.ros2_control_runtime_handle) return;
+          const auto existing = std::find_if(retained->entries.begin(), retained->entries.end(),
+              [&](const auto &entry) { return entry.component == view.controllable_component_id.value(); });
+          if (existing != retained->entries.end()) {
+            Require(existing->handle == view.ros2_control_runtime_handle,
+                    "the views of one component have different transport handles");
+            return;
+          }
+          retained->entries.push_back({view.controllable_component_id.value(),
+              view.ros2_control_runtime_handle, view.gripper_runtime});
         };
         include_retained(*selected);
         for (const auto &participant : selected->participant_compositions)
@@ -8414,12 +8616,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
 
     // The installed owners this Apply keeps (same runtime identity, live
     // process) and the processes of removed and replaced components.
-    std::map<core::ControllableComponentId, RetainedComponentSnapshot> retained_snapshots;
+    std::multimap<core::ControllableComponentId, RetainedComponentSnapshot> retained_snapshots;
     std::vector<core::ControllableComponentId> actual_retained_components;
     std::vector<std::shared_ptr<ControllerLaunchProcess>> processes_to_retire;
     {
       std::lock_guard lock(managed_composition_mutex);
-      std::map<core::ControllableComponentId, const Composition *> keepers;
+      // A component's owner views (one per gripper target of a tool with
+      // several) are kept together or not at all.
+      std::multimap<core::ControllableComponentId, const Composition *> keepers;
       std::shared_lock execution_lock(execution_composition.mutex);
       const std::array<const Composition *, 3> roots{active_managed_composition.get(),
                                                      retired_managed_composition.get(),
@@ -8428,22 +8632,30 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       std::set<const ControllerLaunchProcess *> included_processes;
       for (const auto *root : roots) {
         if (!root || !included_roots.insert(root).second) continue;
-        for (const auto &[id, owner] : IndexNativeComponentCompositions(*root)) {
-          const bool owns_io = owner->io_provider_drivers && !owner->io_provider_drivers->empty();
-          const bool owns_physical = owner->runtime || owner->gripper_runtime;
+        const auto owners = IndexNativeComponentCompositions(*root);
+        for (auto view = owners.begin(); view != owners.end();) {
+          const auto &id = view->first;
+          const auto views = owners.equal_range(id);
+          view = views.second;
+          if (keepers.contains(id)) continue;
           const auto wanted =
               deployment::derive_component_runtime_identity(*candidate_bundle->bundle, site_facts, id);
-          const auto installed =
-              deployment::derive_component_runtime_identity(*owner->bundle, site_facts, id);
-          const bool owned_io_live = owns_io &&
-              std::all_of(owner->io_provider_drivers->begin(), owner->io_provider_drivers->end(),
-                          [](const auto &driver) { return driver && driver->resources_installed(); });
-          // A dead simulated PLC (pure I/O owner) is not a keeper either:
-          // its component is rebuilt and the PLC restarted by this Apply.
-          const bool launch_live = owned_launch_live(owner->controller_process.get(), owns_physical,
-                                                     IsLocalNoOutputGripperOwner(*owner));
-          if (installed && wanted == installed && launch_live && (!owns_io || owned_io_live))
-            keepers.emplace(id, owner);
+          const bool keep = std::all_of(views.first, views.second, [&](const auto &row) {
+            const auto *owner = row.second;
+            const bool owns_io = owner->io_provider_drivers && !owner->io_provider_drivers->empty();
+            const bool owns_physical = owner->runtime || owner->gripper_runtime;
+            const auto installed =
+                deployment::derive_component_runtime_identity(*owner->bundle, site_facts, id);
+            const bool owned_io_live = owns_io &&
+                std::all_of(owner->io_provider_drivers->begin(), owner->io_provider_drivers->end(),
+                            [](const auto &driver) { return driver && driver->resources_installed(); });
+            // A dead simulated PLC (pure I/O owner) is not a keeper either:
+            // its component is rebuilt and the PLC restarted by this Apply.
+            const bool launch_live = owned_launch_live(owner->controller_process.get(), owns_physical,
+                                                       IsLocalNoOutputGripperOwner(*owner));
+            return installed && wanted == installed && launch_live && (!owns_io || owned_io_live);
+          });
+          if (keep) keepers.insert(views.first, views.second);
         }
       }
       for (const auto &[id, owner] : keepers) {
@@ -8453,16 +8665,19 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         if (owner->owner_component && owner->owner_component->component_id != id.value() &&
             !keepers.contains(core::ControllableComponentId(owner->owner_component->component_id)))
           actual_retained_components.emplace_back(owner->owner_component->component_id);
-        retained_snapshots.emplace(
-            id, RetainedComponentSnapshot{
-                    owner->runtime, owner->gripper_runtime, owner->stage,
-                    owner->bundle->value().compiled_products.planning_collision_model,
-                    owner->direct_control_joint_limits, owner->direct_control_motion_descriptor,
-                    owner->direct_control_gripper_descriptor, owner->ros2_control_runtime_handle,
-                    owner->controller_process, owner->io_provider_drivers,
-                    owner->component_runtime_pins, owner->component_adapter,
-                    owner->owner_component, owner->owner_handle, owner->owner_family,
-                    owner->owner_id, owner->member_role, owner->adapter_transport_consumers});
+        RetainedComponentSnapshot snapshot{
+            owner->runtime, owner->gripper_runtime, owner->stage,
+            owner->bundle->value().compiled_products.planning_collision_model,
+            owner->direct_control_joint_limits, owner->direct_control_motion_descriptor,
+            owner->direct_control_gripper_descriptor, owner->ros2_control_runtime_handle,
+            owner->controller_process, owner->io_provider_drivers,
+            owner->component_runtime_pins, owner->component_adapter,
+            owner->owner_component, owner->owner_handle, owner->owner_family,
+            owner->owner_id, owner->member_role, owner->adapter_transport_consumers};
+        if (owner->direct_control_gripper_binding.has_value())
+          snapshot.gripper_target = owner->direct_control_gripper_binding->value().command_target_id;
+        snapshot.measured_joint_state_lane = owner->measured_joint_state_lane;
+        retained_snapshots.emplace(id, std::move(snapshot));
       }
       std::sort(actual_retained_components.begin(), actual_retained_components.end());
       actual_retained_components.erase(
@@ -8470,15 +8685,17 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           actual_retained_components.end());
       for (const auto *root : included_roots)
         for (const auto &[id, owner] : IndexNativeComponentCompositions(*root)) {
-          const auto kept = keepers.find(id);
-          if (kept != keepers.end() &&
-              ((owner->component_runtime_pins &&
-                kept->second->component_runtime_pins == owner->component_runtime_pins) ||
-               (owner->controller_process
-                    ? kept->second->controller_process == owner->controller_process
-                    : IsLocalNoOutputGripperOwner(*owner) &&
-                          IsLocalNoOutputGripperOwner(*kept->second) &&
-                          kept->second->gripper_runtime == owner->gripper_runtime)))
+          const auto kept = keepers.equal_range(id);
+          if (std::any_of(kept.first, kept.second, [&](const auto &row) {
+                const auto *keeper = row.second;
+                return (owner->component_runtime_pins &&
+                        keeper->component_runtime_pins == owner->component_runtime_pins) ||
+                       (owner->controller_process
+                            ? keeper->controller_process == owner->controller_process
+                            : IsLocalNoOutputGripperOwner(*owner) &&
+                                  IsLocalNoOutputGripperOwner(*keeper) &&
+                                  keeper->gripper_runtime == owner->gripper_runtime);
+              }))
             continue;
           if (owner->controller_process &&
               included_processes.insert(owner->controller_process.get()).second &&
@@ -8534,6 +8751,24 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                          {{"component_id", component}}});
       }
     }
+    // A Program/Scene-only Apply keeps every component owner and refreshes
+    // only its publication view; any other Apply re-seals its kept owners.
+    const bool keeps_every_view =
+        IsExactRetainedViewApply(selection) &&
+        actual_retained_components.size() ==
+            candidate_bundle->bundle->value().cell_graph.controllable_components.size() &&
+        active_managed_composition != nullptr;
+    // OD-370 (B): a re-seal replaces each kept motion owner's collision
+    // resources, which its Kernel accepts only Idle with no prepared operation
+    // retained. Refuse now, before any replaced component is stopped.
+    for (const auto &[id, snapshot] : retained_snapshots) {
+      if (keeps_every_view || snapshot.gripper_runtime || !snapshot.runtime ||
+          !snapshot.runtime->participant_engine)
+        continue;
+      if (const auto refusal =
+              snapshot.runtime->participant_engine->collision_resource_replacement_refusal())
+        return failed(host_detail::KeptOwnerNotIdleApplyRefusal(id.value(), *refusal));
+    }
 
     // Copy snapshot pins before any Apply effect. The exit guard owns them
     // across input moves and resolves them against the final slots.
@@ -8587,6 +8822,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       input->motion_trace = host_motion_trace;
       input->retained_component_snapshots = std::move(retained_snapshots);
       input->observation_wake = stable_observation_wake;
+      input->cell_model_state = execution_composition.cell_model_state;
       input->adapter_registry = &adapter_registry;
       input->adapter_owner = adapter_transport.load();
       input->adapter_node = input->adapter_owner->retain_entity(input->adapter_owner->node());
@@ -8594,10 +8830,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       input->enter_transport_effect = enter_component_transport_effect;
       input->io_updates = component_io_updates;
     }
-    const bool retain_view = input.has_value() && IsExactRetainedViewApply(selection) &&
-                             actual_retained_components.size() ==
-                                 input->bundle->value().cell_graph.controllable_components.size() &&
-                             active_managed_composition != nullptr;
+    const bool retain_view = input.has_value() && keeps_every_view;
     const auto staged_tcp = input ? StageRetainedTcpRebinds(*input)
                                   : std::vector<StagedRetainedTcpRebind>{};
     // Remove the slot from reuse now, but keep its owner pinned until the
@@ -8690,6 +8923,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             // An adapter-only component has no Kernel registration.
             if (!IsAdapterOnlyView(*view)) retained_components.push_back(component);
           }
+          // A tool's views (one per gripper target) name one component.
+          retained_components.erase(
+              std::unique(retained_components.begin(), retained_components.end()),
+              retained_components.end());
           auto registrations = NativeCellComponentRegistrations(candidate);
           RetainedRuntimeParticipantResolverFactory staged_factory;
           auto resolver = NativeCellParticipantResolver(candidate, registrations, &staged_factory);
@@ -10569,6 +10806,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     try {
       response = projections.Dispatch(
           component_manager::detail::DecodeNativeProjectionRpcRequest(request));
+    } catch (const component_manager::detail::NativeProjectionRpcBoundExceeded
+                 &error) {
+      response = component_manager::detail::NativeProjectionRpcFailure{
+          core::ErrorDTO{std::string(core::error_codes::kNativeProjectionRpcBoundExceeded),
+                         error.what(),
+                         {}}};
     } catch (const std::exception &error) {
       response = component_manager::detail::NativeProjectionRpcFailure{
           core::ErrorDTO{"native_projection_request_failed", error.what(), {}}};
@@ -10580,7 +10823,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
     SendManagedRuntimePacket(
         config.manager_channel_fd,
-        component_manager::detail::EncodeNativeProjectionRpcResponse(response));
+        component_manager::detail::EncodeNativeProjectionRpcResponseOrRefusal(
+            response));
   }
   return 0;
 }

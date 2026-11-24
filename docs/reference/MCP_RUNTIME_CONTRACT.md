@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-11-14 12:33:24 UTC
+  Last regenerated: 2026-11-23 19:43:18 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -151,14 +151,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               }
             ],
             "title": "Shape"
-          },
-          "support_contacts": {
-            "items": {
-              "$ref": "#/$defs/SceneSupportContactRequest"
-            },
-            "maxItems": 4096,
-            "title": "Support Contacts",
-            "type": "array"
           }
         },
         "required": [
@@ -177,6 +169,17 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "carried_object_attachment_id": {
             "title": "Carried Object Attachment Id",
             "type": "string"
+          },
+          "carrier_component_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Carrier Component Id"
           },
           "command_target_id": {
             "title": "Command Target Id",
@@ -370,28 +373,12 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "CollisionPolicyRequest": {
         "additionalProperties": false,
         "properties": {
-          "allowed_static_static_pairs": {
-            "items": {
-              "$ref": "#/$defs/CollisionPairRequest"
-            },
-            "maxItems": 4096,
-            "title": "Allowed Static Static Pairs",
-            "type": "array"
-          },
           "allowed_touch_link_pairs": {
             "items": {
               "$ref": "#/$defs/CollisionPairRequest"
             },
             "maxItems": 4096,
             "title": "Allowed Touch Link Pairs",
-            "type": "array"
-          },
-          "contact_grasps": {
-            "items": {
-              "$ref": "#/$defs/ContactGraspPolicyRequest"
-            },
-            "maxItems": 4096,
-            "title": "Contact Grasps",
             "type": "array"
           },
           "policy_id": {
@@ -405,22 +392,20 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "revision": {
             "$ref": "#/$defs/CollisionPolicyRevisionRequest"
           },
-          "support_contacts": {
+          "static_body_ids": {
             "items": {
-              "$ref": "#/$defs/SupportContactPolicyRequest"
+              "type": "string"
             },
             "maxItems": 4096,
-            "title": "Support Contacts",
+            "title": "Static Body Ids",
             "type": "array"
           }
         },
         "required": [
           "policy_id",
           "revision",
-          "allowed_static_static_pairs",
+          "static_body_ids",
           "allowed_touch_link_pairs",
-          "support_contacts",
-          "contact_grasps",
           "require_full_diagnostics"
         ],
         "title": "CollisionPolicyRequest",
@@ -621,47 +606,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "operation"
         ],
         "title": "ComposerSceneTransactionRequest",
-        "type": "object"
-      },
-      "ContactGraspPolicyRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "allowed_robot_links": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 4096,
-            "title": "Allowed Robot Links",
-            "type": "array"
-          },
-          "max_penetration_m": {
-            "minimum": 0.0,
-            "title": "Max Penetration M",
-            "type": "number"
-          },
-          "policy_id": {
-            "title": "Policy Id",
-            "type": "string"
-          },
-          "selected_object_id": {
-            "title": "Selected Object Id",
-            "type": "string"
-          },
-          "terminal_window_start_fraction": {
-            "maximum": 1.0,
-            "minimum": 0.0,
-            "title": "Terminal Window Start Fraction",
-            "type": "number"
-          }
-        },
-        "required": [
-          "policy_id",
-          "selected_object_id",
-          "allowed_robot_links",
-          "max_penetration_m",
-          "terminal_window_start_fraction"
-        ],
-        "title": "ContactGraspPolicyRequest",
         "type": "object"
       },
       "CylinderShapeRequest": {
@@ -1263,84 +1207,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "SceneRevisionRequest",
         "type": "object"
       },
-      "SceneSupportContactRequest": {
-        "additionalProperties": false,
-        "description": "Portable object-to-object support intent, never a native body pair.",
-        "properties": {
-          "allow_recontact": {
-            "default": false,
-            "title": "Allow Recontact",
-            "type": "boolean"
-          },
-          "enforce_max_start_penetration": {
-            "default": true,
-            "title": "Enforce Max Start Penetration",
-            "type": "boolean"
-          },
-          "max_contact_penetration_m": {
-            "default": 0.0,
-            "minimum": 0.0,
-            "title": "Max Contact Penetration M",
-            "type": "number"
-          },
-          "max_start_penetration_m": {
-            "default": 0.0,
-            "minimum": 0.0,
-            "title": "Max Start Penetration M",
-            "type": "number"
-          },
-          "min_release_progress_m": {
-            "default": 0.0,
-            "minimum": 0.0,
-            "title": "Min Release Progress M",
-            "type": "number"
-          },
-          "mode": {
-            "default": "contact_release",
-            "enum": [
-              "contact_release",
-              "bounded_penetration",
-              "contact_process"
-            ],
-            "title": "Mode",
-            "type": "string"
-          },
-          "release_evidence_mode": {
-            "default": "signed_penetration",
-            "enum": [
-              "signed_penetration",
-              "binary_contact"
-            ],
-            "title": "Release Evidence Mode",
-            "type": "string"
-          },
-          "release_tolerance_m": {
-            "default": 1e-05,
-            "minimum": 0.0,
-            "title": "Release Tolerance M",
-            "type": "number"
-          },
-          "require_separation_by_end": {
-            "default": true,
-            "title": "Require Separation By End",
-            "type": "boolean"
-          },
-          "require_strictly_decreasing_penetration": {
-            "default": true,
-            "title": "Require Strictly Decreasing Penetration",
-            "type": "boolean"
-          },
-          "support_object_id": {
-            "title": "Support Object Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "support_object_id"
-        ],
-        "title": "SceneSupportContactRequest",
-        "type": "object"
-      },
       "SetCollisionPolicyRequest": {
         "additionalProperties": false,
         "properties": {
@@ -1383,82 +1249,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "sphere_radius_m"
         ],
         "title": "SphereShapeRequest",
-        "type": "object"
-      },
-      "SupportContactPolicyRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "allow_recontact": {
-            "title": "Allow Recontact",
-            "type": "boolean"
-          },
-          "enforce_max_start_penetration": {
-            "title": "Enforce Max Start Penetration",
-            "type": "boolean"
-          },
-          "max_contact_penetration_m": {
-            "minimum": 0.0,
-            "title": "Max Contact Penetration M",
-            "type": "number"
-          },
-          "max_start_penetration_m": {
-            "minimum": 0.0,
-            "title": "Max Start Penetration M",
-            "type": "number"
-          },
-          "min_release_progress_m": {
-            "minimum": 0.0,
-            "title": "Min Release Progress M",
-            "type": "number"
-          },
-          "mode": {
-            "enum": [
-              "contact_release",
-              "bounded_penetration",
-              "contact_process"
-            ],
-            "title": "Mode",
-            "type": "string"
-          },
-          "pair": {
-            "$ref": "#/$defs/CollisionPairRequest"
-          },
-          "release_evidence_mode": {
-            "enum": [
-              "signed_penetration",
-              "binary_contact"
-            ],
-            "title": "Release Evidence Mode",
-            "type": "string"
-          },
-          "release_tolerance_m": {
-            "minimum": 0.0,
-            "title": "Release Tolerance M",
-            "type": "number"
-          },
-          "require_separation_by_end": {
-            "title": "Require Separation By End",
-            "type": "boolean"
-          },
-          "require_strictly_decreasing_penetration": {
-            "title": "Require Strictly Decreasing Penetration",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "pair",
-          "mode",
-          "release_evidence_mode",
-          "enforce_max_start_penetration",
-          "max_start_penetration_m",
-          "release_tolerance_m",
-          "min_release_progress_m",
-          "max_contact_penetration_m",
-          "require_separation_by_end",
-          "require_strictly_decreasing_penetration",
-          "allow_recontact"
-        ],
-        "title": "SupportContactPolicyRequest",
         "type": "object"
       },
       "UpdateSceneObjectPoseRequest": {
@@ -1605,14 +1395,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               }
             ],
             "title": "Shape"
-          },
-          "support_contacts": {
-            "items": {
-              "$ref": "#/$defs/SceneSupportContactRequest"
-            },
-            "maxItems": 4096,
-            "title": "Support Contacts",
-            "type": "array"
           }
         },
         "required": [
@@ -2594,15 +2376,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "description": "Consume exactly one current owner-issued cycle recovery offer.",
         "properties": {
           "action_id": {
-            "enum": [
-              "retry_motion_from_current_state",
-              "acknowledge_and_continue",
-              "retry_after_scene_repair",
-              "replan_from_stopped_state",
-              "retry_runtime_step",
-              "reset_cycle",
-              "continue_with_failure"
-            ],
+            "maxLength": 128,
+            "pattern": "^[a-z][a-z0-9_.-]*$",
             "title": "Action Id",
             "type": "string"
           },
@@ -2768,10 +2543,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Program Binding Id",
             "type": "string"
           },
-          "program_id": {
-            "title": "Program Id",
-            "type": "string"
-          },
           "program_revision": {
             "pattern": "^sha256:[0-9a-f]{64}$",
             "title": "Program Revision",
@@ -2811,7 +2582,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "required": [
           "schema_version",
           "program_run_id",
-          "program_id",
           "program_revision",
           "program_binding_id",
           "node_instance_id",
@@ -3366,6 +3136,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Clock Owner"
               },
+              "collision_rule_id": {
+                "anyOf": [
+                  {
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Collision Rule Id"
+              },
               "components": {
                 "default": [],
                 "items": {
@@ -3387,19 +3170,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                   }
                 ],
                 "title": "Condition Id"
-              },
-              "contact_policy_id": {
-                "anyOf": [
-                  {
-                    "maxLength": 1024,
-                    "minLength": 1,
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Contact Policy Id"
               },
               "end_ns": {
                 "anyOf": [
@@ -3807,6 +3577,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Clock Owner"
               },
+              "collision_rule_id": {
+                "anyOf": [
+                  {
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Collision Rule Id"
+              },
               "components": {
                 "default": [],
                 "items": {
@@ -3828,19 +3611,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                   }
                 ],
                 "title": "Condition Id"
-              },
-              "contact_policy_id": {
-                "anyOf": [
-                  {
-                    "maxLength": 1024,
-                    "minLength": 1,
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Contact Policy Id"
               },
               "end_ns": {
                 "anyOf": [
@@ -4248,6 +4018,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Clock Owner"
               },
+              "collision_rule_id": {
+                "anyOf": [
+                  {
+                    "maxLength": 1024,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Collision Rule Id"
+              },
               "components": {
                 "default": [],
                 "items": {
@@ -4269,19 +4052,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                   }
                 ],
                 "title": "Condition Id"
-              },
-              "contact_policy_id": {
-                "anyOf": [
-                  {
-                    "maxLength": 1024,
-                    "minLength": 1,
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Contact Policy Id"
               },
               "end_ns": {
                 "anyOf": [
@@ -4759,186 +4529,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
 }
 ```
 
-## manyforge_program_save
-
-Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
-
-```json
-{
-  "annotations": {
-    "destructiveHint": true,
-    "idempotentHint": false,
-    "openWorldHint": false,
-    "readOnlyHint": false
-  },
-  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
-  "inputSchema": {
-    "$defs": {
-      "SaveDraftAsRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "applicationStartId": {
-            "title": "Applicationstartid",
-            "type": "string"
-          },
-          "confirmOverwrite": {
-            "default": false,
-            "title": "Confirmoverwrite",
-            "type": "boolean"
-          },
-          "draftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Draftid",
-            "type": "string"
-          },
-          "expectedAdmissionGeneration": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedadmissiongeneration",
-            "type": "integer"
-          },
-          "expectedDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddraftrevision",
-            "type": "integer"
-          },
-          "expectedWorkspaceEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Expectedworkspaceepoch",
-            "type": "string"
-          },
-          "expectedWorkspaceRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedworkspacerevision",
-            "type": "integer"
-          },
-          "path": {
-            "maxLength": 4096,
-            "minLength": 1,
-            "title": "Path",
-            "type": "string"
-          },
-          "requestKey": {
-            "title": "Requestkey",
-            "type": "string"
-          }
-        },
-        "required": [
-          "draftId",
-          "expectedDraftRevision",
-          "expectedAdmissionGeneration",
-          "applicationStartId",
-          "requestKey",
-          "expectedWorkspaceEpoch",
-          "expectedWorkspaceRevision",
-          "path"
-        ],
-        "title": "SaveDraftAsRequest",
-        "type": "object"
-      },
-      "SaveDraftRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "applicationStartId": {
-            "title": "Applicationstartid",
-            "type": "string"
-          },
-          "draftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Draftid",
-            "type": "string"
-          },
-          "expectedAdmissionGeneration": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedadmissiongeneration",
-            "type": "integer"
-          },
-          "expectedDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddraftrevision",
-            "type": "integer"
-          },
-          "expectedWorkspaceEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Expectedworkspaceepoch",
-            "type": "string"
-          },
-          "expectedWorkspaceRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedworkspacerevision",
-            "type": "integer"
-          },
-          "requestKey": {
-            "title": "Requestkey",
-            "type": "string"
-          }
-        },
-        "required": [
-          "draftId",
-          "expectedDraftRevision",
-          "expectedAdmissionGeneration",
-          "applicationStartId",
-          "requestKey",
-          "expectedWorkspaceEpoch",
-          "expectedWorkspaceRevision"
-        ],
-        "title": "SaveDraftRequest",
-        "type": "object"
-      }
-    },
-    "oneOf": [
-      {
-        "additionalProperties": false,
-        "description": "POST /api/program/save",
-        "properties": {
-          "action": {
-            "const": "save",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/SaveDraftRequest"
-          }
-        },
-        "required": [
-          "action",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/program/save-as",
-        "properties": {
-          "action": {
-            "const": "save_as",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/SaveDraftAsRequest"
-          }
-        },
-        "required": [
-          "action",
-          "body"
-        ],
-        "type": "object"
-      }
-    ],
-    "type": "object"
-  },
-  "name": "manyforge_program_save"
-}
-```
-
 ## manyforge_files
 
 Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
@@ -4968,7 +4558,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "properties": {
               "kind": {
                 "default": "program",
-                "pattern": "^(program|deployment|mesh|scenario)$",
+                "pattern": "^(program|deployment|mesh|tool_mesh|scenario)$",
                 "title": "Kind",
                 "type": "string"
               },
@@ -5096,8 +4686,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "ConfirmedApplyRequest": {
         "additionalProperties": false,
-        "description": "Apply and Revert: the ``scope`` of the Preview the user confirmed.\n\nWhen present, the Apply is refused before any effect if the activation\ninput changed since that Preview (``activation_input_changed_after_confirmation``).",
+        "description": "Apply and Revert: the ``scope`` of the Preview the user confirmed.\n\nWhen present, the Apply is refused before any effect if the activation\ninput changed since that Preview (``activation_input_changed_after_confirmation``).\n``confirmed_collision_rule_ids`` names every ``rule_id`` of the Preview's\n``collision_rules``; an Apply that changes a rule it leaves out ends\n``collision_rule_confirmation_required`` before any component step.",
         "properties": {
+          "confirmed_collision_rule_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 64,
+            "title": "Confirmed Collision Rule Ids",
+            "type": "array"
+          },
           "request_key": {
             "title": "Request Key",
             "type": "string"
@@ -5239,126 +4837,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "path"
         ],
         "title": "OpenDeploymentRequest",
-        "type": "object"
-      },
-      "SaveDeploymentAsRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "applicationStartId": {
-            "title": "Applicationstartid",
-            "type": "string"
-          },
-          "confirmOverwrite": {
-            "default": false,
-            "title": "Confirmoverwrite",
-            "type": "boolean"
-          },
-          "draftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Draftid",
-            "type": "string"
-          },
-          "expectedAdmissionGeneration": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedadmissiongeneration",
-            "type": "integer"
-          },
-          "expectedDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddraftrevision",
-            "type": "integer"
-          },
-          "expectedWorkspaceEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Expectedworkspaceepoch",
-            "type": "string"
-          },
-          "expectedWorkspaceRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedworkspacerevision",
-            "type": "integer"
-          },
-          "path": {
-            "maxLength": 4096,
-            "minLength": 1,
-            "title": "Path",
-            "type": "string"
-          },
-          "requestKey": {
-            "title": "Requestkey",
-            "type": "string"
-          }
-        },
-        "required": [
-          "draftId",
-          "expectedDraftRevision",
-          "expectedAdmissionGeneration",
-          "applicationStartId",
-          "requestKey",
-          "expectedWorkspaceEpoch",
-          "expectedWorkspaceRevision",
-          "path"
-        ],
-        "title": "SaveDeploymentAsRequest",
-        "type": "object"
-      },
-      "SaveDeploymentRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "applicationStartId": {
-            "title": "Applicationstartid",
-            "type": "string"
-          },
-          "draftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Draftid",
-            "type": "string"
-          },
-          "expectedAdmissionGeneration": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedadmissiongeneration",
-            "type": "integer"
-          },
-          "expectedDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddraftrevision",
-            "type": "integer"
-          },
-          "expectedWorkspaceEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Expectedworkspaceepoch",
-            "type": "string"
-          },
-          "expectedWorkspaceRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedworkspacerevision",
-            "type": "integer"
-          },
-          "requestKey": {
-            "title": "Requestkey",
-            "type": "string"
-          }
-        },
-        "required": [
-          "draftId",
-          "expectedDraftRevision",
-          "expectedAdmissionGeneration",
-          "applicationStartId",
-          "requestKey",
-          "expectedWorkspaceEpoch",
-          "expectedWorkspaceRevision"
-        ],
-        "title": "SaveDeploymentRequest",
         "type": "object"
       },
       "ServerApplyRequest": {
@@ -5780,42 +5258,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       {
         "additionalProperties": false,
-        "description": "POST /api/deployment/save",
-        "properties": {
-          "action": {
-            "const": "save",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/SaveDeploymentRequest"
-          }
-        },
-        "required": [
-          "action",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
-        "description": "POST /api/deployment/save-as",
-        "properties": {
-          "action": {
-            "const": "save_as",
-            "type": "string"
-          },
-          "body": {
-            "$ref": "#/$defs/SaveDeploymentAsRequest"
-          }
-        },
-        "required": [
-          "action",
-          "body"
-        ],
-        "type": "object"
-      },
-      {
-        "additionalProperties": false,
         "description": "POST /api/deployment/discard",
         "properties": {
           "action": {
@@ -5918,6 +5360,104 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
   "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `load` and `new` return at acceptance with the Apply's row (`manyforge.apply_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `apply_commands` of `status`, found by `request_key`.",
   "inputSchema": {
     "$defs": {
+      "SaveScenarioDocumentRequest": {
+        "additionalProperties": false,
+        "description": "Save the Scenario as ``<directory>/<name>.scenario``.\n\nThe one Scenario name is also written as its scenario_id and manifest name;\nthe description stays free text.",
+        "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
+          "confirmOverwrite": {
+            "default": false,
+            "title": "Confirmoverwrite",
+            "type": "boolean"
+          },
+          "confirmUnappliedExcluded": {
+            "default": false,
+            "title": "Confirmunappliedexcluded",
+            "type": "boolean"
+          },
+          "deploymentDraftId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Deploymentdraftid",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 4096,
+            "title": "Description",
+            "type": "string"
+          },
+          "directory": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Directory",
+            "type": "string"
+          },
+          "draftId": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Draftid",
+            "type": "string"
+          },
+          "expectedAdmissionGeneration": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedadmissiongeneration",
+            "type": "integer"
+          },
+          "expectedDeploymentDraftRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Expecteddeploymentdraftrevision",
+            "type": "integer"
+          },
+          "expectedDraftRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Expecteddraftrevision",
+            "type": "integer"
+          },
+          "expectedWorkspaceEpoch": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Expectedworkspaceepoch",
+            "type": "string"
+          },
+          "expectedWorkspaceRevision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expectedworkspacerevision",
+            "type": "integer"
+          },
+          "name": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+            "title": "Name",
+            "type": "string"
+          },
+          "requestKey": {
+            "title": "Requestkey",
+            "type": "string"
+          }
+        },
+        "required": [
+          "draftId",
+          "expectedDraftRevision",
+          "deploymentDraftId",
+          "expectedDeploymentDraftRevision",
+          "expectedWorkspaceEpoch",
+          "expectedWorkspaceRevision",
+          "expectedAdmissionGeneration",
+          "applicationStartId",
+          "requestKey",
+          "directory",
+          "name"
+        ],
+        "title": "SaveScenarioDocumentRequest",
+        "type": "object"
+      },
       "ScenarioEmptyRequest": {
         "additionalProperties": false,
         "description": "`POST /api/scenario/new` body: refused with\nan unsaved Draft unless the caller confirms `discard_unsaved`.",
@@ -5995,6 +5535,24 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           },
           "body": {
             "$ref": "#/$defs/ScenarioEmptyRequest"
+          }
+        },
+        "required": [
+          "action",
+          "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "POST /api/scenario-documents/save",
+        "properties": {
+          "action": {
+            "const": "save",
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/$defs/SaveScenarioDocumentRequest"
           }
         },
         "required": [
@@ -6583,6 +6141,449 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "CellFrameReferenceRequest",
         "type": "object"
       },
+      "CollisionRuleActiveTcpContactBodiesSelectionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "active_tcp_contact_bodies",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "CollisionRuleActiveTcpContactBodiesSelectionRequest",
+        "type": "object"
+      },
+      "CollisionRuleAttachedObjectSelectionRequest": {
+        "additionalProperties": false,
+        "description": "The Scene objects a component carries; with `collision_body_role_id`\nonly those carried by that collision body (OD-371).",
+        "properties": {
+          "collision_body_role_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collision Body Role Id"
+          },
+          "component_id": {
+            "title": "Component Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "attached_object",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "component_id"
+        ],
+        "title": "CollisionRuleAttachedObjectSelectionRequest",
+        "type": "object"
+      },
+      "CollisionRuleCollisionBodySelectionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "collision_body_id": {
+            "title": "Collision Body Id",
+            "type": "string"
+          },
+          "component_id": {
+            "title": "Component Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "collision_body",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "component_id",
+          "collision_body_id"
+        ],
+        "title": "CollisionRuleCollisionBodySelectionRequest",
+        "type": "object"
+      },
+      "CollisionRuleComponentSelectionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "component_id": {
+            "title": "Component Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "component",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "component_id"
+        ],
+        "title": "CollisionRuleComponentSelectionRequest",
+        "type": "object"
+      },
+      "CollisionRuleContactRequest": {
+        "additionalProperties": false,
+        "description": "The pair may touch. Without a depth limit the depth is not checked.\nWithout `end_from_fraction` the pair may touch from 0.8 of the move on;\n0 means during the whole move, from its first sample.",
+        "properties": {
+          "end_from_fraction": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End From Fraction"
+          },
+          "max_compression_step_m": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Compression Step M"
+          },
+          "max_penetration_m": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Penetration M"
+          },
+          "spring_group": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CollisionSpringGroupRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "CollisionRuleContactRequest",
+        "type": "object"
+      },
+      "CollisionRuleLinkSelectionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "component_id": {
+            "title": "Component Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "link",
+            "title": "Kind",
+            "type": "string"
+          },
+          "link": {
+            "title": "Link",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "component_id",
+          "link"
+        ],
+        "title": "CollisionRuleLinkSelectionRequest",
+        "type": "object"
+      },
+      "CollisionRuleReleaseRequest": {
+        "additionalProperties": false,
+        "description": "A pair in contact at the start of the move must separate. Every key is\nsent with the motion.",
+        "properties": {
+          "allow_recontact": {
+            "title": "Allow Recontact",
+            "type": "boolean"
+          },
+          "enforce_max_start_penetration": {
+            "title": "Enforce Max Start Penetration",
+            "type": "boolean"
+          },
+          "max_start_penetration_m": {
+            "minimum": 0.0,
+            "title": "Max Start Penetration M",
+            "type": "number"
+          },
+          "min_release_progress_m": {
+            "minimum": 0.0,
+            "title": "Min Release Progress M",
+            "type": "number"
+          },
+          "release_evidence_mode": {
+            "enum": [
+              "signed_penetration",
+              "binary_contact"
+            ],
+            "title": "Release Evidence Mode",
+            "type": "string"
+          },
+          "release_tolerance_m": {
+            "minimum": 0.0,
+            "title": "Release Tolerance M",
+            "type": "number"
+          },
+          "require_separation_by_end": {
+            "title": "Require Separation By End",
+            "type": "boolean"
+          },
+          "require_strictly_decreasing_penetration": {
+            "title": "Require Strictly Decreasing Penetration",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "release_evidence_mode",
+          "enforce_max_start_penetration",
+          "max_start_penetration_m",
+          "release_tolerance_m",
+          "min_release_progress_m",
+          "require_separation_by_end",
+          "require_strictly_decreasing_penetration",
+          "allow_recontact"
+        ],
+        "title": "CollisionRuleReleaseRequest",
+        "type": "object"
+      },
+      "CollisionRuleRequest": {
+        "additionalProperties": false,
+        "description": "One collision rule of a motion: every pair of one member of `a` and one\nmember of `b` gets the value. The row without `a` and `b` carries a\nclearance for the pairs of the Deployment's first rule.",
+        "properties": {
+          "a": {
+            "anyOf": [
+              {
+                "items": {
+                  "discriminator": {
+                    "mapping": {
+                      "active_tcp_contact_bodies": "#/components/schemas/CollisionRuleActiveTcpContactBodiesSelectionRequest",
+                      "attached_object": "#/components/schemas/CollisionRuleAttachedObjectSelectionRequest",
+                      "collision_body": "#/components/schemas/CollisionRuleCollisionBodySelectionRequest",
+                      "component": "#/components/schemas/CollisionRuleComponentSelectionRequest",
+                      "link": "#/components/schemas/CollisionRuleLinkSelectionRequest",
+                      "scene_object": "#/components/schemas/CollisionRuleSceneObjectSelectionRequest",
+                      "scene_objects": "#/components/schemas/CollisionRuleSceneObjectsSelectionRequest"
+                    },
+                    "propertyName": "kind"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/$defs/CollisionRuleComponentSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleCollisionBodySelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleLinkSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleAttachedObjectSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleSceneObjectsSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleSceneObjectSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleActiveTcpContactBodiesSelectionRequest"
+                    }
+                  ]
+                },
+                "maxItems": 16,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "A"
+          },
+          "b": {
+            "anyOf": [
+              {
+                "items": {
+                  "discriminator": {
+                    "mapping": {
+                      "active_tcp_contact_bodies": "#/components/schemas/CollisionRuleActiveTcpContactBodiesSelectionRequest",
+                      "attached_object": "#/components/schemas/CollisionRuleAttachedObjectSelectionRequest",
+                      "collision_body": "#/components/schemas/CollisionRuleCollisionBodySelectionRequest",
+                      "component": "#/components/schemas/CollisionRuleComponentSelectionRequest",
+                      "link": "#/components/schemas/CollisionRuleLinkSelectionRequest",
+                      "scene_object": "#/components/schemas/CollisionRuleSceneObjectSelectionRequest",
+                      "scene_objects": "#/components/schemas/CollisionRuleSceneObjectsSelectionRequest"
+                    },
+                    "propertyName": "kind"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/$defs/CollisionRuleComponentSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleCollisionBodySelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleLinkSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleAttachedObjectSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleSceneObjectsSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleSceneObjectSelectionRequest"
+                    },
+                    {
+                      "$ref": "#/$defs/CollisionRuleActiveTcpContactBodiesSelectionRequest"
+                    }
+                  ]
+                },
+                "maxItems": 16,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "B"
+          },
+          "clearance_m": {
+            "anyOf": [
+              {
+                "maximum": 0.05,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Clearance M"
+          },
+          "contact": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CollisionRuleContactRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "release": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CollisionRuleReleaseRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rule_id": {
+            "title": "Rule Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rule_id"
+        ],
+        "title": "CollisionRuleRequest",
+        "type": "object"
+      },
+      "CollisionRuleSceneObjectSelectionRequest": {
+        "additionalProperties": false,
+        "description": "One Scene object; a blackboard key is resolved before the motion is sent.",
+        "properties": {
+          "kind": {
+            "const": "scene_object",
+            "title": "Kind",
+            "type": "string"
+          },
+          "scene_resource_id": {
+            "title": "Scene Resource Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "scene_resource_id"
+        ],
+        "title": "CollisionRuleSceneObjectSelectionRequest",
+        "type": "object"
+      },
+      "CollisionRuleSceneObjectsSelectionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "scene_objects",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "CollisionRuleSceneObjectsSelectionRequest",
+        "type": "object"
+      },
+      "CollisionSpringGroupRequest": {
+        "additionalProperties": false,
+        "description": "The spring slider a contact rule switches on (OD-371): the rule's pairs\nare one spring, compressed along `axis` (slider link frame).",
+        "properties": {
+          "axis": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "title": "Axis",
+            "type": "array"
+          },
+          "component_id": {
+            "title": "Component Id",
+            "type": "string"
+          },
+          "element_id": {
+            "title": "Element Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "component_id",
+          "element_id",
+          "axis"
+        ],
+        "title": "CollisionSpringGroupRequest",
+        "type": "object"
+      },
       "CommandDurationOptionRequest": {
         "additionalProperties": false,
         "properties": {
@@ -6937,29 +6938,13 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Cache Mode",
             "type": "string"
           },
-          "clearance_m": {
-            "anyOf": [
-              {
-                "maximum": 0.05,
-                "minimum": 0.0,
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Clearance M"
-          },
-          "contact_policy_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Contact Policy Id"
+          "collision_rules": {
+            "items": {
+              "$ref": "#/$defs/CollisionRuleRequest"
+            },
+            "maxItems": 64,
+            "title": "Collision Rules",
+            "type": "array"
           },
           "goal_frame_reference": {
             "anyOf": [
@@ -7187,6 +7172,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "cache_mode",
           "target_mode",
           "motion",
+          "collision_rules",
           "per_joint_dynamics_limits",
           "motion_interrupt_scopes"
         ],
@@ -7417,10 +7403,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Program Binding Id",
             "type": "string"
           },
-          "program_id": {
-            "title": "Program Id",
-            "type": "string"
-          },
           "program_revision": {
             "title": "Program Revision",
             "type": "string"
@@ -7444,7 +7426,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         },
         "required": [
           "request_context",
-          "program_id",
           "program_revision",
           "program_binding_id",
           "expected_graph_revision",
@@ -7585,6 +7566,93 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "const": "pose_goal",
             "title": "Kind",
             "type": "string"
+          },
+          "max_angular_acceleration_rad_s2": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Angular Acceleration Rad S2"
+          },
+          "max_angular_speed_rad_s": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Angular Speed Rad S"
+          },
+          "max_linear_acceleration_mps2": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Linear Acceleration Mps2"
+          },
+          "max_rotation_step_rad": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Rotation Step Rad"
+          },
+          "max_translation_step_m": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Translation Step M"
+          },
+          "motion_type": {
+            "anyOf": [
+              {
+                "const": "linear",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Motion Type"
+          },
+          "speed_mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "constant_speed",
+                  "time_optimal"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speed Mode"
           }
         },
         "required": [

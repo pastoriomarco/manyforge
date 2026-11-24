@@ -1,4 +1,4 @@
-"""GENERATED FILE -- program_binding_transport.v3.json; DO NOT EDIT."""
+"""GENERATED FILE -- program_binding_transport.v4.json; DO NOT EDIT."""
 
 from __future__ import annotations
 
@@ -18,8 +18,7 @@ _IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _KINDS = frozenset({
     "model_asset", "runtime_profile", "component_type",
     "control_interface_contract", "controller_topology", "provider_manifest",
-    "command_schema", "capability_definition", "contact_policy",
-    "stop_evidence_policy",
+    "command_schema", "capability_definition", "stop_evidence_policy",
 })
 _MAX = 4096
 _ROLE_MAX = 4096
@@ -28,9 +27,9 @@ _RETRY_MAX = 255
 _PROVENANCE_MAX = 16384
 _TEXT_MAX = 4096
 _IDENTITY_MAX = 128
-_BINDING_API_VERSION = "manyforge.program_binding.v3"
+_BINDING_API_VERSION = "manyforge.program_binding.v4"
 _FIELDS = {
-    "binding": ("api_version", "program_binding_id", "program_id", "program_revision", "retained_bundle_id", "graph_revision", "node_environment", "component_bindings", "target_bindings", "frame_bindings", "collision_body_bindings", "signal_bindings", "node_policies", "contact_grasp_bindings", "provenance"),
+    "binding": ("api_version", "program_binding_id", "program_revision", "retained_bundle_id", "graph_revision", "node_environment", "component_bindings", "target_bindings", "frame_bindings", "collision_body_bindings", "signal_bindings", "node_policies", "collision_rule_bodies", "provenance", "collision_rule_spring_sliders"),
     "node_environment": ("catalog_id", "content_version", "catalog_digest", "environment_digest"),
     "component": ("component_id", "component_type_id", "component_type_revision", "model_bindings"),
     "model": ("model_role_id", "model_instance_id", "model_revision"),
@@ -46,22 +45,21 @@ _FIELDS = {
     "control": ("control_binding_id", "control_binding_revision"),
     "provider": ("capability_provider_binding_id", "capability_provider_binding_revision"),
     "command_schema": ("command_schema_id", "command_schema_revision"),
-    "contact": ("contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "max_penetration_m", "terminal_window_start_fraction", "bodies_from_motion_endpoint"),
-    "contact_body": ("body", "model_role_id", "model_instance_id", "model_revision", "collision_body_ids"),
+    "collision_rule_body": ("body", "model_role_id", "model_instance_id", "model_revision", "collision_body_ids"),
+    "collision_rule_spring_slider": ("body", "axis", "stroke_m", "max_compression_step_m"),
     "provenance": ("binding_compiler_contract_digest", "source_records", "resolved_output_records"),
     "provenance_record": ("record_kind", "record_id", "revision"),
     "signal": ("reference", "target", "runtime_unit_id", "value_type", "direction", "transition_capability", "signal_descriptor_digest"),
     "pneumatic_io": ("outputs", "inputs"),
     "pneumatic_output": ("signal", "open_value", "close_value"),
     "pneumatic_input": ("input", "signal"),
-    "contact_release": ("contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "mode", "release_evidence_mode", "enforce_max_start_penetration", "max_start_penetration_m", "min_release_progress_m", "release_tolerance_m", "require_strictly_decreasing_penetration", "require_separation_by_end", "allow_recontact", "bodies_from_motion_endpoint"),
     "target_reference": ("component_id", "command_target_id"),
     "frame_reference": ("component_id", "frame_id"),
     "body_reference": ("component_id", "collision_body_id"),
     "signal_reference": ("component_id", "signal_name"),
     "frame_association": ("frame", "contact_body_role_ids"),
 }
-_OPTIONAL_FIELDS = {'recovery_policy': ('intervention_stop_scope',), 'target': ('pneumatic_io', 'robot_tcps', 'default_tcp'), 'contact': ('bodies_from_motion_endpoint',), 'contact_release': ('bodies_from_motion_endpoint',)}
+_OPTIONAL_FIELDS = {'binding': ('collision_rule_spring_sliders',), 'recovery_policy': ('intervention_stop_scope',), 'target': ('pneumatic_io', 'robot_tcps', 'default_tcp')}
 _STOP_POLICIES = frozenset(('inherit', 'hold', 'continue'))
 _INTERVENTION_STOP_SCOPES = frozenset(('all', 'own_groups'))
 _PROGRAM_ID = re.compile(r"^[a-z][a-z0-9_.-]*\Z")
@@ -114,15 +112,6 @@ def _digest(value: object, path: str) -> str:
     if not isinstance(value, str) or _DIGEST.fullmatch(value) is None:
         _fail(path, "expected lowercase SHA-256 identity")
     return value
-
-
-def _number(value: object, path: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        _fail(path, "expected finite number")
-    result = float(value)
-    if not math.isfinite(result):
-        _fail(path, "expected finite number")
-    return result
 
 
 def _sorted_unique(rows: list[Mapping[str, Any]], key, path: str) -> None:
@@ -200,11 +189,10 @@ def _node_policy(value: object, path: str) -> Mapping[str, Any]:
 
 def validate_program_binding(value: object, *, label: str = "program_binding") -> ProgramBindingDocument:
     """Validate without repair and return the original exact dict."""
-    root = _record(value, _FIELDS["binding"], label)
+    root = _record(value, _FIELDS["binding"], label, optional=_OPTIONAL_FIELDS["binding"])
     if root["api_version"] != _BINDING_API_VERSION:
         _fail(f"{label}.api_version", f"expected {_BINDING_API_VERSION}")
     _digest(root["program_binding_id"], f"{label}.program_binding_id")
-    _identity(root["program_id"], f"{label}.program_id")
     for field in ("program_revision", "retained_bundle_id", "graph_revision"):
         _digest(root[field], f"{label}.{field}")
     env = _record(root["node_environment"], _FIELDS["node_environment"], f"{label}.node_environment")
@@ -386,70 +374,48 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
         f"{label}.node_policies",
     )
 
-    contacts = _array(root["contact_grasp_bindings"], f"{label}.contact_grasp_bindings", maximum=_ROLE_MAX)
-    for pi, item in enumerate(contacts):
-        pp = f"{label}.contact_grasp_bindings[{pi}]"
-        branch = "contact_release" if isinstance(item, dict) and "mode" in item else "contact"
-        policy = _record(item, _FIELDS[branch], pp, optional=_OPTIONAL_FIELDS[branch])
-        _identity(policy["contact_policy_id"], f"{pp}.contact_policy_id")
-        _digest(policy["contact_policy_revision"], f"{pp}.contact_policy_revision")
-        _identity(policy["runtime_object_id"], f"{pp}.runtime_object_id")
-        if branch == "contact_release":
-            if policy["mode"] != "contact_release":
-                _fail(pp, "unsupported contact mode")
-            if policy["release_evidence_mode"] not in ("signed_penetration", "binary_contact"):
-                _fail(pp, "unsupported release evidence")
-            for field in ("enforce_max_start_penetration", "require_strictly_decreasing_penetration",
-                          "require_separation_by_end", "allow_recontact"):
-                if type(policy[field]) is not bool:
-                    _fail(pp, "release flags must be boolean")
-            for field in ("max_start_penetration_m", "min_release_progress_m", "release_tolerance_m"):
-                if not 0 <= _number(policy[field], f"{pp}.{field}") <= 1000:
-                    _fail(pp, "release metric ranges are invalid")
-            if policy["release_evidence_mode"] == "binary_contact" and (
-                policy["enforce_max_start_penetration"]
-                or policy["require_strictly_decreasing_penetration"]
-                or any(policy[field] != 0 for field in (
-                    "max_start_penetration_m", "min_release_progress_m", "release_tolerance_m"))
-            ):
-                _fail(pp, "binary contact requires neutral metric fields")
-        else:
-            penetration = _number(policy["max_penetration_m"], f"{pp}.max_penetration_m")
-            fraction = _number(policy["terminal_window_start_fraction"], f"{pp}.terminal_window_start_fraction")
-            if penetration <= 0 or not 0 <= fraction <= 1:
-                _fail(pp, "contact numeric ranges are invalid")
-        endpoint = "bodies_from_motion_endpoint" in policy
-        if endpoint and policy["bodies_from_motion_endpoint"] is not True:
-            _fail(pp, "bodies_from_motion_endpoint must be true or omitted")
-        bodies = _array(policy["allowed_body_bindings"], f"{pp}.allowed_body_bindings", minimum=0 if endpoint else 1)
-        if endpoint != (len(bodies) == 0):
-            _fail(pp, "endpoint and explicit contact bodies are mutually exclusive")
-        for bi, item2 in enumerate(bodies):
-            bp = f"{pp}.allowed_body_bindings[{bi}]"
-            body = _record(item2, _FIELDS["contact_body"], bp)
-            ref = _reference(body["body"], "body", f"{bp}.body")
-            _identity(body["model_instance_id"], f"{bp}.model_instance_id")
-            if body["model_role_id"] is not None:
-                _identity(body["model_role_id"], f"{bp}.model_role_id")
-            _digest(body["model_revision"], f"{bp}.model_revision")
-            ids = _id_array(body["collision_body_ids"], f"{bp}.collision_body_ids", text=True)
-            expected = [_COLLISION_BODY_ID.format(
-                controllable_component_id=ref[0], model_instance_id=body["model_instance_id"],
-                collision_body_role_id=ref[1], index=i,
-            ) for i in range(len(ids))]
-            if ids != expected:
-                _fail(bp, "collision body IDs differ from generated scope")
-            collision = body_bindings.get(ref)
-            if collision is None or collision["model_instance_id"] != body["model_instance_id"] or collision["model_revision"] != body["model_revision"] or len(collision["compiled_collision_body_names"]) != len(ids):
-                _fail(bp, "contact body differs from collision binding")
-            if body["model_role_id"] is not None:
-                component = component_by_id.get(ref[0])
-                models = component["model_bindings"] if component else []
-                if sum(x["model_role_id"] == body["model_role_id"] and x["model_instance_id"] == body["model_instance_id"] and x["model_revision"] == body["model_revision"] for x in models) != 1:
-                    _fail(bp, "contact body differs from model binding")
-        _sorted_unique(bodies, lambda x: (x["body"]["component_id"], x["body"]["collision_body_id"],
-            (0, "") if x["model_role_id"] is None else (1, x["model_role_id"])), f"{pp}.allowed_body_bindings")
-    _sorted_unique(contacts, lambda x: x["contact_policy_id"], f"{label}.contact_grasp_bindings")
+    rule_bodies = _array(root["collision_rule_bodies"], f"{label}.collision_rule_bodies", maximum=_ROLE_MAX)
+    for bi, item in enumerate(rule_bodies):
+        bp = f"{label}.collision_rule_bodies[{bi}]"
+        body = _record(item, _FIELDS["collision_rule_body"], bp)
+        ref = _reference(body["body"], "body", f"{bp}.body")
+        _identity(body["model_instance_id"], f"{bp}.model_instance_id")
+        if body["model_role_id"] is not None:
+            _identity(body["model_role_id"], f"{bp}.model_role_id")
+        _digest(body["model_revision"], f"{bp}.model_revision")
+        ids = _id_array(body["collision_body_ids"], f"{bp}.collision_body_ids", text=True)
+        expected = [_COLLISION_BODY_ID.format(
+            controllable_component_id=ref[0], model_instance_id=body["model_instance_id"],
+            collision_body_role_id=ref[1], index=i,
+        ) for i in range(len(ids))]
+        if ids != expected:
+            _fail(bp, "collision body IDs differ from generated scope")
+        collision = body_bindings.get(ref)
+        if collision is None or collision["model_instance_id"] != body["model_instance_id"] or collision["model_revision"] != body["model_revision"] or len(collision["compiled_collision_body_names"]) != len(ids):
+            _fail(bp, "collision rule body differs from collision binding")
+        if body["model_role_id"] is not None:
+            component = component_by_id.get(ref[0])
+            models = component["model_bindings"] if component else []
+            if sum(x["model_role_id"] == body["model_role_id"] and x["model_instance_id"] == body["model_instance_id"] and x["model_revision"] == body["model_revision"] for x in models) != 1:
+                _fail(bp, "collision rule body differs from model binding")
+    _sorted_unique(rule_bodies, lambda x: (x["body"]["component_id"], x["body"]["collision_body_id"]), f"{label}.collision_rule_bodies")
+
+    # Present only when non-empty; every slider is a collision rule body.
+    rule_body_refs = {(x["body"]["component_id"], x["body"]["collision_body_id"]) for x in rule_bodies}
+    if "collision_rule_spring_sliders" in root:
+        sliders = _array(root["collision_rule_spring_sliders"], f"{label}.collision_rule_spring_sliders", minimum=1, maximum=_ROLE_MAX)
+        for si, item in enumerate(sliders):
+            sp = f"{label}.collision_rule_spring_sliders[{si}]"
+            slider = _record(item, _FIELDS["collision_rule_spring_slider"], sp)
+            if _reference(slider["body"], "body", f"{sp}.body") not in rule_body_refs:
+                _fail(sp, "spring slider is not a collision rule body")
+            axis = _array(slider["axis"], f"{sp}.axis", minimum=3, maximum=3)
+            numbers = [*axis, slider["stroke_m"], slider["max_compression_step_m"]]
+            if any(type(x) not in (int, float) or not math.isfinite(x) for x in numbers):
+                _fail(sp, "expected finite numbers")
+            if not abs(math.hypot(*axis) - 1.0) <= 1e-9 or slider["stroke_m"] <= 0 or slider["max_compression_step_m"] <= 0:
+                _fail(sp, "expected a unit axis, a stroke and a step above 0")
+        _sorted_unique(sliders, lambda x: (x["body"]["component_id"], x["body"]["collision_body_id"]), f"{label}.collision_rule_spring_sliders")
 
     provenance = _record(root["provenance"], _FIELDS["provenance"], f"{label}.provenance")
     for field in ("binding_compiler_contract_digest",):

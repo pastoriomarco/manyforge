@@ -80,7 +80,8 @@
   padding: 0.7rem;
   border: 1px solid var(--mf-border-neutral-27);
   border-radius: var(--mf-radius-lg);
-  background: var(--mf-bg-neutral-06-a96);
+  background: color-mix(in srgb, var(--mf-bg-neutral-06) var(--mf-viewer-overlay-fill), transparent);
+  backdrop-filter: blur(0.35rem);
   box-shadow: 0 0.8rem 2rem var(--mf-shadow-neutral-00-a35);
 }
 
@@ -532,18 +533,19 @@ svg.viewer-camera-icon {
   border-radius: var(--mf-radius-md);
   font-size: var(--mf-font-size-084);
   line-height: 1;
+  background: color-mix(in srgb, var(--mf-bg-neutral-15) var(--mf-viewer-overlay-fill), transparent);
 }
 
 .viewer-transport .transport-run:not(:disabled) {
   border-color: var(--mf-border-success-35);
   color: var(--mf-text-success-82);
-  background: var(--mf-bg-success-15);
+  background: color-mix(in srgb, var(--mf-bg-success-15) var(--mf-viewer-overlay-fill), transparent);
 }
 
 .viewer-transport .transport-reset.meaningful:not(:disabled) {
   border-color: var(--mf-border-warning-37);
   color: var(--mf-text-warning-79);
-  background: var(--mf-bg-warning-15);
+  background: color-mix(in srgb, var(--mf-bg-warning-15) var(--mf-viewer-overlay-fill), transparent);
 }
 
 .transport-motion-panel {
@@ -563,7 +565,9 @@ svg.viewer-camera-icon {
   padding: 0.3rem;
   border: 1px solid var(--mf-border-neutral-30);
   border-radius: var(--mf-radius-lg);
-  background: var(--mf-bg-neutral-08-a94);
+  /* Semi-transparent over the 3D viewer (maintainer, 2026-11-24). */
+  background: color-mix(in srgb, var(--mf-bg-neutral-08) var(--mf-viewer-overlay-fill), transparent);
+  backdrop-filter: blur(0.35rem);
   box-shadow: 0 0.55rem 1.5rem var(--mf-shadow-neutral-00-a35);
   flex: 0 1 auto;
 }
@@ -643,6 +647,7 @@ svg.viewer-camera-icon {
   width: var(--viewer-transport-column-width);
   min-width: var(--viewer-transport-column-width);
   height: 100%;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows:
     repeat(2, var(--viewer-transport-control-height))
     minmax(calc(var(--viewer-transport-control-height) + 0.8rem), 1fr)
@@ -754,7 +759,8 @@ svg.viewer-camera-icon {
   padding: 0.3rem;
   border: 1px solid var(--mf-border-neutral-30);
   border-radius: var(--mf-radius-lg);
-  background: var(--mf-bg-neutral-08-a94);
+  background: color-mix(in srgb, var(--mf-bg-neutral-08) var(--mf-viewer-overlay-fill), transparent);
+  backdrop-filter: blur(0.35rem);
   box-shadow: 0 0.55rem 1.5rem var(--mf-shadow-neutral-00-a35);
   margin-left: auto;
   flex: 0 0 var(--viewer-transport-column-width);
@@ -888,17 +894,30 @@ svg.viewer-camera-icon {
 .viewer-transport .transport-run:hover:not(:disabled),
 .viewer-transport .transport-group-resume:hover:not(:disabled) {
   border-color: var(--mf-border-success-51);
-  background: var(--mf-bg-success-20);
+  background: color-mix(in srgb, var(--mf-bg-success-20) var(--mf-viewer-overlay-fill), transparent);
+}
+
+/* :where keeps this below the coloured hovers (run, resume, reset, danger). */
+.viewer-transport button:where(:not(.overlay-panel *)):hover:not(:disabled) {
+  background: color-mix(in srgb, var(--mf-bg-neutral-20) var(--mf-viewer-overlay-fill), transparent);
+}
+
+.viewer-transport .transport-group-resume:not(:disabled) {
+  background: color-mix(in srgb, var(--mf-bg-success-15) var(--mf-viewer-overlay-fill), transparent);
+}
+
+.viewer-transport .danger-button:not(:disabled) {
+  background: color-mix(in srgb, var(--mf-bg-danger-16) var(--mf-viewer-overlay-fill), transparent);
 }
 
 .viewer-transport .danger-button:hover:not(:disabled) {
   border-color: var(--mf-border-danger-53);
-  background: var(--mf-bg-danger-23);
+  background: color-mix(in srgb, var(--mf-bg-danger-23) var(--mf-viewer-overlay-fill), transparent);
 }
 
 .viewer-transport .transport-reset:hover:not(:disabled) {
   border-color: var(--mf-border-warning-49);
-  background: var(--mf-bg-warning-22);
+  background: color-mix(in srgb, var(--mf-bg-warning-22) var(--mf-viewer-overlay-fill), transparent);
 }
 
 .viewer-options-body {

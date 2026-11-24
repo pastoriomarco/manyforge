@@ -123,3 +123,50 @@ describe('values typed by their key', () => {
     expect(render({})).toContain('Choose the key first');
   });
 });
+
+// OD-341: a pose move's motion_type decides which settings apply.
+const moveToPose: CatalogEntry = {
+  ...checkValue,
+  id: 'motion.move_to_pose',
+  name: 'Move to pose',
+  category: 'motion',
+  parameters: [
+    { id: 'motion_type', required: false, schema: { type: 'string', enum: ['joint', 'linear'] }, schemaHash: 'sha256:m', hasDefault: true, default: 'joint' },
+    { id: 'planner', required: false, schema: { type: 'object' }, schemaHash: 'sha256:p', hasDefault: false },
+    { id: 'max_translation_step_m', required: false, schema: { type: 'number' }, schemaHash: 'sha256:s', hasDefault: true, default: 0.005 },
+    { id: 'cartesian_timing', required: false, schema: { type: 'string', enum: ['constant_speed', 'time_optimal'] }, schemaHash: 'sha256:c', hasDefault: false },
+    { id: 'translation_tol_m', required: false, schema: { type: 'number', minimum: 0 }, schemaHash: 'sha256:t', hasDefault: true, default: 0.005 },
+    { id: 'rotation_tol_rad', required: false, schema: { type: 'number', minimum: 0 }, schemaHash: 'sha256:r', hasDefault: true, default: 0.05 },
+    { id: 'velocity_scale', required: false, schema: { type: 'number' }, schemaHash: 'sha256:v', hasDefault: true, default: 1 },
+  ],
+};
+
+describe('pose move settings follow the motion type', () => {
+  const rule = (parameters: ProgramTreeNode['parameters'], id: string) =>
+    keyValueParameterRule(moveToPose, {
+      node_id: 'motion.move_to_pose', instance_id: 'move', parameters, children: [],
+    }, keys, id);
+
+  it('hides the linear settings on a joint move, also by default', () => {
+    for (const parameters of [{}, { motion_type: 'joint' }] as ProgramTreeNode['parameters'][]) {
+      expect(rule(parameters, 'max_translation_step_m').inapplicable).toMatch(/only to linear moves/);
+      expect(rule(parameters, 'cartesian_timing').inapplicable).toMatch(/only to linear moves/);
+      expect(rule(parameters, 'planner')).toEqual({});
+      expect(rule(parameters, 'translation_tol_m')).toEqual({});
+    }
+  });
+
+  it('hides the planner on a linear move and requires both tolerances', () => {
+    const linear = { motion_type: 'linear' };
+    expect(rule(linear, 'planner').inapplicable).toMatch(/only to joint moves/);
+    expect(rule(linear, 'max_translation_step_m')).toEqual({});
+    expect(rule(linear, 'cartesian_timing')).toEqual({});
+    expect(rule(linear, 'translation_tol_m')).toEqual({ required: true });
+    expect(rule(linear, 'rotation_tol_rad')).toEqual({ required: true });
+    expect(rule(linear, 'velocity_scale')).toEqual({});
+  });
+
+  it('leaves nodes without a motion type alone', () => {
+    expect(keyValueParameterRule(checkValue, node({ key: 'force' }), keys, 'planner')).toEqual({});
+  });
+});

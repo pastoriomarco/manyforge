@@ -16,6 +16,7 @@ import uuid
 from fastapi import (
     BackgroundTasks,
     FastAPI,
+    Header,
     HTTPException,
     Path,
     Query,
@@ -39,6 +40,7 @@ from .identity import (
     identified,
 )
 from .control_protocol import (
+    CONTROL_RECEIVED_MONOTONIC_NS_HEADER,
     ControlProtocolError,
     ExecutionCommandRequestDTO,
     is_stop_command,
@@ -65,6 +67,7 @@ from .history_query import (
 from .models import (
     AcknowledgeAlarmRequest,
     ApplyOutcomeRequest,
+    ProgramNodeAttemptBatchRequest,
     ProgramResetOutcomeRequest,
     ComponentActionRequest,
     ComponentGroupActionRequest,
@@ -447,6 +450,8 @@ def _error_status(code: str) -> int:
     ):
         return 400
     if code in {
+        # A Scene change whose result would exceed the Scene size limit.
+        "scene_too_large",
         "confirmation_required",
         "request_key_required",
         "start_identity_required",
@@ -571,6 +576,7 @@ def create_app(
             ),
             activation_preparer=activation_preparer,
             application_start_id=config.application_start_id,
+            scene_mesh_allowed_roots=config.scene_mesh_allowed_roots,
         )
         event_execution = ExecutionCommandClient(
             config.execution_run_root,
@@ -947,7 +953,7 @@ def create_app(
 
     app = FastAPI(
         title="ManyForge Headless Runtime API",
-        version="0.3.1",
+        version="0.4.0",
         lifespan=lifespan,
     )
     maximum_body = (
@@ -1262,6 +1268,13 @@ def create_app(
         start_identity(request.application_start_id)
         return service.core.record_program_diagnostic(request.model_dump(mode="json"))
 
+    @app.post("/api/program/node-attempts")
+    def program_node_attempts(request: ProgramNodeAttemptBatchRequest) -> dict[str, Any]:
+        """Finished Program node attempts from the Program Runner, recorded
+        in History as `program_node_attempt_finished` (OD-375)."""
+        start_identity(request.application_start_id)
+        return service.record_program_node_attempts(request)
+
     @app.get("/api/program/diagnostics/health")
     def program_diagnostic_health() -> dict[str, Any]:
         return service.program_diagnostic_health()
@@ -1436,6 +1449,15 @@ def create_app(
     async def execution_control_command(
         body: ExecutionCommandRequestDTO,
         request: Request,
+        # Set by Composer only: an internal hop, not part of the public API.
+        received_monotonic_ns: Annotated[
+            int | None,
+            Header(
+                alias=CONTROL_RECEIVED_MONOTONIC_NS_HEADER,
+                ge=0,
+                include_in_schema=False,
+            ),
+        ] = None,
     ) -> JSONResponse:
         attribution = _trusted_attribution(request, trusted_principal_adapter)
         submission = await control_ingress.submit(
@@ -1443,6 +1465,7 @@ def create_app(
             transport_kind="rest",
             trusted_principal_id=attribution.principal_id,
             assurance=attribution.assurance,
+            received_monotonic_ns=received_monotonic_ns,
         )
         control_state_source.notify_control()
         return JSONResponse(
@@ -1517,6 +1540,18 @@ def create_app(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
+
+    @app.get("/api/program/runs/{program_run_id}/blackboard-values")
+    def program_runtime_blackboard_values(
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: Annotated[str | None, Query(max_length=16)] = None,
+    ) -> dict[str, Any]:
+        """Read-only: the run's declared keys with their current values."""
+        read_start_identity(
+            application_start_id,
+            HeadlessApiError("program_run_not_found", "Program run is not known"),
+        )
+        return shown(service.program_runtime_blackboard_values(program_run_id))
 
     @app.post("/api/program/runs/{program_run_id}/blackboard-values")
     async def write_runtime_blackboard(

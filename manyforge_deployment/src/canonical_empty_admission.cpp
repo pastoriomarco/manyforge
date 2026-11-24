@@ -28,8 +28,6 @@ namespace {
 
 namespace posix = detail::posix_durability;
 
-constexpr std::string_view kCanonicalDeploymentArtifactId =
-    "c1_build_authority";
 constexpr std::string_view kCanonicalCellId = "c1_build_authority_cell";
 constexpr std::string_view kAdmissionFilename =
     "canonical-empty-admission.json";
@@ -194,8 +192,6 @@ admission_projection(std::string_view admission_digest,
        CanonicalValue(std::string(kCanonicalEmptyAdmissionApiVersion))},
       {"admission_digest", CanonicalValue(std::string(admission_digest))},
       {"cell_id", CanonicalValue(value.cell_graph.cell_id.value())},
-      {"deployment_artifact_id",
-       CanonicalValue(value.deployment_artifact_id.value())},
       {"deployment_revision",
        CanonicalValue(value.deployment_revision.value())},
       {"graph_revision",
@@ -226,7 +222,6 @@ make_admission_record(const RetainedBundle &bundle) {
       std::move(bytes),
       digest,
       bundle.value().cell_graph.cell_id.value(),
-      bundle.value().deployment_artifact_id.value(),
       bundle.value().deployment_revision.value(),
       bundle.value().cell_graph.graph_revision.value(),
       bundle.retained_bundle_id().value(),
@@ -246,10 +241,9 @@ parse_admission_record(std::string_view bytes) {
   const auto &object = require_object(root, "canonical_empty_admission");
   require_exact_fields(object,
                        {"api_version", "admission_digest", "cell_id",
-                        "deployment_artifact_id", "deployment_revision",
-                        "graph_revision", "retained_bundle_id",
-                        "environment_digest", "compiler_contract_digest",
-                        "compiler_build_digest"},
+                        "deployment_revision", "graph_revision",
+                        "retained_bundle_id", "environment_digest",
+                        "compiler_contract_digest", "compiler_build_digest"},
                        "canonical_empty_admission");
 
   const auto field = [&object](std::string_view name) -> const std::string & {
@@ -263,7 +257,6 @@ parse_admission_record(std::string_view bytes) {
   }
   const std::string &admission_digest = field("admission_digest");
   const std::string &cell_id = field("cell_id");
-  const std::string &deployment_artifact_id = field("deployment_artifact_id");
   const std::string &deployment_revision = field("deployment_revision");
   const std::string &graph_revision = field("graph_revision");
   const std::string &retained_bundle_id = field("retained_bundle_id");
@@ -296,7 +289,6 @@ parse_admission_record(std::string_view bytes) {
       canonical_bytes,
       std::string(admission_digest),
       std::string(cell_id),
-      std::string(deployment_artifact_id),
       std::string(deployment_revision),
       std::string(graph_revision),
       std::string(retained_bundle_id),
@@ -310,9 +302,7 @@ parse_admission_record(std::string_view bytes) {
   const auto deployment = verify_deployment_artifact_revision(
       parse_strict_json_model_yaml(detail::kEmbeddedCanonicalEmptyDeployment),
       std::span<const QualifiedRuntimeProfile>{});
-  if (deployment.deployment_artifact_id().value() !=
-          kCanonicalDeploymentArtifactId ||
-      deployment.cell_id().value() != kCanonicalCellId) {
+  if (deployment.cell_id().value() != kCanonicalCellId) {
     throw std::logic_error(
         "embedded canonical-empty deployment has the wrong fixed identity");
   }
@@ -329,7 +319,6 @@ void require_bundle_matches_authorities(
   const auto &value = bundle.value();
   if (!verify_retained_bundle_identity(bundle) ||
       bundle.retained_bundle_id() != value.retained_bundle_id ||
-      value.deployment_artifact_id != deployment.deployment_artifact_id() ||
       value.deployment_revision != deployment.deployment_revision() ||
       value.cell_graph != deployment.graph().graph() ||
       value.cell_graph.cell_id != deployment.cell_id() ||
@@ -343,7 +332,6 @@ void require_bundle_matches_authorities(
     return;
   }
   if (record->cell_id != value.cell_graph.cell_id.value() ||
-      record->deployment_artifact_id != value.deployment_artifact_id.value() ||
       record->deployment_revision != value.deployment_revision.value() ||
       record->graph_revision != value.cell_graph.graph_revision.value() ||
       record->retained_bundle_id != value.retained_bundle_id.value() ||
@@ -371,7 +359,6 @@ void require_bundle_matches_record_and_authorities(
       value.provenance.compiler_contract_digest != compiler_contract_digest ||
       value.provenance.compiler_build_digest != compiler_build_digest ||
       record.cell_id != value.cell_graph.cell_id.value() ||
-      record.deployment_artifact_id != value.deployment_artifact_id.value() ||
       record.deployment_revision != value.deployment_revision.value() ||
       record.graph_revision != value.cell_graph.graph_revision.value() ||
       record.retained_bundle_id != value.retained_bundle_id.value() ||
@@ -534,9 +521,15 @@ FilesystemCanonicalEmptyRetainedBundleSource::load_verified() const {
       fail("canonical-empty admission record is missing");
     }
     CanonicalEmptyAdmissionRecord record = parse_admission_record(*bytes);
+    // The fixed golden is the embedded deployment itself (OD-369: identified
+    // by its content, not by a name); a package compiled for a runtime
+    // profile of the same cell is another deployment.
+    const RevisionVerifiedDeploymentArtifact fixed_deployment =
+        load_fixed_deployment();
     const bool fixed_golden =
         record.cell_id == kCanonicalCellId &&
-        record.deployment_artifact_id == kCanonicalDeploymentArtifactId;
+        record.deployment_revision ==
+            fixed_deployment.deployment_revision().value();
 
     const detail::PackageAdmissionProfile profile =
         detail::verify_package_admission_profile(
@@ -559,17 +552,13 @@ FilesystemCanonicalEmptyRetainedBundleSource::load_verified() const {
            "environment manifest");
     }
     if (fixed_golden) {
-      const RevisionVerifiedDeploymentArtifact deployment =
-          load_fixed_deployment();
-      if (record.deployment_revision !=
-              deployment.deployment_revision().value() ||
-          record.graph_revision !=
-              deployment.graph().graph().graph_revision.value()) {
+      if (record.graph_revision !=
+          fixed_deployment.graph().graph().graph_revision.value()) {
         fail("canonical-empty admission differs from the exact embedded "
              "deployment");
       }
       require_bundle_matches_authorities(
-          *bundle, deployment, bundle->value().catalogs.node_environment,
+          *bundle, fixed_deployment, bundle->value().catalogs.node_environment,
           profile.compiler_contract_digest(), profile.compiler_build_digest(),
           &record);
     }
@@ -578,7 +567,6 @@ FilesystemCanonicalEmptyRetainedBundleSource::load_verified() const {
     return CanonicalEmptyRetainedBundleAdmission(
         core::ContentDigest(std::move(record.admission_digest)),
         core::CellId(std::move(record.cell_id)),
-        core::DeploymentArtifactId(std::move(record.deployment_artifact_id)),
         core::DeploymentRevision(std::move(record.deployment_revision)),
         core::GraphRevision(std::move(record.graph_revision)),
         core::RetainedBundleId(std::move(record.retained_bundle_id)),

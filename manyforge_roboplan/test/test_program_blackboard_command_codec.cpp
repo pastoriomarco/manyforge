@@ -46,6 +46,58 @@ TEST(ToolPayloadCommandCodec, RemovedBridgeCommandIsRejected) {
   EXPECT_THROW(DecodeCommand(command), std::exception);
 }
 
+// OD-341: a joint pose goal keeps its two-field shape; a linear one carries
+// motion_type and the line settings, speed_mode optional.
+TEST(MotionSpecCommandCodec, PoseGoalDecodesItsMotionType) {
+  const Value goal(Value::Object{
+      {"orientation", Value(Value::Object{{"w", Value(1.0)}, {"x", Value(0.0)},
+                                          {"y", Value(0.0)}, {"z", Value(0.0)}})},
+      {"position_m", Value(Value::Object{{"x_m", Value(0.3)}, {"y_m", Value(0.0)},
+                                         {"z_m", Value(0.2)}})}});
+  const auto joint = DecodeMotionSpec(Value(Value::Object{
+      {"goal", goal}, {"kind", Value("pose_goal")}}));
+  ASSERT_TRUE(std::holds_alternative<core::PoseGoalDTO>(joint));
+  EXPECT_FALSE(std::get<core::PoseGoalDTO>(joint).linear.has_value());
+
+  Value::Object line{{"goal", goal},
+                     {"kind", Value("pose_goal")},
+                     {"max_angular_acceleration_rad_s2", Value(1.0)},
+                     {"max_angular_speed_rad_s", Value(0.4)},
+                     {"max_linear_acceleration_mps2", Value(0.3)},
+                     {"max_rotation_step_rad", Value(0.02)},
+                     {"max_translation_step_m", Value(0.002)},
+                     {"motion_type", Value("linear")}};
+  const auto linear = DecodeMotionSpec(Value(line));
+  const auto &decoded = std::get<core::PoseGoalDTO>(linear);
+  ASSERT_TRUE(decoded.linear.has_value());
+  EXPECT_DOUBLE_EQ(decoded.linear->max_translation_step_m, 0.002);
+  EXPECT_DOUBLE_EQ(decoded.linear->max_rotation_step_rad, 0.02);
+  EXPECT_DOUBLE_EQ(decoded.linear->max_angular_speed_rad_s, 0.4);
+  EXPECT_DOUBLE_EQ(decoded.linear->max_linear_acceleration_mps2, 0.3);
+  EXPECT_DOUBLE_EQ(decoded.linear->max_angular_acceleration_rad_s2, 1.0);
+  EXPECT_FALSE(decoded.linear->speed_mode.has_value());
+
+  auto timed = line;
+  timed.emplace_back("speed_mode", Value("time_optimal"));
+  EXPECT_EQ(std::get<core::PoseGoalDTO>(DecodeMotionSpec(Value(timed))).linear->speed_mode,
+            core::CartesianSpeedModeDTO::kTimeOptimal);
+
+  auto missing = line;
+  missing.erase(std::remove_if(missing.begin(), missing.end(),
+                               [](const auto &member) {
+                                 return member.first == "max_rotation_step_rad";
+                               }),
+                missing.end());
+  EXPECT_THROW(DecodeMotionSpec(Value(missing)), std::exception);
+  auto joint_type = line;
+  for (auto &member : joint_type)
+    if (member.first == "motion_type") member.second = Value("joint");
+  EXPECT_THROW(DecodeMotionSpec(Value(joint_type)), std::exception);
+  auto bad_timing = line;
+  bad_timing.emplace_back("speed_mode", Value("bounded"));
+  EXPECT_THROW(DecodeMotionSpec(Value(bad_timing)), std::exception);
+}
+
 Command DecodeSetIoOutput(Value request) {
   return DecodeCommand(content_identity::canonical_json(Value(Value::Object{
       {"api_version", Value(std::string(kCommandApiVersion))},
@@ -619,7 +671,7 @@ TEST(MotionEndpointCommandCodecTest,
       {"target_mode", Value("absolute")},
       {"target_reference", Value(nullptr)},
       {"offset_reference", Value(nullptr)},
-      {"contact_policy_id", Value(nullptr)},
+      {"collision_rules", Value(Value::Array{})},
       {"per_joint_dynamics_limits", Value(Value::Object{})},
       {"motion_interrupt_scopes", Value(Value::Array{})},
       {"motion", Value(Value::Object{
@@ -633,7 +685,6 @@ TEST(MotionEndpointCommandCodecTest,
              Value(Value::Object{{"request_key", Value(core::RequestKeyText(
                                                      core::TestRequestKey("request.endpoint")))},
                                  {"source_label", Value("test")}})},
-            {"program_id", Value("program")},
             {"program_revision", Value("revision")},
             {"program_binding_id", Value("binding")},
             {"program_run_id", Value(107.0)},
@@ -676,25 +727,138 @@ TEST(MotionEndpointCommandCodecTest,
                               Value(Value::Object{{"target_role_id", Value("arm")},
                                                   {"frame_role_id", Value("tcp")}}))),
                std::exception);
-  // Contact is explicit even for a joint destination. Spatial references
-  // remain invalid; resolving this policy/object pair remains Core-owned.
+  EXPECT_TRUE(std::get<core::MotionParticipantIntentDTO>(own.participants.front().payload)
+                  .collision_rules.empty());
+  // Collision rules travel with the motion, a joint destination included.
+  // Resolving their selections remains Core-owned.
+  const Value tcp_bodies(Value::Object{{"kind", Value("active_tcp_contact_bodies")}});
+  const Value probe_block(Value::Object{{"kind", Value("scene_object")},
+                                        {"scene_resource_id", Value("probe_block")}});
+  const Value release(Value::Object{
+      {"release_evidence_mode", Value("signed_penetration")},
+      {"enforce_max_start_penetration", Value(true)},
+      {"max_start_penetration_m", Value(0.002)},
+      {"release_tolerance_m", Value(1e-5)},
+      {"min_release_progress_m", Value(0.0)},
+      {"require_separation_by_end", Value(true)},
+      {"require_strictly_decreasing_penetration", Value(true)},
+      {"allow_recontact", Value(false)}});
+  const Value release_rule(Value::Object{
+      {"rule_id", Value("withdrawal")},
+      {"a", Value(Value::Array{tcp_bodies})},
+      {"b", Value(Value::Array{probe_block})},
+      {"release", release}});
+  const Value contact_rule(Value::Object{
+      {"rule_id", Value("gripper_on_parts")},
+      {"a", Value(Value::Array{
+                Value(Value::Object{{"kind", Value("collision_body")},
+                                    {"component_id", Value("gripper")},
+                                    {"collision_body_id", Value("gripper_collision")}}),
+                Value(Value::Object{{"kind", Value("link")},
+                                    {"component_id", Value("robot")},
+                                    {"link", Value("link6")}}),
+                Value(Value::Object{{"kind", Value("component")},
+                                    {"component_id", Value("gripper")}})})},
+      {"b", Value(Value::Array{
+                Value(Value::Object{{"kind", Value("attached_object")},
+                                    {"component_id", Value("gripper")}}),
+                Value(Value::Object{{"kind", Value("scene_objects")}})})},
+      {"contact", Value(Value::Object{{"max_penetration_m", Value(0.002)},
+                                      {"end_from_fraction", Value(0.8)}})}});
+  const Value everything_else(Value::Object{{"rule_id", Value("everything_else")},
+                                            {"clearance_m", Value(0.002)}});
+  const auto withdrawal = Replace(
+      payload, "collision_rules",
+      Value(Value::Array{everything_else, release_rule, contact_rule}));
+  const auto decoded_withdrawal = decode(withdrawal);
+  const auto &ruled = std::get<core::MotionParticipantIntentDTO>(
+      decoded_withdrawal.participants.front().payload);
+  ASSERT_EQ(ruled.collision_rules.size(), 3U);
+  EXPECT_EQ(ruled.collision_rules[0],
+            (core::CollisionRuleDTO{"everything_else", {}, {},
+                                    core::CollisionClearanceRule{0.002}}));
+  core::CollisionReleaseRule expected_release;
+  expected_release.max_start_penetration_m = 0.002;
+  EXPECT_EQ(ruled.collision_rules[1],
+            (core::CollisionRuleDTO{
+                "withdrawal",
+                {core::CollisionRuleActiveTcpContactBodiesSelection{}},
+                {core::CollisionRuleSceneObjectSelection{core::SceneResourceId("probe_block")}},
+                expected_release}));
+  EXPECT_EQ(ruled.collision_rules[2],
+            (core::CollisionRuleDTO{
+                "gripper_on_parts",
+                {core::CollisionRuleCollisionBodySelection{
+                     {core::ControllableComponentId("gripper"),
+                      core::CollisionBodyRoleId("gripper_collision")}},
+                 core::CollisionRuleLinkSelection{core::ControllableComponentId("robot"),
+                                                  "link6"},
+                 core::CollisionRuleComponentSelection{
+                     core::ControllableComponentId("gripper")}},
+                {core::CollisionRuleAttachedObjectSelection{
+                     core::ControllableComponentId("gripper")},
+                 core::CollisionRuleSceneObjectsSelection{}},
+                core::CollisionContactRule{0.002, 0.8, std::nullopt}}));
+  // A contact value may leave out either member: no depth check, the default
+  // end window.
+  const auto defaulted = decode(Replace(
+      payload, "collision_rules",
+      Value(Value::Array{Replace(contact_rule, "contact", Value(Value::Object{}))})));
+  EXPECT_EQ(std::get<core::CollisionContactRule>(
+                std::get<core::MotionParticipantIntentDTO>(
+                    defaulted.participants.front().payload)
+                    .collision_rules.front()
+                    .value),
+            core::CollisionContactRule{});
+  const auto refused_rule = [&](const char *name, Value rule) {
+    SCOPED_TRACE(name);
+    EXPECT_THROW(decode(Replace(payload, "collision_rules",
+                                Value(Value::Array{std::move(rule)}))),
+                 std::exception);
+  };
+  // One value per row; `a` and `b` together; closed rows and selections.
+  refused_rule("two values", Replace(everything_else, "contact", Value(Value::Object{})));
+  refused_rule("no value", Value(Value::Object{{"rule_id", Value("no_value")}}));
+  refused_rule("a without b", Value(Value::Object{{"rule_id", Value("only_a")},
+                                   {"a", Value(Value::Array{tcp_bodies})},
+                                   {"clearance_m", Value(0.002)}}));
+  refused_rule("unknown row member", Replace(release_rule, "leg", Value("retreat")));
+  refused_rule("unknown selection member", Replace(release_rule, "a",
+                       Value(Value::Array{Replace(tcp_bodies, "extra", Value(true))})));
+  refused_rule("empty side", Replace(release_rule, "a", Value(Value::Array{})));
+  refused_rule("scene object by blackboard key", Replace(release_rule, "b",
+                       Value(Value::Array{Value(Value::Object{
+                           {"kind", Value("scene_object")},
+                           {"blackboard_key", Value("trial.probe_object")}})})));
+  refused_rule("model group on a move", Replace(release_rule, "b",
+                       Value(Value::Array{Value(Value::Object{
+                           {"kind", Value("model_group")},
+                           {"component_id", Value("robot")},
+                           {"group", Value("arm")}})})));
+  refused_rule("unknown release evidence mode", Replace(release_rule, "release",
+                       Replace(release, "release_evidence_mode", Value("force"))));
+  refused_rule("unknown contact member", Replace(contact_rule, "contact",
+                       Value(Value::Object{{"terminal_window_start_fraction", Value(0.8)}})));
+  // Values outside their range and repeated ids are refused by the shared
+  // shape check.
+  refused_rule("clearance out of range", Replace(everything_else, "clearance_m", Value(0.06)));
+  refused_rule("contact end fraction out of range", Replace(contact_rule, "contact",
+                       Value(Value::Object{{"end_from_fraction", Value(1.5)}})));
+  EXPECT_THROW(decode(Replace(payload, "collision_rules",
+                              Value(Value::Array{release_rule, release_rule}))),
+               std::exception);
+  // The removed fields are unknown fields.
+  EXPECT_THROW(decode(Replace(payload, "contact_policy_id", Value(nullptr))),
+               std::exception);
+  EXPECT_THROW(decode(Replace(payload, "clearance_m", Value(0.002))),
+               std::exception);
+  // Runtime-object bindings serve target references; a joint destination
+  // has none, and spatial references stay invalid for it.
   const Value runtime_object(Value::Object{
       {"runtime_object_id", Value("selected_object")},
       {"scene_resource_id", Value("probe_block")}});
-  const auto withdrawal = Replace(
-      Replace(payload, "contact_policy_id", Value("withdrawal.contact")),
-      "runtime_object_bindings", Value(Value::Array{runtime_object}));
-  const auto decoded_withdrawal = decode(withdrawal);
-  const auto &joint_contact = std::get<core::MotionParticipantIntentDTO>(
-      decoded_withdrawal.participants.front().payload);
-  ASSERT_TRUE(joint_contact.contact_policy_id.has_value());
-  EXPECT_EQ(joint_contact.contact_policy_id->value(), "withdrawal.contact");
-  ASSERT_EQ(joint_contact.runtime_object_bindings.size(), 1U);
-  EXPECT_EQ(joint_contact.runtime_object_bindings.front().runtime_object_id.value(),
-            "selected_object");
-  EXPECT_EQ(joint_contact.runtime_object_bindings.front().scene_resource_id.value(),
-            "probe_block");
-  EXPECT_THROW(decode(Replace(withdrawal, "contact_policy_id", Value(nullptr))),
+  EXPECT_THROW(decode(Replace(withdrawal, "runtime_object_bindings",
+                              Value(Value::Array{runtime_object}))),
                std::exception);
   const Value reference(Value::Object{{"type", Value("cell_frame")}});
   for (const auto &mode : {"absolute", "relative"}) {
@@ -704,10 +868,6 @@ TEST(MotionEndpointCommandCodecTest,
                    std::exception);
     }
   }
-  EXPECT_THROW(
-      decode(Replace(withdrawal, "runtime_object_bindings",
-                     Value(Value::Array{Replace(runtime_object, "extra", Value(true))}))),
-      std::exception);
   EXPECT_THROW(
       decode(Replace(Value(fields), "tcp_frame_role_id", Value("tcp"))),
       std::exception);
@@ -758,7 +918,6 @@ TEST(MotionEndpointCommandCodecTest, DecodesTheSetTcpPayload) {
              Value(Value::Object{{"request_key", Value(core::RequestKeyText(
                                                      core::TestRequestKey("request.set_tcp")))},
                                  {"source_label", Value("test")}})},
-            {"program_id", Value("program")},
             {"program_revision", Value("revision")},
             {"program_binding_id", Value("binding")},
             {"program_run_id", Value(107.0)},
@@ -1055,6 +1214,33 @@ Value StopRequestContext(const std::string_view key) {
 Command DecodeRoot(Value::Object root) {
   root.emplace_back("api_version", Value(std::string(kCommandApiVersion)));
   return DecodeCommand(content_identity::canonical_json(Value(std::move(root))));
+}
+
+Value ProgramNodeStopRequest() {
+  auto request = SelectionRequest().as_object();
+  request.emplace_back("stopped_by_node_instance_id", Value("ask"));
+  return Value(std::move(request));
+}
+
+// OD-342: the Program owner's own group Stop names the requesting node; a
+// client cannot, and Run/Resume never carry it.
+TEST(ProgramStopCommandCodec, AProgramNodeStopNamesItsNodeFromTheProgramOwnerOnly) {
+  const auto decoded =
+      DecodeStopCommand("stop_program_selection", InternalAttribution(), ProgramNodeStopRequest());
+  ASSERT_TRUE(decoded.program_selection.has_value());
+  EXPECT_EQ(decoded.program_selection->stopped_by_node_instance_id,
+            std::optional<core::ProgramNodeInstanceId>(core::ProgramNodeInstanceId("ask")));
+  EXPECT_FALSE(
+      DecodeStopCommand("stop_program_selection", InternalAttribution(), SelectionRequest())
+          .program_selection->stopped_by_node_instance_id.has_value());
+  EXPECT_THROW((void)DecodeStopCommand("stop_program_selection", OperatorAttribution(),
+                                       ProgramNodeStopRequest()),
+               std::exception);
+  EXPECT_THROW((void)DecodeRoot({{"attribution", InternalAttribution()},
+                                 {"command", Value("release_program_selection")},
+                                 {"expected_hold_revision", Value(1.0)},
+                                 {"request", ProgramNodeStopRequest()}}),
+               std::exception);
 }
 
 std::vector<std::string> MemberNames(const Value &value) {
@@ -1635,12 +1821,13 @@ TEST(StopResponseCodec, ScopeReadCarriesHoldRevisionAndFrozenLevel) {
             Sorted({"schema_version", "claim_generation", "program_run_id", "hold_revision",
                     "ready_node_indices", "held_node_indices", "stopping_node_indices",
                     "faulted_node_indices", "selection_release_block_reason", "stopped_by",
-                    "rule_id", "frozen", "frozen_by", "all_groups_held"}));
+                    "rule_id", "program_held_nodes", "frozen", "frozen_by",
+                    "all_groups_held"}));
   for (const auto *removed : {"stop_id", "stop_generation", "selection_revision",
                               "request_key", "releasable", "ended"})
     EXPECT_EQ(value.find_object_member(removed), nullptr) << removed;
   EXPECT_EQ(value.find_object_member("schema_version")->as_string(),
-            "manyforge.program_execution_scope.v3");
+            "manyforge.program_execution_scope.v4");
   EXPECT_EQ(value.find_object_member("claim_generation")->as_number(), 1.0);
   EXPECT_EQ(value.find_object_member("program_run_id")->as_number(), 2.0);
   EXPECT_EQ(value.find_object_member("hold_revision")->as_number(), 3.0);
@@ -1657,6 +1844,7 @@ TEST(StopResponseCodec, ScopeReadCarriesHoldRevisionAndFrozenLevel) {
   EXPECT_TRUE(value.find_object_member("selection_release_block_reason")->is_null());
   EXPECT_TRUE(value.find_object_member("stopped_by")->is_null());
   EXPECT_TRUE(value.find_object_member("rule_id")->is_null());
+  EXPECT_TRUE(value.find_object_member("program_held_nodes")->as_array().empty());
   EXPECT_EQ(value.find_object_member("frozen")->as_string(), "none");
   EXPECT_TRUE(value.find_object_member("frozen_by")->is_null());
   EXPECT_FALSE(value.find_object_member("all_groups_held")->as_bool());
@@ -1680,6 +1868,16 @@ TEST(StopResponseCodec, ScopeReadCarriesHoldRevisionAndFrozenLevel) {
     EXPECT_EQ(value.find_object_member("stopped_by")->as_string(), "rule");
     EXPECT_EQ(value.find_object_member("rule_id")->as_string(), "rule.door");
   }
+
+  // OD-342: the held nodes a Program node's own Stop holds, as
+  // [held node index, requesting node index] pairs.
+  scope.program_held_nodes = {{2U, 5U}, {3U, 5U}};
+  value = ProgramExecutionScopeValue(scope);
+  const auto &pairs = value.find_object_member("program_held_nodes")->as_array();
+  ASSERT_EQ(pairs.size(), 2U);
+  EXPECT_EQ(pairs[0].as_array()[0].as_number(), 2.0);
+  EXPECT_EQ(pairs[0].as_array()[1].as_number(), 5.0);
+  EXPECT_EQ(pairs[1].as_array()[0].as_number(), 3.0);
 }
 
 TEST(StopResponseCodec, ParticipantStopObservation) {

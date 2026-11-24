@@ -1,8 +1,11 @@
-from threading import Event, Thread
+from threading import Event, Semaphore, Thread
 
 import pytest
 
-from manyforge_program_runner.diagnostics import ProgramDiagnosticPublisher
+from manyforge_program_runner.diagnostics import (
+    ProgramDiagnosticPublisher,
+    ProgramNodeAttemptPublisher,
+)
 
 
 def test_slow_historian_never_blocks_producer_or_accumulates_unbounded_work():
@@ -179,3 +182,92 @@ def test_close_waits_for_the_in_flight_delivery_and_counts_pending_as_lost():
     assert not closer.is_alive()
     assert [record["label"] for record in records] == ["in_flight"]
     assert not publisher._thread.is_alive()
+
+
+def test_node_attempts_batch_bounded_and_never_block_the_producer():
+    """OD-375: submit never waits on a send in flight; the queue holds 512,
+    a POST carries at most 64, and the overflow is dropped and counted."""
+    entered, release, drained = Event(), Event(), Event()
+    batches = []
+
+    def send(batch):
+        entered.set()
+        assert release.wait(5)
+        batches.append(batch)
+        if sum(len(sent["attempts"]) for sent in batches) == 1 + 512:
+            drained.set()
+        return {"recorded": len(batch["attempts"])}
+
+    publisher = ProgramNodeAttemptPublisher(send, "0123456789abcdef")
+    try:
+        publisher.submit({"node_attempt_id": 0})
+        assert entered.wait(5)
+        for attempt_id in range(1, 1001):
+            publisher.submit({"node_attempt_id": attempt_id})
+        health = publisher.health()
+        assert health["enqueued_count"] == 512
+        assert health["lost_count"] == "488"
+        release.set()
+        assert drained.wait(5)
+    finally:
+        release.set()
+        publisher.close()
+    assert batches[0] == {
+        "schema_version": "manyforge.program_node_attempt_batch.v1",
+        "application_start_id": "0123456789abcdef",
+        "attempts": [{"node_attempt_id": 0}],
+    }
+    assert [len(batch["attempts"]) for batch in batches[1:]] == [64] * 8
+    assert [fact["node_attempt_id"] for batch in batches for fact in batch["attempts"]] == list(
+        range(513)
+    )
+    assert publisher.health()["sent_count"] == "513"
+
+
+def test_node_attempts_lost_by_a_failed_or_unanswered_send_are_counted():
+    answers = iter([OSError("headless unavailable"), {"ok": True}, {"recorded": 1}])
+    sends = Semaphore(0)
+
+    def send(batch):
+        sends.release()
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    publisher = ProgramNodeAttemptPublisher(send, "0123456789abcdef")
+    try:
+        for _ in range(3):
+            publisher.submit({"node_attempt_id": 1})
+            assert sends.acquire(timeout=5)  # One batch per submit.
+    finally:
+        publisher.close()  # Joins the last send.
+    health = publisher.health()
+    assert (health["lost_count"], health["sent_count"]) == ("2", "1")
+
+
+def test_node_attempts_close_drops_pending_and_waits_for_the_send_in_flight():
+    entered, answer = Event(), Event()
+    batches = []
+
+    def send(batch):
+        entered.set()
+        answer.wait()
+        batches.append(batch)
+        return {"recorded": len(batch["attempts"])}
+
+    publisher = ProgramNodeAttemptPublisher(send, "0123456789abcdef")
+    publisher.submit({"label": "in_flight"})
+    assert entered.wait(5)
+    publisher.submit({"label": "pending"})
+    closer = Thread(target=publisher.close, name="test-node-attempts-close")
+    closer.start()
+    with publisher._condition:
+        assert publisher._condition.wait_for(lambda: publisher._closed, timeout=5)
+    assert closer.is_alive()
+    publisher.submit({"label": "after_close"})
+    assert publisher.health()["lost_count"] == "2"
+    answer.set()
+    closer.join(5)
+    assert not closer.is_alive()
+    assert [batch["attempts"] for batch in batches] == [[{"label": "in_flight"}]]

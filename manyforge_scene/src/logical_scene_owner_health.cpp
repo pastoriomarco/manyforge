@@ -37,12 +37,12 @@ LogicalSceneOwner::ActiveProjectionHealth() const {
       auto observed =
           ResolveRequiredProjection(
             binding, impl_->projection_resolver_, *state.active_projection);
-      if (!observed.preflight_health.healthy_for_target(
+      if (!observed.preflight_health->healthy_for_target(
               *state.active_projection)) {
         throw LogicalSceneOwnerConflictError(
             "native projection is not healthy at the active revision");
       }
-      health.push_back(std::move(observed.preflight_health));
+      health.push_back(std::move(*observed.preflight_health));
     } catch (const std::exception &error) {
       ErrorDTO unavailable{
           "active_native_projection_unavailable", error.what(), {}};
@@ -153,8 +153,11 @@ SceneObjectStateDTO LogicalSceneOwner::GetObjectState(
 core::Result<core::Pose3DTO> LogicalSceneOwner::GetObjectPose(
     const core::SceneResourceId &scene_resource_id) const {
   ValidateBoundedIdentity(scene_resource_id.value(), "scene_resource_id");
-  std::lock_guard lock(impl_->mutex_);
-  const auto state = impl_->ReadSceneCommitState().durable_state;
+  // Read under the lock; the native frame resolution below runs without it.
+  const auto state = [&] {
+    std::lock_guard lock(impl_->mutex_);
+    return impl_->ReadSceneCommitState().durable_state;
+  }();
   if (!AccessStatus(state).projection_leases_open ||
       !state.active_projection.has_value() ||
       !state.active_scene_snapshot.has_value()) {
@@ -216,7 +219,7 @@ core::Result<core::Pose3DTO> LogicalSceneOwner::GetObjectPose(
       auto projection =
           ResolveRequiredProjection(
             binding, impl_->projection_resolver_, *state.active_projection);
-      if (!projection.preflight_health.healthy_for_target(
+      if (!projection.preflight_health->healthy_for_target(
               *state.active_projection)) {
         throw LogicalSceneOwnerConflictError(
             "native projection is not healthy at the carried-object "

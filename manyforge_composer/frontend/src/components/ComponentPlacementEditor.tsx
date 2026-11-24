@@ -2,12 +2,13 @@ import { useEffect, useState } from 'react';
 
 import { cellApplyErrorText, type DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import { draftAttachments } from '../state/kinematicIndex';
-import { deploymentActionUnavailableReason } from '../state/documentStates';
 import { busyLabel, busyReason } from '../state/busyOperation';
 import type { JsonValue } from '../types/api';
 import type { ComponentProfileFacts } from '../types/componentCatalog';
 import type { ApplyPreview } from '../types/components';
-import { draftComponents, mountCandidates, type ComponentManagerRow } from '../utils/componentManager';
+import {
+  componentKindOf, draftComponents, mountCandidates, ownerOf, type ComponentManagerRow,
+} from '../utils/componentManager';
 import { rpyDegToXyzw, xyzwToRpyDeg } from '../utils/orientation';
 import { ApplyImpact } from './ApplyImpact';
 
@@ -159,22 +160,26 @@ function CollisionExclusionsField({ componentId, pairs, disabled, write }: {
 
 /**
  * The Components page editors: base position
- * and orientation, mount and primary tool, lane, Remove. Each is a Draft edit;
+ * and orientation, mount (or not mounted yet, OD-366) and primary tool,
+ * Replace tool (OD-367), lane, Remove. Each is a Draft edit;
  * Preview shows the per-component impact and Apply sends it through the one
  * server-side path, after which the affected components come back prepared.
  */
-export function ComponentPlacementEditor({ row, controller, profiles, onRemoved }: {
+export function ComponentPlacementEditor({ row, controller, profiles, onRemoved, onReplaced }: {
   row: ComponentManagerRow;
   controller: DeploymentWorkspaceController;
   profiles: Readonly<Record<string, ComponentProfileFacts>>;
   onRemoved: () => void;
+  /** Called with the replacement's id after Replace tool. */
+  onReplaced: (componentId: string) => void;
 }) {
   const [preview, setPreview] = useState<ApplyPreview | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [replacement, setReplacement] = useState('');
   const document = controller.workspace?.draft.document ?? null;
   const rows = Array.isArray(document?.components) ? document.components : [];
   const index = rows.findIndex((candidate) => object(candidate)?.component_id === row.componentId);
-  if (document === null || document.api_version !== 'manyforge.deployment_intent.v2' || index < 0) return null;
+  if (document === null || document.api_version !== 'manyforge.deployment_intent.v3' || index < 0) return null;
   const component = object(rows[index])!;
   const id = row.componentId;
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
@@ -186,9 +191,12 @@ export function ComponentPlacementEditor({ row, controller, profiles, onRemoved 
   const lanes = row.profileId === null ? undefined : profiles[row.profileId]?.lanes;
   const lane = typeof component.lane === 'string' ? component.lane : null;
   const pose = object(component.root_pose_in_cell);
-  const applyReason = deploymentActionUnavailableReason(
-    controller.workspace, 'apply', controller.documentUnavailableReason,
-  );
+  // Replace with…: the Draft's other tools (typically an unmounted one).
+  const replacements = draftComponents(document).filter((candidate) => (
+    candidate.component_id !== id && ownerOf(candidate) === null
+    && componentKindOf(candidate, typeof candidate.component_profile_id === 'string'
+      ? profiles[candidate.component_profile_id] : undefined) === 'tool'
+  )).map((candidate) => candidate.component_id as string).sort();
 
   const rawAttachments = Array.isArray(document.attachments) ? document.attachments : [];
   const isChildRow = (value: JsonValue) => object(object(value)?.child)?.component_id === id;
@@ -214,15 +222,15 @@ export function ComponentPlacementEditor({ row, controller, profiles, onRemoved 
     });
     return controller.mutate(['attachments'], 'set', next);
   };
+  // Unmounting leaves the tool in the Draft without a mount (OD-366).
+  const unmount = () => controller.mutate(['attachments'], 'set', rawAttachments.filter((value) => !isChildRow(value)));
+  const replace = async () => {
+    if (await controller.replaceTool(id, replacement) !== null) onReplaced(replacement);
+  };
+  // The component and the attachment rows that name it leave in one Draft edit,
+  // so a mounted tool never stands unattached in between.
   const remove = async () => {
-    // Its attachment rows go first, so the Draft never names a missing component.
-    const kept = rawAttachments.filter((value) => {
-      const attachment = object(value);
-      return object(attachment?.parent ?? null)?.component_id !== id && !isChildRow(value);
-    });
-    if (kept.length !== rawAttachments.length
-      && await controller.mutate(['attachments'], 'set', kept) === null) return;
-    if (await controller.mutate(['components', index], 'remove') !== null) onRemoved();
+    if (await controller.removeComponent(id) !== null) onRemoved();
   };
   const runPreview = async () => {
     setError(null);
@@ -246,15 +254,25 @@ export function ComponentPlacementEditor({ row, controller, profiles, onRemoved 
           <legend>Mount</legend>
           <label>
             <span>Mounted on</span>
-            <select aria-label={`${id} mounted on`} disabled={disabled || parents.length === 0}
+            <select aria-label={`${id} mounted on`} disabled={disabled || (mountedAt === null && parents.length === 0)}
               value={mountedAt?.parent.componentId ?? ''}
-              onChange={(event) => { void writeMount(event.target.value, mountedAt?.primary === true); }}>
-              {mountedAt === null && <option value="">Not mounted</option>}
+              onChange={(event) => {
+                void (event.target.value === '' ? unmount()
+                  : writeMount(event.target.value, mountedAt?.primary === true));
+              }}>
+              <option value="">Not mounted</option>
               {parents.map((parent) => (
                 <option key={parent} value={parent}>{parent}.{mountedAt?.parent.interface ?? 'flange'}</option>
               ))}
             </select>
           </label>
+          {mountedAt === null && pose === null && (
+            <p className="inline-message severity-warning" role="status">
+              {parents.length === 0
+                ? `${id} is not mounted, and no robot has a free flange: add a robot or free a flange. Apply is refused until it is mounted or removed.`
+                : `${id} is not mounted: choose a robot above. Apply is refused until it is mounted or removed.`}
+            </p>
+          )}
           {mountedAt !== null && (
             <label className="toggle-control">
               <input type="checkbox" aria-label={`${id} primary tool`} checked={mountedAt.primary}
@@ -267,10 +285,38 @@ export function ComponentPlacementEditor({ row, controller, profiles, onRemoved 
             <CollisionExclusionsField componentId={id} pairs={mountedExclusions} disabled={disabled}
               write={(pairs) => writeMount(mountedAt.parent.componentId, mountedAt.primary, pairs)} />
           )}
+          {mountedAt !== null && (
+            <div className="deployment-focused-field wide">
+              <label>
+                <span>Replace with…</span>
+                <select aria-label={`${id} replace with`} value={replacement}
+                  disabled={disabled || replacements.length === 0}
+                  onChange={(event) => setReplacement(event.target.value)}>
+                  <option value="">{replacements.length === 0 ? 'No other tool in the Draft' : 'Choose a tool'}</option>
+                  {replacements.map((candidate) => <option key={candidate} value={candidate}>{candidate}</option>)}
+                </select>
+              </label>
+              <small>
+                The chosen tool takes over this mount and every Program and Deployment reference to {id};
+                {' '}{id} leaves the Draft. Add the new tool first (Not mounted yet).
+              </small>
+              <div className="dactions">
+                <button type="button" disabled={disabled || replacement === ''}
+                  onClick={() => { void replace(); }}>Replace</button>
+              </div>
+            </div>
+          )}
         </fieldset>
       )}
-      {/* A member runs on its owner's lane: no lane of its own. */}
-      {row.owner === null && <label className="deployment-focused-field">
+      {/* A member runs on its owner's lane: no lane of its own. A model with
+          no lanes (a passive tool, a sensor, the assistant) runs on every lane. */}
+      {row.owner === null && lane === null && lanes !== undefined && lanes.length === 0 && (
+        <div className="deployment-focused-field">
+          <span>Lane</span>
+          <span aria-label={`${id} lane`}>Every lane</span>
+        </div>
+      )}
+      {row.owner === null && !(lane === null && lanes !== undefined && lanes.length === 0) && <label className="deployment-focused-field">
         <span>Lane</span>
         <select aria-label={`${id} lane`} disabled={disabled || lanes === undefined || lanes.length === 0}
           value={lane ?? ''}
@@ -287,17 +333,11 @@ export function ComponentPlacementEditor({ row, controller, profiles, onRemoved 
         )}
         <button type="button" disabled={controller.busy} title={busyReason(controller.busyOperation) ?? undefined}
           onClick={() => { void runPreview(); }}>{busyLabel(controller.busyOperation, 'preview', 'Preview')}</button>
-        <button type="button" className="primary-action" disabled={applyReason !== null || controller.busy}
-          title={applyReason ?? busyReason(controller.busyOperation)
-            ?? 'Preview this Draft and confirm its impact; the affected components come back prepared.'}
-          onClick={() => { void controller.applyDraft(); }}>
-          {busyLabel(controller.busyOperation, ['apply_preview', 'apply'], 'Apply…')}
-        </button>
       </div>
       {error !== null && <p className="inline-message severity-warning" role="alert">{error}</p>}
       {preview !== null && <ApplyImpact preview={preview} />}
       <p className="field-help">
-        Edits change the Deployment Draft only. Apply disables each replaced or removed component,
+        Edits change the Deployment Draft only. Apply (top bar) disables each replaced or removed component,
         applies the Draft and prepares the replaced ones; Enable them afterwards.
       </p>
     </section>

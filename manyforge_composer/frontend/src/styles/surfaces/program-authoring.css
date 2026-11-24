@@ -888,7 +888,13 @@
 .program-formula-editor {
   display: grid;
   gap: 0.55rem;
-  min-width: min(32rem, 80vw);
+  min-width: 0;
+}
+
+/* The compact panel is narrow; a formula needs the room (its actions sit at
+   the row's end and must stay visible). */
+.overlay-panel.overlay-panel-compact:has(.program-formula-editor) {
+  width: min(36rem, calc(100vw - 2rem));
 }
 
 .program-formula-editor label {
@@ -1145,8 +1151,8 @@
 
 .program-template-form,
 .program-template-form label,
-.contact-policy-fields,
-.contact-policy-fields label {
+.collision-rules,
+.collision-rule-selection {
   display: grid;
   gap: 0.35rem;
 }
@@ -1165,34 +1171,28 @@
   gap: 0.55rem;
 }
 
-.contact-policy-fields input {
+.collision-rule-selection :is(input, select) {
   width: 100%;
   min-width: 0;
-  padding: 0.5rem 0.6rem;
-  border: 1px solid var(--mf-border-neutral-27);
-  border-radius: var(--mf-radius-md);
-  color: var(--mf-text-neutral-90);
-  background: var(--mf-bg-neutral-08);
 }
 
-.contact-policy-fields input:invalid {
-  border-color: var(--mf-border-danger-57);
-  color: var(--mf-text-danger-82);
+.collision-rule-selection > button {
+  justify-self: start;
 }
 
-.contact-policy-check,
-.contact-policy-checks {
+.collision-rule-check,
+.collision-rule-checks {
   display: flex !important;
   align-items: center;
   gap: 0.45rem;
 }
 
-.contact-policy-checks {
+.collision-rule-checks {
   align-items: flex-start;
   flex-direction: column;
 }
 
-.contact-policy-check input {
+.collision-rule-check input {
   width: auto;
 }
 
@@ -1827,24 +1827,68 @@
 
 
 .program-reference-attention {
-  position: relative;
-  flex: none;
-  display: flex;
-  align-items: center;
-  padding: 0.35rem 0.75rem;
-  border-bottom: 1px solid var(--mf-border-neutral-19);
-}
-.program-reference-attention [role='region'] {
   position: absolute;
-  top: 100%;
+  top: 0.35rem;
   left: 0.75rem;
   z-index: var(--mf-z-popover-2);
+}
+.program-reference-attention [role='region'] {
+  position: relative;
   width: min(32rem, calc(100vw - 3rem));
   max-height: 20rem;
   overflow: auto;
-  padding: 0.75rem;
+  padding: 0.75rem 2rem 0.75rem 0.75rem;
   background: var(--mf-bg-neutral-08);
   border: 1px solid var(--mf-border-neutral-19);
+  border-radius: var(--mf-radius-md);
+}
+.program-reference-attention-close {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.35rem;
 }
 .program-reference-attention ul { margin: 0; padding-left: 1.25rem; }
 .program-reference-attention li button { text-align: left; }
+
+/* The Program tab's reference-issue badge: out of flow, like the Deployment
+   indicator, so the header never moves when it appears. */
+.program-tab {
+  position: relative;
+  display: inline-flex;
+}
+/* Room for the badge at all times, as the Deployment button has for its dot. */
+.workspace-switcher .program-tab > button[data-workspace='program'] {
+  padding-inline: 1.22rem;
+}
+.workspace-switcher .program-attention-badge {
+  position: absolute;
+  top: 50%;
+  left: -0.48rem;
+  z-index: var(--mf-z-raised);
+  display: grid;
+  width: 1rem;
+  min-width: 1rem;
+  height: 1rem;
+  min-height: 1rem;
+  padding: 0;
+  place-items: center;
+  transform: translateY(-50%);
+  border: 0.14rem solid var(--mf-border-success-64);
+  border-radius: var(--mf-radius-pill);
+  color: transparent;
+  background: var(--mf-bg-success-64);
+  box-shadow: 0 0 0 0.09rem var(--mf-shadow-neutral-06-a70);
+  font-size: var(--mf-font-size-052);
+  font-weight: var(--mf-font-weight-bold);
+  line-height: 1;
+  cursor: pointer;
+}
+.workspace-switcher .program-attention-badge.tone-attention {
+  color: var(--mf-text-neutral-96);
+  background: var(--mf-bg-danger-37);
+}
+.workspace-switcher .program-attention-badge.tone-unavailable {
+  border-color: var(--mf-border-neutral-53);
+  background: var(--mf-bg-neutral-54);
+}
+

@@ -274,7 +274,6 @@
         }
       ],
       "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
-      "program_id": "pick_and_place_minimal",
       "program_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000005",
       "program_run_id": 1,
       "retained_bundle_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
@@ -392,7 +391,9 @@
           "start_allowed": false,
           "start_unavailable_reason": "selected_owner_recovery_unavailable",
           "state": "held",
-          "stop_allowed": false
+          "stop_allowed": false,
+          "stopped_by": null,
+          "stopped_by_node_instance_id": null
         },
         {
           "group_id": "arm",
@@ -411,7 +412,9 @@
           "start_allowed": false,
           "start_unavailable_reason": "selected_owner_recovery_unavailable",
           "state": "held",
-          "stop_allowed": false
+          "stop_allowed": false,
+          "stopped_by": null,
+          "stopped_by_node_instance_id": null
         },
         {
           "group_id": "tools",
@@ -430,12 +433,15 @@
           "start_allowed": false,
           "start_unavailable_reason": "selected_owner_recovery_unavailable",
           "state": "held",
-          "stop_allowed": false
+          "stop_allowed": false,
+          "stopped_by": null,
+          "stopped_by_node_instance_id": null
         }
       ],
       "hold_revision": 1,
       "motion_held": false
     },
+    "operator_questions": [],
     "owner_id": "program-runner",
     "program_run_id": 1,
     "recovery_offer": {
@@ -643,7 +649,7 @@
       "runtime_control_revision": 1,
       "schema_version": "manyforge.program_runtime_controls.v4"
     },
-    "schema_version": "manyforge.program_runtime_control_projection.v10"
+    "schema_version": "manyforge.program_runtime_control_projection.v11"
   },
   "state": "running",
   "terminal_or_settlement_reference": null

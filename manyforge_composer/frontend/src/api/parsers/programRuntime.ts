@@ -6,6 +6,8 @@ import type {
   PersistentKeyValue,
   PersistentKeyValueEdit,
   PersistentKeyValues,
+  ProgramRunKeyValue,
+  ProgramRunKeyValues,
   ExpressionCheckResult,
   ExpressionDiagnostic,
   ExpressionValueType,
@@ -19,6 +21,8 @@ import type {
   CycleRecoveryAction,
   CycleRecoveryActionId,
   CycleRecoveryOffer,
+  ProgramOperatorQuestion,
+  ProgramOperatorQuestionOption,
   ProgramRecoveryHold,
   ProgramRuntimeControlProjection,
   ProgramRuntimeControlsSnapshot,
@@ -587,7 +591,6 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       'node_policy_digest',
       'owner_identities',
       'program_binding_id',
-      'program_id',
       'program_revision',
       'program_run_id',
       'retained_bundle_id',
@@ -700,7 +703,6 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
         capture.source_document_digest,
         `${path}.capture.source_document_digest`,
       ),
-      programId: stringAt(capture.program_id, `${path}.capture.program_id`),
       programRevision: digestAt(
         capture.program_revision,
         `${path}.capture.program_revision`,
@@ -1147,7 +1149,8 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
       'stop_allowed', 'start_allowed', 'start_unavailable_reason',
       'resume_allowed', 'resume_unavailable_reason',
       'runtime_scale_selector', 'runtime_scale_unavailable_reason',
-      'resource_ids'], ['ordinary_held_node_count'], key);
+      'resource_ids', 'stopped_by', 'stopped_by_node_instance_id'],
+    ['ordinary_held_node_count'], key);
     const groupId = stringAt(row.group_id, `${key}.group_id`);
     if (!/^[a-z][a-z0-9_.-]{0,127}$/.test(groupId) || groupId === 'inherit' || groupId <= previous) {
       return fail(key, 'canonical unique captured group IDs');
@@ -1193,6 +1196,18 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
     ))) {
       return fail(`${key}.resource_ids`, 'sorted unique resource IDs');
     }
+    const stoppedBy = nullableStringAt(row.stopped_by, `${key}.stopped_by`);
+    const stoppedByNodeInstanceId = nullableStringAt(
+      row.stopped_by_node_instance_id,
+      `${key}.stopped_by_node_instance_id`,
+    );
+    if (stoppedBy !== null && stoppedBy !== 'program') {
+      return fail(`${key}.stopped_by`, 'program or null');
+    }
+    if ((stoppedBy === null) !== (stoppedByNodeInstanceId === null)
+      || stoppedByNodeInstanceId === '') {
+      return fail(key, 'a Program Stop attribution with its node, or neither');
+    }
     if (nodeCount > 100_000 || heldNodeCount < 0 || heldNodeCount > nodeCount
       || (ordinaryHeldNodeCount !== null && (ordinaryHeldNodeCount < 0 || ordinaryHeldNodeCount > heldNodeCount))
       || (state === 'running' && heldNodeCount !== 0)
@@ -1212,7 +1227,8 @@ function parseExecutionSelectionControls(value: unknown, path: string): ProgramE
       state: state as ProgramExecutionSelectionControls['groups'][number]['state'],
       stopAllowed, startAllowed, startUnavailableReason,
       resumeAllowed, resumeUnavailableReason,
-      runtimeScaleSelector, runtimeScaleUnavailableReason, resourceIds };
+      runtimeScaleSelector, runtimeScaleUnavailableReason, resourceIds,
+      stoppedBy: stoppedBy as 'program' | null, stoppedByNodeInstanceId };
   });
   if (!groups.some((group) => group.groupId === 'all')) return fail(path, 'the built-in all selection');
   return { holdRevision, motionHeld, groups };
@@ -1237,6 +1253,71 @@ function parseProgramRecoveryHold(value: unknown, path: string): ProgramRecovery
   };
 }
 
+const OPERATOR_OPTION_ID = /^[a-z][a-z0-9_.-]*$/;
+
+function parseProgramOperatorQuestionOption(
+  value: unknown,
+  path: string,
+): ProgramOperatorQuestionOption {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['option_id', 'label', 'result'], path);
+  const optionId = stringAt(record.option_id, `${path}.option_id`);
+  if (!OPERATOR_OPTION_ID.test(optionId) || optionId.length > 128) {
+    return fail(`${path}.option_id`, 'an option identifier of at most 128 bytes');
+  }
+  const result = stringAt(record.result, `${path}.result`);
+  if (result !== 'success' && result !== 'failure') {
+    return fail(`${path}.result`, 'success or failure');
+  }
+  return {
+    optionId,
+    label: nonEmptyStringAt(record.label, `${path}.label`),
+    result,
+  };
+}
+
+function parseProgramOperatorQuestion(value: unknown, path: string): ProgramOperatorQuestion {
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'schema_version', 'offer_id', 'offer_revision', 'program_run_id',
+    'node_instance_id', 'node_attempt_id', 'message', 'severity', 'options',
+    'hold_motion_group_ids',
+  ], path);
+  const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 'manyforge.program_operator_question.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.program_operator_question.v1');
+  }
+  const severity = stringAt(record.severity, `${path}.severity`);
+  if (severity !== 'info' && severity !== 'warning' && severity !== 'fault') {
+    return fail(`${path}.severity`, 'info, warning or fault');
+  }
+  const options = boundedArrayAt(record.options, `${path}.options`, 8)
+    .map((item, index) => parseProgramOperatorQuestionOption(item, `${path}.options[${index}]`));
+  if (options.length < 2 || new Set(options.map((option) => option.optionId)).size !== options.length) {
+    return fail(`${path}.options`, '2 to 8 options with unique identifiers');
+  }
+  const holdMotionGroupIds = boundedArrayAt(
+    record.hold_motion_group_ids,
+    `${path}.hold_motion_group_ids`,
+    4097,
+  ).map((item, index) => nonEmptyStringAt(item, `${path}.hold_motion_group_ids[${index}]`));
+  if (new Set(holdMotionGroupIds).size !== holdMotionGroupIds.length) {
+    return fail(`${path}.hold_motion_group_ids`, 'unique motion group IDs');
+  }
+  return {
+    schemaVersion,
+    offerId: digestAt(record.offer_id, `${path}.offer_id`),
+    offerRevision: positiveIntegerAt(record.offer_revision, `${path}.offer_revision`),
+    programRunId: positiveIntegerAt(record.program_run_id, `${path}.program_run_id`),
+    nodeInstanceId: nonEmptyStringAt(record.node_instance_id, `${path}.node_instance_id`),
+    nodeAttemptId: positiveIntegerAt(record.node_attempt_id, `${path}.node_attempt_id`),
+    message: nonEmptyStringAt(record.message, `${path}.message`),
+    severity,
+    options,
+    holdMotionGroupIds,
+  };
+}
+
 export function parseProgramRuntimeControlProjection(
   value: unknown,
 ): ProgramRuntimeControlProjection {
@@ -1245,13 +1326,13 @@ export function parseProgramRuntimeControlProjection(
   exactKeysAt(record, [
     'schema_version', 'owner_id', 'program_run_id',
     'run_revision', 'runtime_controls', 'recovery_offer', 'recovery_offers',
-    'execution_selections',
+    'operator_questions', 'execution_selections',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v10') {
+  if (schemaVersion !== 'manyforge.program_runtime_control_projection.v11') {
     return fail(
       `${path}.schema_version`,
-      'manyforge.program_runtime_control_projection.v10',
+      'manyforge.program_runtime_control_projection.v11',
     );
   }
   const programRunId = positiveIntegerAt(record.program_run_id, `${path}.program_run_id`);
@@ -1264,10 +1345,13 @@ export function parseProgramRuntimeControlProjection(
     : parseCycleRecoveryOffer(record.recovery_offer, `${path}.recovery_offer`);
   const recoveryHolds = boundedArrayAt(record.recovery_offers, `${path}.recovery_offers`, 4096)
     .map((item, index) => parseProgramRecoveryHold(item, `${path}.recovery_offers[${index}]`));
+  const operatorQuestions = boundedArrayAt(record.operator_questions, `${path}.operator_questions`, 4096)
+    .map((item, index) => parseProgramOperatorQuestion(item, `${path}.operator_questions[${index}]`));
   if (
     runtimeControls.programRunId !== programRunId
     || (recoveryOffer !== null && recoveryOffer.programRunId !== programRunId)
     || recoveryHolds.some((hold) => hold.offer.programRunId !== programRunId)
+    || operatorQuestions.some((question) => question.programRunId !== programRunId)
   ) {
     return fail(path, 'one exact Program-run identity');
   }
@@ -1277,6 +1361,13 @@ export function parseProgramRuntimeControlProjection(
   ) {
     return fail(`${path}.recovery_offers`, 'one offer per held node');
   }
+  if (
+    new Set(operatorQuestions.map((question) => question.offerId)).size !== operatorQuestions.length
+    || new Set(operatorQuestions.map((question) => question.nodeInstanceId)).size
+      !== operatorQuestions.length
+  ) {
+    return fail(`${path}.operator_questions`, 'one question per node');
+  }
   return {
     schemaVersion,
     ownerId: stringAt(record.owner_id, `${path}.owner_id`),
@@ -1285,6 +1376,7 @@ export function parseProgramRuntimeControlProjection(
     runtimeControls,
     recoveryOffer,
     recoveryHolds,
+    operatorQuestions,
     executionSelections: parseExecutionSelectionControls(record.execution_selections, `${path}.execution_selections`),
   };
 }
@@ -1347,6 +1439,50 @@ function persistentKeyValueEditAt(value: unknown, path: string): PersistentKeyVa
     nodeAttemptId: nullablePositiveIntegerAt(record.node_attempt_id, `${path}.node_attempt_id`),
     reason,
     detail: nullableStringAt(record.detail, `${path}.detail`),
+  };
+}
+
+function programRunKeyValueAt(value: unknown, path: string): ProgramRunKeyValue {
+  const record = objectAt(value, path);
+  const key = nonEmptyStringAt(record.key, `${path}.key`);
+  const type = nonEmptyStringAt(record.type, `${path}.type`);
+  const valueState = stringAt(record.value_state, `${path}.value_state`);
+  if (valueState === 'value') {
+    exactKeysAt(record, ['key', 'type', 'value', 'value_state'], path);
+    return { key, type, valueState, value: jsonValueAt(record.value, `${path}.value`) };
+  }
+  if (valueState !== 'no_value' && valueState !== 'omitted') {
+    return fail(`${path}.value_state`, 'value, no_value or omitted');
+  }
+  exactKeysAt(record, ['key', 'type', 'value_state'], path);
+  return { key, type, valueState };
+}
+
+/** A run's current key values (GET /api/program/runs/{id}/blackboard-values). */
+export function parseProgramRunKeyValues(
+  value: unknown,
+  path = 'programRunKeyValues',
+): ProgramRunKeyValues {
+  const record = objectAt(value, path);
+  // Headless adds the run's start identity and display form (1.5).
+  exactKeysAt(record, [
+    'application_start_id', 'display', 'keys', 'node_status_revision', 'owner_id',
+    'program_run_id', 'run_revision', 'schema_version',
+  ], path);
+  if (record.schema_version !== 'manyforge.program_runtime_blackboard_values.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.program_runtime_blackboard_values.v1');
+  }
+  if (!isApplicationStartId(record.application_start_id)) {
+    return fail(`${path}.application_start_id`, '16 lowercase hex characters');
+  }
+  nonEmptyStringAt(record.display, `${path}.display`);
+  nonEmptyStringAt(record.owner_id, `${path}.owner_id`);
+  return {
+    programRunId: positiveIntegerAt(record.program_run_id, `${path}.program_run_id`),
+    runRevision: positiveIntegerAt(record.run_revision, `${path}.run_revision`),
+    nodeStatusRevision: integerAt(record.node_status_revision, `${path}.node_status_revision`),
+    keys: arrayAt(record.keys, `${path}.keys`)
+      .map((row, index) => programRunKeyValueAt(row, `${path}.keys[${index}]`)),
   };
 }
 

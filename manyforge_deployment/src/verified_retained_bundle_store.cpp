@@ -1473,6 +1473,18 @@ void require_symbol_role_map_matches_retained_bundle_impl(
     if (expected_targets.insert(key).second)
       non_coordinate_targets.insert(key);
   }
+  // O5: a passive tool's frame-only target has no binding and no provider;
+  // the graph names it as the component's default TCP target. It carries
+  // frames and collision bodies only.
+  std::set<std::pair<std::string, std::string>> frame_only_targets;
+  for (const auto &component : graph.controllable_components) {
+    if (!component.default_tcp)
+      continue;
+    const auto key = std::pair{component.controllable_component_id.value(),
+                               component.default_tcp->command_target_id.value()};
+    if (expected_targets.insert(key).second)
+      frame_only_targets.insert(key);
+  }
   std::set<std::string, std::less<>> found_bindings;
   for (const auto &row :
        require_map_array(map, "control_binding_coordinate_maps")) {
@@ -1511,6 +1523,10 @@ void require_symbol_role_map_matches_retained_bundle_impl(
          !require_map_array(row, "collision_bodies").empty()))
       detail::fail_retained_bundle(
           "retained non-coordinate target contains model geometry roles");
+    if (frame_only_targets.contains(key) &&
+        !require_map_array(row, "model_groups").empty())
+      detail::fail_retained_bundle(
+          "retained frame-only target contains model groups");
     found_targets.insert(key);
   }
   if (found_targets != expected_targets) {
@@ -2455,7 +2471,6 @@ FilesystemVerifiedProgramSource::FilesystemVerifiedProgramSource(
 
 std::shared_ptr<const ProgramBindingContract>
 FilesystemVerifiedProgramSource::get_verified(
-    const core::ProgramId &program_id,
     const core::ProgramRevision &program_revision,
     const RetainedBundle &retained_bundle) const {
   const auto hex = detail::retained_digest_hex(program_revision.value());
@@ -2487,8 +2502,7 @@ FilesystemVerifiedProgramSource::get_verified(
   }
   FilesystemVerifiedCatalogArtifactSource catalog(current_root);
   const auto program = verify_program_binding_contract(*bytes, retained_bundle, model_map, catalog);
-  if (program->value().program_id != program_id ||
-      program->value().program_revision != program_revision) {
+  if (program->value().program_revision != program_revision) {
     throw ProgramContractError(
         "read-only Program key/content or Program identity mismatch");
   }
@@ -2935,17 +2949,24 @@ FilesystemVerifiedRetainedModelMapSource::get_verified(
 
 FilesystemVerifiedRetainedPlanningModelSource::
     FilesystemVerifiedRetainedPlanningModelSource(
-        std::filesystem::path trusted_package_root)
+        std::filesystem::path trusted_package_root,
+        std::optional<std::filesystem::path> activation_root)
     : trusted_package_root_(posix::normalize_existing_plain_root(
-          trusted_package_root, kPosixErrors, kTrustedRootMessages)) {
+          trusted_package_root, kPosixErrors, kTrustedRootMessages)),
+      activation_root_(
+          normalize_activation_root(std::move(activation_root))) {
   (void)require_read_only_retention_paths(trusted_package_root_);
 }
 
 std::optional<VerifiedRetainedPlanningModel>
 FilesystemVerifiedRetainedPlanningModelSource::get_verified(
     const RetainedPlanningModelQuery &query) const {
+  // The installed package wins; a previewed candidate is read from the
+  // activation store (select_package_root), as the model-map source does.
   const std::filesystem::path current_root = require_unchanged_trusted_root(
-      trusted_package_root_, "read-only retained planning-model");
+      select_package_root(trusted_package_root_, activation_root_,
+                          query.retained_bundle_id),
+      "read-only retained planning-model");
   const ReadOnlyRetentionPaths paths =
       require_read_only_retention_paths(current_root);
   const auto bundle =

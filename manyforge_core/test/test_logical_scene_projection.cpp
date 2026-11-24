@@ -80,12 +80,6 @@ TEST(LogicalSceneProjection, ReconstructsUpsertAndExactNoOp) {
   ASSERT_TRUE(add.ok()) << add.error().message;
   EXPECT_EQ(add.value(), added);
 
-  auto missing_resolution = Transaction(
-      empty, added, ResolvedUpsertSceneObjectDTO{added.objects.front()});
-  missing_resolution.resolution_evidence_digest = std::nullopt;
-  EXPECT_FALSE(
-      ApplyResolvedSceneTransaction(empty, missing_resolution).ok());
-
   auto no_op = added;
   no_op.transaction_sequence = 2U;
   const auto repeated = ApplyResolvedSceneTransaction(
@@ -158,7 +152,7 @@ TEST(LogicalSceneProjection, DistinguishesFreshnessFromTopology) {
   EXPECT_EQ(projected_move.value(), moved);
 }
 
-TEST(LogicalSceneProjection, ReconstructsAttachDetachAndRejectsWrongDigest) {
+TEST(LogicalSceneProjection, ReconstructsAttachAndDetach) {
   auto detached = EmptyScene();
   detached.objects.push_back(DetachedObject());
   detached.transaction_sequence = 1U;
@@ -211,18 +205,29 @@ TEST(LogicalSceneProjection, ReconstructsAttachDetachAndRejectsWrongDigest) {
                                 attachment.carried_object_attachment_revision}));
   ASSERT_TRUE(projected_detach.ok()) << projected_detach.error().message;
   EXPECT_EQ(projected_detach.value(), final_scene);
-
-  auto corrupt = Transaction(
-      attached, final_scene,
-      ResolvedDetachCarriedObjectDTO{final_object, attachment.carried_object_attachment_id,
-                                     attachment.carried_object_attachment_revision});
-  corrupt.proposed_projection_revision.scene_revision.content_hash =
-      ContentDigest(std::string(kZeroDigest));
-  const auto rejected = ApplyResolvedSceneTransaction(attached, corrupt);
-  EXPECT_FALSE(rejected.ok());
 }
 
-TEST(LogicalSceneProjection, RejectsInexactProjectionReadyPolicy) {
+TEST(LogicalSceneProjection, TrustsTheOwnersProposedDigest) {
+  const auto empty = EmptyScene();
+  auto added = empty;
+  added.transaction_sequence = 1U;
+  added.topology_epoch = 1U;
+  added.objects.push_back(DetachedObject());
+  SealSuccessor(added, 2U);
+
+  auto transaction =
+      Transaction(empty, added, ResolvedUpsertSceneObjectDTO{added.objects.front()});
+  transaction.proposed_projection_revision.scene_revision.content_hash =
+      ContentDigest(std::string(kZeroDigest));
+  const auto applied = ApplyResolvedSceneTransaction(empty, transaction);
+  ASSERT_TRUE(applied.ok()) << applied.error().message;
+  EXPECT_EQ(applied.value().revision,
+            transaction.proposed_projection_revision.scene_revision);
+  EXPECT_EQ(applied.value().revision.content_hash.value(), kZeroDigest);
+  EXPECT_EQ(applied.value().objects, added.objects);
+}
+
+TEST(LogicalSceneProjection, AppliesTheOwnersResolvedPolicy) {
   const auto current = EmptyScene();
   auto candidate = current;
   candidate.transaction_sequence = 1U;
@@ -236,13 +241,12 @@ TEST(LogicalSceneProjection, RejectsInexactProjectionReadyPolicy) {
           .value();
   SealSuccessor(candidate, 2U);
 
-  auto inexact_effective = candidate.configured_collision_policy;
-  inexact_effective.revision.content_hash = std::string(kZeroDigest);
-  const auto rejected = ApplyResolvedSceneTransaction(
+  const auto applied = ApplyResolvedSceneTransaction(
       current, Transaction(current, candidate,
                            ResolvedCollisionPolicyDTO{candidate.configured_collision_policy,
-                                                      std::move(inexact_effective)}));
-  EXPECT_FALSE(rejected.ok());
+                                                      candidate.configured_collision_policy}));
+  ASSERT_TRUE(applied.ok()) << applied.error().message;
+  EXPECT_EQ(applied.value(), candidate);
 }
 
 }  // namespace

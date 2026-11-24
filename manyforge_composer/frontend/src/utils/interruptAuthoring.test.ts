@@ -61,9 +61,12 @@ describe('interrupt condition authoring', () => {
       'cell.count (int64)',
       'cell.label (string)',
       'part_lost (rule state)',
+      'all (motion group state)',
       'approach (node outcome)',
       'seek (node outcome)',
     ]);
+    expect(choices.find((choice) => choice.key === 'motion_group_state.all')?.values)
+      .toEqual(['ready', 'running', 'stopping', 'held', 'mixed', 'faulted', 'unavailable']);
     expect(choices.find((choice) => choice.key === 'node_outcome.seek')?.values)
       .toContain('no_signal_trip');
     expect(choices.find((choice) => choice.key === 'node_outcome.approach')?.values)
@@ -375,7 +378,8 @@ describe('system keys and their values', () => {
   it('needs no initial for system keys', () => {
     const keys = programBlackboardKeys(program, ['part_lost']);
     const condition = { all: [compare(outcome('seek'), '!=', 'completed'),
-      compare({ key: 'interrupt_state.part_lost' }, '==', 'tripped')] };
+      compare({ key: 'interrupt_state.part_lost' }, '==', 'tripped'),
+      compare({ key: 'motion_group_state.all' }, '==', 'held')] };
     expect(interruptKeyInitialProblem(condition, keys)).toBeNull();
     expect(interruptKeyInitialProblem(compare({ key: 'cell.count' }, '>=', 1), keys))
       .toContain(INTERRUPT_KEY_INITIAL_REQUIRED);

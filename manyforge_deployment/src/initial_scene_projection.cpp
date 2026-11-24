@@ -44,12 +44,6 @@ double Number(const CanonicalValue &value, std::string_view field) {
   return value.as_number();
 }
 
-bool Boolean(const CanonicalValue &value, std::string_view field) {
-  if (!value.is_bool())
-    Fail(field);
-  return value.as_bool();
-}
-
 std::array<double, 3U> Triple(const CanonicalValue &value,
                               std::string_view field) {
   if (!value.is_array() || value.as_array().size() != 3U)
@@ -110,7 +104,9 @@ core::CollisionShapeDTO Shape(const CanonicalValue &value) {
     return core::MeshShapeDTO{
         Text(Member(value, "mesh_resource_uri"), "shape.mesh_resource_uri",
              4096U),
-        Vector(Member(value, "mesh_scale"), "shape.mesh_scale")};
+        Vector(Member(value, "mesh_scale"), "shape.mesh_scale"),
+        // The Manager fills the content the Apply captured for this URI.
+        {}};
   }
   Fail("shape.type");
 }
@@ -143,69 +139,6 @@ core::SceneTransactionFrameRefDTO Frame(
   return core::ComponentSceneFrameRefDTO{
       match->reference.component_id, match->model_instance_id,
       match->reference.frame_id};
-}
-
-std::vector<core::SupportContactDTO>
-SupportContacts(const CanonicalValue &row) {
-  const auto *metadata = row.find_object_member("metadata");
-  if (metadata == nullptr || metadata->is_null())
-    return {};
-  if (!metadata->is_object())
-    Fail("metadata");
-  const auto *contacts = metadata->find_object_member("support_contacts");
-  if (contacts == nullptr)
-    return {};
-  if (!contacts->is_array() || contacts->as_array().size() > 4096U)
-    Fail("metadata.support_contacts");
-  std::vector<core::SupportContactDTO> result;
-  result.reserve(contacts->as_array().size());
-  for (const auto &value : contacts->as_array()) {
-    core::SupportContactDTO contact;
-    contact.support_object_id =
-        Text(Member(value, "support_object_id"), "support_object_id");
-    const auto optional = [&](std::string_view name) {
-      return value.find_object_member(name);
-    };
-    if (const auto *mode = optional("mode")) {
-      const auto text = Text(*mode, "support.mode");
-      if (text == "contact_release")
-        contact.mode = core::CollisionContactPolicyMode::kContactRelease;
-      else if (text == "bounded_penetration")
-        contact.mode = core::CollisionContactPolicyMode::kBoundedPenetration;
-      else
-        Fail("support.mode");
-    }
-    if (const auto *evidence = optional("release_evidence_mode")) {
-      const auto text = Text(*evidence, "support.release_evidence_mode");
-      if (text == "signed_penetration")
-        contact.release_evidence_mode =
-            core::ContactReleaseEvidenceMode::kSignedPenetration;
-      else if (text == "binary_contact")
-        contact.release_evidence_mode =
-            core::ContactReleaseEvidenceMode::kBinaryContact;
-      else
-        Fail("support.release_evidence_mode");
-    }
-    if (const auto *field = optional("enforce_max_start_penetration"))
-      contact.enforce_max_start_penetration = Boolean(*field, "support.enforce");
-    if (const auto *field = optional("max_start_penetration_m"))
-      contact.max_start_penetration_m = Number(*field, "support.max_start");
-    if (const auto *field = optional("release_tolerance_m"))
-      contact.release_tolerance_m = Number(*field, "support.release_tolerance");
-    if (const auto *field = optional("min_release_progress_m"))
-      contact.min_release_progress_m = Number(*field, "support.min_progress");
-    if (const auto *field = optional("max_contact_penetration_m"))
-      contact.max_contact_penetration_m = Number(*field, "support.max_contact");
-    if (const auto *field = optional("require_separation_by_end"))
-      contact.require_separation_by_end = Boolean(*field, "support.separation");
-    if (const auto *field = optional("require_strictly_decreasing_penetration"))
-      contact.require_strictly_decreasing_penetration =
-          Boolean(*field, "support.decreasing");
-    if (const auto *field = optional("allow_recontact"))
-      contact.allow_recontact = Boolean(*field, "support.recontact");
-    result.push_back(std::move(contact));
-  }
-  return result;
 }
 
 double MassKg(const CanonicalValue &row) {
@@ -251,7 +184,7 @@ project_initial_scene_references_value(
         core::Pose3DTO{Vector(Member(pose, "position_m"), "pose.position_m"),
                        Orientation(Member(pose, "orientation"))},
         Frame(Member(pose, "frame_ref"), frames, cell_id),
-        SupportContacts(row), MassKg(row)});
+        MassKg(row)});
   }
   return result;
 }
@@ -269,8 +202,7 @@ std::vector<core::AddObjectRequestDTO>
 project_bound_initial_scene(const ProgramBindingContract &program,
                             const ProgramBinding &binding,
                             const core::CellId &cell_id) {
-  if (binding.value().program_id != program.value().program_id ||
-      binding.value().program_revision != program.value().program_revision ||
+  if (binding.value().program_revision != program.value().program_revision ||
       binding.value().retained_bundle_id.empty())
     Fail("Program/Binding identity");
   return detail::project_bound_initial_scene_value(

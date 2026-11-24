@@ -24,7 +24,6 @@ struct ProgramOptions final {
   std::string catalog_content_version;
   bool include_legacy_robot{false};
   bool duplicate_tree_instance{false};
-  bool include_contact_grasp{false};
   std::string value_source_kind;
   bool duplicate_value_source_parameter{false};
   bool include_node_policy{false};
@@ -39,56 +38,6 @@ text_array(const std::vector<std::string> &values) {
     result.emplace_back(value);
   }
   return CanonicalValue(std::move(result));
-}
-
-[[nodiscard]] inline CanonicalValue make_contact_grasp_policy() {
-  CanonicalValue policy(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.contact_policy.v1")},
-      {"policy_id", CanonicalValue("selected_object_grasp")},
-      {"version", CanonicalValue(std::string(kProgramFixtureZeroDigest))},
-      {"mode", CanonicalValue("contact_grasp")},
-      {"sensing_mode", CanonicalValue("geometry_only")},
-      {"default_unmatched_response", CanonicalValue("hard_stop")},
-      {"zones",
-       CanonicalValue(
-           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-               {"zone_id", CanonicalValue("tool_contact")},
-               {"body_pairs",
-                CanonicalValue(
-                    CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-                        {"body_a",
-                         CanonicalValue(CanonicalValue::Object{
-                             {"kind", CanonicalValue("component_model_body")},
-                             {"body", CanonicalValue(CanonicalValue::Object{
-                                 {"component_id", CanonicalValue("lite6_arm")},
-                                 {"collision_body_id", CanonicalValue("arm_collision")}})},
-                         })},
-                        {"body_b",
-                         CanonicalValue(CanonicalValue::Object{
-                             {"kind", CanonicalValue("runtime_object")},
-                             {"runtime_object_id",
-                              CanonicalValue("selected_object")},
-                         })},
-                    })})},
-               {"violation_response", CanonicalValue("hard_stop")},
-               {"max_penetration_m", CanonicalValue(0.002)},
-               {"terminal_window_start_fraction", CanonicalValue(0.8)},
-           })})},
-  });
-  const std::string revision = compute_content_identity(
-      policy, ContentIdentitySpec{
-                  .identity_domain = "catalog-record-revision/contact_policy",
-                  .api_version = "manyforge.contact_policy.v1",
-                  .own_field = "version",
-              });
-  auto members = policy.as_object();
-  for (auto &[name, value] : members) {
-    if (name == "version") {
-      value = CanonicalValue(revision);
-      return CanonicalValue(std::move(members));
-    }
-  }
-  throw std::logic_error("test contact policy omitted version");
 }
 
 [[nodiscard]] inline CanonicalValue make_program_root(const ProgramOptions &options) {
@@ -153,11 +102,9 @@ text_array(const std::vector<std::string> &values) {
   }
 
   CanonicalValue::Object root{
-      {"api_version", CanonicalValue("manyforge.program.v3")},
-      {"program_id", CanonicalValue("contract_program")},
+      {"api_version", CanonicalValue("manyforge.program.v4")},
       {"program_revision", CanonicalValue(std::string(kProgramFixtureZeroDigest))},
       {"program_profile", CanonicalValue("composable-cell-v1")},
-      {"name", CanonicalValue("Program contract fixture")},
       {"catalog",
        CanonicalValue(CanonicalValue::Object{
            {"api_version", CanonicalValue("manyforge.node_catalog.v3")},
@@ -203,22 +150,6 @@ text_array(const std::vector<std::string> &values) {
                          CanonicalValue(key("wait_s", "float64"))})},
         }));
   }
-  if (options.include_contact_grasp) {
-    root.emplace_back(
-        "blackboard",
-        CanonicalValue(CanonicalValue::Object{
-            {"namespaces", CanonicalValue(CanonicalValue::Array{})},
-            {"keys", CanonicalValue(CanonicalValue::Array{
-                         CanonicalValue(CanonicalValue::Object{
-                             {"key", CanonicalValue("selected_object")},
-                             {"type", CanonicalValue("scene_resource")},
-                             {"access", CanonicalValue("read_write")},
-                             {"persistence", CanonicalValue("run")},
-                         })})},
-        }));
-    root.emplace_back("contact_policies", CanonicalValue(CanonicalValue::Array{
-                                              make_contact_grasp_policy()}));
-  }
   return CanonicalValue(std::move(root));
 }
 
@@ -226,7 +157,7 @@ text_array(const std::vector<std::string> &values) {
   const std::string revision =
       compute_content_identity(root, ContentIdentitySpec{
                                          .identity_domain = "program-revision",
-                                         .api_version = "manyforge.program.v3",
+                                         .api_version = "manyforge.program.v4",
                                          .own_field = "program_revision",
                                      });
   CanonicalValue::Object members = root.as_object();

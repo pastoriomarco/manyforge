@@ -236,7 +236,8 @@ function text(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
-function itemsLabel(action: string, noun: string, ids: string[], plural = `${noun}s`): string {
+function itemsLabel(action: string, noun: string, ids: string[]): string {
+  const plural = `${noun}s`;
   if (ids.length === 0) return `${action} ${plural}`;
   const shown = ids.slice(0, 4).join(', ');
   const more = ids.length > 4 ? ` and ${ids.length - 4} more` : '';
@@ -285,8 +286,6 @@ export function assistantToolCallSummary(call: AssistantToolCallResult): string 
     case 'tree_draft_replace_subtree': summary = named('Replaced subtree'); break;
     case 'program_draft_upsert_parameters': summary = itemsLabel('Created or updated', 'Program parameter', resultIds); break;
     case 'program_draft_remove_parameters': summary = itemsLabel('Removed', 'Program parameter', resultIds); break;
-    case 'program_draft_upsert_contact_policies': summary = itemsLabel('Created or updated', 'contact policy', resultIds, 'contact policies'); break;
-    case 'program_draft_remove_contact_policies': summary = itemsLabel('Removed', 'contact policy', resultIds, 'contact policies'); break;
     case 'blackboard_draft_upsert_namespaces': summary = itemsLabel('Created or updated', 'blackboard namespace', resultIds); break;
     case 'blackboard_draft_remove_namespaces': summary = itemsLabel('Removed', 'blackboard namespace', resultIds); break;
     case 'blackboard_draft_upsert_keys': summary = itemsLabel('Created or updated', 'blackboard key', resultIds); break;

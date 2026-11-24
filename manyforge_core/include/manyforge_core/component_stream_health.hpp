@@ -103,6 +103,17 @@ struct ComponentStreamVerdictDTO final {
 
 class ComponentStreamHealth;
 
+/// Wait-free view of one component's stream-stale condition, kept by the
+/// registry at every classification: true while a `fault` stream of the
+/// component is stale, which is the condition that faults the component as
+/// stream-stale (effective budget with the Deployment overrides, message
+/// stamps). One atomic read, so time-critical paths may read it.
+struct ComponentStreamStaleFlag final {
+  [[nodiscard]] bool stale() const noexcept { return value.load(std::memory_order_acquire); }
+
+  std::atomic<bool> value{false};
+};
+
 /// Adapter handle of one declared stream. Destruction undeclares it.
 /// `Record*` are lock-free and allocation-free unless the stream was not
 /// live (one transition notification). The registry's clock must outlive it.
@@ -164,6 +175,10 @@ class ComponentStreamHealth final {
 
   /// Current health of every stream of the component, sorted by stream id.
   [[nodiscard]] std::vector<StreamHealthDTO> Read(const ControllableComponentId& component) const;
+  /// The component's stream-stale flag. It follows every later classification
+  /// of the component, including streams declared or replaced afterwards.
+  [[nodiscard]] std::shared_ptr<const ComponentStreamStaleFlag> Watch(
+      const ControllableComponentId& component);
   /// Optional edge-triggered transition log (one line per verdict change).
   void SetLog(std::function<void(const std::string&)> log);
 

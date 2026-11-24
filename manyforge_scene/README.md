@@ -2,32 +2,33 @@
 
 `manyforge_scene` is the ROS-free semantic owner for ManyForge logical-scene
 state. It owns the production canonical-empty bootstrap, named structural
-Apply handoff, logical-scene transactions, and the durable current-binding
+Apply handoff, logical-scene transactions, and the current-binding
 overlay used when a finalized Manager-managed native host is replaced. It is
 the replacement direction for the legacy Core `SceneAuthority`, not a second
 owner, compatibility facade, or fallback.
 
 The owner's public constructor accepts the deployment-owned sealed
 `CanonicalEmptyRetainedBundleAdmission`; there is no bare query constructor.
-It derives and durably binds the admission's cell/bundle/graph identities and
+It derives and binds the admission's cell/bundle/graph identities and
 admission digest, and requires Begin's complete retained bundle to equal the
-owned verified bundle. Its separate bounded SQLite database contains the
-immutable bootstrap facts plus append-only named-Apply, scene-transaction, and
-managed-runtime-recovery evidence. Begin atomically rechecks the empty,
-command-fenced prerequisites and uses the public Core logical-scene identity
+owned verified bundle. It holds the Scene in memory only: the immutable
+bootstrap facts plus the named-Apply, scene-transaction, and
+managed-runtime-recovery rows. Nothing of the Scene is written to disk or
+survives the process; every start begins from the canonical empty scene.
+Begin atomically rechecks the empty, command-fenced prerequisites and uses
+the public Core logical-scene identity
 codec, which in turn uses the shared `manyforge_content_identity` RFC 8785 and
 SHA-256 implementation. No caller supplies a scene ID, content hash, policy,
 revision, or counter.
 
 Scene writes and projection leases are derived closed until Finalize rereads
 the requested publication generation through the read-only active-publication
-capability, byte-compares the current receipt, and durably commits that exact
+capability, byte-compares the current receipt, and records that exact
 receipt. A historical or mismatched receipt leaves both gates closed. Exact
-Begin, Rebuild, Finalize, and Status replay is reconstructed from the durable
-rows after restart.
+Begin, Rebuild, Finalize, and Status replay is answered from those rows.
 
-The current-head read and the scene database commit are intentionally not one
-cross-database transaction. The required owner protocol closes that interval:
+The current-head read and the scene commit are intentionally not one
+transaction. The required owner protocol closes that interval:
 Manager is the sole active-publication writer, and any successor publication
 must first enter the scene owner's serialized, quiesced transition. During
 canonical-empty bootstrap no successor is admissible until this Finalize
@@ -35,29 +36,10 @@ completes. The real-Manager integration proof exercises that sole-writer
 ordering and verifies that the receipt stored by the scene owner remains the
 generation-one current head when the gates open.
 
-Storage startup reuses `manyforge_persistence` only for bounded mechanical
-read-only SQLite/WAL preflight. This package alone owns its schema and recovery
-decisions. Its database is not joined transactionally or semantically with a
-Component Manager store. Database page image, WAL, row cardinality,
-generations, and identifiers are all fixed-bounded and corruption fails
-closed. An exact schema-free SQLite file left by a crash during first creation
-is safely initialized on restart; any foreign application/version marker or
-partial schema is rejected. Initial schema publication also fsyncs the owning
-directory.
-
-Construction and WAL-topology-changing Close/destruction share one
-process-local scene-store lifecycle gate. Construction takes the lifecycle gate
-before SQLite. Close/destruction takes the per-instance mutex, then the
-lifecycle gate, then SQLite; ordinary scene transactions take only the
-per-instance mutex and SQLite. No path holds the lifecycle gate while waiting
-for an instance mutex, so an injected publication reader cannot reverse this
-order through another scene-store lifecycle operation. This prevents a
-same-process constructor from preflighting a WAL while last-close removes it.
-Constructor acquisition is bounded to ten seconds; Close/destruction waits for
-the gate so teardown cannot abandon a live SQLite handle merely because gate
-acquisition timed out. Concurrent teardown in one process and startup in
-another process is not qualified by this foundation and requires the future
-operational process-lifecycle owner plus forked replacement coverage.
+Rows, generations and identifiers are fixed-bounded. A commit whose
+resulting scene would encode larger than 384 KiB, the bound of the Scene
+section in the Manager's status stream, is refused with `scene_too_large` and
+changes nothing.
 
 Not implemented yet: component/passive-frame and
 carried-object activation, the complete execution-facing projection-lease

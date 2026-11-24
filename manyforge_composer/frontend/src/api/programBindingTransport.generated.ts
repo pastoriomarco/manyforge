@@ -1,4 +1,4 @@
-/* GENERATED FILE -- program_binding_transport.v3.json; DO NOT EDIT. */
+/* GENERATED FILE -- program_binding_transport.v4.json; DO NOT EDIT. */
 import type {
   CatalogRecordKind, ProgramBindingDocument,
 } from '../types/programBindingTransport.generated';
@@ -8,11 +8,10 @@ const IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const KINDS = new Set<CatalogRecordKind>([
   'model_asset', 'runtime_profile', 'component_type',
   'control_interface_contract', 'controller_topology', 'provider_manifest',
-  'command_schema', 'capability_definition', 'contact_policy',
-  'stop_evidence_policy',
+  'command_schema', 'capability_definition', 'stop_evidence_policy',
 ]);
 const FIELDS = {
-  binding: ['api_version', 'program_binding_id', 'program_id', 'program_revision', 'retained_bundle_id', 'graph_revision', 'node_environment', 'component_bindings', 'target_bindings', 'frame_bindings', 'collision_body_bindings', 'signal_bindings', 'node_policies', 'contact_grasp_bindings', 'provenance'],
+  binding: ['api_version', 'program_binding_id', 'program_revision', 'retained_bundle_id', 'graph_revision', 'node_environment', 'component_bindings', 'target_bindings', 'frame_bindings', 'collision_body_bindings', 'signal_bindings', 'node_policies', 'collision_rule_bodies', 'provenance', 'collision_rule_spring_sliders'],
   node_environment: ['catalog_id', 'content_version', 'catalog_digest', 'environment_digest'],
   component: ['component_id', 'component_type_id', 'component_type_revision', 'model_bindings'],
   model: ['model_role_id', 'model_instance_id', 'model_revision'],
@@ -28,22 +27,21 @@ const FIELDS = {
   control: ['control_binding_id', 'control_binding_revision'],
   provider: ['capability_provider_binding_id', 'capability_provider_binding_revision'],
   command_schema: ['command_schema_id', 'command_schema_revision'],
-  contact: ['contact_policy_id', 'contact_policy_revision', 'runtime_object_id', 'allowed_body_bindings', 'max_penetration_m', 'terminal_window_start_fraction', 'bodies_from_motion_endpoint'],
-  contact_body: ['body', 'model_role_id', 'model_instance_id', 'model_revision', 'collision_body_ids'],
+  collision_rule_body: ['body', 'model_role_id', 'model_instance_id', 'model_revision', 'collision_body_ids'],
+  collision_rule_spring_slider: ['body', 'axis', 'stroke_m', 'max_compression_step_m'],
   provenance: ['binding_compiler_contract_digest', 'source_records', 'resolved_output_records'],
   provenance_record: ['record_kind', 'record_id', 'revision'],
   signal: ['reference', 'target', 'runtime_unit_id', 'value_type', 'direction', 'transition_capability', 'signal_descriptor_digest'],
   pneumatic_io: ['outputs', 'inputs'],
   pneumatic_output: ['signal', 'open_value', 'close_value'],
   pneumatic_input: ['input', 'signal'],
-  contact_release: ['contact_policy_id', 'contact_policy_revision', 'runtime_object_id', 'allowed_body_bindings', 'mode', 'release_evidence_mode', 'enforce_max_start_penetration', 'max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m', 'require_strictly_decreasing_penetration', 'require_separation_by_end', 'allow_recontact', 'bodies_from_motion_endpoint'],
   target_reference: ['component_id', 'command_target_id'],
   frame_reference: ['component_id', 'frame_id'],
   body_reference: ['component_id', 'collision_body_id'],
   signal_reference: ['component_id', 'signal_name'],
   frame_association: ['frame', 'contact_body_role_ids'],
 } as const;
-const OPTIONAL_FIELDS = {'recovery_policy': ['intervention_stop_scope'], 'target': ['pneumatic_io', 'robot_tcps', 'default_tcp'], 'contact': ['bodies_from_motion_endpoint'], 'contact_release': ['bodies_from_motion_endpoint']} as const;
+const OPTIONAL_FIELDS = {'binding': ['collision_rule_spring_sliders'], 'recovery_policy': ['intervention_stop_scope'], 'target': ['pneumatic_io', 'robot_tcps', 'default_tcp']} as const;
 const STOP_POLICIES = new Set(['inherit', 'hold', 'continue']);
 const INTERVENTION_STOP_SCOPES = new Set(['all', 'own_groups']);
 const COLLISION_BODY_ID = 'component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}';
@@ -54,7 +52,7 @@ const RETRY_MAX = 255;
 const PROVENANCE_MAX_ROWS = 16384;
 const TEXT_MAX_BYTES = 4096;
 const IDENTITY_MAX_BYTES = 128;
-const BINDING_API_VERSION = 'manyforge.program_binding.v3';
+const BINDING_API_VERSION = 'manyforge.program_binding.v4';
 type Row = Record<string, unknown>;
 
 export class ProgramBindingTransportError extends Error {}
@@ -101,12 +99,6 @@ const digest = (value: unknown, path: string): string => {
   if (typeof value !== 'string') bad(path, 'lowercase SHA-256');
   const result = value as string;
   if (!matchesExactly(DIGEST, result)) bad(path, 'lowercase SHA-256');
-  return result;
-};
-const number = (value: unknown, path: string): number => {
-  if (typeof value !== 'number') bad(path, 'finite number');
-  const result = value as number;
-  if (!Number.isFinite(result)) bad(path, 'finite number');
   return result;
 };
 const sorted = <T>(rows: T[], key: (row: T) => string, path: string): void => {
@@ -190,10 +182,9 @@ const nodePolicy = (value: unknown, path: string): Row => {
 };
 
 export function parseProgramBindingTransport(value: unknown, path: string): ProgramBindingDocument {
-  const root = record(value, FIELDS.binding, path);
+  const root = record(value, FIELDS.binding, path, OPTIONAL_FIELDS.binding);
   if (root.api_version !== BINDING_API_VERSION) bad(`${path}.api_version`, BINDING_API_VERSION);
   digest(root.program_binding_id, `${path}.program_binding_id`);
-  identity(root.program_id, `${path}.program_id`);
   ['program_revision', 'retained_bundle_id', 'graph_revision'].forEach(
     (field) => digest(root[field], `${path}.${field}`),
   );
@@ -393,68 +384,49 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
     .map((item, i) => nodePolicy(item, `${path}.node_policies[${i}]`));
   sorted(nodePolicies, (row) => row.instance_id as string, `${path}.node_policies`);
 
-  const contacts = array(root.contact_grasp_bindings, `${path}.contact_grasp_bindings`, 0, ROLE_MAX_ROWS).map((item, i) => {
-    const pp = `${path}.contact_grasp_bindings[${i}]`;
-    const release = item !== null && typeof item === 'object' && 'mode' in item;
-    const policy = release
-      ? record(item, FIELDS.contact_release, pp, OPTIONAL_FIELDS.contact_release)
-      : record(item, FIELDS.contact, pp, OPTIONAL_FIELDS.contact);
-    identity(policy.contact_policy_id, `${pp}.contact_policy_id`);
-    digest(policy.contact_policy_revision, `${pp}.contact_policy_revision`);
-    identity(policy.runtime_object_id, `${pp}.runtime_object_id`);
-    if (release) {
-      if (policy.mode !== 'contact_release') bad(pp, 'unsupported contact mode');
-      if (policy.release_evidence_mode !== 'signed_penetration' && policy.release_evidence_mode !== 'binary_contact') bad(pp, 'unsupported release evidence');
-      for (const field of ['enforce_max_start_penetration', 'require_strictly_decreasing_penetration', 'require_separation_by_end', 'allow_recontact']) {
-        if (typeof policy[field] !== 'boolean') bad(pp, 'release flags must be boolean');
-      }
-      for (const field of ['max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m']) {
-        const metric = number(policy[field], `${pp}.${field}`);
-        if (metric < 0 || metric > 1000) bad(pp, 'release metric ranges');
-      }
-      if (policy.release_evidence_mode === 'binary_contact' && (
-        policy.enforce_max_start_penetration || policy.require_strictly_decreasing_penetration
-        || ['max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m'].some((field) => policy[field] !== 0)
-      )) bad(pp, 'binary contact requires neutral metric fields');
-    } else {
-      const penetration = number(policy.max_penetration_m, `${pp}.max_penetration_m`);
-      const fraction = number(policy.terminal_window_start_fraction, `${pp}.terminal_window_start_fraction`);
-      if (penetration <= 0 || fraction < 0 || fraction > 1) bad(pp, 'contact numeric ranges');
+  const ruleBodies = array(root.collision_rule_bodies, `${path}.collision_rule_bodies`, 0, ROLE_MAX_ROWS).map((item, i) => {
+    const bp = `${path}.collision_rule_bodies[${i}]`;
+    const body = record(item, FIELDS.collision_rule_body, bp);
+    const ref = bodyReference(body.body, `${bp}.body`);
+    if (body.model_role_id !== null) identity(body.model_role_id, `${bp}.model_role_id`);
+    identity(body.model_instance_id, `${bp}.model_instance_id`);
+    digest(body.model_revision, `${bp}.model_revision`);
+    const ids = strings(body.collision_body_ids, `${bp}.collision_body_ids`, true);
+    const expected = ids.map((_, k) => COLLISION_BODY_ID
+      .replace('{controllable_component_id}', ref.component_id as string)
+      .replace('{model_instance_id}', body.model_instance_id as string)
+      .replace('{collision_body_role_id}', ref.collision_body_id as string)
+      .replace('{index}', String(k)));
+    if (ids.some((id, k) => id !== expected[k])) bad(bp, 'generated collision body IDs');
+    const collision = bodyByRef.get(bodyKey(ref));
+    if (!collision || collision.model_instance_id !== body.model_instance_id
+        || collision.model_revision !== body.model_revision
+        || (collision.compiled_collision_body_names as unknown[]).length !== ids.length) bad(bp, 'collision correspondence');
+    if (body.model_role_id !== null) {
+      const component = componentById.get(ref.component_id as string);
+      const models = component?.model_bindings as Row[] | undefined;
+      if (!models || models.filter((row) => row.model_role_id === body.model_role_id
+        && row.model_instance_id === body.model_instance_id && row.model_revision === body.model_revision).length !== 1) bad(bp, 'model correspondence');
     }
-    const endpoint = 'bodies_from_motion_endpoint' in policy;
-    if (endpoint && policy.bodies_from_motion_endpoint !== true) bad(pp, 'bodies_from_motion_endpoint must be true or omitted');
-    const bodyValues = array(policy.allowed_body_bindings, `${pp}.allowed_body_bindings`, endpoint ? 0 : 1);
-    if (endpoint !== (bodyValues.length === 0)) bad(pp, 'endpoint and explicit contact bodies are mutually exclusive');
-    const bodies = bodyValues.map((item2, j) => {
-      const bp = `${pp}.allowed_body_bindings[${j}]`;
-      const body = record(item2, FIELDS.contact_body, bp);
-      const ref = bodyReference(body.body, `${bp}.body`);
-      if (body.model_role_id !== null) identity(body.model_role_id, `${bp}.model_role_id`);
-      identity(body.model_instance_id, `${bp}.model_instance_id`);
-      digest(body.model_revision, `${bp}.model_revision`);
-      const ids = strings(body.collision_body_ids, `${bp}.collision_body_ids`, true);
-      const expected = ids.map((_, k) => COLLISION_BODY_ID
-        .replace('{controllable_component_id}', ref.component_id as string)
-        .replace('{model_instance_id}', body.model_instance_id as string)
-        .replace('{collision_body_role_id}', ref.collision_body_id as string)
-        .replace('{index}', String(k)));
-      if (ids.some((id, k) => id !== expected[k])) bad(bp, 'generated collision body IDs');
-      const collision = bodyByRef.get(bodyKey(ref));
-      if (!collision || collision.model_instance_id !== body.model_instance_id
-          || collision.model_revision !== body.model_revision
-          || (collision.compiled_collision_body_names as unknown[]).length !== ids.length) bad(bp, 'collision correspondence');
-      if (body.model_role_id !== null) {
-        const component = componentById.get(ref.component_id as string);
-        const models = component?.model_bindings as Row[] | undefined;
-        if (!models || models.filter((row) => row.model_role_id === body.model_role_id
-          && row.model_instance_id === body.model_instance_id && row.model_revision === body.model_revision).length !== 1) bad(bp, 'model correspondence');
-      }
-      return body;
-    });
-    sorted(bodies, (row) => `${bodyKey(row.body as Row)}\0${row.model_role_id === null ? '\0' : `\u0001${row.model_role_id}`}`, `${pp}.allowed_body_bindings`);
-    return policy;
+    return body;
   });
-  sorted(contacts, (row) => row.contact_policy_id as string, `${path}.contact_grasp_bindings`);
+  sorted(ruleBodies, (row) => bodyKey(row.body as Row), `${path}.collision_rule_bodies`);
+  // Present only when non-empty; every slider is a collision rule body.
+  if ('collision_rule_spring_sliders' in root) {
+    const ruleBodyKeys = new Set(ruleBodies.map((row) => bodyKey(row.body as Row)));
+    const sliders = array(root.collision_rule_spring_sliders, `${path}.collision_rule_spring_sliders`, 1, ROLE_MAX_ROWS).map((item, i) => {
+      const sp = `${path}.collision_rule_spring_sliders[${i}]`;
+      const slider = record(item, FIELDS.collision_rule_spring_slider, sp);
+      if (!ruleBodyKeys.has(bodyKey(bodyReference(slider.body, `${sp}.body`)))) bad(sp, 'collision rule body');
+      const axis = array(slider.axis, `${sp}.axis`, 3, 3);
+      const numbers = [...axis, slider.stroke_m, slider.max_compression_step_m];
+      if (numbers.some((x) => typeof x !== 'number' || !Number.isFinite(x))) bad(sp, 'finite numbers');
+      if (!(Math.abs(Math.hypot(...(axis as number[])) - 1) <= 1e-9)
+        || !((slider.stroke_m as number) > 0) || !((slider.max_compression_step_m as number) > 0)) bad(sp, 'unit axis, stroke and step above 0');
+      return slider;
+    });
+    sorted(sliders, (row) => bodyKey(row.body as Row), `${path}.collision_rule_spring_sliders`);
+  }
   const provenance = record(root.provenance, FIELDS.provenance, `${path}.provenance`);
   ['binding_compiler_contract_digest']
     .forEach((field) => digest(provenance[field], `${path}.provenance.${field}`));

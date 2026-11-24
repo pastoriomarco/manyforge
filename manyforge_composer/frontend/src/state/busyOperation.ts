@@ -25,7 +25,6 @@ const AUTHORING_OPERATIONS = {
   revert: ['Reverting…', 'Revert'],
   discard: ['Discarding…', 'Discard'],
   save: ['Saving…', 'Save'],
-  save_as: ['Saving…', 'Save as'],
   export: ['Exporting…', 'Export'],
   load: ['Loading…', 'Load'],
   new: ['Emptying cell…', 'New Scenario'],

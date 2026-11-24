@@ -1140,7 +1140,6 @@ void register_catalog_record_bindings(py::module_& module) {
       .value("kProviderManifest", CatalogRecordKind::kProviderManifest)
       .value("kCommandSchema", CatalogRecordKind::kCommandSchema)
       .value("kCapabilityDefinition", CatalogRecordKind::kCapabilityDefinition)
-      .value("kContactPolicy", CatalogRecordKind::kContactPolicy)
       .value("kStopEvidencePolicy", CatalogRecordKind::kStopEvidencePolicy);
 
   py::class_<CatalogRecordTypeDescriptor>(module, "CatalogRecordTypeDescriptor", py::is_final())
@@ -1189,12 +1188,10 @@ void register_catalog_record_bindings(py::module_& module) {
                                                             "CommandSchemaCatalogRecordRefDTO");
   bind_catalog_record_ref<CapabilityDefinitionCatalogRecordRefDTO>(
       module, "CapabilityDefinitionCatalogRecordRefDTO");
-  bind_catalog_record_ref<ContactPolicyCatalogRecordRefDTO>(module,
-                                                            "ContactPolicyCatalogRecordRefDTO");
   bind_catalog_record_ref<StopEvidencePolicyCatalogRecordRefDTO>(
       module, "StopEvidencePolicyCatalogRecordRefDTO");
 
-  constexpr std::array<const char*, 10> kRecordRefTypeNames{{
+  constexpr std::array<const char*, 9> kRecordRefTypeNames{{
       "ModelAssetCatalogRecordRefDTO",
       "RuntimeProfileCatalogRecordRefDTO",
       "ComponentTypeCatalogRecordRefDTO",
@@ -1203,7 +1200,6 @@ void register_catalog_record_bindings(py::module_& module) {
       "ProviderManifestCatalogRecordRefDTO",
       "CommandSchemaCatalogRecordRefDTO",
       "CapabilityDefinitionCatalogRecordRefDTO",
-      "ContactPolicyCatalogRecordRefDTO",
       "StopEvidencePolicyCatalogRecordRefDTO",
   }};
   py::tuple record_ref_types{kRecordRefTypeNames.size()};
@@ -1239,7 +1235,6 @@ void register_catalog_record_bindings(py::module_& module) {
   bind_catalog_record_ref_helpers<ProviderManifestCatalogRecordRefDTO>(module);
   bind_catalog_record_ref_helpers<CommandSchemaCatalogRecordRefDTO>(module);
   bind_catalog_record_ref_helpers<CapabilityDefinitionCatalogRecordRefDTO>(module);
-  bind_catalog_record_ref_helpers<ContactPolicyCatalogRecordRefDTO>(module);
   bind_catalog_record_ref_helpers<StopEvidencePolicyCatalogRecordRefDTO>(module);
 }
 

@@ -1,5 +1,5 @@
 {
-  "api_version": "manyforge.deployment_intent.v2",
+  "api_version": "manyforge.deployment_intent.v3",
   "assistant_profile_id": null,
   "attachments": [
     {
@@ -51,8 +51,13 @@
       }
     }
   ],
+  "collision_rules": [
+    {
+      "clearance_m": 0.001,
+      "rule_id": "everything"
+    }
+  ],
   "compatibility": {
-    "lane": "manyforge-only",
     "provides": [
       "lite_gripper"
     ],
@@ -227,12 +232,7 @@
               "mount_frame": "lite_gripper_mount",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "tcp_frame": "link_tcp",
-              "touch_links": [
-                "lite_gripper_base_link",
-                "lite_gripper_left_finger",
-                "lite_gripper_right_finger"
-              ]
+              "tcp_frame": "link_tcp"
             }
           ]
         },
@@ -256,8 +256,5 @@
       "target_settings": {}
     }
   ],
-  "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-  "description": "Mock pick-and-place deployment for the UFACTORY Lite 6 with the lite pneumatic gripper.",
-  "name": "lite6_lite_gripper_pick_and_place",
   "policies": {}
 }

@@ -22,6 +22,7 @@
 #include <limits>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_collision/scene_asset_root.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <memory>
@@ -852,12 +853,13 @@ void write_mesh(const std::filesystem::path& path, const std::string& bytes) {
   output << bytes;
 }
 
-CollisionWorldSnapshot relative_mesh_snapshot(const std::string& uri,
-                                              const std::uint64_t revision) {
+CollisionWorldSnapshot scene_mesh_snapshot(
+    const std::string& uri, const std::optional<std::string>& content_digest,
+    const std::uint64_t revision) {
   auto snapshot = minimal_snapshot();
   snapshot.revision.revision_id = revision;
   snapshot.revision.content_hash =
-      "sha256:relative-scene-mesh-" + std::to_string(revision);
+      "sha256:scene-mesh-" + std::to_string(revision);
   snapshot.component_model_frames.push_back(
       manyforge::core::CollisionComponentModelFrame{
           manyforge::core::ControllableComponentId{"arm"},
@@ -867,7 +869,7 @@ CollisionWorldSnapshot relative_mesh_snapshot(const std::string& uri,
           manyforge::core::ModelRevision{"model-revision-1"},
           {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}});
   manyforge::core::CollisionWorldBody body;
-  body.body_id = manyforge::core::CollisionBodyId("scene/relative-mesh/shape/0");
+  body.body_id = manyforge::core::CollisionBodyId("scene/mesh/shape/0");
   body.owner_kind = manyforge::core::CollisionOwnerKind::kSceneResource;
   body.frame_id = "world";
   body.pose = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
@@ -877,6 +879,7 @@ CollisionWorldSnapshot relative_mesh_snapshot(const std::string& uri,
   geometry.geometry_kind = manyforge::core::CollisionGeometryKind::kTriangleMesh;
   geometry.local_pose = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
   geometry.source_uri = uri;
+  geometry.source_hash = content_digest;
   geometry.mesh_scale = manyforge::core::Vector3DTO{1.0, 1.0, 1.0};
   body.geometries.push_back(geometry);
   snapshot.bodies.push_back(body);
@@ -889,18 +892,22 @@ std::string sync_error(const CollisionResult& result) {
 }
 
 TEST(ManyForgeCollisionEngineTest,
-     RelativeSceneMeshResolvesOnlyBelowTheApprovedSceneAssetRoot) {
+     SceneMeshIsReadOnlyFromTheContentStoreByItsDigest) {
+  using manyforge::collision::scene_mesh_store_path;
+  using manyforge::content_identity::sha256_digest;
   TemporaryModel temporary;
   const std::string triangle = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
-  const auto outside = temporary.root / "outside";
-  const auto approved = temporary.root / "approved";
-  write_mesh(outside / "examples/x/meshes/outside.obj", triangle);
-  write_mesh(approved / "examples/x/meshes/a.obj", triangle);
-  // A repository-relative example mesh: the removed fallbacks would have
-  // found it through the current directory or the development /workspace.
-  const std::string repository_mesh =
-      "examples/isaac_manipulator_scene_light/meshes/"
-      "World__soup_can_collider_cooked.obj";
+  const std::string changed = "v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\n";
+  const auto digest = sha256_digest(triangle);
+  const auto changed_digest = sha256_digest(changed);
+  const auto content = temporary.root / "activation";
+  write_mesh(content / scene_mesh_store_path(digest), triangle);
+  // A file at the relative URI (below the current directory) is never
+  // opened; no file exists at the absolute URI at all.
+  const std::string relative_uri = "examples/x/meshes/a.obj";
+  const std::string absolute_uri =
+      (temporary.root / "absent" / "a.obj").string();
+  write_mesh(temporary.root / relative_uri, triangle);
 
   const auto previous_directory = std::filesystem::current_path();
   struct RestoreDirectory final {
@@ -910,74 +917,81 @@ TEST(ManyForgeCollisionEngineTest,
       std::filesystem::current_path(path, ignored);
     }
   } restore{previous_directory};
-  std::filesystem::current_path(outside);
+  std::filesystem::current_path(temporary.root);
 
   const auto urdf = temporary.root / "empty.urdf";
   const auto srdf = temporary.root / "empty.srdf";
   static_cast<void>(load_empty_collision_model(temporary));
+  const auto expect_refused = [](const CollisionResult& result,
+                                 const std::string& detail) {
+    const auto error = sync_error(result);
+    EXPECT_NE(error.find("scene_mesh_unavailable"), std::string::npos) << error;
+    EXPECT_NE(error.find(detail), std::string::npos) << error;
+  };
 
   {
-    // No approved root: relative scene meshes fail closed even when the
-    // file exists below the current directory.
+    // No content root: scene meshes fail closed even when the URI names an
+    // existing file.
     const auto model = ManyForgeCollisionEngine::load_shared_model(
         "unrooted", urdf, srdf, {temporary.root}, "arm");
     ManyForgeCollisionEngine engine(model, nullptr);
-    const auto result = check(
-        engine, relative_mesh_snapshot("examples/x/meshes/outside.obj", 1U),
-        one_joint_query());
-    EXPECT_NE(sync_error(result).find("no approved scene-asset root"),
-              std::string::npos)
-        << sync_error(result);
+    expect_refused(check(engine, scene_mesh_snapshot(relative_uri, digest, 1U),
+                         one_joint_query()),
+                   "has no scene content root");
   }
 
   const int root_fd =
-      ::open(approved.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      ::open(content.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   ASSERT_GE(root_fd, 0);
   const auto model = ManyForgeCollisionEngine::load_shared_model(
       "rooted", urdf, srdf, {temporary.root, repo_root()}, "arm", root_fd);
   static_cast<void>(::close(root_fd));  // The model keeps its own duplicate.
   {
     ManyForgeCollisionEngine engine(model, nullptr);
+    // Relative and absolute URIs follow the same rule: read by digest.
     for (const auto& [uri, revision] :
          std::vector<std::pair<std::string, std::uint64_t>>{
-             {"examples/x/meshes/outside.obj", 2U},
-             {repository_mesh, 3U},
-             {"../outside/examples/x/meshes/outside.obj", 4U}}) {
-      const auto result =
-          check(engine, relative_mesh_snapshot(uri, revision), one_joint_query());
-      EXPECT_FALSE(sync_error(result).empty()) << uri;
+             {relative_uri, 2U}, {absolute_uri, 3U}}) {
+      const auto loaded = check(engine, scene_mesh_snapshot(uri, digest, revision),
+                                one_joint_query());
+      EXPECT_TRUE(sync_error(loaded).empty()) << uri << ": "
+                                              << sync_error(loaded);
     }
-    const auto loaded = check(
-        engine, relative_mesh_snapshot("examples/x/meshes/a.obj", 5U),
-        one_joint_query());
-    EXPECT_TRUE(sync_error(loaded).empty()) << sync_error(loaded);
+    // No captured digest: refused, the URI is not a fallback.
+    expect_refused(check(engine,
+                         scene_mesh_snapshot(relative_uri, std::nullopt, 4U),
+                         one_joint_query()),
+                   "has no captured content digest");
+    // A digest whose blob is not in the store.
+    expect_refused(check(engine,
+                         scene_mesh_snapshot(relative_uri, changed_digest, 5U),
+                         one_joint_query()),
+                   "is not in the content store");
+    // A blob whose bytes do not match its digest.
+    const auto forged = sha256_digest("not the stored bytes");
+    write_mesh(content / scene_mesh_store_path(forged), triangle);
+    expect_refused(check(engine, scene_mesh_snapshot(relative_uri, forged, 6U),
+                         one_joint_query()),
+                   "do not match the digest");
   }
-  const auto pinned = ManyForgeCollisionEngine::scene_mesh_content_digest(
-      model, "examples/x/meshes/a.obj");
-  ASSERT_TRUE(pinned.ok()) << pinned.error().message;
-  EXPECT_EQ(pinned.value().rfind("sha256:", 0), 0U);
 
-  // Renaming the approved root does not change what the model reads.
-  std::filesystem::rename(approved, temporary.root / "approved-displaced");
-  ASSERT_TRUE(ManyForgeCollisionEngine::scene_mesh_content_digest(
-                  model, "examples/x/meshes/a.obj")
-                  .ok());
-
-  // Changed bytes after the first load: a fresh cache must refuse them.
-  write_mesh(temporary.root / "approved-displaced/examples/x/meshes/a.obj",
-             "v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 2 3\n");
+  // Renaming the content root does not change what the model reads.
+  const auto displaced = temporary.root / "activation-displaced";
+  std::filesystem::rename(content, displaced);
   ManyForgeCollisionEngine fresh(
       model, ManyForgeCollisionEngine::make_shared_scene_cache(model));
-  const auto changed = check(
-      fresh, relative_mesh_snapshot("examples/x/meshes/a.obj", 6U),
-      one_joint_query());
-  EXPECT_NE(sync_error(changed).find("scene_mesh_content_changed"),
-            std::string::npos)
-      << sync_error(changed);
-  const auto still_pinned = ManyForgeCollisionEngine::scene_mesh_content_digest(
-      model, "examples/x/meshes/a.obj");
-  ASSERT_TRUE(still_pinned.ok());
-  EXPECT_EQ(still_pinned.value(), pinned.value());
+  const auto renamed = check(
+      fresh, scene_mesh_snapshot(relative_uri, digest, 7U), one_joint_query());
+  EXPECT_TRUE(sync_error(renamed).empty()) << sync_error(renamed);
+
+  // A re-Apply captures new bytes for the same URI: the new digest is read,
+  // nothing is pinned per URI, and the old blob is not needed.
+  write_mesh(displaced / scene_mesh_store_path(changed_digest), changed);
+  ASSERT_TRUE(std::filesystem::remove(displaced / scene_mesh_store_path(digest)));
+  const auto reapplied =
+      check(fresh, scene_mesh_snapshot(relative_uri, changed_digest, 8U),
+            one_joint_query());
+  EXPECT_TRUE(sync_error(reapplied).empty()) << sync_error(reapplied);
 }
 
 TEST(ManyForgeCollisionEngineTest,
@@ -1027,7 +1041,7 @@ TEST(ManyForgeCollisionEngineTest,
   box_geometry.box_dimensions_m = core::Vector3DTO{0.1, 0.1, 0.1};
   box.geometries.push_back(box_geometry);
   auto margins = std::make_shared<core::CollisionClearanceMargins>();
-  margins->margin_m = 10.0;
+  margins->rule_ids = {"everything"};
   for (const auto& body : snapshot.bodies) {
     margins->pairs.push_back({core::CollisionPairId{body.body_id, box.body_id}, 10.0});
   }
@@ -1191,7 +1205,7 @@ TEST(ManyForgeCollisionEngineTest, ClearanceMarginClassifiesAFingerMeshNearAnObs
   box.geometries.push_back(box_geometry);
   constexpr double kMarginM = 0.5;
   auto margins = std::make_shared<core::CollisionClearanceMargins>();
-  margins->margin_m = kMarginM;
+  margins->rule_ids = {"everything"};
   for (const auto& body : snapshot.bodies) {
     margins->pairs.push_back({core::CollisionPairId{body.body_id, box.body_id}, kMarginM});
   }
@@ -1250,6 +1264,178 @@ TEST(ManyForgeCollisionEngineTest, ClearanceMarginClassifiesAFingerMeshNearAnObs
   EXPECT_TRUE(std::none_of(reset.normalized_pairs.begin(), reset.normalized_pairs.end(),
                            touches_box));
   EXPECT_TRUE(reset.clearance_violations.empty());
+}
+
+// OD-350: a robot carrying a passive tool. The tool's links have either
+// collision geometry (bound at preparation to the reserved default body) or
+// only visual geometry; its tcp link has no geometry at all. Bodies along z
+// (world): base -0.05..0.05, arm 0.10..0.50, tool body 0.55..0.59, jaw
+// 0.61..0.67, tcp at 0.67; no two touch.
+ManyForgeCollisionEngine::SharedModelPtr load_passive_tool_model(
+    const TemporaryModel& temporary, const bool tool_has_collision) {
+  const auto urdf = temporary.root / "passive_tool.urdf";
+  const auto srdf = temporary.root / "passive_tool.srdf";
+  const std::string tool_geometry =
+      tool_has_collision ? "collision" : "visual";
+  {
+    std::ofstream model(urdf);
+    model << R"(<robot name="passive_tool">
+      <link name="base"><collision><geometry><box size="0.1 0.1 0.1"/></geometry></collision></link>
+      <link name="arm_link"><collision><origin xyz="0 0 0.25"/><geometry><box size="0.05 0.05 0.4"/></geometry></collision></link>
+      <link name="tool_body"><)" << tool_geometry
+          << R"(><geometry><box size="0.04 0.04 0.04"/></geometry></)" << tool_geometry
+          << R"(></link>
+      <link name="tool_jaw"><)" << tool_geometry
+          << R"(><geometry><box size="0.02 0.02 0.06"/></geometry></)" << tool_geometry
+          << R"(></link>
+      <link name="tool_tcp"/>
+      <joint name="joint" type="revolute"><parent link="base"/><child link="arm_link"/>
+        <origin xyz="0 0 0.05"/><axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="1" velocity="1"/></joint>
+      <joint name="tool_mount" type="fixed"><parent link="arm_link"/><child link="tool_body"/>
+        <origin xyz="0 0 0.52"/></joint>
+      <joint name="tool_jaw_fixed" type="fixed"><parent link="tool_body"/><child link="tool_jaw"/>
+        <origin xyz="0 0 0.07"/></joint>
+      <joint name="tool_tcp_fixed" type="fixed"><parent link="tool_body"/><child link="tool_tcp"/>
+        <origin xyz="0 0 0.1"/></joint></robot>)";
+    std::ofstream semantic(srdf);
+    semantic << R"(<robot name="passive_tool"><group name="arm"><joint name="joint"/></group></robot>)";
+  }
+  return ManyForgeCollisionEngine::load_shared_model(
+      "passive_tool", urdf, srdf, {}, "arm");
+}
+
+std::vector<manyforge::collision::RetainedComponentCollisionBodyProjectionInput>
+passive_tool_robot_bodies() {
+  namespace core = manyforge::core;
+  std::vector<manyforge::collision::RetainedComponentCollisionBodyProjectionInput> bodies;
+  for (const auto* link : {"base", "arm_link"}) {
+    bodies.push_back({core::ControllableComponentId("robot"), core::ModelInstanceId("robot"),
+                      core::ModelRevision("r1"), core::CollisionBodyRoleId(link), 0, link});
+  }
+  return bodies;
+}
+
+const std::vector<manyforge::collision::RetainedComponentModelFrameProjectionInput>&
+passive_tool_frames() {
+  namespace core = manyforge::core;
+  static const std::vector<manyforge::collision::RetainedComponentModelFrameProjectionInput>
+      frames{{core::ControllableComponentId("robot"), core::ModelInstanceId("robot"),
+              core::ModelRevision("r1"), core::FrameRoleId("base"), "base"},
+             {core::ControllableComponentId("tool"), core::ModelInstanceId("tool"),
+              core::ModelRevision("t1"), core::FrameRoleId("tcp"), "tool_tcp"}};
+  return frames;
+}
+
+// The live trigger: a passive tool's collision links had no authored body and
+// were refused ("retained native geometry has no compiler-owned collision-body
+// mapping"). Bound to `default_collision` they project and are checked.
+TEST(CollisionEngineSelfCoverage, PassiveToolCollisionLinksProjectThroughTheDefaultBody) {
+  namespace core = manyforge::core;
+  TemporaryModel temporary;
+  const auto shared = load_passive_tool_model(temporary, true);
+  auto bodies = passive_tool_robot_bodies();
+
+  const auto uncovered = ManyForgeCollisionEngine::project_retained_component_collision(
+      shared, "base", bodies, passive_tool_frames());
+  ASSERT_FALSE(uncovered.ok());
+  EXPECT_NE(uncovered.error().message.find(
+                "retained native geometry has no compiler-owned collision-body mapping"),
+            std::string::npos)
+      << uncovered.error().message;
+
+  std::size_t index = 0;
+  for (const auto* link : {"tool_body", "tool_jaw"}) {
+    bodies.push_back({core::ControllableComponentId("tool"), core::ModelInstanceId("tool"),
+                      core::ModelRevision("t1"), core::CollisionBodyRoleId("default_collision"),
+                      index++, link});
+  }
+  const auto projection = ManyForgeCollisionEngine::project_retained_component_collision(
+      shared, "base", bodies, passive_tool_frames());
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  const auto& projected = projection.value();
+  ASSERT_EQ(projected.component_bodies.size(), 4U);
+  for (const auto& expected_body :
+       {std::pair{"component/tool/model/tool/body/default_collision/collision/0", "tool_body"},
+        std::pair{"component/tool/model/tool/body/default_collision/collision/1", "tool_jaw"}}) {
+    const std::string body_id = expected_body.first;
+    const auto body = std::find_if(projected.component_bodies.begin(),
+                                   projected.component_bodies.end(),
+                                   [&](const auto& candidate) {
+                                     return candidate.body_id == body_id;
+                                   });
+    ASSERT_NE(body, projected.component_bodies.end()) << body_id;
+    EXPECT_EQ(body->frame_id, expected_body.second);
+    EXPECT_EQ(body->geometries.size(), 1U);
+  }
+  ASSERT_EQ(projected.component_model_frames.size(), 2U);
+  EXPECT_EQ(projected.component_model_frames[1].controllable_component_id,
+            core::ControllableComponentId("tool"));
+
+  // The default body collides like any other body: the jaw against a box.
+  ManyForgeCollisionEngine engine(shared,
+                                  ManyForgeCollisionEngine::make_shared_scene_cache(shared));
+  auto snapshot = minimal_snapshot();
+  snapshot.bodies = projected.component_bodies;
+  snapshot.component_model_frames = projected.component_model_frames;
+  core::CollisionWorldBody obstacle;
+  obstacle.body_id = "scene/obstacle/shape/0";
+  obstacle.owner_kind = core::CollisionOwnerKind::kSceneResource;
+  obstacle.frame_id = "world";
+  obstacle.pose.position_m = {0.0, 0.0, 0.64};
+  core::CollisionGeometryDescriptor shape;
+  shape.body_id = obstacle.body_id;
+  shape.owner_kind = obstacle.owner_kind;
+  shape.geometry_kind = core::CollisionGeometryKind::kBox;
+  shape.box_dimensions_m = core::Vector3DTO{0.01, 0.01, 0.01};
+  obstacle.geometries.push_back(shape);
+  snapshot.bodies.push_back(obstacle);
+  snapshot.body_count = snapshot.bodies.size();
+  snapshot.geometry_count = 5;
+  CollisionQuery query;
+  query.query_id = "passive-tool-default-body";
+  query.robot_state.joint_names = {"joint"};
+  query.robot_state.positions_rad = {0.0};
+  const auto result = check(engine, snapshot, query);
+  ASSERT_EQ(result.engine_status, CollisionEngineStatus::kOk);
+  const core::CollisionPairId expected{
+      "component/tool/model/tool/body/default_collision/collision/1", obstacle.body_id};
+  EXPECT_NE(std::find(result.normalized_pairs.begin(), result.normalized_pairs.end(), expected),
+            result.normalized_pairs.end());
+}
+
+// OD-350 (3): a visual-only tool has frames (its tcp) and no collision body.
+// Its frame projects; only the robot's bodies are collision-checked.
+TEST(CollisionEngineSelfCoverage, VisualOnlyToolFrameProjectsWithoutACollisionBody) {
+  namespace core = manyforge::core;
+  TemporaryModel temporary;
+  const auto shared = load_passive_tool_model(temporary, false);
+  const auto bodies = passive_tool_robot_bodies();
+  const auto projection = ManyForgeCollisionEngine::project_retained_component_collision(
+      shared, "base", bodies, passive_tool_frames());
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  const auto& projected = projection.value();
+  EXPECT_EQ(projected.component_bodies.size(), 2U);
+  ASSERT_EQ(projected.component_model_frames.size(), 2U);
+  const auto& tcp = projected.component_model_frames[1];
+  EXPECT_EQ(tcp.controllable_component_id, core::ControllableComponentId("tool"));
+  EXPECT_EQ(tcp.frame_role_id, core::FrameRoleId("tcp"));
+  EXPECT_EQ(tcp.compiled_frame_name, "tool_tcp");
+  EXPECT_NEAR(tcp.world_pose.position_m.z_m, 0.67, 1e-9);
+
+  ManyForgeCollisionEngine engine(shared,
+                                  ManyForgeCollisionEngine::make_shared_scene_cache(shared));
+  auto snapshot = minimal_snapshot();
+  snapshot.bodies = projected.component_bodies;
+  snapshot.component_model_frames = projected.component_model_frames;
+  snapshot.body_count = snapshot.bodies.size();
+  snapshot.geometry_count = 2;
+  CollisionQuery query;
+  query.query_id = "visual-only-tool";
+  query.robot_state.joint_names = {"joint"};
+  query.robot_state.positions_rad = {0.0};
+  const auto result = check(engine, snapshot, query);
+  ASSERT_EQ(result.engine_status, CollisionEngineStatus::kOk);
+  EXPECT_FALSE(result.in_collision);
 }
 
 }  // namespace

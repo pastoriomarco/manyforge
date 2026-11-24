@@ -87,18 +87,16 @@ require_member(const CanonicalValue::Object &object, std::string_view name,
 void require_closed_root(const CanonicalValue::Object &root) {
   const std::initializer_list<std::string_view> kRequired{
       "api_version",
-      "deployment_artifact_id",
       "deployment_revision",
       "cell_id",
-      "name",
       "catalogs",
       "graph",
       "desired_control_configurations",
       "capability_provider_bindings",
   };
   const std::initializer_list<std::string_view> kOptional{
-      "description",        "site_overlay_ref", "policies",
-      "external_resources", "assistant",        "compatibility",
+      "site_overlay_ref", "policies",  "external_resources",
+      "assistant",        "compatibility",
   };
 
   for (const auto &[name, unused] : root) {
@@ -192,8 +190,7 @@ void validate_compatibility_set(const CanonicalValue &value,
 
 void validate_compatibility(const CanonicalValue &value) {
   const auto &compatibility = require_object(value, "$.compatibility");
-  const std::initializer_list<std::string_view> kFields{"lane", "provides",
-                                                        "tags"};
+  const std::initializer_list<std::string_view> kFields{"provides", "tags"};
   for (const auto &[name, unused] : compatibility) {
     (void)unused;
     if (!contains(kFields, name)) {
@@ -202,12 +199,6 @@ void validate_compatibility(const CanonicalValue &value) {
   }
   for (const std::string_view field : kFields) {
     (void)require_member(compatibility, field, "$.compatibility");
-  }
-  const std::string &lane =
-      require_string(require_member(compatibility, "lane", "$.compatibility"),
-                     "$.compatibility.lane");
-  if (!contains({"manyforge-only", "isaac-sim", "real-robot"}, lane)) {
-    fail("$.compatibility.lane", "unsupported runtime lane");
   }
   validate_compatibility_set(
       require_member(compatibility, "provides", "$.compatibility"),
@@ -256,11 +247,8 @@ authored_graph_member(const CanonicalValue &normalized_full_graph) {
 }
 
 struct DecodedDeployment final {
-  core::DeploymentArtifactId deployment_artifact_id;
   core::DeploymentRevision declared_deployment_revision;
   core::CellId cell_id;
-  std::string name;
-  std::optional<std::string> description;
   std::optional<CanonicalValue> compatibility;
   std::vector<core::CatalogRecordRefDTO> catalog_records;
   GraphIdentityReadyCellGraphCandidate graph_candidate;
@@ -287,25 +275,12 @@ struct DecodedDeployment final {
     compatibility = *authored;
   }
 
-  std::optional<std::string> description;
-  if (const CanonicalValue *authored_description =
-          find_member(root, "description");
-      authored_description != nullptr) {
-    description = require_string(*authored_description, "$.description");
-  }
-
-  const core::DeploymentArtifactId deployment_artifact_id =
-      parse_portable_id<core::DeploymentArtifactId>(
-          require_member(root, "deployment_artifact_id", "$"),
-          "$.deployment_artifact_id");
   const core::DeploymentRevision deployment_revision =
       parse_digest<core::DeploymentRevision>(
           require_member(root, "deployment_revision", "$"),
           "$.deployment_revision");
   const core::CellId cell_id = parse_portable_id<core::CellId>(
       require_member(root, "cell_id", "$"), "$.cell_id");
-  const std::string name =
-      require_string(require_member(root, "name", "$"), "$.name");
 
   const auto &authored_graph =
       require_object(require_member(root, "graph", "$"), "$.graph");
@@ -340,7 +315,6 @@ struct DecodedDeployment final {
     case core::CatalogRecordKind::kProviderManifest:
     case core::CatalogRecordKind::kCommandSchema:
     case core::CatalogRecordKind::kCapabilityDefinition:
-    case core::CatalogRecordKind::kContactPolicy:
     case core::CatalogRecordKind::kStopEvidencePolicy:
       break;
     }
@@ -370,11 +344,8 @@ struct DecodedDeployment final {
   }
 
   return {
-      deployment_artifact_id,
       deployment_revision,
       cell_id,
-      name,
-      std::move(description),
       std::move(compatibility),
       std::move(catalog_records),
       identity_ready_graph,
@@ -390,11 +361,8 @@ struct DecodedDeployment final {
     const RevisionVerifiedDeploymentApplicabilityInputs &applicability) {
   CanonicalValue::Object root{
       {"api_version", CanonicalValue(std::string(kDeploymentApiVersion))},
-      {"deployment_artifact_id",
-       CanonicalValue(decoded.deployment_artifact_id.value())},
       {"deployment_revision", CanonicalValue(deployment_revision.value())},
       {"cell_id", CanonicalValue(decoded.cell_id.value())},
-      {"name", CanonicalValue(decoded.name)},
       {"catalogs", detail::encode_deployment_catalogs(decoded.catalog_records)},
       {"graph", normalized_graph},
       {"desired_control_configurations",
@@ -402,9 +370,6 @@ struct DecodedDeployment final {
       {"capability_provider_bindings",
        applicability.normalized_capability_provider_bindings()},
   };
-  if (decoded.description.has_value()) {
-    root.emplace_back("description", CanonicalValue(*decoded.description));
-  }
   if (decoded.compatibility.has_value()) {
     root.emplace_back("compatibility", *decoded.compatibility);
   }
@@ -533,9 +498,7 @@ RevisionVerifiedDeploymentArtifact compute_deployment_artifact_revision(
     return compute_parts(parsed_deployment, qualified_runtime_profiles);
   });
   return RevisionVerifiedDeploymentArtifact(
-      std::move(parts.decoded.deployment_artifact_id),
       std::move(parts.deployment_revision), std::move(parts.decoded.cell_id),
-      std::move(parts.decoded.name), std::move(parts.decoded.description),
       std::move(parts.decoded.catalog_records), parts.graph,
       parts.applicability, std::move(parts.normalized_root));
 }
@@ -547,9 +510,7 @@ RevisionVerifiedDeploymentArtifact verify_deployment_artifact_revision(
     return verify_parts(parsed_deployment, qualified_runtime_profiles);
   });
   return RevisionVerifiedDeploymentArtifact(
-      std::move(parts.decoded.deployment_artifact_id),
       std::move(parts.deployment_revision), std::move(parts.decoded.cell_id),
-      std::move(parts.decoded.name), std::move(parts.decoded.description),
       std::move(parts.decoded.catalog_records), parts.graph,
       parts.applicability, std::move(parts.normalized_root));
 }

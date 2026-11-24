@@ -49,5 +49,6 @@ def test_planning_phase_uses_planning_selector():
     payload = NativeKernelProgramPort._phase_motion_payload(
         identity=identity, parameters={"base_frame": frame("robot-1", "base")},
         tcp_endpoint=selector, phase="approach", motion={"kind": "pose_goal"},
+        binding={},
     )
     assert payload["tcp_endpoint"] == default

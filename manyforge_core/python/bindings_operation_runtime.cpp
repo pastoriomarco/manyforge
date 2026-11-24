@@ -74,7 +74,8 @@ void register_operation_runtime_bindings(py::module_& module) {
       .value("kOperationReset", StopKind::kOperationReset)
       .value("kPreparedDispatchInvalid", StopKind::kPreparedDispatchInvalid)
       .value("kPlannedStop", StopKind::kPlannedStop)
-      .value("kStopFailedHalt", StopKind::kStopFailedHalt);
+      .value("kStopFailedHalt", StopKind::kStopFailedHalt)
+      .value("kComponentFault", StopKind::kComponentFault);
 
   py::enum_<StopWidenReason>(module, "StopWidenReason")
       .value("kNone", StopWidenReason::kNone)

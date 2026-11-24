@@ -27,15 +27,12 @@ function controller(): DeploymentWorkspaceController {
         revision: 1,
         document: {
           api_version: 'manyforge.deployment.v1',
-          deployment_artifact_id: 'cell-a',
           deployment_revision: `sha256:${'1'.repeat(64)}`,
           cell_id: 'cell-a',
-          name: 'Cell A',
           graph: { runtime_units: [] },
           assistant: { provider: 'local', profile: 'bounded' },
           extension_section: { enabled: true },
         },
-        deploymentArtifactId: 'cell-a',
         deploymentRevision: `sha256:${'1'.repeat(64)}`,
         graphRevision: `sha256:${'2'.repeat(64)}`,
         differsFromSaved: false,
@@ -73,13 +70,13 @@ function controller(): DeploymentWorkspaceController {
     updateControlledStop: vi.fn(),
     updateMotionTargetLimit: vi.fn(),
     revert: vi.fn(),
-    save: vi.fn(),
-    saveAs: vi.fn(),
     discard: vi.fn(),
     applyDraft: vi.fn(),
     applyConfirmedScope: vi.fn(),
     revertConfirmedScope: vi.fn(),
     addComponents: vi.fn(),
+    removeComponent: vi.fn(),
+    replaceTool: vi.fn(),
     previewApply: vi.fn(),
     confirmApply: vi.fn(async () => null),
     cancelApplyConfirmation: vi.fn(),
@@ -168,7 +165,7 @@ describe('DeploymentDocumentEditor', () => {
       ...unapplied.workspace,
       draft: {
         ...unapplied.workspace.draft,
-        document: { name: 'edited' },
+        document: { cell_id: 'edited' },
         deploymentRevision: `sha256:${'2'.repeat(64)}`,
         differsFromSaved: true,
       },
@@ -294,7 +291,7 @@ describe('DeploymentDocumentEditor', () => {
     previewed.applyPreviewKind = 'revert';
     previewed.applyPreview = applyPreviewFixture([
       { component_id: 'lite6_robot', disposition: 'remove', reasons: [], restarts: false },
-    ], { program: { executable: false, program_id: 'pick', unresolved_references: [{
+    ], { program: { executable: false, unresolved_references: [{
       target: { component_id: 'lite6_robot', command_target_id: 'arm' },
       reason: 'component_missing', detail: '' }],
     affected_nodes: [], affected_execution_groups: [] } });

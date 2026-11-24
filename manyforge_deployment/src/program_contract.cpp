@@ -1,4 +1,3 @@
-#include "program_contact_envelope_codec.hpp"
 #include "manyforge_deployment/program_contract.hpp"
 #include "manyforge_deployment/program_reference_validator.hpp"
 
@@ -22,6 +21,7 @@
 #include "content_identity_internal.hpp"
 #include "embedded_build_evidence.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
+#include "manyforge_deployment/collision_rule_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "manyforge_deployment/expression.hpp"
 #include "manyforge_deployment/io_signal_catalog.hpp"
@@ -280,7 +280,9 @@ void verify_value_source(const CanonicalValue &value, std::string_view path) {
                                            child_path(path, "reference"));
     if (!(kind == "blackboard_key" && core::ParseActiveTcpBlackboardKey(reference))) {
       require_program_local_identity(reference, child_path(path, "reference"),
-          kind == "blackboard_key" && reference.starts_with("node_outcome.")
+          kind == "blackboard_key" &&
+                  (reference.starts_with("node_outcome.") ||
+                   reference.starts_with("motion_group_state."))
               ? 256U : kMaximumIdentityBytes);
     }
     return;
@@ -648,17 +650,8 @@ void verify_optional_top_level_shapes(const CanonicalValue::Object &root) {
       compatibility != nullptr) {
     const auto &object =
         require_object(*compatibility, "program.compatibility");
-    require_fields(object, {}, {"lanes", "assistant", "requires", "tags"},
+    require_fields(object, {}, {"assistant", "requires", "tags"},
                    "program.compatibility");
-    if (const auto *lanes = find_member(object, "lanes"); lanes != nullptr) {
-      const auto values = parse_text_set(lanes, "program.compatibility.lanes");
-      for (const auto &lane : values) {
-        if (lane != "manyforge-only" && lane != "isaac-sim" &&
-            lane != "real-robot") {
-          fail("program.compatibility.lanes: unknown lane");
-        }
-      }
-    }
     if (const auto *assistant = find_member(object, "assistant");
         assistant != nullptr) {
       const std::string &spelling =
@@ -676,8 +669,7 @@ void verify_optional_top_level_shapes(const CanonicalValue::Object &root) {
   if (const auto *viewer = find_member(root, "viewer"); viewer != nullptr) {
     (void)require_object(*viewer, "program.viewer");
   }
-  for (const std::string_view field :
-       {"scene", "parameters", "contact_policies"}) {
+  for (const std::string_view field : {"scene", "parameters"}) {
     if (const auto *value = find_member(root, field); value != nullptr) {
       (void)require_array(*value, child_path("program", field));
     }
@@ -688,9 +680,10 @@ void verify_optional_top_level_shapes(const CanonicalValue::Object &root) {
   }
 }
 
+// One declared blackboard key of type scene_resource.
 [[nodiscard]] bool
-declared_scene_resource_runtime_object(const CanonicalValue::Object &root,
-                                       std::string_view runtime_object_id) {
+declared_scene_resource_key(const CanonicalValue::Object &root,
+                                       std::string_view key_name) {
   const auto *blackboard_value = find_member(root, "blackboard");
   if (blackboard_value == nullptr) {
     return false;
@@ -708,251 +701,10 @@ declared_scene_resource_runtime_object(const CanonicalValue::Object &root,
            const auto *type = find_member(key, "type");
            return name != nullptr && type != nullptr &&
                   require_string(*name, "program.blackboard.keys[].key") ==
-                      runtime_object_id &&
+                      key_name &&
                   require_string(*type, "program.blackboard.keys[].type") ==
                       "scene_resource";
          }) == 1;
-}
-
-struct ParsedContactPair final {
-  std::optional<core::ProgramContactGraspBodySelectorDTO> body_selector;
-  core::RuntimeObjectId runtime_object_id;
-  bool bodies_from_motion_endpoint{};
-};
-
-[[nodiscard]] ParsedContactPair
-parse_contact_grasp_pair(const CanonicalValue &value, std::string_view path) {
-  const auto &pair = require_object(value, path);
-  require_fields(pair, {"body_a", "body_b"}, {}, path);
-
-  std::optional<core::ProgramContactGraspBodySelectorDTO> body_selector;
-  std::optional<core::RuntimeObjectId> runtime_object_id;
-  bool motion_endpoint = false;
-  const auto parse_side = [&](const CanonicalValue &side_value,
-                              std::string side_path) {
-    const auto &side = require_object(side_value, side_path);
-    const std::string &kind = require_string(
-        require_member(side, "kind", side_path), child_path(side_path, "kind"));
-    if (kind == "component_model_body") {
-      require_fields(side, {"kind", "body"}, {}, side_path);
-      if (body_selector.has_value() || motion_endpoint) {
-        fail(std::string(path) +
-             ": contact_grasp pair has two component-model sides");
-      }
-      const auto &body = require_object(require_member(side, "body", side_path),
-                                        child_path(side_path, "body"));
-      require_exact_fields(body, {"component_id", "collision_body_id"}, side_path);
-      body_selector = core::ProgramContactGraspBodySelectorDTO{{
-          parse_direct_reference_identity<core::ControllableComponentId>(
-              require_member(body, "component_id", side_path), side_path),
-          parse_direct_reference_identity<core::CollisionBodyRoleId>(
-              require_member(body, "collision_body_id", side_path), side_path)}};
-      return;
-    }
-    if (kind == "motion_endpoint") {
-      require_fields(side, {"kind"}, {}, side_path);
-      if (body_selector.has_value() || motion_endpoint) {
-        fail(std::string(path) + ": contact_grasp pair has two robot sides");
-      }
-      motion_endpoint = true;
-      return;
-    }
-    if (kind == "runtime_object") {
-      require_fields(side, {"kind", "runtime_object_id"}, {}, side_path);
-      if (runtime_object_id.has_value()) {
-        fail(std::string(path) +
-             ": contact_grasp pair has two runtime-object sides");
-      }
-      runtime_object_id = parse_program_identity<core::RuntimeObjectId>(
-          require_member(side, "runtime_object_id", side_path),
-          child_path(side_path, "runtime_object_id"));
-      return;
-    }
-    fail(side_path +
-         ": contact_grasp requires component_model_body, motion_endpoint or "
-         "runtime_object");
-  };
-
-  parse_side(require_member(pair, "body_a", path), child_path(path, "body_a"));
-  parse_side(require_member(pair, "body_b", path), child_path(path, "body_b"));
-  if ((!body_selector.has_value() && !motion_endpoint) ||
-      !runtime_object_id.has_value()) {
-    fail(std::string(path) +
-         ": contact_grasp requires exactly one component body and one "
-         "runtime object");
-  }
-  return {std::move(body_selector), std::move(*runtime_object_id),
-          motion_endpoint};
-}
-
-[[nodiscard]] std::vector<core::ProgramContactGraspTemplateDTO>
-parse_contact_grasp_templates(const CanonicalValue::Object &root) {
-  const auto *policies_value = find_member(root, "contact_policies");
-  if (policies_value == nullptr) {
-    return {};
-  }
-  const auto &policies =
-      require_array(*policies_value, "program.contact_policies");
-  if (policies.size() > core::kMaxProgramContractRoles) {
-    fail("program.contact_policies: exceeds fixed bound");
-  }
-  std::vector<core::ProgramContactGraspTemplateDTO> result;
-  result.reserve(policies.size());
-  for (std::size_t index = 0U; index < policies.size(); ++index) {
-    const std::string path = index_path("program.contact_policies", index);
-    const auto &policy = require_object(policies[index], path);
-    const auto *mode_value = find_member(policy, "mode");
-    if (mode_value == nullptr ||
-        (require_string(*mode_value, child_path(path, "mode")) != "contact_grasp" &&
-         require_string(*mode_value, child_path(path, "mode")) != "contact_release")) {
-      // This adds one binding projection for contact-grasp. Other policy modes
-      // retain their existing Program validation and runtime ownership.
-      continue;
-    }
-    const bool release = require_string(*mode_value, child_path(path, "mode")) == "contact_release";
-    require_fields(policy,
-                   {"api_version", "policy_id", "version", "mode",
-                    "sensing_mode", "default_unmatched_response", "zones"},
-                   {"description"}, path);
-    if (require_string(require_member(policy, "api_version", path),
-                       child_path(path, "api_version")) !=
-        "manyforge.contact_policy.v1") {
-      fail(path + ": unsupported contact-policy api_version");
-    }
-    if (require_string(require_member(policy, "sensing_mode", path),
-                       child_path(path, "sensing_mode")) != "geometry_only") {
-      fail(path + ": only geometry-only contact_grasp policies are accepted");
-    }
-    if (require_string(
-            require_member(policy, "default_unmatched_response", path),
-            child_path(path, "default_unmatched_response")) != "hard_stop") {
-      fail(path +
-           ": contact_grasp unmatched contact must use hard_stop in this "
-           "qualified profile");
-    }
-    const auto policy_id = parse_program_identity<core::ContactPolicyId>(
-        require_member(policy, "policy_id", path),
-        child_path(path, "policy_id"));
-    const auto policy_revision = core::ContactPolicyRevision(require_string(
-        require_member(policy, "version", path), child_path(path, "version")));
-    if (!is_sha256_digest(policy_revision.value()) ||
-        !detail::verify_content_identity(
-            policies[index],
-            detail::ContentIdentitySpec{
-                .identity_domain = "catalog-record-revision/contact_policy",
-                .api_version = "manyforge.contact_policy.v1",
-                .own_field = "version"})) {
-      fail(path + ": ContactPolicyRevision does not match the policy value");
-    }
-
-    const auto &zones = require_array(require_member(policy, "zones", path),
-                                      child_path(path, "zones"));
-    if (zones.size() != 1U) {
-      fail(path + ": contact_grasp currently requires exactly one zone");
-    }
-    const std::string zone_path = index_path(child_path(path, "zones"), 0U);
-    const auto &zone = require_object(zones.front(), zone_path);
-    if (release) {
-      require_fields(zone, {"zone_id", "body_pairs", "violation_response", "release_evidence_mode"},
-          {"notes", "enforce_max_start_penetration", "max_start_penetration_m",
-           "min_release_progress_m", "release_tolerance_m",
-           "require_strictly_decreasing_penetration", "require_separation_by_end", "allow_recontact"}, zone_path);
-    } else {
-      require_fields(zone, {"zone_id", "body_pairs", "violation_response",
-                           "max_penetration_m", "terminal_window_start_fraction"}, {"notes"}, zone_path);
-    }
-    require_program_local_identity(
-        require_string(require_member(zone, "zone_id", zone_path),
-                       child_path(zone_path, "zone_id")),
-        child_path(zone_path, "zone_id"));
-    if (require_string(require_member(zone, "violation_response", zone_path),
-                       child_path(zone_path, "violation_response")) !=
-        "hard_stop") {
-      fail(zone_path +
-           ": contact_grasp violation must use hard_stop in this qualified "
-           "profile");
-    }
-    const auto envelope = [&]() -> core::ContactZoneEnvelopeDTO {
-      if (release) return detail::parse_program_contact_envelope(zone, true, false);
-      const double max_penetration =
-          require_number(require_member(zone, "max_penetration_m", zone_path),
-                         child_path(zone_path, "max_penetration_m"));
-      const double terminal_start = require_number(
-          require_member(zone, "terminal_window_start_fraction", zone_path),
-          child_path(zone_path, "terminal_window_start_fraction"));
-      if (max_penetration <= 0.0 || terminal_start < 0.0 || terminal_start > 1.0) {
-        fail(zone_path + ": contact_grasp bounds are outside their valid range");
-      }
-      return core::ContactGraspEnvelopeDTO{max_penetration, terminal_start};
-    }();
-
-    const auto &pairs =
-        require_array(require_member(zone, "body_pairs", zone_path),
-                      child_path(zone_path, "body_pairs"));
-    if (pairs.empty() || pairs.size() > core::kMaxProgramRoleRequirements) {
-      fail(zone_path + ": contact_grasp body-pair count violates bounds");
-    }
-    std::vector<core::ProgramContactGraspBodySelectorDTO> selectors;
-    selectors.reserve(pairs.size());
-    std::optional<core::RuntimeObjectId> runtime_object_id;
-    bool bodies_from_motion_endpoint = false;
-    for (std::size_t pair_index = 0U; pair_index < pairs.size(); ++pair_index) {
-      auto parsed = parse_contact_grasp_pair(
-          pairs[pair_index],
-          index_path(child_path(zone_path, "body_pairs"), pair_index));
-      if (runtime_object_id.has_value() &&
-          *runtime_object_id != parsed.runtime_object_id) {
-        fail(zone_path +
-             ": every contact_grasp pair must bind the same runtime object");
-      }
-      runtime_object_id = parsed.runtime_object_id;
-      if (parsed.bodies_from_motion_endpoint) {
-        if (pairs.size() != 1U) {
-          fail(zone_path +
-               ": motion_endpoint cannot mix with other body selectors");
-        }
-        bodies_from_motion_endpoint = true;
-      } else {
-        selectors.push_back(std::move(*parsed.body_selector));
-      }
-    }
-    const auto selector_key = [](const auto &selector) {
-      return std::tuple(selector.body.component_id.value(),
-                        selector.body.collision_body_id.value());
-    };
-    if (!std::is_sorted(selectors.begin(), selectors.end(),
-                        [&](const auto &left, const auto &right) {
-                          return selector_key(left) < selector_key(right);
-                        }) ||
-        std::adjacent_find(selectors.begin(), selectors.end(),
-                           [&](const auto &left, const auto &right) {
-                             return selector_key(left) == selector_key(right);
-                           }) != selectors.end()) {
-      fail(zone_path +
-           ": contact_grasp body pairs must be unique and canonical-sorted");
-    }
-    if (!runtime_object_id.has_value() ||
-        !declared_scene_resource_runtime_object(root,
-                                                runtime_object_id->value())) {
-      fail(path + ": contact_grasp runtime object is not one declared "
-                  "scene_resource blackboard key");
-    }
-    result.push_back(core::ProgramContactGraspTemplateDTO{
-        policy_id, policy_revision, *runtime_object_id, std::move(selectors),
-        envelope, bodies_from_motion_endpoint});
-  }
-  if (!std::is_sorted(result.begin(), result.end(),
-                      [](const auto &left, const auto &right) {
-                        return left.contact_policy_id < right.contact_policy_id;
-                      }) ||
-      std::adjacent_find(result.begin(), result.end(),
-                         [](const auto &left, const auto &right) {
-                           return left.contact_policy_id ==
-                                  right.contact_policy_id;
-                         }) != result.end()) {
-    fail("program.contact_policies: must be unique and canonical-sorted");
-  }
-  return result;
 }
 
 struct QualifiedExecutionCatalog final {
@@ -1378,6 +1130,8 @@ void verify_blackboard_pose_keys(const CanonicalValue::Object &root,
 [[nodiscard]] bool reserved_system_namespace(std::string_view name) {
   return name == "node_outcome" || name.starts_with("node_outcome.") ||
          name == "interrupt_state" || name.starts_with("interrupt_state.") ||
+         name == "motion_group_state" ||
+         name.starts_with("motion_group_state.") ||
          name == "active_tcp" || name.starts_with("active_tcp.") ||
          name.starts_with("active_tcp/");
 }
@@ -1415,11 +1169,16 @@ with_node_outcome_declarations(const CanonicalValue::Object &root,
            " is system-owned and cannot be authored");
   }
   std::set<std::string> active_tcp_keys;
+  // OD-339: one motion group state key per group of the runtime controls:
+  // `all` and every execution group a node names.
+  std::set<std::string> motion_groups{"all"};
   // verify_tree has already bounded and validated this tree and its IDs.
   const auto visit = [&](auto &&self, const CanonicalValue &value) -> void {
     const auto &node = require_object(value, "program.tree");
     const auto &id =
         require_string(require_member(node, "node_id", "tree"), "node_id");
+    if (const auto groups = execution_groups(node, "program.tree"))
+      motion_groups.insert(groups->begin(), groups->end());
     if (id == "motion.move_to_joint_target" || id == "motion.move_to_pose" ||
         id == "motion.follow_cartesian_path" || id == "motion.move_until_signal" ||
         id == "motion.probe_search") {
@@ -1458,6 +1217,12 @@ with_node_outcome_declarations(const CanonicalValue::Object &root,
     }
   };
   visit(visit, require_member(root, "tree", "program"));
+  for (const auto &group : motion_groups)
+    keys.emplace_back(CanonicalValue::Object{
+        {"key", CanonicalValue("motion_group_state." + group)},
+        {"type", CanonicalValue("string")},
+        {"access", CanonicalValue("read")},
+        {"persistence", CanonicalValue("run")}});
   // These IDs have crossed the retained-bundle revision/codec boundary. The
   // final bound Apply check still qualifies Program-dependent keys/groups;
   // this validation view grants no source, installed key or runtime rule.
@@ -1846,6 +1611,11 @@ struct CapturedDirectReferences final {
   std::set<core::ProgramSignalReferenceDTO> signals;
   std::set<core::ProgramFrameReferenceDTO> frames;
   std::set<core::ProgramCollisionBodyReferenceDTO> bodies;
+  /// The collision bodies that node `collision_rules` select; also in `bodies`.
+  std::set<core::ProgramCollisionBodyReferenceDTO> rule_bodies;
+  /// The spring sliders that `spring_slider` rows switch on; also in
+  /// `rule_bodies`.
+  std::set<core::ProgramCollisionBodyReferenceDTO> spring_sliders;
   std::map<core::CapabilityId, CapturedInputSignalUse> input_signal_uses;
   bool default_tcp_required{};
 };
@@ -1941,11 +1711,81 @@ void capture_schema_references(const CanonicalValue &value,
   }
 }
 
+// A node's `collision_rules`: the authored shape (a pick or place sequence
+// row names its leg), every `scene_object.blackboard_key` one declared
+// scene_resource key (with `field`: a declared key), and every selected
+// collision body a collision-body requirement: a `collision_body`, the body
+// role of an `attached_object`, and the slider of a `spring_slider` row (also
+// a spring-slider requirement). Rules are resolved at admission, never here.
+void capture_collision_rule_references(const CanonicalValue &rules,
+                                       const CanonicalValue::Object &node,
+                                       const CanonicalValue::Object &root,
+                                       CapturedDirectReferences &result,
+                                       std::string_view path) {
+  const auto &node_id = require_string(require_member(node, "node_id", path), path);
+  const bool sequence = node_id == "planning.plan_pick_sequence" ||
+                        node_id == "planning.plan_place_sequence";
+  const std::string rules_path = std::string(path) + ".parameters.collision_rules";
+  DecodedCollisionRules decoded;
+  try {
+    decoded = decode_collision_rules(
+        rules, sequence ? CollisionRuleRows::kSequence : CollisionRuleRows::kMove,
+        rules_path);
+  } catch (const CollisionRuleCodecError &error) {
+    fail(error.what());
+  }
+  for (const auto &object : decoded.blackboard_scene_objects) {
+    // The key itself holds the Scene object, or one field of a declared
+    // structured key does.
+    const auto *blackboard = find_member(root, "blackboard");
+    const auto *keys = blackboard && blackboard->is_object()
+                           ? find_member(blackboard->as_object(), "keys")
+                           : nullptr;
+    const bool declared =
+        object.field.has_value()
+            ? find_declaration(keys, "key", object.blackboard_key,
+                               "program.blackboard.keys") != nullptr
+            : declared_scene_resource_key(root, object.blackboard_key);
+    if (!declared)
+      fail(rules_path + ": scene_object blackboard_key '" +
+           object.blackboard_key +
+           (object.field.has_value()
+                ? "' is not a declared key"
+                : "' is not one declared scene_resource key"));
+  }
+  const auto require_body = [&](const core::ProgramCollisionBodyReferenceDTO &body) {
+    result.bodies.insert(body);
+    result.rule_bodies.insert(body);
+  };
+  for (const auto &row : decoded.rows) {
+    if (row.spring_slider) {
+      require_body(*row.spring_slider);
+      result.spring_sliders.insert(*row.spring_slider);
+    }
+    for (const auto *side : {&row.rule.a, &row.rule.b}) {
+      for (const auto &selection : *side) {
+        if (const auto *body =
+                std::get_if<core::CollisionRuleCollisionBodySelection>(&selection)) {
+          require_body(body->body);
+        } else if (const auto *carried =
+                       std::get_if<core::CollisionRuleAttachedObjectSelection>(
+                           &selection);
+                   carried && carried->collision_body_role_id) {
+          require_body({carried->component_id,
+                        core::CollisionBodyRoleId(*carried->collision_body_role_id)});
+        }
+      }
+    }
+  }
+}
+
 [[nodiscard]] CapturedDirectReferences capture_node_references(
     const CanonicalValue::Object &node, const CanonicalValue::Object &entry,
     const CanonicalValue::Object &root, std::string_view path) {
   CapturedDirectReferences result;
   const auto &parameters = require_object(require_member(node, "parameters", path), path);
+  if (const auto *rules = find_member(parameters, "collision_rules"))
+    capture_collision_rule_references(*rules, node, root, result, path);
   for (const auto &value : require_array(require_member(entry, "parameters", path), path)) {
     const auto &definition = require_object(value, path);
     const auto &id = require_string(require_member(definition, "id", path), path);
@@ -2003,13 +1843,31 @@ void capture_node_associations(
     if (!target || !value) return;
     capture_direct_reference(*value, kind, associations[*target], path);
   };
+  // OD-372: the attach node's carrier frame and touch bodies of a component
+  // mounted on the target's robot are plain Program references, placed by
+  // that robot's kinematics (as Get frame pose's frame); only those of the
+  // target's own component are target references.
+  const bool attach =
+      require_string(require_member(node, "node_id", path), path) == "scene.attach_carried_object";
+  const auto selects = [&](const core::ProgramTargetReferenceDTO &target,
+                           const CanonicalValue &reference) {
+    const auto *component = reference.is_object()
+                                ? find_member(reference.as_object(), "component_id")
+                                : nullptr;
+    return !attach || !component || !component->is_string() ||
+           component->as_string() == target.component_id.value();
+  };
   append_one(main_target, "base_frame", "frame_reference");
-  append_one(tool_target ? tool_target : main_target, "carrier_frame_ref", "frame_reference");
+  const auto carrier_target = tool_target ? tool_target : main_target;
+  if (const auto *carrier = find_member(parameters, "carrier_frame_ref");
+      carrier && carrier_target && selects(*carrier_target, *carrier))
+    append_one(carrier_target, "carrier_frame_ref", "frame_reference");
   if (const auto *bodies = find_member(parameters, "touch_bodies")) {
     const auto target = tool_target ? tool_target : main_target;
     if (!target) fail(std::string(path) + ": touch bodies have no selected target");
     for (const auto &body : require_array(*bodies, path))
-      capture_direct_reference(body, "collision_body_reference", associations[*target], path);
+      if (selects(*target, body))
+        capture_direct_reference(body, "collision_body_reference", associations[*target], path);
   }
   for (const auto parameter : {"tcp_endpoint", "tcp"}) {
     const auto *tcp = find_member(parameters, parameter);
@@ -2084,26 +1942,6 @@ void capture_non_node_references(const CanonicalValue::Object &root,
       const auto &row = require_object(value, "program.scene[]");
       const auto &pose = require_object(require_member(row, "pose", "scene"), "scene.pose");
       capture_frame_ref(require_member(pose, "frame_ref", "scene.pose"), "scene.pose.frame_ref");
-    }
-  }
-  if (const auto *policies = find_member(root, "contact_policies")) {
-    for (const auto &value : require_array(*policies, "program.contact_policies")) {
-      const auto &policy = require_object(value, "program.contact_policies[]");
-      const auto &zones = require_array(require_member(policy, "zones", "contact policy"),
-                                        "contact policy.zones");
-      for (const auto &zone_value : zones) {
-        const auto &zone = require_object(zone_value, "contact policy zone");
-        const auto &pairs = require_array(require_member(zone, "body_pairs", "zone"), "zone.body_pairs");
-        for (const auto &pair_value : pairs) {
-          const auto &pair = require_object(pair_value, "zone.body_pairs[]");
-          for (const auto side : {"body_a", "body_b"}) {
-            const auto &selector = require_object(require_member(pair, side, "body pair"), side);
-            if (require_string(require_member(selector, "kind", side), side) == "component_model_body")
-              capture_direct_reference(require_member(selector, "body", side),
-                                       "collision_body_reference", result, side);
-          }
-        }
-      }
     }
   }
   if (const auto *parameters = find_member(root, "parameters")) {
@@ -2460,7 +2298,7 @@ void verify_node_value_sources(const CanonicalValue::Object &node,
                                std::string_view path) {
   static const std::set<std::string, std::less<>> kForbiddenParameters{
       "automatic_retries", "automatic_retry_delay_s", "preemption_priority",
-      "preempted_result",  "contact_policy_id",       "model_endpoint_alias",
+      "preempted_result",  "collision_rules",         "model_endpoint_alias",
       "mock_simulation",
       "prompt_template_id"};
   static const std::set<std::string, std::less<>> kForbiddenSemantics{
@@ -2653,6 +2491,11 @@ void verify_node_outcome_writes(const CanonicalValue::Object &node,
       fail(std::string(path) + ": system-owned node outcome keys cannot be "
                                "written by catalog bindings");
     }
+    if (key != nullptr &&
+        require_string(*key, path).starts_with("motion_group_state.")) {
+      fail(std::string(path) + ": system-owned motion group state keys cannot "
+                               "be written by catalog bindings");
+    }
   }
 }
 
@@ -2777,6 +2620,10 @@ void verify_catalog_node_semantics(
     references.signals.insert(node_references.signals.begin(), node_references.signals.end());
     references.frames.insert(node_references.frames.begin(), node_references.frames.end());
     references.bodies.insert(node_references.bodies.begin(), node_references.bodies.end());
+    references.rule_bodies.insert(node_references.rule_bodies.begin(),
+                                  node_references.rule_bodies.end());
+    references.spring_sliders.insert(node_references.spring_sliders.begin(),
+                                     node_references.spring_sliders.end());
     capture_node_associations(node, node_references, signals, references, associations, path);
     const auto &kind =
         require_string(require_member(entry, "kind", path), path);
@@ -2904,30 +2751,20 @@ extract_contract(const CanonicalValue &root_value,
   const auto &root = require_object(root_value, "program");
   require_fields(
       root,
-      {"api_version", "program_id", "program_revision", "program_profile",
-       "name", "catalog", "tree"},
-      {"description", "compatibility", "viewer", "scene", "parameters",
-       "blackboard", "contact_policies", "execution_groups"},
+      {"api_version", "program_revision", "program_profile", "catalog", "tree"},
+      {"compatibility", "viewer", "scene", "parameters", "blackboard",
+       "execution_groups"},
       "program");
   if (require_string(require_member(root, "api_version", "program"),
                      "program.api_version") != core::kProgramApiVersion) {
-    fail("program.api_version: expected manyforge.program.v3");
+    fail("program.api_version: expected manyforge.program.v4 (an older "
+         "Program is rewritten with scripts/convert_scenario_od46.py)");
   }
   if (require_string(require_member(root, "program_profile", "program"),
                      "program.program_profile") !=
       core::kComposableCellProgramProfile) {
     fail("program.program_profile: expected composable-cell-v1");
   }
-  const std::string &name =
-      require_string(require_member(root, "name", "program"), "program.name");
-  if (name.empty()) {
-    fail("program.name: expected non-empty text");
-  }
-  if (const auto *description = find_member(root, "description");
-      description != nullptr) {
-    (void)require_string(*description, "program.description");
-  }
-
   const auto &bundle = retained_bundle.value();
   const auto &catalog = require_object(
       require_member(root, "catalog", "program"), "program.catalog");
@@ -3000,11 +2837,7 @@ extract_contract(const CanonicalValue &root_value,
   if (!is_sha256_digest(revision)) {
     fail("program.program_revision: expected lowercase sha256 digest");
   }
-  auto contact_grasp_templates = parse_contact_grasp_templates(root);
   capture_non_node_references(root, references, associations);
-  for (const auto &contact : contact_grasp_templates)
-    for (const auto &selector : contact.allowed_body_selectors)
-      references.bodies.insert(selector.body);
   std::map<core::ProgramTargetReferenceDTO,
            std::map<core::CapabilityId, core::ProgramCapabilityRequirementDTO>>
       target_capabilities;
@@ -3047,16 +2880,17 @@ extract_contract(const CanonicalValue &root_value,
                        std::move(input_signal_uses), associated.default_tcp_required});
   }
   return core::ProgramBindingContractDTO{
-      parse_program_identity<core::ProgramId>(
-          require_member(root, "program_id", "program"), "program.program_id"),
       core::ProgramRevision(revision),
       bundle.catalogs.node_environment,
       std::move(targets),
       std::vector<core::ProgramFrameReferenceDTO>(references.frames.begin(), references.frames.end()),
       std::vector<core::ProgramSignalReferenceDTO>(references.signals.begin(), references.signals.end()),
       std::vector<core::ProgramCollisionBodyReferenceDTO>(references.bodies.begin(), references.bodies.end()),
-      std::move(contact_grasp_templates),
+      std::vector<core::ProgramCollisionBodyReferenceDTO>(references.rule_bodies.begin(),
+                                                          references.rule_bodies.end()),
       std::move(node_policies),
+      std::vector<core::ProgramCollisionBodyReferenceDTO>(references.spring_sliders.begin(),
+                                                          references.spring_sliders.end()),
   };
 }
 

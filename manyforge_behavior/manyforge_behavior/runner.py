@@ -26,7 +26,6 @@ class OrchestratorRunner:
         if not isinstance(applied_program_binding, Mapping):
             raise TypeError("applied_program_binding must be a Program binding")
         for field in (
-            "program_id",
             "program_revision",
             "program_binding_id",
             "graph_revision",
@@ -131,7 +130,6 @@ class OrchestratorRunner:
                 "request_key": format_request_key(request_key),
                 "source_label": "manyforge_behavior",
             },
-            "program_id": self._binding["program_id"],
             "program_revision": self._binding["program_revision"],
             "program_binding_id": self._binding["program_binding_id"],
             "program_run_id": program_run_id,
@@ -177,7 +175,7 @@ class OrchestratorRunner:
                             "joint_names": list(joint_names),
                             "positions_rad": list(positions_rad),
                         },
-                        "contact_policy_id": None,
+                        "collision_rules": [],
                         "per_joint_dynamics_limits": {},
                         "motion_interrupt_scopes": [],
                     },
@@ -274,7 +272,6 @@ class OrchestratorRunner:
                 "request_key": format_request_key(request_key),
                 "source_label": "manyforge_behavior",
             },
-            "program_id": self._binding["program_id"],
             "program_revision": self._binding["program_revision"],
             "program_binding_id": self._binding["program_binding_id"],
             "program_run_id": program_run_id,

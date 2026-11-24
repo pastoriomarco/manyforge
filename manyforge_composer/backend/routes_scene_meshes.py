@@ -11,7 +11,10 @@ it does not restore the former Composer scene owner.
 
 The service accepts a mesh URI only when that exact URI and scale are present
 either in the fresh logical-scene projection returned by Headless or in the
-explicitly identified current Program Draft. These two read scopes use
+explicitly identified current Program Draft. A third scope serves the
+meshes of a generated tool's editor preview (OD-357): its route resolves them
+from the current Deployment Draft row under the project path rule and hands
+the service only resolved paths. The first two read scopes use
 separate URLs and cache records: an owner URL is content-addressed and is
 served only while some current owner shape still references that exact
 content, while a Program Draft URL is bound to its Draft revision. The service
@@ -42,12 +45,17 @@ import struct
 import tempfile
 import threading
 import time
-from typing import Any, Final, Literal, TYPE_CHECKING
-from urllib.parse import unquote, urlencode, urlsplit
+from typing import Any, Final, Iterable, Literal, TYPE_CHECKING
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, HTTPException, Path as ApiPath, Query
 from fastapi.responses import JSONResponse, Response
 
+from manyforge_behavior.model_source_capture import (
+    SceneMeshPathError,
+    resolve_scene_mesh_path,
+)
+from manyforge_behavior.project_paths import ProjectPathRule
 from manyforge_headless_api.client import HeadlessClientError
 
 if TYPE_CHECKING:
@@ -1152,7 +1160,9 @@ class _DraftMeshBinding:
 
 @dataclass(slots=True)
 class _MeshRecord:
-    scope: Literal["owner", "draft"]
+    # "tool": a generated tool's mesh in its editor preview (OD-357), served
+    # only while the current Deployment Draft's tool parameters name it.
+    scope: Literal["owner", "draft", "tool"]
     descriptor: MeshAssetDescriptor
     # Owner-scope records carry no binding: their content-addressed URL is
     # reauthorized against the current owner projection on every read.
@@ -1172,6 +1182,13 @@ def _scene_mesh_error(
     return HTTPException(
         status_code=status_code,
         detail={"code": code, "message": message},
+    )
+
+
+def _json_error(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": {"code": code, "message": message}},
     )
 
 
@@ -1366,57 +1383,46 @@ def _draft_mesh_binding(
     )
 
 
+def _scene_mesh_project_folder(state: "ComposerState") -> str | None:
+    """The folder relative mesh URIs resolve against.
+
+    The loaded Scenario's project folder; with no Scenario loaded, the folder
+    of the Program file Composer was started with.
+    """
+
+    project = getattr(state, "scenario_project_path", None)
+    if type(project) is str and project:
+        return project
+    program_source = getattr(state, "program_source_path", None)
+    if type(program_source) is str and program_source:
+        return str(Path(program_source).parent)
+    return None
+
+
 def _resolved_mesh_source(
     state: "ComposerState",
     source_uri: str,
 ) -> tuple[Path, tuple[Path, ...]]:
+    """Resolve one mesh URI with the one scene-mesh path rule (OD-335)."""
+
     uri = _bounded_text(
         source_uri,
         label="mesh_resource_uri",
         maximum=_MAX_URI_CHARS,
     )
-    parsed = urlsplit(uri)
-    if parsed.scheme not in {"", "file"}:
-        raise SceneMeshInputError(
-            "scene mesh resources must use a relative path, absolute path, or file URI"
-        )
-    if parsed.scheme == "file" and parsed.netloc not in {"", "localhost"}:
-        raise SceneMeshInputError("scene mesh file URI must be local")
-    if parsed.query or parsed.fragment:
-        raise SceneMeshInputError("scene mesh resource URI cannot contain query or fragment")
-    raw = unquote(parsed.path) if parsed.scheme == "file" else uri
-    if "\x00" in raw or not raw:
-        raise SceneMeshInputError("mesh_resource_uri is invalid")
-
     configured = getattr(state, "allowed_fs_roots", None)
     if type(configured) is not list or not configured:
         raise SceneMeshInputError("Composer has no configured mesh resource roots")
     roots = _resolved_allowed_roots(configured)
-    path = Path(raw)
-    candidates: list[Path] = []
-    if path.is_absolute():
-        candidates.append(path)
-    else:
-        program_source = getattr(state, "program_source_path", None)
-        if type(program_source) is str and program_source:
-            candidates.append(Path(program_source).parent / path)
-        # Authored Scene resources may be workspace-relative while filesystem
-        # access is restricted to a narrower subtree such as examples/.
-        candidates.append(Path.cwd() / path)
-        candidates.extend(root / path for root in roots)
-    for candidate in candidates:
-        normalized = Path(os.path.normpath(str(candidate)))
-        if not normalized.is_absolute():
-            continue
-        try:
-            _relative_to_deepest_root(normalized, roots)
-        except SceneMeshInputError:
-            continue
-        if normalized.exists():
-            return normalized, roots
-    raise SceneMeshInputError(
-        "mesh_resource_uri does not resolve to an allowed local source"
-    )
+    try:
+        path = resolve_scene_mesh_path(
+            uri,
+            project_folder=_scene_mesh_project_folder(state),
+            paths=ProjectPathRule(roots),
+        )
+    except SceneMeshPathError as error:
+        raise SceneMeshInputError(str(error)) from error
+    return path, roots
 
 
 class SceneMeshAssetService:
@@ -1471,6 +1477,17 @@ class SceneMeshAssetService:
                 draft_revision,
             )
         path, roots = _resolved_mesh_source(state, source_uri)
+        return self._admit(scope, source_uri, path, roots, scale, binding)
+
+    def _admit(
+        self,
+        scope: Literal["owner", "draft", "tool"],
+        source_uri: str,
+        path: Path,
+        roots: list[Path] | tuple[Path, ...],
+        scale: tuple[float, float, float],
+        binding: _DraftMeshBinding | None,
+    ) -> _MeshRecord:
         mesh_input = _read_authorized_mesh_input(
             path,
             list(roots),
@@ -1592,6 +1609,79 @@ class SceneMeshAssetService:
                 draft_id=draft_id,
                 draft_revision=draft_revision,
             )
+        )
+
+    def tool_mesh_asset(
+        self,
+        path: Path,
+        allowed_roots: list[Path] | tuple[Path, ...],
+        mesh_scale: list[float] | tuple[float, ...],
+    ) -> str:
+        """Admit one generated-tool mesh, already resolved under the project
+        path rule (OD-364), and return its asset hash. Raises
+        ``SceneMeshInputError`` or ``SceneMeshBoundsError``."""
+
+        scale = _normalize_scale(mesh_scale)
+        return self._admit(
+            "tool", str(path), path, allowed_roots, scale, None,
+        ).descriptor.asset_hash
+
+    def get_tool_glb_response(
+        self,
+        asset_hash: str,
+        sources: Iterable[tuple[Path, list[float] | tuple[float, ...]]],
+        allowed_roots: list[Path] | tuple[Path, ...],
+    ) -> Response:
+        """Serve one generated-tool mesh while one of ``sources`` (path and
+        scale of each mesh the current Deployment Draft's tool parameters
+        resolve to) still is its source, with the same content."""
+
+        try:
+            identity = _validate_lower_hex(asset_hash, label="asset_hash", length=16)
+        except SceneMeshInputError as error:
+            return _json_error(404, "scene_mesh_asset_unknown", str(error))
+        with self._lock:
+            record = self._records.get(f"tool:{identity}")
+        if record is None:
+            return _json_error(404, "scene_mesh_asset_unknown", "unknown tool mesh asset")
+        descriptor = record.descriptor
+        try:
+            if not any(
+                str(path) == descriptor.resolved_realpath
+                and _normalize_scale(scale) == descriptor.mesh_scale
+                for path, scale in sources
+            ):
+                return _json_error(
+                    409, "tool_mesh_not_draft_authorized",
+                    "the Deployment Draft's tool parameters do not name this mesh",
+                )
+            mesh_input = _read_authorized_mesh_input(
+                Path(descriptor.resolved_realpath), list(allowed_roots), limits=self._limits,
+            )
+        except SceneMeshBoundsError as error:
+            return _json_error(413, "scene_mesh_bounds_exceeded", str(error))
+        except SceneMeshInputError as error:
+            return _json_error(409, "scene_mesh_input_invalid", str(error))
+        if _asset_hash(
+            mesh_input.resolved_realpath, mesh_input.content_sha256, descriptor.mesh_scale,
+        ) != identity:
+            return _json_error(
+                409, "scene_mesh_source_changed", "the mesh source content or path changed",
+            )
+        try:
+            content = self._convert(record)
+        except TimeoutError as error:
+            return _json_error(504, "scene_mesh_conversion_timeout", str(error))
+        except SceneMeshBoundsError as error:
+            return _json_error(413, "scene_mesh_bounds_exceeded", str(error))
+        except Exception as error:
+            return _json_error(
+                422, "scene_mesh_conversion_failed", _bounded_worker_message(error),
+            )
+        return Response(
+            content=content,
+            media_type="model/gltf-binary",
+            headers={"Cache-Control": "private, no-cache", "ETag": f'"{identity}"'},
         )
 
     def validate_boundary_or_409(

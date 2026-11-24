@@ -24,6 +24,7 @@
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
+#include <manyforge_persistence/sqlite_record_writer.hpp>
 #include <memory>
 #include <set>
 #include <manyforge_scene/logical_scene_owner.hpp>
@@ -204,13 +205,18 @@ MaterializeRosRuntimePackage(const std::filesystem::path &root,
     if (!authored_name.empty()) {
       // Produce a distinct authoring revision through the actual compiler;
       // keep the host graph/profile/infrastructure and zero component closure.
+      // A Deployment has no name (OD-369): the distinct value is a
+      // compatibility tag, which is metadata only.
       auto authored = derived.normalized_authored_root().as_object();
-      const auto name = std::find_if(authored.begin(), authored.end(),
-          [](const auto &field) { return field.first == "name"; });
-      if (name == authored.end()) {
-        throw std::runtime_error("ROS host-only fixture has no authored name");
-      }
-      name->second = deployment::CanonicalValue(std::string(authored_name));
+      std::erase_if(authored,
+                    [](const auto &field) { return field.first == "compatibility"; });
+      authored.emplace_back(
+          "compatibility",
+          deployment::CanonicalValue(deployment::CanonicalValue::Object{
+              {"provides", deployment::CanonicalValue(deployment::CanonicalValue::Array{})},
+              {"tags", deployment::CanonicalValue(deployment::CanonicalValue::Array{
+                           deployment::CanonicalValue(std::string(authored_name))})},
+          }));
       derived = deployment::compute_deployment_artifact_revision(
           deployment::parse_strict_json_model_yaml(deployment::canonical_json(
               deployment::CanonicalValue(std::move(authored)))), profiles);
@@ -336,11 +342,10 @@ ApplyIntent(const deployment::RetainedBundle &bundle) {
       graph.graph_revision,
       ManagerApplyPreparedActivationDTO{
           ContentDigest(std::string(kDigestOne)),
-          bundle.value().deployment_artifact_id,
           bundle.value().deployment_revision,
           ProgramBindingId(std::string(kDigestOne)),
           ContentDigest(std::string(kDigestTwo)),
-          "{\"program_id\":\"runtime-convergence.program\",\"program_revision\":\"" +
+          "{\"program_revision\":\"" +
               std::string(kDigestTwo) + "\"}",
       },
       AdmissionGeneration(7U),
@@ -1922,7 +1927,6 @@ TEST(ManagerNamedApplyCoordinator,
   stale_bundle.back() = stale_bundle.back() == '0' ? '1' : '0';
   const ManagerNamedApplyRequestDTO request{
       intent_template.request_context,
-      package.bundle->value().deployment_artifact_id,
       package.bundle->value().deployment_revision,
       RetainedBundleId(stale_bundle),
       predecessor.request.candidate_graph_revision,
@@ -1977,7 +1981,7 @@ TEST(ManagerNamedApplyCoordinator,
       [] { return 1'000U; }, [] { return ApplyId(1U); },
       [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
   const ManagerNamedApplyRequestDTO request{
-      prototype.request_context, package.bundle->value().deployment_artifact_id,
+      prototype.request_context,
       package.bundle->value().deployment_revision, package.bundle->retained_bundle_id(),
       package.bundle->value().cell_graph.graph_revision, package.bundle->retained_bundle_id(),
       prototype.prepared_activation, admission.GetAuthoringAdmission().admission_generation,
@@ -2018,7 +2022,16 @@ TEST(ManagerNamedApplyCoordinator,
     const auto prototype = ApplyIntent(*package.bundle);
     const auto predecessor = PredecessorPublication(prototype);
     const auto database = state_root.path() / "acknowledge.sqlite3";
-    SqliteManagerApplyJournal journal(database, package.bundle->value().cell_graph.cell_id);
+    // The journal answers from memory and its writer writes the file
+    // afterwards. Scenario 7 reads the file (raw SQL, restart), so the test
+    // owns the writer and drains it first; the guard drains it before Close.
+    persistence::SqliteRecordWriter writer;
+    SqliteManagerApplyJournal journal(database, package.bundle->value().cell_graph.cell_id,
+                                      &writer);
+    struct DrainBeforeClose {
+      persistence::SqliteRecordWriter &writer;
+      ~DrainBeforeClose() { writer.DrainAndStop(); }
+    } drain_before_close{writer};
     auto &reader = journal;
     ScriptedPublicationStore publication(predecessor, &reader);
     FixedActiveRuntimePlanSource plan(predecessor, BuildVerifiedRuntimeConvergencePlan(
@@ -2044,7 +2057,7 @@ TEST(ManagerNamedApplyCoordinator,
         [] { return 1'000U; }, [] { return ApplyId(1U); },
         [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
     ManagerNamedApplyRequestDTO request{
-        prototype.request_context, package.bundle->value().deployment_artifact_id,
+        prototype.request_context,
         package.bundle->value().deployment_revision, package.bundle->retained_bundle_id(),
         package.bundle->value().cell_graph.graph_revision, package.bundle->retained_bundle_id(),
         prototype.prepared_activation, admission.GetAuthoringAdmission().admission_generation,
@@ -2199,6 +2212,8 @@ TEST(ManagerNamedApplyCoordinator,
       }
       const auto receipt = fence.Release(release_request);
       journal.CompleteFailedApplyRelease(accepted.apply_id, accepted.apply_generation, receipt);
+      // A restart reads the file: every accepted record is written first.
+      writer.DrainAndStop();
       sqlite3 *raw = nullptr;
       ASSERT_EQ(sqlite3_open_v2(database.string().c_str(), &raw,
                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr), SQLITE_OK);
@@ -2526,19 +2541,19 @@ ActiveBundlePublicationReceiptDTO EstablishActualScenePredecessor(
   return receipt;
 }
 
-// Runtime-only regression fixture: establish a real durable Scene over the
+// Runtime-only regression fixture: establish a real Scene over the
 // admitted canonical-empty predecessor, then preserve it through M Apply.
 struct RuntimeConfigurationSceneFixture final {
   RuntimeConfigurationSceneFixture(const std::filesystem::path &package_root,
-      const std::filesystem::path &state_root, const RuntimePackage &package,
-      ScriptedPublicationStore &publication, IKernelCellAdmissionPort &cell_admission)
+      const RuntimePackage &package, ScriptedPublicationStore &publication,
+      IKernelCellAdmissionPort &cell_admission)
       : empty(MaterializeRosRuntimePackage(package_root, true)),
         admission(deployment::detail::publish_cell_scoped_canonical_empty_admission(
             package_root,
             deployment::cell_scoped_canonical_empty_admission_filename(
                 package.bundle->value().cell_graph.cell_id), *empty.bundle)),
-        owner(state_root / "actual-configuration-scene.sqlite3", admission,
-              publication, *package.bundle_source, resolver, cell_admission),
+        owner(admission, publication, *package.bundle_source, resolver,
+              cell_admission),
         predecessor(EstablishActualScenePredecessor(
             owner, publication, admission, *empty.bundle, {})),
         snapshot_bytes(scene::EncodeLogicalSceneSnapshot(*owner.LogicalSnapshot())) {}
@@ -2572,7 +2587,7 @@ TEST(ManagerNamedApplyCoordinator,
     ScriptedPublicationStore publication_store(initial_predecessor, &independent_reader);
     ScriptedCellAdmissionPort cell_admission;
     RuntimeConfigurationSceneFixture actual_scene(
-        package_root.path(), state_root.path(), package, publication_store, cell_admission);
+        package_root.path(), package, publication_store, cell_admission);
     const auto &predecessor = actual_scene.predecessor;
     ASSERT_NE(predecessor.request.candidate_retained_bundle_id, package.bundle->retained_bundle_id());
     ASSERT_EQ(actual_scene.empty.bundle->value().cell_graph.cell_id, package.bundle->value().cell_graph.cell_id);
@@ -2682,7 +2697,6 @@ TEST(ManagerNamedApplyCoordinator,
         });
     const ManagerNamedApplyRequestDTO request{
         intent_template.request_context,
-        package.bundle->value().deployment_artifact_id,
         package.bundle->value().deployment_revision,
         predecessor.request.candidate_retained_bundle_id,
         predecessor.request.candidate_graph_revision,
@@ -2924,7 +2938,6 @@ TEST(ManagerNamedApplyCoordinator,
     // The prepared activation's bound Program travels with the host Apply.
     EXPECT_EQ(runtime_composition.last_request->program,
               std::optional(HostApplyProgramSelection{
-                  ProgramId("runtime-convergence.program"),
                   ProgramRevision(std::string(kDigestTwo)),
                   ProgramBindingId(std::string(kDigestOne))}));
     EXPECT_EQ(runtime_composition.last_runtime_unit,
@@ -3028,7 +3041,7 @@ TEST(ManagerNamedApplyCoordinator,
         true, idle, true, 0U, 0U, true, true, 0U, 0U, 0U};
     ASSERT_TRUE(cell_admission.UpdateCellAdmissionReadiness(ready).ok());
     RuntimeConfigurationSceneFixture actual_scene(
-        package_root.path(), state_root.path(), package, publication_store, cell_admission);
+        package_root.path(), package, publication_store, cell_admission);
     const auto &predecessor = actual_scene.predecessor;
     ASSERT_NE(predecessor.request.candidate_retained_bundle_id, package.bundle->retained_bundle_id());
     ASSERT_EQ(actual_scene.empty.bundle->value().cell_graph.cell_id, package.bundle->value().cell_graph.cell_id);
@@ -3145,7 +3158,6 @@ TEST(ManagerNamedApplyCoordinator,
         });
     const ManagerNamedApplyRequestDTO request{
         intent_template.request_context,
-        package.bundle->value().deployment_artifact_id,
         package.bundle->value().deployment_revision,
         predecessor.request.candidate_retained_bundle_id,
         predecessor.request.candidate_graph_revision,
@@ -3362,8 +3374,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     const auto old_bindings = AdoptionBindings(*previous.bundle, RuntimeEpoch("predecessor-projection-epoch-1"));
     ASSERT_FALSE(old_bindings.empty());
     for (const auto &binding : old_bindings) resolver.clients.push_back(std::make_shared<AdoptionProjection>(binding));
-    const auto scene_path = state_root.path() / "actual-logical-scene.sqlite3";
-    scene::LogicalSceneOwner actual_scene(scene_path, admission, publication_store,
+    scene::LogicalSceneOwner actual_scene(admission, publication_store,
         *package.bundle_source, resolver, cell_admission);
     const auto predecessor = EstablishActualScenePredecessor(
         actual_scene, publication_store, admission, *previous.bundle, old_bindings);
@@ -3371,7 +3382,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     SceneTransactionRequestDTO add{
         {TestRequestKey("actual-add"), "Manager regression"},
         {}, current, AddObjectRequestDTO{SceneResourceId("scene-box"), BoxShapeDTO{{0.1, 0.2, 0.3}},
-                                        Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}, {}},
+                                        Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}},
         cell_admission.GetAuthoringAdmission().admission_generation};
     const auto added = actual_scene.Commit(add);
     ASSERT_TRUE(added.success) << (added.error ? added.error->message : "missing error");
@@ -3394,7 +3405,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
           {TestRequestKey("actual-add-streamed"), "Manager regression"},
           {}, actual_scene.CurrentProjectionRevision(),
           AddObjectRequestDTO{SceneResourceId("streamed-box"), BoxShapeDTO{{0.1, 0.1, 0.1}},
-                              Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}, {}},
+                              Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}},
           cell_admission.GetAuthoringAdmission().admission_generation};
       const auto streamed = actual_scene.Commit(add_streamed);
       ASSERT_TRUE(streamed.success) << (streamed.error ? streamed.error->message : "missing error");
@@ -3572,7 +3583,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
       parent = acquired.value();
     }
     const ManagerNamedApplyRequestDTO request{
-        prototype.request_context, package.bundle->value().deployment_artifact_id,
+        prototype.request_context,
         package.bundle->value().deployment_revision, predecessor.request.candidate_retained_bundle_id,
         predecessor.request.candidate_graph_revision, package.bundle->retained_bundle_id(),
         prototype.prepared_activation, parent ? std::nullopt : std::optional(cell_admission.GetAuthoringAdmission().admission_generation), parent};
@@ -3796,6 +3807,36 @@ namespace {
 
 } // namespace
 
+// A tool with several gripper targets has one local owner per target: one
+// current owner of the component, not several.
+TEST(ManagerNamedApplyCoordinator, LocalOwnersOfOneComponentCountAsOneOwner) {
+  const ControllableComponentId tool("gripper");
+  const std::optional<ContentDigest> identity{ContentDigest(std::string(kDigestOne))};
+  const auto local = [&](const std::string &target) {
+    ManagerComponentProcessOccurrenceDTO row{.controllable_component_id = tool, .launch_identity = {}};
+    row.installed_runtime_identity = identity;
+    row.process_owner_kind = ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal;
+    row.pneumatic_none_owner = ManagerPneumaticNoneProcessOwnerDTO{
+        CommandTargetId(target), ControlBindingId("gripper." + target + ".tool-gripper-command"),
+        ControlBindingRevision("revision")};
+    return row;
+  };
+  auto present = local("outer");
+  present.process_owner_kind = ManagerComponentProcessOwnerKindDTO::kControllerLaunch;
+  present.pneumatic_none_owner.reset();
+  present.process_presence = ProcessPresenceState::kPresent;
+  EXPECT_EQ(CurrentComponentProcessOwners(tool, identity, {local("outer"), local("inner")}),
+            std::optional<std::size_t>(1U));
+  EXPECT_EQ(CurrentComponentProcessOwners(tool, identity, {present}), std::optional<std::size_t>(1U));
+  EXPECT_EQ(CurrentComponentProcessOwners(tool, identity, {}), std::optional<std::size_t>(0U));
+  EXPECT_EQ(CurrentComponentProcessOwners(ControllableComponentId("other"), identity,
+                                          {local("outer")}),
+            std::optional<std::size_t>(0U));
+  EXPECT_FALSE(CurrentComponentProcessOwners(tool, identity, {local("outer"), local("outer")}));
+  EXPECT_FALSE(CurrentComponentProcessOwners(tool, identity, {present, present}));
+  EXPECT_FALSE(CurrentComponentProcessOwners(tool, identity, {present, local("inner")}));
+}
+
 TEST(ManagerNamedApplyCoordinator, NoneProcessOwnerRequiresExactImmutablePneumaticComponentClosure) {
   ScopedPackageRoot root;
   const auto none = MaterializeNoneInventoryPackage(root.path());
@@ -3965,8 +4006,7 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
         [] { return 1'000U; }, [] { return ApplyId(1U); },
         [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
     auto prototype = ApplyIntent(*candidate.bundle);
-    const ManagerNamedApplyRequestDTO request{prototype.request_context,
-        candidate.bundle->value().deployment_artifact_id, candidate.bundle->value().deployment_revision,
+    const ManagerNamedApplyRequestDTO request{prototype.request_context, candidate.bundle->value().deployment_revision,
         previous.bundle->retained_bundle_id(), previous.bundle->value().cell_graph.graph_revision,
         candidate.bundle->retained_bundle_id(), prototype.prepared_activation,
         admission.GetAuthoringAdmission().admission_generation, std::nullopt};
@@ -4039,8 +4079,7 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
         [] { return 1'000U; }, [] { return ApplyId(1U); },
         [](const auto &, const auto &) { return std::vector<AddObjectRequestDTO>{}; });
     const auto prototype = ApplyIntent(*package.bundle);
-    const ManagerNamedApplyRequestDTO request{prototype.request_context,
-        package.bundle->value().deployment_artifact_id, package.bundle->value().deployment_revision,
+    const ManagerNamedApplyRequestDTO request{prototype.request_context, package.bundle->value().deployment_revision,
         package.bundle->retained_bundle_id(), package.bundle->value().cell_graph.graph_revision,
         package.bundle->retained_bundle_id(), prototype.prepared_activation,
         admission.GetAuthoringAdmission().admission_generation, std::nullopt};
@@ -4136,7 +4175,7 @@ struct PendingAfterFenceFixture final {
     const auto prototype = ApplyIntent(*candidate.bundle);
     auto context = prototype.request_context;
     context.request_key = TestRequestKey(key);
-    return {context, candidate.bundle->value().deployment_artifact_id,
+    return {context,
         candidate.bundle->value().deployment_revision, previous.bundle->retained_bundle_id(),
         previous.bundle->value().cell_graph.graph_revision, candidate.bundle->retained_bundle_id(),
         prototype.prepared_activation, admission.GetAuthoringAdmission().admission_generation,
@@ -4645,7 +4684,7 @@ TEST(ManagerNamedApplyCoordinator, NewReleasesAFailureAfterThePublicationReceipt
   ScriptedPublicationStore publication_store(PredecessorPublication(intent_template), &independent_reader);
   ScriptedCellAdmissionPort cell_admission;
   RuntimeConfigurationSceneFixture actual_scene(
-      package_root.path(), state_root.path(), package, publication_store, cell_admission);
+      package_root.path(), package, publication_store, cell_admission);
   const auto &predecessor = actual_scene.predecessor;
   FixedActiveRuntimePlanSource active_plan_source(
       predecessor, BuildVerifiedRuntimeConvergencePlan(
@@ -4684,7 +4723,7 @@ TEST(ManagerNamedApplyCoordinator, NewReleasesAFailureAfterThePublicationReceipt
       [] { return 1'000U; }, [] { return ApplyId(1U); },
       [](const auto &, const auto &) { return std::vector<core::AddObjectRequestDTO>{}; });
   const ManagerNamedApplyRequestDTO request{
-      intent_template.request_context, package.bundle->value().deployment_artifact_id,
+      intent_template.request_context,
       package.bundle->value().deployment_revision, predecessor.request.candidate_retained_bundle_id,
       predecessor.request.candidate_graph_revision, package.bundle->retained_bundle_id(),
       intent_template.prepared_activation, cell_admission.GetAuthoringAdmission().admission_generation,
@@ -4747,7 +4786,7 @@ TEST(ManagerNamedApplyCoordinator, FailureAfterTheSceneCompletionCommitEndsItsAd
   ScriptedPublicationStore publication_store(PredecessorPublication(intent_template), &independent_reader);
   ScriptedCellAdmissionPort cell_admission;
   RuntimeConfigurationSceneFixture actual_scene(
-      package_root.path(), state_root.path(), package, publication_store, cell_admission);
+      package_root.path(), package, publication_store, cell_admission);
   const auto &predecessor = actual_scene.predecessor;
   FixedActiveRuntimePlanSource active_plan_source(
       predecessor, BuildVerifiedRuntimeConvergencePlan(
@@ -4786,7 +4825,7 @@ TEST(ManagerNamedApplyCoordinator, FailureAfterTheSceneCompletionCommitEndsItsAd
       [] { return 1'000U; }, [] { return ApplyId(1U); },
       [](const auto &, const auto &) { return std::vector<core::AddObjectRequestDTO>{}; });
   const ManagerNamedApplyRequestDTO request{
-      intent_template.request_context, package.bundle->value().deployment_artifact_id,
+      intent_template.request_context,
       package.bundle->value().deployment_revision, predecessor.request.candidate_retained_bundle_id,
       predecessor.request.candidate_graph_revision, package.bundle->retained_bundle_id(),
       intent_template.prepared_activation, cell_admission.GetAuthoringAdmission().admission_generation,

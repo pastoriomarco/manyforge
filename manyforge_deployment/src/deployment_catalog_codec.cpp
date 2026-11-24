@@ -255,9 +255,6 @@ template <typename Record>
       return parse_typed_record<
           core::CapabilityDefinitionCatalogRecordRefDTO>(
           object, descriptor, path);
-    case core::CatalogRecordKind::kContactPolicy:
-      return parse_typed_record<core::ContactPolicyCatalogRecordRefDTO>(
-          object, descriptor, path);
     case core::CatalogRecordKind::kStopEvidencePolicy:
       return parse_typed_record<
           core::StopEvidencePolicyCatalogRecordRefDTO>(

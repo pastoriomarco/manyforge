@@ -86,7 +86,9 @@ const CATEGORY_ICONS: Readonly<Record<string, CategoryIconDrawing>> = {
 // id; they take precedence over the category icon and use the same fitting
 // rule. Sequence (→) and Parallel (⇉) are the standard behavior-tree symbols;
 // a cross means failure (Fallback, Retry). Stop uses a circle; Cell Stop
-// uses an octagon because it stops the whole cell.
+// uses an octagon because it stops the whole cell; Stop motion groups puts
+// one stop square per group in a frame. Ask operator is a speech bubble with
+// a question mark.
 const NODE_ICONS: Readonly<Record<string, CategoryIconDrawing>> = {
   sequence: {
     transform: 'translate(-0.087 -0.348) scale(1.0435)',
@@ -146,6 +148,18 @@ const NODE_ICONS: Readonly<Record<string, CategoryIconDrawing>> = {
     transform: 'translate(-0.736 0.034) scale(1.0922)',
     shapes: (
       <><path d="M3.2 8a4.8 4.8 0 1 0 1.4-3.4" /><path d="M4.4 1.8v2.9h2.9" /><circle className="solid" cx="8" cy="8" r="1.3" /></>
+    ),
+  },
+  'motion.stop_groups': {
+    transform: 'translate(0.615 0.615) scale(0.9231)',
+    shapes: (
+      <><rect x="1.5" y="3.5" width="13" height="9" rx="2" /><rect className="solid" x="3.8" y="5.9" width="3.8" height="4.2" rx="0.6" /><rect className="solid" x="8.4" y="5.9" width="3.8" height="4.2" rx="0.6" /></>
+    ),
+  },
+  'operator.request_choice': {
+    transform: 'translate(-0.727 -1.000) scale(1.0909)',
+    shapes: (
+      <><path d="M2.5 3.5h11v7H7.2l-3 2.5v-2.5H2.5z" /><path d="M6.7 5.7a1.3 1.3 0 1 1 1.9 1.2c-.4.2-.6.5-.6.9v.2" /><circle className="solid" cx="8" cy="9.3" r="0.6" /></>
     ),
   },
   'recovery.apply_offered_action': {

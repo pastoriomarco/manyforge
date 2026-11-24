@@ -111,7 +111,6 @@ using ModelKey = std::tuple<ControllableComponentId, ModelInstanceId, ModelRevis
 [[nodiscard]] std::optional<ErrorDTO> validate_query_shape(
     const KinematicStatePathQueryDTO& query) {
   if (query.retained_bundle_id.empty() || query.graph_revision.empty() ||
-      query.maximum_receiver_time_skew_ns < 0 ||
       !valid_terminal_frame(query.frame_path.terminal_frame)) {
     return state_view_error("kinematic_query_identity_invalid",
                             "Kinematic state query identity is incomplete");
@@ -483,7 +482,6 @@ template <typename Segment>
                          {"terminal_frame", resolved_frame_value(query.frame_path.terminal_frame)},
                          {"segments", CanonicalValue(std::move(segments))}})},
       {"expected_active_control_configurations", CanonicalValue(std::move(configurations))},
-      {"maximum_receiver_time_skew_ns", signed_integer_string(query.maximum_receiver_time_skew_ns)},
       {"source_projections", CanonicalValue(std::move(sources))}});
 }
 
@@ -549,19 +547,11 @@ template <typename Segment>
   for (const auto& state : view.model_states) {
     models.push_back(model_state_value(state));
   }
-  const auto optional_time = [](const std::optional<std::int64_t>& value) {
-    return value.has_value() ? signed_integer_string(*value) : CanonicalValue(nullptr);
-  };
   const CanonicalValue payload(CanonicalValue::Object{
       {"query", query_value(view.query)},
       {"resource_states", CanonicalValue(std::move(resources))},
       {"model_states", CanonicalValue(std::move(models))},
-      {"evaluated_at_ns", signed_integer_string(view.evaluated_at_ns)},
-      {"earliest_received_timestamp_ns", optional_time(view.earliest_received_timestamp_ns)},
-      {"latest_received_timestamp_ns", optional_time(view.latest_received_timestamp_ns)},
-      {"actual_receiver_time_skew_ns", signed_integer_string(view.actual_receiver_time_skew_ns)},
-      {"accepted_receiver_time_skew_ns",
-       signed_integer_string(view.accepted_receiver_time_skew_ns)}});
+      {"evaluated_at_ns", signed_integer_string(view.evaluated_at_ns)}});
   return ContentDigest(content_identity::framed_sha256(
       "manyforge.kinematic_state_path_view", "manyforge.kinematic_state_path_view.v1", payload));
 }
@@ -864,30 +854,8 @@ Result<KinematicStatePathViewDTO> ImmutableKinematicStateViewProvider::current_k
     model_states.push_back(std::move(state));
   }
 
-  std::optional<std::int64_t> earliest;
-  std::optional<std::int64_t> latest;
-  for (const auto& state : resource_states) {
-    earliest = !earliest.has_value() ? state.publication_received_timestamp_ns
-                                     : std::min(*earliest, state.publication_received_timestamp_ns);
-    latest = !latest.has_value() ? state.publication_received_timestamp_ns
-                                 : std::max(*latest, state.publication_received_timestamp_ns);
-  }
-  const std::int64_t actual_skew = earliest.has_value() ? *latest - *earliest : 0;
-  if (actual_skew > query.maximum_receiver_time_skew_ns) {
-    return Result<KinematicStatePathViewDTO>::Err(
-        state_view_error("kinematic_receiver_time_skew_exceeded",
-                         "Observed-state sources exceed the retained coherence budget"));
-  }
-
-  KinematicStatePathViewDTO result{query,
-                                   std::move(resource_states),
-                                   std::move(model_states),
-                                   now_ns,
-                                   earliest,
-                                   latest,
-                                   actual_skew,
-                                   query.maximum_receiver_time_skew_ns,
-                                   ContentDigest(std::string{})};
+  KinematicStatePathViewDTO result{query, std::move(resource_states), std::move(model_states),
+                                   now_ns, ContentDigest(std::string{})};
   try {
     result.view_digest = compute_view_digest(result);
   } catch (const std::exception&) {

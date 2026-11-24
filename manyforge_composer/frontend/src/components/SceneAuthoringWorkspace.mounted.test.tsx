@@ -166,7 +166,6 @@ const currentCarriedObject: LogicalSceneObject = {
     carried_object_attachment_revision: currentAttachment.carried_object_attachment_revision,
   },
   provider_evidence: null,
-  support_contacts: [],
 };
 
 const activeProjection = {

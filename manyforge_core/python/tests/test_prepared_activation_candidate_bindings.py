@@ -64,10 +64,9 @@ def _model_free_candidate():
         },
     ]
     deployment = {
-        "api_version": "manyforge.deployment_intent.v2",
-        "deployment_artifact_id": "authored_io",
-        "name": "authored_io",
-        "compatibility": {"lane": "manyforge-only", "provides": [], "tags": []},
+        "api_version": "manyforge.deployment_intent.v3",
+        "collision_rules": [{"rule_id": "everything", "clearance_m": 0.001}],
+        "compatibility": {"provides": [], "tags": []},
         "attachments": [],
         "components": [{
             "component_id": component,
@@ -100,7 +99,7 @@ def test_real_candidate_is_immutable_and_preserves_program_format_error() -> Non
     assert raised.value.code == "program_format_unsupported"
     assert raised.value.details == {
         "actual_api_version": "manyforge.program.v2",
-        "supported_api_version": "manyforge.program.v3",
+        "supported_api_version": "manyforge.program.v4",
     }
 
 
@@ -125,9 +124,9 @@ def test_real_candidate_reports_node_parameter_for_unavailable_target_capability
     root = Path(__file__).resolve().parents[3]
     catalog = NodeCatalog(root / "manyforge_behavior/resources/node_catalog.yaml")
     program = {
-        "api_version": "manyforge.program.v3", "program_id": "io_capability_test",
+        "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "a" * 64,
-        "program_profile": "composable-cell-v1", "name": "I/O capability test",
+        "program_profile": "composable-cell-v1",
         "catalog": {"api_version": catalog.api_version, "content_version": catalog.content_version},
         "tree": {"node_id": "motion.set_tcp", "instance_id": "set_tcp", "children": [],
                  "parameters": {"target": {"component_id": "station", "command_target_id": "io"},
@@ -135,7 +134,7 @@ def test_real_candidate_reports_node_parameter_for_unavailable_target_capability
     }
     program["program_revision"] = compute_content_identity(
         program, own_field="program_revision", identity_domain="program-revision",
-        api_version="manyforge.program.v3")
+        api_version="manyforge.program.v4")
     refusal = json.loads(_model_free_candidate().validate_program_references(json.dumps(program), False))
     rows = [row for row in refusal["diagnostics"]
             if row["location"]["node_instance_id"] == "set_tcp"

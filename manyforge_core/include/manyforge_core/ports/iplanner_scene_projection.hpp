@@ -6,10 +6,19 @@
 #include <manyforge_core/types/scene_transaction.hpp>
 #include <manyforge_core/types/scene_frame_resolution.hpp>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
 namespace manyforge::core {
+
+/// One Scene commit preflight answer (OD-376): the projection's health and,
+/// when a transaction was given and the projection is healthy at its
+/// predecessor, the effective collision policy of its candidate.
+struct SceneCommitPreflightDTO final {
+  ProjectionHealthDTO health;
+  std::optional<Result<CollisionPolicySnapshot>> effective_policy;
+};
 
 /// Focused native participant in the logical-scene commit protocol.
 ///
@@ -128,6 +137,29 @@ public:
     return Result<CollisionPolicySnapshot>::Err(ErrorDTO{
         "invalid_request", "native collision-policy projection is unavailable",
         {{"reason", "collision_policy_resolver_not_installed"}}});
+  }
+
+  /// The Scene commit preflight in one call (OD-376): the health for
+  /// `selected_revision` and, given the owner's transaction and the candidate
+  /// it validated, that candidate's effective collision policy when the
+  /// projection is healthy at the transaction's predecessor. A process proxy
+  /// sends the transaction only: the projection applies its delta to its own
+  /// predecessor and trusts the owner's validation and digest. A typed
+  /// refusal of the call itself (e.g. `native_projection_rpc_bound_exceeded`
+  /// when the transaction exceeds the transport bound) is the error.
+  [[nodiscard]] virtual Result<SceneCommitPreflightDTO> CommitPreflight(
+      const ProjectionRevisionDTO &selected_revision,
+      const SceneTransactionDTO *transaction,
+      const LogicalSceneSnapshotDTO *candidate) const {
+    SceneCommitPreflightDTO result{ProjectionHealthForRevision(selected_revision),
+                                   std::nullopt};
+    if (transaction != nullptr && candidate != nullptr &&
+        result.health.healthy_for_target(
+            transaction->prior_projection_revision)) {
+      result.effective_policy = ProjectEffectiveCollisionPolicy(
+          *candidate, candidate->revision.revision_id);
+    }
+    return Result<SceneCommitPreflightDTO>::Ok(std::move(result));
   }
 };
 

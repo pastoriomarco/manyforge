@@ -18,7 +18,7 @@ constexpr char kSceneId[] =
 constexpr char kOtherSceneId[] =
     "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 constexpr char kCanonicalEmptySceneDigest[] =
-    "sha256:8f39833b5d7eb081ce9c0026868a9f8f381eb3c0a3c30f69353f2de0c865abe3";
+    "sha256:5f895143fe92b8b0b1a857fe27a8c59f96c9ae0d46c305546dc58d237d206eeb";
 constexpr char kNonemptySceneDigest[] =
     "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 
@@ -127,6 +127,19 @@ TEST(LogicalSceneSnapshot, CanonicalEmptyRequiresExactCountersAndPolicy) {
   EXPECT_FALSE(snapshot.canonical_empty_for(Identity()));
 }
 
+TEST(LogicalSceneSnapshot, RetainedPolicyCarriesNoCollisionRules) {
+  auto snapshot = CanonicalEmptySnapshot();
+  ASSERT_TRUE(snapshot.locally_valid());
+  snapshot.configured_collision_policy.contact_rules = {
+      CollisionPairContactRule{
+          {"scene/object-a/shape/0", "scene/support/shape/0"},
+          "lift-a",
+          CollisionReleaseRule{}},
+  };
+  EXPECT_FALSE(snapshot.locally_valid());
+  EXPECT_FALSE(snapshot.canonical_empty_for(Identity()));
+}
+
 TEST(LogicalSceneSnapshot, RevisionRejectsNoncanonicalDigestSpellings) {
   auto revision = Identity().revision;
   EXPECT_TRUE(revision.valid());
@@ -176,47 +189,6 @@ TEST(LogicalSceneSnapshot, CellFixedRowsMustUseSnapshotCellAndCanonicalOrder) {
   EXPECT_FALSE(snapshot.locally_valid());
 }
 
-TEST(LogicalSceneSnapshot,
-     SupportDeclarationsRequireCanonicalResolvableUniqueRelationships) {
-  auto snapshot = CanonicalEmptySnapshot(
-      Identity("cell-alpha", kSceneId, kNonemptySceneDigest));
-  snapshot.objects = {
-      SceneObjectSnapshotDTO{
-          SceneResourceId("object-a"),
-          {Box()},
-          CellFixedSceneObjectPlacementDTO{CellId("cell-alpha"), Pose3DTO{}},
-          std::nullopt,
-          {SupportContactDTO{.support_object_id = "support-a"}},
-      },
-      SceneObjectSnapshotDTO{
-          SceneResourceId("support-a"),
-          {Box()},
-          CellFixedSceneObjectPlacementDTO{CellId("cell-alpha"), Pose3DTO{}},
-          std::nullopt,
-          {},
-      },
-  };
-  EXPECT_TRUE(snapshot.locally_valid());
-
-  auto missing = snapshot;
-  missing.objects[0].support_contacts[0].support_object_id = "support-missing";
-  EXPECT_FALSE(missing.locally_valid());
-
-  auto self = snapshot;
-  self.objects[0].support_contacts[0].support_object_id = "object-a";
-  EXPECT_FALSE(self.locally_valid());
-
-  auto reciprocal = snapshot;
-  reciprocal.objects[1].support_contacts = {
-      SupportContactDTO{.support_object_id = "object-a"}};
-  EXPECT_FALSE(reciprocal.locally_valid());
-
-  auto noncanonical_binary = snapshot;
-  noncanonical_binary.objects[0].support_contacts[0].release_evidence_mode =
-      ContactReleaseEvidenceMode::kBinaryContact;
-  EXPECT_FALSE(noncanonical_binary.locally_valid());
-}
-
 TEST(LogicalSceneSnapshot, CarriedObjectAndAttachmentAreOneToOne) {
   auto snapshot = CanonicalEmptySnapshot(
       Identity("cell-alpha", kSceneId, kNonemptySceneDigest));
@@ -255,6 +227,12 @@ TEST(LogicalSceneSnapshot, CarriedObjectAndAttachmentAreOneToOne) {
            CollisionBodyRoleId("finger-right")},
       },
   };
+  EXPECT_TRUE(snapshot.locally_valid());
+  // OD-372: the carrier frame may belong to a component mounted on the
+  // holder's robot; the scene owner checked the mount.
+  std::get<ComponentSceneFrameRefDTO>(
+      snapshot.carried_object_attachments[0].carrier_frame_ref)
+      .controllable_component_id = ControllableComponentId("tool-a");
   EXPECT_TRUE(snapshot.locally_valid());
 
   snapshot.carried_object_attachments[0].scene_resource_id =

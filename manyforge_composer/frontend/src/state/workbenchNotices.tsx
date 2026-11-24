@@ -54,6 +54,9 @@ export interface WorkbenchNotice {
   title: string;
   message: string;
   details?: string;
+  /** Lines shown in full under the notification row while the notice exists,
+   * never collapsed (OD-354: the Program's active waits, one per line). */
+  pinnedLines?: readonly string[];
   actions?: NoticeAction[];
   busy?: boolean;
   /**
@@ -272,13 +275,18 @@ export function activeViewerIncidentKinds(
   return kinds;
 }
 
-function noticeSignature(notices: readonly WorkbenchNotice[]): string {
+/** Everything a notice shows except its action callbacks: a change republishes it. */
+export function noticeSignature(notices: readonly WorkbenchNotice[]): string {
   return JSON.stringify(notices.map((notice) => [
     notice.id,
     notice.severity,
     notice.domain,
     notice.title,
     notice.message,
+    notice.details ?? null,
+    notice.pinnedLines ?? null,
+    notice.alarmDefinitionIds ?? null,
+    notice.alarmSubjects ?? null,
     notice.busy === true,
     notice.expectedDuringTransition === true,
     notice.incidentKind ?? null,

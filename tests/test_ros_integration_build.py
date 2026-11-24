@@ -53,7 +53,7 @@ def build_fixture(tmp_path: Path) -> dict[str, str]:
         "  if name not in selected and 'all' not in selected: continue\n"
         "  p=Path(args[1])/name; p.touch(); p.chmod(0o755)\n"
         "elif tool=='colcon':\n"
-        " p=Path(args[args.index('--install-base')+1]); p.mkdir(parents=True,exist_ok=True); (p/'setup.bash').touch()\n",
+        " p=Path(args[args.index('--install-base')+1]); p.mkdir(parents=True,exist_ok=True); (p/'setup.bash').touch(); (p/'local_setup.bash').touch()\n",
         encoding="utf-8",
     )
     stub.chmod(0o755)

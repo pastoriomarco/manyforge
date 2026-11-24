@@ -2,6 +2,7 @@
 #include "execution_host_posix.hpp"
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_core/tcp_selector_codec.hpp>
+#include <manyforge_core/collision_rule_codec.hpp>
 #include <algorithm>
 #include <cmath>
 #include <charconv>
@@ -244,8 +245,34 @@ DecodeMotionSpec(const CanonicalValue &value) {
         NumberArray(value, "positions_rad", core::kMaxOperationParticipants)};
   }
   if (kind == "pose_goal") {
-    RequireExactObjectSize(value, 2U, "pose goal");
-    return core::PoseGoalDTO{DecodePose(Member(value, "goal"))};
+    if (value.find_object_member("motion_type") == nullptr) {
+      RequireExactObjectSize(value, 2U, "pose goal");
+      return core::PoseGoalDTO{DecodePose(Member(value, "goal"))};
+    }
+    // A linear pose goal (OD-341): `motion_type: linear` and the line's
+    // settings; `speed_mode` is the one optional field (absent: the
+    // Deployment's `cartesian_timing`).
+    Require(Text(value, "motion_type") == "linear",
+            "pose goal motion type is unsupported");
+    const auto *speed_mode = value.find_object_member("speed_mode");
+    RequireExactObjectSize(value, speed_mode == nullptr ? 8U : 9U,
+                           "linear pose goal");
+    core::LinearPoseMotionDTO linear;
+    linear.max_translation_step_m = Number(value, "max_translation_step_m");
+    linear.max_rotation_step_rad = Number(value, "max_rotation_step_rad");
+    if (speed_mode != nullptr) {
+      linear.speed_mode =
+          core::parse_cartesian_speed_mode(Text(value, "speed_mode"));
+      Require(linear.speed_mode.has_value(),
+              "Cartesian speed mode is unsupported");
+    }
+    linear.max_angular_speed_rad_s = Number(value, "max_angular_speed_rad_s");
+    linear.max_linear_acceleration_mps2 =
+        Number(value, "max_linear_acceleration_mps2");
+    linear.max_angular_acceleration_rad_s2 =
+        Number(value, "max_angular_acceleration_rad_s2");
+    return core::PoseGoalDTO{DecodePose(Member(value, "goal")),
+                             std::move(linear)};
   }
   if (kind == "cartesian_path") {
     const auto *speed_mode = value.find_object_member("speed_mode");
@@ -419,9 +446,6 @@ DecodeMotionPayload(const CanonicalValue &value) {
   const bool has_goal_frame_member =
       value.is_object() &&
       value.find_object_member("goal_frame_reference") != nullptr;
-  // Optional nullable member; absent or null means the Deployment clearance.
-  const bool has_clearance_member =
-      value.is_object() && value.find_object_member("clearance_m") != nullptr;
   // Optional nullable member; absent or null means the Deployment planner.
   const bool has_planner_member =
       value.is_object() && value.find_object_member("planner") != nullptr;
@@ -429,7 +453,6 @@ DecodeMotionPayload(const CanonicalValue &value) {
               value.as_object().size() ==
                   15U + (has_runtime_object_bindings ? 1U : 0U) +
                       (has_goal_frame_member ? 1U : 0U) +
-                      (has_clearance_member ? 1U : 0U) +
                       (has_planner_member ? 1U : 0U),
           "motion payload has an unknown or missing field");
   Require(Text(value, "kind") == "motion",
@@ -504,10 +527,25 @@ DecodeMotionPayload(const CanonicalValue &value) {
             "relative spatial motion requires target_reference");
   }
 
-  std::optional<core::ContactPolicyId> contact_policy;
-  if (const auto contact_name = OptionalText(value, "contact_policy_id");
-      contact_name.has_value()) {
-    contact_policy = core::ContactPolicyId(*contact_name);
+  // The node's rows: `rule_id`, `a` and `b` together or neither, one value.
+  auto decoded_rules =
+      core::DecodeCollisionRules(Member(value, "collision_rules"));
+  Require(decoded_rules.ok(),
+          decoded_rules.ok() ? std::string()
+                             : "motion collision rules are invalid: " +
+                                   decoded_rules.error().details.at("reason"));
+  auto collision_rules = std::move(decoded_rules.value());
+  // Model groups are selections of the Deployment's rules only.
+  for (const auto &rule : collision_rules) {
+    for (const auto *side : {&rule.a, &rule.b}) {
+      Require(std::none_of(side->begin(), side->end(),
+                           [](const core::CollisionRuleSelectionDTO &selection) {
+                             return std::holds_alternative<
+                                 core::CollisionRuleModelGroupSelection>(selection);
+                           }),
+              "motion collision rules are invalid: a move rule cannot select "
+              "a model group");
+    }
   }
   std::vector<core::RuntimeObjectReferenceBindingDTO> runtime_objects;
   if (has_runtime_object_bindings) {
@@ -525,9 +563,11 @@ DecodeMotionPayload(const CanonicalValue &value) {
     }
   }
 
-  if (joint_goal && !contact_policy.has_value()) {
+  // Runtime-object bindings serve target references only; a joint goal has
+  // none.
+  if (joint_goal) {
     Require(runtime_objects.empty(),
-            "joint motion runtime-object bindings require an explicit contact policy");
+            "joint motion cannot carry runtime-object bindings");
   }
 
   const auto &dynamics = Member(value, "per_joint_dynamics_limits");
@@ -565,12 +605,11 @@ DecodeMotionPayload(const CanonicalValue &value) {
       std::move(target_reference),
       std::move(offset_reference),
       std::move(decoded_motion),
-      std::move(contact_policy),
       std::move(limits),
       {},
       std::move(runtime_objects),
       std::move(goal_frame_reference),
-      has_clearance_member ? OptionalNumber(value, "clearance_m") : std::nullopt};
+      std::move(collision_rules)};
 }
 
 [[nodiscard]] core::CoordinatePositionDTO
@@ -685,7 +724,7 @@ DecodeProgramExecutionScope(const CanonicalValue &value,
 DecodeOperation(const CanonicalValue &value,
                 const core::RequestAttributionDTO &attribution) {
   const auto *manual_context = value.find_object_member("manual_handover");
-  RequireExactObjectSize(value, manual_context == nullptr ? 10U : 11U,
+  RequireExactObjectSize(value, manual_context == nullptr ? 9U : 10U,
                          "operation intent");
   std::optional<core::ManualProgramHandoverContextDTO> manual_handover;
   if (manual_context != nullptr &&
@@ -741,7 +780,6 @@ DecodeOperation(const CanonicalValue &value,
   }
   core::OperationIntentDTO result{
       DecodeRequestContext(request),
-      core::ProgramId(Text(value, "program_id")),
       core::ProgramRevision(Text(value, "program_revision")),
       core::ProgramBindingId(Text(value, "program_binding_id")),
       OptionalRun(value),
@@ -820,13 +858,21 @@ DecodePickSynthesis(const CanonicalValue &value) {
 [[nodiscard]] core::PickSequencePlanningIntentDTO
 DecodePickPlanningIntent(const CanonicalValue &value,
                          const core::RequestAttributionDTO &attribution) {
-  RequireExactObjectSize(value, 9U, "pick planning intent");
+  // Present only when the synthesis offset names the selected object by its
+  // runtime-object key; absent leaves the id empty.
+  const bool has_runtime_object =
+      value.is_object() &&
+      value.find_object_member("selected_runtime_object_id") != nullptr;
+  RequireExactObjectSize(value, has_runtime_object ? 9U : 8U,
+                         "pick planning intent");
   const auto &carrier = Member(value, "carrier_frame");
   RequireExactObjectSize(carrier, 2U, "pick carrier frame");
   return core::PickSequencePlanningIntentDTO{
       Text(value, "sequence_id"),
       core::SceneResourceId(Text(value, "selected_object_id")),
-      core::RuntimeObjectId(Text(value, "selected_runtime_object_id")),
+      core::RuntimeObjectId(has_runtime_object
+                                ? Text(value, "selected_runtime_object_id")
+                                : std::string{}),
       {core::ControllableComponentId(Text(carrier, "component_id")),
        core::FrameRoleId(Text(carrier, "frame_id"))},
       DecodePickSynthesis(Member(value, "synthesis")),
@@ -1546,7 +1592,19 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     const bool node_release = request.find_object_member("node_instance_id") != nullptr;
     Require(!node_release || release,
             "exact node selection is exclusive to individual hold release");
-    RequireExactObjectSize(request, node_release ? 5U : 4U, "Program selection request");
+    // OD-342: a Program node's own Stop names the node (stopped_by:
+    // program); only the Program owner sends it, and only for a Stop.
+    const bool program_stop =
+        request.find_object_member("stopped_by_node_instance_id") != nullptr;
+    Require(!program_stop || (!start && !release),
+            "a Program node attribution names only a Stop");
+    Require(!program_stop ||
+                (attribution.transport == core::RequestTransportDTO::kInternal &&
+                 attribution.assurance == core::RequestAssuranceDTO::kUnverified &&
+                 !attribution.principal_id.has_value()),
+            "a Program node Stop requires internal owner attribution");
+    RequireExactObjectSize(request, (node_release || program_stop) ? 5U : 4U,
+                           "Program selection request");
     Require(Text(request, "schema_version") ==
                 "manyforge.program_execution_selection.v3",
             "Program selection request schema is unsupported");
@@ -1564,6 +1622,9 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
       decoded.program_selection->node_instance_id =
           core::ProgramNodeInstanceId(Text(request, "node_instance_id"));
     }
+    if (program_stop)
+      decoded.program_selection->stopped_by_node_instance_id =
+          core::ProgramNodeInstanceId(Text(request, "stopped_by_node_instance_id"));
     if (start || release)
       decoded.expected_hold_revision =
           Counter(root, "expected_hold_revision", 0U);
@@ -1609,7 +1670,7 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
   if (command == "register_program_run_capture") {
     RequireExactObjectSize(root, 3U, "Program capture registration command");
     const auto &capture = Member(root, "capture");
-    RequireExactObjectSize(capture, 8U, "Program capture registration");
+    RequireExactObjectSize(capture, 7U, "Program capture registration");
     Require(Text(capture, "schema_version") ==
                 "manyforge.program_run_execution_capture.v2",
             "Program capture registration schema is unsupported");
@@ -1618,7 +1679,6 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
         core::CellAdmissionClaimGeneration(
             Counter(capture, "claim_generation", 1U)),
         core::ProgramRunNumber(Counter(capture, "program_run_id", 1U)),
-        core::ProgramId(Text(capture, "program_id")),
         core::ProgramRevision(Text(capture, "program_revision")),
         core::ProgramBindingId(Text(capture, "program_binding_id")),
         core::RetainedBundleId(Text(capture, "retained_bundle_id")),

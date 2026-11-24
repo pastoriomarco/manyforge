@@ -3,6 +3,8 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
+#include <manyforge_core/cell_model_state.hpp>
 #include <manyforge_core/collision/collision_validation_coordinator.hpp>
 #include <manyforge_core/collision/i_collision_diagnostic_comparator.hpp>
 #include <manyforge_core/collision/i_collision_query_engine.hpp>
@@ -37,10 +39,26 @@ struct RuntimeCollisionStateProjection {
   std::vector<std::string> query_joint_names;
   std::vector<double> template_positions_rad;
   std::vector<std::size_t> source_to_query_indices;
+  /// The other components of the cell whose observed positions are read at
+  /// every check into the query coordinates they publish. Query coordinates
+  /// that neither the source nor one of these writes keep the template value.
+  std::vector<BoundCellModelStateSource> live_sources;
 };
 
+/// `cell_sources`: the cell's observed-state sources, bound here to the query
+/// coordinates the source trajectory does not move. Null or empty: none.
 Result<RuntimeCollisionStateProjection> build_runtime_collision_state_projection(
-    const TrajectoryDTO& source_trajectory, const TrajectoryDTO& collision_trajectory);
+    const TrajectoryDTO& source_trajectory, const TrajectoryDTO& collision_trajectory,
+    const CellModelStateSources* cell_sources = nullptr);
+
+/// True when a moving replacement may keep the running execution's collision
+/// checks: the same source and query coordinates, and the same template value
+/// for every query coordinate that stays at its template. A coordinate the
+/// source moves, or one `live` reads from another component at every check,
+/// is not compared.
+[[nodiscard]] bool runtime_collision_projection_continues(
+    const RuntimeCollisionStateProjection& live,
+    const RuntimeCollisionStateProjection& replacement) noexcept;
 
 struct RuntimeCollisionStopCoverageSummary {
   static constexpr std::size_t kUnavailableReasonCount = 8;
@@ -143,12 +161,18 @@ RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
     std::optional<ProjectionRevisionDTO> projection_revision = std::nullopt);
 bool runtime_collision_lookup_order_is_valid(const CollisionWorldSnapshot& world) noexcept;
 
-void append_collision_failure_diagnostics(std::map<std::string, std::string>& details,
-                                          const CollisionValidationDecisionBundle& bundle);
-/// Build the native contact-policy violation payload for the selected failing
-/// support-contact record. Returns nullopt for ordinary collisions and for
-/// contact-grasp failures, which retain their existing event taxonomy.
-std::optional<std::map<std::string, std::string>> contact_policy_violation_details(
+/// `clearance_margins`: the move's clearance margins. With them a clearance
+/// refusal names the rule that holds the pair (`collision_rule_id`, `clearance_m`).
+void append_collision_failure_diagnostics(
+    std::map<std::string, std::string>& details,
+    const CollisionValidationDecisionBundle& bundle,
+    const CollisionClearanceMargins* clearance_margins = nullptr);
+/// Build the contact-violation payload for the selected failing record when
+/// its failure is one of a pair under a contact or release rule: reason
+/// (`contact_rule_violation`), `collision_rule_id`, `policy_mode` (`contact` or
+/// `release`), the pair and the measured values. Returns nullopt for ordinary
+/// collisions.
+std::optional<std::map<std::string, std::string>> contact_rule_violation_details(
     const CollisionValidationDecisionBundle& bundle, const CollisionPolicySnapshot& policy,
     std::string_view response,
     std::optional<std::size_t> initial_contact_pair_count = std::nullopt);
@@ -165,5 +189,22 @@ bool collision_world_revision_is_set(const CollisionWorldRevision& revision);
 bool engines_require_single_context_exclusivity(
     const std::vector<std::shared_ptr<ICollisionQueryEngine>>& engines);
 bool runtime_monitor_may_hold_collision_engine(ExecutionState state);
+
+/// True when a contact rule of the policy declares a spring
+/// (`max_compression_step_m`, OD-356).
+[[nodiscard]] bool collision_policy_has_spring_rule(const CollisionPolicySnapshot& policy) noexcept;
+
+/// Validation samples for a move with a spring rule (OD-356): every segment
+/// of `trajectory` is split into the same number of linear sub-steps, the
+/// fewest that keep the tool's travel between two samples at most
+/// `max_travel_m`, so each original waypoint keeps its fraction of the move.
+/// `tcp_position` gives the tool position of a joint state. Fails with
+/// `validation_collision` (`spring_sample_densification_failed` when a tool
+/// position is unavailable, `spring_sample_budget_exceeded` above
+/// `max_samples`).
+Result<TrajectoryDTO> densify_for_spring_contact(
+    const TrajectoryDTO& trajectory,
+    const std::function<Result<Vector3DTO>(const RobotStateDTO&)>& tcp_position,
+    double max_travel_m, std::size_t max_samples);
 
 }  // namespace manyforge::core

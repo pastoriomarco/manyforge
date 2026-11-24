@@ -21,5 +21,4 @@ qualification
 **/*.egg-info
 **/.pytest_cache
 docs
-agent-skills
 exts

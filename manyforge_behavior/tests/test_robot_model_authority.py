@@ -45,7 +45,7 @@ def test_lite6_canonical_mimic_and_gripper_metadata():
             "lite_gripper": RobotModelGripperConfig(
                 group_id="lite_gripper",
                 joint_name="right_finger_joint",
-                touch_links=(
+                grip_body_links=(
                     "lite_gripper_left_finger",
                     "lite_gripper_right_finger",
                 ),
@@ -236,7 +236,7 @@ def test_lite6_asset_descriptor_and_instance_view_preserve_mimic_gripper_maps():
             "lite_gripper": RobotModelGripperConfig(
                 group_id="lite_gripper",
                 joint_name="right_finger_joint",
-                touch_links=(
+                grip_body_links=(
                     "lite_gripper_left_finger",
                     "lite_gripper_right_finger",
                 ),
@@ -288,7 +288,7 @@ def test_lite6_asset_descriptor_and_instance_view_preserve_mimic_gripper_maps():
     assert gripper.generated_group_id == "L_lite_gripper"
     assert gripper.generated_command_joint == "L_right_finger_joint"
     assert gripper.generated_derived_joints == ("L_left_finger_joint",)
-    assert gripper.generated_touch_links == (
+    assert gripper.generated_grip_body_links == (
         "L_lite_gripper_left_finger",
         "L_lite_gripper_right_finger",
     )

@@ -1,4 +1,6 @@
-from manyforge_behavior.program_diagnostics import diagnostic_values
+import pytest
+
+from manyforge_behavior.program_diagnostics import bounded_entry, diagnostic_values
 
 
 def test_small_values_are_copied_and_large_values_are_explicitly_omitted():
@@ -73,3 +75,14 @@ def test_near_limit_capture_validity_survives_canonical_key_ordering():
     canonical = json.loads(canonical_json_bytes(capture["values"]))
     assert list(canonical) != list(values)
     assert diagnostic_values(canonical.items(), total_count=len(canonical)) == capture
+
+
+def test_one_entry_is_copied_with_its_size_or_refused_whole():
+    value = {"pose": [1, 2, 3]}
+    projected, size = bounded_entry("k", value)
+    value["pose"][0] = 9
+    assert projected == {"k": {"pose": [1, 2, 3]}}
+    assert size == len(b'{"k":{"pose":[1,2,3]}}')
+    for refused in ("x" * 2049, [1] * 600, object()):
+        with pytest.raises((ValueError, TypeError)):
+            bounded_entry("k", refused)

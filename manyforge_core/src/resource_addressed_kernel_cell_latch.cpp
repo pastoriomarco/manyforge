@@ -16,14 +16,25 @@ namespace manyforge::core {
 // counts as `activity: unknown` with reason `stop_unconfirmed` until a state
 // of it arriving after the failure reports idle; the existing latch then
 // holds by itself (R1) and clears by itself (R2). No new latch exists.
+//
+// OD-379: a component that enters `fault` while an operation executes also
+// stops every robot in motion, in the same locked step that arms the latch:
+// one Kernel-internal `component_fault` Stop of the whole cell, each robot
+// with its fault Stop profile (as the runtime monitor's containment). A
+// component stop (e-stop) or `offline` only latches, and a simulation that
+// is not playing is neither (`simulation_not_playing` is no fault).
 
 void ResourceAddressedExecutionKernel::observe_component_states(
     std::vector<ComponentState> states) {
   std::vector<std::shared_ptr<IIoSignalService>> resumed;
+  // Obtained before the Kernel lock (it may allocate on this thread's first
+  // Stop); completed after the unlock.
+  StopHandoff& handoff = thread_stop_handoff();
   {
     std::lock_guard state_lock(state_mutex_);
     const bool was_latched = cell_latched_locked();
-    observe_component_states_locked(std::move(states));
+    if (const auto fault = observe_component_states_locked(std::move(states)))
+      request_component_fault_stop_locked(*fault, handoff);
     // Interrupt evaluation resumes when the latch ends. A rule whose
     // condition became true meanwhile trips now (the level, not a lost edge),
     // without waiting for its next sample.
@@ -33,12 +44,16 @@ void ResourceAddressedExecutionKernel::observe_component_states(
         resumed.push_back(global_io_rule_service_);
     }
   }
+  complete_stop_handoff(handoff);
   for (const auto& service : resumed) (void)notify_io_rule_evidence_processing(service);
 }
 
-void ResourceAddressedExecutionKernel::observe_component_states_locked(
+std::optional<ErrorDTO> ResourceAddressedExecutionKernel::observe_component_states_locked(
     std::vector<ComponentState> states) {
   bool arm = false;
+  // OD-379: the components that entered `fault` in this update while an
+  // operation executes (once per fault episode of each component).
+  std::vector<const ComponentState*> entered_fault;
   if (execution_in_progress_locked()) {
     for (const auto& state : states) {
       if (component_healthy(state) || latch_exempt(state, states)) continue;
@@ -46,6 +61,32 @@ void ResourceAddressedExecutionKernel::observe_component_states_locked(
           std::find_if(component_states_.begin(), component_states_.end(),
                        [&](const auto& row) { return row.component_id == state.component_id; });
       if (previous == component_states_.end() || component_healthy(*previous)) arm = true;
+      if (state.lifecycle == ComponentLifecycle::kFault &&
+          (previous == component_states_.end() ||
+           previous->lifecycle != ComponentLifecycle::kFault))
+        entered_fault.push_back(&state);
+    }
+  }
+  std::optional<ErrorDTO> fault_stop;
+  // Only while an operation executes: a run between nodes has nothing to
+  // stop (the latch refuses its next node).
+  if (!entered_fault.empty() &&
+      std::any_of(active_operations_.begin(), active_operations_.end(),
+                  [](const auto& row) { return !terminal(row.second->state.state); })) {
+    // The typed cause each stopped participant keeps (built before the
+    // states move below).
+    const auto& first = *entered_fault.front();
+    std::string components;
+    for (const auto* state : entered_fault)
+      components += (components.empty() ? "" : ", ") + state->component_id;
+    fault_stop = ErrorDTO{std::string(error_codes::kComponentFault),
+                          "Component " + components +
+                              " entered a fault; motion stopped with its fault Stop profile",
+                          {{"reason", std::string(error_codes::kComponentFault)},
+                           {"component_id", first.component_id}}};
+    if (first.fault) {
+      fault_stop->details.emplace("fault_code", std::string(to_string(first.fault->code)));
+      fault_stop->details.emplace("fault_message", first.fault->message);
     }
   }
   // A component that becomes `prepared` starts its outputs'
@@ -86,6 +127,34 @@ void ResourceAddressedExecutionKernel::observe_component_states_locked(
     }
   }
   refresh_cell_latch_locked(arm);
+  return fault_stop;
+}
+
+void ResourceAddressedExecutionKernel::request_component_fault_stop_locked(
+    const ErrorDTO& cause, StopHandoff& handoff) {
+  // One Stop of the whole cell through the one Stop core: every executing
+  // robot's participant starts its fault Stop profile; one already stopping
+  // is covered, not restarted (its Stop keeps its own cause). Never refused.
+  StopRequest request;
+  request.request_key = mint_kernel_request_key();
+  request.kind = StopKind::kComponentFault;
+  request.selector = StopSelectorKind::kCell;
+  request.source_label = "kernel.component_fault";
+  request.reason = error_codes::kComponentFault;
+  request.attribution_rank = StopAttribution{StopAttributionClass::kOperator, 0, 0U};
+  request.mode = StopMode::kFault;
+  const auto record = request_stop_locked(request, handoff);
+  const StopEventId event_id = stop_events_.records[record].event_id;
+  // The participants this event started keep the typed cause, as the
+  // runtime monitor's (their Stop lanes run only after the unlock).
+  for (auto& [id, operation] : active_operations_) {
+    static_cast<void>(id);
+    for (auto& participant : operation->participants) {
+      if (participant.stop.started_by != event_id) continue;
+      participant.runtime_collision_error = cause;
+      participant.last_subordinate_error = cause;
+    }
+  }
 }
 
 void ResourceAddressedExecutionKernel::set_stop_listener(IStopListener* listener) noexcept {

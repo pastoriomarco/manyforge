@@ -94,7 +94,7 @@ class DisabledCollisionPair:
 class RobotModelGripperConfig:
     group_id: str
     joint_name: str
-    touch_links: tuple[str, ...] = ()
+    grip_body_links: tuple[str, ...] = ()
     mount_frame: str = ""
     attach_frame: str = ""
     tcp_frame: str = ""
@@ -107,7 +107,7 @@ class RobotModelGripperProfile:
     group_id: str
     command_joint: str
     derived_joints: tuple[str, ...]
-    touch_links: tuple[str, ...]
+    grip_body_links: tuple[str, ...]
     mount_frame: str = ""
     attach_frame: str = ""
     tcp_frame: str = ""
@@ -193,8 +193,8 @@ class GeneratedGripperProfile:
     generated_command_joint: str
     source_derived_joints: tuple[str, ...]
     generated_derived_joints: tuple[str, ...]
-    source_touch_links: tuple[str, ...]
-    generated_touch_links: tuple[str, ...]
+    source_grip_body_links: tuple[str, ...]
+    generated_grip_body_links: tuple[str, ...]
     source_mount_frame: str = ""
     generated_mount_frame: str = ""
     source_attach_frame: str = ""
@@ -705,11 +705,11 @@ def _coerce_gripper_config(raw: Any) -> RobotModelGripperConfig:
     if isinstance(raw, Mapping):
         group_id = str(raw.get("group_id", "") or "").strip()
         joint_name = str(raw.get("joint_name", "") or "").strip()
-        touch_links = tuple(str(link) for link in raw.get("touch_links", ()) or ())
+        grip_body_links = tuple(str(link) for link in raw.get("grip_body_links", ()) or ())
         return RobotModelGripperConfig(
             group_id=group_id,
             joint_name=joint_name,
-            touch_links=touch_links,
+            grip_body_links=grip_body_links,
             mount_frame=str(raw.get("mount_frame", "") or ""),
             attach_frame=str(raw.get("attach_frame", "") or ""),
             tcp_frame=str(raw.get("tcp_frame", "") or ""),
@@ -719,11 +719,11 @@ def _coerce_gripper_config(raw: Any) -> RobotModelGripperConfig:
         )
     group_id = str(getattr(raw, "group_id", "") or "").strip()
     joint_name = str(getattr(raw, "joint_name", "") or "").strip()
-    touch_links = tuple(str(link) for link in getattr(raw, "touch_links", ()) or ())
+    grip_body_links = tuple(str(link) for link in getattr(raw, "grip_body_links", ()) or ())
     return RobotModelGripperConfig(
         group_id=group_id,
         joint_name=joint_name,
-        touch_links=touch_links,
+        grip_body_links=grip_body_links,
         mount_frame=str(getattr(raw, "mount_frame", "") or ""),
         attach_frame=str(getattr(raw, "attach_frame", "") or ""),
         tcp_frame=str(getattr(raw, "tcp_frame", "") or ""),
@@ -760,11 +760,11 @@ def _build_gripper_profiles(
                 "gripper "
                 f"{gripper_id} command joint {config.joint_name} is not commandable"
             )
-        for touch_link in config.touch_links:
-            if touch_link not in link_set:
+        for grip_body_link in config.grip_body_links:
+            if grip_body_link not in link_set:
                 raise RobotModelAuthorityError(
-                    f"gripper {gripper_id} references unknown touch link "
-                    f"{touch_link}"
+                    f"gripper {gripper_id} references unknown grip body link "
+                    f"{grip_body_link}"
                 )
         for label, frame in (
             ("mount_frame", config.mount_frame),
@@ -798,7 +798,7 @@ def _build_gripper_profiles(
             group_id=config.group_id,
             command_joint=config.joint_name,
             derived_joints=derived,
-            touch_links=config.touch_links,
+            grip_body_links=config.grip_body_links,
             mount_frame=config.mount_frame,
             attach_frame=config.attach_frame,
             tcp_frame=config.tcp_frame,
@@ -1115,9 +1115,9 @@ def robot_model_instance_view(
             generated_derived_joints=tuple(
                 joint_map.generated(joint) for joint in profile.derived_joints
             ),
-            source_touch_links=profile.touch_links,
-            generated_touch_links=tuple(
-                link_map.generated(link) for link in profile.touch_links
+            source_grip_body_links=profile.grip_body_links,
+            generated_grip_body_links=tuple(
+                link_map.generated(link) for link in profile.grip_body_links
             ),
             source_mount_frame=profile.mount_frame,
             generated_mount_frame=_map_optional_frame(frame_map, profile.mount_frame),

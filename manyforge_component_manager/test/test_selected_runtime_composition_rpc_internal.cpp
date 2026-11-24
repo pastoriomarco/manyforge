@@ -52,8 +52,7 @@ InstalledInventoryRequest() {
           {ControllableComponentId("arm.1")},
           {ControllableComponentId("camera.1")},
           {ControlDomainId("camera.domain")},
-          HostApplyProgramSelection{ProgramId("program.1"),
-                                    ProgramRevision(std::string(kDigestTwo)),
+          HostApplyProgramSelection{ProgramRevision(std::string(kDigestTwo)),
                                     ProgramBindingId(std::string(kDigestThree))}};
 }
 
@@ -113,11 +112,10 @@ TEST(SelectedRuntimeCompositionRpcInternal, HostApplyRequestCarriesItsBoundProgr
   truncated_program.resize(truncated_program.size() - 1U);
   EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequestVariant(truncated_program),
                std::invalid_argument);
-  for (auto field : {0, 1, 2}) {
+  for (auto field : {0, 1}) {
     auto empty = bound;
-    if (field == 0) empty.program->program_id = ProgramId("");
-    if (field == 1) empty.program->program_revision = ProgramRevision("");
-    if (field == 2) empty.program->program_binding_id = ProgramBindingId("");
+    if (field == 0) empty.program->program_revision = ProgramRevision("");
+    if (field == 1) empty.program->program_binding_id = ProgramBindingId("");
     EXPECT_FALSE(empty.valid());
     EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcRequest(empty),
                  std::invalid_argument);

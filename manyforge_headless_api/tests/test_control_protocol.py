@@ -54,18 +54,43 @@ def test_freshness_is_stateless_signed_and_expires_at_exact_backend_boundary() -
         secret=b"x" * 32,
     )
     context = _envelope(authority).freshness
+    issued_at = clock.now_ns
 
-    clock.advance(CONTROL_FRESHNESS_VALID_FOR_NS)
     deadline = authority.validate(
         context,
         current_control_revision=4,
+        received_at_ns=issued_at + CONTROL_FRESHNESS_VALID_FOR_NS,
     )
     assert deadline == 1_000_000_000 + CONTROL_FRESHNESS_VALID_FOR_NS
-    clock.advance(1)
     with pytest.raises(ControlProtocolError) as expired:
         authority.validate(
             context,
-                current_control_revision=4,
+            current_control_revision=4,
+            received_at_ns=issued_at + CONTROL_FRESHNESS_VALID_FOR_NS + 1,
+        )
+    assert expired.value.code == "control_freshness_expired"
+
+
+def test_freshness_age_is_measured_at_receipt_not_at_validation() -> None:
+    """OD-240: a slow backend never expires a command it received in time."""
+
+    clock = ManualClock()
+    authority = ControlFreshnessAuthority(
+        clock_ns=clock,
+        secret=b"x" * 32,
+    )
+    context = _envelope(authority).freshness
+    received_in_time = clock.now_ns + CONTROL_FRESHNESS_VALID_FOR_NS - 1
+    received_late = clock.now_ns + CONTROL_FRESHNESS_VALID_FOR_NS + 1
+    # The backend validates long after both receipts.
+    clock.advance(10 * CONTROL_FRESHNESS_VALID_FOR_NS)
+
+    authority.validate(
+        context, current_control_revision=4, received_at_ns=received_in_time
+    )
+    with pytest.raises(ControlProtocolError) as expired:
+        authority.validate(
+            context, current_control_revision=4, received_at_ns=received_late
         )
     assert expired.value.code == "control_freshness_expired"
 
@@ -99,7 +124,9 @@ def test_freshness_rejects_tamper_and_revision() -> None:
     )
     context = _envelope(authority).freshness
     with pytest.raises(ControlProtocolError) as rejected:
-        authority.validate(context, current_control_revision=5)
+        authority.validate(
+            context, current_control_revision=5, received_at_ns=clock.now_ns
+        )
     assert rejected.value.code == "control_projection_stale"
 
     # A middle character carries six signature bits (the last one carries
@@ -116,7 +143,8 @@ def test_freshness_rejects_tamper_and_revision() -> None:
     with pytest.raises(ControlProtocolError) as invalid:
         authority.validate(
             tampered,
-                current_control_revision=4,
+            current_control_revision=4,
+            received_at_ns=clock.now_ns,
         )
     assert invalid.value.code == "control_freshness_invalid"
 
@@ -133,6 +161,7 @@ def test_virtual_time_beyond_thirty_years_creates_no_retained_history() -> None:
     authority.validate(
         context,
         current_control_revision=1,
+        received_at_ns=clock.now_ns,
     )
     assert not hasattr(authority, "_contexts")
     assert not hasattr(authority, "_issued_at_by_sequence")

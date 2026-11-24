@@ -52,7 +52,6 @@ namespace {
   return {OperationNumber(1001U),
           OperationRevision(3U),
           OperationParticipantId{OperationNumber(901U), 1U},
-          ProgramId("program.main"),
           ProgramRevision(Digest('1')),
           ProgramBindingId(Digest('2')),
           ProgramRunNumber(124U),
@@ -657,9 +656,9 @@ TEST(PreparedParticipantStopPlanCodec, FreezesProfileMappingAndDeploymentDefault
             std::string::npos);
   EXPECT_NE(encoded.value().find("\"parameter_source\":\"deployment_default\""), std::string::npos);
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:a999a677643b80b287e06d12c90820fb6551921d8aa284881aecd27e567cffd9");
+            "sha256:85b3ab489794084a448c1684119afb74842cdefbd1891b26e1181079e29d2c42");
   EXPECT_EQ(plan.participant_stop_invocation_plan_digest.value(),
-            "sha256:d6fcb1544356246d68cd7cf400cbf0699c55e81c28e95bf24aaa6e748c967706");
+            "sha256:ef06ff40a33855f11bc5fbe1b20d200f5685a2e3f121edc68f5afd8c50d4f988");
 }
 
 TEST(PreparedParticipantStopPlanCodec, AcceptsFastFaultProfileAndPreservesClosedPlan) {

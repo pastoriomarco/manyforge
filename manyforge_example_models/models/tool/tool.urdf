@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ManyForge generated tool family (OD-357): a neutral placeholder, the model
+  of new_tool.tool.yaml. A component of this family always has its own
+  parameters; Load generates its model from them.
+-->
+<robot name="tool">
+  <link name="tool_mount"/>
+  <joint name="tool_body_fix" type="fixed">
+    <parent link="tool_mount"/>
+    <child link="tool_body"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  <link name="tool_body">
+    <visual>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.025" length="0.1"/></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.025" length="0.1"/></geometry>
+    </collision>
+  </link>
+  <joint name="tool_tcp_fix" type="fixed">
+    <parent link="tool_body"/>
+    <child link="tool_tcp"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+  </joint>
+  <link name="tool_tcp"/>
+</robot>

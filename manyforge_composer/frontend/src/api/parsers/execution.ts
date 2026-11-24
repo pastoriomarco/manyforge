@@ -58,7 +58,7 @@ const STOP_KINDS: ReadonlySet<string> = new Set([
   'groups', 'stop_all', 'halt', 'operation', 'cell_stop', 'rule_fail_node', 'rule_hold',
   'interrupt_rule', 'runner_loss', 'program_end', 'internal_fault', 'takeover',
   'partial_dispatch', 'runtime_collision', 'hold_timeout', 'operation_reset',
-  'prepared_dispatch_invalid', 'planned_stop', 'stop_failed_halt',
+  'prepared_dispatch_invalid', 'planned_stop', 'stop_failed_halt', 'component_fault',
 ]);
 /** A completed Stop event's results (`pending` only while it runs). */
 const COMPLETED_STOP_RESULTS: ReadonlySet<string> = new Set([
@@ -488,12 +488,12 @@ function manualControlGripperDescriptorAt(
     'command_duration_s', 'command_kind', 'command_target_id',
     'target', 'completion_policy', 'contracts',
     'control_interface_contract_id', 'controllable_component_id',
-    'coordinate_kind', 'description', 'grasp_confirmation_policy',
+    'coordinate_kind', 'description', 'grasp_confirmation_policy', 'grip_body_links',
     'max_position', 'mimic_followers', 'min_position', 'mount_frame',
     'named_presets', 'open_state_ref', 'output_mode', 'schema_version',
     'source_coordinate_name', 'source_group_name', 'source_kind',
     'state_authority_class', 'state_authority_id',
-    'tcp_frame', 'touch_links', 'transport_kind', 'unit',
+    'tcp_frame', 'transport_kind', 'unit',
   ], ['grasp_confirmation', 'pneumatic_outputs'], path);
   const target = directTargetAt(record.target, `${path}.target`);
   if (target.componentId !== record.controllable_component_id || target.targetId !== record.command_target_id)
@@ -577,7 +577,8 @@ function manualControlGripperDescriptorAt(
     if (result.trim() === '') return fail(`${path}.${field}[${index}]`, 'a non-empty source name');
     return result;
   });
-  const touchLinks = strings(record.touch_links, 'touch_links');
+  // Links of the component type's grip body; not part of the authored configuration.
+  const gripBodyLinks = strings(record.grip_body_links, 'grip_body_links');
   const auxiliaryFrames = strings(record.auxiliary_frames, 'auxiliary_frames');
   const contracts = manualControlContractsAt(record.contracts, `${path}.contracts`);
   const commandKind = stringAt(record.command_kind, `${path}.command_kind`);
@@ -634,7 +635,6 @@ function manualControlGripperDescriptorAt(
   // A retained SRDF group and its presets can exist without authored tool
   // configuration. Once configured, the complete configuration needs both.
   const configured = authoredValues.some((item) => item !== null)
-    || touchLinks.length > 0
     || auxiliaryFrames.length > 0;
   if (
     (configured && (
@@ -645,11 +645,10 @@ function manualControlGripperDescriptorAt(
       || commandDurationS < 0
       || (actuationKind !== 'pneumatic' && commandDurationS === 0)
       || commandDurationS > 60
-      || touchLinks.length === 0
       || !namedPresets.some((preset) => preset.name === openStateRef)
       || !namedPresets.some((preset) => preset.name === closedStateRef)
     ))
-    || new Set(touchLinks).size !== touchLinks.length
+    || new Set(gripBodyLinks).size !== gripBodyLinks.length
     || new Set(auxiliaryFrames).size !== auxiliaryFrames.length
     || (stateAuthorityId === null) !== (stateAuthorityClass === null)
     || controlInterfaceContractId !== (contracts.controlPath?.controlInterfaceContractId ?? null)
@@ -714,7 +713,7 @@ function manualControlGripperDescriptorAt(
     closedStateRef,
     commandDurationS,
     ...(pneumaticOutputs === undefined ? {} : { pneumaticOutputs }),
-    touchLinks,
+    gripBodyLinks,
     mountFrame,
     attachFrame,
     tcpFrame,
@@ -962,7 +961,7 @@ export function parseExecutionControlStatus(
         const command = objectAt(target.command, `${targetPath}.command`);
         const manual = objectAt(command.manual_control, `${targetPath}.command.manual_control`);
         exactKeysAt(manual, [
-          'program_binding_id', 'program_id', 'program_revision',
+          'program_binding_id', 'program_revision',
         ], `${targetPath}.command.manual_control`);
         const commandFields = { ...command };
         delete commandFields.manual_control;
@@ -1205,7 +1204,6 @@ function directControlMotionAt(value: unknown, applicationStartId: string): {
     'operation_capability_id',
     'planning_capability_ids',
     'program_binding_id',
-    'program_id',
     'program_revision',
     'target',
     'target_descriptor',
@@ -1410,10 +1408,6 @@ function directControlMotionAt(value: unknown, applicationStartId: string): {
       ),
       planningCapabilityIds,
       frameRoleIds,
-      programId: stringAt(
-        direct.program_id,
-        'executionStatus.status.direct_control.program_id',
-      ),
       programRevision: stringAt(
         direct.program_revision,
         'executionStatus.status.direct_control.program_revision',
@@ -1451,7 +1445,6 @@ function directControlGripperAt(value: unknown): {
     'observed_state',
     'operation_capability_id',
     'program_binding_id',
-    'program_id',
     'program_revision',
     'resource',
     'target',
@@ -1631,10 +1624,6 @@ function directControlGripperAt(value: unknown): {
       operationCapabilityId: stringAt(
         directGripper.operation_capability_id,
         'executionStatus.status.direct_control_gripper.operation_capability_id',
-      ),
-      programId: stringAt(
-        directGripper.program_id,
-        'executionStatus.status.direct_control_gripper.program_id',
       ),
       programRevision: stringAt(
         directGripper.program_revision,
@@ -2046,7 +2035,7 @@ export function parseProgramNodeCorrectionPreview(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'schema_version', 'request_key', 'application_start_id', 'display',
-    'program_run_id', 'program_id',
+    'program_run_id',
     'program_revision', 'program_binding_id', 'node_instance_id',
     'node_attempt_id', 'run_revision',
     'retained_bundle_id', 'graph_revision', 'node_id', 'proposed_paths',
@@ -2067,7 +2056,6 @@ export function parseProgramNodeCorrectionPreview(
     !sameClientRequestKey(stringAt(record.request_key, `${path}.request_key`), request.request_key)
     || record.application_start_id !== request.application_start_id
     || record.program_run_id !== request.program_run_id
-    || record.program_id !== request.program_id
     || record.program_revision !== request.program_revision
     || record.program_binding_id !== request.program_binding_id
     || record.node_instance_id !== request.node_instance_id
@@ -2107,7 +2095,6 @@ export function parseProgramNodeCorrectionPreview(
       if (
         receipt.programRunId !== request.program_run_id
         || receipt.programBindingId !== request.program_binding_id
-        || receipt.programId !== request.program_id
         || receipt.programRevision !== request.program_revision
         || receipt.retainedBundleId !== record.retained_bundle_id
         || receipt.graphRevision !== record.graph_revision
@@ -2137,7 +2124,6 @@ export function parseProgramNodeCorrectionPreview(
     requestKey: request.request_key,
     applicationStartId: request.application_start_id,
     programRunId: request.program_run_id,
-    programId: request.program_id,
     programRevision: request.program_revision,
     programBindingId: request.program_binding_id,
     nodeInstanceId: request.node_instance_id,
@@ -2307,7 +2293,6 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
     'graph_revision',
     'intent_digest',
     'program_binding_id',
-    'program_id',
     'program_revision',
     'program_run_id',
     'receipt_digest',
@@ -2407,10 +2392,6 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
       'motionPreview.preview_receipt.intent_digest',
     ),
     requestKey: stringAt(receipt.request_key, 'motionPreview.preview_receipt.request_key'),
-    programId: stringAt(
-      receipt.program_id,
-      'motionPreview.preview_receipt.program_id',
-    ),
     programRevision: stringAt(
       receipt.program_revision,
       'motionPreview.preview_receipt.program_revision',
@@ -2495,7 +2476,6 @@ export function parseCapabilityCommandPreviewResponse(
     'max_position',
     'min_position',
     'program_binding_id',
-    'program_id',
     'program_revision',
     'program_run_id',
     'receipt_digest',
@@ -2587,10 +2567,6 @@ export function parseCapabilityCommandPreviewResponse(
     requestKey: stringAt(
       receipt.request_key,
       'capabilityCommandPreview.preview_receipt.request_key',
-    ),
-    programId: stringAt(
-      receipt.program_id,
-      'capabilityCommandPreview.preview_receipt.program_id',
     ),
     programRevision: stringAt(
       receipt.program_revision,

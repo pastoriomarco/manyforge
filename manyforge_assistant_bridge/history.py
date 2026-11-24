@@ -111,7 +111,6 @@ class SessionHistory:
 _EDITED_ID_FIELDS = frozenset({
     "instance_id", "new_instance_id", "scene_resource_id", "scene_resource_ids",
     "parameter_id", "parameter_ids", "key", "keys", "namespace_id", "namespace_ids",
-    "policy_id", "contact_policy_ids",
 })
 # Node parameter values and bindings are not names of edited Draft items.
 _NOT_EDITED_IDS = frozenset({"value_sources"})

@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.component_type.v1
-schema_revision: sha256:d971a7022a7977625256649896f8253020686a7b543c30d557162ebee8f69dde
+schema_revision: sha256:4c1a934edc63d9da5eac2d1aef76d86142fcb797950a12306009e028d551c3fa
 schema_purpose: artifact_document
 root_definition_id: component_type
 definitions:
@@ -354,6 +354,16 @@ definitions:
             constraints:
               - kind: string_format
                 value: portable_id
+        - field_id: grip_body_role_id
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: string_format
+                value: portable_id
   - definition_id: command_target_model_group_role
     value_schema:
       kind: object
@@ -579,6 +589,79 @@ definitions:
             constraints:
               - kind: string_format
                 value: portable_id
+        - field_id: optional
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []
+        - field_id: spring_slider
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: local_ref
+            definition_id: command_target_collision_body_spring_slider
+  - definition_id: command_target_collision_body_spring_slider
+    value_schema:
+      kind: object
+      fields:
+        - field_id: axis
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 3
+            max_items: 3
+            collection:
+              kind: ordered
+            item_schema:
+              kind: scalar
+              scalar_type: number
+              constraints: []
+        - field_id: stroke_m
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+        - field_id: trip_depth_m
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+        - field_id: release_depth_m
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
+        - field_id: max_compression_step_m
+          presence: required
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: number
+            constraints:
+              - kind: exclusive_minimum
+                value: 0
   - definition_id: command_target_capability
     value_schema:
       kind: object

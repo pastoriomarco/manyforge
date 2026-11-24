@@ -20,8 +20,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def _context(catalog):
     return {
-        "api_version": "manyforge.program.v3", "program_id": "skill_host",
-        "program_profile": "composable-cell-v1", "name": "Skill host",
+        "api_version": "manyforge.program.v4",
+        "program_profile": "composable-cell-v1",
         "catalog": {"api_version": catalog.api_version, "content_version": catalog.content_version},
     }
 
@@ -189,10 +189,8 @@ def test_repeated_structured_argument_is_bounded_before_output_allocation(catalo
 def test_first_subtree_needs_declarations_not_a_dummy_program(catalog, artifact):
     skills = SkillCatalog([artifact], catalog=catalog)
     context = {
-        "api_version": "manyforge.program.v3",
-        "program_id": "new_program",
+        "api_version": "manyforge.program.v4",
         "program_profile": "composable-cell-v1",
-        "name": "New Program",
         "catalog": {
             "api_version": catalog.api_version,
             "content_version": catalog.content_version,

@@ -1,18 +1,15 @@
 {
-  "api_version": "manyforge.program.v3",
+  "api_version": "manyforge.program.v4",
   "blackboard": {
     "keys": [],
     "namespaces": []
   },
   "catalog": {
     "api_version": "manyforge.node_catalog.v3",
-    "content_version": "3.0.0"
+    "content_version": "4.0.0"
   },
   "compatibility": {
     "assistant": "forbidden",
-    "lanes": [
-      "manyforge-only"
-    ],
     "requires": [
       "lite_gripper"
     ],
@@ -21,7 +18,6 @@
       "pick-and-place"
     ]
   },
-  "description": "Lite6 pneumatic pick and place with a valve-only gripper and no grasp sensor. Close completes after the configured dwell; there is no workpiece-loss rule.",
   "forest": [
     {
       "children": [
@@ -606,7 +602,6 @@
       "parameters": {}
     }
   ],
-  "name": "lite6_pneumatic_real_no_sensor",
   "parameters": [
     {
       "constraints": {
@@ -657,7 +652,6 @@
     }
   ],
   "positions": {},
-  "program_id": "lite6_pneumatic_real_no_sensor",
   "program_profile": "composable-cell-v1",
   "scene": [
     {

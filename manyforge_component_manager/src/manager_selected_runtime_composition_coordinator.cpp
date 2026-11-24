@@ -59,9 +59,8 @@ HostApplyResult ManagerSelectedRuntimeCompositionCoordinator::ApplyOnHost(
               "host Apply prepared activation lacks its bound Program");
       return value->as_string();
     };
-    program = HostApplyProgramSelection{core::ProgramId(text("program_id")),
-                                        core::ProgramRevision(text("program_revision")),
-                                        *binding};
+    program = HostApplyProgramSelection{
+        core::ProgramRevision(text("program_revision")), *binding};
   }
   const auto request = MakeHostApplyRequest(
       {apply_id, apply_generation}, predecessor, candidate,

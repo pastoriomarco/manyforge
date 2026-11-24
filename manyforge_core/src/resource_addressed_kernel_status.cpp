@@ -782,8 +782,18 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
                     [](const auto& row) { return row.stop.phase == StopPhase::kFailed; }))
       assessment.recovery_class = RecoveryClass::kUnknownFault;
     if (std::any_of(operation->participants.begin(), operation->participants.end(),
-                    [](const auto& row) { return row.runtime_collision_error.has_value(); }))
+                    [](const auto& row) { return row.runtime_collision_error.has_value(); })) {
       assessment.recovery_class = RecoveryClass::kRuntimeCollision;
+      // OD-373 (A): only a collision Stop contained cleanly (the move ended
+      // Stopped) is replanned from its stopped state; one that left the move
+      // intervention-required needs Reset, like any intervention-required
+      // participant.
+      if (operation->state.state == OperationStateKind::kInterventionRequired &&
+          std::erase(assessment.allowed_actions, RecoveryAction::kReplanFromStoppedState) > 0U) {
+        assessment.retry_admissible = false;
+        assessment.status = RecoveryAssessmentStatus::kResetRequired;
+      }
+    }
     const auto& retained = operation->recovery_assessment_inputs;
     bool semantic_change =
         !operation->published_recovery_assessment || retained.size() != assessments.size();

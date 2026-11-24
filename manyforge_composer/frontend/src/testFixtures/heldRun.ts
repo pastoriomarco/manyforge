@@ -11,11 +11,9 @@ const digest = (fill: string) => `sha256:${fill.repeat(64)}`;
 
 export function heldProgram(): ProgramDocument {
   return {
-    api_version: 'manyforge.program.v3',
-    program_id: 'pick',
+    api_version: 'manyforge.program.v4',
     program_revision: digest('a'),
     program_profile: 'composable-cell-v1',
-    name: 'Pick',
     catalog: { api_version: 'manyforge.node_catalog.v3', content_version: 'fixture' },
     parameters: [{
       parameter_id: 'approach_height', type: 'float64', default: 0.1,
@@ -106,7 +104,6 @@ export function heldRun(): ProgramRunStatus {
     state: 'intervention_required',
     capture: {
       programRunId: 1,
-      programId: 'pick',
       programRevision: digest('a'),
       programBindingId: digest('c'),
     },

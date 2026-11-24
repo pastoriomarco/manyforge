@@ -29,7 +29,6 @@ inline constexpr std::string_view kExecutionHostProducer = "execution_host";
 /// The Program an Apply's prepared activation binds: the host loads these
 /// sealed products for the candidate and keeps the facts with its installed Apply.
 struct HostApplyProgramSelection final {
-  manyforge::core::ProgramId program_id;
   manyforge::core::ProgramRevision program_revision;
   manyforge::core::ProgramBindingId program_binding_id;
 
@@ -164,6 +163,36 @@ inline constexpr std::size_t kMaximumComponentProcessInventoryEntries = 4096U;
   }
   return any;
 }
+/// A component's current process owners with the wanted runtime identity:
+/// one present launch process, or its local owners, one per gripper target
+/// (a tool with several gripper targets has several, counted as one owner).
+/// Nullopt when the inventory names more than one owner (two processes, a
+/// process and local owners, or one target twice).
+[[nodiscard]] inline std::optional<std::size_t> CurrentComponentProcessOwners(
+    const manyforge::core::ControllableComponentId &component,
+    const std::optional<manyforge::core::ContentDigest> &wanted,
+    const std::vector<ManagerComponentProcessOccurrenceDTO> &occurrences) {
+  std::size_t launches = 0U;
+  std::vector<std::string> local_targets;
+  for (const auto &row : occurrences) {
+    if (row.controllable_component_id != component || row.installed_runtime_identity != wanted)
+      continue;
+    if (row.process_owner_kind == ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) {
+      const auto target = row.pneumatic_none_owner.has_value()
+                              ? row.pneumatic_none_owner->command_target_id.value()
+                              : std::string();
+      for (const auto &seen : local_targets)
+        if (seen == target) return std::nullopt;
+      local_targets.push_back(target);
+    } else if (row.process_presence == ProcessPresenceState::kPresent) {
+      ++launches;
+    }
+  }
+  const std::size_t owners = launches + (local_targets.empty() ? 0U : 1U);
+  if (owners > 1U) return std::nullopt;
+  return owners;
+}
+
 /// Current installed lifecycle facts, bound to the inventory's exact predecessor.
 /// These are observation only, never permission to deactivate or replace.
 struct ManagerComponentLifecycleObservationDTO final {

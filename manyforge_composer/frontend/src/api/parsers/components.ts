@@ -14,6 +14,10 @@ import {
   type ActionError,
   type ActionPhase,
   type ActionResult,
+  type ApplyCollisionRuleChange,
+  type ApplyCollisionRuleMember,
+  type ApplyCollisionRuleState,
+  type ApplyMeshDepthReport,
   type ApplyPreview,
   type ApplyResult,
   type CellLatch,
@@ -322,10 +326,6 @@ export function parseProgramRunEnd(value: unknown, path = 'run_end'): ProgramRun
   return { end_reason: oneOf(RUN_END_REASONS, record.end_reason, `${path}.end_reason`), details: parsed };
 }
 
-function nullableString(value: unknown, path: string): string | null {
-  return value === null ? null : stringAt(value, path);
-}
-
 export function parseApplyPreview(value: unknown, path = 'apply_preview'): ApplyPreview {
   const record = objectAt(value, path);
   const program = objectAt(record.program, `${path}.program`);
@@ -345,7 +345,6 @@ export function parseApplyPreview(value: unknown, path = 'apply_preview'): Apply
     scope: objectAt(record.scope, `${path}.scope`),
     program: {
       executable: booleanAt(program.executable, `${path}.program.executable`),
-      program_id: nullableString(program.program_id, `${path}.program.program_id`),
       unresolved_references: arrayAt(program.unresolved_references, `${path}.program.unresolved_references`)
         .map((item, index) => {
           const at = `${path}.program.unresolved_references[${index}]`;
@@ -372,7 +371,75 @@ export function parseApplyPreview(value: unknown, path = 'apply_preview'): Apply
       record.attachment_changed_components, `${path}.attachment_changed_components`,
     ),
     detached_components: stringArrayAt(record.detached_components, `${path}.detached_components`),
+    collision_rules: arrayAt(record.collision_rules, `${path}.collision_rules`)
+      .map((item, index) => parseCollisionRuleChange(item, `${path}.collision_rules[${index}]`)),
+    mesh_depth_reports: arrayAt(record.mesh_depth_reports, `${path}.mesh_depth_reports`)
+      .map((item, index) => parseMeshDepthReport(item, `${path}.mesh_depth_reports[${index}]`)),
   };
+}
+
+function parseMeshDepthReport(value: unknown, path: string): ApplyMeshDepthReport {
+  const row = objectAt(value, path);
+  const byRule = row.collision_rule_id !== undefined;
+  exactKeysAt(row, ['code', byRule ? 'collision_rule_id' : 'signal_id', 'member', 'mesh_uri'], path);
+  const at = `${path}.member`;
+  const member = objectAt(row.member, at);
+  const kind = oneOf(['link', 'scene_object'] as const, member.kind, `${at}.kind`);
+  exactKeysAt(member, kind === 'link' ? ['kind', 'component_id', 'link'] : ['kind', 'scene_resource_id'], at);
+  return {
+    code: oneOf(['mesh_not_closed'] as const, row.code, `${path}.code`),
+    ...(byRule
+      ? { collision_rule_id: stringAt(row.collision_rule_id, `${path}.collision_rule_id`) }
+      : { signal_id: stringAt(row.signal_id, `${path}.signal_id`) }),
+    member: kind === 'link'
+      ? {
+        kind, component_id: stringAt(member.component_id, `${at}.component_id`),
+        link: stringAt(member.link, `${at}.link`),
+      }
+      : { kind, scene_resource_id: stringAt(member.scene_resource_id, `${at}.scene_resource_id`) },
+    mesh_uri: stringAt(row.mesh_uri, `${path}.mesh_uri`),
+  };
+}
+
+function parseCollisionRuleMember(value: unknown, path: string): ApplyCollisionRuleMember {
+  const row = objectAt(value, path);
+  const kind = oneOf(['link', 'attached_object', 'scene_objects'] as const, row.kind, `${path}.kind`);
+  if (kind === 'scene_objects') {
+    exactKeysAt(row, ['kind'], path);
+    return { kind };
+  }
+  if (kind === 'attached_object') {
+    exactKeysAt(row, ['kind', 'component_id'], path);
+    return { kind, component_id: stringAt(row.component_id, `${path}.component_id`) };
+  }
+  exactKeysAt(row, ['kind', 'component_id', 'link'], path);
+  return {
+    kind, component_id: stringAt(row.component_id, `${path}.component_id`),
+    link: stringAt(row.link, `${path}.link`),
+  };
+}
+
+function parseCollisionRuleState(value: unknown, path: string): ApplyCollisionRuleState | null {
+  if (value === null) return null;
+  const row = objectAt(value, path);
+  exactKeysAt(row, ['rule', 'a', 'b'], path);
+  return {
+    rule: objectAt(row.rule, `${path}.rule`),
+    a: arrayAt(row.a, `${path}.a`).map((item, index) => parseCollisionRuleMember(item, `${path}.a[${index}]`)),
+    b: arrayAt(row.b, `${path}.b`).map((item, index) => parseCollisionRuleMember(item, `${path}.b[${index}]`)),
+  };
+}
+
+function parseCollisionRuleChange(value: unknown, path: string): ApplyCollisionRuleChange {
+  const row = objectAt(value, path);
+  exactKeysAt(row, ['rule_id', 'change', 'now', 'was'], path);
+  const change = oneOf(['added', 'removed', 'changed'] as const, row.change, `${path}.change`);
+  const now = parseCollisionRuleState(row.now, `${path}.now`);
+  const was = parseCollisionRuleState(row.was, `${path}.was`);
+  if ((now === null) !== (change === 'removed') || (was === null) !== (change === 'added')) {
+    return fail(path, 'now absent exactly when removed and was absent exactly when added');
+  }
+  return { rule_id: stringAt(row.rule_id, `${path}.rule_id`), change, now, was };
 }
 
 export function parseApplyResult(value: unknown, path = 'apply_result'): ApplyResult {

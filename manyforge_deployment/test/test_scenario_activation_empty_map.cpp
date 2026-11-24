@@ -23,9 +23,10 @@ namespace detail = manyforge::deployment::detail;
 TEST(ScenarioActivationEmptyCell,
      CandidateCarriesTheEmptyMapAndSealedPredecessorDoesNot) {
   const CanonicalValue intent_value(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.deployment_intent.v2")},
-      {"deployment_artifact_id", CanonicalValue("empty_scenario_activation")},
-      {"name", CanonicalValue("empty_scenario_activation")},
+      {"api_version", CanonicalValue("manyforge.deployment_intent.v3")},
+      {"collision_rules",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{{"clearance_m", CanonicalValue(0.001)},
+                   {"rule_id", CanonicalValue("everything")}})})},
       {"attachments", CanonicalValue(CanonicalValue::Array{})},
       {"components", CanonicalValue(CanonicalValue::Array{})},
       {"policies", CanonicalValue(CanonicalValue::Object{})},

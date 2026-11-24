@@ -149,7 +149,6 @@ ManagerApplyIntentDTO Intent(const std::uint64_t apply_id = 1U,
       GraphRevision("candidate-graph"),
       ManagerApplyPreparedActivationDTO{
           ContentDigest("sha256:1414141414141414141414141414141414141414141414141414141414141414"),
-          core::DeploymentArtifactId("deployment-artifact-1"),
           core::DeploymentRevision(
               "sha256:1515151515151515151515151515151515151515151515151515151515151515"),
           core::ProgramBindingId(std::string(kDigestTwo)),
@@ -768,7 +767,7 @@ std::string ForeignIntentRowSql(const std::uint64_t apply_id) {
          "predecessor_graph_revision,predecessor_scene_id,"
          "predecessor_scene_revision_id,predecessor_scene_content_hash,"
          "candidate_retained_bundle_id,candidate_graph_revision,"
-         "captured_input_digest,deployment_artifact_id,deployment_revision,"
+         "captured_input_digest,deployment_revision,"
          "program_binding_id,prepared_activation_id,"
          "prepared_activation_receipt_json,"
          "expected_admission_generation,parent_authoring_claim,scene_"
@@ -778,7 +777,7 @@ std::string ForeignIntentRowSql(const std::uint64_t apply_id) {
          "','foreign','predecessor-bundle','predecessor-graph','" +
          std::string(kSceneIdOne) + "',7,'" + std::string(kDigestOne) +
          "','candidate-bundle','candidate-graph','" + std::string(kDigestOne) +
-         "','deployment-artifact-1','" + std::string(kDigestOne) + "','" +
+         "','" + std::string(kDigestOne) + "','" +
          std::string(kDigestTwo) + "','" + std::string(kDigestThree) +
          "','{}',7,NULL,'preserve','" + std::string(kDigestOne) + "',999);";
 }
@@ -916,10 +915,6 @@ TEST(ManagerApplyIntent, ValidityRejectsMissingRequiredIdentity) {
   // intent without it cannot name the input it accepted.
   intent = Intent();
   intent.prepared_activation.captured_input_digest = ContentDigest("");
-  EXPECT_FALSE(intent.valid());
-  intent = Intent();
-  intent.prepared_activation.deployment_artifact_id =
-      core::DeploymentArtifactId("");
   EXPECT_FALSE(intent.valid());
   intent = Intent();
   intent.prepared_activation.deployment_revision =
@@ -1660,10 +1655,6 @@ TEST(ManagerApplyJournalIntegrity,
         ContentDigest(std::string(kDigestTwo));
   });
   add([](auto &value) {
-    value.prepared_activation.deployment_artifact_id =
-        core::DeploymentArtifactId("deployment-artifact-2");
-  });
-  add([](auto &value) {
     value.prepared_activation.deployment_revision =
         core::DeploymentRevision(std::string(kDigestTwo));
   });
@@ -1856,7 +1847,7 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
         "candidate_retained_bundle_id,candidate_graph_revision,"
-        "captured_input_digest,deployment_artifact_id,deployment_revision,"
+        "captured_input_digest,deployment_revision,"
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,scene_"
@@ -1872,7 +1863,7 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         std::string(kDigestOne) +
         "','candidate-bundle','candidate-graph',"
         "'sha256:14141414141414141414141414141414141414141414141414141414"
-        "14141414','deployment-artifact-1',"
+        "14141414',"
         "'sha256:15151515151515151515151515151515151515151515151515151515"
         "15151515','sha256:"
         "17171717171717171717171717171717171717171717171717171717"
@@ -3632,7 +3623,7 @@ TEST(ManagerApplyJournalIntegrity,
     const std::string message(error.what());
     EXPECT_NE(message.find(path.string()), std::string::npos);
     EXPECT_NE(message.find("version 20"), std::string::npos);
-    EXPECT_NE(message.find("v24"), std::string::npos);
+    EXPECT_NE(message.find("v25"), std::string::npos);
     EXPECT_NE(message.find("Preserve"), std::string::npos);
     EXPECT_NE(message.find("interrupted"), std::string::npos);
     EXPECT_NE(message.find("reconcile"), std::string::npos);

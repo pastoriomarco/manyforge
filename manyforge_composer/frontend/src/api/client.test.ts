@@ -484,7 +484,6 @@ function motionPreviewResponse(intent: DirectControlOperationIntent): Record<str
       receipt_digest: 'sha256:receipt',
       intent_digest: 'sha256:intent',
       request_key: intent.request_context.request_key,
-      program_id: intent.program_id,
       program_revision: intent.program_revision,
       program_binding_id: intent.program_binding_id,
       program_run_id: null,
@@ -602,13 +601,11 @@ function workspaceFixture(): Record<string, unknown> {
     children: [],
   };
   const programFields = {
-    api_version: 'manyforge.program.v3',
-    program_id: 'fixture',
+    api_version: 'manyforge.program.v4',
     program_profile: 'composable-cell-v1',
-    name: 'Fixture',
     catalog: {
       api_version: 'manyforge.node_catalog.v3',
-      content_version: '3.0.0',
+      content_version: '4.0.0',
     },
   };
   return {
@@ -1105,7 +1102,6 @@ describe('headless intent client', () => {
       scene_initialization: 'preserve',
       prepared_activation: {
         captured_input_digest: `sha256:${'2'.repeat(64)}`,
-        deployment_artifact_id: 'deployment-1',
         deployment_revision: `sha256:${'3'.repeat(64)}`,
         program_binding_id: `sha256:${'4'.repeat(64)}`,
         prepared_activation_id: `sha256:${'5'.repeat(64)}`,
@@ -1199,7 +1195,6 @@ describe('headless intent client', () => {
       scene_initialization: 'preserve',
       prepared_activation: {
         captured_input_digest: `sha256:${'2'.repeat(64)}`,
-        deployment_artifact_id: 'deployment-1',
         deployment_revision: `sha256:${'3'.repeat(64)}`,
         program_binding_id: `sha256:${'4'.repeat(64)}`,
         prepared_activation_id: `sha256:${'5'.repeat(64)}`,
@@ -1370,10 +1365,10 @@ describe('server-side Apply, Load and New', () => {
     ['new', () => api.cellApply.newScenario(), '/api/scenario/new', { discard_unsaved: true }],
     ['load', () => api.cellApply.load('/projects/cell'), '/api/scenario/load',
       { path: '/projects/cell', discard_unsaved: true }],
-    ['apply', () => api.cellApply.apply({ draft_revision: 3 }), '/api/deployment/apply',
-      { scope: { draft_revision: 3 } }],
+    ['apply', () => api.cellApply.apply({ draft_revision: 3 }, ['pads_part']), '/api/deployment/apply',
+      { scope: { draft_revision: 3 }, confirmed_collision_rule_ids: ['pads_part'] }],
     ['revert', () => api.cellApply.revert({ saved: 'x' }), '/api/deployment/revert',
-      { scope: { saved: 'x' } }],
+      { scope: { saved: 'x' }, confirmed_collision_rule_ids: [] }],
   ] as const)('%s calls its endpoint once with a request key and returns the accepted row', async (_name, call, url, body) => {
     const fetchMock = replyEchoingKey();
     vi.stubGlobal('fetch', fetchMock);
@@ -1413,11 +1408,21 @@ describe('server-side Apply, Load and New', () => {
     { component_id: 'arm', disposition: 'replace', reasons: ['description'], restarts: true },
     { component_id: 'gripper', disposition: 'retain', reasons: [], restarts: false }],
   scope: { deployment_draft_revision: 4 },
-  program: { executable: false, program_id: 'pick', unresolved_references: [{
+  program: { executable: false, unresolved_references: [{
     target: { component_id: 'arm', command_target_id: 'arm' },
     reason: 'component_missing', detail: 'arm is removed' }],
   affected_nodes: ['move_1'], affected_execution_groups: [] },
-  attachment_changed_components: ['gripper'], detached_components: ['camera'] };
+  attachment_changed_components: ['gripper'], detached_components: ['camera'],
+  collision_rules: [{
+    rule_id: 'pads_part', change: 'changed',
+    now: { rule: { rule_id: 'pads_part' }, a: [{ kind: 'link', component_id: 'gripper', link: 'left_pad' }],
+      b: [{ kind: 'attached_object', component_id: 'gripper' }] },
+    was: { rule: { rule_id: 'pads_part' }, a: [], b: [{ kind: 'scene_objects' }] },
+  }],
+  mesh_depth_reports: [{
+    code: 'mesh_not_closed', signal_id: 'tool_io/TI0',
+    member: { kind: 'scene_object', scene_resource_id: 'endplate' }, mesh_uri: 'meshes/endplate.stl',
+  }] };
   it.each([
     ['preview', () => api.cellApply.preview(), '/api/deployment/preview'],
     ['revert preview', () => api.cellApply.revertPreview(), '/api/deployment/revert/preview'],

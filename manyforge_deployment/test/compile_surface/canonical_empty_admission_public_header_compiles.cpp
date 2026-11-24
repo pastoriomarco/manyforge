@@ -24,7 +24,6 @@ static_assert(!std::is_constructible_v<
               Admission,
               manyforge::core::ContentDigest,
               manyforge::core::CellId,
-              manyforge::core::DeploymentArtifactId,
               manyforge::core::DeploymentRevision,
               manyforge::core::GraphRevision,
               manyforge::core::RetainedBundleId,

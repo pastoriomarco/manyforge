@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <fstream>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -14,6 +15,8 @@
 
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+
+#include "activation_io_provider_internal.hpp"
 
 namespace manyforge::deployment::detail {
 namespace {
@@ -186,15 +189,17 @@ model_free_profile(std::string_view profile_id) {
 }
 
 /// A lane-free tool: a pneumatic gripper whose lane lives in the I/O
-/// components its `pneumatic_io` references, so it names no lane.
+/// components its `pneumatic_io` references, or a passive tool (no
+/// `gripper` section, OD-336) with nothing to drive, so it names no lane.
 [[nodiscard]] bool may_be_lane_free(const CanonicalValue &descriptor) {
   const auto *kind = descriptor.find_object_member("kind");
   const auto *gripper = descriptor.find_object_member("gripper");
   const auto *actuation =
       gripper != nullptr ? gripper->find_object_member("actuation") : nullptr;
   return kind != nullptr && kind->is_string() && kind->as_string() == "tool" &&
-         actuation != nullptr && actuation->is_string() &&
-         actuation->as_string() == "pneumatic";
+         (gripper == nullptr ||
+          (actuation != nullptr && actuation->is_string() &&
+           actuation->as_string() == "pneumatic"));
 }
 
 } // namespace
@@ -429,11 +434,13 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
       const auto &descriptor = found_model->second.descriptor;
       const auto *owner_row =
           component.owner ? component_of(*component.owner) : &component;
-      if ((kind == "machine") == component.owner.has_value())
-        fail("component " + component.component_id + " selects " + kind +
-             " model " + component.component_profile_id +
-             (kind == "machine" ? " but is a member" : " but has no owner"));
-      // One machine, one lane: the owner's.
+      // A machine is never a member. A model-form I/O device is a machine's
+      // member or an owner-less device of its own (a PLC's bank, OD-327);
+      // a machine's own member model is placed only in its machine (above).
+      if (kind == "machine" && component.owner.has_value())
+        fail("component " + component.component_id + " selects machine model " +
+             component.component_profile_id + " but is a member");
+      // One machine, one lane: the owner's (an owner-less device's own).
       const auto &lane = *owner_row->lane;
       std::optional<CanonicalValue> lane_row;
       if (const auto *row =
@@ -533,8 +540,8 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
       continue;
     }
     // The authored lane picks one of the model's `lanes` rows; only a
-    // pneumatic tool may name none (lane-free). A member runs on its
-    // owner's lane.
+    // pneumatic or a passive tool may name none (lane-free). A member runs
+    // on its owner's lane.
     const auto &descriptor = model->second.descriptor;
     const auto &lanes = member(descriptor, "lanes", "component model");
     const auto *owner_row =
@@ -574,6 +581,32 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
         lane,
         std::move(lane_row),
     };
+    // The generated tool family (`manyforge.tool`) is made from parameters
+    // only, and only it takes them (OD-357): its targets, bodies, frames,
+    // groups and joints are its parameters', not the family's.
+    const bool generated =
+        component.model_source.has_value() &&
+        component.model_source->generated_component.has_value();
+    if (generated != (profile.model_family_id == kGeneratedToolFamily))
+      throw core::TypedError(
+          generated ? "parametric_tool_kind_unsupported" : "generated_tool_parameters_required",
+          "Activation component profiles: " +
+              std::string(generated ? "parametric_tool_kind_unsupported: "
+                                    : "generated_tool_parameters_required: ") +
+              component.component_id + " (model " + component.component_profile_id +
+              (generated ? ") cannot take tool parameters; only manyforge.tool does"
+                         : ") is made from its parameters (model_source.parameters)"));
+    if (generated) {
+      auto tool = parse_generated_tool_component(
+          *component.model_source->generated_component);
+      auto family_row = profile.model_family.as_object();
+      for (auto &[name, value] : family_row)
+        if (name == "semantics") value = generated_tool_semantics(tool);
+      profile.model_family = CanonicalValue(std::move(family_row));
+      profile.generated_tool = std::move(tool);
+      profile.derived_component_type_id = derived_component_type_id(
+          "tool", generated_tool_type_shape(*profile.generated_tool));
+    }
     if (owner_row != nullptr) {
       profile.owner_component_id = component.owner;
       profile.member_role = component.role;
@@ -586,6 +619,224 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
   return result;
 }
 
+namespace {
+
+[[noreturn]] void mock_input_invalid(const std::string &component_id, std::string message,
+                                     std::map<std::string, std::string> details = {}) {
+  details.emplace("component_id", component_id);
+  throw core::TypedError(
+      "io_mock_input_invalid",
+      "Activation component profiles: io_mock_input_invalid: " + component_id +
+          ".mock_inputs: " + message,
+      std::move(details));
+}
+
+// The geometric Mock behaviour of an I/O member's inputs (OD-356), by signal
+// name: the provider of the `geometric_contact` profile it becomes on a lane
+// without the physical device, and the inputs' sample age.
+struct MockInputBehaviour final {
+  Object provider;
+  double maximum_sample_age_ms = 1000.0;
+};
+
+double sample_age_ms(const std::string &component_id, const std::string &where,
+                     const CanonicalValue &value) {
+  const auto *age = std::get_if<double>(&value.storage());
+  if (age == nullptr || !(*age > 0.0) || *age > 3'600'000.0)
+    mock_input_invalid(component_id,
+                       where + ".maximum_sample_age_ms must be above 0 and at most 3600000");
+  return *age;
+}
+
+// The robot a tool is mounted on: the base of its attachment chain (through
+// a tool changer, the arm). Nullopt when the tool is not mounted.
+std::optional<std::string> mounting_robot(const CanonicalValue &attachments,
+                                          std::string component_id) {
+  const auto &rows = array(attachments, "attachments");
+  const auto end_of = [](const CanonicalValue &row, std::string_view end) -> const std::string & {
+    return text(member(member(row, end, "attachment"), "component_id", "attachment end"),
+                "attachment component_id");
+  };
+  bool mounted = false;
+  // One attachment up per step; no chain is longer than the rows.
+  for (std::size_t step = 0U; step != rows.size(); ++step) {
+    const auto row = std::find_if(rows.begin(), rows.end(), [&](const CanonicalValue &candidate) {
+      return end_of(candidate, "child") == component_id;
+    });
+    if (row == rows.end()) break;
+    component_id = end_of(*row, "parent");
+    mounted = true;
+  }
+  return mounted ? std::optional<std::string>(std::move(component_id)) : std::nullopt;
+}
+
+// A `spring_slider` input (OD-371): contact between the slider with the
+// objects it carries and `b`, observed on the robot the tool is mounted on,
+// true from the slider's trip depth until its release depth.
+Object spring_slider_provider(const ActivationDeploymentIntent &intent,
+                              const std::vector<ActivationComponentProfile> &profiles,
+                              const std::string &component_id, const std::string &signal_name,
+                              const CanonicalValue &reference, const CanonicalValue &b) {
+  const auto *fields = std::get_if<Object>(&reference.storage());
+  const auto *tool_value = reference.find_object_member("component_id");
+  const auto *element_value = reference.find_object_member("element_id");
+  if (fields == nullptr || fields->size() != 2U || tool_value == nullptr ||
+      element_value == nullptr || !std::holds_alternative<std::string>(tool_value->storage()) ||
+      !std::holds_alternative<std::string>(element_value->storage()))
+    mock_input_invalid(component_id,
+                       signal_name + ".spring_slider has component_id and element_id only");
+  const auto &tool_id = std::get<std::string>(tool_value->storage());
+  const auto &element_id = std::get<std::string>(element_value->storage());
+  const auto refuse = [&](std::string reason, const std::string &message) {
+    mock_input_invalid(component_id, signal_name + ".spring_slider: " + message,
+                       {{"signal_name", signal_name},
+                        {"tool_component_id", tool_id},
+                        {"element_id", element_id},
+                        {"reason", std::move(reason)}});
+  };
+  const auto profile = std::find_if(profiles.begin(), profiles.end(), [&](const auto &candidate) {
+    return candidate.component_id == tool_id;
+  });
+  if (profile == profiles.end())
+    refuse("tool_unknown", tool_id + " is not a component of the Deployment");
+  if (!profile->generated_tool)
+    refuse("tool_not_generated", tool_id + " is not a generated tool");
+  const auto slider = generated_spring_slider(*profile->generated_tool, element_id);
+  if (!slider)
+    refuse("element_not_spring_slider", element_id + " is not a spring slider of " + tool_id);
+  const auto robot = mounting_robot(intent.attachments, tool_id);
+  if (!robot) refuse("tool_not_mounted", tool_id + " is not mounted on a robot");
+  Object provider{
+      {"profile", CanonicalValue("geometric_contact")},
+      {"ingress_depth", CanonicalValue(16.0)},
+      {"robot_component_id", CanonicalValue(*robot)},
+      {"a", CanonicalValue(Array{
+                CanonicalValue(Object{{"kind", CanonicalValue("collision_body")},
+                                      {"component_id", CanonicalValue(tool_id)},
+                                      {"collision_body_id", CanonicalValue(element_id)}}),
+                CanonicalValue(Object{{"kind", CanonicalValue("attached_object")},
+                                      {"component_id", CanonicalValue(tool_id)},
+                                      {"collision_body_role_id", CanonicalValue(element_id)}}),
+            })},
+      {"b", b},
+      {"trip_depth_m", CanonicalValue(slider->trip_depth_m)},
+  };
+  if (slider->release_depth_m)
+    provider.emplace_back("release_depth_m", CanonicalValue(*slider->release_depth_m));
+  return provider;
+}
+
+// Each row gives exactly one of `geometric_contact` (its provider fields as
+// authored) and `spring_slider` (with `b`), and optionally the sample age.
+std::map<std::string, MockInputBehaviour, std::less<>> mock_input_behaviours(
+    const ActivationDeploymentIntent &intent,
+    const std::vector<ActivationComponentProfile> &profiles,
+    const ActivationDeploymentComponent &component, const CanonicalValue &model_descriptor) {
+  std::map<std::string, MockInputBehaviour, std::less<>> result;
+  const auto *rows = component.configuration.find_object_member("mock_inputs");
+  if (rows == nullptr)
+    return result;
+  const auto *list = std::get_if<Array>(&rows->storage());
+  if (list == nullptr)
+    mock_input_invalid(component.component_id, "must be a list");
+  std::set<std::string, std::less<>> inputs;
+  for (const auto &signal : array(member(model_descriptor, "signals", "I/O model"),
+                                  "I/O model signals"))
+    if (text(member(signal, "direction", "I/O signal"), "direction") == "input")
+      inputs.insert(text(member(signal, "signal_name", "I/O signal"), "I/O signal name"));
+  for (const auto &row : *list) {
+    const auto *fields = std::get_if<Object>(&row.storage());
+    const auto *name = row.find_object_member("signal_name");
+    const auto *geometry = row.find_object_member("geometric_contact");
+    const auto *slider = row.find_object_member("spring_slider");
+    const auto *b = row.find_object_member("b");
+    const auto *age = row.find_object_member("maximum_sample_age_ms");
+    const auto slider_fields = 3U + (age != nullptr ? 1U : 0U);
+    if (fields == nullptr || name == nullptr ||
+        !std::holds_alternative<std::string>(name->storage()) ||
+        (geometry != nullptr
+             ? fields->size() != 2U
+             : slider == nullptr || b == nullptr || fields->size() != slider_fields))
+      mock_input_invalid(component.component_id,
+                         "each row has signal_name and either geometric_contact, or "
+                         "spring_slider, b and optionally maximum_sample_age_ms");
+    const auto &signal_name = std::get<std::string>(name->storage());
+    if (!inputs.contains(signal_name))
+      mock_input_invalid(component.component_id,
+                         signal_name + " is not an input of model " +
+                             component.component_profile_id);
+    MockInputBehaviour behaviour;
+    if (slider != nullptr) {
+      behaviour.provider = spring_slider_provider(intent, profiles, component.component_id,
+                                                  signal_name, *slider, *b);
+      if (age != nullptr)
+        behaviour.maximum_sample_age_ms =
+            sample_age_ms(component.component_id, signal_name, *age);
+    } else {
+      const auto *contact = std::get_if<Object>(&geometry->storage());
+      if (contact == nullptr)
+        mock_input_invalid(component.component_id,
+                           signal_name + ".geometric_contact must be a mapping");
+      behaviour.provider = {{"profile", CanonicalValue("geometric_contact")},
+                            {"ingress_depth", CanonicalValue(16.0)}};
+      for (const auto &[key, value] : *contact) {
+        if (key == "maximum_sample_age_ms") {
+          behaviour.maximum_sample_age_ms = sample_age_ms(
+              component.component_id, signal_name + ".geometric_contact", value);
+        } else if (key == "robot_component_id" || key == "a" || key == "b" ||
+                   key == "trip_depth_m" || key == "release_depth_m") {
+          // Checked with the signal's provider row (the I/O catalog).
+          behaviour.provider.emplace_back(key, value);
+        } else {
+          mock_input_invalid(component.component_id,
+                             signal_name + ".geometric_contact has unexpected field " + key);
+        }
+      }
+      for (const auto *required : {"robot_component_id", "a", "b"})
+        if (geometry->find_object_member(required) == nullptr)
+          mock_input_invalid(component.component_id,
+                             signal_name + ".geometric_contact is missing " + required);
+    }
+    if (!result.emplace(signal_name, std::move(behaviour)).second)
+      mock_input_invalid(component.component_id, signal_name + " is listed twice");
+  }
+  return result;
+}
+
+}  // namespace
+
+void expand_generated_tool_wiring(
+    ActivationDeploymentIntent &intent,
+    const std::vector<ActivationComponentProfile> &profiles) {
+  if (intent.components.size() != profiles.size())
+    throw std::logic_error("generated tool wiring joins differ in size");
+  for (std::size_t index = 0U; index != profiles.size(); ++index) {
+    const auto &profile = profiles[index];
+    if (!profile.generated_tool.has_value()) continue;
+    auto &component = intent.components[index];
+    const auto *runtime_configuration =
+        component.configuration.find_object_member("runtime_configuration");
+    const auto rows = generated_tool_gripper_rows(
+        *profile.generated_tool, component.component_id,
+        runtime_configuration == nullptr
+            ? nullptr
+            : runtime_configuration->find_object_member("gripper_target_configurations"));
+    auto runtime = runtime_configuration == nullptr || !runtime_configuration->is_object()
+                       ? CanonicalValue::Object{}
+                       : runtime_configuration->as_object();
+    std::erase_if(runtime, [](const auto &field) {
+      return field.first == "gripper_target_configurations";
+    });
+    if (!rows.as_array().empty()) runtime.emplace_back("gripper_target_configurations", rows);
+    std::sort(runtime.begin(), runtime.end(),
+              [](const auto &left, const auto &right) { return left.first < right.first; });
+    auto configuration = component.configuration.as_object();
+    for (auto &[name, value] : configuration)
+      if (name == "runtime_configuration") value = CanonicalValue(std::move(runtime));
+    component.configuration = CanonicalValue(std::move(configuration));
+  }
+}
+
 void expand_activation_machine_members(
     ActivationDeploymentIntent &intent,
     const std::vector<ActivationComponentProfile> &profiles) {
@@ -593,14 +844,29 @@ void expand_activation_machine_members(
     throw std::logic_error("machine member expansion joins differ in size");
   for (std::size_t index = 0U; index != profiles.size(); ++index) {
     const auto &profile = profiles[index];
+    // A model-form I/O device: a machine's member or an owner-less device.
     if (profile.runtime_kind != ActivationRuntimeKind::kIoProvider ||
-        !profile.member_role.has_value())
+        !profile.lane.has_value())
       continue;
     auto &component = intent.components[index];
     const auto &id = component.component_id;
-    // Real: the vendor family serves the bank through the owner's
-    // connection; Mock and Isaac: the host's Mock I/O.
+    const bool member_device = profile.member_role.has_value();
+    // Real: the adapter family serves the bank (a member's through its
+    // owner's connection, an owner-less device's by its own `adapter`);
+    // Mock and Isaac: the host's Mock I/O.
     const bool adapter = *profile.lane == "real";
+    // On Mock and Isaac an input may follow geometry (OD-356); on Real the
+    // physical input is read.
+    const auto behaviours = mock_input_behaviours(intent, profiles, intent.components[index],
+                                                  profile.model_descriptor);
+    // The lane row's keys belong to its adapter family, which checks them
+    // (OD-327 D20): every one but the inputs' freshness budget travels on
+    // each signal's provider row; a member's family is its owner's.
+    Object lane_keys;
+    if (adapter)
+      for (const auto &[key, value] : object(*profile.lane_row, "I/O lane row"))
+        if (key != "input_maximum_age_ms" && (key != "adapter" || !member_device))
+          lane_keys.emplace_back(key, value);
     Array signals;
     for (const auto &signal :
          array(member(profile.model_descriptor, "signals", "I/O model"),
@@ -620,27 +886,38 @@ void expand_activation_machine_members(
       };
       Object provider;
       if (adapter) {
-        provider = {{"profile", CanonicalValue("component_adapter")},
-                    {"bank", member(*profile.lane_row, "bank", "I/O lane row")}};
+        provider = lane_keys;
+        provider.emplace_back("profile", CanonicalValue("component_adapter"));
+        // The signal's own key for its family: its bit in the bank.
+        if (const auto *bit = signal.find_object_member("index"))
+          provider.emplace_back("index", *bit);
         if (!output) provider.emplace_back("ingress_depth", CanonicalValue(16.0));
       } else if (output) {
         provider = {{"profile", CanonicalValue("mock_output")},
                     {"channel", CanonicalValue(id + "." + name)}};
+      } else if (const auto behaviour = behaviours.find(name); behaviour != behaviours.end()) {
+        provider = behaviour->second.provider;
       } else {
         provider = {{"profile", CanonicalValue("mock")},
                     {"initial_value", CanonicalValue(false)},
                     {"ingress_depth", CanonicalValue(64.0)}};
       }
       row.emplace_back("provider", CanonicalValue(std::move(provider)));
+      const auto geometric = !adapter && !output && behaviours.contains(name);
       if (!output) {
         row.emplace_back("update_mode",
-                         CanonicalValue(adapter ? "sampled" : "change_only"));
+                         CanonicalValue(adapter || geometric ? "sampled" : "change_only"));
         row.emplace_back("transition_capability", CanonicalValue("sampled_only"));
         // Real: the bank reports its inputs once per stream period, so they
         // carry the model's sample-age budget; a stale input leaves a rule
         // unable to watch it.
         Object freshness{{"mode", CanonicalValue("provider_validity")}};
-        if (adapter)
+        if (geometric)
+          freshness = {
+              {"maximum_age_ns",
+               CanonicalValue(std::ceil(behaviours.find(name)->second.maximum_sample_age_ms * 1e6))},
+              {"mode", CanonicalValue("sample_age")}};
+        else if (adapter)
           freshness = {
               {"maximum_age_ns",
                CanonicalValue(std::ceil(
@@ -652,17 +929,17 @@ void expand_activation_machine_members(
       }
       signals.emplace_back(std::move(row));
     }
+    Object device{{"controllable_component_id", CanonicalValue(id)}};
+    if (member_device) {
+      device.emplace_back("member_role", CanonicalValue(*profile.member_role));
+      device.emplace_back("owner_component_id", CanonicalValue(*profile.owner_component_id));
+    }
     component.configuration = CanonicalValue(Object{
         {"runtime_kind", CanonicalValue("io_provider")},
         {"runtime_configuration",
          CanonicalValue(Object{
              {"io_provider_devices",
-              CanonicalValue(Array{CanonicalValue(Object{
-                  {"controllable_component_id", CanonicalValue(id)},
-                  {"member_role", CanonicalValue(*profile.member_role)},
-                  {"owner_component_id",
-                   CanonicalValue(*profile.owner_component_id)},
-              })})},
+              CanonicalValue(Array{CanonicalValue(device)})},
              {"io_signals", CanonicalValue(std::move(signals))},
          })},
     });

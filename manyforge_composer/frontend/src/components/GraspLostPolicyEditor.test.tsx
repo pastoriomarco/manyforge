@@ -65,9 +65,7 @@ const attachNode: ProgramTreeNode = {
 
 const program = {
   api_version: 'manyforge.program.v2',
-  program_id: 'grasp_lost_ui',
   program_profile: 'composable-cell-v1',
-  name: 'Grasp lost UI',
   catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.7.0' },
   component_roles: {},
   target_roles: {},

@@ -324,12 +324,10 @@ class ScopedTrustedRoot final {
     std::string_view cell_id) {
   const std::string document =
       "{\"api_version\":\"manyforge.deployment.v1\","
-      "\"deployment_artifact_id\":\"durable_store_fixture\","
       "\"deployment_revision\":\"" +
       std::string(kZeroDigest) + "\",\"cell_id\":\"" +
       std::string(cell_id) +
-      "\",\"name\":\"Durable store fixture\","
-      "\"catalogs\":{\"records\":[]},\"graph\":" +
+      "\",\"catalogs\":{\"records\":[]},\"graph\":" +
       empty_graph() +
       ",\"desired_control_configurations\":[],"
       "\"capability_provider_bindings\":[]}";
@@ -3472,6 +3470,78 @@ TEST(RetainedBundleStore,
   EXPECT_THROW(detail::require_symbol_role_map_matches_retained_bundle(
                    parsed, invalid_witness),
                RetainedBundleError);
+}
+
+
+// O5/OD-336: a passive tool's frame-only target has no control binding and no
+// provider. The graph names it as the component's default TCP target; it
+// carries frames and collision bodies only.
+TEST(RetainedBundleStore, FrameOnlyTargetIsTheGraphsDefaultTcpTarget) {
+  ScopedTrustedRoot root;
+  const auto bundle =
+      test::materialize_boolean_io_retained_fixture(root.path(), true, true)
+          .bundle;
+  ASSERT_NE(bundle, nullptr);
+  const auto &artifact =
+      bundle->value().compiled_products.symbol_role_maps.front().artifact_refs.front();
+  const auto bytes =
+      FilesystemRawArtifactStore(root.path())
+          .get_verified(artifact.content_addressed_store_key,
+                        artifact.content_digest, artifact.byte_size);
+  ASSERT_TRUE(bytes.has_value());
+  const auto parsed = detail::parse_and_verify_composed_model_symbol_role_map(
+      *bytes, /*allow_empty_model_map=*/true);
+  const auto with_field = [](const CanonicalValue &value, std::string_view name,
+                             CanonicalValue replacement) {
+    auto fields = value.as_object();
+    for (auto &[key, selected] : fields) {
+      if (key == name) {
+        selected = std::move(replacement);
+        return CanonicalValue(std::move(fields));
+      }
+    }
+    throw std::logic_error("map fixture field missing");
+  };
+  const auto &existing = parsed.find_object_member("target_role_maps")->as_array();
+  const auto map_with_tool_target = [&](CanonicalValue::Array groups) {
+    auto tool = with_field(existing.front(), "controllable_component_id",
+                           CanonicalValue("passive_tool"));
+    tool = with_field(tool, "command_target_id", CanonicalValue("tool"));
+    tool = with_field(tool, "model_groups", CanonicalValue(std::move(groups)));
+    auto targets = existing;
+    targets.push_back(std::move(tool));
+    return with_field(parsed, "target_role_maps", CanonicalValue(std::move(targets)));
+  };
+  // Negative and positive input to the pure validator only; never made into
+  // a verified retained product.
+  auto with_tool = bundle->value();
+  auto component = with_tool.cell_graph.controllable_components.front();
+  component.controllable_component_id = core::ControllableComponentId("passive_tool");
+  component.model_role_bindings.clear();
+  component.default_tcp = core::ComponentDefaultTcpDTO{
+      core::CommandTargetId("tool"), core::FrameRoleId("tcp")};
+  with_tool.cell_graph.controllable_components.push_back(component);
+
+  EXPECT_NO_THROW(detail::require_symbol_role_map_matches_retained_bundle(
+      map_with_tool_target({}), with_tool));
+  // Not named by the graph: refused.
+  EXPECT_THROW(detail::require_symbol_role_map_matches_retained_bundle(
+                   map_with_tool_target({}), bundle->value()),
+               RetainedBundleError);
+  // The graph names it but the map omits it: refused.
+  EXPECT_THROW(detail::require_symbol_role_map_matches_retained_bundle(
+                   parsed, with_tool),
+               RetainedBundleError);
+  // A frame-only target never carries model groups.
+  try {
+    detail::require_symbol_role_map_matches_retained_bundle(
+        map_with_tool_target({CanonicalValue(CanonicalValue::Object{})}), with_tool);
+    FAIL() << "frame-only target gained model groups";
+  } catch (const RetainedBundleError &error) {
+    EXPECT_NE(std::string(error.what()).find("frame-only target contains model groups"),
+              std::string::npos)
+        << error.what();
+  }
 }
 
 } // namespace manyforge::deployment

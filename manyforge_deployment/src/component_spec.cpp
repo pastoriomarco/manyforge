@@ -10,6 +10,7 @@
 #include <variant>
 
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_deployment/collision_rule_codec.hpp>
 #include <manyforge_deployment/deployment_applicability_codec.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
@@ -58,7 +59,7 @@ constexpr std::array<std::string_view, 10> kHostKernelScalars{
 /// Planner settings: CellContext.
 constexpr std::array<std::string_view, 10> kHostPlannerScalars{
     "cartesian_timing",  "collision_check_fresh_plans", "collision_check_step_rad",
-    "collision_clearance_m", "motion_timing",           "planner_max_nodes",
+    "collision_rules",   "motion_timing",               "planner_max_nodes",
     "planner_n",         "planner_optimize",            "planner_rng_seed",
     "planner_search"};
 /// The component's slice of the cell's initial joint state (launch).
@@ -403,7 +404,7 @@ TypedHostShare(const RetainedBundle &bundle, const core::RuntimeUnitId &unit,
                const core::ControllableComponentId &id) {
   auto share = host_contract::require_component_configuration(bundle, unit, id);
   share.planner_rng_seed = 0U;
-  share.collision_clearance_m.reset();
+  share.collision_rules.reset();
   share.collision_check_step_rad.reset();
   share.collision_check_fresh_plans.reset();
   if (share.motion_target_limits.empty()) {
@@ -752,8 +753,8 @@ PlannerSettings planner_settings(const CellContext &context,
     settings.rng_seed = static_cast<std::uint32_t>(seed->as_number());
   if (const auto *step = host->find_object_member("collision_check_step_rad"))
     settings.collision_check_step_rad = step->as_number();
-  if (const auto *clearance = host->find_object_member("collision_clearance_m"))
-    settings.collision_clearance_m = clearance->as_number();
+  if (const auto *rules = host->find_object_member("collision_rules"))
+    settings.collision_rules = decode_cell_collision_rules(*rules, "collision_rules");
   if (const auto *fresh = host->find_object_member("collision_check_fresh_plans"))
     settings.collision_check_fresh_plans = fresh->as_bool();
   if (const auto *search = host->find_object_member("planner_search"))

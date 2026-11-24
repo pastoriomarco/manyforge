@@ -7,6 +7,7 @@ import {
   activeViewerIncidentKinds,
   classifyWorkbenchNotices,
   noticeRowSummary,
+  noticeSignature,
   noticesOfSeverity,
   type WorkbenchNotice,
 } from './workbenchNotices';
@@ -21,6 +22,16 @@ function notice(overrides: Partial<WorkbenchNotice> & Pick<WorkbenchNotice, 'id'
 }
 
 describe('workbench notification model', () => {
+  it('republishes a notice when only its pinned lines, details or alarms change', () => {
+    const waiting = notice({ id: 'program.waiting', severity: 'info', message: '', pinnedLines: ['input a = true — n1'] });
+    const signature = noticeSignature([waiting]);
+    expect(noticeSignature([{ ...waiting, pinnedLines: ['key cycle_on == true — n2'] }])).not.toBe(signature);
+    expect(noticeSignature([{ ...waiting, details: 'more' }])).not.toBe(signature);
+    expect(noticeSignature([{ ...waiting, alarmDefinitionIds: ['a'] }])).not.toBe(signature);
+    expect(noticeSignature([{ ...waiting, alarmSubjects: [{ definitionId: 'a', subjectId: 'b' }] }])).not.toBe(signature);
+    expect(noticeSignature([{ ...waiting }])).toBe(signature);
+  });
+
   it('orders errors, warnings, then information while keeping producer order', () => {
     const ordered = classifyWorkbenchNotices([
       notice({ id: 'info.a', severity: 'info' }),

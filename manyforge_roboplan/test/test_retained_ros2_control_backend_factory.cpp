@@ -118,7 +118,6 @@ commanded_binding(std::string component_id = "robot_1",
                   const core::StateAuthorityClass authority =
                       core::StateAuthorityClass::kCommanded) {
   core::RuntimeParticipantBindingDTO value{
-      core::ProgramId("program.physical"),
       core::ProgramRevision("program-revision"),
       core::ProgramBindingId("program-binding"),
       core::RetainedBundleId("bundle"),
@@ -190,7 +189,6 @@ commanded_binding(std::string component_id = "robot_1",
 [[nodiscard]] core::RuntimeParticipantBinding
 commanded_gripper_binding(std::string component_id = "robot_1") {
   core::RuntimeParticipantBindingDTO value{
-      core::ProgramId("program.physical"),
       core::ProgramRevision("program-revision"),
       core::ProgramBindingId("program-binding"),
       core::RetainedBundleId("bundle"),

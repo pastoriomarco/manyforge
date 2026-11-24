@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_deployment/component_type_codec.hpp>
+
 #include "activation_io_provider_internal.hpp"
 #include "activation_prepared_model_internal.hpp"
 
@@ -14,13 +16,16 @@ namespace manyforge::deployment::detail {
 /// expanded `{pose_sources:[row]}`. Typed refusals:
 /// `scene_pose_source_unknown_component`, `scene_pose_source_mode_missing`,
 /// `scene_pose_source_relative_reference_missing`,
-/// `scene_pose_source_relative_requires_simulation`.
+/// `scene_pose_source_relative_requires_simulation`. A relative reference's
+/// gripper link is the base link of the gripper target's grip body, read
+/// from the component's qualified type in `component_types`.
 [[nodiscard]] std::vector<ActivationPreparedIoType>
 prepare_activation_pose_source_types(
     const ActivationDeploymentIntent &intent,
     std::span<const ActivationComponentProfile> profiles,
     const std::vector<ActivationPreparedModel> &prepared_models,
-    std::span<const QualifiedCapabilityDefinition> capabilities);
+    std::span<const QualifiedCapabilityDefinition> capabilities,
+    std::span<const QualifiedComponentType> component_types);
 
 /// One model-free AI model component (runtime kind `ai_model`, profile
 /// `ai_model_v0`) becomes a derived component type with the single target

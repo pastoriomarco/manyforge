@@ -45,9 +45,6 @@ public:
   RuntimeProgramTargetBinding &
   operator=(RuntimeProgramTargetBinding &&) noexcept = default;
 
-  [[nodiscard]] const core::ProgramId &program_id() const noexcept {
-    return program_id_;
-  }
   [[nodiscard]] const core::ProgramRevision &program_revision() const noexcept {
     return program_revision_;
   }
@@ -114,14 +111,14 @@ public:
   capability_provider_binding() const noexcept {
     return capability_provider_binding_;
   }
-  [[nodiscard]] const std::vector<core::ProgramContactGraspBindingDTO> &
-  contact_grasp_bindings() const noexcept {
-    return contact_grasp_bindings_;
+  [[nodiscard]] const std::vector<core::ProgramCollisionRuleBodyBindingDTO> &
+  collision_rule_bodies() const noexcept {
+    return collision_rule_bodies_;
   }
 
 private:
   RuntimeProgramTargetBinding(
-      core::ProgramId program_id, core::ProgramRevision program_revision,
+      core::ProgramRevision program_revision,
       core::ProgramBindingId program_binding_id,
       core::RetainedBundleId retained_bundle_id,
       core::GraphRevision graph_revision,
@@ -142,9 +139,8 @@ private:
       std::optional<CompositionControlBindingCoordinateMap> coordinate_map,
       std::optional<core::CapabilityProviderBindingDTO>
           capability_provider_binding,
-      std::vector<core::ProgramContactGraspBindingDTO> contact_grasp_bindings)
-      : program_id_(std::move(program_id)),
-        program_revision_(std::move(program_revision)),
+      std::vector<core::ProgramCollisionRuleBodyBindingDTO> collision_rule_bodies)
+      : program_revision_(std::move(program_revision)),
         program_binding_id_(std::move(program_binding_id)),
         retained_bundle_id_(std::move(retained_bundle_id)),
         graph_revision_(std::move(graph_revision)),
@@ -163,9 +159,8 @@ private:
         desired_route_(std::move(desired_route)),
         coordinate_map_(std::move(coordinate_map)),
         capability_provider_binding_(std::move(capability_provider_binding)),
-        contact_grasp_bindings_(std::move(contact_grasp_bindings)) {}
+        collision_rule_bodies_(std::move(collision_rule_bodies)) {}
 
-  core::ProgramId program_id_;
   core::ProgramRevision program_revision_;
   core::ProgramBindingId program_binding_id_;
   core::RetainedBundleId retained_bundle_id_;
@@ -187,7 +182,7 @@ private:
   std::optional<CompositionControlBindingCoordinateMap> coordinate_map_;
   std::optional<core::CapabilityProviderBindingDTO>
       capability_provider_binding_;
-  std::vector<core::ProgramContactGraspBindingDTO> contact_grasp_bindings_;
+  std::vector<core::ProgramCollisionRuleBodyBindingDTO> collision_rule_bodies_;
 
   friend RuntimeProgramTargetBinding resolve_runtime_program_target(
       const ProgramBinding &, const core::ProgramTargetReferenceDTO &,

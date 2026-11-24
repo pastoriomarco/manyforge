@@ -24,7 +24,6 @@ namespace detail {
 using PreparedActivationArtifact = ::manyforge::deployment::PreparedActivationArtifact;
 
 struct PreparedActivationMaterialization final {
-  core::DeploymentArtifactId deployment_artifact_id;
   core::DeploymentRevision deployment_revision;
   ScenarioDeploymentCompatibilityDTO deployment_compatibility;
   std::shared_ptr<const RetainedBundle> bundle;

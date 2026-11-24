@@ -32,12 +32,10 @@ def target_binding(
     }
 
 
-def program_document(catalog: Any, tree: dict[str, Any], *, program_id: str, name: str) -> dict[str, Any]:
+def program_document(catalog: Any, tree: dict[str, Any]) -> dict[str, Any]:
     return {
-        "api_version": "manyforge.program.v3",
-        "program_id": program_id,
+        "api_version": "manyforge.program.v4",
         "program_profile": "composable-cell-v1",
-        "name": name,
         "catalog": {"api_version": catalog.api_version, "content_version": catalog.content_version},
         "tree": tree,
     }

@@ -261,11 +261,14 @@ planner block (otherwise the Deployment's). Cartesian paths require the Deployme
 advertise `planning.motion.cartesian_path`. Unsupported choices are rejected
 instead of silently falling back to another planner behavior.
 
-Use a narrow `contact_grasp` policy only for the intended tool/object contact.
-After attachment, `touch_links` are the only gripper/object collision allowance.
-Support-contact release remains a separate object/support policy and may not be
-replaced by a broad collision exemption. Preview and execution must use the same
-object, frames, contact policy, scene lease, and validation path.
+Use a narrow contact rule only for the intended tool/object contact: on the
+pick sequence's descend leg, the gripper's collision body against the picked
+object. After attachment, the attach node's `touch_bodies` are the only
+gripper/object collision allowance. The release from the support is a
+separate rule for the object/support pair and may not be replaced by a broad
+collision exemption. Preview and execution must use the same object, frames,
+collision rules, scene lease, and validation path
+([Collision rules](../authoring/COLLISION_RULES.md)).
 
 Program artifacts persist joint angles and angular pose fields in radians.
 Composer may display degrees for operator convenience, but it converts back to
@@ -328,27 +331,30 @@ Custom frame/TCP testing is allowed only after the frame inventory and TF chain
 have been verified; do not treat a successful preview in one frame as evidence
 that approval is safe in another.
 
-The `graspable` scene resource declares a support-contact release policy against
-`ground`, with `max_start_penetration_m: 0.03` while the first-waypoint cap is
-enabled. This lets the attached trocar start the lift in bounded contact with
-the support surface, but validation still fails closed unless the retreat
-trajectory separates that exact pair and does not re-contact. Do not replace
-this with a global collision exemption; only the picked-object/support pair
-should receive this policy.
+The lift of the trocar has a release rule, `lift_from_ground`: the object the
+gripper carries against `ground`, with `max_start_penetration_m: 0.03` while
+the starting-depth check is on. It is on the pick sequence's retreat leg and on
+the move that executes the lift (`retreat_after_pick`). This lets the attached
+trocar start the lift in bounded contact with the support surface, but
+validation still fails closed unless the lift separates that exact pair and
+does not touch it again. The last move before the detach (`move_to_drop`) has
+a contact rule for the same pair, `place_on_ground`, for the end of that move
+only; the moves in between keep the normal clearance to the ground. Do not
+replace these with a global collision exemption; only the picked-object/support
+pair should have these rules.
 
-In Composer, edit these relationships in the Scene's **Support contacts**
-section. **Limit the starting penetration** maps to
-`enforce_max_start_penetration`; disabling it removes the first-waypoint
-penetration envelope only. Release, final separation, and re-contact checks
-remain active.
+In Composer, edit them in the **Collision rules** table of the node.
+**Limit starting penetration** maps to `enforce_max_start_penetration`;
+turning it off removes the starting-depth check only. Release, final
+separation, and re-contact checks remain active.
 
 If a validation refusal names a colliding pair, expand its details.
 `collision_result_first_failure_pair` is the pair that failed.
 `collision_result_contact_release_pair` (with
-`collision_result_contact_release_violation`) is present when the
-support-contact check of the configured pair is what failed. If the failing
-pair is not the picked object and its support, for example a robot link,
-support contacts do not cover that collision and must not hide it.
+`collision_result_contact_release_violation`) is present when the release
+check of a rule's pair is what failed. If the failing pair is not the picked
+object and its support, for example a robot link, the release rule does not
+cover that collision and must not hide it.
 
 ## Troubleshooting
 

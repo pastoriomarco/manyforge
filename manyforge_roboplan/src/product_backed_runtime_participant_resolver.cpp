@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <manyforge_deployment/cell_collision_rule_members.hpp>
 #include <manyforge_deployment/cell_kinematic_index.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
@@ -47,7 +48,9 @@ RequiredPlannerCapability(const core::MotionParticipantIntentDTO &motion) {
         if constexpr (std::is_same_v<Value, core::JointGoalDTO>) {
           return core::CapabilityId("planning.motion.joint_goal");
         } else if constexpr (std::is_same_v<Value, core::PoseGoalDTO>) {
-          return core::CapabilityId("planning.motion.pose_goal");
+          // A linear pose goal is planned as a Cartesian path (OD-341).
+          return core::CapabilityId(value.linear ? "planning.motion.cartesian_path"
+                                                 : "planning.motion.pose_goal");
         } else if constexpr (std::is_same_v<Value, core::NamedTargetDTO>) {
           return core::CapabilityId("planning.motion.named_target");
         } else {
@@ -171,8 +174,7 @@ FindExactPrecomposedBinding(
   const core::RuntimeParticipantBinding *result = nullptr;
   for (const auto &binding : physical_bindings) {
     const auto &value = binding.value();
-    if (value.program_id != operation.program_id ||
-        value.program_revision != operation.program_revision ||
+    if (value.program_revision != operation.program_revision ||
         value.program_binding_id != operation.program_binding_id ||
         value.controllable_component_id != participant.target.component_id ||
         value.command_target_id != participant.target.command_target_id ||
@@ -296,7 +298,6 @@ HeldRunSourcesFor(const core::ProgramRunResolutionContext &held_run,
   if (sources->binding->program_binding_id() != program_binding_id ||
       binding.retained_bundle_id != bundle.retained_bundle_id() ||
       binding.graph_revision != bundle.value().cell_graph.graph_revision ||
-      program.program_id != binding.program_id ||
       program.program_revision != binding.program_revision)
     return {};
   return {sources->binding, sources->program};
@@ -318,8 +319,7 @@ ProductBackedRuntimeParticipantResolver::ResolveOperationTarget(
       throw std::invalid_argument("no exact retained Program Binding");
     const auto program =
         held.program ? std::move(held.program)
-                     : LoadProgram(binding->value().program_id,
-                                   binding->value().program_revision);
+                     : LoadProgram(binding->value().program_revision);
     if (!program ||
         program->value().node_environment != binding->value().node_environment)
       throw std::invalid_argument("no exact canonical Program");
@@ -638,6 +638,160 @@ ProductBackedRuntimeParticipantResolver::BindCollisionBodyAliases(
       std::move(binding), collision_body_aliases_);
 }
 
+core::Result<std::vector<core::CollisionRule>>
+ProductBackedRuntimeParticipantResolver::ResolveCellCollisionRules(
+    const std::vector<core::CollisionRuleDTO> &rules) const {
+  using Reply = core::Result<std::vector<core::CollisionRule>>;
+  const auto refuse = [](const core::CollisionRuleDTO &rule, std::string message,
+                         std::string reason,
+                         std::map<std::string, std::string> details = {}) {
+    details.emplace("reason", std::move(reason));
+    details.emplace("collision_rule_id", rule.rule_id);
+    return Reply::Err(core::ErrorDTO{
+        std::string(core::to_string(core::ErrorCode::kInvalidCollisionRule)),
+        "Deployment collision rule " + rule.rule_id + ": " + std::move(message),
+        std::move(details)});
+  };
+  const auto &bodies = retained_model_map_.model_collision_bodies();
+  // The physical bodies of one collision body (role): its semantic ids, then
+  // the physical body each one is projected to (a link named by two bodies is
+  // one physical body). Sorted, unique; empty when the cell has none.
+  const auto role_body_ids = [&](const core::ControllableComponentId &component_id,
+                                 const std::string &role) {
+    std::vector<core::CollisionBodyId> ids;
+    for (const auto &candidate : bodies) {
+      if (candidate.owner_component_id != component_id ||
+          candidate.collision_body_role_id.value() != role) {
+        continue;
+      }
+      for (std::size_t index = 0U; index < candidate.compiled_link_names.size(); ++index) {
+        const auto semantic = core::make_component_collision_body_id(
+            component_id, candidate.model_instance_id, candidate.collision_body_role_id, index);
+        const auto alias = std::find_if(
+            collision_body_aliases_.begin(), collision_body_aliases_.end(),
+            [&](const core::RuntimeCollisionBodyAliasDTO &row) {
+              return row.semantic_body_id == semantic;
+            });
+        if (alias != collision_body_aliases_.end()) {
+          ids.push_back(alias->projected_body_id);
+        }
+      }
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    return ids;
+  };
+  std::vector<core::CollisionRule> resolved;
+  resolved.reserve(rules.size());
+  for (const auto &rule : rules) {
+    core::CollisionRule out{rule.rule_id, {}, {}, rule.value};
+    std::optional<Reply> refusal;
+    const auto resolve_side =
+        [&](const std::vector<core::CollisionRuleSelectionDTO> &selections,
+            std::vector<core::CollisionRuleSelection> &side) {
+          side.reserve(selections.size());
+          for (const auto &selection : selections) {
+            if (const auto *component =
+                    std::get_if<core::CollisionRuleComponentSelection>(&selection)) {
+              side.emplace_back(*component);
+            } else if (const auto *link =
+                           std::get_if<core::CollisionRuleLinkSelection>(&selection)) {
+              side.emplace_back(*link);
+            } else if (const auto *attached =
+                           std::get_if<core::CollisionRuleAttachedObjectSelection>(
+                               &selection)) {
+              if (!attached->collision_body_role_id) {
+                side.emplace_back(*attached);
+                continue;
+              }
+              // The objects carried by one collision body (OD-371).
+              auto ids = role_body_ids(attached->component_id,
+                                       *attached->collision_body_role_id);
+              if (ids.empty()) {
+                refusal = refuse(
+                    rule, "collision body is not in the cell's collision model",
+                    "collision_rule_selection_unresolved",
+                    {{"component_id", attached->component_id.value()},
+                     {"collision_body_id", *attached->collision_body_role_id}});
+                return;
+              }
+              side.emplace_back(
+                  core::CollisionRuleResolvedAttachedObjectSelection{std::move(ids)});
+            } else if (std::holds_alternative<core::CollisionRuleSceneObjectsSelection>(
+                           selection)) {
+              side.emplace_back(core::CollisionRuleSceneObjectsSelection{});
+            } else if (const auto *group =
+                           std::get_if<core::CollisionRuleModelGroupSelection>(
+                               &selection)) {
+              // The physical bodies of the group's links that carry a
+              // collision body, as a collision body selection resolves them.
+              const auto links = deployment::model_group_compiled_links(
+                  retained_model_map_, group->component_id, group->group);
+              core::CollisionRuleResolvedBodiesSelection ids;
+              for (const auto &candidate : bodies) {
+                if (candidate.owner_component_id != group->component_id) continue;
+                for (std::size_t index = 0U;
+                     index < candidate.compiled_link_names.size(); ++index) {
+                  if (!std::binary_search(links.begin(), links.end(),
+                                          candidate.compiled_link_names[index]))
+                    continue;
+                  const auto semantic = core::make_component_collision_body_id(
+                      group->component_id, candidate.model_instance_id,
+                      candidate.collision_body_role_id, index);
+                  const auto alias = std::find_if(
+                      collision_body_aliases_.begin(), collision_body_aliases_.end(),
+                      [&](const core::RuntimeCollisionBodyAliasDTO &row) {
+                        return row.semantic_body_id == semantic;
+                      });
+                  if (alias != collision_body_aliases_.end())
+                    ids.collision_body_ids.push_back(alias->projected_body_id);
+                }
+              }
+              if (ids.collision_body_ids.empty()) {
+                refusal = refuse(
+                    rule, "model group has no collision body in the cell's collision model",
+                    "collision_rule_selection_unresolved",
+                    {{"component_id", group->component_id.value()},
+                     {"model_group", group->group}});
+                return;
+              }
+              std::sort(ids.collision_body_ids.begin(), ids.collision_body_ids.end());
+              ids.collision_body_ids.erase(
+                  std::unique(ids.collision_body_ids.begin(),
+                              ids.collision_body_ids.end()),
+                  ids.collision_body_ids.end());
+              side.emplace_back(std::move(ids));
+            } else if (const auto *body =
+                           std::get_if<core::CollisionRuleCollisionBodySelection>(
+                               &selection)) {
+              core::CollisionRuleResolvedBodiesSelection ids{role_body_ids(
+                  body->body.component_id, body->body.collision_body_id.value())};
+              if (ids.collision_body_ids.empty()) {
+                refusal = refuse(
+                    rule, "collision body is not in the cell's collision model",
+                    "collision_rule_selection_unresolved",
+                    {{"component_id", body->body.component_id.value()},
+                     {"collision_body_id", body->body.collision_body_id.value()}});
+                return;
+              }
+              side.emplace_back(std::move(ids));
+            } else {
+              // One Scene object and the TCP's contact bodies exist per move.
+              refusal = refuse(rule,
+                               "selection is available on a motion's rules only",
+                               "collision_rule_selection_invalid");
+              return;
+            }
+          }
+        };
+    resolve_side(rule.a, out.a);
+    if (!refusal) resolve_side(rule.b, out.b);
+    if (refusal) return std::move(*refusal);
+    resolved.push_back(std::move(out));
+  }
+  return Reply::Ok(std::move(resolved));
+}
+
 std::set<core::ControllableComponentId>
 ProductBackedRuntimeParticipantResolver::SelfAndMounted(
     const core::ControllableComponentId &robot) const {
@@ -671,23 +825,20 @@ ProductBackedRuntimeParticipantResolver::ActiveTcpContactBodies(
 
 std::shared_ptr<const deployment::ProgramBindingContract>
 ProductBackedRuntimeParticipantResolver::LoadProgram(
-    const core::ProgramId &program_id,
     const core::ProgramRevision &program_revision) const {
   if (artifact_programs_) {
-    auto program = artifact_programs_->get_verified(
-        program_id, program_revision, *retained_bundle_);
+    auto program = artifact_programs_->get_verified(program_revision, *retained_bundle_);
     if (program)
       return program;
   }
-  return programs_.get_verified(program_id, program_revision,
-                                *retained_bundle_);
+  return programs_.get_verified(program_revision, *retained_bundle_);
 }
 
-core::Result<core::FrameRoleId>
+core::Result<core::ProgramFrameReferenceDTO>
 ProductBackedRuntimeParticipantResolver::ResolveAttachActiveTcp(
     const core::ProgramBindingId &binding_id, const core::ProgramTargetReferenceDTO &holder_ref,
     const std::function<std::optional<ActiveTcp>(const core::ControllableComponentId &)> &read) const {
-  using Reply = core::Result<core::FrameRoleId>;
+  using Reply = core::Result<core::ProgramFrameReferenceDTO>;
   std::shared_ptr<const deployment::ProgramBinding> binding;
   try {
     binding = LoadProgramBinding(binding_id);
@@ -715,9 +866,16 @@ ProductBackedRuntimeParticipantResolver::ResolveAttachActiveTcp(
     const auto active = read(robot);
     if (!active || !active->value() || !active->reference())
       return Reply::Err({"attach_active_tcp_unavailable", "The holder's robot has no Active TCP", {}});
+    const auto &frame = active->reference()->frame;
+    // OD-372: on a robot holder, the TCP of a tool mounted on the robot is a
+    // frame its kinematics places, unless it is on a moving part of the tool.
+    if (frame.component_id != holder->target.component_id &&
+        index.places_mounted_frame(holder->target.component_id,
+                                   active->value()->frame.compiled_frame_name))
+      return Reply::Ok(frame);
     if (active->reference()->target != holder_ref ||
         !index.carries(robot, holder->target.component_id) ||
-        active->reference()->frame.component_id != holder->target.component_id)
+        frame.component_id != holder->target.component_id)
       return Reply::Err({"attach_active_tcp_not_holder", "Active TCP does not belong to the holder", {}});
     const auto *target = retained_model_map_.find_target(
         holder->target.component_id, holder->target.command_target_id);
@@ -730,7 +888,7 @@ ProductBackedRuntimeParticipantResolver::ResolveAttachActiveTcp(
                  model->compiled_frame_name == active->value()->frame.compiled_frame_name;
         }))
       return Reply::Err({"attach_active_tcp_not_holder", "Active TCP frame is not a holder frame", {}});
-    return Reply::Ok(active->reference()->frame.frame_id);
+    return Reply::Ok(frame);
   }
   return Reply::Err({"attach_active_tcp_unavailable", "The holder has no carrying robot", {}});
 }
@@ -846,8 +1004,7 @@ ProductBackedRuntimeParticipantResolver::ResolveObservationTarget(
         if (!binding) {
           throw std::invalid_argument("no exact retained Program Binding");
         }
-        const auto program = LoadProgram(binding->value().program_id,
-                                         binding->value().program_revision);
+        const auto program = LoadProgram(binding->value().program_revision);
         if (!program || program->value().node_environment !=
                             binding->value().node_environment) {
           throw std::invalid_argument("no exact canonical Program");
@@ -959,8 +1116,7 @@ ProductBackedRuntimeParticipantResolver::ResolveProgramCapture(
     if (!selected_binding.ok())
       return core::Result<core::ProgramRunExecutionCaptureDTO>::Err(
           selected_binding.error());
-    const auto program =
-        LoadProgram(capture.program_id, capture.program_revision);
+    const auto program = LoadProgram(capture.program_revision);
     return detail::ResolveSealedProgramCapture(std::move(capture), program,
                                                binding, *retained_bundle_);
   } catch (const std::exception &exception) {
@@ -1178,7 +1334,6 @@ ProductBackedRuntimeParticipantResolver::Resolve(
     if (binding == nullptr)
       binding = LoadProgramBinding(operation.program_binding_id);
     if (binding == nullptr ||
-        binding->value().program_id != operation.program_id ||
         binding->value().program_revision != operation.program_revision) {
       return Reject<core::RuntimeParticipantBinding>(
           "operation has no exact generated Program Binding in the active "
@@ -1187,7 +1342,7 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           core::ErrorCode::kMissingReference);
     }
     if (program == nullptr)
-      program = LoadProgram(operation.program_id, operation.program_revision);
+      program = LoadProgram(operation.program_revision);
     if (program == nullptr || program->value().node_environment !=
                                   binding->value().node_environment) {
       return Reject<core::RuntimeParticipantBinding>(

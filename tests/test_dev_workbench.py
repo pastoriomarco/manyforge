@@ -422,7 +422,6 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
     assert "--projection-root" not in commands["Manager"]
     assert not (tmp_path / "state/current/publications").exists()
     manager_command = commands["Manager"]
-    assert manager_command[manager_command.index("--logical-scene-database") + 1] == str(tmp_path / "state/current/logical-scene.sqlite3")
     assert manager_command[manager_command.index("--execution-state-root") + 1] == str(tmp_path / "state/current/execution-state")
     assert workbench.project_path is None and workbench.scenario_id is None
     assert "--startup-scenario-document" not in workbench._composer_command("http://headless")
@@ -443,7 +442,14 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
     assert workbench._vite_command == (
         "/usr/bin/node", str(dev_workbench.FRONTEND_ROOT / "node_modules/vite/bin/vite.js"),
         "--host", "0.0.0.0", "--port", "4")
-    assert "MANYFORGE_FS_ROOTS" in document["processes"][2]["environment"]
+    # Composer and Headless read below the same folders: the examples
+    # (Composer's default browse folder), the mounted project folders and
+    # ManyForge's own content root, the workbench folder (OD-335).
+    read_roots = document["processes"][2]["environment"]["MANYFORGE_FS_ROOTS"]
+    assert read_roots.split(",")[0] == str(dev_workbench.WORKSPACE / "examples")
+    assert read_roots.split(",")[-1] == str(dev_workbench.WORKSPACE)
+    assert document["processes"][0]["environment"] == {"MANYFORGE_FS_ROOTS": read_roots}
+    assert "--scene-asset-root" not in commands["Manager"]
     assert all("--owner-id" not in row["argv"] for row in document["processes"])
     assert prepared["manager_environment"] == {
         "MANYFORGE_COMPOSER_URL": "http://127.0.0.1:3",
@@ -575,7 +581,9 @@ def test_ros_start_guard_admits_model_free_components_beside_ros2_control(
             "/fixture", allowed_roots=[REPOSITORY_ROOT / "examples"])
 
 
-def test_ros_bootstrap_captures_io_provider_scenario() -> None:
+def test_ros_bootstrap_captures_io_provider_scenario(monkeypatch: Any) -> None:
+    # As in the container: the workbench folder is this checkout.
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
     captured, source = dev_workbench._capture_ros_bootstrap_project(
         str(REPOSITORY_ROOT / "examples/real_lite6_pneumatic_pick_and_place.scenario"),
         allowed_roots=[REPOSITORY_ROOT / "examples"],
@@ -595,13 +603,28 @@ def test_ros_bootstrap_captures_authored_program_and_uses_production_preparer(
     from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
     from manyforge_headless_api import activation_preparer
 
+    # As in the container: the workbench folder is this checkout, so the
+    # example's model sources (manyforge_example_models) resolve.
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
     captured, source = dev_workbench._capture_ros_bootstrap_project(
         str(REPOSITORY_ROOT / "examples/sim_ur10e_pick_and_place.scenario"),
         allowed_roots=[REPOSITORY_ROOT / "examples"],
     )
     assert source.endswith("/examples/sim_ur10e_pick_and_place.scenario")
-    assert captured["program"]["api_version"] == "manyforge.program.v3"
+    assert captured["program"]["api_version"] == "manyforge.program.v4"
     assert captured["model_source_closure"]["components"]
+    # The Program's scene meshes resolve against the Scenario project folder.
+    meshes = captured["scene_mesh_closure"]["meshes"]
+    assert captured["scene_mesh_closure"]["schema_version"] == (
+        "manyforge.activation_scene_mesh_closure.v1")
+    assert [row["resource_uri"] for row in meshes] == sorted(
+        f"../isaac_manipulator_scene_light/meshes/{name}" for name in (
+            "mac_n_cheese_centered_collider_cooked.obj",
+            "World__small_KLT_collider_primitives.obj",
+            "World__small_KLT_01_collider_primitives.obj",
+            "World__soup_can_collider_cooked.obj",
+            "background__table_low_327_collider_cooked.obj",
+        ))
     assert sorted(
         component["configuration"]["runtime_kind"]
         for component in captured["deployment"]["components"]
@@ -851,14 +874,14 @@ def test_composer_roots_include_launcher_mounted_folders(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
     examples = tmp_path / "examples"
-    monkeypatch.delenv("MANYFORGE_DEV_PROJECT_ROOTS", raising=False)
-    assert dev_workbench._composer_filesystem_roots(examples) == str(examples)
     monkeypatch.setenv(
         "MANYFORGE_DEV_PROJECT_ROOTS",
         "/projects/first,/projects/second",
     )
-    assert dev_workbench._composer_filesystem_roots(examples) == (
-        f"{examples},/projects/first,/projects/second"
+    # The examples stay the first (default browse) folder; ManyForge's own
+    # content root comes last.
+    assert dev_workbench._read_filesystem_roots(examples) == (
+        examples, Path("/projects/first"), Path("/projects/second"), dev_workbench.WORKSPACE,
     )
 
 

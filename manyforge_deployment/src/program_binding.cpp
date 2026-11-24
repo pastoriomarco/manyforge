@@ -1,4 +1,3 @@
-#include "program_contact_envelope_codec.hpp"
 #include "manyforge_deployment/program_binding.hpp"
 
 #include <algorithm>
@@ -17,6 +16,7 @@
 #include <variant>
 #include <vector>
 
+#include "activation_generated_tool_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "manyforge_core/types/command_schema.hpp"
 #include "manyforge_core/types/collision_world_snapshot.hpp"
@@ -68,15 +68,6 @@ constexpr std::size_t kMaximumCompiledNameBytes = 4096U;
     fail(std::string(path) + ": expected string");
   }
   return *string;
-}
-
-[[nodiscard]] double require_number(const CanonicalValue& value,
-                                    std::string_view path) {
-  const auto* number = std::get_if<double>(&value.storage());
-  if (number == nullptr || !std::isfinite(*number)) {
-    fail(std::string(path) + ": expected finite number");
-  }
-  return *number;
 }
 
 [[nodiscard]] const CanonicalValue& require_member(
@@ -456,11 +447,10 @@ void validate_source_record(const core::RetainedSourceRecordDTO& record,
 
 void normalize_and_validate(core::ProgramBindingDTO& value) {
   if (value.api_version != core::kProgramBindingApiVersion) {
-    fail("program_binding.api_version: expected manyforge.program_binding.v3");
+    fail("program_binding.api_version: expected manyforge.program_binding.v4");
   }
   require_digest(value.program_binding_id.value(),
                  "program_binding.program_binding_id");
-  require_identity(value.program_id.value(), "program_binding.program_id");
   require_digest(value.program_revision.value(),
                  "program_binding.program_revision");
   require_digest(value.retained_bundle_id.value(),
@@ -733,72 +723,76 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
               [](const auto& policy) { return policy.instance_id; },
               "program_binding.node_policies");
 
-  if (value.contact_grasp_bindings.size() >
-      core::kMaxProgramRoleBindings) {
-    fail("contact-grasp binding table exceeds fixed bound");
+  if (value.collision_rule_bodies.size() > core::kMaxProgramRoleBindings) {
+    fail("collision-rule body table exceeds fixed bound");
   }
-  for (auto& policy : value.contact_grasp_bindings) {
-    require_identity(policy.contact_policy_id.value(),
-                     "contact_grasp_bindings.contact_policy_id");
-    require_digest(policy.contact_policy_revision.value(),
-                   "contact_grasp_bindings.contact_policy_revision");
-    require_identity(policy.runtime_object_id.value(),
-                     "contact_grasp_bindings.runtime_object_id");
-    if ((policy.bodies_from_motion_endpoint != policy.allowed_body_bindings.empty()) ||
-        policy.allowed_body_bindings.size() >
-            core::kMaxProgramNestedRoleBindings ||
-        !core::valid_program_contact_envelope(policy.envelope)) {
-      fail("contact-grasp binding envelope is empty, oversized, or invalid");
+  for (const auto& body : value.collision_rule_bodies) {
+    validate_body_reference(body.body, "collision_rule_bodies.body");
+    if (body.model_role_id.has_value()) {
+      require_identity(body.model_role_id->value(),
+                       "collision_rule_bodies.model_role_id");
     }
-    for (const auto& body : policy.allowed_body_bindings) {
-      validate_body_reference(body.body, "contact_grasp_body_bindings.body");
-      if (body.model_role_id.has_value()) {
-        require_identity(body.model_role_id->value(),
-                         "contact_grasp_body_bindings.model_role_id");
+    require_identity(body.model_instance_id.value(),
+                     "collision_rule_bodies.model_instance_id");
+    require_digest(body.model_revision.value(),
+                   "collision_rule_bodies.model_revision");
+    if (body.collision_body_ids.empty() ||
+        body.collision_body_ids.size() >
+            core::kMaxProgramNestedRoleBindings) {
+      fail("collision-rule body binding has an invalid body-id count");
+    }
+    for (std::size_t index = 0U; index < body.collision_body_ids.size();
+         ++index) {
+      require_text(body.collision_body_ids[index],
+                   "collision_rule_bodies.collision_body_ids");
+      if (body.collision_body_ids[index] !=
+          core::make_component_collision_body_id(
+              body.body.component_id, body.model_instance_id,
+              body.body.collision_body_id, index)) {
+        fail("collision-rule body id differs from its exact resolved scope");
       }
-      require_identity(body.model_instance_id.value(),
-                       "contact_grasp_body_bindings.model_instance_id");
-      require_digest(body.model_revision.value(),
-                     "contact_grasp_body_bindings.model_revision");
-      if (body.collision_body_ids.empty() ||
-          body.collision_body_ids.size() >
-              core::kMaxProgramNestedRoleBindings) {
-        fail("contact-grasp body binding has an invalid body-id count");
-      }
-      for (std::size_t index = 0U; index < body.collision_body_ids.size();
-           ++index) {
-        require_text(body.collision_body_ids[index],
-                     "contact_grasp_body_bindings.collision_body_ids");
-        if (body.collision_body_ids[index] !=
-            core::make_component_collision_body_id(
-                body.body.component_id, body.model_instance_id,
-                body.body.collision_body_id, index)) {
-          fail("contact-grasp body id differs from its exact resolved scope");
-        }
-      }
+    }
 
-      const auto collision = std::lower_bound(value.collision_body_bindings.begin(), value.collision_body_bindings.end(), body.body,
-          [](const auto& row, const auto& key) { return row.reference < key; });
-      if (collision == value.collision_body_bindings.end() || collision->reference != body.body || collision->model_instance_id != body.model_instance_id || collision->model_revision != body.model_revision || collision->compiled_collision_body_names.size() != body.collision_body_ids.size())
-        fail("contact-grasp body differs from its collision-body binding");
-      if (body.model_role_id) {
-        const auto component = std::lower_bound(value.component_bindings.begin(), value.component_bindings.end(), body.body.component_id,
-            [](const auto& row, const auto& key) { return row.component_id < key; });
-        if (component == value.component_bindings.end() || component->component_id != body.body.component_id ||
-            std::count_if(component->model_bindings.begin(), component->model_bindings.end(), [&](const auto& model) { return model.model_role_id == *body.model_role_id && model.model_instance_id == body.model_instance_id && model.model_revision == body.model_revision; }) != 1)
-          fail("contact-grasp model role differs from the component binding");
-      }
+    const auto collision = std::lower_bound(value.collision_body_bindings.begin(), value.collision_body_bindings.end(), body.body,
+        [](const auto& row, const auto& key) { return row.reference < key; });
+    if (collision == value.collision_body_bindings.end() || collision->reference != body.body || collision->model_instance_id != body.model_instance_id || collision->model_revision != body.model_revision || collision->compiled_collision_body_names.size() != body.collision_body_ids.size())
+      fail("collision-rule body differs from its collision-body binding");
+    if (body.model_role_id) {
+      const auto component = std::lower_bound(value.component_bindings.begin(), value.component_bindings.end(), body.body.component_id,
+          [](const auto& row, const auto& key) { return row.component_id < key; });
+      if (component == value.component_bindings.end() || component->component_id != body.body.component_id ||
+          std::count_if(component->model_bindings.begin(), component->model_bindings.end(), [&](const auto& model) { return model.model_role_id == *body.model_role_id && model.model_instance_id == body.model_instance_id && model.model_revision == body.model_revision; }) != 1)
+        fail("collision-rule body model role differs from the component binding");
     }
-    sort_unique(
-        policy.allowed_body_bindings,
-        [](const auto& body) {
-          return std::tie(body.body, body.model_role_id);
-        },
-        "contact_grasp_bindings.allowed_body_bindings");
   }
-  sort_unique(value.contact_grasp_bindings,
-              [](const auto& policy) { return policy.contact_policy_id; },
-              "contact_grasp_bindings");
+  sort_unique(value.collision_rule_bodies,
+              [](const auto& body) { return body.body; },
+              "collision_rule_bodies");
+
+  // OD-371: every slider is one of the collision-rule bodies; a unit axis,
+  // a stroke and a step above 0.
+  if (value.collision_rule_spring_sliders.size() > core::kMaxProgramRoleBindings) {
+    fail("collision-rule spring slider table exceeds fixed bound");
+  }
+  for (const auto& slider : value.collision_rule_spring_sliders) {
+    validate_body_reference(slider.body, "collision_rule_spring_sliders.body");
+    const auto body = std::lower_bound(
+        value.collision_rule_bodies.begin(), value.collision_rule_bodies.end(),
+        slider.body, [](const auto& row, const auto& key) { return row.body < key; });
+    if (body == value.collision_rule_bodies.end() || body->body != slider.body) {
+      fail("collision-rule spring slider is not a collision-rule body");
+    }
+    const double length = std::hypot(slider.axis[0], slider.axis[1], slider.axis[2]);
+    if (!std::isfinite(length) || std::abs(length - 1.0) > 1e-9 ||
+        !std::isfinite(slider.stroke_m) || !(slider.stroke_m > 0.0) ||
+        !std::isfinite(slider.max_compression_step_m) ||
+        !(slider.max_compression_step_m > 0.0)) {
+      fail("collision-rule spring slider has an invalid axis, stroke or step");
+    }
+  }
+  sort_unique(value.collision_rule_spring_sliders,
+              [](const auto& slider) { return slider.body; },
+              "collision_rule_spring_sliders");
 
   require_digest(
       value.provenance.binding_compiler_contract_digest.value(),
@@ -966,8 +960,6 @@ template <typename StrongType>
   MANYFORGE_PARSE_SOURCE_RECORD(kCapabilityDefinition,
                                 "capability_definition", CapabilityId,
                                 CapabilityDefinitionRevision)
-  MANYFORGE_PARSE_SOURCE_RECORD(kContactPolicy, "contact_policy",
-                                ContactPolicyId, ContactPolicyRevision)
   MANYFORGE_PARSE_SOURCE_RECORD(kStopEvidencePolicy, "stop_evidence_policy",
                                 StopEvidencePolicyId,
                                 StopEvidencePolicyRevision)
@@ -1052,18 +1044,52 @@ template <typename Parse>
                          child_path(path, "compiled_frame_name"))};
 }
 
+// The optional `collision_rule_spring_sliders`: absent when empty.
+[[nodiscard]] std::vector<core::ProgramSpringSliderBindingDTO> parse_spring_sliders(
+    const CanonicalValue* value) {
+  if (value == nullptr) return {};
+  constexpr std::string_view label = "program_binding.collision_rule_spring_sliders";
+  const auto& rows = require_array(*value, label);
+  if (rows.empty() || rows.size() > core::kMaxProgramRoleBindings)
+    fail(std::string(label) + ": is absent when empty and within its bound");
+  const auto number = [](const CanonicalValue& member, const std::string& path) {
+    const auto* result = std::get_if<double>(&member.storage());
+    if (result == nullptr) fail(path + ": expected a number");
+    return *result;
+  };
+  std::vector<core::ProgramSpringSliderBindingDTO> result;
+  result.reserve(rows.size());
+  for (std::size_t index = 0U; index < rows.size(); ++index) {
+    const auto path = index_path(label, index);
+    const auto& row = require_object(rows[index], path);
+    require_exact_fields(row, {"body", "axis", "stroke_m", "max_compression_step_m"}, path);
+    const auto& axis = require_array(require_member(row, "axis", path), child_path(path, "axis"));
+    if (axis.size() != 3U) fail(child_path(path, "axis") + ": expected 3 numbers");
+    core::ProgramSpringSliderBindingDTO slider{
+        parse_body_reference(require_member(row, "body", path), child_path(path, "body"))};
+    for (std::size_t axis_index = 0U; axis_index < 3U; ++axis_index)
+      slider.axis[axis_index] = number(axis[axis_index], child_path(path, "axis"));
+    slider.stroke_m = number(require_member(row, "stroke_m", path), child_path(path, "stroke_m"));
+    slider.max_compression_step_m =
+        number(require_member(row, "max_compression_step_m", path),
+               child_path(path, "max_compression_step_m"));
+    result.push_back(std::move(slider));
+  }
+  return result;
+}
+
 [[nodiscard]] core::ProgramBindingDTO parse_program_binding(
     const CanonicalValue& value) {
   const auto& root = require_object(value, "program_binding");
-  require_exact_fields(
+  require_fields(
       root,
-      {"api_version", "program_binding_id", "program_id",
-       "program_revision", "retained_bundle_id", "graph_revision",
-       "node_environment", "component_bindings",
+      {"api_version", "program_binding_id", "program_revision",
+       "retained_bundle_id", "graph_revision", "node_environment",
+       "component_bindings",
        "target_bindings", "frame_bindings", "collision_body_bindings",
-       "signal_bindings", "node_policies", "contact_grasp_bindings",
+       "signal_bindings", "node_policies", "collision_rule_bodies",
        "provenance"},
-      "program_binding");
+      {"collision_rule_spring_sliders"}, "program_binding");
 
   const auto& node_environment = require_object(
       require_member(root, "node_environment", "program_binding"),
@@ -1391,106 +1417,45 @@ template <typename Parse>
         parse_program_node_policy(node_policy_values[index], path));
   }
 
-  const auto& contact_values = require_array(
-      require_member(root, "contact_grasp_bindings", "program_binding"),
-      "program_binding.contact_grasp_bindings");
-  if (contact_values.size() > core::kMaxProgramRoleBindings) {
-    fail("program_binding.contact_grasp_bindings: exceeds fixed bound");
+  const auto& rule_body_values = require_array(
+      require_member(root, "collision_rule_bodies", "program_binding"),
+      "program_binding.collision_rule_bodies");
+  if (rule_body_values.size() > core::kMaxProgramRoleBindings) {
+    fail("program_binding.collision_rule_bodies: exceeds fixed bound");
   }
-  std::vector<core::ProgramContactGraspBindingDTO> contact_bindings;
-  contact_bindings.reserve(contact_values.size());
-  for (std::size_t policy_index = 0U;
-       policy_index < contact_values.size(); ++policy_index) {
-    const std::string policy_path =
-        index_path("program_binding.contact_grasp_bindings", policy_index);
-    const auto& policy = require_object(contact_values[policy_index],
-                                        policy_path);
-    const auto* mode = find_member(policy, "mode");
-    const bool release = mode != nullptr;
-    if (release) {
-      if (require_string(*mode, child_path(policy_path, "mode")) != "contact_release")
-        fail(policy_path + ": unsupported contact mode");
-      require_fields(policy,
-          {"contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings",
-           "mode", "release_evidence_mode", "enforce_max_start_penetration", "max_start_penetration_m",
-           "min_release_progress_m", "release_tolerance_m", "require_strictly_decreasing_penetration",
-           "require_separation_by_end", "allow_recontact"}, {"bodies_from_motion_endpoint"}, policy_path);
-    } else {
-      require_fields(policy, {"contact_policy_id", "contact_policy_revision", "runtime_object_id",
-          "allowed_body_bindings", "max_penetration_m", "terminal_window_start_fraction"},
-          {"bodies_from_motion_endpoint"}, policy_path);
+  std::vector<core::ProgramCollisionRuleBodyBindingDTO> collision_rule_bodies;
+  collision_rule_bodies.reserve(rule_body_values.size());
+  for (std::size_t body_index = 0U; body_index < rule_body_values.size();
+       ++body_index) {
+    const std::string body_path =
+        index_path("program_binding.collision_rule_bodies", body_index);
+    const auto& body = require_object(rule_body_values[body_index], body_path);
+    require_exact_fields(
+        body,
+        {"body", "model_role_id", "model_instance_id",
+         "model_revision", "collision_body_ids"},
+        body_path);
+    std::optional<core::ModelRoleId> model_role;
+    const auto& model_role_value =
+        require_member(body, "model_role_id", body_path);
+    if (!std::holds_alternative<std::nullptr_t>(
+            model_role_value.storage())) {
+      model_role = parse_identity<core::ModelRoleId>(
+          model_role_value, child_path(body_path, "model_role_id"));
     }
-    bool bodies_from_motion_endpoint = false;
-    if (const auto* supplied = find_member(policy, "bodies_from_motion_endpoint")) {
-      const auto* selected = std::get_if<bool>(&supplied->storage());
-      if (selected == nullptr || !*selected) {
-        fail(policy_path + ": bodies_from_motion_endpoint must be true or omitted");
-      }
-      bodies_from_motion_endpoint = true;
-    }
-    const std::string bodies_path =
-        child_path(policy_path, "allowed_body_bindings");
-    const auto& body_values = require_array(
-        require_member(policy, "allowed_body_bindings", policy_path),
-        bodies_path);
-    if ((bodies_from_motion_endpoint != body_values.empty()) ||
-        body_values.size() > core::kMaxProgramNestedRoleBindings) {
-      fail(bodies_path + ": endpoint/explicit body-selector shape or fixed bound is invalid");
-    }
-    std::vector<core::ProgramContactGraspBodyBindingDTO> bodies;
-    bodies.reserve(body_values.size());
-    for (std::size_t body_index = 0U; body_index < body_values.size();
-         ++body_index) {
-      const std::string body_path = index_path(bodies_path, body_index);
-      const auto& body = require_object(body_values[body_index], body_path);
-      require_exact_fields(
-          body,
-          {"body", "model_role_id", "model_instance_id",
-           "model_revision", "collision_body_ids"},
-          body_path);
-      std::optional<core::ModelRoleId> model_role;
-      const auto& model_role_value =
-          require_member(body, "model_role_id", body_path);
-      if (!std::holds_alternative<std::nullptr_t>(
-              model_role_value.storage())) {
-        model_role = parse_identity<core::ModelRoleId>(
-            model_role_value, child_path(body_path, "model_role_id"));
-      }
-      const auto body_id_values = parse_string_array(
-          require_member(body, "collision_body_ids", body_path),
-          child_path(body_path, "collision_body_ids"), true);
-      bodies.push_back(core::ProgramContactGraspBodyBindingDTO{
-          parse_body_reference(require_member(body, "body", body_path), child_path(body_path, "body")),
-          std::move(model_role),
-          parse_identity<core::ModelInstanceId>(
-              require_member(body, "model_instance_id", body_path),
-              child_path(body_path, "model_instance_id")),
-          parse_digest<core::ModelRevision>(
-              require_member(body, "model_revision", body_path),
-              child_path(body_path, "model_revision")),
-          body_id_values});
-    }
-    contact_bindings.push_back(core::ProgramContactGraspBindingDTO{
-        parse_identity<core::ContactPolicyId>(
-            require_member(policy, "contact_policy_id", policy_path),
-            child_path(policy_path, "contact_policy_id")),
-        parse_digest<core::ContactPolicyRevision>(
-            require_member(policy, "contact_policy_revision", policy_path),
-            child_path(policy_path, "contact_policy_revision")),
-        parse_identity<core::RuntimeObjectId>(
-            require_member(policy, "runtime_object_id", policy_path),
-            child_path(policy_path, "runtime_object_id")),
-        std::move(bodies),
-        [&]() -> core::ContactZoneEnvelopeDTO {
-          if (release) return detail::parse_program_contact_envelope(policy, true, true);
-          return core::ContactGraspEnvelopeDTO{
-              require_number(require_member(policy, "max_penetration_m", policy_path),
-                             child_path(policy_path, "max_penetration_m")),
-              require_number(
-                  require_member(policy, "terminal_window_start_fraction", policy_path),
-                  child_path(policy_path, "terminal_window_start_fraction"))};
-        }(),
-        bodies_from_motion_endpoint});
+    const auto body_id_values = parse_string_array(
+        require_member(body, "collision_body_ids", body_path),
+        child_path(body_path, "collision_body_ids"), true);
+    collision_rule_bodies.push_back(core::ProgramCollisionRuleBodyBindingDTO{
+        parse_body_reference(require_member(body, "body", body_path), child_path(body_path, "body")),
+        std::move(model_role),
+        parse_identity<core::ModelInstanceId>(
+            require_member(body, "model_instance_id", body_path),
+            child_path(body_path, "model_instance_id")),
+        parse_digest<core::ModelRevision>(
+            require_member(body, "model_revision", body_path),
+            child_path(body_path, "model_revision")),
+        body_id_values});
   }
 
   const auto& provenance = require_object(
@@ -1543,9 +1508,6 @@ template <typename Parse>
       parse_digest<core::ProgramBindingId>(
           require_member(root, "program_binding_id", "program_binding"),
           "program_binding.program_binding_id"),
-      parse_identity<core::ProgramId>(
-          require_member(root, "program_id", "program_binding"),
-          "program_binding.program_id"),
       parse_digest<core::ProgramRevision>(
           require_member(root, "program_revision", "program_binding"),
           "program_binding.program_revision"),
@@ -1587,8 +1549,9 @@ template <typename Parse>
                              "program_binding.provenance"),
               "program_binding.provenance.resolved_output_records"),
       },
-      std::move(contact_bindings),
+      std::move(collision_rule_bodies),
       std::move(node_policies),
+      parse_spring_sliders(find_member(root, "collision_rule_spring_sliders")),
   };
   core::ProgramBindingDTO normalized = result;
   normalize_and_validate(normalized);
@@ -1807,6 +1770,16 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
     if (matches.size() != 1U || matches.front() != body)
       fail("body binding differs from the exact retained model map");
   }
+  for (const auto& slider : binding.collision_rule_spring_sliders) {
+    const auto retained = detail::generated_spring_slider(
+        qualified_program_component_type(slider.body.component_id, retained_bundle,
+                                         catalog_source),
+        slider.body.collision_body_id.value());
+    if (!retained || retained->axis != slider.axis ||
+        retained->stroke_m != slider.stroke_m ||
+        retained->max_compression_step_m != slider.max_compression_step_m)
+      fail("spring slider binding differs from the retained generated tool");
+  }
   for (const auto& signal : binding.signal_bindings) {
     const auto matches = FindProgramSignalMatches(io_catalog.value(), signal.reference);
     if (matches.size() != 1U)
@@ -1833,7 +1806,7 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
     if (!target_type) fail("target binding has no exact qualified component-type target");
     const auto expected_associations = reference_probe::resolve_target_frame_associations(
         target_binding.target, target_binding.frame_references, *target_type, *target,
-        retained_model_map, binding.frame_bindings);
+        graph, retained_model_map, binding.frame_bindings);
     if (expected_associations != target_binding.frame_associations)
       fail("target frame contact associations differ from the exact retained catalog");
     const auto* retained_default = retained_model_map.kinematic_index().default_tcp_of(target_binding.target.component_id);
@@ -2239,47 +2212,27 @@ CanonicalValue program_binding_projection(
     node_policies.emplace_back(node_policy_projection(policy));
   }
 
-  CanonicalValue::Array contact_grasps;
-  contact_grasps.reserve(value.contact_grasp_bindings.size());
-  for (const auto& policy : value.contact_grasp_bindings) {
-    CanonicalValue::Array bodies;
-    bodies.reserve(policy.allowed_body_bindings.size());
-    for (const auto& body : policy.allowed_body_bindings) {
-      bodies.emplace_back(CanonicalValue::Object{
-          {"body", body_reference_projection(body.body)},
-          {"model_role_id",
-           body.model_role_id.has_value()
-               ? CanonicalValue(body.model_role_id->value())
-               : CanonicalValue(nullptr)},
-          {"model_instance_id",
-           CanonicalValue(body.model_instance_id.value())},
-          {"model_revision", CanonicalValue(body.model_revision.value())},
-          {"collision_body_ids",
-           string_array(body.collision_body_ids)},
-      });
-    }
-    CanonicalValue::Object contact{
-        {"contact_policy_id",
-         CanonicalValue(policy.contact_policy_id.value())},
-        {"contact_policy_revision",
-         CanonicalValue(policy.contact_policy_revision.value())},
-        {"runtime_object_id",
-         CanonicalValue(policy.runtime_object_id.value())},
-        {"allowed_body_bindings", CanonicalValue(std::move(bodies))},
-
-    };
-    detail::append_program_contact_envelope(contact, policy.envelope);
-    if (policy.bodies_from_motion_endpoint) {
-      contact.emplace_back("bodies_from_motion_endpoint", CanonicalValue(true));
-    }
-    contact_grasps.emplace_back(std::move(contact));
+  CanonicalValue::Array collision_rule_bodies;
+  collision_rule_bodies.reserve(value.collision_rule_bodies.size());
+  for (const auto& body : value.collision_rule_bodies) {
+    collision_rule_bodies.emplace_back(CanonicalValue::Object{
+        {"body", body_reference_projection(body.body)},
+        {"model_role_id",
+         body.model_role_id.has_value()
+             ? CanonicalValue(body.model_role_id->value())
+             : CanonicalValue(nullptr)},
+        {"model_instance_id",
+         CanonicalValue(body.model_instance_id.value())},
+        {"model_revision", CanonicalValue(body.model_revision.value())},
+        {"collision_body_ids",
+         string_array(body.collision_body_ids)},
+    });
   }
 
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object root{
       {"api_version", CanonicalValue(value.api_version)},
       {"program_binding_id",
        CanonicalValue(value.program_binding_id.value())},
-      {"program_id", CanonicalValue(value.program_id.value())},
       {"program_revision", CanonicalValue(value.program_revision.value())},
       {"retained_bundle_id",
        CanonicalValue(value.retained_bundle_id.value())},
@@ -2301,8 +2254,8 @@ CanonicalValue program_binding_projection(
       {"collision_body_bindings", CanonicalValue(std::move(body_bindings))},
       {"signal_bindings", CanonicalValue(std::move(signal_bindings))},
       {"node_policies", CanonicalValue(std::move(node_policies))},
-      {"contact_grasp_bindings",
-       CanonicalValue(std::move(contact_grasps))},
+      {"collision_rule_bodies",
+       CanonicalValue(std::move(collision_rule_bodies))},
       {"provenance",
        CanonicalValue(CanonicalValue::Object{
            {"binding_compiler_contract_digest",
@@ -2314,7 +2267,23 @@ CanonicalValue program_binding_projection(
             source_records_projection(
                 value.provenance.resolved_output_records)},
        })},
-  });
+  };
+  if (!value.collision_rule_spring_sliders.empty()) {
+    CanonicalValue::Array sliders;
+    sliders.reserve(value.collision_rule_spring_sliders.size());
+    for (const auto& slider : value.collision_rule_spring_sliders) {
+      sliders.emplace_back(CanonicalValue::Object{
+          {"body", body_reference_projection(slider.body)},
+          {"axis", CanonicalValue(CanonicalValue::Array{
+                       CanonicalValue(slider.axis[0]), CanonicalValue(slider.axis[1]),
+                       CanonicalValue(slider.axis[2])})},
+          {"stroke_m", CanonicalValue(slider.stroke_m)},
+          {"max_compression_step_m", CanonicalValue(slider.max_compression_step_m)},
+      });
+    }
+    root.emplace_back("collision_rule_spring_sliders", CanonicalValue(std::move(sliders)));
+  }
+  return CanonicalValue(std::move(root));
 }
 
 std::shared_ptr<const ProgramBinding>

@@ -155,7 +155,6 @@ public:
 
 [[nodiscard]] core::RuntimeParticipantBinding ArmBinding() {
   core::RuntimeParticipantBindingDTO value{
-      core::ProgramId("program.physical"),
       core::ProgramRevision("program-revision"),
       core::ProgramBindingId("program-binding"),
       core::RetainedBundleId("bundle"),

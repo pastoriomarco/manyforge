@@ -463,7 +463,8 @@ describe('IoSignalConfigurationSection', () => {
         'runtime_collision_body_alias_table_invalid', 'runtime_collision_body_alias_unresolved',
         'observed_state_missing_or_stale', 'collision_geometry_missing_or_stale',
         'collision_geometry_unresolved', 'collision_query_busy',
-        'collision_query_inconclusive', 'contact_bodies_static',
+        'collision_query_inconclusive', 'contact_bodies_static', 'mesh_not_closed',
+        'mesh_depth_vertex_cap_reached',
       ]) expect(help).toContain(reason);
       expect(help).toContain('at least one contact body is static relative to');
       expect(help).toContain('so it does not move with the robot.');

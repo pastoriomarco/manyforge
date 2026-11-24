@@ -15,7 +15,6 @@ using namespace manyforge::core;
     std::string command_target, std::string capability,
     CoordinateKind kind, std::optional<ProgramCommandSchemaRefDTO> command_schema = std::nullopt) {
   RuntimeParticipantBindingDTO value{
-      ProgramId("program.pick"),
       ProgramRevision("program-revision"),
       ProgramBindingId("program-binding"),
       RetainedBundleId("bundle"),
@@ -95,7 +94,6 @@ using namespace manyforge::core;
       std::nullopt,
       std::nullopt,
       JointGoalDTO{{"joint"}, {0.2}},
-      std::nullopt,
       {},
       {}};
 }
@@ -104,7 +102,6 @@ using namespace manyforge::core;
                                                OperationParticipantPayloadDTO payload) {
   return OperationIntentDTO{
       PublicRequestContextDTO{TestRequestKey("request.1"), "test"},
-      ProgramId("program.pick"),
       ProgramRevision("program-revision"),
       ProgramBindingId("program-binding"),
       ProgramRunNumber(1U),

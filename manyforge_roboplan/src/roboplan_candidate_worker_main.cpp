@@ -45,13 +45,15 @@ using worker_protocol::MessageType;
 constexpr std::size_t kHeaderBytes = 16U;
 constexpr std::size_t kMaximumFrameBytes = 256U * 1024U * 1024U;
 
-/// The loaded scene-mesh bytes differ from the collision model's pinned
-/// digest. Reported with the exact kSceneMeshContentChangedDetail.
-class SceneMeshContentChanged final : public std::runtime_error {
+/// A captured scene mesh is missing from the content root or its bytes differ
+/// from its digest. Its text starts with kSceneMeshUnavailableDetailPrefix,
+/// which the client maps to the typed reason `scene_mesh_unavailable`.
+class SceneMeshUnavailable final : public std::runtime_error {
  public:
-  SceneMeshContentChanged()
+  explicit SceneMeshUnavailable(const std::string& detail)
       : std::runtime_error(
-            std::string(worker_protocol::kSceneMeshContentChangedDetail)) {}
+            std::string(worker_protocol::kSceneMeshUnavailableDetailPrefix) +
+            detail) {}
 };
 
 [[noreturn]] void fail(std::string message) {
@@ -255,7 +257,7 @@ void add_geometry(roboplan::Scene& scene,
               !finite_positive(shape.scale.y_m) ||
               !finite_positive(shape.scale.z_m) ||
               geometry.resolved_mesh_path.has_value() ==
-                  geometry.scene_mesh_content_digest.has_value()) {
+                  !shape.content_digest.empty()) {
             return tl::unexpected("mesh resource is invalid or unavailable");
           }
           const Eigen::Vector3d scale(shape.scale.x_m, shape.scale.y_m,
@@ -272,19 +274,29 @@ void add_geometry(roboplan::Scene& scene,
                 roboplan::Mesh(*geometry.resolved_mesh_path, scale), pose,
                 color);
           }
-          // Relative Program scene mesh: open it below this worker's own
-          // scene-asset root descriptor, keep the validated file open, hash
-          // exactly those bytes, and load only through /proc/self/fd/<fd>.
+          // Program scene mesh captured at activation: open it by its digest
+          // below this worker's scene content root descriptor, keep the
+          // validated file open, verify exactly those bytes against the
+          // digest, and load only through /proc/self/fd/<fd>. The URI is
+          // never opened.
+          const auto& digest = shape.content_digest;
+          const auto store_path = collision::scene_mesh_store_path(digest);
+          if (store_path.empty()) {
+            throw SceneMeshUnavailable("scene mesh " + shape.resource_uri +
+                                       " has no exact content digest");
+          }
           std::string error;
           const auto opened = collision::OpenedSceneMesh::open(
-              worker_protocol::kSceneAssetRootDescriptor, shape.resource_uri,
-              error);
+              worker_protocol::kSceneContentRootDescriptor, store_path, error);
           if (!opened.has_value()) {
-            return tl::unexpected("scene mesh is unavailable: " + error);
+            throw SceneMeshUnavailable("scene mesh " + shape.resource_uri +
+                                       " (content " + digest +
+                                       ") is unavailable: " + error);
           }
-          if (opened->content_digest() !=
-              *geometry.scene_mesh_content_digest) {
-            throw SceneMeshContentChanged();
+          if (opened->content_digest() != digest) {
+            throw SceneMeshUnavailable("scene mesh " + shape.resource_uri +
+                                       " store bytes do not match content " +
+                                       digest);
           }
           return scene.addMeshGeometry(
               geometry.native_geometry_name, parent_frame,
@@ -409,7 +421,7 @@ void apply_pair_margins(roboplan::Scene& scene,
   applied = margins;
 }
 
-// Sets one request's contact-policy pairs on the worker scene: the previous
+// Sets one request's contact-rule pairs on the worker scene: the previous
 // request's pairs become active again and these are skipped. Only active flags
 // change, so the pair order and the clearance margins stay as they are.
 void apply_contact_pairs(
@@ -424,7 +436,7 @@ void apply_contact_pairs(
     result = scene.setCollisionPairsActive(pairs, false);
   }
   if (!result.has_value()) {
-    fail("could not apply contact-policy pairs: " + result.error());
+    fail("could not apply contact-rule pairs: " + result.error());
   }
   applied = pairs;
 }
@@ -480,6 +492,13 @@ int run_worker(int descriptor) {
   auto input = worker_protocol::decode_initialization(initialize.payload);
   std::string srdf_xml;
   auto scene = make_scene(input.model, &srdf_xml);
+  ignore_pairs_without_group_bodies(*scene, input.binding.compiled_joint_names);
+  // Each request starts from these: a reused worker keeps nothing of the
+  // previous request's other-component positions.
+  const std::vector<double> initial_positions = [&] {
+    const Eigen::VectorXd q = scene->getCurrentJointPositions();
+    return std::vector<double>(q.data(), q.data() + q.size());
+  }();
   RoboPlanCandidateComputer computer(scene, input.binding, input.candidate_config);
   std::vector<RoboPlanPairMarginDTO> applied_margins;
   std::vector<std::pair<std::string, std::string>> applied_contact_pairs;
@@ -492,11 +511,17 @@ int run_worker(int descriptor) {
         std::optional<std::int64_t> planning_deadline_ns;
         auto candidate =
             worker_protocol::decode_candidate_request(request.payload, &planning_deadline_ns);
+        // The other components of the cell, where the host observed them for
+        // this request; every other coordinate at the scene's initial value.
+        // Before anything reads the scene's positions.
+        set_scene_joint_positions(*scene, initial_positions,
+                                  candidate.other_coordinates.joint_names,
+                                  candidate.other_coordinates.positions);
         RoboPlanCandidateControl control;
         std::unique_ptr<RoboPlanCandidateComputer> diagnostic_computer;
         std::shared_ptr<roboplan::Scene> diagnostic_scene;
         if (candidate.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled) {
-          const bool cartesian = std::holds_alternative<core::CartesianPathDTO>(candidate.motion);
+          const bool cartesian = core::cartesian_planned(candidate.motion);
           if (!candidate.diagnostic_deadline_ns ||
               (!cartesian && !candidate.diagnostic_qualified_target) ||
               candidate.moving_replacement) fail("invalid diagnostic plan request");
@@ -583,6 +608,9 @@ int run_worker(int descriptor) {
       }
       case MessageType::kIk: {
         auto candidate = worker_protocol::decode_ik_request(request.payload);
+        set_scene_joint_positions(*scene, initial_positions,
+                                  candidate.other_coordinates.joint_names,
+                                  candidate.other_coordinates.positions);
         std::unique_ptr<RoboPlanCandidateComputer> diagnostic_computer;
         std::shared_ptr<roboplan::Scene> diagnostic_scene;
         RoboPlanCandidateControl control;
@@ -639,15 +667,6 @@ int main(int argc, char** argv) {
     const auto parent = parse_parent_pid(argc, argv);
     constrain_process(parent);
     return run_worker(descriptor);
-  } catch (const SceneMeshContentChanged& error) {
-    try {
-      send_frame(descriptor, worker_protocol::MessageType::kProtocolError,
-                 worker_protocol::encode_protocol_error(
-                     worker_protocol::kSceneMeshContentChangedDetail));
-    } catch (...) {
-    }
-    std::cerr << error.what() << '\n';
-    return 2;
   } catch (const std::exception& error) {
     try {
       send_frame(descriptor, worker_protocol::MessageType::kProtocolError,

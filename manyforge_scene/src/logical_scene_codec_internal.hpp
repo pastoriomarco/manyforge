@@ -1,6 +1,5 @@
 #pragma once
 
-#include <map>
 #include <string>
 #include <string_view>
 
@@ -22,9 +21,5 @@ DecodeRequest(std::string_view bytes);
 EncodeSnapshot(const manyforge::core::LogicalSceneSnapshotDTO &snapshot);
 [[nodiscard]] manyforge::core::LogicalSceneSnapshotDTO
 DecodeSnapshot(std::string_view bytes);
-[[nodiscard]] std::string
-EncodeErrorDetails(const std::map<std::string, std::string> &details);
-[[nodiscard]] std::map<std::string, std::string>
-DecodeErrorDetails(std::string_view bytes);
 
 } // namespace manyforge::scene::logical_scene_codec_internal

@@ -1054,6 +1054,116 @@ Object geometric_contact_input(std::string name = "contact",
   return row;
 }
 
+TEST(IoSignalCatalogTest, GeometricContactBetweenTwoSelectionsWithATripDepth) {
+  // OD-356: a carried tube pressed into an endplate deeper than 4 mm.
+  auto row = geometric_contact_input();
+  provider(row).erase("target_scene_resource_id");
+  const auto selection = [](std::initializer_list<std::pair<const char *, const char *>> keys) {
+    Object result;
+    for (const auto &[key, text] : keys)
+      result[key] = JsonValueDTO{std::string(text)};
+    return JsonValueDTO{result};
+  };
+  provider(row)["a"] = JsonValueDTO{JsonValueDTO::Array{
+      selection({{"kind", "attached_object"}, {"component_id", "gripper"}})}};
+  provider(row)["b"] = JsonValueDTO{JsonValueDTO::Array{
+      selection({{"kind", "scene_object"}, {"scene_resource_id", "endplate"}})}};
+  provider(row)["trip_depth_m"] = JsonValueDTO{0.004};
+  auto result = ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{row}}));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto &address = result.value().front().provider;
+  EXPECT_FALSE(address.target_scene_resource_id);
+  ASSERT_EQ(address.contact_a.size(), 1U);
+  EXPECT_EQ(std::get<CollisionRuleAttachedObjectSelection>(address.contact_a.front()).component_id,
+            ControllableComponentId("gripper"));
+  ASSERT_EQ(address.contact_b.size(), 1U);
+  EXPECT_EQ(std::get<CollisionRuleSceneObjectSelection>(address.contact_b.front())
+                .scene_resource_id,
+            SceneResourceId("endplate"));
+  EXPECT_EQ(address.trip_depth_m, 0.004);
+  EXPECT_FALSE(address.release_depth_m);
+
+  // OD-360: a release depth below the trip depth gives hysteresis.
+  auto hysteresis = row;
+  provider(hysteresis)["release_depth_m"] = JsonValueDTO{0.003};
+  const auto with_release = ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{hysteresis}}));
+  ASSERT_TRUE(with_release.ok()) << with_release.error().message;
+  EXPECT_EQ(with_release.value().front().provider.release_depth_m, 0.003);
+  // Not below the trip depth, not above 0, or without a trip depth: refused.
+  for (const double release : {0.004, 0.005, 0.0, -0.001}) {
+    auto refused = row;
+    provider(refused)["release_depth_m"] = JsonValueDTO{release};
+    const auto refusal = ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{refused}}));
+    ASSERT_FALSE(refusal.ok()) << release;
+    EXPECT_EQ(refusal.error().details.at("reason"), "io_signal_configuration_invalid") << release;
+  }
+  auto untripped = row;
+  provider(untripped).erase("trip_depth_m");
+  provider(untripped)["release_depth_m"] = JsonValueDTO{0.003};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{untripped}})).ok());
+
+  // Selections that need admission (the TCP's bodies), a negative depth, a
+  // missing side or a trip depth on the TCP form are refused.
+  auto malformed = row;
+  provider(malformed)["b"] = JsonValueDTO{
+      JsonValueDTO::Array{selection({{"kind", "active_tcp_contact_bodies"}})}};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{malformed}})).ok());
+  malformed = row;
+  provider(malformed)["trip_depth_m"] = JsonValueDTO{-0.001};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{malformed}})).ok());
+  malformed = row;
+  provider(malformed).erase("b");
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{malformed}})).ok());
+  malformed = geometric_contact_input();
+  provider(malformed)["trip_depth_m"] = JsonValueDTO{0.004};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{malformed}})).ok());
+}
+
+TEST(IoSignalCatalogTest, GeometricContactSelectsASpringSliderAndWhatItCarries) {
+  // OD-371: a slider body by its collision body role, and the objects
+  // carried by that body only.
+  auto row = geometric_contact_input();
+  provider(row).erase("target_scene_resource_id");
+  const auto selection = [](std::initializer_list<std::pair<const char *, const char *>> keys) {
+    Object result;
+    for (const auto &[key, text] : keys)
+      result[key] = JsonValueDTO{std::string(text)};
+    return JsonValueDTO{result};
+  };
+  provider(row)["a"] = JsonValueDTO{JsonValueDTO::Array{
+      selection({{"kind", "collision_body"},
+                 {"component_id", "tube_holder"},
+                 {"collision_body_id", "holder_rod"}}),
+      selection({{"kind", "attached_object"},
+                 {"component_id", "tube_holder"},
+                 {"collision_body_role_id", "holder_rod"}})}};
+  provider(row)["b"] = JsonValueDTO{JsonValueDTO::Array{
+      selection({{"kind", "scene_object"}, {"scene_resource_id", "endplate"}})}};
+  provider(row)["trip_depth_m"] = JsonValueDTO{0.0095};
+  provider(row)["release_depth_m"] = JsonValueDTO{0.009};
+  auto result = ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{row}}));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto &a = result.value().front().provider.contact_a;
+  ASSERT_EQ(a.size(), 2U);
+  const auto &body = std::get<CollisionRuleCollisionBodySelection>(a[0]).body;
+  EXPECT_EQ(body.component_id, ControllableComponentId("tube_holder"));
+  EXPECT_EQ(body.collision_body_id, CollisionBodyRoleId("holder_rod"));
+  const auto &carried = std::get<CollisionRuleAttachedObjectSelection>(a[1]);
+  EXPECT_EQ(carried.component_id, ControllableComponentId("tube_holder"));
+  EXPECT_EQ(carried.collision_body_role_id, std::optional<std::string>("holder_rod"));
+
+  // A collision body without its id, or an unknown field: refused.
+  for (const auto &bad :
+       {selection({{"kind", "collision_body"}, {"component_id", "tube_holder"}}),
+        selection({{"kind", "attached_object"},
+                   {"component_id", "tube_holder"},
+                   {"collision_body", "holder_rod"}})}) {
+    auto refused = row;
+    provider(refused)["a"] = JsonValueDTO{JsonValueDTO::Array{bad}};
+    EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{refused}})).ok());
+  }
+}
+
 TEST(IoSignalCatalogTest,
      GeometricContactUsesIndependentStandardAgeAndSourceScopedSelectors) {
   auto first = geometric_contact_input();

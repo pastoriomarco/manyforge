@@ -13,7 +13,6 @@ from manyforge_behavior.program import (
     _validate_node_capabilities,
     _validate_mock_simulation,
     _validate_initial_scene_pose,
-    _validate_contact_selector,
     _goal_frame,
     _validate_program_document,
     _validate_semantic_value,
@@ -28,18 +27,19 @@ from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.canonical_artifact import compute_content_identity
 
 
-def test_v3_refuses_v2_before_identity_or_catalog_validation():
-    source = {"api_version": "manyforge.program.v2", "program_revision": "invalid"}
+def test_v4_refuses_an_older_format_before_identity_or_catalog_validation():
+    source = {"api_version": "manyforge.program.v3", "program_revision": "invalid"}
     before = deepcopy(source)
     with pytest.raises(ProgramFormatUnsupported) as failure:
         _validate_program_document(
-            source, catalog=None, source="test", api_version="manyforge.program.v3"
+            source, catalog=None, source="test", api_version="manyforge.program.v4"
         )
     assert failure.value.code == "program_format_unsupported"
     assert failure.value.details == {
-        "actual_api_version": "manyforge.program.v2",
-        "supported_api_version": "manyforge.program.v3",
+        "actual_api_version": "manyforge.program.v3",
+        "supported_api_version": "manyforge.program.v4",
     }
+    assert "scripts/convert_scenario_od46.py" in str(failure.value)
     assert source == before
     catalog = NodeCatalog(Path(__file__).parents[1] / "resources/node_catalog.yaml")
     with pytest.raises(ProgramFormatUnsupported) as public_failure:
@@ -47,10 +47,10 @@ def test_v3_refuses_v2_before_identity_or_catalog_validation():
     assert public_failure.value.details == failure.value.details
 
 
-def test_format_guard_accepts_v3_forest_without_mutation():
-    forest = {"api_version": "manyforge.program.v3", "forest": []}
+def test_format_guard_accepts_v4_forest_without_mutation():
+    forest = {"api_version": "manyforge.program.v4", "forest": []}
     before = deepcopy(forest)
-    require_program_format(forest, supported_api_version="manyforge.program.v3")
+    require_program_format(forest, supported_api_version="manyforge.program.v4")
     assert forest == before
 
 
@@ -93,7 +93,7 @@ def test_reference_object_is_not_interpreted_as_a_role_identifier():
 
 def test_active_catalog_exposes_direct_reference_parameters():
     catalog = NodeCatalog(Path(__file__).parents[1] / "resources/node_catalog.yaml")
-    assert catalog.content_version == "3.0.0"
+    assert catalog.content_version == "4.0.0"
     for node_id, parameter, semantic in (
         ("motion.move_to_joint_target", "target", "target_reference"),
         ("motion.move_to_joint_target", "base_frame", "frame_reference"),
@@ -216,20 +216,18 @@ def test_mock_signal_rows_are_matched_by_direct_identity():
 def test_v3_program_root_loads_without_role_declarations(tree):
     catalog = NodeCatalog(Path(__file__).parents[1] / "resources/node_catalog.yaml")
     document = {
-        "api_version": "manyforge.program.v3",
-        "program_id": "simple",
+        "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "0" * 64,
         "program_profile": "composable-cell-v1",
-        "name": "Simple",
         "catalog": {"api_version": catalog.api_version, "content_version": catalog.content_version},
         "tree": tree,
     }
     document["program_revision"] = compute_content_identity(
         document, own_field="program_revision", identity_domain="program-revision",
-        api_version="manyforge.program.v3"
+        api_version="manyforge.program.v4"
     )
     normalized, *_ = _validate_program_document(
-        document, catalog=catalog, source="test", api_version="manyforge.program.v3"
+        document, catalog=catalog, source="test", api_version="manyforge.program.v4"
     )
     assert "component_roles" not in normalized
     assert "target_roles" not in normalized
@@ -259,21 +257,13 @@ def test_direct_tcp_selection_keeps_current_and_target_default_distinct():
         )
 
 
-def test_scene_and_contact_selectors_use_component_owned_features():
+def test_scene_poses_use_component_owned_features():
     _validate_initial_scene_pose(
         {"frame_ref": {"kind": "component_frame", "frame": {
             "component_id": "robot", "frame_id": "base"
         }}, "position_m": [0.0, 0.0, 0.0], "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]}},
         path="scene[0].pose", component_roles={}, direct_references=True,
     )
-    kind, _ = _validate_contact_selector(
-        {"kind": "component_model_body", "body": {
-            "component_id": "gripper", "collision_body_id": "gripper_collision"
-        }},
-        path="contact.body", component_roles={}, target_roles={}, blackboard_keys={},
-        direct_references=True,
-    )
-    assert kind == "component_model_body"
 
 
 def test_direct_goal_frame_recognizes_only_the_selected_base():

@@ -352,7 +352,7 @@ TEST(RecoveryAssessmentTest, AutomaticPlanningRetryRequiresClosedCauseAndExactNo
 }
 
 TEST(RecoveryAssessmentTest, AutomaticRetryDoesNotInheritBroaderManualFailureRecovery) {
-  for (const auto* code : {kErrorContactPolicyViolation, kErrorSceneChangedDuringValidation,
+  for (const auto* code : {kErrorContactRuleViolation, kErrorSceneChangedDuringValidation,
                            kErrorExecutionRejected, kErrorValidationDeferred, "signal_trip",
                            "no_signal_trip", "interrupted_fault", "vendor_fault", "unknown"}) {
     SCOPED_TRACE(code);

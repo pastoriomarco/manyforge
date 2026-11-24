@@ -944,3 +944,25 @@
   padding: 0;
   list-style: none;
 }
+
+/* A Tool's parameters: the preview of the generated tool (OD-357). */
+.generated-tool-preview {
+  min-width: 0;
+  margin: 0 0 0.5rem;
+}
+
+/* The preview's Fit and Opaque controls: the cell viewer's tool strip. */
+.generated-tool-preview-tools {
+  width: fit-content;
+  margin-bottom: 0.35rem;
+}
+
+/* A fixed box the canvas fills; `contain: strict` keeps the box's size
+   independent of the canvas, so the two never grow each other. */
+.generated-tool-preview-canvas {
+  width: 100%;
+  height: 240px;
+  contain: strict;
+  border: 1px solid var(--mf-border-neutral-32);
+  border-radius: var(--mf-radius-sm);
+}

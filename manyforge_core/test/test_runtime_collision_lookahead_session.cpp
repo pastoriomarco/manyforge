@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "collision_rule_test_helpers.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -184,7 +186,7 @@ RuntimeCollisionQueryBundlePtr with_projection_revision(
   return bundle;
 }
 
-RuntimeCollisionQueryBundlePtr with_contact_grasp_world_bodies(
+RuntimeCollisionQueryBundlePtr with_contact_world_bodies(
     RuntimeCollisionQueryBundlePtr source) {
   auto bundle = std::make_shared<RuntimeCollisionQueryBundle>(*source);
   auto world = std::make_shared<CollisionWorldSnapshot>(*source->world);
@@ -216,14 +218,14 @@ RuntimeContactReleaseStateSnapshot active_contact_release_state(
     const RuntimeCollisionQueryBundlePtr& bundle, double depth_m) {
   RuntimeContactReleaseStateSnapshot snapshot;
   snapshot.valid = bundle && bundle->policy_index &&
-                   bundle->policy_index->support_contact_index.size() == 1;
+                   bundle->policy_index->contact_rule_index.size() == 1;
   if (!snapshot.valid) {
     return snapshot;
   }
   snapshot.binding_owner = bundle;
   snapshot.count = 1;
   auto& entry = snapshot.entries[0];
-  entry.pair = &bundle->policy_index->support_contact_index.begin()->first;
+  entry.pair = &bundle->policy_index->contact_rule_index.begin()->first;
   entry.support_state = SupportContactEvaluationState::kContactActive;
   entry.release_state.initialized = true;
   entry.release_state.started_in_contact = true;
@@ -238,14 +240,14 @@ RuntimeContactReleaseStateSnapshot clear_contact_release_state(
     const RuntimeCollisionQueryBundlePtr& bundle) {
   RuntimeContactReleaseStateSnapshot snapshot;
   snapshot.valid = bundle && bundle->policy_index &&
-                   bundle->policy_index->support_contact_index.size() == 1;
+                   bundle->policy_index->contact_rule_index.size() == 1;
   if (!snapshot.valid) {
     return snapshot;
   }
   snapshot.binding_owner = bundle;
   snapshot.count = 1;
   auto& entry = snapshot.entries[0];
-  entry.pair = &bundle->policy_index->support_contact_index.begin()->first;
+  entry.pair = &bundle->policy_index->contact_rule_index.begin()->first;
   entry.support_state = SupportContactEvaluationState::kNotInContact;
   entry.release_state.initialized = true;
   entry.release_state.started_in_contact = false;
@@ -258,14 +260,14 @@ RuntimeContactReleaseStateSnapshot separated_contact_release_state(
     double previous_depth_m) {
   RuntimeContactReleaseStateSnapshot snapshot;
   snapshot.valid = bundle && bundle->policy_index &&
-                   bundle->policy_index->support_contact_index.size() == 1;
+                   bundle->policy_index->contact_rule_index.size() == 1;
   if (!snapshot.valid) {
     return snapshot;
   }
   snapshot.binding_owner = bundle;
   snapshot.count = 1;
   auto& entry = snapshot.entries[0];
-  entry.pair = &bundle->policy_index->support_contact_index.begin()->first;
+  entry.pair = &bundle->policy_index->contact_rule_index.begin()->first;
   entry.support_state = SupportContactEvaluationState::kSeparated;
   entry.release_state.initialized = true;
   entry.release_state.started_in_contact = true;
@@ -398,18 +400,9 @@ RuntimeCollisionLookaheadResult run_bounded_handoff_case(
   CollisionPolicySnapshot policy;
   policy.policy_id = "bounded-lookahead-handoff";
   policy.revision = {10, "bounded-lookahead-handoff"};
-  SupportContactPolicyEntry bounded;
-  bounded.pair = pair;
-  bounded.mode = CollisionContactPolicyMode::kBoundedPenetration;
-  bounded.enforce_max_start_penetration = false;
-  bounded.max_start_penetration_m = 0.0;
-  bounded.release_tolerance_m = 0.0;
-  bounded.min_release_progress_m = 0.0;
-  bounded.max_contact_penetration_m = 0.005;
-  bounded.require_separation_by_end = false;
-  bounded.require_strictly_decreasing_penetration = false;
-  bounded.allow_recontact = false;
-  policy.support_contacts.push_back(bounded);
+  // Whole-move contact with a 5 mm depth limit.
+  testing::add_contact_rule(
+      policy, testing::contact_rule(pair, 0.005, std::nullopt, "bounded-lookahead-handoff"));
   publisher.bundle = make_bundle(10, std::move(policy));
 
   ExecutionProgressPublication progress(
@@ -449,7 +442,7 @@ RuntimeCollisionLookaheadResult run_bounded_handoff_case(
         sink.push(std::move(result));
       },
       accept_test_authority());
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
 
   // This is the state an immediate RuntimeCollisionQuerySession publishes
   // after its first clear bounded-contact tick. Any configured allowed pair
@@ -642,6 +635,134 @@ TEST(RuntimeCollisionLookaheadSelectionTest,
   // unexamined dense-oracle state prevents a continuous-clearance claim.
 }
 
+// The moving robot's joint j1 and another component's joint j2, which the
+// accepted trajectory carries at 0.
+TrajectoryDTO trajectory_beside_another_component() {
+  TrajectoryDTO value;
+  value.joint_names = {"j1", "j2"};
+  value.waypoints = {
+      TrajectoryWaypointDTO{0.0, {0.0, 0.0}, {}, {}}, TrajectoryWaypointDTO{0.1, {0.1, 0.0}, {}, {}},
+      TrajectoryWaypointDTO{0.2, {0.2, 0.0}, {}, {}}, TrajectoryWaypointDTO{0.3, {0.3, 0.0}, {}, {}},
+      TrajectoryWaypointDTO{0.4, {0.4, 0.0}, {}, {}},
+  };
+  return value;
+}
+
+struct AnotherComponent final {
+  std::shared_ptr<ObservedRobotStatePublication> publication{
+      std::make_shared<ObservedRobotStatePublication>(
+          std::vector<std::string>{"j2"},
+          std::vector<ObservedRobotStateSourceConfig>{ObservedRobotStateSourceConfig{
+              ObservedRobotStateSourceKind::kCommandedState, "peer",
+              ObservedRobotStateAuthorityProfile::kCommandedSimulation, 0}})};
+  std::shared_ptr<ComponentStreamStaleFlag> stream_stale{
+      std::make_shared<ComponentStreamStaleFlag>()};
+
+  [[nodiscard]] std::vector<BoundCellModelStateSource> bound(const TrajectoryDTO& curve) const {
+    const std::vector<std::string> own{"j1"};
+    return bind_cell_model_state(
+        CellModelStateSources{{ControllableComponentId("robot_b"), publication, stream_stale}},
+        curve.joint_names, own);
+  }
+  [[nodiscard]] bool publish(double position, std::int64_t now_ns) const {
+    const std::vector<std::string> names{"j2"};
+    const std::vector<double> positions{position};
+    return publication
+        ->publish(ObservedRobotStateSourceKind::kCommandedState, names, positions, {}, now_ns,
+                  now_ns)
+        .published;
+  }
+};
+
+TEST(RuntimeCollisionLookaheadSessionTest, EverySampleHasTheOtherComponentWhereItIsNow) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  publisher.bundle = make_bundle(10);
+  ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
+                                        ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                        "isaac", 0);
+  ASSERT_TRUE(progress.publish(3, 50'000'000, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-1");
+  std::mutex queried_mutex;
+  std::vector<std::vector<double>> queried;
+  engine->result_for_query = [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    std::lock_guard<std::mutex> lock(queried_mutex);
+    queried.push_back(query.robot_state.positions_rad);
+    return std::nullopt;
+  };
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.horizon_ns = 300'000'000;
+  config.max_samples = 4;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      }, accept_test_authority());
+  const auto curve =
+      std::make_shared<const TrajectoryDTO>(trajectory_beside_another_component());
+  const AnotherComponent other;
+  // Armed while the other component was at 0.4; it has moved to 0.9 since.
+  ASSERT_TRUE(other.publish(0.4, clock.now()));
+  session.arm(42, 3, curve, other.bound(*curve));
+  ASSERT_TRUE(other.publish(0.9, clock.now()));
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+  const auto result = sink.wait();
+  EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kClear);
+  std::lock_guard<std::mutex> lock(queried_mutex);
+  ASSERT_FALSE(queried.empty());
+  for (const auto& positions : queried) {
+    ASSERT_EQ(positions.size(), 2U);
+    EXPECT_GT(positions[0], 0.0);
+    EXPECT_DOUBLE_EQ(positions[1], 0.9);
+  }
+  // The accepted trajectory itself is not rewritten.
+  EXPECT_DOUBLE_EQ(curve->waypoints[2].positions_rad[1], 0.0);
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest, AnotherComponentsLostStateEndsTheCycleUnchecked) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  TestPublisher publisher;
+  publisher.bundle = make_bundle(10);
+  ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
+                                        ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                        "isaac", 0);
+  ASSERT_TRUE(progress.publish(3, 50'000'000, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-1");
+  ResultSink sink;
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.horizon_ns = 300'000'000;
+  config.max_samples = 4;
+  RuntimeCollisionLookaheadSession session(
+      config, clock, scheduler, publisher, progress, {engine},
+      [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
+        sink.push(std::move(result));
+      }, accept_test_authority());
+  const auto curve =
+      std::make_shared<const TrajectoryDTO>(trajectory_beside_another_component());
+  const AnotherComponent other;
+  ASSERT_TRUE(other.publish(0.4, clock.now()));
+  other.stream_stale->value.store(true);
+  session.arm(42, 3, curve, other.bound(*curve));
+  ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+  // That component's stream condition, naming the component; nothing was
+  // checked.
+  const auto result = sink.wait();
+  EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kInconclusive);
+  EXPECT_EQ(result.reason, kComponentStreamStaleCode);
+  ASSERT_TRUE(result.checked_input_details.contains("peer_component_id"));
+  EXPECT_EQ(result.checked_input_details.at("peer_component_id"), "robot_b");
+  EXPECT_EQ(engine->check_calls.load(), 0U);
+}
+
 TEST(RuntimeCollisionLookaheadSessionTest, MapsEarliestFailureBackToOriginalTrajectoryIndex) {
   FakeClock clock;
   clock.set(1'000'000'000);
@@ -664,7 +785,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, MapsEarliestFailureBackToOriginalTraj
       [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
         sink.push(std::move(result));
       }, accept_test_authority());
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -688,12 +809,11 @@ TEST(RuntimeCollisionLookaheadSessionTest,
     CollisionPolicySnapshot policy;
     policy.policy_id = "contact-release";
     policy.revision = {8, "lookahead-release-end"};
-    SupportContactPolicyEntry release;
-    release.pair = pair;
-    release.max_start_penetration_m = 0.01;
-    release.require_separation_by_end = true;
-    release.require_strictly_decreasing_penetration = false;
-    policy.support_contacts.push_back(release);
+    auto release = testing::release_rule(pair);
+    testing::release_of(release).max_start_penetration_m = 0.01;
+    testing::release_of(release).require_separation_by_end = true;
+    testing::release_of(release).require_strictly_decreasing_penetration = false;
+    testing::add_contact_rule(policy, release);
     publisher.bundle = make_bundle(10, std::move(policy));
 
     ExecutionProgressPublication progress(
@@ -716,8 +836,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
           sink.push(std::move(result));
         },
         accept_test_authority());
-    session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()),
-                "");
+    session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
     const auto contact_state =
         active_contact_release_state(publisher.bundle, 0.004);
     EXPECT_TRUE(contact_state.valid);
@@ -757,7 +876,7 @@ CollisionResult clear_lookahead_result() {
 // Runs one release lookahead from cursor 0 with the monitor's entering state
 // and one engine result per local sample index (the last entry repeats).
 RuntimeCollisionLookaheadResult run_release_handoff_case(
-    SupportContactPolicyEntry release,
+    CollisionPairContactRule release,
     const std::function<RuntimeContactReleaseStateSnapshot(
         const RuntimeCollisionQueryBundlePtr&)>& entering_state,
     std::vector<std::optional<double>> clearances_by_sample,
@@ -771,7 +890,7 @@ RuntimeCollisionLookaheadResult run_release_handoff_case(
   policy.policy_id = "contact-release";
   policy.revision = {9, "lookahead-entering-release-state"};
   release.pair = pair;
-  policy.support_contacts.push_back(release);
+  testing::add_contact_rule(policy, release);
   publisher.bundle = make_bundle(10, std::move(policy));
 
   ExecutionProgressPublication progress(
@@ -799,7 +918,7 @@ RuntimeCollisionLookaheadResult run_release_handoff_case(
         sink.push(std::move(result));
       },
       accept_test_authority());
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
   const auto contact_state = entering_state(publisher.bundle);
   EXPECT_TRUE(contact_state.valid);
   if (!request_until_started(session, clock, publisher, contact_state)) {
@@ -822,10 +941,10 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   // LKA-1: the monitor observed separation, but the cursor trails it; the
   // planned samples from the cursor are still in contact. That is the plan's
   // own continued contact, not a recontact.
-  SupportContactPolicyEntry release;
-  release.max_start_penetration_m = 0.01;
-  release.require_separation_by_end = false;
-  release.require_strictly_decreasing_penetration = false;
+  auto release = testing::release_rule();
+  testing::release_of(release).max_start_penetration_m = 0.01;
+  testing::release_of(release).require_separation_by_end = false;
+  testing::release_of(release).require_strictly_decreasing_penetration = false;
   const auto separated = [](const RuntimeCollisionQueryBundlePtr& bundle) {
     return separated_contact_release_state(bundle, 0.004, 0.002);
   };
@@ -848,8 +967,8 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   // withdrawal 0-40 ms in (0.8 mm), while the cursor is still 0, so the first
   // planned samples are deeper (0.98 mm) than that observation. The plan
   // itself withdraws strictly and separates by its end.
-  SupportContactPolicyEntry release;
-  release.max_start_penetration_m = 0.002;
+  auto release = testing::release_rule();
+  testing::release_of(release).max_start_penetration_m = 0.002;
   const auto observed = [](const RuntimeCollisionQueryBundlePtr& bundle) {
     return active_contact_release_state(bundle, 0.0008);
   };
@@ -900,15 +1019,14 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   const auto violation = result.failure_details.find(
       "collision_result_contact_release_violation");
   ASSERT_NE(violation, result.failure_details.end());
-  EXPECT_EQ(violation->second, "contact_penetration_exceeds_policy");
-  EXPECT_EQ(result.failure_details.at("contact_policy_violation"),
-            "contact_penetration_exceeds_policy");
-  EXPECT_EQ(result.failure_details.at("contact_policy_id"),
+  EXPECT_EQ(violation->second, "contact_penetration_exceeded");
+  EXPECT_EQ(result.failure_details.at("contact_rule_violation"),
+            "contact_penetration_exceeded");
+  EXPECT_EQ(result.failure_details.at("collision_rule_id"),
             "bounded-lookahead-handoff");
-  EXPECT_EQ(result.failure_details.at("policy_mode"),
-            "bounded_penetration");
-  EXPECT_EQ(result.failure_details.at("zone_id"),
-            "support_pair:gripper<->object");
+  EXPECT_EQ(result.failure_details.at("policy_mode"), "contact");
+  EXPECT_EQ(result.failure_details.at("contact_body_a"), "gripper");
+  EXPECT_EQ(result.failure_details.at("contact_body_b"), "object");
   EXPECT_EQ(result.failure_details.at("contact_present"), "true");
   EXPECT_EQ(result.failure_details.at("initial_contact_pair_count"), "0");
   EXPECT_EQ(result.failure_details.at("current_contact_pair_count"), "1");
@@ -918,7 +1036,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   EXPECT_DOUBLE_EQ(
       std::stod(result.failure_details.at("penetration_depth_m")), 0.006);
   EXPECT_DOUBLE_EQ(
-      std::stod(result.failure_details.at("max_contact_penetration_m")),
+      std::stod(result.failure_details.at("max_penetration_m")),
       0.005);
   EXPECT_EQ(result.failure_details.at("within_penetration_bound"), "false");
   EXPECT_EQ(result.failure_details.at("response"), "preempt_trajectory");
@@ -961,7 +1079,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
         authority_calls.fetch_add(1, std::memory_order_relaxed);
         return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
       });
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
 
   session.request(clock.now(),
                   publisher.published_runtime_collision_query_bundle(), {});
@@ -1010,7 +1128,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
         authority_calls.fetch_add(1, std::memory_order_relaxed);
         return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
       });
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto deadline =
@@ -1052,7 +1170,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, PreparesChangedSnapshotOnceBeforeWork
       [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
         sink.push(std::move(result));
       }, accept_test_authority());
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -1082,7 +1200,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, FailsClosedWhenSnapshotPreparationFai
       [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
         sink.push(std::move(result));
       }, accept_test_authority());
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -1122,7 +1240,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
               RuntimeCollisionLookaheadResult result) {
         sink.push(std::move(result));
       }, accept_test_authority());
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -1138,29 +1256,27 @@ TEST(RuntimeCollisionLookaheadSessionTest,
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest,
-     ContactGraspWindowRemainsBoundToTheCompleteAcceptedTrajectory) {
+     ContactWindowRemainsBoundToTheCompleteAcceptedTrajectory) {
   FakeClock clock;
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
   CollisionPolicySnapshot policy;
-  policy.policy_id = "grasp";
-  policy.revision = {1, "grasp-policy"};
+  policy.policy_id = "windowed_contact";
+  policy.revision = {1, "windowed-contact-rule"};
   policy.require_full_diagnostics = true;
-  ContactGraspPolicyEntry grasp;
-  grasp.policy_id = "contact_grasp/part";
-  grasp.selected_object_id = "part";
-  grasp.allowed_robot_links = {"finger_left"};
-  grasp.max_penetration_m = 0.003;
-  grasp.terminal_window_start_fraction = 0.8;
-  policy.contact_grasps.push_back(std::move(grasp));
-  publisher.bundle = with_contact_grasp_world_bodies(
+  testing::add_contact_rule(
+      policy,
+      testing::contact_rule(
+          {"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"},
+          0.003, 0.8, "finger_on_part"));
+  publisher.bundle = with_contact_world_bodies(
       make_bundle(10, std::move(policy)));
   ExecutionProgressPublication progress(ExecutionProgressSourceKind::kBackendCommanded,
                                         ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                         "isaac", 0);
   ASSERT_TRUE(progress.publish(3, 50'000'000, clock.now(), clock.now()).published);
-  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-grasp");
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-contact");
   engine->collision_local_waypoint = 2;
   engine->collision_pair = {
       "component/arm/model/arm_model/body/finger_left/collision/0",
@@ -1175,21 +1291,20 @@ TEST(RuntimeCollisionLookaheadSessionTest,
       [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
         sink.push(std::move(result));
       }, accept_test_authority());
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "contact_grasp/part");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
   EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kCollision);
   ASSERT_TRUE(result.first_failing_waypoint.has_value());
   EXPECT_EQ(*result.first_failing_waypoint, 3);
-  EXPECT_EQ(result.failure_details.at("contact_policy_violation"),
+  EXPECT_EQ(result.failure_details.at("contact_rule_violation"),
             "grasp_contact_before_terminal_window");
-  EXPECT_EQ(result.failure_details.at("contact_policy_id"),
-            "contact_grasp/part");
-  EXPECT_EQ(result.failure_details.at("policy_mode"), "contact_grasp");
-  EXPECT_EQ(result.failure_details.at("zone_id"),
-            "contact_grasp_pair:component/arm/model/arm_model/body/"
-            "finger_left/collision/0<->scene/part/shape/0");
+  EXPECT_EQ(result.failure_details.at("collision_rule_id"), "finger_on_part");
+  EXPECT_EQ(result.failure_details.at("policy_mode"), "contact");
+  EXPECT_EQ(result.failure_details.at("contact_body_a"),
+            "component/arm/model/arm_model/body/finger_left/collision/0");
+  EXPECT_EQ(result.failure_details.at("contact_body_b"), "scene/part/shape/0");
   EXPECT_EQ(result.failure_details.at("contact_present"), "true");
   EXPECT_EQ(result.failure_details.at("distance_request_mode"),
             "selected_colliding_pairs");
@@ -1198,7 +1313,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
       std::stod(result.failure_details.at("penetration_depth_m")), 0.001);
   EXPECT_DOUBLE_EQ(
       std::stod(result.failure_details.at("max_penetration_m")), 0.003);
-  EXPECT_EQ(result.failure_details.at("inside_terminal_window"), "false");
+  EXPECT_EQ(result.failure_details.at("inside_window"), "false");
   EXPECT_EQ(result.failure_details.at("response"), "preempt_trajectory");
   EXPECT_EQ(result.failure_details.at("surface"),
             "observed_runtime_lookahead");
@@ -1209,23 +1324,21 @@ TEST(RuntimeCollisionLookaheadSessionTest,
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest,
-     ContactGraspMissingMetricCarriesNativeViolationWithoutFabricatedDepth) {
+     WindowedContactMissingMetricCarriesViolationWithoutFabricatedDepth) {
   FakeClock clock;
   clock.set(1'000'000'000);
   ManualScheduler scheduler;
   TestPublisher publisher;
   CollisionPolicySnapshot policy;
-  policy.policy_id = "grasp";
-  policy.revision = {1, "grasp-policy"};
+  policy.policy_id = "windowed_contact";
+  policy.revision = {1, "windowed-contact-rule"};
   policy.require_full_diagnostics = true;
-  ContactGraspPolicyEntry grasp;
-  grasp.policy_id = "contact_grasp/part";
-  grasp.selected_object_id = "part";
-  grasp.allowed_robot_links = {"finger_left"};
-  grasp.max_penetration_m = 0.003;
-  grasp.terminal_window_start_fraction = 0.8;
-  policy.contact_grasps.push_back(std::move(grasp));
-  publisher.bundle = with_contact_grasp_world_bodies(
+  testing::add_contact_rule(
+      policy,
+      testing::contact_rule(
+          {"component/arm/model/arm_model/body/finger_left/collision/0", "scene/part/shape/0"},
+          0.003, 0.8, "finger_on_part"));
+  publisher.bundle = with_contact_world_bodies(
       make_bundle(10, std::move(policy)));
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
@@ -1233,7 +1346,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   ASSERT_TRUE(
       progress.publish(3, 50'000'000, clock.now(), clock.now()).published);
   auto engine =
-      std::make_shared<TestLookaheadEngine>("lookahead-grasp-missing-metric");
+      std::make_shared<TestLookaheadEngine>("lookahead-contact-missing-metric");
   const CollisionPairId pair{
       "component/arm/model/arm_model/body/finger_left/collision/0",
       "scene/part/shape/0"};
@@ -1258,22 +1371,20 @@ TEST(RuntimeCollisionLookaheadSessionTest,
         sink.push(std::move(result));
       },
       accept_test_authority());
-  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()),
-              "contact_grasp/part");
+  session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
   EXPECT_EQ(result.status,
             RuntimeCollisionLookaheadResultStatus::kInconclusive);
   EXPECT_EQ(result.reason, "runtime_lookahead_diagnostic_incomplete");
-  EXPECT_EQ(result.failure_details.at("contact_policy_violation"),
+  EXPECT_EQ(result.failure_details.at("contact_rule_violation"),
             "missing_grasp_contact_clearance");
-  EXPECT_EQ(result.failure_details.at("contact_policy_id"),
-            "contact_grasp/part");
-  EXPECT_EQ(result.failure_details.at("policy_mode"), "contact_grasp");
-  EXPECT_EQ(result.failure_details.at("zone_id"),
-            "contact_grasp_pair:component/arm/model/arm_model/body/"
-            "finger_left/collision/0<->scene/part/shape/0");
+  EXPECT_EQ(result.failure_details.at("collision_rule_id"), "finger_on_part");
+  EXPECT_EQ(result.failure_details.at("policy_mode"), "contact");
+  EXPECT_EQ(result.failure_details.at("contact_body_a"),
+            "component/arm/model/arm_model/body/finger_left/collision/0");
+  EXPECT_EQ(result.failure_details.at("contact_body_b"), "scene/part/shape/0");
   EXPECT_EQ(result.failure_details.at("classification"),
             "diagnostic_incomplete");
   EXPECT_EQ(result.failure_details.at("contact_present"), "true");
@@ -1321,7 +1432,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, ClearResultCannotCertifyARevisionPubl
       [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
         sink.push(std::move(result));
       }, accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -1353,7 +1464,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
         sink.push(std::move(result));
       },
       accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -1395,7 +1506,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
         sink.push(std::move(result));
       },
       accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -1422,14 +1533,14 @@ TEST(RuntimeCollisionLookaheadSessionTest,
       [](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult) {},
       accept_test_authority());
 
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   const auto first = session.status();
   ASSERT_TRUE(first.armed);
   EXPECT_TRUE(session.accept_result_for_current_arm(first.execution_id, first.execution_generation,
                                                     first.arm_generation,
                                                     first.permit_generation));
 
-  session.arm(7, 10, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 10, std::make_shared<const TrajectoryDTO>(trajectory()));
   const auto second = session.status();
   ASSERT_NE(second.arm_generation, first.arm_generation);
   EXPECT_FALSE(session.accept_result_for_current_arm(first.execution_id, first.execution_generation,
@@ -1456,9 +1567,9 @@ TEST(RuntimeCollisionLookaheadSessionTest, PreparingReplacementArmDoesNotReplace
       [](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult) {},
       accept_test_authority());
   auto curve = std::make_shared<const TrajectoryDTO>(trajectory());
-  session.arm(7, 9, curve, "old");
+  session.arm(7, 9, curve);
   const auto old = session.status();
-  auto prepared = RuntimeCollisionLookaheadSession::prepare_arm(8, 10, curve, "new");
+  auto prepared = RuntimeCollisionLookaheadSession::prepare_arm(8, 10, curve);
   EXPECT_EQ(session.status().execution_id, 7U);
   EXPECT_EQ(session.status().arm_generation, old.arm_generation);
   EXPECT_TRUE(session.accept_result_for_current_arm(old.execution_id, old.execution_generation,
@@ -1472,7 +1583,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, PreparingReplacementArmDoesNotReplace
                                                      old.arm_generation, old.permit_generation));
   EXPECT_TRUE(session.accept_result_for_current_arm(next.execution_id, next.execution_generation,
                                                     next.arm_generation, next.permit_generation));
-  EXPECT_THROW((void)RuntimeCollisionLookaheadSession::prepare_arm(0, 11, curve, "bad"),
+  EXPECT_THROW((void)RuntimeCollisionLookaheadSession::prepare_arm(0, 11, curve),
                std::invalid_argument);
   EXPECT_EQ(session.status().execution_id, 8U);
 }
@@ -1534,7 +1645,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, StatusReportsGenerationMatchedFreshCu
       config, clock, scheduler, publisher, progress, {engine},
       [](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult) {},
       accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
 
   clock.advance(5'000'000);
   const auto status = session.status();
@@ -1584,7 +1695,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
       [&callbacks](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult) {
         callbacks.fetch_add(1, std::memory_order_relaxed);
       }, accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   {
@@ -1598,7 +1709,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   EXPECT_EQ(session.status().reruns_coalesced_total, coalesced_before_busy_request + 1);
 
   ASSERT_TRUE(progress.publish(10, 0, clock.now(), clock.now()).published);
-  session.arm(7, 10, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 10, std::make_shared<const TrajectoryDTO>(trajectory()));
   {
     std::lock_guard<std::mutex> lock(gate_mutex);
     release = true;
@@ -1653,7 +1764,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
                  RuntimeCollisionLookaheadResult result) {
         history.push(std::move(result));
       }, accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
   {
     std::unique_lock<std::mutex> lock(gate_mutex);
@@ -1720,7 +1831,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
                  RuntimeCollisionLookaheadResult result) {
         history.push(std::move(result));
       }, accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
   ASSERT_TRUE(history.wait_for_size(1));
   EXPECT_EQ(session.status().jobs_started_total, 1u);
@@ -1763,7 +1874,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
                    RuntimeCollisionLookaheadResult) {
         callbacks.fetch_add(1, std::memory_order_relaxed);
       }, accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
   {
     std::unique_lock<std::mutex> lock(gate_mutex);
@@ -1822,7 +1933,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, DetachClosesIdleSessionAndIsIdempoten
       accept_test_authority());
   session.detach();
   session.detach();
-  EXPECT_THROW(session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), ""),
+  EXPECT_THROW(session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory())),
                std::logic_error);
 }
 
@@ -1853,7 +1964,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
               RuntimeCollisionLookaheadResult result) {
         sink.push(std::move(result));
       }, accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -1893,7 +2004,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
               RuntimeCollisionLookaheadResult result) {
         sink.push(std::move(result));
       }, accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
 
   const auto admitted_at_ns = clock.now();
   clock.advance(7'000'000);
@@ -1975,7 +2086,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
         authority_applied.store(true, std::memory_order_release);
         return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
       });
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -2023,7 +2134,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
         result.stop_authority_signalled = true;
         return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
       });
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
 
   const auto result = sink.wait();
@@ -2070,7 +2181,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
                 RuntimeCollisionLookaheadResult result) {
           sink.push(std::move(result));
         }, accept_test_authority());
-    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
     EXPECT_TRUE(request_until_started(session, clock, publisher));
     auto result = sink.wait();
     return CaseOutcome{std::move(result), session.status()};
@@ -2122,7 +2233,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, EarlyFailureDiagnosticsDoNotInventWor
         [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
           sink.push(std::move(result));
         }, accept_test_authority());
-    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
     const auto requested_at = expected_reason == "runtime_lookahead_deadline_exceeded"
                                   ? clock.now() - config.cycle_budget_ns : clock.now();
     const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -2181,7 +2292,7 @@ TEST(RuntimeCollisionLookaheadSessionTest, BundleRefusalRetainsOnlyObservedBundl
       [&sink](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult result) {
         sink.push(std::move(result));
       }, accept_test_authority());
-  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+  session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
   ASSERT_TRUE(request_until_started(session, clock, publisher));
   const auto result = sink.wait();
   EXPECT_EQ(result.reason, "runtime_lookahead_bundle_invalid");
@@ -2224,7 +2335,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
            RuntimeCollisionLookaheadResult&) -> RuntimeCollisionLookaheadAuthorityDisposition {
           throw std::runtime_error("addressed Stop handoff failed");
         });
-    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
     ASSERT_TRUE(request_until_started(session, clock, publisher));
 
     EXPECT_EQ(scheduler.wait_for_reasons(1U),
@@ -2263,7 +2374,7 @@ TEST(RuntimeCollisionLookaheadSessionTest,
           authority_calls.fetch_add(1, std::memory_order_relaxed);
           return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
         });
-    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()));
     ASSERT_TRUE(request_until_started(session, clock, publisher));
 
     EXPECT_EQ(scheduler.wait_for_reasons(1U),

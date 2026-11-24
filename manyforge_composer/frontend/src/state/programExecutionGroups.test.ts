@@ -30,7 +30,6 @@ function appliedProgram(): AppliedProgramSelection {
     scenarioId: 'two-robots',
     sourceDocumentDigest: digest('a'),
     projectPath: '/projects/two-robots.scenario',
-    programId: 'two-robots',
     programRevision: digest('b'),
     programBindingId: digest('c'),
     retainedBundleId: digest('d'),
@@ -50,12 +49,10 @@ function appliedProgram(): AppliedProgramSelection {
       applicationStartId: '3f9a00000000002a',
     }],
     program: {
-      api_version: 'manyforge.program.v3',
-      program_id: 'two-robots',
+      api_version: 'manyforge.program.v4',
       program_revision: digest('b'),
       program_profile: 'composable-cell-v1',
-      name: 'Two robots',
-      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '3.0.0' },
+      catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
       execution_groups: { robots: { execution_policy: 'independent' } },
       tree: {
         node_id: 'parallel',
@@ -76,9 +73,8 @@ function appliedProgram(): AppliedProgramSelection {
       },
     },
     programBinding: {
-      api_version: 'manyforge.program_binding.v3',
+      api_version: 'manyforge.program_binding.v4',
       program_binding_id: digest('c'),
-      program_id: 'two-robots',
       program_revision: digest('b'),
       retained_bundle_id: digest('d'),
       graph_revision: digest('e'),
@@ -97,7 +93,7 @@ function appliedProgram(): AppliedProgramSelection {
         signal_references: [], resource_role_bindings: [], capability_bindings: [],
       }],
       frame_bindings: [], collision_body_bindings: [], signal_bindings: [],
-      node_policies: [], contact_grasp_bindings: [],
+      node_policies: [], collision_rule_bodies: [],
       provenance: {
         binding_compiler_contract_digest: digest('3'),
         source_records: [], resolved_output_records: [],

@@ -419,7 +419,6 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
          CanonicalValue(std::move(planning_capabilities))},
         {"program_binding_id",
          CanonicalValue(binding.program_binding_id.value())},
-        {"program_id", CanonicalValue(binding.program_id.value())},
         {"program_revision", CanonicalValue(binding.program_revision.value())},
         {"target", CanonicalValue(CanonicalValue::Object{
             {"component_id", CanonicalValue(binding.controllable_component_id.value())},
@@ -441,7 +440,11 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
       const auto refuse = [&](std::string phase, const core::ErrorDTO *error = nullptr) {
         if (failures == nullptr)
           return;
-        const auto prefix = candidate.controllable_component_id.value() + ".";
+        // `<component>.` for an arm, `<component>.<target>.` for a gripper
+        // view: each target of a tool with several has its own entries.
+        const auto [component_id, target_id] = candidate.owner_key();
+        const auto prefix =
+            component_id.value() + "." + (target_id.empty() ? std::string() : target_id + ".");
         failures->emplace(prefix + "phase", std::move(phase));
         if (error != nullptr) {
           failures->emplace(prefix + "code", error->code);
@@ -887,8 +890,7 @@ CanonicalValue ExecutionCommandSurface::MockNodeSimulationResponse(
       product.program_binding->program_binding_id() != request.scope.program_binding_id)
     return mismatch();
   const auto& bound = product.program_binding->value();
-  if (bound.program_id != product.program->value().program_id ||
-      bound.program_revision != product.program->value().program_revision ||
+  if (bound.program_revision != product.program->value().program_revision ||
       bound.retained_bundle_id != product.bundle->retained_bundle_id() ||
       bound.graph_revision != product.bundle->value().cell_graph.graph_revision)
     return mismatch();
@@ -1465,7 +1467,6 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
          CanonicalValue(binding.capability_id.value())},
         {"program_binding_id",
          CanonicalValue(binding.program_binding_id.value())},
-        {"program_id", CanonicalValue(binding.program_id.value())},
         {"program_revision", CanonicalValue(binding.program_revision.value())},
         {"resource",
          CanonicalValue(CanonicalValue::Object{
@@ -1700,11 +1701,14 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     using TargetKey = std::tuple<std::string, std::string, std::string>;
     std::map<core::ControllableComponentId, Composition *>
         runtime_component_owners;
+    // One owner view per component, which stands for it here; a tool with
+    // several gripper targets has one view per target, the first standing
+    // for the component.
+    std::set<std::pair<core::ControllableComponentId, std::string>> runtime_owner_keys;
     const auto register_runtime_component = [&](Composition &candidate) {
-      Require(runtime_component_owners
-                  .emplace(candidate.controllable_component_id, &candidate)
-                  .second,
+      Require(runtime_owner_keys.insert(candidate.owner_key()).second,
               "native execution component has multiple runtime owners");
+      runtime_component_owners.emplace(candidate.controllable_component_id, &candidate);
     };
     register_runtime_component(composition);
     for (const auto &participant : composition.participant_compositions) {
@@ -1768,7 +1772,6 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
       };
       CanonicalValue::Object manual_control{
           {"program_binding_id", field("program_binding_id")},
-          {"program_id", field("program_id")},
           {"program_revision", field("program_revision")},
       };
       CanonicalValue::Object command;
@@ -2196,6 +2199,8 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     std::vector<ObservationRow> rows;
     rows.reserve(2U * (1U + composition.participant_compositions.size()));
     std::vector<ObservationRow> measured_rows;
+    std::vector<core::SpringCompressionDTO> springs;
+    constexpr std::size_t kMaximumObservedSpringCompressions = 64U;
     const auto append_target = [&](
         const std::shared_ptr<IRetainedObservedStateChannel> &selected_channel,
         const core::ControllableComponentId &owner_component_id,
@@ -2480,6 +2485,10 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
       Require((owner.runtime == nullptr) != (owner.gripper_runtime == nullptr),
               "native observation component has no unique runtime owner");
       if (owner.runtime != nullptr) {
+        // OD-358: the compressed spring pairs this robot's monitor sees.
+        if (owner.runtime->participant_engine != nullptr)
+          for (auto &spring : owner.runtime->participant_engine->spring_compressions())
+            springs.push_back(std::move(spring));
         if (owner.direct_control_motion_binding.has_value()) {
           append_target(owner.runtime->motion_state_channel,
                         owner.controllable_component_id);
@@ -2540,27 +2549,61 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     measured_targets.reserve(measured_rows.size());
     for (auto &row : measured_rows)
       measured_targets.emplace_back(std::move(row.value));
+    // Absent when no spring pair is compressed. Bounded like the targets.
+    std::sort(springs.begin(), springs.end(), [](const auto &left, const auto &right) {
+      return std::tie(left.rule_id, left.a_component_id, left.a_link,
+                      left.a_scene_resource_id) <
+             std::tie(right.rule_id, right.a_component_id, right.a_link,
+                      right.a_scene_resource_id);
+    });
+    if (springs.size() > kMaximumObservedSpringCompressions)
+      springs.resize(kMaximumObservedSpringCompressions);
+    CanonicalValue::Array spring_compressions;
+    spring_compressions.reserve(springs.size());
+    for (auto &spring : springs) {
+      CanonicalValue::Object side =
+          spring.a_kind == core::SpringCompressionDTO::SideKind::kComponentLink
+              ? CanonicalValue::Object{
+                    {"component_id", CanonicalValue(std::move(spring.a_component_id))},
+                    {"kind", CanonicalValue("component_link")},
+                    {"link", CanonicalValue(std::move(spring.a_link))}}
+              : CanonicalValue::Object{
+                    {"kind", CanonicalValue("scene_object")},
+                    {"scene_resource_id",
+                     CanonicalValue(std::move(spring.a_scene_resource_id))}};
+      CanonicalValue::Array direction;
+      for (const double value : spring.push_direction) direction.emplace_back(value);
+      spring_compressions.emplace_back(CanonicalValue(CanonicalValue::Object{
+          {"a", CanonicalValue(std::move(side))},
+          {"depth_m", CanonicalValue(spring.depth_m)},
+          {"push_direction", CanonicalValue(std::move(direction))},
+          {"rule_id", CanonicalValue(std::move(spring.rule_id))},
+      }));
+    }
     const auto &bundle = *composition.bundle;
+    CanonicalValue::Object observation{
+        {"application_start_id", CanonicalValue(start_id_text_)},
+        {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
+        {"graph_revision",
+         CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
+        {"measured_targets", CanonicalValue(std::move(measured_targets))},
+        {"retained_bundle_id",
+         CanonicalValue(bundle.retained_bundle_id().value())},
+        {"schema_version", CanonicalValue("manyforge.execution_observation.v5")},
+        {"source_epoch", CanonicalValue(stream_epoch)},
+        {"source_sequence",
+         CanonicalValue(static_cast<double>(change_generation))},
+        {"targets", CanonicalValue(std::move(targets))},
+    };
+    if (!spring_compressions.empty()) // keys stay sorted: before "targets"
+      observation.insert(observation.end() - 1,
+                         std::pair<std::string, CanonicalValue>(
+                             "spring_compressions",
+                             CanonicalValue(std::move(spring_compressions))));
     auto response = CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("observation")},
-        {"observation",
-         CanonicalValue(CanonicalValue::Object{
-             {"application_start_id", CanonicalValue(start_id_text_)},
-             {"cell_id",
-              CanonicalValue(bundle.value().cell_graph.cell_id.value())},
-             {"graph_revision",
-              CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
-             {"measured_targets", CanonicalValue(std::move(measured_targets))},
-             {"retained_bundle_id",
-              CanonicalValue(bundle.retained_bundle_id().value())},
-             {"schema_version",
-              CanonicalValue("manyforge.execution_observation.v5")},
-             {"source_epoch", CanonicalValue(stream_epoch)},
-             {"source_sequence",
-              CanonicalValue(static_cast<double>(change_generation))},
-             {"targets", CanonicalValue(std::move(targets))},
-         })},
+        {"observation", CanonicalValue(std::move(observation))},
         {"ok", CanonicalValue(true)},
     });
     return ObservationProjection{std::move(response), std::move(wake_channel),
@@ -3492,8 +3535,8 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("resolve_attach_active_tcp")},
           {"ok", CanonicalValue(true)}, {"frame", CanonicalValue(CanonicalValue::Object{
-              {"component_id", CanonicalValue(command.attach_holder->component_id.value())},
-              {"frame_id", CanonicalValue(frame.value().value())}})}});
+              {"component_id", CanonicalValue(frame.value().component_id.value())},
+              {"frame_id", CanonicalValue(frame.value().frame_id.value())}})}});
     }
     if (command.kind == CommandKind::kReadActiveTcp ||
         command.kind == CommandKind::kReadActiveTcpOrdered)

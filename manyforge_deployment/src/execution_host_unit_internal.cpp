@@ -166,7 +166,7 @@ decode_execution_gripper_target_configurations(
     result.push_back(Configuration::GripperTargetConfiguration{
         core::ControllableComponentId(component_id), core::CommandTargetId(target_id),
         string_member("description"), actuation_kind, string_member("open_state_ref"),
-        string_member("closed_state_ref"), *duration_s, string_array_member("touch_links", true),
+        string_member("closed_state_ref"), *duration_s, string_array_member("grip_body_links", true),
         string_member("mount_frame"), string_member("attach_frame"), string_member("tcp_frame"),
         string_array_member("auxiliary_frames", false)});
   }

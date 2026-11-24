@@ -441,19 +441,20 @@ void replace_once(std::string& value, std::string_view before,
 
 [[nodiscard]] std::string srdf_for_exact_expansion_budget(
     std::size_t target_rows) {
-  // Every non-empty one-joint expansion with P provenance occurrences costs
-  // P provenance rows plus one unique expanded-joint row. A Fibonacci-shaped
-  // subgroup DAG creates large, deterministic overlap from a tiny source.
+  // Every non-empty one-joint expansion with P provenance occurrences per
+  // member costs 2P provenance rows plus two unique expanded rows: the joint
+  // and its child link. A Fibonacci-shaped subgroup DAG creates large,
+  // deterministic overlap from a tiny source.
   std::vector<std::size_t> provenance_counts{1U, 1U};
   std::vector<std::string> groups{
       "<group name=\"budget_0\"><joint name=\"joint1\"/></group>",
       "<group name=\"budget_1\"><group name=\"budget_0\"/></group>"};
-  std::size_t used_rows = 4U;
+  std::size_t used_rows = 8U;
   while (true) {
     const auto next_provenance =
         provenance_counts[provenance_counts.size() - 1U] +
         provenance_counts[provenance_counts.size() - 2U];
-    const auto next_cost = next_provenance + 1U;
+    const auto next_cost = 2U * next_provenance + 2U;
     if (next_cost >= target_rows - used_rows) {
       break;
     }
@@ -467,12 +468,18 @@ void replace_once(std::string& value, std::string_view before,
     used_rows += next_cost;
   }
 
-  if (target_rows <= used_rows + 1U) {
+  if (target_rows <= used_rows + 3U) {
     ADD_FAILURE() << "target expansion budget is not representable";
     return {};
   }
-  std::size_t required_provenance = target_rows - used_rows - 1U;
+  const auto remaining_rows = target_rows - used_rows - 2U;
+  std::size_t required_provenance = remaining_rows / 2U;
   std::string final_group{"<group name=\"manipulator\">"};
+  // A direct tool0 member repeats the subgroups' joint1 child link: one
+  // provenance row and no new member, which makes an odd total exact.
+  if (remaining_rows % 2U != 0U) {
+    final_group += "<link name=\"tool0\"/>";
+  }
   for (std::size_t index = provenance_counts.size(); index-- > 0U;) {
     if (provenance_counts[index] <= required_provenance) {
       final_group += "<group name=\"budget_" + std::to_string(index) +
@@ -1932,6 +1939,68 @@ TEST(ModelSource, AcceptsSharedSrdfSubgroupsWithoutCallingThemACycle) {
               SrdfExpansionProvenanceKind::kDirectJoint);
     EXPECT_EQ(leaf_node.source_symbol_name, "joint1");
   }
+}
+
+TEST(ModelSource, ListedSrdfJointsBringInTheirChildLinksLikeMoveIt) {
+  Fixture fixture;
+  auto& srdf = blob_for(fixture, *fixture.srdf_uri);
+  const auto end = srdf.bytes.rfind("</robot>");
+  ASSERT_NE(end, std::string::npos);
+  srdf.bytes.insert(
+      end,
+      "<group name=\"joints_only\"><joint name=\"joint1\"/></group>"
+      "<group name=\"link_and_joint\"><link name=\"tool0\"/>"
+      "<joint name=\"joint1\"/></group>"
+      "<group name=\"outer\"><group name=\"joints_only\"/></group>");
+
+  const auto verified = verify(fixture);
+  const auto& index = verified.source_ir().semantic_index();
+  const auto expanded = [&](std::string_view name)
+      -> const ExpandedSrdfGroupIr& {
+    const auto found = std::find_if(
+        index.expanded_groups.begin(), index.expanded_groups.end(),
+        [name](const ExpandedSrdfGroupIr& group) {
+          return group.group_name == name;
+        });
+    EXPECT_NE(found, index.expanded_groups.end());
+    return *found;
+  };
+  const auto kind = [&](std::size_t provenance_index) {
+    return index.group_expansion_provenance.at(provenance_index).kind;
+  };
+
+  // The base link is not included: no listed joint moves it.
+  const auto& joints_only = expanded("joints_only");
+  ASSERT_EQ(joints_only.links.size(), 1U);
+  EXPECT_EQ(joints_only.links.front().name, "tool0");
+  ASSERT_EQ(joints_only.links.front().provenance_indices.size(), 1U);
+  const auto& child_node = index.group_expansion_provenance.at(
+      joints_only.links.front().provenance_indices.front());
+  EXPECT_EQ(child_node.kind, SrdfExpansionProvenanceKind::kJointChildLink);
+  EXPECT_EQ(child_node.source_member_index, 0U);
+  EXPECT_EQ(child_node.source_symbol_name, "tool0");
+  ASSERT_EQ(joints_only.joints.size(), 1U);
+  EXPECT_EQ(joints_only.joints.front().name, "joint1");
+
+  const auto& both = expanded("link_and_joint");
+  ASSERT_EQ(both.links.size(), 1U);
+  EXPECT_EQ(both.links.front().name, "tool0");
+  ASSERT_EQ(both.links.front().provenance_indices.size(), 2U);
+  EXPECT_EQ(kind(both.links.front().provenance_indices[0]),
+            SrdfExpansionProvenanceKind::kDirectLink);
+  EXPECT_EQ(kind(both.links.front().provenance_indices[1]),
+            SrdfExpansionProvenanceKind::kJointChildLink);
+
+  const auto& outer = expanded("outer");
+  ASSERT_EQ(outer.links.size(), 1U);
+  EXPECT_EQ(outer.links.front().name, "tool0");
+  ASSERT_EQ(outer.links.front().provenance_indices.size(), 1U);
+  const auto& subgroup_node = index.group_expansion_provenance.at(
+      outer.links.front().provenance_indices.front());
+  EXPECT_EQ(subgroup_node.kind, SrdfExpansionProvenanceKind::kSubgroup);
+  ASSERT_TRUE(subgroup_node.nested_provenance_index.has_value());
+  EXPECT_EQ(kind(*subgroup_node.nested_provenance_index),
+            SrdfExpansionProvenanceKind::kJointChildLink);
 }
 
 TEST(ModelSource, EnforcesExactAggregateExpandedSemanticRowBound) {

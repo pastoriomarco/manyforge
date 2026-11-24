@@ -302,7 +302,6 @@ void embed_global_io_stop_products(
 struct PreparedProgramParts final {
   CanonicalValue program = CanonicalValue(nullptr);
   CanonicalValue program_binding = CanonicalValue(nullptr);
-  CanonicalValue program_id = CanonicalValue(nullptr);
   CanonicalValue program_revision = CanonicalValue(nullptr);
   CanonicalValue program_outcome = CanonicalValue(nullptr);
 };
@@ -328,17 +327,17 @@ identify_prepared_activation(const PreparedActivationAssemblyInput &input,
        })},
       {"assistant_mode", CanonicalValue(input.assistant_mode)},
       {"captured_input_digest", CanonicalValue(input.captured_input_digest.value())},
-      {"deployment_artifact_id",
-       CanonicalValue(bundle.value().deployment_artifact_id.value())},
       {"deployment_revision", CanonicalValue(bundle.value().deployment_revision.value())},
       {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
       {"node_environment_digest",
        CanonicalValue(bundle.value().catalogs.node_environment.environment_digest.value())},
-      {"program_id", std::move(parts.program_id)},
       {"program_outcome", std::move(parts.program_outcome)},
       {"program_revision", std::move(parts.program_revision)},
       {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
       {"origin", prepared_activation_origin_value(input.origin)},
+      // An assembled value captures no scene mesh: a Program naming one is
+      // refused by the parse below (only the preparer captures mesh bytes).
+      {"scene_meshes", CanonicalValue(CanonicalValue::Array{})},
       {"schema_version", CanonicalValue(std::string(kPreparedActivationInputSchemaVersion))},
   };
   const auto prepared_id =
@@ -369,7 +368,6 @@ PreparedActivationInput assemble_prepared_activation(
                                 raw_artifacts, raw_artifacts_to_embed);
   PreparedProgramParts parts;
   parts.program = program.normalized_program_root();
-  parts.program_id = CanonicalValue(program.value().program_id.value());
   parts.program_revision =
       CanonicalValue(program.value().program_revision.value());
   if (outcome.binding != nullptr) {

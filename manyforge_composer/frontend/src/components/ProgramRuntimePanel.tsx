@@ -5,6 +5,7 @@ import {
 import {
   displayRunId,
   programMotionStopSettled,
+  programRunProjectionKey,
   type ProgramPendingCommand,
   type ProgramResetOptions,
   type ProgramRuntimeController,
@@ -18,6 +19,10 @@ import type {
   JsonValue,
   ProgramExecutionSelectionControls,
   ProgramInterventionStopScope,
+  ProgramOperatorQuestion,
+  ProgramOperatorQuestionSeverity,
+  ProgramRunKeyValue,
+  ProgramRunKeyValues,
   ProgramRunStateName,
   RuntimeControlAuditEvent,
   TakeoverFallbackAuditEvent,
@@ -38,6 +43,7 @@ import { useAuthoringAdmissionTooltip } from './authoringAdmission';
 import { ActiveTcpHoldHistory, activeTcpSnapshot, type ResumeTcpChange } from '../state/activeTcpResume';
 import { NamespaceGroupOptions, useNamespaceGroups } from './common/NamespaceGroupOptions';
 import { groupByNamespace } from '../utils/blackboardNamespaces';
+import { activeProgramWaits } from '../state/programWaits';
 import {
   blockedReasonText,
   haltCauseText,
@@ -58,6 +64,7 @@ import {
 } from '../api/parsers';
 import {
   BlackboardValueEditor,
+  formatBlackboardValue,
   blackboardValueDraft,
   blackboardValueDraftIssue,
   blackboardValueEditable,
@@ -137,6 +144,76 @@ function RecoveryCommandRow({
   );
 }
 
+/** Question severity onto the shared notice severities (a fault reads as an error). */
+const QUESTION_SEVERITY: Readonly<Record<ProgramOperatorQuestionSeverity, WorkbenchNotice['severity']>> = {
+  info: 'info',
+  warning: 'warning',
+  fault: 'error',
+};
+
+const QUESTION_SEVERITY_LABEL: Readonly<Record<ProgramOperatorQuestionSeverity, string>> = {
+  info: 'Info',
+  warning: 'Warning',
+  fault: 'Fault',
+};
+
+/**
+ * One open operator question: its message, node, the motion groups it holds,
+ * and one button per option. Only the node's branch waits for the answer.
+ */
+function OperatorQuestionSection({
+  question,
+  pending,
+  refusal,
+  answer,
+}: {
+  question: ProgramOperatorQuestion;
+  /** The control command in progress, if any. */
+  pending: string | null;
+  /** The Composer-side refusal (unapplied Draft, assistant turn), as for Retry. */
+  refusal: string | null;
+  answer: (optionId: string) => void;
+}) {
+  const titleId = `operator-question-${question.nodeInstanceId}`;
+  const severity = QUESTION_SEVERITY[question.severity];
+  return (
+    <section
+      className={`runtime-control-section${question.severity === 'fault' ? ' program-recovery-failed' : ''}`}
+      aria-labelledby={titleId}
+    >
+      <div className="runtime-control-heading">
+        <div>
+          <span>{`${QUESTION_SEVERITY_LABEL[question.severity]} · node `}<code>{question.nodeInstanceId}</code></span>
+          <h3 id={titleId}>Question</h3>
+        </div>
+        <code>offer {question.offerRevision}</code>
+      </div>
+      <p className={`inline-message severity-${severity}`}>{question.message}</p>
+      {question.holdMotionGroupIds.length > 0 && (
+        <p className="hint">
+          Holds motion {question.holdMotionGroupIds.join(', ')}: stopped until Run, also after the answer.
+        </p>
+      )}
+      <div className="runtime-control-actions">
+        {question.options.map((option) => {
+          const optionPending = pending === `recovery:${question.offerId}:${option.optionId}`;
+          return (
+            <button
+              key={option.optionId}
+              type="button"
+              className={option.result === 'failure' ? 'danger-button' : undefined}
+              disabled={pending !== null || refusal !== null}
+              title={refusal
+                ?? (option.result === 'failure' ? 'The node fails with this answer.' : undefined)}
+              onClick={() => answer(option.optionId)}
+            >{optionPending ? `${option.label}…` : option.label}</button>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function shortIdentity(value: string | null): string {
   if (!value) return 'none';
   return value.length > 26 ? `${value.slice(0, 22)}…` : value;
@@ -158,6 +235,14 @@ const RETRY_ACTION_IDS: readonly string[] = [
   'retry_motion_from_current_state',
   'retry_after_scene_repair',
   'retry_runtime_step',
+];
+
+/** A failure hold's Retry also takes the Kernel's replan from the stopped
+ * state (a cleanly contained collision Stop, OD-373); an operator Stop's
+ * replan stays its Resume. */
+const FAILURE_RETRY_ACTION_IDS: readonly string[] = [
+  ...RETRY_ACTION_IDS,
+  'replan_from_stopped_state',
 ];
 
 /** The Program commands' busy labels while their request is in flight. */
@@ -309,6 +394,43 @@ export function simulationRefusalAuditText(event: RuntimeControlAuditEvent): str
   return hold.held
     ? `Simulation not playing on ${hold.nodeInstanceId} · stopped, waiting for Run`
     : `Simulation hold ended on ${hold.nodeInstanceId}`;
+}
+
+function stringFacts(value: JsonValue | undefined): string[] | null {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string')
+    ? value as string[]
+    : null;
+}
+
+/**
+ * The Program's operator questions and group Stops (OD-342):
+ * "Question on ask_bin (warning): Bin is full. · options continue, abort · holds motion left_arm",
+ * "Answer on ask_bin: Bin emptied, continue (failure)" or
+ * "Program node stop_left stopped motion left_arm · waits for Run"; null for another event.
+ */
+export function programOperatorAuditText(event: RuntimeControlAuditEvent): string | null {
+  const facts = event.facts as Record<string, JsonValue>;
+  const node = facts.node_instance_id;
+  if (typeof node !== 'string') return null;
+  if (event.kind === 'program_operator_choice_requested') {
+    const options = stringFacts(facts.option_ids);
+    const groups = stringFacts(facts.hold_motion_group_ids);
+    const severity = typeof facts.severity === 'string' ? ` (${facts.severity})` : '';
+    const message = typeof facts.message === 'string' ? `: ${facts.message}` : '';
+    return `Question on ${node}${severity}${message}`
+      + (options === null || options.length === 0 ? '' : ` · options ${options.join(', ')}`)
+      + (groups === null || groups.length === 0 ? '' : ` · holds motion ${groups.join(', ')}`);
+  }
+  if (event.kind === 'program_operator_choice_answered') {
+    const label = typeof facts.label === 'string' ? facts.label
+      : typeof facts.option_id === 'string' ? facts.option_id : 'an option';
+    return `Answer on ${node}: ${label}${facts.result === 'failure' ? ' (failure)' : ''}`;
+  }
+  if (event.kind === 'program_motion_groups_stopped') {
+    const groups = stringFacts(facts.group_ids);
+    return `Program node ${node} stopped motion${groups === null || groups.length === 0 ? '' : ` ${groups.join(', ')}`} · waits for Run`;
+  }
+  return null;
 }
 
 /**
@@ -483,13 +605,15 @@ function actionLabel(value: string): string {
 const RUNTIME_MONITOR_NON_CONTACT_REASONS = [
   'runtime_monitor_observation_lost',
   'runtime_monitor_checks_stopped',
+  'component_fault',
 ] as const;
 
 /**
  * The Recovery line's class label. A runtime-monitor Stop for lost position
- * feedback, or for collision checks that did not run in time (OD-217), keeps
- * the `runtime_collision` recovery class but is not a collision: it is named
- * by its reason's catalog text. Display only.
+ * feedback, for collision checks that did not run in time (OD-217), or a
+ * component fault's Stop (OD-379) keeps the `runtime_collision` recovery
+ * class but is not a collision: it is named by its reason's catalog text.
+ * Display only.
  */
 export function recoveryClassLabel(
   offer: Pick<CycleRecoveryOffer, 'recoveryClass' | 'reason'>,
@@ -512,6 +636,294 @@ function cycleFailureMessage(failure: Record<string, JsonValue> | null): string 
   return typeof code === 'string' ? humanizeReasonCode(code) : null;
 }
 
+/** One key's current value as the Keys panel shows it. */
+export function runKeyValueText(row: ProgramRunKeyValue): string {
+  if (row.valueState === 'value') return formatBlackboardValue(row.type, row.value);
+  return row.valueState === 'no_value' ? 'no value' : 'too large to show';
+}
+
+/**
+ * The run's declared keys with their current values. Read while mounted,
+ * again whenever the run's projection (its revision or node statuses)
+ * changes; no timer.
+ */
+export function ProgramRunKeyValuesSection({
+  runId,
+  refreshKey,
+  read,
+}: {
+  runId: number | null;
+  refreshKey: string;
+  read: ProgramRuntimeController['readRunKeyValues'];
+}) {
+  const [values, setValues] = useState<ProgramRunKeyValues | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (runId === null) {
+      setValues(null);
+      setError(null);
+      return undefined;
+    }
+    const controller = new AbortController();
+    read(runId, controller.signal)
+      .then((next) => {
+        if (controller.signal.aborted) return;
+        setValues(next);
+        setError(null);
+      })
+      .catch((reason: unknown) => {
+        if (!controller.signal.aborted) {
+          setError(reason instanceof Error ? reason.message : 'Current values are unavailable.');
+        }
+      });
+    return () => controller.abort();
+  }, [read, refreshKey, runId]);
+  const shown = values !== null && values.programRunId === runId ? values : null;
+  return (
+    <section className="runtime-control-section" aria-labelledby="run-key-values-title">
+      <div className="runtime-control-heading">
+        <div>
+          <span>Current run</span>
+          <h3 id="run-key-values-title">Key values</h3>
+        </div>
+      </div>
+      {runId === null && <p className="panel-state">No run is active.</p>}
+      {error !== null && (
+        <p className="inline-message severity-error" role="alert">
+          Current values could not be read: {error}
+        </p>
+      )}
+      {shown !== null && shown.keys.length === 0 && (
+        <p className="panel-state">The Program declares no keys.</p>
+      )}
+      {shown !== null && shown.keys.length > 0 && (
+        <div className="program-run-setup-table-wrap">
+          <table className="program-key-values-table">
+            <thead>
+              <tr><th scope="col">Key</th><th scope="col">Type</th><th scope="col">Value</th></tr>
+            </thead>
+            <tbody>
+              {shown.keys.map((row) => (
+                <tr key={row.key} data-run-key={row.key}>
+                  <td><code>{row.key}</code></td>
+                  <td>{row.type}</td>
+                  <td className={row.valueState === 'value' ? undefined : 'hint'}>
+                    {runKeyValueText(row)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * Program keys (viewer "Keys" panel): the current run's key values, write a
+ * current-run value, and the stored (persistent) values of the Applied
+ * Program.
+ */
+export function ProgramKeysPanel({
+  enabled,
+  controller,
+  onEditInitial,
+}: {
+  enabled: boolean;
+  controller: ProgramRuntimeController;
+  /** Opens a key's declaration in the Program tab (its initial value). */
+  onEditInitial?: (key: string) => void;
+}) {
+  const {
+    state,
+    writeRuntimeBlackboard,
+    persistentValues,
+    readRunKeyValues,
+    runnerAllows,
+    runnerRefusal,
+    runnerBusyReason,
+  } = controller;
+  const [blackboardKey, setBlackboardKey] = useState('');
+  const keyNamespaces = useNamespaceGroups();
+  const [blackboardDraft, setBlackboardDraft] = useState('');
+  const [blackboardPoseIssue, setBlackboardPoseIssue] = useState<string | null>(null);
+  const [blackboardError, setBlackboardError] = useState<string | null>(null);
+  const [blackboardWritten, setBlackboardWritten] = useState<string | null>(null);
+  const declaredKeys = state.applied?.program.blackboard?.keys ?? [];
+  // Operator writes follow the key's access and use its typed editor; a
+  // computed key always holds its formula's result.
+  const writableKeys = declaredKeys.filter((key) => (
+    (key.access === 'write' || key.access === 'read_write')
+    && key.expression === undefined
+    && blackboardValueEditable(key.type)
+  ));
+  const hasPersistentKeys = declaredKeys.some((key) => key.persistence === 'persistent');
+  const sceneResourceIds = useMemo(
+    () => (state.applied?.program.scene ?? []).map((resource) => resource.scene_resource_id),
+    [state.applied],
+  );
+  const selectedBlackboardKey = writableKeys.find(
+    (key) => key.key === blackboardKey,
+  ) ?? null;
+  // The backend says when writes are refused (for example after Halt).
+  const blackboardWriteRefusal = runnerAllows('program_runtime_blackboard_write')
+    ? null
+    : runnerRefusal('program_runtime_blackboard_write')
+      ?? 'writes are allowed only while the run is running or paused on a failure';
+  const blackboardIssue = selectedBlackboardKey === null
+    ? null
+    : blackboardPoseIssue ?? blackboardValueDraftIssue(
+      selectedBlackboardKey.type,
+      blackboardDraft,
+      sceneResourceIds,
+    );
+  const showRuntime = enabled && state.run !== null && writableKeys.length > 0;
+  const showStored = enabled && hasPersistentKeys && state.applied !== null;
+  const showValues = enabled && state.applied !== null;
+  return (
+    <div className="program-keys-panel">
+      {/* Writes first, then stored values, then the long list of current values. */}
+      {!showRuntime && !showStored && (
+        <p className="panel-state">
+          {state.applied === null
+            ? 'No Applied Program.'
+            : state.run === null
+              ? 'Current-run values can be written while a run is active. The Program has no stored values.'
+              : 'The Program has no keys the operator may write.'}
+        </p>
+      )}
+      {showRuntime && (
+        <section className="runtime-control-section" aria-labelledby="runtime-blackboard-title">
+          <div className="runtime-control-heading">
+            <div>
+              <span>Typed current-run value</span>
+              <h3 id="runtime-blackboard-title">Runtime blackboard</h3>
+            </div>
+          </div>
+          <label className="runtime-control-field">
+            <span>Writable key</span>
+            <select
+              value={blackboardKey}
+              onChange={(event) => {
+                if (keyNamespaces.handleToggle(event.currentTarget.value)) return;
+                const key = writableKeys.find((row) => row.key === event.currentTarget.value);
+                setBlackboardKey(event.currentTarget.value);
+                setBlackboardDraft(key === undefined
+                  ? ''
+                  : blackboardValueDraft(key.type, key.initial, sceneResourceIds));
+                setBlackboardPoseIssue(null);
+                setBlackboardError(null);
+                setBlackboardWritten(null);
+              }}
+            >
+              <option value="">Choose a key</option>
+              <NamespaceGroupOptions
+                groups={groupByNamespace(writableKeys, (key) => key.key)}
+                expanded={keyNamespaces.expanded}
+                current={blackboardKey}
+                valueOf={(key) => key.key}
+                option={(key) => (
+                  <option key={key.key} value={key.key}>
+                    {key.key} · {key.type}
+                  </option>
+                )}
+              />
+            </select>
+          </label>
+          {selectedBlackboardKey !== null && (
+            <BlackboardValueEditor
+              // Another key starts its own fields: unfinished text of the
+              // previous key's pose is not shown over the new draft.
+              key={selectedBlackboardKey.key}
+              id="runtime-blackboard-value"
+              label={`Value (${selectedBlackboardKey.type})`}
+              type={selectedBlackboardKey.type}
+              draft={blackboardDraft}
+              sceneResourceIds={sceneResourceIds}
+              frameScope={state.applied === null ? undefined : {
+                program: state.applied.program,
+                ...(selectedBlackboardKey.allowed_frames === undefined
+                  ? {}
+                  : { allowedFrames: selectedBlackboardKey.allowed_frames }),
+              }}
+              disabled={state.controlPending !== null}
+              onDraftChange={(draft) => {
+                setBlackboardDraft(draft);
+                setBlackboardError(null);
+                setBlackboardWritten(null);
+              }}
+              onInvalidChange={setBlackboardPoseIssue}
+            />
+          )}
+          {blackboardWriteRefusal !== null && (
+            <p className="hint" role="status">
+              Writes are refused now: {blackboardWriteRefusal.replaceAll('_', ' ')}.
+            </p>
+          )}
+          {blackboardIssue !== null && (
+            <p className="inline-message severity-error">{blackboardIssue}</p>
+          )}
+          {blackboardError && (
+            <p className="inline-message severity-error" role="alert">
+              Not written: {blackboardError}
+            </p>
+          )}
+          {blackboardWritten && <p className="hint" role="status">{blackboardWritten}</p>}
+          <button
+            type="button"
+            disabled={
+              selectedBlackboardKey === null
+              || blackboardIssue !== null
+              || blackboardWriteRefusal !== null
+              || runnerBusyReason !== null
+              || state.controlPending !== null
+            }
+            title={runnerBusyReason ?? undefined}
+            onClick={() => {
+              if (selectedBlackboardKey === null) return;
+              const { key, type } = selectedBlackboardKey;
+              const value = parseBlackboardValueDraft(type, blackboardDraft, sceneResourceIds);
+              setBlackboardError(null);
+              setBlackboardWritten(null);
+              void writeRuntimeBlackboard(key, value).then((refusal) => {
+                if (refusal === null) setBlackboardWritten(`Wrote ${key}.`);
+                else setBlackboardError(refusal);
+              });
+            }}
+          >
+            Write current-run value
+          </button>
+        </section>
+      )}
+
+      {showStored && state.applied !== null && (
+        <PersistentKeyValuesSection
+          projectPath={state.applied.projectPath}
+          appliedRevision={state.applied.programRevision}
+          runId={state.run?.capture.programRunId ?? null}
+          applicationStartId={controller.applicationStartId}
+          sceneResourceIds={sceneResourceIds}
+          frameProgram={{
+            program: state.applied.program,
+            frames: state.applied.programBinding.frame_bindings.map((row) => row.reference),
+          }}
+          client={persistentValues}
+          runnerBusyReason={runnerBusyReason}
+          onEditInitial={onEditInitial}
+        />
+      )}
+      {showValues && (
+        <ProgramRunKeyValuesSection
+          runId={state.run?.capture.programRunId ?? null}
+          refreshKey={`${programRunProjectionKey(state.run)}:${blackboardWritten ?? ''}`}
+          read={readRunKeyValues}
+        />
+      )}
+    </div>
+  );
+}
+
 export function ProgramRuntimePanel({
   enabled,
   controller,
@@ -523,23 +935,15 @@ export function ProgramRuntimePanel({
     cycleState,
     cycleFailure,
     refresh,
-    writeRuntimeBlackboard,
-    persistentValues,
-    runnerAllows,
-    runnerRefusal,
-    runnerBusyReason,
     stageManualResult,
+    answerOperatorQuestion,
+    composerRefusalReason,
   } = controller;
-  const [blackboardKey, setBlackboardKey] = useState('');
-  const keyNamespaces = useNamespaceGroups();
-  const [blackboardDraft, setBlackboardDraft] = useState('');
-  const [blackboardPoseIssue, setBlackboardPoseIssue] = useState<string | null>(null);
-  const [blackboardError, setBlackboardError] = useState<string | null>(null);
-  const [blackboardWritten, setBlackboardWritten] = useState<string | null>(null);
   const [manualOutput, setManualOutput] = useState('null');
   const [manualError, setManualError] = useState<string | null>(null);
   const controls = state.controls?.runtimeControls ?? null;
   const recoveryOffer = state.controls?.recoveryOffer ?? null;
+  const operatorQuestions = state.controls?.operatorQuestions ?? [];
   const ordinaryMotionHeld = recoveryOffer?.recoveryClass === 'ordinary_operator_stop';
   const ioSourceUnavailable = state.run === null || controls === null
     ? []
@@ -562,19 +966,6 @@ export function ProgramRuntimePanel({
   const failureHold = recoveryOffer !== null && !ordinaryMotionHeld;
   const recoveryCause = cycleFailureMessage(cycleFailure)
     ?? (failureHold ? recoveryOffer.reason.message || humanizeReasonCode(recoveryOffer.reason.code) : null);
-  const declaredKeys = state.applied?.program.blackboard?.keys ?? [];
-  // Operator writes follow the key's access and use its typed editor; a
-  // computed key always holds its formula's result.
-  const writableKeys = declaredKeys.filter((key) => (
-    (key.access === 'write' || key.access === 'read_write')
-    && key.expression === undefined
-    && blackboardValueEditable(key.type)
-  ));
-  const hasPersistentKeys = declaredKeys.some((key) => key.persistence === 'persistent');
-  const sceneResourceIds = useMemo(
-    () => (state.applied?.program.scene ?? []).map((resource) => resource.scene_resource_id),
-    [state.applied],
-  );
   // Live motion of the whole Program, from the owner's group projection
   // (the Kernel's active-operation count is only set while a Stop settles).
   const allMotion = state.controls?.executionSelections.groups
@@ -587,26 +978,7 @@ export function ProgramRuntimePanel({
       : allMotion === null
         ? 'Unknown'
         : MOTION_STATE_LABEL[allMotion.state] ?? 'Unknown';
-  const hasAdvanced = enabled && (
-    (controls !== null && controls.audit.length > 0)
-    || (state.run !== null && writableKeys.length > 0)
-    || hasPersistentKeys
-  );
-  const selectedBlackboardKey = writableKeys.find(
-    (key) => key.key === blackboardKey,
-  ) ?? null;
-  // The backend says when writes are refused (for example after Halt).
-  const blackboardWriteRefusal = runnerAllows('program_runtime_blackboard_write')
-    ? null
-    : runnerRefusal('program_runtime_blackboard_write')
-      ?? 'writes are allowed only while the run is running or paused on a failure';
-  const blackboardIssue = selectedBlackboardKey === null
-    ? null
-    : blackboardPoseIssue ?? blackboardValueDraftIssue(
-      selectedBlackboardKey.type,
-      blackboardDraft,
-      sceneResourceIds,
-    );
+  const hasAdvanced = enabled && controls !== null && controls.audit.length > 0;
 
   return (
     <section className="panel program-runtime-panel" aria-labelledby="program-runtime-title">
@@ -637,15 +1009,15 @@ export function ProgramRuntimePanel({
         </div>
       )}
 
-      {enabled && state.nonExecutable !== null && state.nonExecutable.programId === null && (
+      {enabled && state.nonExecutable !== null && state.nonExecutable.programRevision === null && (
         <div className="panel-state" role="status">
           No Program is applied. Add steps and Apply to enable Execute. Manual control remains independent.
         </div>
       )}
-      {enabled && state.nonExecutable !== null && state.nonExecutable.programId !== null && (
+      {enabled && state.nonExecutable !== null && state.nonExecutable.programRevision !== null && (
         <div className="program-feedback" role="alert" aria-label="Applied Program not executable">
           <p>
-            Applied Program <strong>{state.nonExecutable.programId}</strong> is not
+            The Applied Program of Scenario <strong>{state.nonExecutable.origin.scenarioId}</strong> is not
             executable in the active Deployment. It is kept unchanged; edit it and
             Apply again to run it.
           </p>
@@ -680,13 +1052,13 @@ export function ProgramRuntimePanel({
           <div className="program-runtime-fact">
             <span>Applied Program</span>
             <strong>
-              {state.applied?.programId ?? state.nonExecutable?.programId ?? 'none'}
+              {state.applied?.scenarioId ?? state.nonExecutable?.origin.scenarioId ?? 'none'}
             </strong>
             <small>
               {state.applied
-                ? `${state.applied.scenarioId} · ${shortIdentity(state.applied.programRevision)}`
+                ? shortIdentity(state.applied.programRevision)
                 : state.nonExecutable !== null
-                  ? `${state.nonExecutable.origin.scenarioId} · ${state.nonExecutable.programId === null ? 'no Program' : 'not executable in this Deployment'}`
+                  ? (state.nonExecutable.programRevision === null ? 'no Program' : 'not executable in this Deployment')
                   : 'Apply a validated Draft before Execute.'}
             </small>
             {state.applied && (
@@ -723,10 +1095,10 @@ export function ProgramRuntimePanel({
           </div>
           <div className="program-runtime-fact">
             <span>Program in this run</span>
-            <strong>{state.run?.capture.programId ?? 'none'}</strong>
+            <strong>{state.run?.capture.scenarioId ?? 'none'}</strong>
             <small>
               {state.run
-                ? `${state.run.capture.scenarioId} · ${shortIdentity(state.run.capture.programRevision)} · fixed for this run`
+                ? `${shortIdentity(state.run.capture.programRevision)} · fixed for this run`
                 : 'Execute captures the Applied Program for the run.'}
             </small>
           </div>
@@ -897,131 +1269,20 @@ export function ProgramRuntimePanel({
           </details>
         </section>
       )}
+      {enabled && operatorQuestions.map((question) => (
+        <OperatorQuestionSection
+          key={question.offerId}
+          question={question}
+          pending={state.controlPending}
+          refusal={composerRefusalReason}
+          answer={(optionId) => answerOperatorQuestion(question, optionId)}
+        />
+      ))}
 
       {/* Rarely needed tools, kept out of the way; they exist only during a
           run, so the section is shown only when it has content. */}
       {hasAdvanced && <details className="runtime-advanced">
-        <summary>Advanced: runtime blackboard, stored values and audit</summary>
-      {enabled && state.run !== null && writableKeys.length > 0 && (
-        <section className="runtime-control-section" aria-labelledby="runtime-blackboard-title">
-          <div className="runtime-control-heading">
-            <div>
-              <span>Typed current-run value</span>
-              <h3 id="runtime-blackboard-title">Runtime blackboard</h3>
-            </div>
-          </div>
-          <label className="runtime-control-field">
-            <span>Writable key</span>
-            <select
-              value={blackboardKey}
-              onChange={(event) => {
-                if (keyNamespaces.handleToggle(event.currentTarget.value)) return;
-                const key = writableKeys.find((row) => row.key === event.currentTarget.value);
-                setBlackboardKey(event.currentTarget.value);
-                setBlackboardDraft(key === undefined
-                  ? ''
-                  : blackboardValueDraft(key.type, key.initial, sceneResourceIds));
-                setBlackboardPoseIssue(null);
-                setBlackboardError(null);
-                setBlackboardWritten(null);
-              }}
-            >
-              <option value="">Choose a key</option>
-              <NamespaceGroupOptions
-                groups={groupByNamespace(writableKeys, (key) => key.key)}
-                expanded={keyNamespaces.expanded}
-                current={blackboardKey}
-                valueOf={(key) => key.key}
-                option={(key) => (
-                  <option key={key.key} value={key.key}>
-                    {key.key} · {key.type}
-                  </option>
-                )}
-              />
-            </select>
-          </label>
-          {selectedBlackboardKey !== null && (
-            <BlackboardValueEditor
-              // Another key starts its own fields: unfinished text of the
-              // previous key's pose is not shown over the new draft.
-              key={selectedBlackboardKey.key}
-              id="runtime-blackboard-value"
-              label={`Value (${selectedBlackboardKey.type})`}
-              type={selectedBlackboardKey.type}
-              draft={blackboardDraft}
-              sceneResourceIds={sceneResourceIds}
-              frameScope={state.applied === null ? undefined : {
-                program: state.applied.program,
-                ...(selectedBlackboardKey.allowed_frames === undefined
-                  ? {}
-                  : { allowedFrames: selectedBlackboardKey.allowed_frames }),
-              }}
-              disabled={state.controlPending !== null}
-              onDraftChange={(draft) => {
-                setBlackboardDraft(draft);
-                setBlackboardError(null);
-                setBlackboardWritten(null);
-              }}
-              onInvalidChange={setBlackboardPoseIssue}
-            />
-          )}
-          {blackboardWriteRefusal !== null && (
-            <p className="hint" role="status">
-              Writes are refused now: {blackboardWriteRefusal.replaceAll('_', ' ')}.
-            </p>
-          )}
-          {blackboardIssue !== null && (
-            <p className="inline-message severity-error">{blackboardIssue}</p>
-          )}
-          {blackboardError && (
-            <p className="inline-message severity-error" role="alert">
-              Not written: {blackboardError}
-            </p>
-          )}
-          {blackboardWritten && <p className="hint" role="status">{blackboardWritten}</p>}
-          <button
-            type="button"
-            disabled={
-              selectedBlackboardKey === null
-              || blackboardIssue !== null
-              || blackboardWriteRefusal !== null
-              || runnerBusyReason !== null
-              || state.controlPending !== null
-            }
-            title={runnerBusyReason ?? undefined}
-            onClick={() => {
-              if (selectedBlackboardKey === null) return;
-              const { key, type } = selectedBlackboardKey;
-              const value = parseBlackboardValueDraft(type, blackboardDraft, sceneResourceIds);
-              setBlackboardError(null);
-              setBlackboardWritten(null);
-              void writeRuntimeBlackboard(key, value).then((refusal) => {
-                if (refusal === null) setBlackboardWritten(`Wrote ${key}.`);
-                else setBlackboardError(refusal);
-              });
-            }}
-          >
-            Write current-run value
-          </button>
-        </section>
-      )}
-
-      {enabled && hasPersistentKeys && state.applied !== null && (
-        <PersistentKeyValuesSection
-          projectPath={state.applied.projectPath}
-          appliedRevision={state.applied.programRevision}
-          runId={state.run?.capture.programRunId ?? null}
-          applicationStartId={controller.applicationStartId}
-          sceneResourceIds={sceneResourceIds}
-          frameProgram={{
-            program: state.applied.program,
-            frames: state.applied.programBinding.frame_bindings.map((row) => row.reference),
-          }}
-          client={persistentValues}
-          runnerBusyReason={runnerBusyReason}
-        />
-      )}
-
+        <summary>Advanced: runtime-control audit</summary>
       {controls !== null && controls.audit.length > 0 && (
         <details className="runtime-control-section">
           <summary>Recent runtime-control events ({controls.audit.length})</summary>
@@ -1041,6 +1302,7 @@ export function ProgramRuntimePanel({
                     ?? takeoverFallbackText(event)
                     ?? ioSourceAuditText(event)
                     ?? simulationRefusalAuditText(event)
+                    ?? programOperatorAuditText(event)
                     ?? actionLabel(event.kind)}
                 </li>
               );
@@ -1328,7 +1590,49 @@ export function deriveTransportGuidance({
       });
     }
   }
+  // An open operator question is answered where it is seen: one notice per
+  // question, one action per option (OD-342), as in the run details.
+  for (const question of program.state.controls?.operatorQuestions ?? []) {
+    const refusal = program.composerRefusalReason;
+    notices.push({
+      id: `program.question.${question.offerId}`,
+      severity: QUESTION_SEVERITY[question.severity],
+      domain: 'runtime',
+      title: `Question from ${question.nodeInstanceId}`,
+      message: question.holdMotionGroupIds.length === 0
+        ? question.message
+        : `${question.message} Holds motion ${question.holdMotionGroupIds.join(', ')} until Run.`,
+      actions: question.options.map((option) => ({
+        id: `answer-${option.optionId}`,
+        label: option.label,
+        title: refusal ?? (option.result === 'failure' ? 'The node fails with this answer.' : undefined),
+        disabled: program.state.controlPending !== null || refusal !== null,
+        run: () => program.answerOperatorQuestion(question, option.optionId),
+      })),
+    });
+  }
+  const waiting = programWaitNotice(program);
+  if (waiting !== null) notices.push(waiting);
   return notices;
+}
+
+/** What the running Program waits for (OD-354); null when nothing waits. */
+function programWaitNotice(program: ProgramRuntimeController): WorkbenchNotice | null {
+  const { run, applied } = program.state;
+  // The node statuses name nodes of the captured Program: read its tree only when it is the Applied one.
+  if (run === null || applied === null || run.state !== 'running'
+    || run.capture.programRevision !== applied.programRevision) return null;
+  const waits = activeProgramWaits(applied.program.tree, run.nodeStatuses);
+  if (waits.length === 0) return null;
+  return {
+    id: 'program.waiting',
+    severity: 'info',
+    domain: 'runtime',
+    title: 'Waiting',
+    message: '',
+    // Every active wait on its own line, always shown while it waits.
+    pinnedLines: waits.map((wait) => `${wait.condition} — ${wait.nodeInstanceIds.join(', ')}`),
+  };
 }
 
 /** Operator explanation for an automatically revealed All column. */
@@ -1358,6 +1662,8 @@ const NO_PROGRAM_SELECTIONS: ProgramExecutionSelectionControls['groups'] = [{
   runtimeScaleSelector: null,
   runtimeScaleUnavailableReason: 'program_run_not_active',
   resourceIds: [],
+  stoppedBy: null,
+  stoppedByNodeInstanceId: null,
 }];
 
 /**
@@ -1782,11 +2088,12 @@ export function ProgramTransportControls({
   const offerControls = (
     offer: CycleRecoveryOffer,
     interventionStopScope: ProgramInterventionStopScope,
+    retryActionIds: readonly string[],
   ) => {
     // A disabled Retry still replaces Run/Resume: the pause must not be
     // bypassed, and its reason (e.g. containment not confirmed) is shown.
     const retryActions = offer.actions.filter(
-      (action) => RETRY_ACTION_IDS.includes(action.actionId),
+      (action) => retryActionIds.includes(action.actionId),
     );
     const retryAction = retryActions.find((action) => action.enabled)
       ?? retryActions[0]
@@ -1808,11 +2115,11 @@ export function ProgramTransportControls({
   };
   const holdsControls = recoveryHolds.map((hold) => ({
     hold,
-    ...offerControls(hold.offer, hold.interventionStopScope),
+    ...offerControls(hold.offer, hold.interventionStopScope, FAILURE_RETRY_ACTION_IDS),
   }));
   const operatorControls = operatorOffer === null
     ? null
-    : offerControls(operatorOffer, 'all');
+    : offerControls(operatorOffer, 'all', RETRY_ACTION_IDS);
   // A hold whose node is in no named group (['all']) owns every group that
   // no other hold names.
   const groupHold = (groupId: string) => holdsControls.find(
@@ -2286,9 +2593,19 @@ export function ProgramTransportControls({
                     aria-label={`Requested velocity ${scaleOutput}`}
                   >{scale?.pending ? '…' : scaleOutput}</output>
                 </label>
-                <span className="transport-group-name" title={groupTitle(group.groupId)}>
-                  {group.groupId === 'all' ? 'All groups' : group.groupId}
-                </span>
+                {group.stoppedBy === 'program' ? (
+                  <span
+                    className="transport-group-name"
+                    role="status"
+                    title={`Stopped by Program node ${group.stoppedByNodeInstanceId} · waits for Run`}
+                  >
+                    {`${group.groupId} · by Program`}
+                  </span>
+                ) : (
+                  <span className="transport-group-name" title={groupTitle(group.groupId)}>
+                    {group.groupId === 'all' ? 'All groups' : group.groupId}
+                  </span>
+                )}
               </section>
             );
           })}
@@ -2435,7 +2752,11 @@ export function ProgramTransportControls({
             </div>
             <div>
               <dt>Retry</dt>
-              <dd>Shown instead of Run/Resume when the Program paused on a failed node: retries that node and lets all the Program&apos;s stopped and not-yet-started motion continue. To start over, use Reset.</dd>
+              <dd>Shown instead of Run/Resume when the Program paused on a failed node: retries that node. Retry and Continue release the node&apos;s own motion groups and, with its intervention stop scope All (the default), also the groups no other paused node holds. To start over, use Reset.</dd>
+            </div>
+            <div>
+              <dt>Question</dt>
+              <dd>A Program node asks the operator to choose. Only its branch waits; the rest of the tree goes on. Groups it stopped wait for Run, also after the answer.</dd>
             </div>
             <div>
               <dt>Halt</dt>
@@ -2455,7 +2776,7 @@ export function ProgramTransportControls({
             </div>
             <div>
               <dt>Failure pause</dt>
-              <dd>A node allowed to pause for the operator (its Recovery policy) failed: the tree waits and all Program motion is stopped until Retry or Reset.</dd>
+              <dd>A node allowed to pause for the operator (its Recovery policy) failed: the tree waits and Program motion is stopped until Retry, Continue or Reset: all of it, or only the node&apos;s own motion groups when its intervention stop scope is Own groups.</dd>
             </div>
           </dl>
         </details>

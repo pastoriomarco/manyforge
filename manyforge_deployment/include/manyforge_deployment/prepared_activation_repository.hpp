@@ -58,7 +58,8 @@ struct PreparedActivationAssemblyInput final {
 /// exactly the catalog artifacts that binding reads and the bundle's model-map
 /// artifact, then parse and verify the result like any stored value. Used by
 /// callers that prepare from already-retained artifacts (for example package
-/// fixtures); the activation preparer materializes its own closure.
+/// fixtures); the activation preparer materializes its own closure. It
+/// captures no scene mesh, so a Program naming one is refused.
 [[nodiscard]] PreparedActivationInput assemble_prepared_activation(
     const PreparedActivationAssemblyInput &input, const RetainedBundle &bundle,
     const VerifiedRetainedModelMap &model_map,

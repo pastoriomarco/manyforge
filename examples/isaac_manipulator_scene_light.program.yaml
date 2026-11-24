@@ -1,17 +1,10 @@
-api_version: manyforge.program.v3
-program_id: isaac_manipulator_scene_light
-program_revision: sha256:5bd30172683f2ff305ee628a6cd5ad7342fa8ef13b21c1ea86a1dea8b9560831
+api_version: manyforge.program.v4
+program_revision: sha256:bbd6357c351720301bfaf55a7a544fc20cbcdc522505af91a454cc06f8e13ccb
 program_profile: composable-cell-v1
-name: isaac_manipulator_scene_light
-description: Retained Isaac Sim light-scene pick-and-place Program for the UR10e and Robotiq 2F-140. It
-  preserves the exact authored meshes and poses, typed simulator play/reset/pause lifecycle, observed-scene
-  planning, physical gripper commands, carried-object transitions, and retained-world rest pose.
 catalog:
   api_version: manyforge.node_catalog.v3
-  content_version: 3.0.0
+  content_version: 4.0.0
 compatibility:
-  lanes:
-  - isaac-sim
   assistant: optional
   requires:
   - robotiq_2f_140_gripper
@@ -25,7 +18,7 @@ scene:
 - scene_resource_id: isaac_cheese_box
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/mac_n_cheese_centered_collider_cooked.obj
     mesh_scale:
     - 1.0
     - 1.0
@@ -44,22 +37,10 @@ scene:
       - -90.093258
   resource_roles:
   - pick_object
-  metadata:
-    support_contacts:
-    - support_object_id: isaac_table_low_327
-      mode: contact_release
-      release_evidence_mode: binary_contact
-      enforce_max_start_penetration: false
-      max_start_penetration_m: 0.0
-      release_tolerance_m: 0.0
-      min_release_progress_m: 0.0
-      require_separation_by_end: true
-      require_strictly_decreasing_penetration: false
-      allow_recontact: false
 - scene_resource_id: isaac_small_klt
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/World__small_KLT_collider_primitives.obj
     mesh_scale:
     - 1.0
     - 1.0
@@ -79,7 +60,7 @@ scene:
 - scene_resource_id: isaac_small_klt_01
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/World__small_KLT_01_collider_primitives.obj
     mesh_scale:
     - 1.0
     - 1.0
@@ -99,7 +80,7 @@ scene:
 - scene_resource_id: isaac_soup_can
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/World__soup_can_collider_cooked.obj
     mesh_scale:
     - 1.0
     - 1.0
@@ -119,7 +100,7 @@ scene:
 - scene_resource_id: isaac_table_low_327
   shape:
     type: mesh
-    mesh_resource_uri: examples/isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj
+    mesh_resource_uri: isaac_manipulator_scene_light/meshes/background__table_low_327_collider_cooked.obj
     mesh_scale:
     - 1.0
     - 1.5
@@ -335,6 +316,23 @@ tree:
       planning_timeout_s: 10.0
       execution_timeout_s: 30.0
       acceleration_scale: 0.8
+      collision_rules:
+      - rule_id: lift_from_isaac_table_low_327
+        a:
+        - kind: attached_object
+          component_id: robotiq_2f_140
+        b:
+        - kind: scene_object
+          scene_resource_id: isaac_table_low_327
+        release:
+          release_evidence_mode: binary_contact
+          enforce_max_start_penetration: false
+          max_start_penetration_m: 0.0
+          min_release_progress_m: 0.0
+          release_tolerance_m: 0.0
+          require_strictly_decreasing_penetration: false
+          require_separation_by_end: true
+          allow_recontact: false
     children: []
     value_sources:
       velocity_scale:
@@ -412,6 +410,16 @@ tree:
       planning_timeout_s: 10.0
       execution_timeout_s: 30.0
       acceleration_scale: 0.8
+      collision_rules:
+      - rule_id: place_on_isaac_table_low_327
+        a:
+        - kind: attached_object
+          component_id: robotiq_2f_140
+        b:
+        - kind: scene_object
+          scene_resource_id: isaac_table_low_327
+        contact:
+          end_from_fraction: 0.8
     children: []
     value_sources:
       velocity_scale:

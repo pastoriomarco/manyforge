@@ -21,8 +21,6 @@ namespace manyforge::core {
 // retained-product DTO family is linked into the complete core surface.  They
 // remain StrongString domains and therefore cannot be interchanged with an
 // equal-spelled graph, catalog, or raw-content identity.
-struct DeploymentArtifactIdTag final {};
-using DeploymentArtifactId = StrongString<DeploymentArtifactIdTag>;
 
 struct DeploymentRevisionTag final {};
 using DeploymentRevision = StrongString<DeploymentRevisionTag>;
@@ -184,9 +182,6 @@ using RetainedCommandSchemaSourceRecordDTO =
 using RetainedCapabilityDefinitionSourceRecordDTO =
     TypedRetainedSourceRecordDTO<CatalogRecordKind::kCapabilityDefinition, CapabilityId,
                                  CapabilityDefinitionRevision>;
-using RetainedContactPolicySourceRecordDTO =
-    TypedRetainedSourceRecordDTO<CatalogRecordKind::kContactPolicy, ContactPolicyId,
-                                 ContactPolicyRevision>;
 using RetainedStopEvidencePolicySourceRecordDTO =
     TypedRetainedSourceRecordDTO<CatalogRecordKind::kStopEvidencePolicy, StopEvidencePolicyId,
                                  StopEvidencePolicyRevision>;
@@ -199,7 +194,7 @@ using RetainedSourceRecordDTO =
                  RetainedControlInterfaceContractSourceRecordDTO,
                  RetainedControllerTopologySourceRecordDTO, RetainedProviderManifestSourceRecordDTO,
                  RetainedCommandSchemaSourceRecordDTO, RetainedCapabilityDefinitionSourceRecordDTO,
-                 RetainedContactPolicySourceRecordDTO, RetainedStopEvidencePolicySourceRecordDTO>;
+                 RetainedStopEvidencePolicySourceRecordDTO>;
 
 static_assert(std::variant_size_v<RetainedSourceRecordDTO> == kCatalogRecordTypeRegistry.size());
 
@@ -243,7 +238,6 @@ struct RetainedBundleProvenanceDTO final {
 struct RetainedBundleDTO final {
   std::string api_version;
   RetainedBundleId retained_bundle_id;
-  DeploymentArtifactId deployment_artifact_id;
   DeploymentRevision deployment_revision;
   CellGraphDTO cell_graph;
   RetainedCatalogDTO catalogs;

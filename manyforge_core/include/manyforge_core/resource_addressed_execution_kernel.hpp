@@ -576,7 +576,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] StopAcceptedDTO recognized_stop(const RecognizedStopIngressDTO& ingress);
 
   // ---- Reads (memory only).
-  /// The scope read (`manyforge.program_execution_scope.v3`).
+  /// The scope read (`manyforge.program_execution_scope.v4`).
   [[nodiscard]] Result<ProgramExecutionScopeStateDTO> get_program_execution_scope(
       const ProgramRunNumber& program_run_id) const;
   /// The event stream's Stop facts (K18): the claimed run's hold facts and
@@ -612,6 +612,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Component model v2: the execution host passes the
   /// current state of every component in the cell on every change. Components
   /// absent from `states` no longer count. Nothing is stored or journaled.
+  /// OD-379: a component entering `fault` while an operation executes also
+  /// stops every robot in motion with its fault Stop profile (one
+  /// `component_fault` Stop); the call never waits for that Stop.
   void observe_component_states(std::vector<ComponentState> states);
   /// The cell latch, derived from the last observed component states and the
   /// Kernel's own Stops and execution. While latched, Program dispatch, node
@@ -1367,7 +1370,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ProgramCycleStatusDTO* program_reset_status);
   /// Cell latch, state_mutex_ held. `arm` arms the latch
   /// condition; the arm clears when every component is healthy and idle.
-  void observe_component_states_locked(std::vector<ComponentState> states);
+  /// Returns the typed `component_fault` cause when a component entered
+  /// `fault` in this update while an operation executes (OD-379).
+  [[nodiscard]] std::optional<ErrorDTO> observe_component_states_locked(
+      std::vector<ComponentState> states);
+  /// OD-379: the cell's `component_fault` Stop (fault Stop profiles) through
+  /// `request_stop_locked`; the participants it starts keep `cause`. The
+  /// caller completes `handoff` after the unlock.
+  void request_component_fault_stop_locked(const ErrorDTO& cause, StopHandoff& handoff);
   void refresh_cell_latch_locked(bool arm);
   /// Every component in the cell is healthy and idle (or latch-exempt).
   [[nodiscard]] bool cell_settled_locked() const;

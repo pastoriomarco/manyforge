@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_component_manager VERSION 0.3.1 LANGUAGES CXX)
+project(manyforge_component_manager VERSION 0.4.0 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -488,7 +488,7 @@ if(BUILD_TESTING)
     endif()
   endforeach()
   target_link_libraries(test_manager_runtime_convergence_coordinator PRIVATE
-    SQLite::SQLite3)
+    manyforge::persistence SQLite::SQLite3)
   gtest_discover_tests(test_manager_runtime_convergence_coordinator
     DISCOVERY_TIMEOUT 60
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

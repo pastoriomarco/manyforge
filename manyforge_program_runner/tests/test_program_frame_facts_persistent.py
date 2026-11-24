@@ -27,7 +27,7 @@ def test_persistent_write_preserves_the_runtime_frame_reason() -> None:
 
     declaration = BlackboardKeyDeclaration("pose", "stored_pose", "read_write", "persistent", {})
     program = object.__new__(Program)
-    program._data = {"api_version": "manyforge.program.v3", "scene": []}
+    program._data = {"api_version": "manyforge.program.v4", "scene": []}
     program.blackboard_keys = {"pose": declaration}
     program.parameters = {}
     captured = program.with_program_frame_facts(ProgramFrameFacts.from_capture(deepcopy(facts()), IDENTITY))

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -19,7 +20,7 @@
 namespace manyforge::deployment {
 
 inline constexpr std::string_view kPreparedActivationInputSchemaVersion =
-    "manyforge.prepared_activation_input.v7";
+    "manyforge.prepared_activation_input.v8";
 
 struct PreparedScenarioOrigin final {
   std::string scenario_id;
@@ -49,6 +50,29 @@ class PreparedActivationInputError final : public std::invalid_argument {
 public:
   using std::invalid_argument::invalid_argument;
 };
+
+/// One Program scene mesh captured into the activation: its bytes are a raw
+/// artifact of the prepared activation, stored content-addressed at
+/// `raw-artifacts/sha256/<hex>.blob` below the activation root. The Program
+/// keeps the URI unchanged; consumers read the bytes by the digest only.
+struct PreparedSceneMesh final {
+  std::string resource_uri;
+  core::ContentDigest content_digest;
+  std::uint64_t byte_size{0U};
+  friend bool operator==(const PreparedSceneMesh &, const PreparedSceneMesh &) = default;
+};
+
+/// The scene-mesh URIs of one normalized Program: the `mesh_resource_uri`
+/// text of every object whose `type` is "mesh", anywhere in the Program (the
+/// initial Scene and Scene-node shape parameters alike), sorted and unique.
+/// None for a null value (no Program).
+[[nodiscard]] std::vector<std::string>
+program_scene_mesh_uris(const CanonicalValue &normalized_program);
+
+/// The `scene_meshes` value of a prepared activation: rows sorted by
+/// resource URI.
+[[nodiscard]] CanonicalValue
+prepared_scene_meshes_value(std::vector<PreparedSceneMesh> meshes);
 
 struct PreparedActivationArtifact final {
   core::ContentAddressedStoreKey content_addressed_store_key;
@@ -84,10 +108,6 @@ public:
       noexcept {
     return captured_input_digest_;
   }
-  [[nodiscard]] const core::DeploymentArtifactId &deployment_artifact_id()
-      const noexcept {
-    return deployment_artifact_id_;
-  }
   [[nodiscard]] const core::DeploymentRevision &deployment_revision() const
       noexcept {
     return deployment_revision_;
@@ -98,9 +118,6 @@ public:
   }
   [[nodiscard]] const core::GraphRevision &graph_revision() const noexcept {
     return graph_revision_;
-  }
-  [[nodiscard]] const std::optional<core::ProgramId> &program_id() const noexcept {
-    return program_id_;
   }
   [[nodiscard]] const std::optional<core::ProgramRevision> &program_revision() const noexcept {
     return program_revision_;
@@ -122,6 +139,12 @@ public:
   [[nodiscard]] std::string_view assistant_mode() const noexcept {
     return assistant_mode_;
   }
+  /// The captured Program scene meshes, sorted by URI: exactly the carried
+  /// Program's mesh URIs, each a carried raw artifact of that digest and size.
+  [[nodiscard]] const std::vector<PreparedSceneMesh> &scene_meshes() const
+      noexcept {
+    return scene_meshes_;
+  }
   [[nodiscard]] const CanonicalValue &normalized_root() const noexcept {
     return normalized_root_;
   }
@@ -135,30 +158,29 @@ private:
       core::ContentDigest prepared_activation_id,
       PreparedScenarioOrigin origin,
       core::ContentDigest captured_input_digest,
-      core::DeploymentArtifactId deployment_artifact_id,
       core::DeploymentRevision deployment_revision,
       core::RetainedBundleId retained_bundle_id,
-      core::GraphRevision graph_revision, std::optional<core::ProgramId> program_id,
+      core::GraphRevision graph_revision,
       std::optional<core::ProgramRevision> program_revision,
       std::optional<core::ProgramBindingId> program_binding_id,
       std::optional<ProgramNonExecutableOutcomeDTO> program_outcome,
       core::ContentDigest node_environment_digest, std::string assistant_mode,
+      std::vector<PreparedSceneMesh> scene_meshes,
       CanonicalValue normalized_root,
       VerifiedPreparedActivationClosure closure);
 
   core::ContentDigest prepared_activation_id_;
   PreparedScenarioOrigin origin_;
   core::ContentDigest captured_input_digest_;
-  core::DeploymentArtifactId deployment_artifact_id_;
   core::DeploymentRevision deployment_revision_;
   core::RetainedBundleId retained_bundle_id_;
   core::GraphRevision graph_revision_;
-  std::optional<core::ProgramId> program_id_;
   std::optional<core::ProgramRevision> program_revision_;
   std::optional<core::ProgramBindingId> program_binding_id_;
   std::optional<ProgramNonExecutableOutcomeDTO> program_outcome_;
   core::ContentDigest node_environment_digest_;
   std::string assistant_mode_;
+  std::vector<PreparedSceneMesh> scene_meshes_;
   CanonicalValue normalized_root_;
   VerifiedPreparedActivationClosure closure_;
 

@@ -96,6 +96,9 @@ class HeadlessApiConfig:
     activation_preparer_capability_root: Path | None = None
     activation_preparer_activation_root: Path | None = None
     activation_preparer_timeout_seconds: float = 120.0
+    # The allowed folders of scene meshes an API scene call adds (OD-335),
+    # from MANYFORGE_FS_ROOTS.
+    scene_mesh_allowed_roots: tuple[str, ...] = ()
     canonical_empty_admission_filename: Path | None = None
     workbench_previous_session_reports_root: Path | None = None
     workbench_previous_session_id: str | None = None
@@ -241,6 +244,8 @@ class ViewerModelAsset:
 
 class HeadlessCorePort(Protocol):
     def runtime_snapshot(self) -> dict[str, Any]: ...
+
+    def logical_scene_active_projection(self) -> dict[str, Any] | None: ...
 
     def node_environment_projection(self) -> dict[str, Any]: ...
 
@@ -729,6 +734,18 @@ class NativeHeadlessCore:
 
         sources = self._native.viewer_pose_sources()
         return None if sources is None else (sources[0], sources[1])
+
+    def logical_scene_active_projection(self) -> dict[str, Any] | None:
+        """The logical scene's active projection revision from the mirror's
+        last valid value, whatever its freshness; None before a value or while
+        it shows none. Lock-free: no core lock, no runtime snapshot (OD-378)."""
+
+        shown = self._native.logical_scene_active_projection()
+        return (
+            None
+            if shown is None
+            else strict_json_object(shown, label="native active projection")
+        )
 
     def node_environment_projection(self) -> dict[str, Any]:
         return self._require_object(

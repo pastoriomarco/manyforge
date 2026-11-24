@@ -408,8 +408,23 @@ void write_motion(Encoder& encoder,
           write_string_vector(encoder, value.joint_names);
           write_double_vector(encoder, value.positions_rad);
         } else if constexpr (std::is_same_v<Value, core::PoseGoalDTO>) {
-          encoder.u8(1U);
+          if (!value.linear) {
+            encoder.u8(1U);
+            write_pose(encoder, value.goal);
+            return;
+          }
+          const auto& linear = *value.linear;
+          encoder.u8(4U);
           write_pose(encoder, value.goal);
+          encoder.floating(linear.max_translation_step_m);
+          encoder.floating(linear.max_rotation_step_rad);
+          encoder.optional(linear.speed_mode,
+                           [](Encoder& out, core::CartesianSpeedModeDTO mode) {
+                             out.u8(static_cast<std::uint8_t>(mode));
+                           });
+          encoder.floating(linear.max_angular_speed_rad_s);
+          encoder.floating(linear.max_linear_acceleration_mps2);
+          encoder.floating(linear.max_angular_acceleration_rad_s2);
         } else if constexpr (std::is_same_v<Value, core::NamedTargetDTO>) {
           encoder.u8(2U);
           encoder.string(value.name);
@@ -481,6 +496,18 @@ void write_motion(Encoder& encoder,
       value.fallback_policy =
           static_cast<core::CartesianFallbackPolicyDTO>(fallback);
       value.blend_radii_m = read_double_vector(decoder);
+      return value;
+    }
+    case 4U: {
+      core::PoseGoalDTO value{read_pose(decoder), core::LinearPoseMotionDTO{}};
+      auto& linear = *value.linear;
+      linear.max_translation_step_m = decoder.floating();
+      linear.max_rotation_step_rad = decoder.floating();
+      linear.speed_mode = decoder.optional<core::CartesianSpeedModeDTO>(
+          read_cartesian_speed_mode);
+      linear.max_angular_speed_rad_s = decoder.floating();
+      linear.max_linear_acceleration_mps2 = decoder.floating();
+      linear.max_angular_acceleration_rad_s2 = decoder.floating();
       return value;
     }
     default:
@@ -664,6 +691,8 @@ void write_shape(Encoder& encoder, const core::CollisionShapeDTO& shape) {
           encoder.floating(value.scale.x_m);
           encoder.floating(value.scale.y_m);
           encoder.floating(value.scale.z_m);
+          // Empty for a model-local asset:// mesh.
+          encoder.string(value.content_digest);
         }
       },
       shape);
@@ -679,9 +708,13 @@ void write_shape(Encoder& encoder, const core::CollisionShapeDTO& shape) {
     case 2U:
       return core::CylinderShapeDTO{decoder.floating(), decoder.floating()};
     case 3U:
-      return core::MeshShapeDTO{
-          decoder.string(),
-          {decoder.floating(), decoder.floating(), decoder.floating()}};
+    {
+      auto resource_uri = decoder.string();
+      core::Vector3DTO scale{decoder.floating(), decoder.floating(),
+                             decoder.floating()};
+      return core::MeshShapeDTO{std::move(resource_uri), scale,
+                                decoder.string()};
+    }
     default:
       fail("collision-shape tag is invalid");
   }
@@ -781,6 +814,20 @@ void write_trajectory(Encoder& encoder, const core::TrajectoryDTO& value) {
   return value;
 }
 
+void write_other_coordinates(Encoder& encoder, const RoboPlanOtherCoordinatesDTO& value) {
+  if (value.joint_names.size() != value.positions.size())
+    fail("other-coordinate names and positions differ in count");
+  write_string_vector(encoder, value.joint_names);
+  write_double_vector(encoder, value.positions);
+}
+
+[[nodiscard]] RoboPlanOtherCoordinatesDTO read_other_coordinates(Decoder& decoder) {
+  RoboPlanOtherCoordinatesDTO value{read_string_vector(decoder), read_double_vector(decoder)};
+  if (value.joint_names.size() != value.positions.size())
+    fail("other-coordinate names and positions differ in count");
+  return value;
+}
+
 }  // namespace
 
 std::string encode_initialization(const WorkerInitializationDTO& value) {
@@ -818,10 +865,6 @@ std::string encode_initialization(const WorkerInitializationDTO& value) {
             [](Encoder& nested, const std::filesystem::path& path) {
               nested.string(path.string());
             });
-        out.optional(geometry.scene_mesh_content_digest,
-                     [](Encoder& nested, const std::string& digest) {
-                       nested.string(digest);
-                     });
       });
   encoder.vector(
       value.model.allowed_collision_pairs,
@@ -872,9 +915,7 @@ WorkerInitializationDTO decode_initialization(std::string_view bytes) {
             read_pose(input),
             input.optional<std::filesystem::path>([](Decoder& nested) {
               return std::filesystem::path(nested.string());
-            }),
-            input.optional<std::string>(
-                [](Decoder& nested) { return nested.string(); })};
+            })};
       });
   model.allowed_collision_pairs =
       decoder.vector<std::pair<std::string, std::string>>(
@@ -915,7 +956,7 @@ std::string encode_candidate_request(
       value.collision_mode != core::PlannerCollisionMode::kDiagnosticDisabled)
     fail("invalid collision mode");
   const bool diagnostic = value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled;
-  const bool cartesian = std::holds_alternative<core::CartesianPathDTO>(value.motion);
+  const bool cartesian = core::cartesian_planned(value.motion);
   if ((!diagnostic && value.diagnostic_qualified_target) ||
       (diagnostic && !cartesian && !value.diagnostic_qualified_target) ||
       diagnostic != value.diagnostic_deadline_ns.has_value() ||
@@ -950,6 +991,7 @@ std::string encode_candidate_request(
                    out.floating(margin.margin_m);
                  });
   write_contact_pairs(encoder, value.contact_allowed_pairs);
+  write_other_coordinates(encoder, value.other_coordinates);
   encoder.boolean(value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled);
   encoder.optional(value.diagnostic_qualified_target, write_controlled_state);
   encoder.optional(value.diagnostic_deadline_ns, [](Encoder& out, std::int64_t stamp) {
@@ -1028,6 +1070,7 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
         return margin;
       });
   value.contact_allowed_pairs = read_contact_pairs(decoder);
+  value.other_coordinates = read_other_coordinates(decoder);
   value.collision_mode = decoder.boolean() ? core::PlannerCollisionMode::kDiagnosticDisabled
                                           : core::PlannerCollisionMode::kEnforced;
   value.diagnostic_qualified_target = decoder.optional<core::ControlledStateDTO>(read_controlled_state);
@@ -1038,7 +1081,7 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
     return static_cast<std::int64_t>(stamp);
   });
   const bool diagnostic = value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled;
-  const bool cartesian = std::holds_alternative<core::CartesianPathDTO>(value.motion);
+  const bool cartesian = core::cartesian_planned(value.motion);
   if ((!diagnostic && value.diagnostic_qualified_target) ||
       (diagnostic && !cartesian && !value.diagnostic_qualified_target) ||
       diagnostic != value.diagnostic_deadline_ns.has_value())
@@ -1133,6 +1176,7 @@ std::string encode_ik_request(const WorkerIkRequestDTO& value) {
     out.floating(t.translation_tol_m);
     out.floating(t.rotation_tol_rad);
   });
+  write_other_coordinates(encoder, value.other_coordinates);
   return std::move(encoder).finish();
 }
 
@@ -1154,6 +1198,7 @@ WorkerIkRequestDTO decode_ik_request(std::string_view bytes) {
   value.diagnostic_tolerances = decoder.optional<core::TolerancesDTO>([](Decoder& in) {
     return core::TolerancesDTO{in.floating(), in.floating(), in.floating()};
   });
+  value.other_coordinates = read_other_coordinates(decoder);
   const bool diagnostic = value.collision_mode == core::PlannerCollisionMode::kDiagnosticDisabled;
   if (diagnostic != value.diagnostic_deadline_ns.has_value() ||
       diagnostic != value.diagnostic_tolerances.has_value())

@@ -110,6 +110,9 @@ class _Store:
     def write_node_outcome(self, *_args, **_kwargs) -> None:
         pass
 
+    def reset_node_outcome(self, *_args, **_kwargs) -> None:
+        pass
+
 
 def _resolver() -> SimpleNamespace:
     return SimpleNamespace(
@@ -535,11 +538,11 @@ def _context() -> ProgramRunPortContext:
     io_target = target_binding("io.1", "io.command", [])
     return ProgramRunPortContext(
         program_run_id=1, applied_record_digest=_D, scenario_id="s",
-        source_document_digest=_A, program_id="p", program_revision=_A,
+        source_document_digest=_A, program_revision=_A,
         program_binding_id=_BINDING, retained_bundle_id=_B, graph_revision=_C,
         node_environment_digest=_D,
         program_binding={
-            "program_binding_id": _BINDING, "program_id": "p", "program_revision": _A,
+            "program_binding_id": _BINDING, "program_revision": _A,
             "retained_bundle_id": _B, "graph_revision": _C,
             "target_bindings": [io_target], "signal_bindings": [],
         },
@@ -568,7 +571,7 @@ class _Transport:
 
     def read_program_execution_scope(self, program_run_id: int) -> dict[str, Any]:
         return {"ok": True, "scope": {
-            "schema_version": "manyforge.program_execution_scope.v3",
+            "schema_version": "manyforge.program_execution_scope.v4",
             "program_run_id": program_run_id, "claim_generation": 1,
             "hold_revision": 0,
         }}

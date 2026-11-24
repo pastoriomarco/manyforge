@@ -29,7 +29,7 @@ ComputeCarriedObjectAttachmentRevision(
 /// Computes one object's non-pose collision identity. Provider sample
 /// sequence/timestamps and a cell-fixed pose are deliberately excluded so a
 /// live observation can be checked by the scene-snapshot lease's explicit
-/// freshness and pose-drift rules. Geometry, support/attachment semantics,
+/// freshness and pose-drift rules. Geometry, attachment semantics,
 /// provider lineage, and freshness policy remain covered.
 [[nodiscard]] ContentDigest ComputeSceneObjectCollisionIdentity(
     const SceneObjectSnapshotDTO& normalized_object,

@@ -1,10 +1,11 @@
 """Component descriptors: one `component.yaml` per component folder.
 
-A descriptor (`api_version: manyforge.component_package.v1`) describes one
+A descriptor (`api_version: manyforge.component_package.v2`, v1 still read) describes one
 robot, tool, I/O device, machine, sensor or the AI assistant as data. A machine (`kind: machine`) is an
 owner with member slots `{role, model}` and lane rows naming their adapter
-(`lanes.real: {adapter}`); a machine's own I/O bank is an `io_device` in model form (signals
-once plus `lanes.real {adapter, bank}`); a sensor (`kind: sensor`, e.g. a
+(`lanes.real: {adapter}`); an I/O bank is an `io_device` in model form (signals
+once, each with an optional `index`, plus `lanes.real {adapter, ...}` whose other keys
+belong to the adapter family), a machine's member or an owner-less device; a sensor (`kind: sensor`, e.g. a
 point-cloud source) names its sensor type and its one adapter row
 (`adapter_row: {adapter}`); it has no lane. The AI assistant (`kind:
 assistant`) has only its one adapter row, like a sensor. Its field names are the planned component
@@ -29,6 +30,11 @@ What reads a descriptor today:
   each checked; read-only. `runtime.modelFamilyId` joins a robot or tool to
   the rows Composer's component catalog offers.
 
+A tool without a `gripper` section is passive (OD-336): mount and TCP
+frames only, no joints or groups, `lanes: {}`; it runs no controller, so its
+components name no lane (lane-free) and run on every lane. A project supplies
+its own URDF, meshes and TCP for it through the component's `model_source`.
+
 Apply still reads the rows, never the descriptor. Every problem is one
 `ComponentError` with a typed code, printed as one line.
 """
@@ -49,7 +55,10 @@ from typing import Any
 import yaml
 
 
-API_VERSION = "manyforge.component_package.v1"
+API_VERSION = "manyforge.component_package.v2"
+# Versions still read. v2 only adds the optional I/O signal `index` and opens a
+# model-form I/O device's `lanes.real` keys, so a v1 file reads as before.
+API_VERSIONS = ("manyforge.component_package.v1", API_VERSION)
 LIST_SCHEMA = "manyforge.component_list.v1"
 DESCRIPTOR = "component.yaml"
 KINDS = ("robot", "tool", "io_device", "simulator", "machine", "sensor", "assistant")
@@ -71,12 +80,12 @@ _COMMON_REQUIRED = ("api_version", "kind", "id", "version", "title", "license")
 _COMMON_OPTIONAL = ("provenance",)
 _KIND_FIELDS = {
     "robot": (
-        ("model", "roles", "tcps", "limits", "lanes"),
-        ("defaults",),
+        ("model", "roles", "tcps", "limits", "lanes", "defaults"),
+        (),
     ),
     "tool": (("model", "mount", "tcps"), ("roles", "gripper", "lanes")),
     # Provider form (a separate device, each signal names its provider) or
-    # model form (a machine's own I/O bank: `lanes.real {adapter, bank}`).
+    # model form (an I/O bank: `lanes.real {adapter, ...}`).
     "io_device": (("signals",), ("lanes",)),
     # A machine (owner) with its member slots and its own lane rows.
     "machine": (("default_owner_id", "members", "lanes"), ()),
@@ -103,8 +112,6 @@ IO_PROVIDER_PROFILES = {
     ),
     "output": ("mock_output", "ros2_control_gpio", "ros_set_bool"),
 }
-# A model-form I/O bank's real row: its vendor family and which bank it is.
-IO_BANKS = ("controller", "tool")
 # The description's list of model-free component models the compiler reads
 # without a URDF: machines, model-form I/O devices, sensors and the assistant.
 COMPONENT_MODELS = "component_models"
@@ -297,12 +304,23 @@ class _Fields:
 def _validate_roles(f: _Fields, value: Any, robot: bool) -> dict[str, Any]:
     if robot:
         required = ("root_frame", "frames", "groups", "joints")
-        optional: tuple[str, ...] = ("collision_bodies", "instance_cardinality")
+        optional: tuple[str, ...] = (
+            "collision_bodies", "optional_collision_bodies", "instance_cardinality")
     else:
-        required, optional = (), ("frames", "groups", "joints", "collision_bodies")
+        required, optional = (), (
+            "frames", "groups", "joints", "collision_bodies", "optional_collision_bodies")
     roles = f.mapping(value, "roles", required, optional)
     if roles is None:
         return {}
+    # OD-352 A1: collision bodies a model of the family may lack (a passive
+    # tool's `tip`): left unbound then, they contribute nothing.
+    if "optional_collision_bodies" in roles:
+        bodies = roles.get("collision_bodies")
+        if f.names(roles["optional_collision_bodies"], "roles.optional_collision_bodies"):
+            for role in roles["optional_collision_bodies"]:
+                if not isinstance(bodies, dict) or role not in bodies:
+                    f.fail("roles.optional_collision_bodies",
+                           f"{role!r} is not a roles.collision_bodies role")
     if robot and "root_frame" in roles:
         f.text(roles["root_frame"], "roles.root_frame")
     found: dict[str, dict[str, Any]] = {}
@@ -363,15 +381,39 @@ def _frame_roles(data: dict[str, Any]) -> dict[str, Any]:
     return frames
 
 
-def _validate_tcps(f: _Fields, value: Any, frames: dict[str, Any]) -> None:
+def _collision_body_roles(data: dict[str, Any]) -> set[str]:
+    roles = data.get("roles")
+    bodies = roles.get("collision_bodies") if isinstance(roles, dict) else None
+    return set(bodies) if isinstance(bodies, dict) else set()
+
+
+def _validate_tcps(
+    f: _Fields, value: Any, frames: dict[str, Any], bodies: set[str]
+) -> None:
     if not isinstance(value, list) or not value:
         f.fail("tcps", "must be a non-empty list of {id, frame}; the first is the default TCP")
         return
     seen: set[str] = set()
     for index, row in enumerate(value):
-        tcp = f.mapping(row, f"tcps[{index}]", ("id", "frame"))
+        tcp = f.mapping(row, f"tcps[{index}]", ("id", "frame"), ("contact_bodies",))
         if tcp is None:
             continue
+        # The collision bodies that may touch under a rule that selects the
+        # TCP's contact bodies. Left out: a gripper's pads, else its fingers;
+        # a passive tool has none. An empty list means none.
+        if "contact_bodies" in tcp:
+            contact_bodies = tcp["contact_bodies"]
+            path = f"tcps[{index}].contact_bodies"
+            if not isinstance(contact_bodies, list) or not all(
+                isinstance(role, str) and role for role in contact_bodies
+            ):
+                f.fail(path, f"must be a list of collision body names, got {contact_bodies!r}")
+            else:
+                if len(contact_bodies) != len(set(contact_bodies)):
+                    f.fail(path, "names a collision body more than once")
+                for role in contact_bodies:
+                    if role not in bodies:
+                        f.fail(path, f"{role!r} is not a roles.collision_bodies role")
         if "id" in tcp and f.portable(tcp["id"], f"tcps[{index}].id"):
             if tcp["id"] in seen:
                 f.fail(f"tcps[{index}].id", f"{tcp['id']!r} appears more than once")
@@ -400,11 +442,11 @@ def _validate_model(f: _Fields, value: Any, robot: bool) -> None:
         f.text(model["package_name"], "model.package_name")
 
 
-def _validate_gripper(f: _Fields, value: Any) -> None:
+def _validate_gripper(f: _Fields, value: Any, bodies: set[str]) -> None:
     gripper = f.mapping(
         value,
         "gripper",
-        ("actuation", "states", "attach_frame", "touch_links"),
+        ("actuation", "states", "attach_frame", "grip_body"),
         ("command_duration_s",),
     )
     if gripper is None:
@@ -426,8 +468,11 @@ def _validate_gripper(f: _Fields, value: Any) -> None:
                 f.text(states[key], f"gripper.states.{key}")
     if "attach_frame" in gripper:
         f.text(gripper["attach_frame"], "gripper.attach_frame")
-    if "touch_links" in gripper:
-        f.names(gripper["touch_links"], "gripper.touch_links")
+    # The grip body: the collision body made of the gripper's own links.
+    if "grip_body" in gripper and f.portable(gripper["grip_body"], "gripper.grip_body"):
+        if gripper["grip_body"] not in bodies:
+            f.fail("gripper.grip_body",
+                   f"{gripper['grip_body']!r} is not a roles.collision_bodies role")
 
 
 def _validate_lanes(f: _Fields, data: dict[str, Any], robot: bool,
@@ -544,7 +589,7 @@ def _validate_robot(f: _Fields, data: dict[str, Any]) -> None:
         _validate_model(f, data["model"], robot=True)
     roles = _validate_roles(f, data["roles"], robot=True) if "roles" in data else {}
     if "tcps" in data:
-        _validate_tcps(f, data["tcps"], _frame_roles(data))
+        _validate_tcps(f, data["tcps"], _frame_roles(data), _collision_body_roles(data))
     limit = None
     limits = (
         f.mapping(data["limits"], "limits", ("max_tcp_linear_speed_mps",))
@@ -560,7 +605,7 @@ def _validate_robot(f: _Fields, data: dict[str, Any]) -> None:
         defaults = f.mapping(
             data["defaults"],
             "defaults",
-            (),
+            ("controlled_stop_max_deceleration_rad_s2",),
             ("initial_joint_positions_rad", "maximum_tcp_linear_speed_mps"),
         )
         if defaults is None:
@@ -581,6 +626,9 @@ def _validate_robot(f: _Fields, data: dict[str, Any]) -> None:
                     f"has {len(initial)} values for {len(arm)} arm joints {arm}",
                     "component_joint_count_mismatch",
                 )
+        if "controlled_stop_max_deceleration_rad_s2" in defaults:
+            f.number(defaults["controlled_stop_max_deceleration_rad_s2"],
+                     "defaults.controlled_stop_max_deceleration_rad_s2")
         speed = defaults.get("maximum_tcp_linear_speed_mps")
         if speed is not None and f.number(speed, "defaults.maximum_tcp_linear_speed_mps"):
             if limit is not None and speed > limit:
@@ -591,19 +639,49 @@ def _validate_robot(f: _Fields, data: dict[str, Any]) -> None:
                 )
 
 
+# The generated tool family (OD-357): made from parameters, Load derives its type.
+GENERATED_TOOL_ID = "manyforge.tool"
+
+
+def is_passive_tool(data: dict[str, Any]) -> bool:
+    """A tool without a `gripper` section (OD-336): mount and TCP frames only."""
+    return data.get("kind") == "tool" and "gripper" not in data
+
+
+def is_lane_free_tool(data: dict[str, Any]) -> bool:
+    """A tool whose components may name no lane: a pneumatic gripper (driven
+    by I/O, D4) or a passive tool (nothing to drive, OD-336)."""
+    return is_passive_tool(data) or (
+        data.get("kind") == "tool"
+        and isinstance(data.get("gripper"), dict)
+        and data["gripper"].get("actuation") == "pneumatic"
+    )
+
+
 def _validate_tool(f: _Fields, data: dict[str, Any]) -> None:
     if "model" in data:
         _validate_model(f, data["model"], robot=False)
     roles = _validate_roles(f, data["roles"], robot=False) if "roles" in data else {}
     joints = roles.get("joints") if isinstance(roles.get("joints"), dict) else {}
+    if is_passive_tool(data):
+        # Nothing to drive: no controller, so no lane rows (`lanes: {}`), and
+        # no joints or groups a controller would move.
+        if data.get("lanes") != {}:
+            f.fail("lanes", "a passive tool (no gripper section) runs no controller: "
+                   "declare `lanes: {}`; its components name no lane",
+                   "component_lane_invalid")
+        for key in ("joints", "groups"):
+            if roles.get(key):
+                f.fail(f"roles.{key}", "a passive tool (no gripper section) has no "
+                       f"{key}; add a gripper section for a gripper")
     _validate_lanes(f, data, robot=False)
     mount = f.mapping(data["mount"], "mount", ("frame",)) if "mount" in data else None
     if mount is not None and "frame" in mount:
         f.text(mount["frame"], "mount.frame")
     if "tcps" in data:
-        _validate_tcps(f, data["tcps"], _frame_roles(data))
+        _validate_tcps(f, data["tcps"], _frame_roles(data), _collision_body_roles(data))
     if "gripper" in data:
-        _validate_gripper(f, data["gripper"])
+        _validate_gripper(f, data["gripper"], _collision_body_roles(data))
 
 
 def _signal_name(f: _Fields, value: Any, path: str) -> bool:
@@ -615,28 +693,30 @@ def _signal_name(f: _Fields, value: Any, path: str) -> bool:
 
 
 def is_io_model_form(data: dict[str, Any]) -> bool:
-    """An `io_device` descriptor in model form (a machine's own I/O bank)."""
+    """An `io_device` descriptor in model form (an I/O bank)."""
     return data.get("kind") == "io_device" and "lanes" in data
 
 
 def _validate_io(f: _Fields, data: dict[str, Any]) -> None:
-    # Model form: a machine's own I/O bank, its provider per lane (real: the
-    # vendor family and bank; mock and isaac: the host's Mock I/O).
+    # Model form: an I/O bank, its provider per lane (real: the adapter
+    # family; mock and isaac: the host's Mock I/O).
     model_form = "lanes" in data
     if model_form:
         lanes = f.mapping(data["lanes"], "lanes", ("real",))
-        # `input_maximum_age_ms`: the inputs' freshness budget (sample age).
-        row = f.mapping(lanes["real"], "lanes.real",
-                        ("adapter", "bank", "input_maximum_age_ms")) if (
+        # `adapter` names the family; `input_maximum_age_ms` is the inputs'
+        # freshness budget (sample age). The row's other keys belong to the
+        # family, which checks them when the component is applied.
+        row = f.mapping(lanes["real"], "lanes.real", ("adapter", "input_maximum_age_ms"),
+                        open_keys=True) if (
             lanes is not None and "real" in lanes) else None
         if row is not None:
             if "adapter" in row:
                 f.portable(row["adapter"], "lanes.real.adapter")
             if "input_maximum_age_ms" in row:
                 f.number(row["input_maximum_age_ms"], "lanes.real.input_maximum_age_ms")
-            if "bank" in row and row["bank"] not in IO_BANKS:
-                f.fail("lanes.real.bank", f"must be one of {', '.join(IO_BANKS)}, "
-                       f"got {row['bank']!r}")
+            for key, value in row.items():
+                if isinstance(value, (dict, list)) or value is None:
+                    f.fail(f"lanes.real.{key}", f"must be a scalar, got {value!r}")
     if "signals" not in data:
         return
     signals = data["signals"]
@@ -644,6 +724,7 @@ def _validate_io(f: _Fields, data: dict[str, Any]) -> None:
         f.fail("signals", "must be a non-empty list of signals")
         return
     seen: set[str] = set()
+    indexes: set[tuple[str, int]] = set()
     for index, value in enumerate(signals):
         path = f"signals[{index}]"
         direction = value.get("direction") if isinstance(value, dict) else None
@@ -653,10 +734,21 @@ def _validate_io(f: _Fields, data: dict[str, Any]) -> None:
         extra = _INPUT_ONLY_FIELDS if direction == "input" and not model_form else ()
         provider = () if model_form else ("provider",)
         signal = f.mapping(
-            value, path, ("signal_name", "direction", "value_type", *provider, *extra)
+            value, path, ("signal_name", "direction", "value_type", *provider, *extra),
+            ("index",) if model_form else (),
         )
         if signal is None:
             continue
+        # A model-form signal's position in its device's bank, when its
+        # adapter family needs one (`ros_io_bank`: required, 0..63).
+        if "index" in signal:
+            bit = signal["index"]
+            if isinstance(bit, bool) or not isinstance(bit, int) or bit < 0:
+                f.fail(f"{path}.index", f"must be a whole number from 0, got {bit!r}")
+            elif (direction, bit) in indexes:
+                f.fail(f"{path}.index", f"{bit} is used by another {direction}")
+            else:
+                indexes.add((direction, bit))
         name = signal.get("signal_name")
         if "signal_name" in signal and (
             f.portable(name, f"{path}.signal_name") if not model_form
@@ -693,8 +785,9 @@ def validate(data: Any, report: Report, label: str) -> bool:
         return False
     required, optional = _KIND_FIELDS[kind]
     f.mapping(data, "", (*_COMMON_REQUIRED, *required), (*_COMMON_OPTIONAL, *optional))
-    if data.get("api_version") != API_VERSION:
-        f.fail("api_version", f"must be {API_VERSION}, got {data.get('api_version')!r}")
+    if data.get("api_version") not in API_VERSIONS:
+        f.fail("api_version", f"must be one of {', '.join(API_VERSIONS)}, "
+               f"got {data.get('api_version')!r}")
     if not isinstance(data.get("id"), str) or not _ID.fullmatch(data["id"]):
         f.fail(
             "id",
@@ -776,8 +869,11 @@ def _load_model(urdf: Path, srdf: Path | None, report: Report, label: str) -> Mo
 
 
 def package_prefix(folder: Path, package_name: str) -> str | None:
-    """`package://<package>/<path>/` for a folder inside a folder named <package>."""
+    """`package://<package>/<path>/` for a folder inside a folder named
+    <package>; `package://<package>/` for the folder named <package> itself."""
     folder = folder.resolve()
+    if folder.name == package_name:
+        return f"package://{package_name}/"
     for parent in folder.parents:
         if parent.name == package_name:
             return f"package://{package_name}/{folder.relative_to(parent).as_posix()}/"
@@ -809,6 +905,15 @@ def _model_package(root: Path, descriptor: Descriptor, uris: list[str]) -> str |
     return relative.split("/", 1)[0] if relative and not uris else None
 
 
+def _package_root(root: Path, descriptor: Descriptor, package: str) -> str:
+    """The workspace folder of a model's mesh package: the descriptor folder
+    when it is named after the package (a model that is its own package, e.g.
+    the passive tool's `passive_tool`), else `<package>` under the workspace."""
+    if descriptor.folder.name == package:
+        return _relative(root, descriptor.folder) or package
+    return package
+
+
 def _model_mesh_source(root: Path, descriptor: Descriptor) -> tuple[str | None, str | None]:
     """Derive the maintained mesh root from the package URIs in this model."""
     uris = _mesh_uris(descriptor)
@@ -829,7 +934,7 @@ def _model_mesh_source(root: Path, descriptor: Descriptor) -> tuple[str | None, 
     if len(roots) != 1:
         return None, None
     parts = next(iter(roots))
-    relative = Path(package, *parts).as_posix()
+    relative = Path(_package_root(root, descriptor, package), *parts).as_posix()
     suffix = f"{'/'.join(parts)}/" if parts else ""
     return f"{uri_prefix}{suffix}", relative
 
@@ -899,8 +1004,6 @@ def check_model(root: Path, descriptor: Descriptor, report: Report) -> Model | N
                          f"{gripper['states'][key]!r} is not a group_state of SRDF group "
                          f"{gripper_group!r}")
         link(gripper["attach_frame"], "gripper.attach_frame")
-        for name in gripper.get("touch_links", []):
-            link(name, "gripper.touch_links")
     for index, tcp in enumerate(data["tcps"]):
         link(tcp["frame"], f"tcps[{index}].frame")
     if descriptor.kind == "tool":
@@ -918,7 +1021,8 @@ def check_model(root: Path, descriptor: Descriptor, report: Report) -> Model | N
             if not uri.startswith(uri_prefix):
                 fail("component_mesh_unresolved", "model.urdf",
                      f"mesh {uri!r} is not under {uri_prefix}")
-            elif not (root / package / uri[len(uri_prefix):]).is_file():
+            elif not (root / _package_root(root, descriptor, package)
+                      / uri[len(uri_prefix):]).is_file():
                 fail("component_mesh_unresolved", "model.urdf",
                      f"mesh {uri!r} has no file under package {package!r}")
     elif model.mesh_uris:
@@ -1081,12 +1185,13 @@ def _family_mesh_source_errors(root: Path, descriptor: Descriptor,
         resource_root, str
     ):
         return ["source does not name a package mesh root"]
-    package_root = f"{package}/"
-    if not resource_root.startswith(package_root):
+    package_root = _package_root(root, descriptor, package).rstrip("/")
+    if resource_root.rstrip("/") != package_root and not resource_root.startswith(
+        f"{package_root}/"
+    ):
         return [f"source.resource_root {resource_root!r} is outside package {package!r}"]
-    expected_prefix = (
-        f"package://{package}/{resource_root[len(package_root):].rstrip('/')}/"
-    )
+    inner = resource_root.rstrip("/")[len(package_root):].strip("/")
+    expected_prefix = f"package://{package}/" + (f"{inner}/" if inner else "")
     if prefix != expected_prefix:
         return ["source.accepted_package_uri_prefix does not match source.resource_root"]
     if uris is None:
@@ -1249,9 +1354,6 @@ def _check_gripper_rows(rows: list[Any], model: Model, gripper_group: str | None
         for key in ("tcp_frame", "attach_frame", "mount_frame"):
             if row.get(key) not in model.links:
                 fail(f"gripper {key} {row.get(key)!r} is not a URDF link")
-        for name in row.get("touch_links", []):
-            if name not in model.links:
-                fail(f"gripper touch link {name!r} is not a URDF link")
         for key in ("open_state_ref", "closed_state_ref"):
             if row.get(key) not in model.group_states.get(gripper_group, set()):
                 fail(f"gripper {key} {row.get(key)!r} is not a group_state of SRDF "
@@ -1433,6 +1535,7 @@ def check_tool_scenario(
     gripper = descriptor.data.get("gripper")
     gripper_group = descriptor.data.get("roles", {}).get("groups", {}).get("gripper")
     mount_frame = descriptor.data["mount"]["frame"]
+    passive = is_passive_tool(descriptor.data)
     before = len(report.errors)
     for component in components:
         component_id = component.get("component_id", "?")
@@ -1484,6 +1587,20 @@ def check_tool_scenario(
         model_source = component.get("model_source")
         if type(model_source) is not dict:
             fail("model_source is required and must match the registered model source")
+        elif "parameters" in model_source or descriptor.id == GENERATED_TOOL_ID:
+            # OD-352, OD-357: a Tool's parameters (inline, or a parameter
+            # file) generate its model at Load; only the Tool model takes them.
+            parameters = model_source.get("parameters")
+            if descriptor.id != GENERATED_TOOL_ID:
+                fail("model_source.parameters is only for the Tool model (manyforge.tool)")
+            elif set(model_source) != {"parameters"}:
+                fail("a Tool's model_source is its parameters only (no urdf, srdf or "
+                     "package_roots)")
+            elif not (isinstance(parameters, dict) and "api_version" in parameters) and (
+                _scenario_source_path(parameters, scenario) is None
+            ):
+                fail("model_source.parameters is neither inline parameters nor a Deployment "
+                     "source reference")
         else:
             if not {"urdf", "package_roots"} <= set(model_source) or set(model_source) - {
                 "urdf", "srdf", "package_roots"
@@ -1504,6 +1621,10 @@ def check_tool_scenario(
 
             if not isinstance(registered_source, dict):
                 fail(f"profile {component.get('component_profile_id')!r} has no registered model source")
+            elif passive:
+                # A passive tool's model is the project's own (OD-336): its
+                # URDF, SRDF and package roots may name any Deployment source.
+                pass
             else:
                 for field, registered_field in (("urdf", "urdf_path"), ("srdf", "srdf_path")):
                     registered_path = registered_source.get(registered_field)
@@ -1524,19 +1645,26 @@ def check_tool_scenario(
                            else None)
                 if package is not None:
                     package_path = _scenario_source_path(roots.get(package), scenario)
-                    if package_path != Path(os.path.abspath(root / package)):
+                    if package_path != Path(os.path.abspath(
+                            root / _package_root(root, descriptor, package))):
                         fail(f"model_source.package_roots.{package} must resolve to its registered package path")
-        # A pneumatic tool may name no lane: it runs no controller (D4).
-        lane_free = "lane" not in component and (gripper or {}).get("actuation") == "pneumatic"
+        # A pneumatic tool may name no lane: it runs no controller (D4); a
+        # passive tool never names one (OD-336).
+        lane_free = "lane" not in component and is_lane_free_tool(descriptor.data)
         if not lane_free and component.get("lane") not in descriptor.data.get("lanes", {}):
             fail(f"lane {component.get('lane')!r} is not a lane of {descriptor.id}",
                  "component_lane_invalid")
         streams = sorted(row.get("stream_id") for row in runtime.get("component_streams", []))
-        # A lane-free (pneumatic) tool runs no controller, so it has no streams.
+        # A lane-free (pneumatic or passive) tool runs no controller, so it has
+        # no streams.
         expected_streams = [] if lane_free else ["gripper_feedback", "measured_joints"]
         if streams != expected_streams:
             fail(f"component_streams must declare exactly {expected_streams}, got {streams}")
         grippers = runtime.get("gripper_target_configurations", [])
+        if descriptor.id == GENERATED_TOOL_ID:
+            # Made from its parameters: its rows are tool-end wiring, which
+            # Load checks against the parameters (OD-357).
+            continue
         if gripper is not None and not grippers:
             fail("the tool has a gripper but gripper_target_configurations is empty")
         for row in grippers:
@@ -1764,7 +1892,7 @@ def register(root: Path, folder: Path) -> tuple[Report, list[str]]:
 def _runtime(data: dict[str, Any]) -> dict[str, Any]:
     """What a Deployment component of this descriptor selects: its model id
     (`component_profile_id`) and one of its lanes; a pneumatic tool may name
-    none (`lane_free`, D4)."""
+    none (`lane_free`, D4), a passive tool names none (OD-336)."""
     component_id = data.get("id")
     if is_io_model_form(data):
         # Only a machine member: its model is its profile.
@@ -1783,7 +1911,7 @@ def _runtime(data: dict[str, Any]) -> dict[str, Any]:
     ):
         return {}
     lanes = sorted(data.get("lanes") or {})
-    if data.get("kind") == "tool" and (data.get("gripper") or {}).get("actuation") == "pneumatic":
+    if is_lane_free_tool(data):
         lanes = sorted([*lanes, "lane_free"])
     return {
         "modelFamilyId": component_id.split(".", 1)[1],

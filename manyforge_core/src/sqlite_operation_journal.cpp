@@ -15,6 +15,7 @@
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/collision_rule_codec.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/stop_event_codec.hpp>
@@ -666,9 +667,27 @@ template <typename StrongId>
               {"positions_rad", CanonicalValue(std::move(positions))},
           });
         } else if constexpr (std::is_same_v<T, PoseGoalDTO>) {
+          if (!value.linear) {
+            return CanonicalValue(CanonicalValue::Object{
+                {"goal", PoseValue(value.goal)},
+                {"kind", CanonicalValue("pose_goal")},
+            });
+          }
+          const auto& linear = *value.linear;
           return CanonicalValue(CanonicalValue::Object{
               {"goal", PoseValue(value.goal)},
               {"kind", CanonicalValue("pose_goal")},
+              {"max_angular_acceleration_rad_s2",
+               CanonicalValue(linear.max_angular_acceleration_rad_s2)},
+              {"max_angular_speed_rad_s", CanonicalValue(linear.max_angular_speed_rad_s)},
+              {"max_linear_acceleration_mps2", CanonicalValue(linear.max_linear_acceleration_mps2)},
+              {"max_rotation_step_rad", CanonicalValue(linear.max_rotation_step_rad)},
+              {"max_translation_step_m", CanonicalValue(linear.max_translation_step_m)},
+              {"motion_type", CanonicalValue("linear")},
+              {"speed_mode", linear.speed_mode
+                                 ? CanonicalValue(std::string(
+                                       cartesian_speed_mode_name(*linear.speed_mode)))
+                                 : CanonicalValue(nullptr)},
           });
         } else if constexpr (std::is_same_v<T, NamedTargetDTO>) {
           return CanonicalValue(CanonicalValue::Object{
@@ -771,7 +790,6 @@ template <typename StrongId>
           {"component_id", CanonicalValue(motion.base_frame.component_id.value())},
           {"frame_id", CanonicalValue(motion.base_frame.frame_id.value())}})},
       {"cache_mode", CanonicalValue(cache_mode)},
-      {"contact_policy_id", OptionalIdentity(motion.contact_policy_id)},
       {"kind", CanonicalValue("motion")},
       {"motion", MotionSpecValue(motion.motion)},
       {"motion_interrupt_scopes", CanonicalValue(CanonicalValue::Array{})},
@@ -814,9 +832,9 @@ template <typename StrongId>
   if (motion.goal_frame_reference.has_value()) {
     value.emplace_back("goal_frame_reference", ReferenceValue(motion.goal_frame_reference));
   }
-  // Emitted only when the move sets its own clearance, for the same reason.
-  if (motion.clearance_m.has_value()) {
-    value.emplace_back("clearance_m", CanonicalValue(*motion.clearance_m));
+  // Emitted only when the move has its own collision rules, for the same reason.
+  if (!motion.collision_rules.empty()) {
+    value.emplace_back("collision_rules", CollisionRulesValue(motion.collision_rules));
   }
   // Emitted only when the move overrides the Deployment planner block.
   if (motion.planner != PlannerOverrideDTO{}) {
@@ -926,7 +944,6 @@ void AddExecutionScope(CanonicalValue::Object& row,
       {"expected_scene_revision", SceneRevisionValue(intent.expected_scene_revision)},
       {"participants", CanonicalValue(std::move(participants))},
       {"program_binding_id", CanonicalValue(intent.program_binding_id.value())},
-      {"program_id", CanonicalValue(intent.program_id.value())},
       {"program_revision", CanonicalValue(intent.program_revision.value())},
       {"program_run_id", RunValue(intent.program_run_id)},
       {"request_attribution", RequestAttributionValue(intent.attribution)},

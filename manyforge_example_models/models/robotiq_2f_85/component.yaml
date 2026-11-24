@@ -1,7 +1,7 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
 # `scripts/manyforge component check manyforge_example_models/models/robotiq_2f_85`.
 # Mounts on a robot's `flange` interface as its own component.
-api_version: manyforge.component_package.v1
+api_version: manyforge.component_package.v2
 kind: tool
 id: robotiq.robotiq_2f_85
 version: 1.0.0
@@ -25,7 +25,7 @@ gripper:
   actuation: position_commanded
   states: {open: open, closed: closed}
   attach_frame: robotiq_85_base_link
-  touch_links: [robotiq_85_base_link, robotiq_85_left_finger_link, robotiq_85_left_finger_tip_link, robotiq_85_left_inner_knuckle_link, robotiq_85_left_knuckle_link, robotiq_85_right_finger_link, robotiq_85_right_finger_tip_link, robotiq_85_right_inner_knuckle_link, robotiq_85_right_knuckle_link]
+  grip_body: gripper_collision      # the collision body made of the gripper's own links
 lanes:
   mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
     adapter: mock

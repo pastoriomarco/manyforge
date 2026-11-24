@@ -13,10 +13,6 @@ from typing import Any, Callable, Mapping, NoReturn, TypeVar
 
 from manyforge_behavior.value_path import ValuePathError, parse_value_path
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.canonical_artifact import (
-    canonical_json_bytes,
-    compute_content_identity,
-)
 from manyforge_behavior.geometry import (
     GeometryError,
     add_rpy_deg,
@@ -33,8 +29,10 @@ from manyforge_behavior.program import (
     ProgramValidationError,
     _frame_ref_order,
     _program_direct_reference,
+    active_tcp_key,
     merge_param_patch,
     motion_tcp_selection,
+    parse_active_tcp_key,
     parse_execution_groups,
 )
 from manyforge_behavior.pick_place_templates import (
@@ -53,6 +51,7 @@ from .authoring_forest import (
     program_formula_references,
 )
 from .authoring_identity import freeze_json, thaw_json
+from .deployment_draft import note_referenced_features, referenced_features
 
 
 _DRAFT_API_VERSION = "manyforge.composer_draft.v2"
@@ -65,9 +64,7 @@ SUPPORTED_DRAFT_MUTATIONS = (
     "blackboard_draft_remove_namespaces",
     "blackboard_draft_upsert_keys",
     "blackboard_draft_upsert_namespaces",
-    "program_draft_remove_contact_policies",
     "program_draft_remove_parameters",
-    "program_draft_upsert_contact_policies",
     "program_draft_upsert_parameters",
     "scene_draft_add_object",
     "scene_draft_remove_objects",
@@ -85,7 +82,6 @@ SUPPORTED_DRAFT_MUTATIONS = (
 OPERATOR_DRAFT_MUTATIONS = (
     "program_draft_expand_authoring_macro",
     "program_draft_update_motion_defaults",
-    "program_draft_replace_support_contacts",
     "program_draft_store_observed_move",
     "program_draft_store_observed_scene_resource",
     "program_draft_update_settings",
@@ -108,63 +104,6 @@ _PROGRAM_MOTION_CEILINGS = frozenset(
 _PORTABLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _PORTABLE_ID_MAX_BYTES = 128
 _T = TypeVar("_T")
-
-
-def _finite(value: Any) -> bool:
-    return type(value) in {int, float} and math.isfinite(float(value))
-
-
-def _contact_grasp_envelope_valid(zone: dict[str, Any], common: set[str]) -> bool:
-    """The grasp envelope: a positive penetration cap and a terminal window."""
-
-    return (
-        set(zone) == common | {"max_penetration_m", "terminal_window_start_fraction"}
-        and _finite(zone["max_penetration_m"])
-        and float(zone["max_penetration_m"]) > 0.0
-        and _finite(zone["terminal_window_start_fraction"])
-        and 0.0 <= float(zone["terminal_window_start_fraction"]) <= 1.0
-    )
-
-
-# Release envelope fields; signed defaults and binary neutral values.
-_RELEASE_METRICS = ("max_start_penetration_m", "min_release_progress_m", "release_tolerance_m")
-_RELEASE_FLAGS = (
-    "enforce_max_start_penetration",
-    "require_strictly_decreasing_penetration",
-    "require_separation_by_end",
-    "allow_recontact",
-)
-_RELEASE_BINARY_NEUTRAL: dict[str, Any] = {
-    "enforce_max_start_penetration": False,
-    "max_start_penetration_m": 0,
-    "min_release_progress_m": 0,
-    "release_tolerance_m": 0,
-    "require_strictly_decreasing_penetration": False,
-}
-
-
-def _contact_release_envelope_valid(zone: dict[str, Any], common: set[str]) -> bool:
-    """Release envelope; omitted fields take their defaults.
-
-    A ``binary_contact`` zone may only carry the neutral metric values.
-    """
-
-    mode = zone.get("release_evidence_mode")
-    if type(mode) is not str or mode not in ("signed_penetration", "binary_contact"):
-        return False
-    if not set(zone) <= common | {"release_evidence_mode", *_RELEASE_METRICS, *_RELEASE_FLAGS}:
-        return False
-    if any(
-        field in zone and not (_finite(zone[field]) and 0.0 <= float(zone[field]) <= 1000.0)
-        for field in _RELEASE_METRICS
-    ):
-        return False
-    if any(field in zone and type(zone[field]) is not bool for field in _RELEASE_FLAGS):
-        return False
-    return mode == "signed_penetration" or all(
-        field not in zone or zone[field] == neutral
-        for field, neutral in _RELEASE_BINARY_NEUTRAL.items()
-    )
 
 
 def _is_portable_id(value: Any) -> bool:
@@ -627,8 +566,7 @@ def _is_scene_resource_id(value: Any) -> bool:
 class _SceneRename:
     """Rename one scene resource id at every place the Program types it.
 
-    The places come from the Program schema: the scene rows and their support
-    contacts, viewer visibility maps, scene_resource frame references of stored
+    The places come from the Program schema: the scene rows, viewer visibility maps, scene_resource frame references of stored
     poses (Program parameter defaults, blackboard initial values and
     allowed_frames), scene_resource-typed Program parameters and blackboard
     keys, and node parameters whose catalog schema (or key-typed value) is a
@@ -694,15 +632,6 @@ class _SceneRename:
             row["scene_resource_id"] = self._id(
                 row.get("scene_resource_id"), f"scene[{index}].scene_resource_id"
             )
-            contacts = (row.get("metadata") or {}).get("support_contacts")
-            if type(contacts) is list:
-                for contact_index, contact in enumerate(contacts):
-                    contact["support_object_id"] = self._id(
-                        contact.get("support_object_id"),
-                        f"scene[{index}].metadata.support_contacts[{contact_index}]"
-                        ".support_object_id",
-                    )
-                contacts.sort(key=lambda item: str(item.get("support_object_id")))
         scene.sort(key=lambda item: str(item.get("scene_resource_id")))
 
         viewer = document.get("viewer")
@@ -760,6 +689,144 @@ class _SceneRename:
                     else:
                         parameters[parameter.id] = self._schema_value(
                             parameter.schema, parameters[parameter.id], parameter_path
+                        )
+            pending.extend(
+                (child, f"{path}.children[{index}]")
+                for index, child in enumerate(node.get("children") or [])
+            )
+
+
+class _ComponentRename:
+    """Rewrite one Deployment component id at every place the Program types
+    it (OD-367: Replace tool).
+
+    The places come from the Program schema: every ``component_id`` property
+    of a catalog object schema (target, frame, collision body and signal
+    references, collision rule selections) in node parameters and in the
+    Program parameter defaults and blackboard initial values and allowed
+    frames of a registered type (a tcp_entry, a stored pose's target frame),
+    the viewer's frame visibility, and the reserved Active TCP keys
+    (``active_tcp/<component>/<target>``) a blackboard-key parameter or a
+    value source names. ``paths`` lists every changed place, ``used`` the
+    command targets, frames and collision bodies the rewritten references
+    name.
+    """
+
+    def __init__(self, previous: str, replacement: str, catalog: NodeCatalog) -> None:
+        self.previous = previous
+        self.replacement = replacement
+        self.registry = catalog.schema_registry
+        self.catalog = catalog
+        self.paths: list[str] = []
+        self.used = referenced_features()
+
+    def _key(self, value: Any, path: str) -> Any:
+        identity = parse_active_tcp_key(value)
+        if identity is None or identity[0] != self.previous:
+            return value
+        self.paths.append(path)
+        self.used["commandTargets"].add(identity[1])
+        return active_tcp_key(self.replacement, identity[1])
+
+    def _schema_value(self, schema: Any, value: Any, path: str) -> Any:
+        concrete = self.registry.resolve(schema)
+        if concrete.semantic_type == "blackboard_key" and type(value) is str:
+            return self._key(value, path)
+        if concrete.schema_type == "object" and type(value) is dict:
+            if "component_id" in concrete.properties and value.get("component_id") == self.previous:
+                value["component_id"] = self.replacement
+                self.paths.append(f"{path}.component_id")
+                note_referenced_features(value, self.used)
+            for name in list(value):
+                child = concrete.properties.get(name)
+                if child is None:
+                    child = concrete.additional_property_schema
+                if child is not None:
+                    value[name] = self._schema_value(child, value[name], f"{path}.{name}")
+        elif (
+            concrete.schema_type == "array"
+            and type(value) is list
+            and concrete.items is not None
+        ):
+            for index, item in enumerate(value):
+                value[index] = self._schema_value(concrete.items, item, f"{path}[{index}]")
+        return value
+
+    def _declared(self, declared_type: Any, value: Any, path: str) -> Any:
+        schema = self.registry.types.get(declared_type) if type(declared_type) is str else None
+        return value if schema is None else self._schema_value(schema, value, path)
+
+    def apply(self, document: dict[str, Any]) -> None:
+        viewer = document.get("viewer")
+        entries = viewer.get("frame_visibility") if type(viewer) is dict else None
+        if type(entries) is list:
+            for index, entry in enumerate(entries):
+                frame = entry.get("frame") if type(entry) is dict else None
+                if type(frame) is dict and frame.get("component_id") == self.previous:
+                    frame["component_id"] = self.replacement
+                    self.paths.append(f"viewer.frame_visibility[{index}].frame.component_id")
+            # Sorted and unique by frame; a frame the replacement already shows keeps its row.
+            unique = {
+                (entry["frame"]["component_id"], entry["frame"]["frame_id"]): entry
+                for entry in reversed(entries)
+            }
+            viewer["frame_visibility"] = [unique[key] for key in sorted(unique)]
+
+        for index, row in enumerate(document.get("parameters") or []):
+            if "default" in row:
+                row["default"] = self._declared(
+                    row.get("type"), row["default"], f"parameters[{index}].default"
+                )
+
+        key_types: dict[str, Any] = {}
+        blackboard = document.get("blackboard")
+        for index, row in enumerate(
+            (blackboard.get("keys") or []) if type(blackboard) is dict else []
+        ):
+            key_types[row.get("key")] = row.get("type")
+            path = f"blackboard.keys[{index}]"
+            if "initial" in row:
+                row["initial"] = self._declared(
+                    row.get("type"), row["initial"], f"{path}.initial"
+                )
+            frames = row.get("allowed_frames")
+            if type(frames) is list:
+                for frame_index, frame in enumerate(frames):
+                    self._declared(
+                        "pose_frame_ref", frame, f"{path}.allowed_frames[{frame_index}]"
+                    )
+                frames.sort(key=_frame_ref_order)
+
+        pending = [
+            (root, f"forest[{index}]")
+            for index, root in enumerate(document.get("forest") or [])
+        ]
+        while pending:
+            node, path = pending.pop()
+            parameters = node.get("parameters")
+            if type(parameters) is dict:
+                entry = self.catalog.get(node["node_id"])
+                for parameter in entry.parameters:
+                    if parameter.id not in parameters:
+                        continue
+                    parameter_path = f"{path}.parameters.{parameter.id}"
+                    key_parameter = parameter.schema.value_type_from_key
+                    if key_parameter is not None:
+                        parameters[parameter.id] = self._declared(
+                            key_types.get(parameters.get(key_parameter)),
+                            parameters[parameter.id],
+                            parameter_path,
+                        )
+                    else:
+                        parameters[parameter.id] = self._schema_value(
+                            parameter.schema, parameters[parameter.id], parameter_path
+                        )
+            sources = node.get("value_sources")
+            if type(sources) is dict:
+                for name, source in sources.items():
+                    if type(source) is dict and "reference" in source:
+                        source["reference"] = self._key(
+                            source["reference"], f"{path}.value_sources.{name}.reference"
                         )
             pending.extend(
                 (child, f"{path}.children[{index}]")
@@ -2041,16 +2108,15 @@ class ComposerDraftSession:
             Callable[[dict[str, Any], dict[str, Any], NodeCatalog], dict[str, Any]],
         ] = {
             "program_draft_expand_authoring_macro": self._authoring_macro_expand,
-            "program_draft_remove_contact_policies": self._contact_policies_remove,
             "program_draft_store_observed_move": self._observed_move_store,
             "program_draft_store_observed_scene_resource": self._observed_scene_resource_store,
-            "program_draft_replace_support_contacts": self._support_contacts_replace,
-            "program_draft_upsert_contact_policies": self._contact_policies_upsert,
             "scene_draft_add_object": self._scene_add,
             "scene_draft_update_object": self._scene_update,
             "scene_draft_upsert_objects": self._scene_upsert,
             "scene_draft_remove_objects": self._scene_remove,
             "scene_draft_rename_object": self._scene_rename,
+            # Internal: the Deployment's Replace tool route only (OD-367).
+            "program_draft_replace_component": self._component_replace,
             "viewer_draft_replace": self._viewer_replace,
             "tree_draft_insert_node": self._tree_insert,
             "tree_draft_update_node_params": self._tree_update,
@@ -2082,194 +2148,6 @@ class ComposerDraftSession:
         details = handler(document, arguments, catalog)
         return tool_id, details
 
-    @staticmethod
-    def _contact_policy_rows(document: dict[str, Any]) -> list[dict[str, Any]]:
-        rows = document.setdefault("contact_policies", [])
-        if type(rows) is not list:
-            _error(
-                "composer_draft_invalid",
-                "Program Draft contact_policies is not an array",
-            )
-        return rows
-
-    @staticmethod
-    def _canonical_contact_policy(raw: Any) -> dict[str, Any]:
-        if type(raw) is not dict:
-            _error("draft_arguments_invalid", "contact policy must be an object")
-        policy = deepcopy(raw)
-        policy.pop("version", None)
-        required = {
-            "api_version",
-            "policy_id",
-            "mode",
-            "sensing_mode",
-            "default_unmatched_response",
-            "zones",
-        }
-        if set(policy) != required:
-            _error(
-                "draft_arguments_invalid",
-                "contact policy fields do not match the qualified v1 shape",
-            )
-        if (
-            policy["api_version"] != "manyforge.contact_policy.v1"
-            or type(policy["mode"]) is not str
-            or policy["mode"] not in ("contact_grasp", "contact_release")
-            or policy["sensing_mode"] != "geometry_only"
-            or policy["default_unmatched_response"] != "hard_stop"
-            or not _is_portable_id(policy["policy_id"])
-            or type(policy["zones"]) is not list
-            or len(policy["zones"]) != 1
-        ):
-            _error(
-                "draft_arguments_invalid",
-                "contact policy is outside the qualified geometry-only grasp/release profile",
-            )
-        zone = policy["zones"][0]
-        common = {"zone_id", "body_pairs", "violation_response"}
-        if (
-            type(zone) is not dict
-            or not common <= set(zone)
-            or not _is_portable_id(zone["zone_id"])
-            or type(zone["body_pairs"]) is not list
-            or not zone["body_pairs"]
-            or zone["violation_response"] != "hard_stop"
-            or not (
-                _contact_grasp_envelope_valid(zone, common)
-                if policy["mode"] == "contact_grasp"
-                else _contact_release_envelope_valid(zone, common)
-            )
-        ):
-            _error("draft_arguments_invalid", "contact policy zone is invalid")
-        pair_keys: list[tuple[str, str]] = []
-        for pair in zone["body_pairs"]:
-            if type(pair) is not dict or set(pair) != {"body_a", "body_b"}:
-                _error("draft_arguments_invalid", "contact body pair is invalid")
-            selectors = [pair["body_a"], pair["body_b"]]
-            if any(type(selector) is not dict for selector in selectors):
-                _error("draft_arguments_invalid", "contact selector is invalid")
-            component = next(
-                (
-                    selector
-                    for selector in selectors
-                    if selector.get("kind") == "component_model_body"
-                ),
-                None,
-            )
-            endpoint = next(
-                (
-                    selector
-                    for selector in selectors
-                    if selector.get("kind") == "motion_endpoint"
-                ),
-                None,
-            )
-            runtime = next(
-                (
-                    selector
-                    for selector in selectors
-                    if selector.get("kind") == "runtime_object"
-                ),
-                None,
-            )
-            if (component is None) == (endpoint is None) or runtime is None:
-                _error(
-                    "draft_arguments_invalid",
-                    "contact pair must join one component body or motion endpoint "
-                    "to one runtime object",
-                )
-            component_valid = False
-            if component is not None and set(component) == {"kind", "body"}:
-                try:
-                    _program_direct_reference(
-                        component["body"], path="contact.body", member="collision_body_id"
-                    )
-                    component_valid = True
-                except ProgramValidationError:
-                    pass
-            endpoint_valid = endpoint is not None and set(endpoint) == {"kind"}
-            if (
-                not (component_valid or endpoint_valid)
-                or set(runtime) != {"kind", "runtime_object_id"}
-                or not _is_portable_id(runtime.get("runtime_object_id"))
-            ):
-                _error("draft_arguments_invalid", "contact selector is invalid")
-            body_identity = (
-                "component_model_body:"
-                + canonical_json_bytes(component).decode("utf-8")
-                if component is not None
-                else "motion_endpoint"
-            )
-            pair_keys.append(
-                tuple(
-                    sorted(
-                        (
-                            body_identity,
-                            f"runtime_object:{runtime['runtime_object_id']}",
-                        )
-                    )
-                )
-            )
-        if pair_keys != sorted(set(pair_keys)):
-            _error(
-                "draft_arguments_invalid",
-                "contact body pairs must be unique and canonical-sorted",
-            )
-        if (
-            any("motion_endpoint" in pair for pair in pair_keys)
-            and len(pair_keys) != 1
-        ):
-            _error(
-                "draft_arguments_invalid",
-                "motion_endpoint contact requires exactly one body pair",
-            )
-        policy["version"] = "sha256:" + ("0" * 64)
-        policy["version"] = compute_content_identity(
-            policy,
-            own_field="version",
-            identity_domain="catalog-record-revision/contact_policy",
-            api_version="manyforge.contact_policy.v1",
-        )
-        return policy
-
-    def _contact_policies_upsert(
-        self,
-        document: dict[str, Any],
-        arguments: dict[str, Any],
-        _catalog: NodeCatalog,
-    ) -> dict[str, Any]:
-        if set(arguments) != {"contact_policies"} or type(arguments["contact_policies"]) is not list:
-            _error(
-                "draft_arguments_invalid",
-                "program_draft_upsert_contact_policies requires one contact_policies array",
-            )
-        incoming = [
-            self._canonical_contact_policy(row)
-            for row in arguments["contact_policies"]
-        ]
-        inserted, updated = self._upsert_rows(
-            self._contact_policy_rows(document), incoming, "policy_id"
-        )
-        return {"inserted": inserted, "updated": updated}
-
-    def _contact_policies_remove(
-        self,
-        document: dict[str, Any],
-        arguments: dict[str, Any],
-        _catalog: NodeCatalog,
-    ) -> dict[str, Any]:
-        if set(arguments) != {"contact_policy_ids"} or type(arguments["contact_policy_ids"]) is not list:
-            _error(
-                "draft_arguments_invalid",
-                "program_draft_remove_contact_policies requires one contact_policy_ids array",
-            )
-        return self._remove_rows(
-            self._contact_policy_rows(document),
-            arguments["contact_policy_ids"],
-            "policy_id",
-            "contact policies",
-        )
-
     def _authoring_macro_expand(
         self,
         document: dict[str, Any],
@@ -2299,11 +2177,12 @@ class ComposerDraftSession:
             "tool_wait_for_duration",
             "tool_completion_timeout_s",
             "tcp_endpoint",
+            "collision_rules",
         }
         macro_id = arguments.get("macro_id")
         if macro_id == "pick_subtree":
             operation = "pick"
-            specific = {"contact_policy_id", "touch_bodies"}
+            specific = {"touch_bodies"}
         elif macro_id == "place_subtree":
             operation = "place"
             specific = {"place_pose", "approach_offset_m"}
@@ -2328,8 +2207,6 @@ class ComposerDraftSession:
             "blackboard_key",
             "instance_prefix",
         }
-        if operation == "pick":
-            identifier_fields.add("contact_policy_id")
         if any(not _is_portable_id(arguments[field]) for field in identifier_fields):
             _error(
                 "draft_arguments_invalid",
@@ -2360,14 +2237,8 @@ class ComposerDraftSession:
                 f"{operation} authoring requires an existing Program scene resource",
                 status_code=404,
             )
-        if operation == "pick" and arguments["contact_policy_id"] not in {
-            row.get("policy_id") for row in self._contact_policy_rows(document)
-        }:
-            _error(
-                "draft_contact_policy_not_found",
-                "pick authoring contact policy is not declared",
-                status_code=404,
-            )
+        if "collision_rules" in arguments and type(arguments["collision_rules"]) is not list:
+            _error("draft_arguments_invalid", "collision_rules must be an array")
 
         blackboard = self._blackboard(document)
         namespace_id = arguments["blackboard_namespace_id"]
@@ -2445,9 +2316,9 @@ class ComposerDraftSession:
         }
         if "planner" in arguments:
             template_parameters["planner"] = deepcopy(arguments["planner"])
-        if operation == "pick":
-            template_parameters["contact_policy_id"] = arguments["contact_policy_id"]
-        else:
+        if "collision_rules" in arguments:
+            template_parameters["collision_rules"] = deepcopy(arguments["collision_rules"])
+        if operation == "place":
             template_parameters["place_pose"] = deepcopy(arguments["place_pose"])
             template_parameters["approach_offset_m"] = deepcopy(
                 arguments["approach_offset_m"]
@@ -2603,57 +2474,6 @@ class ComposerDraftSession:
             catalog,
         )
 
-    def _support_contacts_replace(
-        self,
-        document: dict[str, Any],
-        arguments: dict[str, Any],
-        _catalog: NodeCatalog,
-    ) -> dict[str, Any]:
-        if (
-            set(arguments) != {"scene_resource_id", "support_contacts"}
-            or not _is_portable_id(arguments["scene_resource_id"])
-            or type(arguments["support_contacts"]) is not list
-        ):
-            _error(
-                "draft_arguments_invalid",
-                "support-contact replacement requires one scene resource and contact array",
-            )
-        resource = next(
-            (
-                row
-                for row in self._scene(document)
-                if row.get("scene_resource_id") == arguments["scene_resource_id"]
-            ),
-            None,
-        )
-        if resource is None:
-            _error(
-                "draft_scene_resource_not_found",
-                "supported Program scene resource does not exist",
-                status_code=404,
-            )
-        metadata = deepcopy(resource.get("metadata", {}))
-        if type(metadata) is not dict:
-            _error("composer_draft_invalid", "Program scene metadata is not an object")
-        contacts = sorted(
-            deepcopy(arguments["support_contacts"]),
-            key=lambda row: row.get("support_object_id", "")
-            if type(row) is dict
-            else "",
-        )
-        if contacts:
-            metadata["support_contacts"] = contacts
-        else:
-            metadata.pop("support_contacts", None)
-        if metadata:
-            resource["metadata"] = metadata
-        else:
-            resource.pop("metadata", None)
-        return {
-            "scene_resource_id": arguments["scene_resource_id"],
-            "support_contact_count": len(contacts),
-        }
-
     @staticmethod
     def _program_settings_update(
         document: dict[str, Any],
@@ -2661,8 +2481,6 @@ class ComposerDraftSession:
         _catalog: NodeCatalog,
     ) -> dict[str, Any]:
         required = {
-            "name",
-            "description",
             "program_profile",
             "compatibility",
             "execution_groups",
@@ -2670,18 +2488,12 @@ class ComposerDraftSession:
         if set(arguments) != required:
             _error(
                 "draft_arguments_invalid",
-                "program_draft_update_settings requires exactly name, description, "
-                "program_profile, compatibility, and execution_groups",
+                "program_draft_update_settings requires exactly program_profile, "
+                "compatibility, and execution_groups",
             )
-        name = arguments["name"]
-        description = arguments["description"]
         program_profile = arguments["program_profile"]
         compatibility = arguments["compatibility"]
         execution_groups = arguments["execution_groups"]
-        if type(name) is not str or not name.strip():
-            _error("draft_arguments_invalid", "Program name must be non-empty text")
-        if type(description) is not str:
-            _error("draft_arguments_invalid", "Program description must be text")
         if type(program_profile) is not str:
             _error("draft_arguments_invalid", "Program profile must be text")
         if type(compatibility) is not dict:
@@ -2705,12 +2517,7 @@ class ComposerDraftSession:
             ):
                 _error("draft_arguments_invalid", "execution group definition is invalid")
 
-        document["name"] = name.strip()
         document["program_profile"] = program_profile
-        if description.strip():
-            document["description"] = description.strip()
-        else:
-            document.pop("description", None)
         if compatibility:
             document["compatibility"] = deepcopy(compatibility)
         else:
@@ -3290,6 +3097,24 @@ class ComposerDraftSession:
             "previous_scene_resource_id": previous,
             "renamed_scene_resource_id": replacement,
             "references": rename.paths,
+        }
+
+    def _component_replace(
+        self, document: dict[str, Any], arguments: dict[str, Any], catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        """Rewrite every Program reference to one component id (Replace tool).
+
+        References the replacement does not declare are left for Program
+        reference validation to show; nothing here refuses them.
+        """
+
+        rename = _ComponentRename(
+            arguments["component_id"], arguments["replacement_component_id"], catalog
+        )
+        rename.apply(document)
+        return {
+            "references": rename.paths,
+            "used": {kind: sorted(ids) for kind, ids in rename.used.items()},
         }
 
     @staticmethod

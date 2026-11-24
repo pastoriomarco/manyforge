@@ -105,8 +105,7 @@ ArmBinding(const deployment::RetainedBundle &bundle,
              : core::CoordinateKind::kLinear});
   }
   auto sealed = core::verify_runtime_participant_binding(
-      {core::ProgramId("product.test.program"),
-       core::ProgramRevision("product.test.revision"),
+      {core::ProgramRevision("product.test.revision"),
        core::ProgramBindingId("product.test.binding"),
        bundle.retained_bundle_id(),
        graph.graph_revision,

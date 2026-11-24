@@ -25,7 +25,7 @@ const rows: ComponentManagerRow[] = [
 function workspace(revision: number) {
   return {
     draft: {
-      id: 'draft', revision, document: { api_version: 'manyforge.deployment_intent.v2' },
+      id: 'draft', revision, document: { api_version: 'manyforge.deployment_intent.v3' },
       deploymentRevision: null, differsFromSaved: true,
     },
     saved: { path: '/projects/cell.scenario', deploymentRevision: null, differsFromApplied: false },
@@ -70,7 +70,7 @@ function texts(all: ReturnType<typeof reactPropsHost>['all']): string {
 }
 
 describe('Component Manager Changes', () => {
-  it('shows the Preview\'s per-component impact; Apply opens the one confirmation', async () => {
+  it('shows the Preview\'s per-component impact; Apply is only the top bar\'s', async () => {
     const mounted = await mount();
     try {
       await mounted.click('Preview changes');
@@ -78,20 +78,16 @@ describe('Component Manager Changes', () => {
       const shown = texts(mounted.all);
       expect(shown).toContain('Restarts lite6_a; adds lite6_b; the others keep running.');
       expect(shown).toContain('description');
-      expect(mounted.button('Apply…').disabled).toBe(false);
-      await mounted.click('Apply…');
-      expect(mounted.controller.applyDraft).toHaveBeenCalledExactlyOnceWith();
+      expect(mounted.all((props) => props.children === 'Apply…')).toHaveLength(0);
     } finally { await mounted.unmount(); }
   });
 
-  it('shows the running Preview\'s busy label and names it on Apply…, until it returns', async () => {
+  it('shows the running Preview\'s busy label until it returns', async () => {
     const mounted = await mount();
     try {
       Object.assign(mounted.controller, { busy: true, busyOperation: authoringOperation('preview') });
       await mounted.render();
       expect(mounted.button('Previewing…').disabled).toBe(true);
-      expect(mounted.button('Apply…').disabled).toBe(true);
-      expect(mounted.button('Apply…').title).toBe('Preview is in progress.');
       Object.assign(mounted.controller, { busy: false, busyOperation: null });
       await mounted.render();
       expect(mounted.button('Preview changes').disabled).toBe(false);

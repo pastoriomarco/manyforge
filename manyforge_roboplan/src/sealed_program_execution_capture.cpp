@@ -121,7 +121,6 @@ core::Result<void> ValidateSealedProgramCaptureBinding(
   // A caller with an already sealed pair must prove the same exact join.
   if (binding == nullptr ||
       binding->program_binding_id() != capture.program_binding_id ||
-      binding->value().program_id != capture.program_id ||
       binding->value().program_revision != capture.program_revision)
     return core::Result<void>::Err(
         CaptureError("Program capture has no exact generated Binding",
@@ -145,7 +144,6 @@ core::Result<core::ProgramRunExecutionCaptureDTO> ResolveSealedProgramCapture(
     if (!selected_binding.ok())
       return Reply::Err(selected_binding.error());
     if (program == nullptr ||
-        program->value().program_id != capture.program_id ||
         program->value().program_revision != capture.program_revision ||
         program->value().node_environment != binding->value().node_environment)
       return Reply::Err(

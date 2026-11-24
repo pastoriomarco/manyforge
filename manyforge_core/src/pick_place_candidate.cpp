@@ -304,8 +304,7 @@ template <typename T>
 
 [[nodiscard]] bool same_program_context(const OperationIntentDTO& left,
                                         const OperationIntentDTO& right) {
-  return left.program_id == right.program_id &&
-         left.program_revision == right.program_revision &&
+  return left.program_revision == right.program_revision &&
          left.program_binding_id == right.program_binding_id &&
          left.program_run_id == right.program_run_id &&
          left.expected_graph_revision == right.expected_graph_revision &&
@@ -544,17 +543,11 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
       request.approach_operation.expected_scene_revision !=
           std::optional(predecessor.projection_binding.projection_revision
                             .scene_revision) ||
-      approach_motion->contact_policy_id.has_value() ||
       !approach_motion->runtime_object_bindings.empty() ||
-      !descend_motion->contact_policy_id.has_value() ||
-      std::count_if(
-          descend_motion->runtime_object_bindings.begin(),
-          descend_motion->runtime_object_bindings.end(),
-          [&](const RuntimeObjectReferenceBindingDTO& binding) {
-            return binding.scene_resource_id ==
-                   request.grid.selected_object_id();
-          }) != 1 ||
-      retreat_motion->contact_policy_id.has_value() ||
+      descend_motion->runtime_object_bindings.size() > 1U ||
+      (descend_motion->runtime_object_bindings.size() == 1U &&
+       descend_motion->runtime_object_bindings.front().scene_resource_id !=
+           request.grid.selected_object_id()) ||
       !retreat_motion->runtime_object_bindings.empty()) {
     return reject("pick_candidate_planning_request_invalid",
                   "pick candidate planning request is incomplete or crosses "
@@ -714,15 +707,12 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
       request.approach_operation.expected_scene_revision !=
           std::optional(predecessor.projection_binding.projection_revision
                             .scene_revision) ||
-      approach_motion->contact_policy_id.has_value() ||
-      descend_motion->contact_policy_id.has_value() ||
-      retreat_motion->contact_policy_id.has_value() ||
       !approach_motion->runtime_object_bindings.empty() ||
       !descend_motion->runtime_object_bindings.empty() ||
       !retreat_motion->runtime_object_bindings.empty()) {
     return reject("place_planning_request_invalid",
                   "place planning request is incomplete or crosses binding, "
-                  "carrier, contact-policy, or projection identity");
+                  "carrier, or projection identity");
   }
 
   const auto object =

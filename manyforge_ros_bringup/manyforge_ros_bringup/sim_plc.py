@@ -9,6 +9,24 @@ Shape of a ROXSIE-served PLC:
 With ``mirror`` on, ``out_i`` takes the value of ``in_i`` ``mirror_delay_s``
 after an accepted write. ``ready`` is never mirrored and has no service.
 
+Bank mode (``mode: bank``): the PLC side of one I/O bank (``ros_io_bank``,
+``manyforge_io_interfaces``). Each cycle, at ``rate_hz`` (default 200), the
+command block reads the latest ``/<device>/io_bank/command`` and applies it
+when its ``seq`` differs from ``applied_seq``: each value 0 or 1 sets its
+output (or is refused), any other value leaves it unchanged; the values
+first, then ``refused`` and the result, then ``applied_seq``; the first
+command read after a start or restart is adopted, not applied (the start-up
+guard against replaying the last command). Then the state block publishes
+``/<device>/io_bank/state`` with ``cycle`` + 1 and the real output values.
+With ``mirror`` on, input ``i`` follows output ``i`` (a loop-back wiring).
+Test-only ROS parameters: ``bank.response`` (``accept``, ``no_answer``),
+``bank.refused`` (the output indexes it refuses, e.g. ``"2,5"``),
+``bank.device_code`` (the code of a command with a refusal),
+``bank.apply_delay_cycles`` (a late effect), ``bank.publishing`` (stream
+stops), ``bank.frozen`` (samples repeat with a frozen ``cycle``) and
+``bank.restart`` (setting it true restarts the PLC: ``cycle``, outputs and
+``applied_seq`` reset).
+
 Configuration: optional ``<config_dir>/<device>.yaml`` read once at start.
 Test-only ROS parameters (``ready``, ``outputs.out_<i>.publishing``,
 ``inputs.in_<i>.response``, ``inputs.in_<i>.ack_delay_s``) change behaviour at
@@ -38,6 +56,19 @@ EXIT_OCCUPIED = 3
 
 MAX_COUNT = 64
 MAX_RATE_HZ = 100.0
+MODES = ("signals", "bank")
+BANK_SIZE = 64
+MAX_BANK_RATE_HZ = 1000.0
+DEFAULT_BANK_RATE_HZ = 200.0
+BANK_RESPONSES = ("accept", "no_answer")
+# IoBankCommand.values.
+OUTPUT_OFF = 0
+OUTPUT_ON = 1
+OUTPUT_KEEP = 2
+# IoBankState.applied_result values.
+RESULT_UNSET = 0
+RESULT_ACCEPTED = 1
+RESULT_REFUSED = 2
 DISCOVERY_S = 1.0
 DUPLICATE_CHECK_PERIOD_S = 1.0
 UNKNOWN_GRACE_S = 3.0
@@ -56,6 +87,7 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class SimPlcConfig:
+    mode: str = "signals"
     inputs: int = 8
     outputs: int = 8
     ready: bool = True
@@ -66,6 +98,7 @@ class SimPlcConfig:
 
 
 _FIELDS = {
+    "mode": "mode",
     "inputs": "count",
     "outputs": "count",
     "ready": "bool",
@@ -92,11 +125,18 @@ def parse_config(data: Any) -> SimPlcConfig:
     if not isinstance(data, dict):
         raise ConfigError("top level must be a mapping")
     values: dict[str, Any] = {}
+    bank = data.get("mode") == "bank"
+    # A bank has 64 inputs and 64 outputs and answers in its state.
+    allowed = ("mode", "rate_hz", "mirror") if bank else tuple(_FIELDS)
     for key, value in data.items():
-        kind = _FIELDS.get(key) if isinstance(key, str) else None
+        kind = _FIELDS.get(key) if isinstance(key, str) and key in allowed else None
         if kind is None:
-            raise ConfigError(f"unknown key '{key}' (allowed: {', '.join(_FIELDS)})")
-        if kind == "bool":
+            raise ConfigError(f"unknown key '{key}' (allowed: {', '.join(allowed)})")
+        if kind == "mode":
+            if value not in MODES:
+                raise ConfigError(f"'{key}' must be one of {', '.join(MODES)}, got {value!r}")
+            values[key] = value
+        elif kind == "bool":
             if not isinstance(value, bool):
                 raise ConfigError(f"'{key}' must be a boolean, got {type(value).__name__}")
             values[key] = value
@@ -108,14 +148,18 @@ def parse_config(data: Any) -> SimPlcConfig:
             values[key] = value
         elif kind == "rate":
             rate = _number(key, value)
-            if not 0.0 < rate <= MAX_RATE_HZ:
-                raise ConfigError(f"'{key}' must be > 0 and <= {MAX_RATE_HZ:g}, got {value}")
+            limit = MAX_BANK_RATE_HZ if bank else MAX_RATE_HZ
+            if not 0.0 < rate <= limit:
+                raise ConfigError(f"'{key}' must be > 0 and <= {limit:g}, got {value}")
             values[key] = rate
         else:
             delay = _number(key, value)
             if delay < 0.0:
                 raise ConfigError(f"'{key}' must be >= 0, got {value}")
             values[key] = delay
+    if bank:
+        values.setdefault("rate_hz", DEFAULT_BANK_RATE_HZ)
+        values.update(inputs=BANK_SIZE, outputs=BANK_SIZE)
     return SimPlcConfig(**values)
 
 
@@ -153,13 +197,23 @@ def validate_device(device: str) -> str:
 
 @dataclass(frozen=True)
 class Endpoints:
+    # The status topic (bank mode: the bank's state topic).
     ready: str
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
 
 
+def bank_topics(device: str) -> tuple[str, str]:
+    """``(state, command)`` topics of a bank (``/<device>/io_bank/...``)."""
+    validate_device(device)
+    return f"/{device}/io_bank/state", f"/{device}/io_bank/command"
+
+
 def endpoint_names(device: str, config: SimPlcConfig) -> Endpoints:
     validate_device(device)
+    if config.mode == "bank":
+        # The only endpoint it serves: its state publisher.
+        return Endpoints(ready=bank_topics(device)[0], inputs=(), outputs=())
     return Endpoints(
         ready=f"/{device}/ready",
         inputs=tuple(f"/{device}/in_{i}" for i in range(config.inputs)),
@@ -233,6 +287,121 @@ class SimPlcCore:
         return self.ready, [
             (i, value) for i, value in enumerate(self.outputs) if self.publishing[i]
         ]
+
+
+@dataclass(frozen=True)
+class BankCommand:
+    seq: int = 0
+    # One value per output: OUTPUT_OFF/ON set it, anything else keeps it
+    # (a data block before any command holds zeros).
+    values: tuple[int, ...] = (OUTPUT_OFF,) * BANK_SIZE
+
+
+def bank_command(seq: int, **outputs: bool) -> BankCommand:
+    """A command setting ``Q<i>=value`` outputs, KEEP for the others (tests)."""
+    values = [OUTPUT_KEEP] * BANK_SIZE
+    for name, value in outputs.items():
+        values[int(name[1:])] = OUTPUT_ON if value else OUTPUT_OFF
+    return BankCommand(seq, tuple(values))
+
+
+def parse_refused(text: str) -> frozenset[int]:
+    """``bank.refused``: comma-separated output indexes 0..63 (empty: none)."""
+    indexes = set()
+    for part in (piece.strip() for piece in text.split(",")):
+        if not part:
+            continue
+        if not part.isdigit() or int(part) >= BANK_SIZE:
+            raise ConfigError(f"bank.refused: {part!r} is not an output index 0..{BANK_SIZE - 1}")
+        indexes.add(int(part))
+    return frozenset(indexes)
+
+
+@dataclass(frozen=True)
+class BankState:
+    """One ``IoBankState`` sample."""
+
+    cycle: int
+    applied_seq: int
+    applied_result: int
+    device_code: int
+    inputs: tuple[bool, ...]
+    outputs: tuple[bool, ...]
+    refused: tuple[bool, ...]
+
+
+class BankCore:
+    """ROS-free PLC side of one bank, one ``step`` per PLC cycle. Not
+    thread-safe; the node serializes access."""
+
+    def __init__(self, mirror: bool = True) -> None:
+        self.mirror = mirror
+        self.response = "accept"
+        self.refuse: frozenset[int] = frozenset()
+        self.device_code = 2
+        self.apply_delay_cycles = 0
+        self.frozen = False
+        # The command data block: the latest command received (zeros before any).
+        self.command = BankCommand()
+        self.inputs = [False] * BANK_SIZE
+        self.restart()
+
+    def restart(self) -> None:
+        """A PLC (re)start: non-retain data back to zero; OB100's guard set.
+        The command data block still holds the last command received."""
+        self.cycle = 0
+        self.outputs = [False] * BANK_SIZE
+        self.applied_seq = 0
+        self.applied_result = RESULT_UNSET
+        self.applied_code = 0
+        self.refused = [False] * BANK_SIZE
+        self.first_command = True
+        self._seen_seq: Optional[int] = None
+        self._seen_at = 0
+
+    def receive(self, command: BankCommand) -> None:
+        """The latest command (the topic keeps one)."""
+        self.command = command
+
+    def step(self) -> BankState:
+        """One PLC cycle: the command block, then the state block."""
+        if not self.frozen:
+            self._apply_command()
+            self.cycle = (self.cycle + 1) % (1 << 32)
+            if self.mirror:
+                self.inputs = list(self.outputs)
+        return BankState(self.cycle, self.applied_seq, self.applied_result,
+                         self.applied_code, tuple(self.inputs), tuple(self.outputs),
+                         tuple(self.refused))
+
+    def _apply_command(self) -> None:
+        command = self.command
+        if self.first_command:
+            # Start-up guard: the first command read is adopted, not applied.
+            self.applied_seq = command.seq
+            self.first_command = False
+            return
+        if command.seq == self.applied_seq or self.response == "no_answer":
+            return
+        # A late effect: the command takes effect some cycles after it arrived.
+        if self._seen_seq != command.seq:
+            self._seen_seq, self._seen_at = command.seq, self.cycle
+        if self.cycle - self._seen_at < self.apply_delay_cycles:
+            return
+        refused = [False] * BANK_SIZE
+        for index, value in enumerate(command.values):
+            if value not in (OUTPUT_OFF, OUTPUT_ON):
+                continue  # KEEP (or any other value): unchanged
+            if index in self.refuse:
+                refused[index] = True
+            else:
+                self.outputs[index] = value == OUTPUT_ON  # the values first,
+        self.refused = refused  # then refused and the result,
+        if any(refused):
+            self.applied_result, self.applied_code = RESULT_REFUSED, self.device_code
+        else:
+            self.applied_result, self.applied_code = RESULT_ACCEPTED, 0
+        self.applied_seq = command.seq  # then the sequence
 
 
 GUID_PREFIX_LEN = 12  # RTPS GUID = 12-byte participant prefix + 4-byte entity id
@@ -402,6 +571,7 @@ def _make_node(
             self.device = device
             self.endpoints = endpoint_names(device, config)
             self.core = SimPlcCore(config)
+            self.bank = BankCore(config.mirror) if config.mode == "bank" else None
             self._lock = threading.Lock()
             self._input_services: list[Any] = [None] * config.inputs
             self._parked: list[Any] = []  # futures that are never answered
@@ -448,6 +618,92 @@ def _make_node(
 
         def start(self) -> None:
             """Declare parameters and create every endpoint."""
+            if self.bank is not None:
+                self._start_bank()
+            else:
+                self._start_signals()
+            self.duplicates: dict[str, list[str]] = {}
+            window = self.declare_parameter(
+                "successor_window_s", SUCCESSOR_WINDOW_S,
+                ParameterDescriptor(description="test only; read once at start"),
+            ).value
+            if isinstance(window, bool) or not isinstance(window, (int, float)) \
+                    or not math.isfinite(window) or window < 0:
+                raise ConfigError("successor_window_s must be a finite number >= 0")
+            self._watch = DuplicateWatch(
+                self.get_fully_qualified_name(), time.monotonic(), float(window)
+            )
+            self.create_timer(
+                DUPLICATE_CHECK_PERIOD_S, self._check_duplicates,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+
+        def _start_bank(self) -> None:
+            from manyforge_io_interfaces.msg import IoBankCommand, IoBankState
+
+            self._bank_state_type = IoBankState
+            bank = self.bank
+            for name, default in (
+                ("bank.response", bank.response), ("bank.refused", ""),
+                ("bank.device_code", bank.device_code),
+                ("bank.apply_delay_cycles", bank.apply_delay_cycles),
+                ("bank.publishing", True), ("bank.frozen", False), ("bank.restart", False),
+            ):
+                value = self.declare_parameter(name, default).value
+                problem = _parameter_problem(name, value)
+                if problem:
+                    raise ConfigError(problem)
+                self._apply_bank_parameter(name, value)
+            self.add_on_set_parameters_callback(self._validate_parameters)
+            self.add_post_set_parameters_callback(self._apply_parameters)
+            self._own_prefix = self.participant_prefix()
+            state_topic, command_topic = bank_topics(self.device)
+            # As a PLC bridge: reliable, the latest sample / command only.
+            self._state_pub = self.create_publisher(IoBankState, state_topic, 1)
+            self.create_subscription(IoBankCommand, command_topic, self._on_command, 1)
+            self.create_timer(
+                1.0 / config.rate_hz, self._bank_cycle,
+                callback_group=MutuallyExclusiveCallbackGroup(),
+            )
+
+        def _on_command(self, message) -> None:
+            with self._lock:
+                self.bank.receive(BankCommand(message.seq, tuple(int(value) for value in message.values)))
+
+        def _bank_cycle(self) -> None:
+            with self._lock:
+                state = self.bank.step()
+                publishing = self._bank_publishing
+            if not publishing:
+                return
+            message = self._bank_state_type()
+            message.cycle = state.cycle
+            message.applied_seq = state.applied_seq
+            message.applied_result = state.applied_result
+            message.device_code = state.device_code
+            message.inputs = list(state.inputs)
+            message.outputs = list(state.outputs)
+            message.refused = list(state.refused)
+            self._state_pub.publish(message)
+
+        def _apply_bank_parameter(self, name: str, value: Any) -> None:
+            bank = self.bank
+            if name == "bank.response":
+                bank.response = value
+            elif name == "bank.refused":
+                bank.refuse = parse_refused(value)
+            elif name == "bank.device_code":
+                bank.device_code = int(value)
+            elif name == "bank.apply_delay_cycles":
+                bank.apply_delay_cycles = int(value)
+            elif name == "bank.publishing":
+                self._bank_publishing = bool(value)
+            elif name == "bank.frozen":
+                bank.frozen = bool(value)
+            elif name == "bank.restart" and value:
+                bank.restart()
+
+        def _start_signals(self) -> None:
             core = self.core
             core.ready = bool(self.declare_parameter(
                 "ready", config.ready, ParameterDescriptor(description="PLC status (test)")
@@ -484,21 +740,6 @@ def _make_node(
             )
             self.create_timer(
                 TICK_PERIOD_S, self._tick, callback_group=MutuallyExclusiveCallbackGroup()
-            )
-            self.duplicates: dict[str, list[str]] = {}
-            window = self.declare_parameter(
-                "successor_window_s", SUCCESSOR_WINDOW_S,
-                ParameterDescriptor(description="test only; read once at start"),
-            ).value
-            if isinstance(window, bool) or not isinstance(window, (int, float)) \
-                    or not math.isfinite(window) or window < 0:
-                raise ConfigError("successor_window_s must be a finite number >= 0")
-            self._watch = DuplicateWatch(
-                self.get_fully_qualified_name(), time.monotonic(), float(window)
-            )
-            self.create_timer(
-                DUPLICATE_CHECK_PERIOD_S, self._check_duplicates,
-                callback_group=MutuallyExclusiveCallbackGroup(),
             )
 
         def _check_duplicates(self) -> None:
@@ -562,7 +803,9 @@ def _make_node(
             for parameter in parameters:
                 name, value = parameter.name, parameter.value
                 with self._lock:
-                    if name == "ready":
+                    if name.startswith("bank."):
+                        self._apply_bank_parameter(name, value)
+                    elif name == "ready":
                         self.core.ready = bool(value)
                     elif name.startswith("outputs.out_") and name.endswith(".publishing"):
                         self.core.publishing[_index(name)] = bool(value)
@@ -590,6 +833,24 @@ def _index(name: str) -> int:
 
 
 def _parameter_problem(name: str, value: Any) -> Optional[str]:
+    if name == "bank.response":
+        return None if value in BANK_RESPONSES else \
+            f"{name} must be one of {', '.join(BANK_RESPONSES)}"
+    if name == "bank.refused":
+        if not isinstance(value, str):
+            return f"{name} must be text, e.g. '2,5'"
+        try:
+            parse_refused(value)
+        except ConfigError as error:
+            return str(error)
+        return None
+    if name in ("bank.device_code", "bank.apply_delay_cycles"):
+        limit = 65535 if name == "bank.device_code" else 1_000_000
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= limit:
+            return f"{name} must be an integer in 0..{limit}"
+        return None
+    if name in ("bank.publishing", "bank.frozen", "bank.restart"):
+        return None if isinstance(value, bool) else f"{name} must be a boolean"
     if name.endswith(".response") and value not in RESPONSES:
         return f"{name} must be one of {', '.join(RESPONSES)}"
     if name.endswith(".ack_delay_s"):
@@ -671,10 +932,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         except ConfigError as error:
             print(f"sim_plc: parameter error: {error}", file=sys.stderr, flush=True)
             return EXIT_CONFIG
-        node.get_logger().info(
-            f"simulated PLC '{args.device}' up: {config.inputs} inputs, "
-            f"{config.outputs} outputs, ready={node.core.ready}, rate={config.rate_hz:g} Hz"
-        )
+        if config.mode == "bank":
+            node.get_logger().info(
+                f"simulated PLC '{args.device}' up: I/O bank of {BANK_SIZE} inputs and "
+                f"{BANK_SIZE} outputs, rate={config.rate_hz:g} Hz"
+            )
+        else:
+            node.get_logger().info(
+                f"simulated PLC '{args.device}' up: {config.inputs} inputs, "
+                f"{config.outputs} outputs, ready={node.core.ready}, rate={config.rate_hz:g} Hz"
+            )
         executor = MultiThreadedExecutor()
         executor.add_node(node)
         # spin() runs in a worker thread; the main thread only waits for the

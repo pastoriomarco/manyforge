@@ -42,14 +42,10 @@ struct RuntimeCollisionQueryBundle {
   CollisionWorldSnapshotPtr world;
   std::shared_ptr<const CollisionPolicySnapshot> policy;
   std::shared_ptr<const CollisionPolicyIndex> policy_index;
-  /// Pre-resolved metric selections prepared on the NRT publication path.
-  /// The default vector contains signed-release and bounded-penetration pairs.
-  /// Each contact-grasp entry contains that same base union plus the concrete
-  /// world body pairs matched by the active grasp binding. Binary release
-  /// pairs are intentionally absent.
+  /// Pre-resolved metric selection prepared on the NRT publication path: the
+  /// contact-rule pairs whose rule needs a signed distance (a depth limit, or
+  /// a release with signed-penetration evidence).
   std::vector<CollisionPairId> selected_distance_pairs;
-  std::map<std::string, std::vector<CollisionPairId>, std::less<>>
-      contact_grasp_selected_distance_pairs;
   bool distance_selection_order_valid = false;
   /// Publication-time proof that world bodies are sorted and unique by body
   /// id, enabling allocation-free lookup per tick.
@@ -153,9 +149,9 @@ public:
   /// policy snapshot if one exists, otherwise fail closed.
   ///
   /// When provided, this policy has priority over any static kernel-installed
-  /// policy because scene edits such as attach/detach, touch-link changes, and
-  /// support-contact discovery can change the effective policy at the same
-  /// cadence as the collision world.
+  /// policy because scene edits such as attach/detach and touch-link changes
+  /// can change the effective policy at the same cadence as the collision
+  /// world.
   [[nodiscard]] virtual std::optional<CollisionPolicySnapshot>
   collision_policy_snapshot() const {
     return std::nullopt;

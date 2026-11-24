@@ -20,11 +20,13 @@ import {
  * deleted here through the Deployment Draft and take effect at Apply.
  */
 export function ComponentTcpsCard({
-  componentId, controller, frames, gripperFrames, motionDescriptors,
+  componentId, controller, frames, collisionBodies, gripperFrames, motionDescriptors,
 }: {
   componentId: string;
   controller: DeploymentWorkspaceController;
   frames: readonly ComponentFrameTarget[];
+  /** The component's collision body ids: the contact-body choices of a custom TCP. */
+  collisionBodies: readonly string[];
   gripperFrames: readonly DraftGripperFrames[];
   motionDescriptors: readonly ManualControlMotionDescriptor[];
 }) {
@@ -71,7 +73,8 @@ export function ComponentTcpsCard({
               <div key={frame.frameRoleId}>
                 <dt>{frame.frameRoleId}</dt>
                 <dd>{`${frame.sourceLinkName ?? 'cell frame'}${tcp === undefined ? ''
-                  : ` · TCP ${tcp.qualifiedName}${tcp.isDefault ? ' (default)' : ''}`}`}</dd>
+                  : ` · TCP ${tcp.qualifiedName}${tcp.isDefault ? ' (default)' : ''} · contact bodies: ${
+                    tcp.contactBodyRoleIds.length === 0 ? 'none' : tcp.contactBodyRoleIds.join(', ')}`}`}</dd>
               </div>
             );
           })}
@@ -91,12 +94,14 @@ export function ComponentTcpsCard({
           <div key={tcp.tcpId}>
             <dt>{`${componentId}.${tcp.tcpId}`}</dt>
             <dd>
-              {`on ${tcp.parentFrame} · [${tcp.positionM.join(', ')}] m · rpy [${tcp.rpyDeg.join(', ')}] deg `}
+              {`on ${tcp.parentFrame} · [${tcp.positionM.join(', ')}] m · rpy [${tcp.rpyDeg.join(', ')}] deg · contact bodies: ${
+                tcp.contactBodies === null ? 'default' : tcp.contactBodies.length === 0 ? 'none' : tcp.contactBodies.join(', ')} `}
               <button type="button" className="text-button" disabled={disabled || noDraftRow || editing !== null}
                 title={noDraftRowTitle} aria-label={`Edit custom TCP ${tcp.tcpId}`}
                 onClick={() => setEditing({ replacing: tcp.tcpId, tcp: {
                   // Without `stored`: the edited row is written from the form.
                   tcpId: tcp.tcpId, parentFrame: tcp.parentFrame, positionM: [...tcp.positionM], rpyDeg: [...tcp.rpyDeg],
+                  contactBodies: tcp.contactBodies === null ? null : [...tcp.contactBodies],
                 } })}>Edit</button>{' '}
               <button type="button" className="text-button" disabled={disabled || noDraftRow || editing !== null}
                 title={noDraftRowTitle} aria-label={`Delete custom TCP ${tcp.tcpId}`}
@@ -112,6 +117,7 @@ export function ComponentTcpsCard({
               ? 'Apply the component first: a custom TCP needs one of its frames as parent.' : undefined)}
             onClick={() => setEditing({ replacing: null, tcp: {
               tcpId: '', parentFrame: parents[0] ?? '', positionM: [0, 0, 0], rpyDeg: [0, 0, 0],
+              contactBodies: null,
             } })}>Add custom TCP</button>
         </div>
       ) : (
@@ -119,6 +125,7 @@ export function ComponentTcpsCard({
           value={editing.tcp}
           renaming={editing.replacing === null}
           parents={parents}
+          collisionBodies={collisionBodies}
           problem={problem}
           disabled={disabled}
           onChange={(tcp) => setEditing({ ...editing, tcp })}
@@ -134,7 +141,8 @@ export function ComponentTcpsCard({
       <p className="field-help">
         Model frames and descriptor TCPs are read-only; they come from the robot or tool. A custom TCP is placed on one
         of this component's frames and runs after Apply. Model frames are the Applied ones; a Draft change shows after
-        Apply. Gripper frames are edited under Current gripper configuration below.
+        Apply. Gripper frames are edited under Current gripper configuration below. A TCP's contact bodies are the
+        collision bodies a collision rule on the contact bodies of the move's TCP selects.
       </p>
     </section>
   );
@@ -143,10 +151,11 @@ export function ComponentTcpsCard({
 const AXES = ['x', 'y', 'z'] as const;
 const ANGLES = ['roll', 'pitch', 'yaw'] as const;
 
-function CustomTcpForm({ value, renaming, parents, problem, disabled, onChange, onCancel, onSave }: {
+function CustomTcpForm({ value, renaming, parents, collisionBodies, problem, disabled, onChange, onCancel, onSave }: {
   value: CustomTcp;
   renaming: boolean;
   parents: readonly string[];
+  collisionBodies: readonly string[];
   problem: string | null;
   disabled: boolean;
   onChange: (tcp: CustomTcp) => void;
@@ -155,6 +164,8 @@ function CustomTcpForm({ value, renaming, parents, problem, disabled, onChange, 
 }) {
   const number = (text: string) => (text.trim() === '' ? Number.NaN : Number(text));
   const problemId = useId();
+  // The component's bodies plus any stored one that is not among them.
+  const bodyChoices = [...new Set([...collisionBodies, ...(value.contactBodies ?? [])])].sort();
   return (
     <div className="deployment-focused-body" aria-label="Custom TCP">
       <label className="deployment-focused-field">
@@ -193,6 +204,39 @@ function CustomTcpForm({ value, renaming, parents, problem, disabled, onChange, 
             }} />
         </label>
       ))}
+      <label className="deployment-focused-field">
+        <span>Contact bodies</span>
+        <select aria-label="Custom TCP contact bodies" value={value.contactBodies === null ? 'default' : 'chosen'}
+          disabled={disabled}
+          onChange={(event) => onChange({
+            ...value, contactBodies: event.target.value === 'default' ? null : [],
+          })}>
+          <option value="default">Default (a gripper&apos;s pads, else its fingers; none on a passive tool)</option>
+          <option value="chosen">Chosen below</option>
+        </select>
+      </label>
+      {value.contactBodies !== null && (
+        <fieldset className="deployment-focused-field" aria-label="Custom TCP contact body choices">
+          <legend>Collision bodies of this component</legend>
+          {bodyChoices.length === 0 && <span className="muted">None chosen. No collision body of this component is known.</span>}
+          {bodyChoices.map((body) => {
+            const chosen = value.contactBodies?.includes(body) ?? false;
+            return (
+              <label key={body}>
+                <input type="checkbox" aria-label={`Custom TCP contact body ${body}`} checked={chosen}
+                  disabled={disabled}
+                  onChange={() => onChange({
+                    ...value,
+                    contactBodies: chosen
+                      ? (value.contactBodies ?? []).filter((item) => item !== body)
+                      : [...(value.contactBodies ?? []), body].sort(),
+                  })} />
+                {' '}{body}{collisionBodies.includes(body) ? '' : ' (not a known collision body of this component)'}
+              </label>
+            );
+          })}
+        </fieldset>
+      )}
       {/* Local validation, red; described by Save rather than announced on open. */}
       {problem !== null && <p id={problemId} className="program-form-error inline-message severity-error">{problem}</p>}
       <div className="dactions">

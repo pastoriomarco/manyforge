@@ -1371,8 +1371,8 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
   const auto &object = require_object(root, "retained_bundle");
   require_required_and_optional_fields(
       object,
-      {"api_version", "retained_bundle_id", "deployment_artifact_id",
-       "deployment_revision", "cell_graph", "catalogs",
+      {"api_version", "retained_bundle_id", "deployment_revision",
+       "cell_graph", "catalogs",
        "desired_control_configurations", "capability_provider_bindings",
        "retained_policy_records", "runtime_contract_requirements",
        "compiled_products", "provenance"},
@@ -1392,11 +1392,6 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       "retained_bundle.retained_bundle_id");
   detail::require_retained_digest(retained_bundle_id,
                                   "retained_bundle.retained_bundle_id");
-  const std::string &deployment_artifact_id = require_string(
-      require_member(object, "deployment_artifact_id", "retained_bundle"),
-      "retained_bundle.deployment_artifact_id");
-  detail::require_retained_portable_identity(
-      deployment_artifact_id, "retained_bundle.deployment_artifact_id");
   const std::string &deployment_revision = require_string(
       require_member(object, "deployment_revision", "retained_bundle"),
       "retained_bundle.deployment_revision");
@@ -1888,7 +1883,6 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
   return core::RetainedBundleDTO{
       std::string(core::kRetainedBundleApiVersion),
       core::RetainedBundleId(retained_bundle_id),
-      core::DeploymentArtifactId(deployment_artifact_id),
       core::DeploymentRevision(deployment_revision),
       verified_graph.graph(),
       core::RetainedCatalogDTO{

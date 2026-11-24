@@ -463,11 +463,11 @@ TEST(RoboPlanPlannerBackendTest, AcceptsTheFramesOfAToolMountedOnTheMotionCompon
 }
 
 TEST(RoboPlanPlannerBackendTest,
-     ContactSelectionIsOperationScopedAndOrdinaryPlanAndIkClearIt) {
+     PlansAllowEndWindowContactPairsAndIkDoesNot) {
   BackendFixture fixture;
   fixture.client->require_projection = true;
   auto policy = std::make_shared<CollisionPolicySnapshot>();
-  policy->policy_id = "contact-policy-snapshot";
+  policy->policy_id = "contact-rule-snapshot";
   policy->revision = CollisionPolicyRevision{
       1U, "sha256:"
           "0000000000000000000000000000000000000000000000000000000000000000"};
@@ -482,23 +482,20 @@ TEST(RoboPlanPlannerBackendTest,
       "move:contact", ResolvedMotionSpecDTO{joint_goal(fixture.binding)});
   input.retained_collision_world = world.value();
   input.retained_collision_policy = policy;
-  for (const auto &selected : {std::optional<std::string>("contact-a"),
-                               std::optional<std::string>("contact-b"),
-                               std::optional<std::string>{}}) {
-    input.contact_policy_id = selected;
+  // A plan may relax the policy's end-window contact pairs.
+  for (int repeat = 0; repeat < 3; ++repeat) {
     const auto result = fixture.backend->plan(input);
     ASSERT_TRUE(result.trajectory)
         << (result.error ? result.error->message : "missing trajectory");
     ASSERT_FALSE(fixture.client->projection_history.empty());
     const auto &actual = fixture.client->projection_history.back();
-    EXPECT_EQ(actual.contact_policy_id, selected);
+    EXPECT_TRUE(actual.end_contact_pairs_allowed);
     EXPECT_EQ(actual.world, input.retained_collision_world);
     EXPECT_EQ(actual.policy, input.retained_collision_policy);
     EXPECT_EQ(actual.projection_binding, input.projection_binding);
   }
-  // IK has no operation contact selector: never inherit the previous plan's
-  // allowance, even when all retained projection identities are unchanged.
-  input.contact_policy_id = "contact-a";
+  // IK never takes the plan's allowance, even when all retained projection
+  // identities are unchanged.
   ASSERT_TRUE(fixture.backend->plan(input).trajectory);
   const auto resolved = testing::make_test_execution_binding();
   IkRequestDTO ik{resolved.controllable_component_id,
@@ -516,7 +513,7 @@ TEST(RoboPlanPlannerBackendTest,
   const auto solved = fixture.backend->solve_ik(ik);
   ASSERT_TRUE(solved.ok);
   ASSERT_EQ(fixture.client->projection_history.size(), 5U);
-  EXPECT_FALSE(fixture.client->projection_history.back().contact_policy_id);
+  EXPECT_FALSE(fixture.client->projection_history.back().end_contact_pairs_allowed);
   EXPECT_EQ(fixture.client->compute_calls, 4);
   EXPECT_EQ(fixture.client->ik_calls, 1);
 }
@@ -537,10 +534,10 @@ TEST(RoboPlanPlannerBackendTest, PlanForwardsTheKernelClearanceMarginsAndIkClear
           .build_shared();
   ASSERT_TRUE(world.ok()) << world.error().message;
   auto margins = std::make_shared<CollisionClearanceMargins>();
-  margins->margin_m = 0.003;
+  margins->rule_ids = {"everything"};
   margins->pairs = {{CollisionPairId{"component/arm/model/arm_model/body/link1/collision/0",
                                      "scene/wall/shape/0"},
-                     0.003}};
+                     0.003, 0U}};
   auto input = testing::make_test_plan_request(
       "move:clearance", ResolvedMotionSpecDTO{joint_goal(fixture.binding)});
   input.retained_collision_world = world.value();

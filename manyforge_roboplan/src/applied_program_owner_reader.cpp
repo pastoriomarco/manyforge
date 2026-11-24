@@ -20,10 +20,8 @@ CompileAppliedProgramBlackboardContext(
          {{"reason", std::move(reason)}}});
   };
   if (!applied.publication_generation.nonzero() || !program || !binding ||
-      program->value().program_id != applied.program_id ||
       program->value().program_revision != applied.program_revision ||
       binding->program_binding_id() != applied.program_binding_id ||
-      binding->value().program_id != applied.program_id ||
       binding->value().program_revision != applied.program_revision ||
       binding->value().retained_bundle_id != bundle.retained_bundle_id() ||
       binding->value().graph_revision !=
@@ -60,7 +58,7 @@ CompileAppliedProgramBlackboardContext(
       program, &program->blackboard_key_declarations());
   return Reply::Ok(
       {applied.publication_generation,
-       applied.program_id, applied.program_revision, applied.program_binding_id,
+       applied.program_revision, applied.program_binding_id,
        bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
        actual_binding, declarations,
        std::make_shared<const core::ProgramIoConditionProjectionDTO>(

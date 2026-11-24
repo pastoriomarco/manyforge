@@ -13,6 +13,10 @@ from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
     canonical_json_bytes,
 )
+from manyforge_behavior.collision_rules import (
+    CollisionRuleError,
+    validate_collision_rules,
+)
 
 from .stop_fallback_sequence import (
     FALLBACK_STOP_MODES_FIELD,
@@ -20,7 +24,9 @@ from .stop_fallback_sequence import (
 )
 
 
-DEPLOYMENT_INTENT_API_VERSION = "manyforge.deployment_intent.v2"
+DEPLOYMENT_INTENT_API_VERSION = "manyforge.deployment_intent.v3"
+# Script that rewrites a Scenario saved in an older format.
+SCENARIO_CONVERTER = "scripts/convert_scenario_od46.py"
 _PORTABLE_ID = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
 _PACKAGE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,127}$")
 _FRAME_PREFIX = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_/]*/")
@@ -29,6 +35,9 @@ _MAX_ATTACHMENTS = 256
 _MAX_PACKAGE_ROOTS = 128
 _MAX_TARGETS = 128
 _MAX_PATH_BYTES = 4096
+_MAX_TCP_CONTACT_BODIES = 256
+# A collision body id as the component catalog spells it.
+_COLLISION_BODY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class DeploymentIntentError(ValueError):
@@ -183,12 +192,47 @@ def _validate_authoring_pose(value: Any, label: str) -> dict[str, Any]:
     }
 
 
+def _validate_contact_bodies(value: Any, label: str) -> list[str]:
+    """A TCP's contact bodies: collision body ids of its component, sorted.
+
+    Absent means the component's default (a gripper's pads, else its fingers;
+    none on a passive tool); an empty list means none.
+    """
+    if type(value) is not list or len(value) > _MAX_TCP_CONTACT_BODIES:
+        _fail(f"{label} must be a bounded list")
+    for index, body in enumerate(value):
+        if type(body) is not str or _COLLISION_BODY_ID.fullmatch(body) is None:
+            _fail(f"{label}[{index}] must be a collision body id")
+    bodies = sorted(value)
+    if len(set(bodies)) != len(bodies):
+        _fail(f"{label} repeats a collision body")
+    return bodies
+
+
+def _validate_collision_rules(value: Any, label: str) -> list[dict[str, Any]]:
+    """The cell's collision rules, in authored order.
+
+    Row 0 is the first rule: no selections, a clearance, it holds every
+    robot x environment pair. Every other row gives one value (`clearance_m`,
+    `contact` or `release`) to the pairs of one member of `a` and one of `b`.
+    Which bodies a selection names is resolved when a move is admitted.
+    """
+    try:
+        validate_collision_rules(value, path=label, move_rules=False)
+    except CollisionRuleError as error:
+        _fail(f"{error.reason}: {error}")
+    return deepcopy(value)
+
+
 def _validate_custom_tcps(value: Any, label: str) -> list[dict[str, Any]]:
-    """`custom_tcps` rows `{tcp_id, parent_frame, pose}`, sorted by tcp_id.
+    """`custom_tcps` rows `{tcp_id, parent_frame, pose, contact_bodies?}`,
+    sorted by tcp_id.
 
     `parent_frame` names a frame of the component's model (a descriptor frame
     role or a URDF link); the compiler resolves it and refuses chaining and
-    name collisions. The pose is the authoring pose shape.
+    name collisions. The pose is the authoring pose shape. `contact_bodies`
+    names the collision bodies of the component that may touch under a rule
+    selecting the TCP's contact bodies.
     """
     if type(value) is not list or len(value) > _MAX_CUSTOM_TCPS:
         _fail(f"{label} must be a bounded list")
@@ -197,18 +241,24 @@ def _validate_custom_tcps(value: Any, label: str) -> list[dict[str, Any]]:
         row_label = f"{label}[{index}]"
         row = _require_object(raw, row_label)
         _require_exact_fields(
-            row, required={"tcp_id", "parent_frame", "pose"}, label=row_label
+            row,
+            required={"tcp_id", "parent_frame", "pose"},
+            optional={"contact_bodies"},
+            label=row_label,
         )
         pose = _validate_authoring_pose(row["pose"], f"{row_label}.pose")
-        rows.append(
-            {
-                "tcp_id": _require_id(row["tcp_id"], f"{row_label}.tcp_id"),
-                "parent_frame": _require_text(
-                    row["parent_frame"], f"{row_label}.parent_frame", 1024
-                ),
-                "pose": pose,
-            }
-        )
+        normalized: dict[str, Any] = {
+            "tcp_id": _require_id(row["tcp_id"], f"{row_label}.tcp_id"),
+            "parent_frame": _require_text(
+                row["parent_frame"], f"{row_label}.parent_frame", 1024
+            ),
+            "pose": pose,
+        }
+        if "contact_bodies" in row:
+            normalized["contact_bodies"] = _validate_contact_bodies(
+                row["contact_bodies"], f"{row_label}.contact_bodies"
+            )
+        rows.append(normalized)
     rows.sort(key=lambda row: row["tcp_id"])
     if len({row["tcp_id"] for row in rows}) != len(rows):
         _fail(f"custom_tcp_duplicate: {label} repeats a tcp_id")
@@ -475,7 +525,8 @@ def _validate_lane_free_component(component: dict[str, Any], label: str) -> dict
 
 def _is_machine_owner(component: dict[str, Any]) -> bool:
     """A machine's owner row: no owner, no model source and no
-    runtime kind; it holds the machine's lane and address reference."""
+    runtime kind; it holds the machine's lane and address reference. An
+    owner-less model-form I/O device (a PLC's bank) has the same row."""
     configuration = component.get("configuration")
     return (
         "owner" not in component
@@ -523,14 +574,16 @@ def _validate_machine_owner(component: dict[str, Any], label: str) -> dict[str, 
 
 
 def _validate_io_member(component: dict[str, Any], label: str) -> dict[str, Any]:
-    """A machine's I/O member: its signals come from its model."""
+    """A machine's I/O member: its signals come from its model. Its optional
+    `mock_inputs` (OD-356) give inputs a geometric Mock behaviour; Apply
+    checks them against the model and the cell."""
     _require_exact_fields(
         component,
         required={"component_id", "component_profile_id", "owner", "role"},
-        optional={"active"},
+        optional={"active", "mock_inputs"},
         label=label,
     )
-    return {
+    result = {
         "component_id": _require_id(component["component_id"], f"{label}.component_id"),
         "component_profile_id": _require_id(
             component["component_profile_id"], f"{label}.component_profile_id"
@@ -539,6 +592,67 @@ def _validate_io_member(component: dict[str, Any], label: str) -> dict[str, Any]
         "role": _require_id(component["role"], f"{label}.role"),
         **_validate_active(component, label),
     }
+    if "mock_inputs" in component:
+        result["mock_inputs"] = _validate_mock_inputs(component["mock_inputs"], f"{label}.mock_inputs")
+    return result
+
+
+def _validate_mock_inputs(value: Any, label: str) -> list[dict[str, Any]]:
+    """One row per input, in exactly one of two forms:
+    `{signal_name, geometric_contact: {robot_component_id, a, b,
+    trip_depth_m?, release_depth_m?, maximum_sample_age_ms?}}` (OD-356), or
+    `{signal_name, spring_slider: {component_id, element_id}, b,
+    maximum_sample_age_ms?}`: the input follows a generated tool's spring
+    slider pressed against `b` (OD-371). The compiler checks release_depth_m
+    against trip_depth_m and the slider against the tool."""
+    if not isinstance(value, list):
+        _fail(f"{label} must be a list")
+    rows: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for index, row in enumerate(value):
+        where = f"{label}[{index}]"
+        row = _require_object(row, where)
+        name = row.get("signal_name")
+        if not isinstance(name, str) or not name or name in names:
+            _fail(f"{where}.signal_name must be a signal name, once per list")
+        names.add(name)
+        if ("geometric_contact" in row) == ("spring_slider" in row):
+            _fail(f"{where} must have exactly one of geometric_contact and spring_slider")
+        if "spring_slider" in row:
+            _require_exact_fields(
+                row, required={"signal_name", "spring_slider", "b"},
+                optional={"maximum_sample_age_ms"}, label=where,
+            )
+            slider = _require_object(row["spring_slider"], f"{where}.spring_slider")
+            _require_exact_fields(
+                slider, required={"component_id", "element_id"}, label=f"{where}.spring_slider"
+            )
+            for key in ("component_id", "element_id"):
+                _require_id(slider[key], f"{where}.spring_slider.{key}")
+            _check_mock_input_fields(row, ("b",), where)
+            rows.append({**row, "spring_slider": dict(slider)})
+            continue
+        _require_exact_fields(row, required={"signal_name", "geometric_contact"}, label=where)
+        contact = _require_object(row["geometric_contact"], f"{where}.geometric_contact")
+        _require_exact_fields(
+            contact,
+            required={"robot_component_id", "a", "b"},
+            optional={"trip_depth_m", "release_depth_m", "maximum_sample_age_ms"},
+            label=f"{where}.geometric_contact",
+        )
+        _check_mock_input_fields(contact, ("a", "b"), f"{where}.geometric_contact")
+        rows.append({"signal_name": name, "geometric_contact": dict(contact)})
+    return rows
+
+
+def _check_mock_input_fields(fields: dict[str, Any], sides: tuple[str, ...], label: str) -> None:
+    for side in sides:
+        if not isinstance(fields[side], list) or not fields[side]:
+            _fail(f"{label}.{side} must be a non-empty list of selections")
+    for key in ("trip_depth_m", "release_depth_m", "maximum_sample_age_ms"):
+        number = fields.get(key, 0)
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or number < 0:
+            _fail(f"{label}.{key} must be a number of at least 0")
 
 
 def _validate_default_tcp(value: Any, label: str) -> dict[str, str]:
@@ -567,34 +681,26 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     intent = _require_object(value, f"{source}: Deployment intent")
     required = {
         "api_version",
-        "deployment_artifact_id",
-        "name",
         "components",
         "attachments",
+        "collision_rules",
         "policies",
     }
     optional = {
-        "description",
         "assistant_profile_id",
         "assistant_model_components",
         "compatibility",
     }
+    # The version is checked first: an older file differs in its fields.
+    if intent.get("api_version", DEPLOYMENT_INTENT_API_VERSION) != DEPLOYMENT_INTENT_API_VERSION:
+        _fail(
+            f"{source}: unsupported Deployment intent version; "
+            f"{SCENARIO_CONVERTER} rewrites an older Scenario"
+        )
     _require_exact_fields(
         intent, required=required, optional=optional, label=f"{source}: Deployment intent"
     )
-    if intent["api_version"] != DEPLOYMENT_INTENT_API_VERSION:
-        _fail(f"{source}: unsupported Deployment intent version")
-    result: dict[str, Any] = {
-        "api_version": DEPLOYMENT_INTENT_API_VERSION,
-        "deployment_artifact_id": _require_id(
-            intent["deployment_artifact_id"], f"{source}: deployment_artifact_id"
-        ),
-        "name": _require_text(intent["name"], f"{source}: name", 256),
-    }
-    if "description" in intent:
-        if type(intent["description"]) is not str or len(intent["description"].encode("utf-8")) > 4096:
-            _fail(f"{source}: description is invalid")
-        result["description"] = intent["description"]
+    result: dict[str, Any] = {"api_version": DEPLOYMENT_INTENT_API_VERSION}
 
     components = intent["components"]
     if type(components) is not list or len(components) > _MAX_COMPONENTS:
@@ -603,6 +709,8 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     component_ids: set[str] = set()
     # A child mounted through an attachment row takes its placement from the
     # parent interface and omits root_pose_in_cell. Preparation owns the row.
+    # An unattached component without one is unmounted (OD-366): the Draft
+    # accepts it for a tool only, and Apply refuses it.
     mounted: set[Any] = set()
     if type(intent["attachments"]) is list:
         for row in intent["attachments"]:
@@ -642,10 +750,11 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
                 "target_settings",
                 "configuration",
             }
-            | (set() if is_mounted else {"root_pose_in_cell"})
+            | ({"root_pose_in_cell"} if member and not is_mounted else set())
             | ({"owner", "role"} if member else set()),
             optional={"frame_prefix", "custom_tcps", "default_tcp"}
-            | ({"active"} if member else {"lane"}),
+            | ({"active"} if member else {"lane"})
+            | ({"root_pose_in_cell"} if not member and not is_mounted else set()),
             label=label,
         )
         component_id = _require_id(component["component_id"], f"{label}.component_id")
@@ -653,35 +762,55 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
             _fail(f"{source}: duplicate component_id {component_id!r}")
         component_ids.add(component_id)
         model_source = _require_object(component["model_source"], f"{label}.model_source")
-        _require_exact_fields(
-            model_source,
-            required={"urdf", "package_roots"},
-            optional={"srdf"},
-            label=f"{label}.model_source",
-        )
-        package_roots = _require_object(
-            model_source["package_roots"], f"{label}.model_source.package_roots"
-        )
-        if len(package_roots) > _MAX_PACKAGE_ROOTS:
-            _fail(f"{label}.model_source.package_roots exceeds the bound")
-        normalized_roots: dict[str, dict[str, str]] = {}
-        for package_name, reference in package_roots.items():
-            if type(package_name) is not str or _PACKAGE_NAME.fullmatch(package_name) is None:
-                _fail(f"{label}.model_source.package_roots has an invalid package name")
-            normalized_roots[package_name] = validate_source_reference(
-                reference,
-                label=f"{label}.model_source.package_roots.{package_name}",
+        normalized_source: dict[str, Any]
+        if "parameters" in model_source:
+            # OD-352, OD-357: a Tool's parameters generate the model at Load;
+            # they replace urdf, srdf and package_roots. Inline (a mapping
+            # with api_version, which capture validates) or a parameter file.
+            _require_exact_fields(
+                model_source,
+                required={"parameters"},
+                optional=set(),
+                label=f"{label}.model_source",
             )
-        normalized_source: dict[str, Any] = {
-            "urdf": validate_source_reference(
-                model_source["urdf"], label=f"{label}.model_source.urdf"
-            ),
-            "package_roots": dict(sorted(normalized_roots.items())),
-        }
-        if "srdf" in model_source:
-            normalized_source["srdf"] = validate_source_reference(
-                model_source["srdf"], label=f"{label}.model_source.srdf"
+            parameters = model_source["parameters"]
+            normalized_source = {
+                "parameters": deepcopy(parameters)
+                if isinstance(parameters, dict) and "api_version" in parameters
+                else validate_source_reference(
+                    parameters, label=f"{label}.model_source.parameters"
+                )
+            }
+        else:
+            _require_exact_fields(
+                model_source,
+                required={"urdf", "package_roots"},
+                optional={"srdf"},
+                label=f"{label}.model_source",
             )
+            package_roots = _require_object(
+                model_source["package_roots"], f"{label}.model_source.package_roots"
+            )
+            if len(package_roots) > _MAX_PACKAGE_ROOTS:
+                _fail(f"{label}.model_source.package_roots exceeds the bound")
+            normalized_roots: dict[str, dict[str, str]] = {}
+            for package_name, reference in package_roots.items():
+                if type(package_name) is not str or _PACKAGE_NAME.fullmatch(package_name) is None:
+                    _fail(f"{label}.model_source.package_roots has an invalid package name")
+                normalized_roots[package_name] = validate_source_reference(
+                    reference,
+                    label=f"{label}.model_source.package_roots.{package_name}",
+                )
+            normalized_source = {
+                "urdf": validate_source_reference(
+                    model_source["urdf"], label=f"{label}.model_source.urdf"
+                ),
+                "package_roots": dict(sorted(normalized_roots.items())),
+            }
+            if "srdf" in model_source:
+                normalized_source["srdf"] = validate_source_reference(
+                    model_source["srdf"], label=f"{label}.model_source.srdf"
+                )
         frame_prefix = _require_frame_prefix(
             component.get("frame_prefix", ""), f"{label}.frame_prefix"
         )
@@ -707,7 +836,7 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
             normalized["owner"] = _require_id(component["owner"], f"{label}.owner")
             normalized["role"] = _require_id(component["role"], f"{label}.role")
             normalized.update(_validate_active(component, label))
-        if not is_mounted:
+        if "root_pose_in_cell" in component:
             normalized["root_pose_in_cell"] = _validate_pose(
                 component["root_pose_in_cell"], f"{label}.root_pose_in_cell"
             )
@@ -729,6 +858,9 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     if any(type(row) is not dict for row in attachments):
         _fail(f"{source}: every attachment must be an object")
     result["attachments"] = deepcopy(attachments)
+    result["collision_rules"] = _validate_collision_rules(
+        intent["collision_rules"], f"{source}: collision_rules"
+    )
     result["policies"] = deepcopy(
         _require_object(intent["policies"], f"{source}: policies")
     )
@@ -759,6 +891,26 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     return result
 
 
+def unmounted_component_ids(intent: dict[str, Any]) -> list[str]:
+    """The model components of a validated intent that nothing places: no
+    attachment row mounts them and they have no ``root_pose_in_cell``. Only a
+    tool may be unmounted (OD-366); Apply refuses while one is."""
+
+    mounted = {
+        row["child"].get("component_id")
+        for row in intent["attachments"]
+        if isinstance(row.get("child"), dict)
+    }
+    return sorted(
+        row["component_id"]
+        for row in intent["components"]
+        if "model_source" in row
+        and "owner" not in row
+        and "root_pose_in_cell" not in row
+        and row["component_id"] not in mounted
+    )
+
+
 def iter_source_references(
     intent: dict[str, Any],
 ) -> Iterable[tuple[tuple[str | int, ...], dict[str, str], bool]]:
@@ -774,6 +926,11 @@ def iter_source_references(
             "model_source",
         )
         model_source = component["model_source"]
+        if "parameters" in model_source:
+            # Inline parameters reference no file.
+            if "api_version" not in model_source["parameters"]:
+                yield base + ("parameters",), deepcopy(model_source["parameters"]), False
+            continue
         yield base + ("urdf",), deepcopy(model_source["urdf"]), False
         if "srdf" in model_source:
             yield base + ("srdf",), deepcopy(model_source["srdf"]), False

@@ -11,6 +11,7 @@ import time
 from typing import Any, Callable, Iterator, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException
+from manyforge_behavior import parametric_tool
 from manyforge_behavior.canonical_artifact import (
     canonical_json_bytes,
     raw_sha256_digest,
@@ -18,7 +19,9 @@ from manyforge_behavior.canonical_artifact import (
 from manyforge_behavior.model_source_capture import (
     ModelSourceCaptureError,
     capture_deployment_model_sources,
+    load_tool_parameters,
 )
+from manyforge_behavior.model_source_capture import SceneMeshPathError
 from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.held_run_authoring import (
     held_run_draft_edit_allowed,
@@ -36,25 +39,19 @@ from .application_identity import (
 from .authoring_admission import (
     AuthoringOperationError,
     AuthoringMutationEnvelope,
-    OperationEffects,
     PARTIAL_EFFECT_OBSERVATION_CODES,
     draft_session_http_exception,
     headless_client_http_exception,
-    raise_save_failure,
     refused_before_effect,
     scenario_artifact_http_exception,
 )
-from .component_catalog import component_catalog
+from .component_catalog import component_catalog, profile_facts
 from .deployment_artifacts import (
     load_deployment_artifact,
-    normalize_deployment_save_path,
-    save_deployment_artifact,
 )
-from .deployment_draft import DeploymentDraftError
+from .deployment_draft import DeploymentDraftError, PreparedDeploymentReplacement
 from .deployment_intent import (
     DEPLOYMENT_INTENT_API_VERSION,
-    DeploymentIntentError,
-    rebase_deployment_intent_sources,
 )
 from .draft_session import DraftSessionError
 from .apply_orchestration import (
@@ -77,12 +74,9 @@ from .authoring_workspace import (
     AuthoringOperationContext,
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
-    scenario_project_facts,
 )
 from .scenario_artifacts import (
-    SCENARIO_PROJECT_MEMBERS,
     ScenarioArtifactError,
-    save_scenario_member,
 )
 from .authoring_workspace_fence import (
     commit_draft_edit,
@@ -107,14 +101,23 @@ def _capture_model_sources(
         )
     try:
         return capture_deployment_model_sources(
-            deployment, project_root=Path(project)
+            deployment, project_root=Path(project), paths=state.project_paths
         )
     except ModelSourceCaptureError as error:
         raise DeploymentDraftError(
-            "activation_model_source_invalid",
+            error.code or "activation_model_source_invalid",
             str(error),
             status_code=409,
         ) from error
+
+
+def _capture_scene_meshes(
+    program: dict[str, Any] | None, state: ComposerState, project_path: str
+) -> dict[str, Any]:
+    try:
+        return state.capture_scene_mesh_closure(program, project_path=project_path)
+    except SceneMeshPathError as error:
+        raise DeploymentDraftError(error.code, str(error), status_code=409) from error
 
 
 class _Fence(BaseModel):
@@ -177,6 +180,15 @@ class AddComponentsRequest(_LocalFence):
     attachments: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
 
 
+class RemoveComponentRequest(_LocalFence):
+    component_id: str = Field(min_length=1, max_length=256)
+
+
+class ReplaceToolRequest(_LocalFence):
+    component_id: str = Field(min_length=1, max_length=256)
+    replacement_component_id: str = Field(min_length=1, max_length=256)
+
+
 class UpdateControlledStopRequest(_LocalFence):
     controllable_component_id: str = Field(min_length=1, max_length=256)
     command_target_id: str = Field(min_length=1, max_length=256)
@@ -187,15 +199,6 @@ class UpdateMotionTargetLimitRequest(_LocalFence):
     controllable_component_id: str = Field(min_length=1, max_length=256)
     command_target_id: str = Field(min_length=1, max_length=256)
     maximum_tcp_linear_speed_mps: float = Field(gt=0.0, le=1000.0)
-
-
-class SaveDeploymentRequest(_LocalFence):
-    pass
-
-
-class SaveDeploymentAsRequest(_LocalFence):
-    path: str = Field(min_length=1, max_length=4096)
-    confirm_overwrite: bool = Field(default=False, alias="confirmOverwrite")
 
 
 class DiscardDeploymentRequest(_LocalFence):
@@ -221,9 +224,16 @@ class ConfirmedApplyRequest(ServerApplyRequest):
 
     When present, the Apply is refused before any effect if the activation
     input changed since that Preview (``activation_input_changed_after_confirmation``).
+    ``confirmed_collision_rule_ids`` names every ``rule_id`` of the Preview's
+    ``collision_rules``; an Apply that changes a rule it leaves out ends
+    ``collision_rule_confirmation_required`` before any component step.
     """
 
     scope: dict[str, Any] | None = None
+    # The ids of the Preview's ``collision_rules`` the user confirmed. An Apply
+    # whose Preview changes a rule this list leaves out ends
+    # ``collision_rule_confirmation_required`` before any component step.
+    confirmed_collision_rule_ids: list[str] = Field(default_factory=list, max_length=64)
     # The command's identity (OD-214): the same key again returns its row.
     request_key: RequestKeyText
 
@@ -367,32 +377,6 @@ def _raise(error: Exception) -> NoReturn:
     raise error
 
 
-def _write_roots(state: ComposerState) -> list[str]:
-    if state.allowed_deployment_write_roots is not None:
-        return state.allowed_deployment_write_roots
-    return state.allowed_fs_roots
-
-
-def _published_deployment_canonical(
-    state: ComposerState, target: str
-) -> str | None:
-    """Return the content identity already published at one exact target.
-
-    Save resolves a lost response by rereading the exact target and comparing
-    this identity with the canonical content captured for that request. A
-    missing or unreadable target returns ``None``, so the ordinary overwrite
-    rules still apply.
-    """
-
-    try:
-        source, _path = load_deployment_artifact(
-            target, allowed_roots=_write_roots(state)
-        )
-        return state.deployment_draft_session.preview_source(source).canonical_json
-    except (DeploymentDraftError, OSError, ValueError):
-        return None
-
-
 def _workspace(state: ComposerState) -> dict[str, Any]:
     authoring = state.authoring_workspace.snapshot()
     deployment = authoring.as_dict()["deployment"]
@@ -404,11 +388,6 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
             "id": deployment["draftId"],
             "revision": deployment["draftRevision"],
             "document": document,
-            "deploymentArtifactId": (
-                document.get("deployment_artifact_id")
-                if isinstance(document, dict)
-                else None
-            ),
             "deploymentRevision": (
                 document.get("deployment_revision")
                 if isinstance(document, dict)
@@ -456,7 +435,13 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
         if current is not None
         else None
     )
-    run_ready = applied_document is not None and document == applied_document
+    # Applied holds the compiled input (required defaults filled at Apply);
+    # the Draft keeps the document as authored, so compare it filled the same way.
+    run_ready = (
+        applied_document is not None
+        and isinstance(document, dict)
+        and with_defaults(document) == applied_document
+    )
     # The same comparison the Revert guard makes, on the Saved this view
     # captured with its authoring snapshot; unknown without both sides.
     workspace["saved"]["differsFromApplied"] = saved_deployment_differs(
@@ -502,6 +487,94 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
     return workspace
 
 
+def deployment_unapplied(view: dict[str, Any]) -> bool:
+    """Something is applied and the Deployment Draft is not it.
+
+    The publication identity (revision) decides when both sides carry one;
+    otherwise the backend's document comparison (run admission) decides.
+    """
+
+    draft = view.get("draft") or {}
+    applied = (view.get("managerApplied") or {}).get("deploymentRevision")
+    if draft.get("document") is None or applied is None:
+        return False
+    revision = draft.get("deploymentRevision")
+    if revision is not None:
+        return revision != applied
+    return (view.get("runAdmission") or {}).get("ready") is not True
+
+
+def read_applied_deployment(
+    state: ComposerState,
+) -> tuple[dict[str, Any], str | None, str]:
+    """The Manager Applied Deployment as captured at its Apply, the project
+    folder its relative sources resolve against, and its identity.
+
+    Only the captured authoring input whose exact candidate was published by
+    Manager and Program binding is returned.
+    """
+
+    current_projection = state.published_scenario()
+    current = current_projection.get("published_scenario")
+    if current_projection.get("ready") is not True or not isinstance(
+        current, dict
+    ):
+        raise DeploymentDraftError(
+            "deployment_applied_unavailable",
+            "Deployment Discard requires one exact Manager Applied Scenario",
+            status_code=409,
+        )
+    if state.headless_client is None:
+        raise DeploymentDraftError(
+            "deployment_applied_unavailable",
+            "Deployment Discard requires the configured Manager",
+            status_code=503,
+        )
+    context = state.applied_activation_for_publication(current)
+    if context is None:
+        raise DeploymentDraftError(
+            "deployment_applied_projection_mismatch",
+            "this Composer process has no exact Applied Deployment baseline",
+            status_code=409,
+        )
+    applied = context["deployment"]
+    identity = raw_sha256_digest(
+        canonical_json_bytes(
+            {
+                "scenario_id": current["scenario_id"],
+                "deployment": applied,
+            }
+        )
+    )
+    return applied, context["project_path"], identity
+
+
+def prepare_deployment_saved_baseline(
+    state: ComposerState,
+    *,
+    saved_document: dict[str, Any],
+    saved_path: str,
+    source_project_root: str | None,
+    draft_document: dict[str, Any] | None = None,
+) -> PreparedDeploymentReplacement:
+    """The Deployment Draft with ``saved_document``, written at
+    ``saved_path``, as its Saved baseline; the Draft keeps its own content
+    (OD-365: Save writes the Applied Deployment, never unapplied edits).
+    ``draft_document``, when given, is the Draft's new content (a Save into
+    another project folder rebases its sources)."""
+
+    retained = state.deployment_draft_session.retained_state()
+    if draft_document is not None and draft_document != retained["document"]:
+        retained.update(
+            draft_revision=retained["draft_revision"] + 1,
+            document=deepcopy(draft_document),
+        )
+    retained.update(saved_path=saved_path, saved_document=deepcopy(saved_document))
+    return state.deployment_draft_session.prepare_load_replacement(
+        retained, source_project_root=source_project_root
+    )
+
+
 def prepare_deployment_discard(
     state: ComposerState, draft_id: str, expected_revision: int
 ) -> tuple[Callable[[], None], Callable[[], bool]]:
@@ -511,43 +584,7 @@ def prepare_deployment_discard(
     Deployment Discard and the Scenario Discard commit it the same way.
     """
 
-    # Discard restores only the captured authoring input whose exact
-    # candidate was published by Manager and Program binding.
-    def read_applied() -> tuple[dict[str, Any], str]:
-        current_projection = state.published_scenario()
-        current = current_projection.get("published_scenario")
-        if current_projection.get("ready") is not True or not isinstance(
-            current, dict
-        ):
-            raise DeploymentDraftError(
-                "deployment_applied_unavailable",
-                "Deployment Discard requires one exact Manager Applied Scenario",
-                status_code=409,
-            )
-        if state.headless_client is None:
-            raise DeploymentDraftError(
-                "deployment_applied_unavailable",
-                "Deployment Discard requires the configured Manager",
-                status_code=503,
-            )
-        applied = state.applied_deployment_for_publication(current)
-        if applied is None:
-            raise DeploymentDraftError(
-                "deployment_applied_projection_mismatch",
-                "this Composer process has no exact Applied Deployment baseline",
-                status_code=409,
-            )
-        identity = raw_sha256_digest(
-            canonical_json_bytes(
-                {
-                    "scenario_id": current["scenario_id"],
-                    "deployment": applied,
-                }
-            )
-        )
-        return applied, identity
-
-    applied, applied_identity = read_applied()
+    applied, _root, applied_identity = read_applied_deployment(state)
     # The publication read and compilation stay outside owner locks.
     # Once admission is claimed, re-read its exact identity before the
     # local install; Manager publication is external to the workspace
@@ -557,7 +594,7 @@ def prepare_deployment_discard(
     )
 
     def validate_applied_unchanged() -> None:
-        _current, current_identity = read_applied()
+        _current, _root, current_identity = read_applied_deployment(state)
         if current_identity != applied_identity:
             raise DeploymentDraftError(
                 "deployment_applied_changed",
@@ -614,6 +651,61 @@ def assistant_profile_aliases() -> dict[str, Any]:
             }
             for row in sorted(profiles, key=lambda row: row["profile_id"])
         ],
+    }
+
+
+def _tool_declarations(
+    state: ComposerState, row: dict[str, Any]
+) -> dict[str, set[str]] | None:
+    """The command targets, frames and collision bodies a tool row declares:
+    from its parameters (a generated tool: its body target ``tool``, a
+    gripper target per jaw pair, its TCPs and collision bodies), else from
+    its model's catalog facts plus its custom TCPs. None when they cannot be
+    read (parameters that do not load, a model without facts)."""
+
+    parameters = row["model_source"].get("parameters")
+    if parameters is not None:
+        project = state.deployment_source_project_path
+        if not isinstance(project, str):
+            return None
+        try:
+            loaded, _folder = load_tool_parameters(
+                row["component_id"], parameters,
+                project_root=Path(project), paths=state.project_paths,
+            )
+        except (parametric_tool.ParametricToolError, ModelSourceCaptureError):
+            return None
+        semantics = parametric_tool.component_semantics(loaded)
+        return {
+            "commandTargets": {
+                "tool", *(target["command_target_id"] for target in semantics["gripper_targets"])
+            },
+            # Its TCPs and, on its body target, each spring slider (OD-371).
+            "frames": {tcp["id"] for tcp in semantics["tcps"]} | {
+                slider["collision_body_role_id"] for slider in semantics["spring_sliders"]
+            },
+            "collisionBodies": set(semantics["collision_bodies"]),
+        }
+    facts = profile_facts().get(row["component_profile_id"])
+    if facts is None:
+        return None
+    targets = [
+        *facts.get("frameTargets", []),
+        *facts.get("tcpTargets", []),
+        *facts.get("collisionBodyTargets", []),
+    ]
+    return {
+        "commandTargets": {target["commandTargetId"] for target in targets},
+        "frames": {
+            frame
+            for target in facts.get("frameTargets", [])
+            for frame in target["frameRoleIds"]
+        } | {tcp["tcp_id"] for tcp in row.get("custom_tcps", [])},
+        "collisionBodies": {
+            body
+            for target in facts.get("collisionBodyTargets", [])
+            for body in target["collisionBodyRoleIds"]
+        },
     }
 
 
@@ -789,6 +881,116 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         except Exception as error:
             _raise(error)
 
+    @router.post("/api/deployment/draft/components/remove")
+    def remove_component(body: RemoveComponentRequest) -> dict[str, Any]:
+        """Remove a component and the attachment rows that name it, in one edit
+        (a mounted tool and its mount row leave together)."""
+
+        try:
+            state.deployment_draft_session.require_current(
+                body.draft_id, body.expected_draft_revision
+            )
+            compiled = state.deployment_draft_session.preview_component_removal(
+                body.component_id,
+                draft_id=body.draft_id,
+                expected_revision=body.expected_draft_revision,
+            )
+            commit_draft_edit(
+                state,
+                body,
+                operation_kind="remove_deployment_component",
+                session="deployment",
+                install=lambda: state.deployment_draft_session.commit_compiled(
+                    compiled,
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ),
+            )
+            return _workspace(state)
+        except Exception as error:
+            _raise(error)
+
+    @router.post("/api/deployment/draft/components/replace-tool")
+    def replace_tool(body: ReplaceToolRequest) -> dict[str, Any]:
+        """Replace tool (OD-367): the replacement takes over the old tool's
+        mount and every reference to it in the Deployment and Program Drafts,
+        one Draft-only edit; the old tool leaves. Lists what the replacement
+        does not declare of what those references name."""
+
+        try:
+            deployment = state.deployment_draft_session
+            deployment.require_current(body.draft_id, body.expected_draft_revision)
+            compiled, used = deployment.preview_tool_replacement(
+                body.component_id,
+                body.replacement_component_id,
+                draft_id=body.draft_id,
+                expected_revision=body.expected_draft_revision,
+            )
+            program = state.draft_session
+            prepared = (
+                program.prepare_mutation(
+                    tool_id="program_draft_replace_component",
+                    arguments={
+                        "component_id": body.component_id,
+                        "replacement_component_id": body.replacement_component_id,
+                    },
+                    expected_revision=program.revision,
+                    catalog=state.node_catalog,
+                    draft_id=program.draft_id,
+                )
+                if program.program_loaded
+                else None
+            )
+            if prepared is not None:
+                for kind, ids in prepared.details["used"].items():
+                    used[kind].update(ids)
+
+            def validate() -> None:
+                deployment.require_current(body.draft_id, body.expected_draft_revision)
+                if prepared is not None:
+                    program.require_identity(prepared.draft_id, prepared.base_revision)
+
+            def install() -> bool:
+                changed = prepared is not None and program.install_prepared_mutation(prepared)
+                return deployment.commit_compiled(
+                    compiled,
+                    draft_id=body.draft_id,
+                    expected_revision=body.expected_draft_revision,
+                ) or changed
+
+            commit_draft_edit(
+                state,
+                body,
+                operation_kind="replace_deployment_tool",
+                # Both Drafts in one commit when the Program names the tool.
+                session="scenario" if prepared is not None and prepared.changed else "deployment",
+                validate=validate,
+                install=install,
+            )
+            row = next(
+                row for row in compiled.document["components"]
+                if row["component_id"] == body.replacement_component_id
+            )
+            declared = _tool_declarations(state, row)
+            return {
+                "schemaVersion": "manyforge.composer_tool_replacement.v1",
+                "workspace": _workspace(state),
+                "replacement": {
+                    "componentId": body.component_id,
+                    "replacementComponentId": body.replacement_component_id,
+                    "programReferences": (
+                        0 if prepared is None else len(prepared.details["references"])
+                    ),
+                    # What the rewritten references name and the new tool does
+                    # not declare; null when its declarations cannot be read.
+                    "lacks": None if declared is None else {
+                        kind: sorted(ids - declared[kind]) for kind, ids in used.items()
+                    },
+                },
+            }
+        except Exception as error:
+            _raise(error)
+
     @router.post("/api/deployment/draft/controlled-stop")
     def update_controlled_stop(body: UpdateControlledStopRequest) -> dict[str, Any]:
         try:
@@ -848,145 +1050,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             return _workspace(state)
         except Exception as error:
             _raise(error)
-
-    def save(body: SaveDeploymentRequest | SaveDeploymentAsRequest) -> dict[str, Any]:
-        """Persist one exact Deployment Draft and adopt it as the Saved baseline.
-
-        The capture, the write and the baseline adoption are three separate
-        steps: the write happens only after admission, under the local
-        authoring claim, so an admission refusal writes nothing; the adoption
-        is one composite commit fenced by the captured workspace identity.
-        One effect record decides both the HTTP outcome and the claim
-        settlement: Not saved, Saved but not adopted (naming the written
-        path), or unverified.
-        """
-
-        effects = OperationEffects()
-        try:
-            save_under_claim(body, effects)
-        except Exception as error:
-            raise_save_failure(
-                error,
-                effects,
-                _raise,
-                code="deployment_saved_baseline_not_adopted",
-                document="Deployment Draft",
-            )
-        # The Deployment workspace carries its own Draft-matched identity;
-        # the composite snapshot must not replace it (it breaks that contract).
-        try:
-            return _workspace(state)
-        except Exception as error:
-            _raise(error)
-
-    def save_under_claim(
-        body: SaveDeploymentRequest | SaveDeploymentAsRequest,
-        effects: OperationEffects,
-    ) -> None:
-        target = body.path if isinstance(body, SaveDeploymentAsRequest) else None
-        prepared = state.deployment_draft_session.prepare_save(
-            draft_id=body.draft_id,
-            expected_revision=body.expected_draft_revision,
-            target_path=(
-                normalize_deployment_save_path(target)
-                if target is not None
-                else None
-            ),
-            confirm_overwrite=(
-                body.confirm_overwrite
-                if isinstance(body, SaveDeploymentAsRequest)
-                else True
-            ),
-        )
-        project_path = state.authoring_workspace.snapshot().project["document_path"]
-        scenario_member = (
-            target is None and project_path is not None
-            and prepared.resolved_target == str(
-                Path(project_path) / SCENARIO_PROJECT_MEMBERS["deployment_draft"]
-            )
-        )
-        saved_path = prepared.resolved_target
-        source_root = state.deployment_draft_session.source_project_root
-
-        def write_artifact_under_claim() -> None:
-            nonlocal saved_path
-            # The adoption's fences, checked before the write: a stale
-            # Save is refused before any effect.
-            body.require_workspace_fence(state.authoring_workspace.identity())
-            state.deployment_draft_session.require_current(
-                prepared.draft_id, prepared.base_revision
-            )
-            # A prior completed write of this exact document is resolved
-            # without repeating it.
-            intended = prepared.canonical_json
-            if _published_deployment_canonical(state, prepared.target_path) == intended:
-                return
-            try:
-                saved_path = save_deployment_artifact(
-                    intended,
-                    prepared.target_path,
-                    allowed_roots=_write_roots(state),
-                    overwrite=prepared.overwrite,
-                )
-            except Exception:
-                # One atomic replacement: the target holds either its
-                # previous content (Not saved) or exactly this document.
-                if _published_deployment_canonical(
-                    state, prepared.target_path
-                ) == intended:
-                    effects.destination_published(saved_path)
-                raise
-            effects.destination_published(saved_path)
-
-        def prepare_saved_project() -> dict[str, Any]:
-            deployment = json.loads(prepared.canonical_json)
-            if source_root is not None and source_root != project_path:
-                try:
-                    deployment = rebase_deployment_intent_sources(
-                        deployment,
-                        source_project_root=Path(source_root),
-                        destination_project_root=Path(project_path),
-                    )
-                except DeploymentIntentError as error:
-                    raise DeploymentDraftError(
-                        "scenario_deployment_intent_invalid", str(error),
-                        status_code=400,
-                    ) from error
-            document, path, digest = save_scenario_member(
-                project_path, "deployment_draft", deployment,
-                allowed_roots=state.allowed_fs_roots, effects=effects,
-            )
-            return scenario_project_facts(
-                document, document_path=path, source_document_digest=digest
-            )
-
-        # Both forms are written under the claim, after admission: a
-        # Scenario member with its manifest, a standalone artifact as the
-        # under-claim step before the commit.
-        commit_local_authoring(
-            state,
-            body,
-            operation_kind=prepared.tool_id,
-            session="whole-workspace" if scenario_member else "deployment",
-            validate_under_claim=(
-                None if scenario_member else write_artifact_under_claim
-            ),
-            prepare_project_under_claim=(
-                prepare_saved_project if scenario_member else None
-            ),
-            install=lambda: state.deployment_draft_session.install_prepared_save(
-                prepared, saved_path=saved_path
-            ),
-            effects=effects,
-        )
-
-    @router.post("/api/deployment/save")
-    def save_draft(body: SaveDeploymentRequest) -> dict[str, Any]:
-        return save(body)
-
-    @router.post("/api/deployment/save-as")
-    def save_draft_as(body: SaveDeploymentAsRequest) -> dict[str, Any]:
-        return save(body)
 
     @router.post("/api/deployment/discard")
     def discard(body: DiscardDeploymentRequest) -> dict[str, Any]:
@@ -1049,6 +1112,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             )
         identity_at_request = state.authoring_workspace.identity()
         source_closure = _capture_model_sources(state, saved)
+        scene_mesh_closure = _capture_scene_meshes(program, state, project_path)
         captured_input_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
@@ -1058,6 +1122,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "deployment": saved,
                     "model_source_closure": source_closure,
                     "program": program,
+                    "scene_mesh_closure": scene_mesh_closure,
                 }
             )
         )
@@ -1078,6 +1143,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "source_document_digest": source_document_digest,
             "captured_input_digest": captured_input_digest,
             "model_source_closure": source_closure,
+            "scene_mesh_closure": scene_mesh_closure,
             "program": deepcopy(program),
             "deployment": deepcopy(saved),
             "expected_manager_current": {
@@ -1216,7 +1282,10 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             try:
                 with apply_slot():
                     require_activation_scope(state, body.scope)
-                    return orchestrated_apply(revert_ports(server_deployment_fence(state)))
+                    return orchestrated_apply(
+                        revert_ports(server_deployment_fence(state)),
+                        body.confirmed_collision_rule_ids,
+                    )
             except Exception as error:
                 _raise(error)
 
@@ -1295,6 +1364,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             )
         deployment = with_defaults(deployment)
         source_closure = _capture_model_sources(state, deployment)
+        scene_mesh_closure = _capture_scene_meshes(program, state, project_path)
         if apply or refuse_unchanged:
             # Nothing to apply: every input already is the Manager's Applied
             # activation. Refused before admission, so no effect is possible.
@@ -1315,6 +1385,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 applied_context is not None
                 and applied_context.get("deployment") == deployment
                 and applied_context.get("model_source_closure") == source_closure
+                and applied_context.get("scene_mesh_closure") == scene_mesh_closure
                 and applied_context.get("source_document_digest") == source_document_digest
                 and applied_context.get("scenario_id") == scenario_id
                 and applied_context.get("scenario_project_path") == project_path
@@ -1342,6 +1413,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     "deployment": deployment,
                     "model_source_closure": source_closure,
                     "program": program,
+                    "scene_mesh_closure": scene_mesh_closure,
                 }
             )
         )
@@ -1361,6 +1433,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "source_document_digest": source_document_digest,
             "captured_input_digest": captured_input_digest,
             "model_source_closure": source_closure,
+            "scene_mesh_closure": scene_mesh_closure,
             "deployment": deepcopy(deployment),
             "program": deepcopy(program),
             "expected_manager_current": {
@@ -1529,7 +1602,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     # Nothing to apply is refused before any effect, a finished
                     # run's Reset included.
                     ports.refuse_unchanged()
-                    return orchestrated_apply(ports)
+                    return orchestrated_apply(ports, body.confirmed_collision_rule_ids)
             except Exception as error:
                 _raise(error)
 
@@ -1586,14 +1659,21 @@ def manager_apply_failure(failure: dict[str, Any], terminal: str) -> ApplyStepFa
     )
 
 
-def orchestrated_apply(ports: Any) -> dict[str, Any]:
+def orchestrated_apply(
+    ports: Any, confirmed_collision_rule_ids: list[str] | None = None
+) -> dict[str, Any]:
     """Run one orchestrated Apply; a refusal before any effect is a 409.
 
     The caller holds the Apply slot (:func:`apply_slot`).
+    ``confirmed_collision_rule_ids`` as in :func:`run_apply`.
     """
 
     try:
-        return run_apply(ports, error_code=_error_text)
+        return run_apply(
+            ports,
+            error_code=_error_text,
+            confirmed_collision_rule_ids=confirmed_collision_rule_ids,
+        )
     except ApplyRefused as refusal:
         raise refused_before_effect(
             409, {"code": refusal.code, "message": str(refusal)}

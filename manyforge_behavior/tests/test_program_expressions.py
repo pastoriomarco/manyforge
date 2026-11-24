@@ -80,11 +80,9 @@ def _base_program_document() -> dict[str, Any]:
     # Construct the v3 document explicitly: historical role assignments are
     # deliberately not converted into direct references.
     return {
-        "api_version": "manyforge.program.v3",
-        "program_id": "expression_fixture",
+        "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "0" * 64,
         "program_profile": "composable-cell-v1",
-        "name": "Expression fixture",
         "catalog": {"api_version": "manyforge.node_catalog.v3", "content_version": _catalog().content_version},
         "parameters": [],
     }
@@ -121,7 +119,7 @@ def _program(
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, _catalog())
 
@@ -419,7 +417,7 @@ def _conformance_program(case: dict[str, Any]) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, _catalog())
 
@@ -475,7 +473,7 @@ def _pose_conformance_program(case: dict[str, Any]) -> Program:
         document,
         own_field="program_revision",
         identity_domain="program-revision",
-        api_version="manyforge.program.v3",
+        api_version="manyforge.program.v4",
     )
     return Program.from_dict(document, _catalog())
 

@@ -1,0 +1,28 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md). Check with
+# `scripts/manyforge component check manyforge_example_models/models/passive_tool`.
+# The generic passive tool (OD-336): a mount frame and a TCP frame, an
+# optional tip, no joints, groups, gripper or controller, so it names no lane
+# and runs on every lane.
+# Mounts on a robot's `flange` interface as its own component. This folder's
+# model is a neutral placeholder; a project supplies its own tool through the
+# Deployment row's `model_source`: a parameter file (`parameters`, OD-352) or
+# its own URDF, meshes and TCP (README.md).
+api_version: manyforge.component_package.v2
+kind: tool
+id: manyforge.passive_tool
+version: 1.0.0
+title: Tool from your URDF (passive)
+license: Apache-2.0
+model:
+  urdf: passive_tool.urdf
+  srdf: passive_tool.srdf
+  package_name: passive_tool       # this folder is the package: mesh URIs package://passive_tool/...
+mount:
+  frame: passive_tool_mount        # the URDF root link, on the robot flange
+tcps:                              # the default TCP
+  - {id: tcp, frame: passive_tool_tcp, contact_bodies: [tip]}   # the tip may touch under a contact rule
+roles:
+  collision_bodies:
+    tip: [passive_tool_tip]        # a probe tip: the default TCP's contact body
+  optional_collision_bodies: [tip] # a model without the link leaves it unbound
+lanes: {}                          # no controller on any lane: its components name no lane

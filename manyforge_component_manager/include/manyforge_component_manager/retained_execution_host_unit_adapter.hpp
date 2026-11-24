@@ -91,10 +91,10 @@ struct ExecutionHostExitDTO final {
 /// authorization. A child is staged-ready only after its direct status report
 /// matches the verified retained product and reports a closed command surface.
 ///
-/// `scene_asset_root`, when non-empty, is the approved root for relative
-/// Program scene meshes. It is opened once here, kept for the adapter's
-/// lifetime, and passed to every child as an inherited directory descriptor;
-/// it is never a retained package root.
+/// `activation_root`, when non-empty, is also every child's scene-content
+/// root: a duplicate of its descriptor is inherited as FD 9, from whose
+/// raw-artifact store scene meshes are read by content digest. Without an
+/// activation root no FD 9 is passed and scene meshes fail closed.
 ///
 /// `site_settings_document`, when supplied, is the Manager-validated generic
 /// machine site document (`manyforge.site.v2`). It is captured once into a
@@ -121,7 +121,6 @@ public:
           &artifact_source,
       std::string operating_system, std::string launch_environment_contract,
       std::filesystem::path activation_root = {},
-      std::filesystem::path scene_asset_root = {},
       std::optional<std::string> site_settings_document = std::nullopt,
       std::function<manyforge::core::ActiveBundlePublicationReceiptDTO()>
           active_publication = {});
@@ -138,7 +137,6 @@ public:
       std::string operating_system,
       std::vector<std::string> launch_environment_contracts,
       std::filesystem::path activation_root = {},
-      std::filesystem::path scene_asset_root = {},
       std::optional<std::string> site_settings_document = std::nullopt,
       // The Manager's current publication; every fence request but Release
       // carries it to the host.

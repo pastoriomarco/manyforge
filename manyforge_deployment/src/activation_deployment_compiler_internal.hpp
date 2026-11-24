@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -57,5 +58,20 @@ namespace manyforge::deployment::detail {
 [[nodiscard]] std::optional<core::ComponentDefaultTcpDTO> compiled_default_tcp(
     const ActivationDeploymentComponent &component,
     const core::ComponentTypeDTO &type);
+
+/// Source link names (sorted, unique) of the grip body of one command target:
+/// the collision body `type` names as that target's `grip_body_role_id`, as
+/// the model asset binds it. Empty when the target names no grip body.
+[[nodiscard]] std::vector<std::string> grip_body_links(
+    const core::ComponentTypeDTO &type, const core::ModelAssetDTO &asset,
+    std::string_view command_target_id);
+
+/// The same for a component row: its type is found in `component_types` by
+/// the type id its profile and authored gripper target select.
+[[nodiscard]] std::vector<std::string> activation_grip_body_links(
+    const ActivationDeploymentComponent &component,
+    const ActivationComponentProfile &profile,
+    const ActivationPreparedModel &model, std::string_view command_target_id,
+    std::span<const QualifiedComponentType> component_types);
 
 } // namespace manyforge::deployment::detail
