@@ -1,6 +1,6 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ExecutionHistoryPanel,
   HISTORY_FOLLOW_INTERVAL_MS,
@@ -9,10 +9,13 @@ import {
   historyRawEvent,
   historyStartOptions,
   historyRunEnd,
+  historyLocalText,
   historyTimeline,
   historyUtcText,
   type ExecutionHistoryEventView,
 } from './ExecutionHistoryPanel';
+
+afterEach(() => vi.unstubAllEnvs());
 import type { HistorianDetail } from '../types/headless';
 
 const CURRENT_START = '3f9a000000000001';
@@ -150,7 +153,9 @@ describe('execution history filtering', () => {
     // Once a start's last row is loaded its label shows that row's time;
     // before, or when its read failed (nothing recorded), the fallback stays.
     const lastNs = '1785931200000000000';
-    const time = new Date(Number(BigInt(lastNs) / 1_000_000n)).toLocaleString();
+    // The browser's local time (UTC+05:30 here) with milliseconds.
+    vi.stubEnv('TZ', 'Asia/Kolkata');
+    const time = '2026-08-05 17:30:00.000';
     expect(historyStartOptions(CURRENT_START, [newer, EARLIER_START], { [newer]: lastNs, [EARLIER_START]: null })
       .map((option) => option.label)).toEqual([
       'Current start',
@@ -320,15 +325,20 @@ describe('execution history filtering', () => {
     },
   });
 
-  it('shows a row time with its date, milliseconds and UTC', () => {
-    // 2026-11-24T10:00:00.123Z
+  it('shows a row time in local time with its date and milliseconds, UTC in the tooltip', () => {
+    // 2026-11-24T10:00:00.123Z; the browser's local time is UTC+05:30.
+    vi.stubEnv('TZ', 'Asia/Kolkata');
     const utcNs = '1795514400123456789';
     expect(historyUtcText(utcNs)).toBe('2026-11-24 10:00:00.123 UTC');
+    expect(historyLocalText(utcNs)).toBe('2026-11-24 15:30:00.123');
     const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
       open: true, onClose: vi.fn(),
-      events: [{ id: 't', timestampNs: '1', timestampUtcNs: utcNs, channel: 'c', message: 'Timed', type: 'x' }],
+      events: [{ id: 't', timestampNs: '1', timestampUtcNs: utcNs, timestamp: '2026-11-24T10:00:00.123456789Z',
+        channel: 'c', message: 'Timed', type: 'x' }],
     }));
-    expect(markup).toContain('2026-11-24 10:00:00.123 UTC</time>');
+    expect(markup).toContain(
+      '<time title="2026-11-24 10:00:00.123 UTC\nOriginal recorded wall time: 2026-11-24T10:00:00.123456789Z">'
+      + '2026-11-24 15:30:00.123</time>');
   });
 
   it('sends a node attempt filter as its number and refuses other text', () => {
@@ -405,11 +415,12 @@ describe('execution history filtering', () => {
     expect(historyTimeline(page).map(({ event, sincePreviousMs }) => [event.id, sincePreviousMs])).toEqual([
       ['run started', null], ['late attempt', 500], ['run finished', 500], ['no time', null],
     ]);
+    vi.stubEnv('TZ', 'Asia/Kolkata');
     const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
       open: true, onClose: vi.fn(), events: page, timelineRunId: 3,
     }));
     expect(markup).toContain('<summary>Run 3 timeline · this page, oldest first</summary>');
-    expect(markup).toContain('>10:00:00.500</time>');
+    expect(markup).toContain('<time title="2026-11-24 10:00:00.500 UTC">15:30:00.500</time>');
     expect(markup).toContain('+0.500 s');
     expect(markup).toContain('<small>program run started</small>');
     expect(renderToStaticMarkup(createElement(ExecutionHistoryPanel, {

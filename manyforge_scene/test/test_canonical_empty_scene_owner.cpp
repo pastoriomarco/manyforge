@@ -1160,6 +1160,87 @@ TEST(LogicalSceneTransactionCodec, ObjectMassIsAbsentAtZeroAndPositiveWhenPresen
   }
 }
 
+// OD-400: the HTTP caller rides in the Manager command's request context
+// only; the stored and the digested forms never carry it.
+TEST(LogicalSceneTransactionCodec,
+     HttpCallerRoundTripsInTheRequestContextOutsideDigestAndStore) {
+  const ProjectionRevisionDTO expected{
+      core::RetainedBundleId(Digest('b').value()),
+      GraphRevision(Digest('c').value()),
+      core::SceneRevision{core::SceneId(Digest('d').value()), 1U, Digest('a')},
+  };
+  const auto plain = AddBoxRequest(expected, CellId("cell-a"));
+  auto request = plain;
+  request.request_id = "req-1.a_B-9";
+  request.request_transport = "mcp";
+  const auto encoded = EncodeCanonicalSceneTransactionRequest(request);
+  const auto context = content_identity::canonical_json(
+      *content_identity::parse_canonical_json(encoded).find_object_member(
+          "request_context"));
+  EXPECT_NE(context.find(R"("request_id":"req-1.a_B-9")"), std::string::npos)
+      << context;
+  EXPECT_NE(context.find(R"("transport":"mcp")"), std::string::npos)
+      << context;
+  const auto decoded = DecodeCanonicalSceneTransactionRequest(encoded);
+  EXPECT_EQ(decoded.request_id, request.request_id);
+  EXPECT_EQ(decoded.request_transport, request.request_transport);
+  EXPECT_EQ(EncodeCanonicalSceneTransactionRequest(decoded), encoded);
+  // Either alone, or neither.
+  auto only_id = plain;
+  only_id.request_id = "r";
+  const auto decoded_id = DecodeCanonicalSceneTransactionRequest(
+      EncodeCanonicalSceneTransactionRequest(only_id));
+  EXPECT_EQ(decoded_id.request_id, std::optional<std::string>("r"));
+  EXPECT_FALSE(decoded_id.request_transport.has_value());
+  const auto decoded_plain = DecodeCanonicalSceneTransactionRequest(
+      EncodeCanonicalSceneTransactionRequest(plain));
+  EXPECT_FALSE(decoded_plain.request_id.has_value());
+  EXPECT_FALSE(decoded_plain.request_transport.has_value());
+  EXPECT_EQ(EncodeCanonicalSceneTransactionRequest(plain),
+            logical_scene_codec_internal::EncodeRequest(plain));
+
+  // Not in the stored form, not in the digest input: two requests that
+  // differ only in their caller are the same request.
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(request),
+            logical_scene_codec_internal::EncodeRequest(plain));
+  auto other = request;
+  other.request_id = "req-2";
+  other.request_transport = "http";
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequestDigestInput(other),
+            logical_scene_codec_internal::EncodeRequestDigestInput(request));
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequestDigestInput(request),
+            logical_scene_codec_internal::EncodeRequestDigestInput(plain));
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequestDigestInput(request)
+                .find("req-1.a_B-9"),
+            std::string::npos);
+
+  // An invalid caller is refused.
+  const auto refused = [&](const std::string &from, const std::string &to) {
+    auto text = encoded;
+    const auto at = text.find(from);
+    ASSERT_NE(at, std::string::npos) << from;
+    text.replace(at, from.size(), to);
+    EXPECT_THROW(DecodeCanonicalSceneTransactionRequest(text),
+                 std::invalid_argument)
+        << text;
+  };
+  refused(R"("request_id":"req-1.a_B-9")", R"("request_id":"")");
+  refused(R"("request_id":"req-1.a_B-9")", R"("request_id":"req 1")");
+  refused(R"("request_id":"req-1.a_B-9")", R"("request_id":"req/1")");
+  refused(R"("request_id":"req-1.a_B-9")",
+          "\"request_id\":\"" + std::string(65U, 'a') + "\"");
+  refused(R"("request_id":"req-1.a_B-9")", R"("request_id":7)");
+  refused(R"("transport":"mcp")", R"("transport":"grpc")");
+  refused(R"("transport":"mcp")", R"("transport":null)");
+  // 64 characters are accepted.
+  auto longest = plain;
+  longest.request_id = std::string(64U, 'a');
+  EXPECT_EQ(DecodeCanonicalSceneTransactionRequest(
+                EncodeCanonicalSceneTransactionRequest(longest))
+                .request_id,
+            longest.request_id);
+}
+
 TEST(LogicalSceneTransactionCodec,
      MeshContentDigestIsOptionalInRequestsAndAbsentFromTheDigestInput) {
   const ProjectionRevisionDTO expected{

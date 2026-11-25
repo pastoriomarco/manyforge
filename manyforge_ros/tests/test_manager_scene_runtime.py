@@ -19,7 +19,7 @@ from manyforge_ros.manager_scene_runtime import (
 )
 
 
-MANAGER_COMMAND_VERSION = "manyforge.manager_command.v2"
+MANAGER_COMMAND_VERSION = "manyforge.manager_command.v4"
 MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v3"
 
 

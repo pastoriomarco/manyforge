@@ -101,7 +101,7 @@ class PinnedRunRoot {
 /// Which owner protocol an exchange speaks (bounds, error codes).
 enum class OwnerProtocol {
   kExecutionHost,  ///< manyforge.execution_command.v4
-  kManager,        ///< manyforge.manager_command.v2 / _response.v3
+  kManager,        ///< manyforge.manager_command.v4 / _response.v3
 };
 
 inline constexpr std::string_view kExecutionCommandApiVersion =
@@ -114,7 +114,7 @@ inline constexpr std::string_view kExecutionResponseApiVersion =
 inline constexpr std::string_view kCellAdmissionResponseApiVersion =
     "manyforge.execution_command_response.v5";
 inline constexpr std::string_view kManagerCommandApiVersion =
-    "manyforge.manager_command.v2";
+    "manyforge.manager_command.v4";
 inline constexpr std::string_view kManagerResponseApiVersion =
     "manyforge.manager_command_response.v3";
 inline constexpr std::size_t kMaximumExecutionPacketBytes = 1024U * 1024U;
@@ -242,10 +242,15 @@ class Gateway {
   /// `manager.commit_scene_transaction` sent (transport `http`, whatever the
   /// gateway's own attribution; an internal gateway has no principal), the
   /// exchange.
+  /// `request_id` and `transport`: the HTTP request that asked for it,
+  /// carried in its `request_context` for History's caller (OD-400); any the
+  /// body names are replaced.
   /// Returns the Manager's reply (ok true or false) unchanged.
   [[nodiscard]] CanonicalValue SceneCommit(
       CanonicalValue::Object transaction,
-      std::optional<std::string> principal_id = {}) const;
+      std::optional<std::string> principal_id = {},
+      std::optional<std::string> request_id = {},
+      std::optional<std::string> transport = {}) const;
 
   [[nodiscard]] const GatewayConfig &config() const noexcept { return config_; }
 

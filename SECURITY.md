@@ -33,9 +33,9 @@ Only the latest 0.x line receives security fixes at this stage:
 
 | Version | Supported                              |
 | ------- | -------------------------------------- |
-| 0.3.x   | ✅ Yes                                 |
-| 0.2.x   | Critical fixes only, until 0.4 ships   |
-| < 0.2   | ❌ No                                  |
+| 0.4.x   | ✅ Yes                                 |
+| 0.3.x   | Critical fixes only, until 0.5 ships   |
+| < 0.3   | ❌ No                                  |
 
 When a new minor version ships, the previous one continues to receive
 critical security fixes for one minor version cycle.

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { api } from '../api/client';
+import { localText, utcText } from '../state/componentPresentation';
 import { errorMessage } from '../state/structuralResource';
 import type {
   HistorianCapture,
@@ -16,10 +17,11 @@ const UNCERTAINTY_TEXT: Record<HistorianCaptureUncertainty, string> = {
   tail_interrupted_by_restart: 'a restart ended it before its tail completed',
 };
 
-function utcText(nanoseconds: string | null): string {
-  return nanoseconds === null
-    ? 'time unavailable'
-    : new Date(Number(BigInt(nanoseconds) / 1_000_000n)).toISOString();
+/** A capture time in local time, UTC in the tooltip. */
+function CaptureTime({ utcNs }: { utcNs: string | null }) {
+  return utcNs === null
+    ? <>time unavailable</>
+    : <time title={utcText(utcNs)}>{localText(utcNs)}</time>;
 }
 
 /** One bounded page of events, bound to the capture it was read for. */
@@ -157,7 +159,7 @@ export function FailureCapturePanel({ open }: { open: boolean }) {
               {capture.trigger?.message ?? capture.trigger?.eventType ?? `Event ${capture.triggerSequence}`}
             </strong>
             {' · '}{capture.trigger?.conditionSeverity ?? 'ERROR'}
-            {' · '}{utcText(capture.openedAtUtcNs)}
+            {' · '}<CaptureTime utcNs={capture.openedAtUtcNs} />
           </p>
           <p className="muted">
             Capture {capture.captureId}: {captureStateText(capture)}; events {capture.firstSequence}–{capture.lastSequence}

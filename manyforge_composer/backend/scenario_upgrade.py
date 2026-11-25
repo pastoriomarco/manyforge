@@ -16,10 +16,14 @@ converter scripts' own conversions, in their order:
    Deployment in the current format, so it runs second.
 
 The check converts in memory and writes nothing. An upgrade copies the
-project folder next to it, converts the copy, then swaps the two folders: the
-original becomes the backup ``<name>.scenario.before-<version>-<UTC time>``
-and the converted copy takes its name. Until the swap the original is
-untouched; a conversion that fails removes the copy and is refused with
+project folder next to it, converts the copy, then swaps the two folders in
+one step (Linux ``renameat2`` with ``RENAME_EXCHANGE``; where the kernel or
+file system cannot, the upgrade is refused with
+``scenario_artifact_write_failed`` and nothing changes): the converted copy
+takes the Scenario's name, and the original, now at the copy's hidden name, is
+then renamed to the backup ``<name>.scenario.before-<version>-<UTC time>``.
+A crash between the two steps leaves the converted Scenario in place and the
+original at the hidden name. Until the swap the original is untouched; a conversion that fails removes the copy and is refused with
 ``scenario_upgrade_conversion_failed``, naming what could not be converted.
 Each upgrade keeps exactly one backup. A Scenario already in the current
 format is left alone and gets none, so repeating a request (the same
@@ -28,6 +32,8 @@ format is left alone and gets none, so repeating a request (the same
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import logging
 import os
 from pathlib import Path
@@ -153,6 +159,26 @@ def check_scenario_upgrade(
     return _reply(project, "available" if conversions else "current", conversions, version)
 
 
+_AT_FDCWD = -100
+_RENAME_EXCHANGE = 2
+_RENAMEAT2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+if _RENAMEAT2 is not None:
+    _RENAMEAT2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                           ctypes.c_uint]
+    _RENAMEAT2.restype = ctypes.c_int
+
+
+def _exchange(first: Path, second: Path) -> None:
+    """Swap two paths in one step (``renameat2(RENAME_EXCHANGE)``)."""
+
+    if _RENAMEAT2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is not available in the C library")
+    if _RENAMEAT2(_AT_FDCWD, os.fsencode(first), _AT_FDCWD, os.fsencode(second),
+                  _RENAME_EXCHANGE) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(first), None, str(second))
+
+
 def _write_failed(project: Path, message: str, error: OSError) -> NoReturn:
     raise sa.ScenarioArtifactError(
         "scenario_artifact_write_failed", f"{project}: {message}: {error}",
@@ -174,6 +200,7 @@ def upgrade_scenario(
     if not conversions:
         return _reply(project, "current", [], version)
     stage = project.with_name(f".{project.name}.upgrade-{uuid.uuid4().hex}")
+    exchanged = False
     try:
         try:
             shutil.copytree(project, stage, symlinks=True)
@@ -194,22 +221,20 @@ def upgrade_scenario(
             os.close(stage_fd)
         backup = _backup_path(project, version)
         try:
-            os.rename(project, backup)
+            _exchange(stage, project)
         except OSError as error:
-            _write_failed(project, "the Scenario could not be moved to its backup; it "
-                          "is unchanged", error)
-        try:
-            os.rename(stage, project)
-        except OSError as error:
-            try:
-                os.rename(backup, project)
-            except OSError:
-                _write_failed(project, f"the upgraded copy could not take the Scenario's "
-                              f"place; the original is kept at {backup}", error)
             _write_failed(project, "the upgraded copy could not take the Scenario's "
                           "place; the Scenario is unchanged", error)
+        # The original is now at the copy's hidden name.
+        exchanged = True
+        try:
+            os.rename(stage, backup)
+        except OSError as error:
+            _write_failed(project, f"the Scenario is upgraded, but its original could "
+                          f"not be moved to its backup; it is kept at {stage}", error)
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
+        if not exchanged:
+            shutil.rmtree(stage, ignore_errors=True)
     parent_fd = os.open(project.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
         os.fsync(parent_fd)

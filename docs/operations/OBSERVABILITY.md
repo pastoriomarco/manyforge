@@ -22,7 +22,7 @@ component's bridge also writes a JSONL audit file.
   `docker logs --timestamps --tail 200 manyforge-development-workbench` (or
   the `MANYFORGE_DEV_CONTAINER_NAME` you set); `--timestamps` prefixes each
   line with the UTC time Docker received it, which matches History's UTC
-  times. Docker rotates it at 50 MB × 3 files. `./scripts/compose-dev.sh stop`
+  times (shown in the History rows' tooltips). Docker rotates it at 50 MB × 3 files. `./scripts/compose-dev.sh stop`
   keeps the last 10 MB, with those times, under the runtime root's `evidence/`
   (see [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)).
 - **Python process format** (Composer, Headless API, Program runner): one
@@ -272,7 +272,8 @@ the previous start's `application_start_id` shows that operation's own events
 and the report that lists it as unfinished.
 
 History also records what was asked of the components and the cell, once per
-terminal, with the typed error code and message:
+terminal, with the typed error code and message (each payload's
+`schema_version` is `manyforge.activity_event.v2`):
 
 - `component_action_finished` — one per component action (Prepare, Enable,
   Disable, Recover, Reset position, Power off, Reboot, Sim reset), whoever
@@ -321,29 +322,40 @@ terminal, with the typed error code and message:
   `Node pick_1 (motion.move_to_pose) failed: <code>: <message> · run 3 attempt 12 · 1.24 s`,
   with `· add object box_1` for a scene node.
 - `scene_change_finished` — one per scene change made outside a Program node
-  through `POST /api/scene/transactions` (component `manyforge.scene`):
-  Composer, the assistant, MCP, any HTTP caller, and the Program runner's own
-  changes (initial-scene preparation, a Program Reset's scene reload, the
-  scene clear of an empty Apply; `source_label`
-  `manyforge.behavior.program_scene` for the runner's, which commits them at
-  the Manager and records them through
-  `POST /api/execution/history/scene-changes`). A Program node's
-  scene change is in its `program_node_attempt_finished` event, and a request
-  sent again that is answered with its first result records nothing again. The payload has `subject` (the operation:
-  `add_object`, `upsert_object`, `remove_object`, `update_object_pose`,
-  `attach_carried_object`, `detach_carried_object`,
+  (component `manyforge.scene`), whoever made it: Composer, the assistant,
+  MCP, any HTTP caller of `POST /api/scene/transactions`, the Program
+  runner's own changes (initial-scene preparation, a Program Reset's scene
+  reload, the scene clear of an empty Apply; `source_label`
+  `manyforge.behavior.program_scene`) and the execution host's. Headless
+  records each from the Manager's status stream, which carries every scene
+  commit outcome the Manager decided, so an event lands shortly after the
+  change's answer, not before it. A Program node's scene change is in its
+  `program_node_attempt_finished` event, and a request sent again that is
+  answered with its first result records nothing again. The payload has
+  `subject` (the operation: `add_object`, `upsert_object`, `remove_object`,
+  `update_object_pose`, `attach_carried_object`, `detach_carried_object`,
   `detach_carried_object_at_current_pose`, `set_collision_policy`),
-  `outcome` (`succeeded`, `refused` by the scene owner, `unknown` when the
-  owner could not tell whether its view of the scene changed, `failed` when
-  Headless could not complete the request, for example when the owner did not
-  answer or an added object's mesh could not be read), `error` (with the
-  owner's `details` when they fit 2 KiB), and
-  `scene_change`: `scene_resource_id` (null for an operation without an
-  object), `source_label` and `principal_id` of the caller, `duration_ms` in
-  Headless until the owner's answer, and `scene_revision_id` committed (null
-  unless succeeded). Severity: INFO on success, WARN when refused, ERROR when
-  failed or unknown. The line reads like
-  `Scene add object box_1 succeeded · composer_ui · 12 ms`.
+  `outcome` (`succeeded`, `refused` by the scene owner or the Manager,
+  `unknown` when the owner could not tell whether its view of the scene
+  changed, `failed` when Headless could not complete the request without an
+  answer from the Manager, for example when the Manager did not answer or an
+  added object's mesh could not be read), `error` (with the owner's
+  `details` when they fit 2 KiB), `caller` (request id and transport of an
+  HTTP or MCP request, `source_label`, `principal_id`) and `scene_change`:
+  `scene_resource_id` (null for an operation without an object),
+  `source_label` and `principal_id` of the caller, `duration_ms` the
+  Manager took to commit it (for a `failed` change, the time in Headless),
+  `scene_revision_id` committed (null unless succeeded), and
+  `manager_start_id` and `sequence`, the change's number in that Manager
+  start (null for a `failed` change). Severity: INFO on success, WARN when
+  refused, ERROR when failed or unknown. The line reads like
+  `Scene add object box_1 succeeded · composer_ui · 12 ms`. The Manager
+  keeps its last 32 outcomes; changes Headless could not read before they
+  left (Headless busy or restarting) are one `historian_records_lost` event
+  with subject `manager_scene_changes` and their `lost_count`. After a
+  Headless restart it goes on after the last change History holds. If the
+  Manager's answer is lost on its way to Headless after it committed, the
+  change is recorded `failed` by Headless and `succeeded` from the stream.
 
 - `command_finished` — one per operator command at its answer (component
   `manyforge.headless`): Execute, motion start and stop, resume, resume or
@@ -404,7 +416,10 @@ or `mcp` for a request made through Composer's MCP adapter), `source_label`
 and `principal_id`. A runtime-collision event's line names the bodies, like
 `... (lite6_link5 <-> fixture_box)`.
 
-In Composer's History panel row times show the UTC date and milliseconds; a
+In Composer's History panel row times show the browser's local date and
+time with milliseconds, and the full UTC time in their tooltip; History stores
+and exports UTC, and the recorded event's JSON keeps it. A component fault's
+start, a failure capture and a recent notice show local time the same way. A
 selected row shows the recorded event as JSON with Copy, and its ids as
 "Set filter" buttons; Follow reads the newest page every 2 s while the panel
 is visible; a page filtered to one Program run also shows the run's timeline,

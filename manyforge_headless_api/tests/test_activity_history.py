@@ -316,69 +316,6 @@ def test_a_program_reset_outcome_is_recorded_through_the_route() -> None:
         "Program reset failed: program_cycle_recovery_required: scene owner lost · run 7")
 
 
-# Program Runner scene changes outside a node (OD-375) ----------------------------
-
-
-def _runner_scene_change(**changes: Any) -> dict[str, Any]:
-    return {
-        "application_start_id": _APPLICATION_START_ID,
-        "operation_kind": "remove_object", "outcome": "succeeded", "error": None,
-        "scene_change": {"scene_resource_id": "part.1",
-                         "source_label": "manyforge.behavior.program_scene",
-                         "duration_ms": 2.5, "scene_revision_id": 4},
-        **changes,
-    }
-
-
-def test_a_runner_scene_change_is_recorded_as_its_scene_route_recorded_it() -> None:
-    core = _ActivityCore()
-    service = _service(core, FakeManager(), _ModelExecution(_reply()),
-                       program_runner=FakeProgramRunner(active=False))
-    refused_error = {"code": "missing_reference", "message": "carrier unavailable",
-                     "details": {"reason": "carrier"}}
-    detach = {"scene_resource_id": None, "source_label": "manyforge.behavior.program_scene",
-              "duration_ms": 1.0, "scene_revision_id": None}
-    invalid = [
-        _runner_scene_change(outcome="accepted"),
-        _runner_scene_change(operation_kind="scene_clear"),
-        _runner_scene_change(scene_change={**detach, "duration_ms": -1.0}),
-        _runner_scene_change(scene_change={**detach, "scene_revision_id": 0}),
-        _runner_scene_change(scene_change={**detach, "principal_id": "operator.7"}),
-        _runner_scene_change(error={"code": ""}),
-        {**_runner_scene_change(), "extra": 1},
-    ]
-    with TestClient(create_app(service=service)) as client:
-        succeeded = client.post("/api/execution/history/scene-changes",
-                                json=_runner_scene_change())
-        refused = client.post("/api/execution/history/scene-changes", json=_runner_scene_change(
-            operation_kind="detach_carried_object", outcome="refused", error=refused_error,
-            scene_change=detach))
-        bad = [client.post("/api/execution/history/scene-changes", json=body) for body in invalid]
-        no_start = client.post("/api/execution/history/scene-changes",
-                               json=_runner_scene_change(application_start_id=None))
-        other_start = client.post("/api/execution/history/scene-changes",
-                                  json=_runner_scene_change(application_start_id="0bad0000000000b2"))
-    assert succeeded.status_code == 200 and succeeded.json() == {"recorded": True}
-    assert refused.status_code == 200
-    assert {response.status_code for response in bad} == {422}
-    assert no_start.json()["detail"]["code"] == "start_identity_required"
-    assert other_start.json()["detail"]["code"] == "stale_application_start_id"
-    # The same records Headless's scene route wrote for these commits, each
-    # naming its caller: the runner's request and its source label.
-    callers = [record.pop("caller") for record in core.activity]
-    assert [{name: value for name, value in named.items() if name != "request_id"}
-            for named in callers] == [
-        {"transport": "http", "source_label": "manyforge.behavior.program_scene"}] * 2
-    assert all(named["request_id"] for named in callers)
-    assert core.activity == [
-        scene_change_record("remove_object", "succeeded", None, {
-            "scene_resource_id": "part.1", "source_label": "manyforge.behavior.program_scene",
-            "principal_id": None, "duration_ms": 2.5, "scene_revision_id": 4}),
-        scene_change_record("detach_carried_object", "refused", refused_error,
-                            {**detach, "principal_id": None}),
-    ]
-
-
 # Program node attempts from the Program Runner (OD-375) ---------------------------
 
 
@@ -501,7 +438,8 @@ def test_a_lost_node_attempt_line_is_not_counted_and_never_fails_the_route() -> 
 def test_a_scene_change_record_names_object_caller_and_time() -> None:
     record = scene_change_record("add_object", "succeeded", None, {
         "scene_resource_id": "box_1", "source_label": "composer_ui",
-        "principal_id": None, "duration_ms": 12.3, "scene_revision_id": 4})
+        "principal_id": None, "duration_ms": 12.3, "scene_revision_id": 4,
+        "manager_start_id": "0123456789abcdef", "sequence": 9})
     assert record == {
         "schema_version": SCHEMA_VERSION,
         "kind": "scene_change",
@@ -513,7 +451,8 @@ def test_a_scene_change_record_names_object_caller_and_time() -> None:
         "message": "Scene add object box_1 succeeded · composer_ui · 12 ms",
         "scene_change": {
             "scene_resource_id": "box_1", "source_label": "composer_ui",
-            "principal_id": None, "duration_ms": 12.3, "scene_revision_id": 4},
+            "principal_id": None, "duration_ms": 12.3, "scene_revision_id": 4,
+            "manager_start_id": "0123456789abcdef", "sequence": 9},
     }
     refused = scene_change_record(
         "set_collision_policy", "refused",
@@ -561,86 +500,79 @@ def _commit(manager: _SceneManager, request: SceneTransactionRequest) -> list[di
     return core.activity
 
 
-def test_a_gui_scene_commit_is_recorded_once_with_its_facts() -> None:
+@pytest.mark.parametrize("response", [
+    {},
+    {"replay_status": "replayed_exact"},
+    {"ok": False, "projection_status": "not_attempted", "committed_projection_revision": None,
+     "error": {"code": "stale_revision", "message": "Scene changed"}},
+    {"ok": False, "projection_status": "failed_projection_uncertain",
+     "committed_projection_revision": None,
+     "error": {"code": "stale_revision", "message": "Scene changed"}},
+])
+def test_a_scene_commit_the_manager_answered_reaches_history_from_its_stream_only(
+    response: dict[str, Any],
+) -> None:
+    """OD-400: whatever the Manager decided is recorded from its status
+    stream (``test_scene_change_history``), never by the caller too."""
+
     core = _ActivityCore()
-    manager = _SceneManager()
+    manager = _SceneManager(**response)
     service = _service(core, manager)
     app = create_app(service=service, trusted_principal_adapter=FakeTrustedAdapter())
     body = _scene_body()
     body["request_context"]["source_label"] = "composer_ui"
     with TestClient(app) as client:
-        response = client.post("/api/scene/transactions", json=body)
-    assert response.status_code == 200, response.text
-    [record] = core.activity
-    assert record["kind"] == "scene_change" and record["subject"] == "remove_object"
-    assert record["outcome"] == "succeeded" and record["error"] is None
+        client.post("/api/scene/transactions", json=body)
+    assert core.activity == []
+    assert len(manager.scene_requests) == 1
+
+
+def test_a_command_the_manager_could_not_read_is_recorded_refused_by_headless() -> None:
+    """No outcome of it reaches the Manager's stream, so Headless records the
+    refusal it got back, as before OD-400."""
+
+    refusal = {"code": "invalid_request", "message": "scene transaction request is invalid",
+               "details": {"command": "invalid"}, "producer": "component_manager"}
+
+    class Unread(_SceneManager):
+        def commit_scene_transaction(self, request, *, trusted_principal_id, mesh_content_digest):
+            super().commit_scene_transaction(
+                request, trusted_principal_id=trusted_principal_id,
+                mesh_content_digest=mesh_content_digest)
+            return {"api_version": "manyforge.manager_command_response.v3",
+                    "error": refusal, "ok": False}
+
+    [record] = _commit(Unread(), _scene_request())
+    assert (record["kind"], record["subject"], record["outcome"]) == (
+        "scene_change", "remove_object", "refused")
+    assert record["error"] == {"code": "invalid_request",
+                               "message": "scene transaction request is invalid",
+                               "details": {"command": "invalid"}}
     facts = record["scene_change"]
-    assert facts["duration_ms"] >= 0
     assert {**facts, "duration_ms": 0} == {
         "scene_resource_id": "part.1", "source_label": "composer_ui",
-        "principal_id": "operator.7", "duration_ms": 0, "scene_revision_id": 2}
-    assert record["message"].startswith("Scene remove object part.1 succeeded · composer_ui · ")
+        "principal_id": "operator.7", "duration_ms": 0, "scene_revision_id": None,
+        "manager_start_id": None, "sequence": None}
+    # Any other Manager refusal without an owner outcome came with its record
+    # on the stream (the Manager records it): nothing here.
+    other = {**refusal, "code": "manager_command_rejected", "details": {}}
+
+    class Rejected(Unread):
+        def commit_scene_transaction(self, request, **kwargs):
+            return {**super().commit_scene_transaction(request, **kwargs), "error": other}
+
+    assert _commit(Rejected(), _scene_request()) == []
 
 
-def test_a_program_node_scene_commit_is_left_to_its_node_attempt_event() -> None:
+def test_a_program_node_scene_commit_that_failed_is_left_to_its_node_attempt_event() -> None:
     manager = _SceneManager()
+    manager.raised = HeadlessApiError("manager_unavailable", "Manager is not answering")
     request = _scene_request(program_node_evidence={
         "program_run_id": 7, "parent_program_cycle_claim_generation": 2,
         "node_instance_id": "remove_part", "node_attempt_id": 5,
         "owner_api": "scene.transaction"})
     assert _commit(manager, request) == []
     assert len(manager.scene_requests) == 1
-
-
-_RESET_AUTHORIZATION = {
-    "program_run_id": 7, "cycle_claim_generation": 2,
-    "terminal_or_settlement_reference": "sha256:" + "e" * 64,
-    "program_cycle_status": {
-        "cycle_generation": 3, "state": "resetting", "program_run_id": 7,
-        "cycle_claim_generation": 2,
-        "terminal_or_settlement_reference": "sha256:" + "e" * 64,
-        "accepted_reset": None,
-    },
-}
-
-
-@pytest.mark.parametrize(("request_changes", "source_label"), [
-    # A Program Reset's scene reload.
-    ({"expected_admission_generation": None,
-      "program_reset_scene_authorization": _RESET_AUTHORIZATION}, "composer_ui"),
-    # The Runner's own initial-scene preparation and empty-Apply clear.
-    ({"request_context": {"request_key": "d1" * 16,
-                          "source_label": "manyforge.behavior.program_scene"}},
-     "manyforge.behavior.program_scene"),
-])
-def test_the_programs_scene_changes_outside_a_node_are_recorded_too(
-    request_changes: dict[str, Any], source_label: str,
-) -> None:
-    [record] = _commit(_SceneManager(), _scene_request(**request_changes))
-    assert (record["kind"], record["outcome"]) == ("scene_change", "succeeded")
-    assert record["scene_change"]["source_label"] == source_label
-
-
-def test_a_replayed_retry_is_not_a_new_scene_change() -> None:
-    assert _commit(_SceneManager(replay_status="replayed_exact"), _scene_request()) == []
-
-
-@pytest.mark.parametrize(("projection_status", "outcome"), [
-    ("not_attempted", "refused"),
-    ("rejected_rollback_proven", "refused"),
-    ("failed_projection_uncertain", "unknown"),
-])
-def test_a_refused_or_uncertain_scene_commit_is_recorded_with_its_code(
-    projection_status: str, outcome: str,
-) -> None:
-    [record] = _commit(_SceneManager(
-        ok=False, projection_status=projection_status, committed_projection_revision=None,
-        error={"code": "stale_revision", "message": "Scene changed",
-               "details": {"expected": 3, "current": 4}}), _scene_request())
-    assert record["outcome"] == outcome
-    assert record["error"] == {"code": "stale_revision", "message": "Scene changed",
-                               "details": {"expected": 3, "current": 4}}
-    assert record["scene_change"]["scene_revision_id"] is None
 
 
 def test_a_scene_commit_that_raised_is_recorded_failed_and_still_raises() -> None:
@@ -654,7 +586,13 @@ def test_a_scene_commit_that_raised_is_recorded_failed_and_still_raises() -> Non
     [record] = core.activity
     assert (record["outcome"], record["error"]) == (
         "failed", {"code": "manager_unavailable", "message": "Manager is not answering"})
-    assert record["scene_change"]["principal_id"] is None
+    facts = record["scene_change"]
+    assert facts["duration_ms"] >= 0
+    # No Manager outcome: no Manager start, no sequence.
+    assert {**facts, "duration_ms": 0} == {
+        "scene_resource_id": "part.1", "source_label": "composer_ui", "principal_id": None,
+        "duration_ms": 0, "scene_revision_id": None, "manager_start_id": None,
+        "sequence": None}
 
 
 def test_a_lost_scene_change_line_never_fails_the_commit() -> None:
@@ -664,5 +602,9 @@ def test_a_lost_scene_change_line_never_fails_the_commit() -> None:
         raise RuntimeError("historian queue closed")
 
     core.record_activity = fail  # type: ignore[method-assign]
-    service = _service(core, _SceneManager())
-    assert service.scene_commit(_scene_request(), TrustedAttribution())["ok"] is True
+    manager = _SceneManager()
+    manager.raised = HeadlessApiError("manager_unavailable", "Manager is not answering")
+    service = _service(core, manager)
+    with pytest.raises(HeadlessApiError) as raised:
+        service.scene_commit(_scene_request(), TrustedAttribution())
+    assert raised.value.code == "manager_unavailable"

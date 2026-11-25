@@ -5650,88 +5650,23 @@ def test_scene_commit_transport_failure_keeps_its_typed_cause_as_unknown() -> No
     assert len(manager.submissions) == 1
 
 
-def _recording_port(manager):
-    records: list[dict[str, Any]] = []
-    port = HeadlessSceneProgramPort(
-        manager,
-        program_node_evidence=_scene_port(manager)._program_node_evidence,
-        record_scene_change=records.append,
-    )
-    return port, records
+def test_runner_scene_changes_reach_history_only_through_the_manager() -> None:
+    """OD-400: the port sends each scene change to the Manager, whose status
+    stream History follows; it has no History callback of its own."""
 
-
-def test_runner_scene_changes_outside_nodes_are_recorded_once_each() -> None:
     manager = _SceneTransport(populated=True)
-    port, records = _recording_port(manager)
-
+    with pytest.raises(TypeError):
+        HeadlessSceneProgramPort(manager, record_scene_change=lambda record: None)
+    port = _scene_port(manager)
     port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
     port.bind(_scene_context())
-    node = _remove_graspable(port, _identity("recorded-remove"))
+    node = _remove_graspable(port, _identity("stream-remove"))
 
     assert node.succeeded is True
-    # The node's change is in its node attempt event, not here.
-    assert [(row["operation_kind"], row["outcome"]) for row in records] == [
-        ("detach_carried_object_at_current_pose", "succeeded"),
-        ("add_object", "succeeded"),
-        ("remove_object", "succeeded"),
-        ("remove_object", "succeeded"),
+    assert [row["operation"]["kind"] for row in manager.submissions] == [
+        "detach_carried_object_at_current_pose", "add_object", "remove_object",
+        "remove_object", "remove_object",
     ]
-    revisions = [row["scene_change"].pop("scene_revision_id") for row in records]
-    assert revisions == [2, 3, 4, 5]
-    assert all(row["scene_change"].pop("duration_ms") >= 0 for row in records)
-    assert [row["scene_change"] for row in records] == [
-        {"scene_resource_id": resource, "source_label": "manyforge.behavior.program_scene"}
-        for resource in ("old-part", "graspable", "old-part", "old-support")
-    ]
-    assert all(row["error"] is None for row in records)
-
-
-def test_runner_scene_change_records_refusal_unknown_and_failure_and_skip_replays() -> None:
-    import manyforge_headless_py as core
-
-    class Outcomes(_SceneTransport):
-        def __init__(self, reply):
-            super().__init__(populated=True)
-            self.reply = reply
-
-        def scene_commit(self, transaction):
-            if isinstance(self.reply, Exception):
-                raise self.reply
-            return deepcopy(self.reply)
-
-    refused = {
-        "api_version": "manyforge.manager_command_response.v3", "ok": False,
-        "projection_status": "not_attempted", "committed_projection_revision": None,
-        "replay_status": "accepted_new", "transaction_sequence": None, "update_status": None,
-        "request_key": None,
-        "error": {"code": "missing_reference", "message": "carrier unavailable",
-                  "details": {"reason": "carrier"}, "producer": "component_manager"},
-    }
-    cases = [
-        (refused, "refused", {"code": "missing_reference", "message": "carrier unavailable",
-                              "details": {"reason": "carrier"}}),
-        ({**refused, "projection_status": "failed_projection_uncertain"}, "unknown",
-         {"code": "missing_reference", "message": "carrier unavailable",
-          "details": {"reason": "carrier"}}),
-        (core.GatewayError("manager_command_unavailable", "no Manager", {"reason": "x"}),
-         "failed", {"code": "manager_command_unavailable", "message": "no Manager",
-                    "details": {"reason": "x"}}),
-        ({**refused, "replay_status": "replayed_exact"}, None, None),
-    ]
-    for reply, outcome, error in cases:
-        port, records = _recording_port(Outcomes(reply))
-        result = port.clear_applied_scene(
-            retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C, is_current=lambda: True,
-        )
-        assert result["state"] in {"failed", "unknown", "partial"}
-        if outcome is None:
-            assert records == []
-            continue
-        assert records[0]["operation_kind"] == "detach_carried_object"
-        assert records[0]["outcome"] == outcome
-        assert records[0]["error"] == error
-        assert records[0]["scene_change"]["scene_resource_id"] is None
-        assert records[0]["scene_change"]["scene_revision_id"] is None
 
 
 def test_runner_scene_transactions_are_the_wire_form_headless_sent() -> None:

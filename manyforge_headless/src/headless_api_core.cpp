@@ -2398,9 +2398,13 @@ CanonicalValue HeadlessApiCore::OperatorAlarmMotionAttention() {
 
 CanonicalValue HeadlessApiCore::ApplyManagerStatusFrame(
     const std::string_view frame) {
-  const auto result = manager_status_.Apply(frame);
+  auto result = manager_status_.Apply(frame);
   return CanonicalValue(CanonicalValue::Object{
       {"control_changed", CanonicalValue(result.control_changed)},
+      // OD-400: History's recorder takes these on the follower thread.
+      {"scene_changes", result.scene_changes.has_value()
+                            ? std::move(*result.scene_changes)
+                            : CanonicalValue(nullptr)},
       {"tick_advanced", CanonicalValue(result.tick_advanced)},
       {"viewer_changed", CanonicalValue(result.viewer_changed)},
   });
@@ -2891,7 +2895,7 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
     Require(has_code, code, "activity record error has no code");
     return true;
   };
-  Require(text("schema_version") == "manyforge.activity_event.v1", code,
+  Require(text("schema_version") == "manyforge.activity_event.v2", code,
           "activity record version is unsupported");
   const auto kind = text("kind");
   const auto subject = text("subject");
@@ -3056,14 +3060,22 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
       Require(operations.contains(subject), code,
               "activity record scene operation is unsupported");
       // The object, the caller, the time it took and the committed revision.
+      // From the Manager's stream also the Manager start and the change's
+      // sequence in it (OD-400); null for a failure that never reached it.
       const auto &change = facts_object(
           "scene_change", {"scene_resource_id", "source_label", "principal_id",
-                           "duration_ms", "scene_revision_id"});
+                           "duration_ms", "scene_revision_id",
+                           "manager_start_id", "sequence"});
       optional_fact_text(change, "scene_resource_id");
       optional_fact_text(change, "source_label");
       optional_fact_text(change, "principal_id");
       fact_duration(change);
       fact_number(change, "scene_revision_id", true);
+      Require(optional_fact_text(change, "manager_start_id") ==
+                  !std::holds_alternative<std::nullptr_t>(
+                      RequiredMember(change, "sequence").storage()),
+              code, "activity record scene change sequence is incomplete");
+      fact_number(change, "sequence", true);
     }
   } else if (scalar_kind) {
     Require(std::holds_alternative<std::nullptr_t>(action.storage()) &&

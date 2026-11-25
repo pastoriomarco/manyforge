@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { parseApplyResult, parseCellLatch, parseComponentState, parseRunReadiness, parseSignalSample } from '../api/parsers/components';
 import { applyImpactSummary, applyResultText } from '../components/ApplyImpact';
@@ -43,6 +43,8 @@ const robot = {
   observed_at_ns: 10,
 };
 
+afterEach(() => vi.unstubAllEnvs());
+
 describe('component model v2 wire parsing', () => {
   it('parses a component state with its fault, keeping the contract field names', () => {
     const state = parseComponentState(robot, 'state');
@@ -55,15 +57,18 @@ describe('component model v2 wire parsing', () => {
     const plain = parseComponentState(robot, 'state').fault!;
     expect(plain).not.toHaveProperty('since_utc_ns');
     expect(plain).not.toHaveProperty('output_tail');
-    expect(faultPresentation(plain)).toMatchObject({ since: null, outputTail: null });
+    expect(faultPresentation(plain)).toMatchObject({ since: null, sinceUtc: null, outputTail: null });
     const launched = parseComponentState({ ...robot, fault: {
       ...robot.fault, since_utc_ns: '1795514400123000000',
       details: { output_tail: 'Traceback\nValueError: bad config' },
     }, stop: { code: 'estop', message: 'E-stop', since_ns: 5, since_utc_ns: 1_795_514_400_000_000_000 } }, 'state');
     expect(launched.fault).toMatchObject({ since_utc_ns: '1795514400123000000', output_tail: 'Traceback\nValueError: bad config' });
     expect(launched.stop?.since_utc_ns).toBe('1795514400000000000');
+    // Shown in the browser's local time (UTC+05:30 here), UTC for the tooltip.
+    vi.stubEnv('TZ', 'Asia/Kolkata');
     expect(faultPresentation(launched.fault!, 1_795_514_400_123 + 125_000)).toMatchObject({
-      since: 'since 2026-11-24 10:00:00.123 UTC (2 min ago)',
+      since: 'since 2026-11-24 15:30:00.123 (2 min ago)',
+      sinceUtc: '2026-11-24 10:00:00.123 UTC',
       outputTail: 'Traceback\nValueError: bad config',
     });
     // An empty tail is no tail.

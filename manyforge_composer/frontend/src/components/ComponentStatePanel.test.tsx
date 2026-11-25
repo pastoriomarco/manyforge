@@ -22,7 +22,7 @@ vi.mock('../api/client', async (original) => ({
   } },
 }));
 
-afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks(); });
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.clearAllMocks(); });
 
 function state(patch: Partial<ComponentState> = {}): ComponentState {
   return {
@@ -71,12 +71,13 @@ describe('ComponentStatePanel', () => {
   });
 
   it('shows when a fault began and a launch fault\'s output tail, collapsed with Copy', () => {
+    vi.stubEnv('TZ', 'Asia/Kolkata');
     const html = renderToStaticMarkup(<ComponentStatePanel enabled state={state({
       lifecycle: 'fault',
       fault: { code: 'fault_process_exited', message: 'exited', clearable: true, operator_action: 'recover',
         since_ns: 1, since_utc_ns: '1795514400123000000', output_tail: 'line 1\nValueError: bad <config>' },
     })} />);
-    expect(html).toContain('since 2026-11-24 10:00:00.123 UTC (');
+    expect(html).toContain('<small class="muted" title="2026-11-24 10:00:00.123 UTC"> since 2026-11-24 15:30:00.123 (');
     expect(html).toContain('<details class="process-output-tail"><summary>Process output (last lines)</summary>');
     expect(html).toContain('<pre>line 1\nValueError: bad &lt;config&gt;</pre>');
     expect(html).toContain('>Copy</button>');

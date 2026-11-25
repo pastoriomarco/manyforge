@@ -21,6 +21,7 @@ from .models import (
     SceneTransactionRequest,
 )
 from .native import HeadlessApiError
+from .activity_history import request_caller
 from manyforge_behavior.reference_validation import validate_reference_refusal
 
 
@@ -354,7 +355,10 @@ class ManagerCommandClient:
 
         try:
             response = self._gateway.scene_commit(
-                _transaction_body(request, mesh_content_digest), trusted_principal_id
+                _transaction_body(request, mesh_content_digest),
+                trusted_principal_id,
+                # History's caller of the change (OD-400).
+                **request_caller(),
             )
         except self._gateway_error as error:
             raise self._error(error) from error

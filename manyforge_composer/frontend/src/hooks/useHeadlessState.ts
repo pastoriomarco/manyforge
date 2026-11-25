@@ -293,7 +293,7 @@ export interface HeadlessStateAdmission {
   reason: string | null;
 }
 
-const CONTROL_PROTOCOL_VERSION = 'manyforge.execution_control.v4';
+const CONTROL_PROTOCOL_VERSION = 'manyforge.execution_control.v5';
 const EXECUTION_COMMAND_SCHEMA = 'manyforge.execution_command.v2';
 // Starts, resumes and recovery actions are admitted by Composer, which checks
 // the shared Draft (an unapplied Draft refuses Execute/Run/Resume/Retry).

@@ -118,7 +118,7 @@ without explicit authorization.
    `lyrical-no-gazebo` branch. For `v0.4.0`:
    `3654c9afef9c51c3bd6723d65ccecca166bc38b0`.
 4. Run the applicable gates, squash-merge `dev` into `main` and tag
-   `vX.Y.Z` (for this release `v0.4.0`; `v0.3.1` is `main` at `c6a4f93f`,
+   `vX.Y.Z` (for this release `v0.4.0`; `v0.3.1` is `main` at `9e7f528f`,
    `v0.3.0` is `main` at `3fc751bc`,
    `v0.2.1` is `main` at `34bb5f4a`, `v0.2.0` is `main` at `3cc3e5d5`,
    `v0.1.0` is `main` at `8ae05265`).

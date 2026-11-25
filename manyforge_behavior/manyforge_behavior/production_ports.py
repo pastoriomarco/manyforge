@@ -5684,7 +5684,6 @@ class HeadlessSceneProgramPort:
         program_node_evidence: (
             Callable[[NodeAttemptIdentity, str], Mapping[str, Any]] | None
         ) = None,
-        record_scene_change: Callable[[Mapping[str, Any]], None] | None = None,
         read_limit_s: float | None = None,
     ) -> None:
         self._gateway = gateway
@@ -5695,9 +5694,6 @@ class HeadlessSceneProgramPort:
         self._read_limit_s = read_limit_s
         self._resolve_attach_active_tcp = resolve_attach_active_tcp
         self._program_node_evidence = program_node_evidence
-        # History of the commits outside a Program node attempt (OD-375):
-        # called with one scene-change record after each such commit.
-        self._record_scene_change = record_scene_change
         # Keyed by scene context id: ("run", run number) or ("apply", Apply number).
         self._contexts: dict[tuple[str, int], _SceneBoundContext] = {}
         # Scene node commit keys: (run, node attempt, admission generation).
@@ -6138,7 +6134,7 @@ class HeadlessSceneProgramPort:
         # The owner names the key it was sent.
         receipt_key = body["request_context"]["request_key"] if verify_receipt else None
         try:
-            response = self._send_commit(body, recorded=program_node_evidence is None)
+            response = self._send_commit(body)
         except SceneTransactionRejectedError as error:
             if verify_receipt and error.response.get("request_key") != receipt_key:
                 raise SceneOutcomeUnknownError("Scene refusal names another request") from error
@@ -6181,25 +6177,20 @@ class HeadlessSceneProgramPort:
             raise SceneOutcomeUnknownError("Scene receipt names another request")
         return self._committed_revision(context, expected_projection_revision, response), response
 
-    def _send_commit(self, body: Mapping[str, Any], *, recorded: bool) -> dict[str, Any]:
+    def _send_commit(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """One gateway scene commit and the outcome its reply decides. A
         failure of the call itself (transport, envelope or a refused local
-        rule) leaves the outcome unknown, with its typed cause. A ``recorded``
-        commit (outside a Program node attempt) is also recorded in History
-        (OD-375): its outcome, its error and what it changed."""
+        rule) leaves the outcome unknown, with its typed cause. History
+        records each outcome the Manager decides from its status stream
+        (OD-400)."""
 
-        started_ns = time.monotonic_ns()
         try:
             reply = self._gateway.scene_commit(body)
         except Exception as error:
-            if recorded:
-                self._record_commit(body, started_ns, None, error)
             raise SceneOutcomeUnknownError(
                 f"Scene transaction delivery/outcome is unconfirmed: {error}",
                 getattr(error, "code", None), getattr(error, "details", None),
             ) from error
-        if recorded:
-            self._record_commit(body, started_ns, reply, None)
         return _scene_result(reply)
 
     def _receipt(self, body: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -6213,60 +6204,6 @@ class HeadlessSceneProgramPort:
         if reply.get("ok") is not True:
             raise SceneOutcomeUnknownError("Scene result lookup is unavailable")
         return None if reply["result"] is None else _scene_result(reply["result"])
-
-    def _record_commit(
-        self,
-        body: Mapping[str, Any],
-        started_ns: int,
-        reply: Mapping[str, Any] | None,
-        raised: BaseException | None,
-    ) -> None:
-        """One History record of a scene change outside a Program node: the
-        Program runner's initial-scene preparation, a Program Reset's reload
-        and the empty-Apply clear (OD-375, OD-378). A replayed retry changed
-        nothing and is not recorded."""
-
-        if self._record_scene_change is None or (
-            reply is not None and reply.get("replay_status") == "replayed_exact"
-        ):
-            return
-        duration_ms = (time.monotonic_ns() - started_ns) / 1e6
-        if raised is not None:
-            details = getattr(raised, "details", None)
-            outcome, error = "failed", {
-                "code": getattr(raised, "code", None) or "scene_program_request_failed",
-                # History keeps the first 2 KiB of each text.
-                "message": (str(raised) or type(raised).__name__)[:2048],
-                "details": dict(details) if isinstance(details, Mapping) else None,
-            }
-        elif reply.get("ok") is True:
-            outcome, error = "succeeded", None
-        else:
-            outcome = (
-                "unknown"
-                if reply.get("projection_status") == "failed_projection_uncertain"
-                else "refused"
-            )
-            owner_error = reply.get("error")
-            error = None if not isinstance(owner_error, Mapping) else {
-                "code": owner_error.get("code"),
-                "message": str(owner_error.get("message") or "")[:2048] or None,
-                "details": owner_error.get("details"),
-            }
-        operation = body["operation"]
-        self._record_scene_change({
-            "operation_kind": operation["kind"],
-            "outcome": outcome,
-            "error": error,
-            "scene_change": {
-                "scene_resource_id": operation.get("scene_resource_id")
-                or operation.get("expected_scene_resource_id"),
-                "source_label": body["request_context"]["source_label"],
-                "duration_ms": duration_ms,
-                "scene_revision_id": reply["committed_projection_revision"][
-                    "scene_revision"]["revision_id"] if outcome == "succeeded" else None,
-            },
-        })
 
     @staticmethod
     def _raise_if_stop_prevented_admission(error: SceneTransactionRejectedError) -> None:

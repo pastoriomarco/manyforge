@@ -275,7 +275,8 @@ as described [there](#option-1-run-the-prebuilt-manyforge-image).
   back reuses it.
 - **To return to an earlier release**: stop the workbench, check out its tag
   (`git checkout vX.Y.Z`) and follow the guide in that checkout. Releases
-  before 0.3.1 have no published image and are built with option 3.
+  before 0.3.1 have no published image and are built with option 3;
+  releases before 0.4.0 have no ManyForge image (option 1).
 
 ### What the images hold
 

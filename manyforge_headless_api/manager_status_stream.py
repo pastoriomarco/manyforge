@@ -2,12 +2,13 @@
 
 The Manager serves its state from memory on a socket of its own,
 ``manager-status.sock`` in its run root: the connection itself is the
-subscription. Each packet is one frame of ``manyforge.manager_status_stream.v1``
+subscription. Each packet is one frame of ``manyforge.manager_status_stream.v2``
 (``snapshot`` first, then a whole ``section`` frame each time a section
 changes, a ``keepalive`` when only the Manager's main-loop tick advanced, or an
 ``error``). One follower thread feeds every frame to the native core's one
 mirror, which validates it; the runtime snapshot, the control state and the
-viewer read that mirror.
+viewer read that mirror. The ``scene_changes`` section is not mirrored: each
+usable value goes to History's scene-change recorder (OD-400).
 
 The Manager is "not answering" when its connection ended, or when no frame
 showing a new tick of its main loop arrived within the freshness budget (the
@@ -36,7 +37,7 @@ from .private_stream import TIMED_OUT, PrivateStreamSubscription, follow_private
 from .private_transport import PinnedRunRoot, PrivateTransportCapabilityError
 
 MANAGER_STATUS_SOCKET_FILE: Final = "manager-status.sock"
-MANAGER_STATUS_STREAM_API_VERSION: Final = "manyforge.manager_status_stream.v1"
+MANAGER_STATUS_STREAM_API_VERSION: Final = "manyforge.manager_status_stream.v2"
 # The Manager's largest frame (its response bound) plus one byte: a longer
 # packet is truncated and refused as invalid.
 MAX_MANAGER_STATUS_FRAME_BYTES: Final = 3 * 128 * 1024 + 16 * 1024 + 1
@@ -101,7 +102,9 @@ class ManagerStatusFollower:
     state shows changed (not for pose samples alone), ``on_viewer_change``
     when the viewer's scene-runtime or pose-session sources changed, and both
     whenever the Manager starts or stops answering. ``on_disconnect`` runs,
-    before them, when a connected subscription ended. They must not block; if
+    before them, when a connected subscription ended. ``on_scene_changes``
+    runs with each usable ``scene_changes`` value
+    (``{application_start_id, records}``, OD-400). They must not block; if
     one raises, the follower logs it and reconnects.
     """
 
@@ -114,6 +117,7 @@ class ManagerStatusFollower:
         on_control_change: Callable[[], None],
         on_viewer_change: Callable[[], None],
         on_disconnect: Callable[[], None] = lambda: None,
+        on_scene_changes: Callable[[Mapping[str, Any]], None] = lambda _changes: None,
         backoff_seconds: tuple[float, float] = RECONNECT_BACKOFF_SECONDS,
     ) -> None:
         if silence_seconds <= 0:
@@ -124,6 +128,7 @@ class ManagerStatusFollower:
         self._on_control_change = on_control_change
         self._on_viewer_change = on_viewer_change
         self._on_disconnect = on_disconnect
+        self._on_scene_changes = on_scene_changes
         self._backoff_seconds = backoff_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -181,6 +186,8 @@ class ManagerStatusFollower:
             self._on_control_change()
         if viewer:
             self._on_viewer_change()
+        if (changes := result.get("scene_changes")) is not None:
+            self._on_scene_changes(changes)
 
     def _silent(self) -> None:
         """No new tick before the deadline: the Manager is not answering."""

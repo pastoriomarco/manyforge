@@ -314,7 +314,7 @@ public:
   /// One finished component action, Apply or Program Reset terminal, Program
   /// node attempt (stamped at its end on the Runner's clocks) or scene change
   /// outside a Program node
-  /// (`manyforge.activity_event.v1`): `component_action_finished` under the
+  /// (`manyforge.activity_event.v2`): `component_action_finished` under the
   /// component's id, `apply_finished` under `manyforge.composer`,
   /// `program_reset_finished` under `manyforge.program_runner` (OD-305),
   /// `program_node_attempt_finished` under `manyforge.program_runner` (WARN

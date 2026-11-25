@@ -8,7 +8,9 @@
 namespace manyforge::scene {
 
 /// Encode one already-normalized scene request for the same-user Manager
-/// command transport. This is not a public wire format.
+/// command transport, its HTTP caller (`request_id`, `transport`) in its
+/// `request_context` when it has one (OD-400). This is not a public wire
+/// format.
 [[nodiscard]] std::string EncodeCanonicalSceneTransactionRequest(
     const manyforge::core::SceneTransactionRequestDTO &request);
 

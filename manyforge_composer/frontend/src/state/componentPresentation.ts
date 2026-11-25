@@ -202,8 +202,11 @@ export interface FaultPresentation {
   vendor: string | null;
   /** The action the fault names for the operator; null for `none`. */
   operatorAction: string | null;
-  /** When it began (`since … UTC (5 min ago)`); null when the owner sends no UTC time. */
+  /** When it began, in local time (`since 2026-11-24 15:02:03.123 (5 min ago)`);
+   * null when the owner sends no UTC time. */
   since: string | null;
+  /** The same time in UTC, for the tooltip; null with `since`. */
+  sinceUtc: string | null;
   /** A launch fault's last process output lines; null without them. */
   outputTail: string | null;
 }
@@ -216,7 +219,8 @@ export function faultPresentation(fault: Fault, nowMs = Date.now()): FaultPresen
     detail: codedErrorDetail(fault),
     vendor: vendor.length === 0 ? null : `Vendor: ${vendor.join(' · ')}`,
     operatorAction: fault.operator_action === 'none' ? null : actionLabel(fault.operator_action),
-    since: fault.since_utc_ns === undefined ? null : sinceUtcText(fault.since_utc_ns, nowMs),
+    since: fault.since_utc_ns === undefined ? null : sinceText(fault.since_utc_ns, nowMs),
+    sinceUtc: fault.since_utc_ns === undefined ? null : utcText(fault.since_utc_ns),
     outputTail: fault.output_tail ?? null,
   };
 }
@@ -224,6 +228,16 @@ export function faultPresentation(fault: Fault, nowMs = Date.now()): FaultPresen
 /** A UTC nanosecond time (decimal text) with date and milliseconds: `2026-11-24 14:02:03.123 UTC`. */
 export function utcText(utcNs: string): string {
   return `${new Date(Number(BigInt(utcNs) / 1_000_000n)).toISOString().replace('T', ' ').replace('Z', '')} UTC`;
+}
+
+/** The same time in the browser's local time, with date and milliseconds:
+ * `2026-11-24 15:02:03.123`. Operators read local time; tooltips, copies and
+ * exports keep UTC (`utcText`). */
+export function localText(utcNs: string): string {
+  const time = new Date(Number(BigInt(utcNs) / 1_000_000n));
+  const pad = (value: number, width = 2) => String(value).padStart(width, '0');
+  return `${time.getFullYear()}-${pad(time.getMonth() + 1)}-${pad(time.getDate())} `
+    + `${pad(time.getHours())}:${pad(time.getMinutes())}:${pad(time.getSeconds())}.${pad(time.getMilliseconds(), 3)}`;
 }
 
 /** A coarse elapsed time: `40 s`, `12 min`, `3 h 5 min`. */
@@ -234,9 +248,9 @@ export function elapsedText(ms: number): string {
   return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
 }
 
-/** When a state began: `since 2026-11-24 14:02:03.123 UTC (12 min ago)`. */
-export function sinceUtcText(utcNs: string, nowMs: number): string {
-  return `since ${utcText(utcNs)} (${elapsedText(nowMs - Number(BigInt(utcNs) / 1_000_000n))} ago)`;
+/** When a state began, in local time: `since 2026-11-24 15:02:03.123 (12 min ago)`. */
+export function sinceText(utcNs: string, nowMs: number): string {
+  return `since ${localText(utcNs)} (${elapsedText(nowMs - Number(BigInt(utcNs) / 1_000_000n))} ago)`;
 }
 
 /** An e-stop as the operator reads it: "E-stop pressed or not yet cleared (C2)". */

@@ -664,7 +664,7 @@ class ProcessStack:
         if self.manager is None or self.manager.poll() is not None:
             self.manager = None
             return
-        request = b'{"api_version":"manyforge.manager_command.v2",' b'"command":"shutdown_runtime"}'
+        request = b'{"api_version":"manyforge.manager_command.v4",' b'"command":"shutdown_runtime"}'
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
                 client.settimeout(1.0)

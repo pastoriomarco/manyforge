@@ -8,7 +8,7 @@ import {
 } from '../api/applicationIdentity';
 import type { HistorianDetail, HistorianRetention } from '../types/headless';
 import { parseProgramRunEnd } from '../api/parsers/components';
-import { runEndPresentation, utcText, type RunEndPresentation } from '../state/componentPresentation';
+import { localText, runEndPresentation, utcText, type RunEndPresentation } from '../state/componentPresentation';
 import { copyToClipboard } from '../utils/clipboard';
 import type { NoticeHistoryRef } from '../state/workbenchNotices';
 
@@ -54,6 +54,13 @@ export const HISTORY_FOLLOW_INTERVAL_MS = 2_000;
 /** A recorded UTC time with date and milliseconds: `2026-11-24 14:02:03.123 UTC`. */
 export function historyUtcText(utcNs: string): string {
   return utcText(utcNs);
+}
+
+/** The same time as the operator reads it, in the browser's local time:
+ * `2026-11-24 15:02:03.123`. History stores and exports UTC; the tooltip
+ * shows it. */
+export function historyLocalText(utcNs: string): string {
+  return localText(utcNs);
 }
 
 /** Ids an event names, by payload key, that a History filter takes. */
@@ -237,7 +244,7 @@ function historyIdFilter(
 /**
  * The start selector's entries: the current start first, then the earlier
  * starts that have History rows, newest first (as discovery lists them).
- * An earlier start is labelled with the recorded UTC time of its last event
+ * An earlier start is labelled with the local time of its last event
  * once that row is loaded (`lastEventUtcNs`), else with its 4-hex prefix.
  */
 export function historyStartOptions(
@@ -252,7 +259,7 @@ export function historyStartOptions(
       const last = lastEventUtcNs[start];
       const label = last == null
         ? `Earlier start ${start.slice(0, 4)}`
-        : `Earlier start, last event ${new Date(Number(BigInt(last) / 1_000_000n)).toLocaleString()}`;
+        : `Earlier start, last event ${historyLocalText(last)}`;
       return { value: start, label: `${label}${index === 0 ? ' (previous start)' : ''}`, title: start };
     }),
   ];
@@ -307,10 +314,26 @@ export function historyFilterQuery(options: {
 }
 
 function eventTime(event: ExecutionHistoryEventView): string {
-  if (event.timestampUtcNs != null) return historyUtcText(event.timestampUtcNs);
+  if (event.timestampUtcNs != null) return historyLocalText(event.timestampUtcNs);
   return event.clockOwner
     ? `UTC unavailable · ${event.clockOwner}: ${event.timestampNs} ns`
     : 'Recorded UTC unavailable';
+}
+
+/** The row time's tooltip: the full UTC time and the original recorded wall time. */
+function eventTimeTitle(event: ExecutionHistoryEventView): string | undefined {
+  const lines = [
+    event.timestampUtcNs == null ? null : historyUtcText(event.timestampUtcNs),
+    event.timestamp ? `Original recorded wall time: ${event.timestamp}` : null,
+  ].filter((line) => line !== null);
+  return lines.length === 0 ? undefined : lines.join('\n');
+}
+
+/** A retention coverage bound: local time, UTC in the tooltip. */
+function CoverageTime({ utcNs }: { utcNs: string | null }) {
+  return utcNs === null
+    ? <>unavailable</>
+    : <time title={historyUtcText(utcNs)}>{historyLocalText(utcNs)}</time>;
 }
 
 interface ExecutionHistoryPanelProps {
@@ -640,8 +663,8 @@ export function ExecutionHistoryPanel({
         </p>)}
         {retention.partitions.map((part) => <p key={part.partition}>
           <strong>{part.partition}</strong>: {part.retainedCount} retained; {part.prunedCount} pruned{part.lossCounterSaturated ? ' (at least)' : ''}.
-          {' '}Recorded UTC: {part.firstRecordedUtcNs === null ? 'unavailable' : new Date(Number(BigInt(part.firstRecordedUtcNs) / 1_000_000n)).toISOString()}
-          {' → '}{part.lastRecordedUtcNs === null ? 'unavailable' : new Date(Number(BigInt(part.lastRecordedUtcNs) / 1_000_000n)).toISOString()}.
+          {' '}Recorded: <CoverageTime utcNs={part.firstRecordedUtcNs} />
+          {' → '}<CoverageTime utcNs={part.lastRecordedUtcNs} />.
           {' '}{part.unknownTimeCount} unknown times; {part.regressedTimeCount} clock regressions.
         </p>)}
         <p>
@@ -663,7 +686,7 @@ export function ExecutionHistoryPanel({
               {historyTimeline(events.slice(0, MAXIMUM_MOUNTED_HISTORY_ROWS)).map(({ event, sincePreviousMs }) => (
                 <li key={event.id} className={`severity-${historySeverityGroup(event.severity)}`}>
                   <time title={event.timestampUtcNs == null ? undefined : historyUtcText(event.timestampUtcNs)}>
-                    {event.timestampUtcNs == null ? 'time unknown' : historyUtcText(event.timestampUtcNs).slice(11, 23)}
+                    {event.timestampUtcNs == null ? 'time unknown' : historyLocalText(event.timestampUtcNs).slice(11)}
                   </time>
                   <small title="Time since the row before">{sincePreviousMs === null ? '' : `+${(sincePreviousMs / 1000).toFixed(3)} s`}</small>
                   <small>{event.type.replaceAll('_', ' ')}</small>
@@ -687,7 +710,7 @@ export function ExecutionHistoryPanel({
           >
             <header>
               <strong>{event.message || event.type}</strong>
-              <time title={event.timestamp ? `Original recorded wall time: ${event.timestamp}` : undefined}>{eventTime(event)}{event.wallClockRegressed ? ' · clock moved backward' : ''}</time>
+              <time title={eventTimeTitle(event)}>{eventTime(event)}{event.wallClockRegressed ? ' · clock moved backward' : ''}</time>
             </header>
             <small>
               {event.channel} · {event.type}

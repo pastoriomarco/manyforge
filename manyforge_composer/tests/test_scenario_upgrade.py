@@ -4,6 +4,7 @@ upgraded in place by the converters' own code, with one backup kept."""
 from __future__ import annotations
 
 from copy import deepcopy
+import errno
 import json
 import os
 from pathlib import Path
@@ -264,31 +265,62 @@ def test_a_part_without_a_counterpart_is_refused_and_nothing_changes(tmp_path: P
     assert sorted(os.listdir(tmp_path)) == ["cell.scenario", "model.urdf"]
 
 
-def test_a_failed_swap_restores_the_original(
+def test_a_failed_exchange_is_refused_and_nothing_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Where renameat2(RENAME_EXCHANGE) is unavailable (old kernel, file
+    system without it), the upgrade is refused; there is no two-step swap."""
+
     project = _current(tmp_path)
     _age(project, _ALL)
     before = _files(project)
-    rename = os.rename
-    calls: list[tuple[str, str]] = []
 
-    def failing_rename(source, destination) -> None:
-        calls.append((str(source), str(destination)))
-        if len(calls) == 2:  # the converted copy taking the Scenario's place
-            raise OSError(28, "No space left on device")
-        rename(source, destination)
+    def unsupported(_first, _second) -> None:
+        raise OSError(errno.EINVAL, "Invalid argument")
 
-    monkeypatch.setattr(scenario_upgrade.os, "rename", failing_rename)
+    monkeypatch.setattr(scenario_upgrade, "_exchange", unsupported)
     reply = _upgrade(_client(tmp_path), project)
 
     assert reply.status_code == 400
     detail = reply.json()["detail"]
     assert detail["code"] == "scenario_artifact_write_failed"
     assert "the Scenario is unchanged" in detail["message"]
-    assert len(calls) == 3  # moved to the backup, failed, moved back
     assert _files(project) == before
     assert sorted(os.listdir(tmp_path)) == ["cell.scenario", "model.urdf"]
+
+
+class _Crash(BaseException):
+    """The process dying between the exchange and the backup rename."""
+
+
+def test_a_crash_after_the_exchange_leaves_the_upgraded_scenario_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _current(tmp_path)
+    current_program = json.loads((project / "program.yaml").read_text(encoding="utf-8"))
+    _age(project, _ALL)
+    before = _files(project)
+
+    def crash(_source, _destination) -> None:
+        raise _Crash
+
+    monkeypatch.setattr(scenario_upgrade.os, "rename", crash)
+    with pytest.raises(_Crash):
+        scenario_upgrade.upgrade_scenario(
+            str(project), allowed_roots=[str(tmp_path)], version="0.4.0",
+            request_key=uuid.uuid4().hex)
+
+    # The Scenario's folder is the converted one ...
+    document, _source, _digest = capture_scenario_artifact(
+        str(project), allowed_roots=[str(tmp_path)])
+    assert document["program_draft"] == current_program
+    # ... and the original is whole at the copy's hidden name.
+    stages = [path for path in tmp_path.iterdir()
+              if path.name.startswith(".cell.scenario.upgrade-")]
+    assert len(stages) == 1
+    assert _files(stages[0]) == before
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(
+        ["cell.scenario", "model.urdf", stages[0].name])
 
 
 def test_an_upgrade_outside_the_allowed_folders_is_refused(tmp_path: Path) -> None:

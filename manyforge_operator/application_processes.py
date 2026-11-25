@@ -44,7 +44,7 @@ MANAGER_APPLICATION_PROCESS_EXITED = 72
 MANAGER_STOP_INCOMPLETE = 74
 _ENVIRONMENT_NAME = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
 _PR_SET_PDEATHSIG = 1
-_SHUTDOWN_COMMAND = b'{"api_version":"manyforge.manager_command.v2","command":"shutdown_runtime"}'
+_SHUTDOWN_COMMAND = b'{"api_version":"manyforge.manager_command.v4","command":"shutdown_runtime"}'
 
 
 @dataclass(frozen=True, slots=True)

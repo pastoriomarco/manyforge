@@ -170,8 +170,26 @@ void RegisterGateway(py::module_ &module) {
   gateway.def(
       "scene_commit",
       [](const Gateway &self, const py::object &transaction,
-         const py::object &principal_id) {
+         const py::object &principal_id, const py::object &request_id,
+         const py::object &transport) {
         auto object = Members(transaction, "manager_command_invalid");
+        // The HTTP caller for History (OD-400); the Manager checks its form.
+        const auto caller_text = [](const py::object &value)
+            -> std::optional<std::string> {
+          if (value.is_none())
+            return std::nullopt;
+          if (!py::isinstance<py::str>(value))
+            RaiseGatewayError(GatewayError("scene_request_attribution_invalid",
+                                           "the request caller must be text"));
+          try {
+            return python::ToUtf8(value);
+          } catch (const GatewayError &) {
+            RaiseGatewayError(GatewayError("scene_request_attribution_invalid",
+                                           "the request caller must be NFC text"));
+          }
+        };
+        auto caller_id = caller_text(request_id);
+        auto caller_transport = caller_text(transport);
         std::optional<std::string> principal;
         if (!principal_id.is_none()) {
           if (!py::isinstance<py::str>(principal_id))
@@ -186,10 +204,13 @@ void RegisterGateway(py::module_ &module) {
           }
         }
         return Released([&] {
-          return self.SceneCommit(std::move(object), std::move(principal));
+          return self.SceneCommit(std::move(object), std::move(principal),
+                                  std::move(caller_id),
+                                  std::move(caller_transport));
         });
       },
-      py::arg("transaction"), py::arg("principal_id") = py::none());
+      py::arg("transaction"), py::arg("principal_id") = py::none(),
+      py::arg("request_id") = py::none(), py::arg("transport") = py::none());
   gateway.def_static("host_commands", [] {
     py::list names;
     for (const auto &spec : HostCommands())

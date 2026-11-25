@@ -31,7 +31,7 @@ from pydantic import (
 )
 
 
-CONTROL_PROTOCOL_VERSION = "manyforge.execution_control.v4"
+CONTROL_PROTOCOL_VERSION = "manyforge.execution_control.v5"
 EXECUTION_COMMAND_SCHEMA = "manyforge.execution_command.v2"
 EXECUTION_COMMAND_RECEIPT_SCHEMA = "manyforge.execution_command_receipt.v3"
 EXECUTION_CONTROL_PROJECTION_SCHEMA = "manyforge.execution_control_projection.v2"
@@ -278,9 +278,9 @@ class ExecutionCommandReceiptDTO(_StrictDTO):
 
 
 class ControlClientHelloDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["client_hello"]
-    supported_versions: tuple[Literal["manyforge.execution_control.v4"]]
+    supported_versions: tuple[Literal["manyforge.execution_control.v5"]]
     client_incarnation: str
     source_label: str
 
@@ -304,7 +304,7 @@ class ControlClientHelloDTO(_StrictDTO):
 
 
 class ControlHeartbeatEchoDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["heartbeat_echo"]
     control_session_number: ControlSessionNumber
     client_sequence: str
@@ -319,7 +319,7 @@ class ControlHeartbeatEchoDTO(_StrictDTO):
 class ControlStateAppliedDTO(_StrictDTO):
     """Browser credit for one consumed replaceable state value."""
 
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["state_applied"]
     control_session_number: ControlSessionNumber
     state_sequence: str
@@ -333,7 +333,7 @@ class ControlStateAppliedDTO(_StrictDTO):
 class ControlClientIncidentDTO(_StrictDTO):
     """Strict non-authoritative browser-only incident transition."""
 
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["client_incident"]
     control_session_number: ControlSessionNumber
     client_sequence: str
@@ -365,7 +365,7 @@ class ControlClientIncidentDTO(_StrictDTO):
 
 
 class ExecutionControlCommandDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["command"]
     control_session_number: ControlSessionNumber
     client_sequence: str
@@ -388,7 +388,7 @@ class ExecutionControlCommandDTO(_StrictDTO):
 
 
 class ControlServerHelloDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["server_hello"]
     application_start_id: str
     control_session_number: ControlSessionNumber
@@ -400,7 +400,7 @@ class ControlServerHelloDTO(_StrictDTO):
 
 
 class ControlHeartbeatChallengeDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["heartbeat_challenge"]
     control_session_number: ControlSessionNumber
     server_sequence: str
@@ -427,7 +427,7 @@ class ControlHeartbeatChallengeDTO(_StrictDTO):
 
 
 class ExecutionControlSnapshotDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["snapshot"]
     control_session_number: ControlSessionNumber
     server_sequence: str
@@ -439,7 +439,7 @@ class ExecutionControlSnapshotDTO(_StrictDTO):
 
 
 class ExecutionControlDeltaDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["delta"]
     control_session_number: ControlSessionNumber
     server_sequence: str
@@ -486,7 +486,7 @@ class ExecutionControlDeltaDTO(_StrictDTO):
 
 
 class ExecutionCommandReceiptMessageDTO(_StrictDTO):
-    schema_version: Literal["manyforge.execution_control.v4"]
+    schema_version: Literal["manyforge.execution_control.v5"]
     message_kind: Literal["command_receipt"]
     control_session_number: ControlSessionNumber
     server_sequence: str

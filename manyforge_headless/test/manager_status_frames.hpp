@@ -18,7 +18,7 @@ StatusEnvelope(const std::string_view type, const std::uint64_t tick,
                content_identity::CanonicalValue::Object members = {}) {
   using content_identity::CanonicalValue;
   members.emplace_back("api_version",
-                       CanonicalValue("manyforge.manager_status_stream.v1"));
+                       CanonicalValue("manyforge.manager_status_stream.v2"));
   members.emplace_back("application_start_id",
                        CanonicalValue(std::string(kStatusFrameStart)));
   members.emplace_back("tick", CanonicalValue(static_cast<double>(tick)));
@@ -31,7 +31,8 @@ inline std::string StatusSnapshotFrame(const std::uint64_t tick,
                                        const std::uint64_t manager = 0U,
                                        const std::uint64_t logical_scene = 0U,
                                        const std::uint64_t scene_runtime = 0U,
-                                       const std::uint64_t viewer_pose_sessions = 0U) {
+                                       const std::uint64_t viewer_pose_sessions = 0U,
+                                       const std::uint64_t scene_changes = 0U) {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(StatusEnvelope(
       "snapshot", tick,
@@ -39,14 +40,15 @@ inline std::string StatusSnapshotFrame(const std::uint64_t tick,
         CanonicalValue(CanonicalValue::Object{
             {"logical_scene", CanonicalValue(static_cast<double>(logical_scene))},
             {"manager", CanonicalValue(static_cast<double>(manager))},
+            {"scene_changes", CanonicalValue(static_cast<double>(scene_changes))},
             {"scene_runtime", CanonicalValue(static_cast<double>(scene_runtime))},
             {"viewer_pose_sessions",
              CanonicalValue(static_cast<double>(viewer_pose_sessions))},
         })}}));
 }
 
-/// One whole section value; `name` is manager, logical_scene, scene_runtime
-/// or viewer_pose_sessions.
+/// One whole section value; `name` is manager, logical_scene, scene_runtime,
+/// viewer_pose_sessions or scene_changes.
 inline std::string StatusSectionFrame(const std::string_view name,
                                       const std::uint64_t generation,
                                       const content_identity::CanonicalValue &payload,

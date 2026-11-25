@@ -403,7 +403,7 @@ TEST(GatewayManager, SceneOwnerReadIsTheBareCommand) {
   EXPECT_NE(gw::FindManagerCommand("scene_owner_read"), nullptr);
   EXPECT_EQ(ci::canonical_json(gateway.Manager("scene_owner_read", {})), reply);
   EXPECT_EQ(owner.Request(),
-            R"({"api_version":"manyforge.manager_command.v2","command":"scene_owner_read"})");
+            R"({"api_version":"manyforge.manager_command.v4","command":"scene_owner_read"})");
 }
 
 std::string AttributionSent(gw::AttributionTransport transport,
@@ -512,11 +512,35 @@ TEST(GatewaySceneCommit, WireBody) {
             reply);
   EXPECT_EQ(
       owner.Request(),
-      R"({"api_version":"manyforge.manager_command.v2","command":"scene_commit","transaction":{)"
+      R"({"api_version":"manyforge.manager_command.v4","command":"scene_commit","transaction":{)"
       R"("attribution":{"assurance":"externally_authenticated","principal_id":"operator.7","transport":"http"},)"
       R"("expected_admission_generation":null,)"
       R"("operation":{"carrier_component_id":"c","kind":"add_object"},)"
       R"("program_reset_scene_authorization":{},"request_context":{}}})");
+}
+
+// OD-400: the HTTP caller goes into the request context, replacing any the
+// body names.
+TEST(GatewaySceneCommit, RequestContextCarriesTheHttpCaller) {
+  RunRoot root;
+  FakeOwner owner(root.path(), "manager-command.sock");
+  owner.Serve(R"({"api_version":"manyforge.manager_command_response.v3","ok":true})");
+  const auto gateway = MakeGateway(root, gw::AttributionTransport::kHttp);
+  auto transaction = Transaction("add_object", false, false, true);
+  for (auto &[name, value] : transaction)
+    if (name == "request_context")
+      value = CanonicalValue(CanonicalValue::Object{
+          {"request_id", CanonicalValue("stale")},
+          {"request_key", CanonicalValue("k")},
+          {"source_label", CanonicalValue("composer_ui")},
+          {"transport", CanonicalValue("ws")}});
+  (void)gateway.SceneCommit(std::move(transaction), std::nullopt, "req-1.a_b",
+                            "mcp");
+  const auto request = Parse(owner.Request());
+  EXPECT_EQ(ci::canonical_json(*Member(*Member(request, "transaction"),
+                                       "request_context")),
+            R"({"request_id":"req-1.a_b","request_key":"k",)"
+            R"("source_label":"composer_ui","transport":"mcp"})");
 }
 
 TEST(GatewaySceneCommit, InternalGatewaySendsTheHttpAttribution) {

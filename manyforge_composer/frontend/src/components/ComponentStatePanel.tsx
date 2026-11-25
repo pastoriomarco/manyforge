@@ -247,7 +247,7 @@ export function ComponentStatePanel({ state, enabled, states = [], embedded = fa
       {fault !== null && (
         <div className="notice severity-error" role="alert">
           <strong>{withErrorCode(fault.title, fault.code)}</strong>
-          {fault.since !== null && <small className="muted"> {fault.since}</small>}
+          {fault.since !== null && <small className="muted" title={fault.sinceUtc ?? undefined}> {fault.since}</small>}
           <p>{fault.detail}</p>
           {fault.vendor !== null && <p className="muted">{fault.vendor}</p>}
           {fault.operatorAction !== null && <p>Operator action: {fault.operatorAction}</p>}

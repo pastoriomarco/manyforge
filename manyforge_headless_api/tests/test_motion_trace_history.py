@@ -128,7 +128,7 @@ def test_record_names_the_file_and_its_cause() -> None:
         "request_count": 1,
     })
     assert record == {
-        "schema_version": "manyforge.activity_event.v1",
+        "schema_version": "manyforge.activity_event.v2",
         "kind": "motion_trace_captured",
         "subject": "arm_1",
         "action": None,

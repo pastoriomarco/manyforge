@@ -41,7 +41,7 @@ import {
   type RecentNotice,
   type WorkbenchNotice,
 } from '../state/workbenchNotices';
-import { utcText } from '../state/componentPresentation';
+import { localText, utcText } from '../state/componentPresentation';
 import { OverlayPanel } from './OverlayPanel';
 import { NoticeActions, NoticeItem, NotificationRail } from './WorkbenchNotifications';
 
@@ -674,7 +674,9 @@ export function HeadlessRuntimeSurfacesView({
             <ol className="recent-notices">
               {recent.map((notice) => (
                 <li key={notice.sequence} className={`severity-${notice.severity}`}>
-                  <time>{utcText(String(BigInt(notice.presentedAtMs) * 1_000_000n))}</time>
+                  <time title={utcText(String(BigInt(notice.presentedAtMs) * 1_000_000n))}>
+                    {localText(String(BigInt(notice.presentedAtMs) * 1_000_000n))}
+                  </time>
                   <span><strong>{notice.title}</strong>{notice.message !== '' && ` · ${notice.message}`}</span>
                   <button type="button" className="text-button"
                     title={notice.history === undefined ? 'Open History.' : 'Open History filtered to this notice\'s run or operation.'}

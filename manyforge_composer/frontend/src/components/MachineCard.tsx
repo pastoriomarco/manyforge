@@ -280,7 +280,7 @@ function MemberStatus({ state, states, enabled, applicationStartId }: {
       )}
       {fault !== null && (
         <p className="inline-message severity-error" role="alert">
-          {withErrorCode(fault.title, fault.code)}{fault.since !== null && ` (${fault.since})`}. {fault.detail}
+          {withErrorCode(fault.title, fault.code)}{fault.since !== null && <> (<span title={fault.sinceUtc ?? undefined}>{fault.since}</span>)</>}. {fault.detail}
           {fault.vendor !== null && ` ${fault.vendor}.`}
           {fault.operatorAction !== null && ` Operator action: ${fault.operatorAction}`}
         </p>

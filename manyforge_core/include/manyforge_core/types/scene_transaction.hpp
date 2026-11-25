@@ -134,6 +134,12 @@ struct SceneTransactionRequestDTO final {
   std::optional<ProgramResetSceneAuthorizationDTO>
       program_reset_scene_authorization{};
   std::optional<ProgramNodeAdmissionEvidenceDTO> program_node_evidence{};
+  /// The HTTP request that sent it and its transport (`http`, `ws`, `mcp`),
+  /// History's caller of the change (OD-400). Carried in the Manager
+  /// command's `request_context` only: outside the request digest and never
+  /// stored by the scene owner.
+  std::optional<std::string> request_id{};
+  std::optional<std::string> request_transport{};
 };
 
 /// Owner-private, non-durable scene-successor request used by deterministic

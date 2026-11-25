@@ -7,8 +7,12 @@
 
 namespace manyforge::scene::logical_scene_codec_internal {
 
+/// `with_caller`: also the request's HTTP caller (`request_id`, `transport`)
+/// in its `request_context`, as the Manager command carries it (OD-400);
+/// stored and digested forms never carry it.
 [[nodiscard]] std::string
-EncodeRequest(const manyforge::core::SceneTransactionRequestDTO &request);
+EncodeRequest(const manyforge::core::SceneTransactionRequestDTO &request,
+              bool with_caller = false);
 /// Canonical public payload/precondition projection used for request replay.
 /// Transport-stamped attribution is deliberately absent.
 [[nodiscard]] std::string EncodeRequestDigestInput(

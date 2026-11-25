@@ -44,7 +44,7 @@ def _source() -> HeadlessStateSource:
 def _owner_snapshot() -> str:
     return json.dumps(
         {
-            "schema_version": "manyforge.execution_control.v4",
+            "schema_version": "manyforge.execution_control.v5",
             "message_kind": "snapshot",
             "control_session_number": 1,
             "server_sequence": "1",
@@ -81,7 +81,7 @@ def test_source_only_enriches_owner_frames_and_performs_no_http_reads() -> None:
 
 def test_source_forwards_receipts_without_reencoding_them() -> None:
     source = _source()
-    receipt = '{ "schema_version":"manyforge.execution_control.v4", "message_kind":"command_receipt" }'
+    receipt = '{ "schema_version":"manyforge.execution_control.v5", "message_kind":"command_receipt" }'
 
     assert source.enrich(receipt) == receipt
 
@@ -215,7 +215,7 @@ def test_proxy_refuses_execution_start_that_bypasses_composer_admission(
             headless_ws, "connect_websocket", lambda *_args, **_kwargs: upstream
         )
         browser = _Browser(json.dumps({
-            "schema_version": "manyforge.execution_control.v4",
+            "schema_version": "manyforge.execution_control.v5",
             "message_kind": "command",
             "command": {
                 "command_envelope": {"command_kind": command_kind},
@@ -514,7 +514,7 @@ def test_oversized_stop_frame_is_forwarded_before_the_size_check(
             headless_ws, "connect_websocket", lambda *_args, **_kwargs: upstream
         )
         frame = json.dumps({
-            "schema_version": "manyforge.execution_control.v4",
+            "schema_version": "manyforge.execution_control.v5",
             "message_kind": "command",
             "command": {
                 "command_envelope": {"command_kind": command_kind},

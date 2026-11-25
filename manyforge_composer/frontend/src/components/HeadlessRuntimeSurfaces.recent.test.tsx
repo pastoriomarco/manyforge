@@ -9,6 +9,7 @@ import { HeadlessRuntimeSurfacesView } from './HeadlessRuntimeSurfaces';
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 const text = (props: MountedProps): string => (Array.isArray(props.children)
@@ -16,6 +17,7 @@ const text = (props: MountedProps): string => (Array.isArray(props.children)
   : typeof props.children === 'string' ? props.children : '');
 
 it('lists the recent notices newest first; see History opens History filtered by the notice\'s run', async () => {
+  vi.stubEnv('TZ', 'Asia/Kolkata');
   const { host, find, all } = reactPropsHost();
   const list = vi.spyOn(api.history, 'list').mockResolvedValue({
     events: [], retention: null, truncated: false, nextBeforeSequence: null,
@@ -38,8 +40,12 @@ it('lists the recent notices newest first; see History opens History filtered by
     commandLatch: false, semanticStatus: 'current', semanticReason: null, reconnect: () => undefined,
   } as never} />));
   await act(() => find((props) => text(props) === 'Recent 2').onClick!());
-  const times = all((props) => typeof props.children === 'string' && props.children.endsWith(' UTC'));
-  expect(times.map((props) => props.children)).toEqual(['2026-11-24 10:00:01.000 UTC', '2026-11-24 10:00:00.123 UTC']);
+  // Local time (UTC+05:30 here) with milliseconds; UTC in the tooltip.
+  const times = all((props) => typeof props.title === 'string' && props.title.endsWith(' UTC'));
+  expect(times.map((props) => [props.children, props.title])).toEqual([
+    ['2026-11-24 15:30:01.000', '2026-11-24 10:00:01.000 UTC'],
+    ['2026-11-24 15:30:00.123', '2026-11-24 10:00:00.123 UTC'],
+  ]);
   const links = all((props) => props.children === 'see History');
   expect(links).toHaveLength(2);
   await act(async () => { links[0].onClick!(); });

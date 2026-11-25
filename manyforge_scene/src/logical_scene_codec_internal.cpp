@@ -762,9 +762,39 @@ CanonicalValue RequestContext(const core::PublicRequestContextDTO &value) {
   });
 }
 
+/// A scene request's context with its optional HTTP caller (OD-400):
+/// `request_id` (1 to 64 of A-Z a-z 0-9 . _ -) and `transport` (http, ws or
+/// mcp).
 core::PublicRequestContextDTO
-DecodeRequestContext(const CanonicalValue &value) {
-  ExactObject(value, 2U, "request context");
+DecodeSceneRequestContext(const CanonicalValue &value,
+                          core::SceneTransactionRequestDTO &request) {
+  if (!value.is_object()) {
+    Fail("request context is not an object");
+  }
+  const auto *request_id = value.find_object_member("request_id");
+  const auto *transport = value.find_object_member("transport");
+  ExactObject(value,
+              2U + (request_id != nullptr ? 1U : 0U) +
+                  (transport != nullptr ? 1U : 0U),
+              "request context");
+  if (request_id != nullptr) {
+    const auto &text = String(*request_id, "request_id");
+    if (text.empty() || text.size() > 64U ||
+        !std::all_of(text.begin(), text.end(), [](const char c) {
+          return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        })) {
+      Fail("request context request_id is invalid");
+    }
+    request.request_id = text;
+  }
+  if (transport != nullptr) {
+    const auto &text = String(*transport, "transport");
+    if (text != "http" && text != "ws" && text != "mcp") {
+      Fail("request context transport is unsupported");
+    }
+    request.request_transport = text;
+  }
   return {
       DecodeRequestKey(Member(value, "request_key"), "request_key"),
       String(Member(value, "source_label"), "source_label"),
@@ -1572,7 +1602,18 @@ DecodeProgramNodeEvidence(const CanonicalValue &value) {
 
 } // namespace
 
-std::string EncodeRequest(const core::SceneTransactionRequestDTO &request) {
+std::string EncodeRequest(const core::SceneTransactionRequestDTO &request,
+                          const bool with_caller) {
+  auto context = RequestContext(request.request_context);
+  if (with_caller &&
+      (request.request_id.has_value() || request.request_transport.has_value())) {
+    auto members = context.as_object();
+    if (request.request_id.has_value())
+      members.emplace_back("request_id", CanonicalValue(*request.request_id));
+    if (request.request_transport.has_value())
+      members.emplace_back("transport", CanonicalValue(*request.request_transport));
+    context = CanonicalValue(std::move(members));
+  }
   CanonicalValue::Object fields{
       {"attribution", Attribution(request.attribution)},
       {"expected_admission_generation",
@@ -1589,7 +1630,7 @@ std::string EncodeRequest(const core::SceneTransactionRequestDTO &request) {
            ? ProgramResetSceneAuthorization(
                  *request.program_reset_scene_authorization)
            : CanonicalValue(nullptr)},
-      {"request_context", RequestContext(request.request_context)},
+      {"request_context", std::move(context)},
   };
   if (request.program_node_evidence.has_value())
     fields.emplace_back("program_node_evidence",
@@ -1642,7 +1683,7 @@ core::SceneTransactionRequestDTO DecodeRequest(const std::string_view bytes) {
         DecodeProgramResetSceneAuthorization(encoded_reset_authorization);
   }
   core::SceneTransactionRequestDTO request{
-      DecodeRequestContext(Member(root, "request_context")),
+      {},
       DecodeAttribution(Member(root, "attribution")),
       DecodeProjection(Member(root, "expected_projection_revision")),
       DecodeRequestOperation(Member(root, "operation")),
@@ -1652,6 +1693,8 @@ core::SceneTransactionRequestDTO DecodeRequest(const std::string_view bytes) {
           ? std::nullopt
           : std::optional{DecodeProgramNodeEvidence(*node_evidence)},
   };
+  request.request_context =
+      DecodeSceneRequestContext(Member(root, "request_context"), request);
   if (!request.attribution.locally_valid() ||
       !request.expected_projection_revision.valid()) {
     Fail("scene transaction request is invalid");
@@ -1961,7 +2004,7 @@ namespace manyforge::scene {
 
 std::string EncodeCanonicalSceneTransactionRequest(
     const core::SceneTransactionRequestDTO &request) {
-  return logical_scene_codec_internal::EncodeRequest(request);
+  return logical_scene_codec_internal::EncodeRequest(request, true);
 }
 
 core::SceneTransactionRequestDTO

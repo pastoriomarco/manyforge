@@ -577,7 +577,7 @@ def test_install_failure_after_a_save_write_is_logged_once_and_published(
     assert headless.events == ["acquire", "wake"]
 
     template = json.dumps({
-        "schema_version": "manyforge.execution_control.v4",
+        "schema_version": "manyforge.execution_control.v5",
         "message_kind": "delta",
         "control_session_number": 1,
         "server_sequence": "2",

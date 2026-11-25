@@ -38,7 +38,7 @@ inline constexpr std::string_view kComponentSocketFileName =
 inline constexpr std::string_view kEventStreamSocketFileName = "execution-events.sock";
 inline constexpr std::string_view kManagerSocketFileName = "manager-command.sock";
 inline constexpr std::string_view kManagerCommandApiVersion =
-    "manyforge.manager_command.v2";
+    "manyforge.manager_command.v4";
 inline constexpr std::string_view kManagerResponseApiVersion =
     "manyforge.manager_command_response.v3";
 inline constexpr std::string_view kLockFileName = ".execution-host.lock";

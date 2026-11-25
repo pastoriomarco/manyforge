@@ -653,7 +653,7 @@ private:
 // sends a `snapshot` frame, then one `section` frame per section with a
 // value, then a `section` frame per change and `keepalive` frames per tick.
 constexpr std::string_view kStatusStreamApiVersion =
-    "manyforge.manager_status_stream.v1";
+    "manyforge.manager_status_stream.v2";
 /// One byte above the stream's frame bound (409,600 bytes): a larger packet
 /// is reported by MSG_TRUNC and refused.
 constexpr std::size_t kStatusFrameBufferBytes = 409'601U;
@@ -951,7 +951,7 @@ public:
         try {
           const auto response =
               SendCommand(directory.socket_path(),
-                          "{\"api_version\":\"manyforge.manager_command.v2\","
+                          "{\"api_version\":\"manyforge.manager_command.v4\","
                           "\"command\":\"scene_owner_read\"}");
           if (response.find("\"ok\":true") != std::string::npos) {
             return;
@@ -1711,7 +1711,7 @@ std::string ApplyRequest(
   }
   const auto preview_request =
       content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+          {"api_version", CanonicalValue("manyforge.manager_command.v4")},
           {"command", CanonicalValue("deployment_candidate_preview")},
           {"candidate_graph_revision", CanonicalValue(candidate_graph)},
           {"candidate_retained_bundle_id", CanonicalValue(candidate_bundle)},
@@ -1748,7 +1748,7 @@ std::string ApplyRequest(
        : accepted_impact.empty()
            ? CanonicalValue(nullptr)
            : CanonicalValue(std::string(accepted_impact))},
-      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v4")},
       {"candidate_receipt", RequiredMember(preview, "candidate_receipt")},
       {"command", CanonicalValue("apply")},
       {"deployment_revision", CanonicalValue(std::string(deployment_revision))},
@@ -1780,7 +1780,7 @@ ApplyStatusRequest(const std::string_view submission_response) {
   }
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
       {"api_version",
-       CanonicalValue(std::string("manyforge.manager_command.v2"))},
+       CanonicalValue(std::string("manyforge.manager_command.v4"))},
       {"apply_generation", CanonicalValue(generation)},
       {"apply_id", CanonicalValue(*apply_id)},
       {"command", CanonicalValue(std::string("apply_status"))},
@@ -1798,7 +1798,7 @@ std::string SceneAddRequest(
   const auto &cell_id = RequiredMember(
       RequiredMember(scene_source.payload, "snapshot"), "cell_id");
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v4")},
       {"command", CanonicalValue("scene_commit")},
       {"transaction",
        CanonicalValue(CanonicalValue::Object{
@@ -1863,7 +1863,7 @@ std::string ScenePoseRequest(const StatusSection &scene_source,
   const auto &projection = RequiredMember(
       RequiredMember(scene_source.payload, "access"), "active_projection");
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v4")},
       {"command", CanonicalValue("scene_pose_query")},
       {"expected_projection_revision", projection},
       {"scene_resource_ids", CanonicalValue(CanonicalValue::Array{
@@ -1881,7 +1881,7 @@ std::string ScenePoseRequestAheadOfOwner(const StatusSection &scene_source,
       RequiredMember(scene_source.payload, "access"), "active_projection");
   const auto &scene = RequiredMember(projection, "scene_revision");
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v4")},
       {"command", CanonicalValue("scene_pose_query")},
       {"expected_projection_revision",
        CanonicalValue(CanonicalValue::Object{
@@ -1913,7 +1913,7 @@ ScenePreviewRequest(const StatusSection &scene_source,
                                                expected_admission_generation))
                                .root();
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v4")},
       {"candidate_request",
        CanonicalValue(CanonicalValue::Object{
            {"frame_resolution", CanonicalValue(nullptr)},
@@ -1954,7 +1954,7 @@ std::string SceneRuntimeObserverOpenRequest(
     const bool eligible = false) {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v4")},
       {"bindings",
        CanonicalValue(CanonicalValue::Array{
            CanonicalValue(CanonicalValue::Object{
@@ -1983,7 +1983,7 @@ std::string SceneRuntimeObserveRequest(
     const bool eligible = false) {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v4")},
       {"command", CanonicalValue("scene_runtime_observe")},
       {"eligible", CanonicalValue(eligible)},
       {"expected_runtime_identity",
@@ -2017,7 +2017,7 @@ std::string SceneRuntimePoseObserveRequest(
     const std::string_view object_id = "scene-process-box") {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v4")},
       {"command", CanonicalValue("scene_runtime_observe")},
       {"eligible", CanonicalValue(true)},
       {"expected_runtime_identity",
@@ -2057,7 +2057,7 @@ std::string SceneRuntimeBeforePlanningLatchRequest(
     const StatusSection &) {
   using content_identity::CanonicalValue;
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue("manyforge.manager_command.v2")},
+      {"api_version", CanonicalValue("manyforge.manager_command.v4")},
       {"command", CanonicalValue("scene_runtime_latch_before_planning")},
       {"expected_runtime_identity",
        SceneRuntimeIdentityValue(scene_runtime_source)},
@@ -2348,10 +2348,14 @@ TEST(ManagerDaemonProcess,
   }
   EXPECT_FALSE(first.application_start_id.empty());
   // Every section has a value from the start-up publication, the viewer pose
-  // sessions included (published when the scene runtime opens).
-  ASSERT_EQ(first.generations.size(), 4U);
+  // sessions included (published when the scene runtime opens);
+  // `scene_changes` (OD-400) has none before a scene commit.
+  ASSERT_EQ(first.generations.size(), 5U);
   for (const auto &[name, generation] : first.generations) {
-    EXPECT_GE(generation, 1U) << name;
+    if (name == "scene_changes")
+      EXPECT_EQ(generation, 0U);
+    else
+      EXPECT_GE(generation, 1U) << name;
   }
   const std::vector<std::string> order{"manager", "logical_scene",
                                        "scene_runtime", "viewer_pose_sessions"};
@@ -2461,8 +2465,8 @@ TEST(ManagerDaemonProcess,
   auto last_tick = first_tick;
   auto slowest = std::chrono::steady_clock::duration::zero();
   const std::string commands[]{
-      R"({"api_version":"manyforge.manager_command.v2","command":"scene_runtime_owner_read"})",
-      R"({"api_version":"manyforge.manager_command.v2","command":"scene_owner_read"})"};
+      R"({"api_version":"manyforge.manager_command.v4","command":"scene_runtime_owner_read"})",
+      R"({"api_version":"manyforge.manager_command.v4","command":"scene_owner_read"})"};
   std::size_t sent = 0U;
   const auto window_end =
       std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -2495,16 +2499,16 @@ TEST(ManagerDaemonProcess, ApplyAcknowledgementRequiresAnExactRequestContext) {
   ManagerProcess manager(directory);
   manager.WaitReady(directory);
   const auto valid = SendCommand(directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_acknowledge","request_context":{"request_key":"40000000000000010000000000000a01","source_label":"composer"}})");
+      R"({"api_version":"manyforge.manager_command.v4","apply_generation":1,"apply_id":999,"command":"apply_acknowledge","request_context":{"request_key":"40000000000000010000000000000a01","source_label":"composer"}})");
   const auto accepted_shape = deployment::parse_strict_json_model_yaml(valid).root();
   EXPECT_EQ(RequiredMember(RequiredMember(accepted_shape, "error"), "code"),
             CanonicalValue("apply_status_not_found")) << valid;
   EXPECT_EQ(RequiredMember(RequiredMember(RequiredMember(accepted_shape, "error"), "details"), "effect"),
             CanonicalValue("none")) << valid;
   for (const auto *request : {
-      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_acknowledge"})",
-      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_acknowledge","extra":true,"request_context":{"request_key":"40000000000000010000000000000a01","source_label":"composer"}})",
-      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_acknowledge","request_context":{"extra":true,"request_key":"40000000000000010000000000000a01","source_label":"composer"}})"}) {
+      R"({"api_version":"manyforge.manager_command.v4","apply_generation":1,"apply_id":999,"command":"apply_acknowledge"})",
+      R"({"api_version":"manyforge.manager_command.v4","apply_generation":1,"apply_id":999,"command":"apply_acknowledge","extra":true,"request_context":{"request_key":"40000000000000010000000000000a01","source_label":"composer"}})",
+      R"({"api_version":"manyforge.manager_command.v4","apply_generation":1,"apply_id":999,"command":"apply_acknowledge","request_context":{"extra":true,"request_key":"40000000000000010000000000000a01","source_label":"composer"}})"}) {
     const auto bytes = SendCommand(directory.socket_path(), request);
     const auto rejected = deployment::parse_strict_json_model_yaml(bytes).root();
     EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
@@ -2522,13 +2526,13 @@ TEST(ManagerDaemonProcess, ApplyReleaseForNewReleasesNothingOnAFreshCell) {
   ManagerProcess manager(directory);
   manager.WaitReady(directory);
   const auto valid = SendCommand(directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v2","command":"apply_release_for_new","request_context":{"request_key":"40000000000000010000000000000b01","source_label":"composer"}})");
+      R"({"api_version":"manyforge.manager_command.v4","command":"apply_release_for_new","request_context":{"request_key":"40000000000000010000000000000b01","source_label":"composer"}})");
   const auto released = deployment::parse_strict_json_model_yaml(valid).root();
   EXPECT_EQ(RequiredMember(released, "ok"), CanonicalValue(true)) << valid;
   EXPECT_EQ(RequiredMember(released, "released"), CanonicalValue(nullptr)) << valid;
   for (const auto *request : {
-      R"({"api_version":"manyforge.manager_command.v2","command":"apply_release_for_new"})",
-      R"({"api_version":"manyforge.manager_command.v2","apply_generation":1,"apply_id":999,"command":"apply_release_for_new","request_context":{"request_key":"40000000000000010000000000000b01","source_label":"composer"}})"}) {
+      R"({"api_version":"manyforge.manager_command.v4","command":"apply_release_for_new"})",
+      R"({"api_version":"manyforge.manager_command.v4","apply_generation":1,"apply_id":999,"command":"apply_release_for_new","request_context":{"request_key":"40000000000000010000000000000b01","source_label":"composer"}})"}) {
     const auto bytes = SendCommand(directory.socket_path(), request);
     const auto rejected = deployment::parse_strict_json_model_yaml(bytes).root();
     EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
@@ -2575,11 +2579,11 @@ TEST(ManagerDaemonProcess,
 
     SendCommandAndDisconnect(
         directory.socket_path(),
-        "{\"api_version\":\"manyforge.manager_command.v2\","
+        "{\"api_version\":\"manyforge.manager_command.v4\","
         "\"command\":\"scene_owner_read\"}");
     const auto post_disconnect_response =
         SendCommand(directory.socket_path(),
-                    "{\"api_version\":\"manyforge.manager_command.v2\","
+                    "{\"api_version\":\"manyforge.manager_command.v4\","
                     "\"command\":\"scene_owner_read\"}");
     EXPECT_NE(post_disconnect_response.find("\"ok\":true"), std::string::npos);
     EXPECT_EQ(::kill(manager.pid(), 0), 0);
@@ -2615,7 +2619,7 @@ TEST(ManagerDaemonProcess,
     for (int reconcile = 0; reconcile < 20; ++reconcile) {
       const auto response =
           SendCommand(directory.socket_path(),
-                      "{\"api_version\":\"manyforge.manager_command.v2\","
+                      "{\"api_version\":\"manyforge.manager_command.v4\","
                       "\"command\":\"scene_owner_read\"}");
       EXPECT_NE(response.find("\"ok\":true"), std::string::npos);
     }
@@ -2672,7 +2676,7 @@ TEST(ManagerDaemonProcess,
         while (!stop.load()) {
           const auto response =
               SendCommand(directory.socket_path(),
-                          "{\"api_version\":\"manyforge.manager_command.v2\","
+                          "{\"api_version\":\"manyforge.manager_command.v4\","
                           "\"command\":\"scene_owner_read\"}");
           if (response.find("\"ok\":true") == std::string::npos) {
             failed.store(true);
@@ -2725,7 +2729,7 @@ TEST(ManagerDaemonProcess,
 
     const auto owner_read = SendCommand(
         directory.socket_path(),
-        R"({"api_version":"manyforge.manager_command.v2","command":"scene_runtime_owner_read"})");
+        R"({"api_version":"manyforge.manager_command.v4","command":"scene_runtime_owner_read"})");
     EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos);
     // The reply names no owner epoch (contract 1.4).
     EXPECT_EQ(owner_read.find("\"scene_runtime_owner_epoch\":"),
@@ -3074,7 +3078,7 @@ TEST(ManagerDaemonProcess,
 
   const auto owner_read = SendCommand(
       directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v2","command":"scene_owner_read"})");
+      R"({"api_version":"manyforge.manager_command.v4","command":"scene_owner_read"})");
   EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos) << owner_read;
 
   const auto deadline =
@@ -3099,7 +3103,7 @@ TEST(ManagerDaemonProcess,
 
   const auto shutdown = SendCommand(
       directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v2","command":"shutdown_runtime"})");
+      R"({"api_version":"manyforge.manager_command.v4","command":"shutdown_runtime"})");
   EXPECT_NE(shutdown.find("\"ok\":true"), std::string::npos) << shutdown;
   const auto status = manager.Wait();
   EXPECT_TRUE(WIFEXITED(status));
@@ -3132,13 +3136,13 @@ TEST(ManagerDaemonProcess,
     ASSERT_TRUE(initial.has_value());
     const auto owner_read =
         SendCommand(directory.socket_path(),
-                    "{\"api_version\":\"manyforge.manager_command.v2\","
+                    "{\"api_version\":\"manyforge.manager_command.v4\","
                     "\"command\":\"scene_owner_read\"}");
     EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos);
     // A read naming its resources (OD-380): the same reply with only their
     // rows, here none. The selection decodes as scene_pose_query's does.
     EXPECT_EQ(SendCommand(directory.socket_path(),
-                          R"({"api_version":"manyforge.manager_command.v2",)"
+                          R"({"api_version":"manyforge.manager_command.v4",)"
                           R"("command":"scene_owner_read",)"
                           R"("scene_resource_ids":["absent","box"]})"),
               owner_read);
@@ -3148,7 +3152,7 @@ TEST(ManagerDaemonProcess,
           R"("unknown":true)"}) {
       const auto refused = SendCommand(
           directory.socket_path(),
-          std::string(R"({"api_version":"manyforge.manager_command.v2",)"
+          std::string(R"({"api_version":"manyforge.manager_command.v4",)"
                       R"("command":"scene_owner_read",)") +
               selection + "}");
       EXPECT_NE(refused.find("\"code\":\"invalid_request\""),
@@ -3177,6 +3181,23 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(replayed.find("\"authoring_not_ready\""), std::string::npos);
     EXPECT_NE(replayed.find("\"replay_status\":\"replayed_exact\""),
               std::string::npos);
+    // OD-400: the refused commit is one `scene_changes` record; its exact
+    // replay adds none.
+    const auto changes = ReadStatusSection(directory, "scene_changes");
+    ASSERT_TRUE(changes.has_value());
+    const auto &records = RequiredMember(changes->payload, "records").as_array();
+    ASSERT_EQ(records.size(), 1U)
+        << content_identity::canonical_json(changes->payload);
+    EXPECT_EQ(RequiredMember(records[0], "sequence").as_number(), 1.0);
+    EXPECT_EQ(RequiredMember(records[0], "operation_kind").as_string(),
+              "add_object");
+    EXPECT_EQ(RequiredMember(records[0], "scene_resource_id").as_string(),
+              "scene-process-box");
+    EXPECT_EQ(RequiredMember(records[0], "outcome").as_string(), "refused");
+    EXPECT_EQ(RequiredMember(RequiredMember(records[0], "error"), "code")
+                  .as_string(),
+              "authoring_not_ready");
+    EXPECT_TRUE(RequiredMember(records[0], "scene_revision_id").is_null());
 
     const auto published = scene_source.Read();
     ASSERT_TRUE(published.has_value());
@@ -3604,7 +3625,7 @@ TEST(ManagerDaemonProcess,
   // first and only time the Manager asks it to shut down.
   const auto shutdown = SendCommand(
       directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v2","command":"shutdown_runtime"})");
+      R"({"api_version":"manyforge.manager_command.v4","command":"shutdown_runtime"})");
   EXPECT_NE(shutdown.find("\"ok\":true"), std::string::npos) << shutdown;
   const auto status = manager.Wait();
   ASSERT_TRUE(WIFEXITED(status));

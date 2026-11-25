@@ -1,4 +1,4 @@
-# Execution Control WebSocket (v4)
+# Execution Control WebSocket (v5)
 
 `/ws/control` is ManyForge's low-latency command and authoritative-status
 session for the first-party UI and compatible external clients. Composer
@@ -15,7 +15,7 @@ session.
 
 | Property | Value |
 |---|---:|
-| Protocol/schema version | `manyforge.execution_control.v4` |
+| Protocol/schema version | `manyforge.execution_control.v5` |
 | Heartbeat challenge period | 250 ms |
 | Delayed classification | 500 ms without a confirmed heartbeat |
 | Stale command cutoff | 1,000 ms without a confirmed heartbeat |

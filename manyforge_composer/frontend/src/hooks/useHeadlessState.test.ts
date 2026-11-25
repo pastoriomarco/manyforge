@@ -710,7 +710,7 @@ function synchronizeControl(
 ): void {
   socket.testServerSequence = 0;
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v4',
+    schema_version: 'manyforge.execution_control.v5',
     message_kind: 'server_hello',
     application_start_id: TEST_START_ID,
     control_session_number: sessionNumber,
@@ -721,7 +721,7 @@ function synchronizeControl(
     maximum_messages_per_second: 64,
   });
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v4',
+    schema_version: 'manyforge.execution_control.v5',
     message_kind: 'heartbeat_challenge',
     control_session_number: sessionNumber,
     server_sequence: nextControlServerSequence(socket),
@@ -732,7 +732,7 @@ function synchronizeControl(
     freshness: controlFreshness(1),
   });
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v4',
+    schema_version: 'manyforge.execution_control.v5',
     message_kind: 'heartbeat_challenge',
     control_session_number: sessionNumber,
     server_sequence: nextControlServerSequence(socket),
@@ -752,7 +752,7 @@ function receiveHeartbeat(
   controlRevision = 1,
 ): void {
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v4',
+    schema_version: 'manyforge.execution_control.v5',
     message_kind: 'heartbeat_challenge',
     control_session_number: sessionNumber,
     server_sequence: nextControlServerSequence(socket),
@@ -774,7 +774,7 @@ function receiveControlSnapshot(
   const revision = cycle.execution_control_revision as number;
   const serverSequence = nextControlServerSequence(socket);
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v4',
+    schema_version: 'manyforge.execution_control.v5',
     message_kind: 'snapshot',
     control_session_number: sessionNumber,
     server_sequence: serverSequence,
@@ -1401,7 +1401,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       const pending = source.sendExecutionCommand('program_reset', {});
       const command = JSON.parse(FakeWebSocket.shell.sent.at(-1)!) as { client_sequence: string };
       receiveControl(FakeWebSocket.shell, {
-        schema_version: 'manyforge.execution_control.v4',
+        schema_version: 'manyforge.execution_control.v5',
         message_kind: 'command_receipt',
         control_session_number: CONTROL_SESSION_NUMBER,
         server_sequence: nextControlServerSequence(FakeWebSocket.shell),
@@ -1768,7 +1768,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     receiveControlSnapshot(FakeWebSocket.shell, second);
     changed.mockClear();
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'delta',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
@@ -1839,7 +1839,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const delta = (runtime: Record<string, unknown>) => {
       const sequence = nextControlServerSequence(FakeWebSocket.shell);
       receiveControl(FakeWebSocket.shell, {
-        schema_version: 'manyforge.execution_control.v4',
+        schema_version: 'manyforge.execution_control.v5',
         message_kind: 'delta',
         control_session_number: CONTROL_SESSION_NUMBER,
         server_sequence: sequence,
@@ -1973,7 +1973,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.subscribeOperationProgress(progressChanged);
     const progress = [{ operation_id: 1, operation_revision: 1, progress: 0.6 }];
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4', message_kind: 'delta',
+      schema_version: 'manyforge.execution_control.v5', message_kind: 'delta',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: '2', received_client_sequence: '2', event_class: 'cold',
@@ -1992,7 +1992,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(source.getGlobalRules()).toBeNull();
     const rules = [{ rule_id: 'door', state: 'tripped', keys: [] }];
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4', message_kind: 'delta',
+      schema_version: 'manyforge.execution_control.v5', message_kind: 'delta',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: '2', received_client_sequence: '2', event_class: 'cold',
@@ -2012,7 +2012,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     // can't read the host's model) clears them, so the GUI shows
     // "unavailable" rather than last values.
     const cellDelta = (shell: Record<string, unknown>) => receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4', message_kind: 'delta',
+      schema_version: 'manyforge.execution_control.v5', message_kind: 'delta',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: '2', received_client_sequence: '2', event_class: 'cold',
@@ -2045,7 +2045,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       held_run_draft_edit_allowed: true,
     };
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'delta',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
@@ -2779,7 +2779,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     // Semantic unavailable on a connected transport: not current.
     rulesChanged.mockClear();
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'heartbeat_challenge',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
@@ -2903,7 +2903,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
     let stateSequence = 1;
     const runtimeDelta = (runtime: unknown) => receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'delta',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
@@ -2974,7 +2974,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
     let stateSequence = 1;
     const runtimeDelta = (runtime: unknown) => receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'delta',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
@@ -3124,7 +3124,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'server_hello',
       application_start_id: TEST_START_ID,
       control_session_number: CONTROL_SESSION_NUMBER,
@@ -3178,14 +3178,14 @@ describe('HeadlessStateSource delivery scheduling', () => {
     // Headless requires the browser's identity in the hello (it refuses the
     // session without it).
     expect(JSON.parse(socket.sent[0]!)).toEqual({
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'client_hello',
-      supported_versions: ['manyforge.execution_control.v4'],
+      supported_versions: ['manyforge.execution_control.v5'],
       client_incarnation: expect.stringMatching(/^control-client\.[A-Za-z0-9_-]{8,256}$/),
       source_label: 'operator_ui',
     });
     const hello = (override: Record<string, unknown>) => ({
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'server_hello',
       application_start_id: TEST_START_ID,
       control_session_number: 7,
@@ -3212,7 +3212,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     }
     receiveControl(socket, hello({}));
     receiveControl(socket, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'heartbeat_challenge',
       control_session_number: 7,
       server_sequence: '1',
@@ -3229,7 +3229,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(echo).not.toHaveProperty('control_session_id');
     // A frame of another session number is invalid.
     receiveControl(socket, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'heartbeat_challenge',
       control_session_number: 8,
       server_sequence: '2',
@@ -3385,7 +3385,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     // A WebSocket command carries no request id, request key, correlation id
     // or `A`: the session number and client sequence name it.
     expect(command).toEqual({
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'command',
       control_session_number: CONTROL_SESSION_NUMBER,
       client_sequence: command.client_sequence,
@@ -3405,7 +3405,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(command.client_sequence).toMatch(/^[1-9][0-9]*$/);
     for (const draftRevision of [2, 3]) {
       receiveControl(FakeWebSocket.shell, {
-        schema_version: 'manyforge.execution_control.v4',
+        schema_version: 'manyforge.execution_control.v5',
         message_kind: 'delta',
         control_session_number: CONTROL_SESSION_NUMBER,
         server_sequence: nextControlServerSequence(FakeWebSocket.shell),
@@ -3432,7 +3432,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       source.getShellSnapshot().snapshot?.authoringWorkspace.programDraftRevision,
     ).toBe(1);
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'command_receipt',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
@@ -3618,7 +3618,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(settled).toBe(false);
 
     receiveControl(socket, {
-      schema_version: 'manyforge.execution_control.v4',
+      schema_version: 'manyforge.execution_control.v5',
       message_kind: 'command_receipt',
       control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(socket),
@@ -4073,7 +4073,7 @@ describe('The control connection stays open for Stop', () => {
     return { source, socket, controls, commandKinds, send, dispose };
   }
   const invalidDelta = (socket: ControlTestSocket) => receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v4',
+    schema_version: 'manyforge.execution_control.v5',
     message_kind: 'delta',
     control_session_number: CONTROL_SESSION_NUMBER,
     server_sequence: nextControlServerSequence(socket),

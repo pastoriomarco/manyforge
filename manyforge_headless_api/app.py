@@ -66,6 +66,11 @@ from .execution_control import (
 )
 from .manager import ManagerCommandClient
 from .request_validation import request_validation_detail
+from .scene_change_history import (
+    SCENE_CHANGE_EVENT_TYPE,
+    ManagerSceneChangeRecorder,
+    last_recorded_scene_change,
+)
 from .history_query import (
     HistorianCaptureRequest,
     HistorianQueryRequest,
@@ -77,7 +82,6 @@ from .models import (
     ApplyOutcomeRequest,
     ProgramNodeAttemptBatchRequest,
     ProgramResetOutcomeRequest,
-    SceneChangeRecordRequest,
     ComponentActionRequest,
     ComponentGroupActionRequest,
     RecoveryPreflightConfirmation,
@@ -494,6 +498,17 @@ def create_app(
             control_state_source.notify_cold()
             scene_commits_wake()
 
+        # OD-400: every scene change outside a Program node reaches History
+        # from the Manager's stream, on the follower thread; after a restart
+        # it goes on after the last change History holds (read once here).
+        scene_change_recorder = ManagerSceneChangeRecorder(
+            core,
+            last_recorded=last_recorded_scene_change(
+                lambda: service.history_export(HistorianQueryRequest(
+                    event_types=[SCENE_CHANGE_EVENT_TYPE], limit=32
+                ))
+            ),
+        )
         manager_status_follower = ManagerStatusFollower(
             core,
             config.manager_run_root,
@@ -501,6 +516,7 @@ def create_app(
             on_control_change=manager_control_changed,
             on_viewer_change=manager_status_changes.notify,
             on_disconnect=service.manager_status_disconnected,
+            on_scene_changes=scene_change_recorder.observe,
         )
         viewer_pose_sources = core.viewer_pose_sources
         event_pump = ExecutionEventPump(
@@ -2332,14 +2348,6 @@ def create_app(
         Applied Program and reloaded scene revision), recorded by the Program
         Runner as `program_reset_finished` (OD-305)."""
         return service.record_program_reset_outcome(body)
-
-    @app.post("/api/execution/history/scene-changes")
-    def history_scene_change(body: SceneChangeRecordRequest) -> dict[str, Any]:
-        """One scene change the Program Runner made outside a Program node
-        (initial-scene preparation, Program Reset reload, empty-Apply clear),
-        recorded as `scene_change`."""
-        start_identity(body.application_start_id)
-        return service.record_scene_change(body)
 
     return app
 

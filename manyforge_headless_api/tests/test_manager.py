@@ -11,6 +11,7 @@ import rfc8785
 
 import manyforge_headless_py as core
 
+from manyforge_headless_api.activity_history import bind_request_caller, unbind_request_caller
 from manyforge_headless_api.manager import ManagerCommandClient
 from manyforge_headless_api.models import (
     ManagerApplyRequest,
@@ -53,10 +54,11 @@ class _Gateway:
         self.commands.append(command)
         return self.reply(command) if callable(self.reply) else self.reply
 
-    def scene_commit(self, transaction, principal_id=None):
-        return self._answer(
-            {"command": "scene_commit", "transaction": transaction, "principal_id": principal_id}
-        )
+    def scene_commit(self, transaction, principal_id=None, **caller):
+        return self._answer({
+            "command": "scene_commit", "transaction": transaction,
+            "principal_id": principal_id, **caller,
+        })
 
     def __getattr__(self, name: str):
         if name.startswith("_"):
@@ -687,12 +689,16 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
             },
         }
     )
+    # The HTTP request being served reaches the Manager with the change, for
+    # History's caller (OD-400).
+    token = bind_request_caller("req-7", "mcp")
     try:
         response = _socket_client(tmp_path).commit_scene_transaction(
             request, trusted_principal_id="operator.7", mesh_content_digest=None
         )
         assert response["projection_status"] == "committed"
     finally:
+        unbind_request_caller(token)
         server.close()
         worker.join(timeout=1.0)
     assert not worker.is_alive()
@@ -706,6 +712,10 @@ def test_scene_client_stamps_attribution_and_uses_one_canonical_packet(
         "transport": "http",
     }
     assert "support_contacts" not in command["transaction"]["operation"]
+    assert command["transaction"]["request_context"] == {
+        **request.request_context.model_dump(mode="json", exclude_none=True),
+        "request_id": "req-7", "transport": "mcp",
+    }
 
 
 def test_scene_body_carries_a_captured_mesh_digest_only_when_given(

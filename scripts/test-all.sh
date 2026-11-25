@@ -874,6 +874,7 @@ run_ros_tests() {
 # Manager-owned mock controller launches from the sourced bringup overlay.
 MOCK_CELL_ROS_PROCESS_TESTS=(
     manyforge_headless_api/process_tests/test_dual_robot_grouped_execution.py
+    manyforge_headless_api/process_tests/test_dual_robot_stop_resume_process.py
     manyforge_headless_api/process_tests/test_operator_alarm_motion_attention.py
     manyforge_headless_api/process_tests/test_interrupt_signal_nodes_process.py
 )

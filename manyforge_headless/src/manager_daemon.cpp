@@ -9,6 +9,7 @@
 #include "manager_status_stream.hpp"
 #include "program_runner_publisher_fault_internal.hpp"
 #include "scene_admission_reconciliation_internal.hpp"
+#include "scene_change_ring_internal.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
@@ -103,7 +104,7 @@ namespace scene = manyforge::scene;
 using content_identity::CanonicalValue;
 
 constexpr std::string_view kManagerCommandApiVersion =
-    "manyforge.manager_command.v2";
+    "manyforge.manager_command.v4";
 
 // Preserve the scene-runtime operation's existing refusal code while keeping
 // a typed lower-level cause and its producer for diagnosis.
@@ -5388,6 +5389,35 @@ private:
     return generation;
   }
 
+  /// Command strand, with no lock held (OD-400): one scene commit outcome
+  /// outside a Program node attempt (a node's change is in its node attempt
+  /// event) into the `scene_changes` section, which History records. Memory
+  /// only: the record, the section payload and the board's swap.
+  void PublishSceneChange(const core::SceneTransactionRequestDTO &transaction,
+                          const double duration_ms,
+                          const std::string_view outcome,
+                          const core::ErrorDTO *error,
+                          const std::optional<std::uint64_t> scene_revision_id) noexcept {
+    if (transaction.program_node_evidence.has_value())
+      return;
+    try {
+      static_cast<void>(status_board_.PublishEncoded(
+          ManagerStatusSection::kSceneChanges,
+          static_cast<std::int64_t>(ElapsedNs()),
+          scene_changes_.Add(detail::SceneChangeRecord(
+              scene_changes_.next_sequence(), transaction, outcome, error,
+              scene_revision_id, duration_ms))));
+      status_board_.NotifyIfChanged();
+    } catch (const std::exception &failure) {
+      core::LogLine(core::LogSeverity::kError,
+                    core::LogText("Manager scene change publication failed: ",
+                                  failure.what()));
+    } catch (...) {
+      core::LogLine(core::LogSeverity::kError,
+                    "Manager scene change publication failed");
+    }
+  }
+
   void TryPublishLogicalScene() noexcept {
     try {
       static_cast<void>(
@@ -6829,6 +6859,10 @@ private:
           RequireCurrentPackageGeneration();
         } catch (const ManagerPackageGenerationRestartRequired &error) {
           PublishPackageRestartRequired();
+          if (command.kind == CommandKind::kSceneCommit &&
+              command.scene_transaction.has_value())
+            PublishSceneChange(*command.scene_transaction, 0.0, "refused",
+                               &error.error(), std::nullopt);
           if (command.kind == CommandKind::kApply &&
               command.request_key.has_value()) {
             TrySendResponse(client.get(),
@@ -7217,10 +7251,30 @@ private:
         Require(command.scene_transaction.has_value(),
                 "decoded scene command lacks its transaction");
         auto transaction = *command.scene_transaction;
-        ResolveSceneMeshContent(transaction);
-        const auto detached = DetachedHolder(transaction);
-        const auto result = detail::CommitSceneWithAdmissionObservation(
-            scene_owner_, transaction, scene_admission_reconciled_);
+        // The Manager's commit time (mesh resolution and the owner commit).
+        const auto started = std::chrono::steady_clock::now();
+        const auto elapsed_ms = [&started] {
+          return std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - started)
+              .count();
+        };
+        decltype(DetachedHolder(transaction)) detached;
+        std::optional<core::SceneCommitResultDTO> committed;
+        double duration_ms = 0.0;
+        try {
+          ResolveSceneMeshContent(transaction);
+          detached = DetachedHolder(transaction);
+          committed = detail::CommitSceneWithAdmissionObservation(
+              scene_owner_, transaction, scene_admission_reconciled_);
+          duration_ms = elapsed_ms();
+        } catch (const std::exception &error) {
+          // The refusal its reply carries (this command's catch below).
+          const auto cause = ManagerCauseOf(error, "manager_command_rejected");
+          PublishSceneChange(transaction, elapsed_ms(), "refused",
+                             &cause.error, std::nullopt);
+          throw;
+        }
+        const auto &result = *committed;
         if (result.success) {
           ClearCarriedObjectLostAfterCommit(transaction, detached);
           // The durable scene result remains authoritative if this projection
@@ -7229,6 +7283,21 @@ private:
           // native scene effect.
           TryPublishLogicalScene();
         }
+        // After the scene it names, so the stream carries that first.
+        if (result.replay_status != core::RequestReplayStatusDTO::kReplayedExact)
+          PublishSceneChange(
+              transaction, duration_ms,
+              result.success ? "succeeded"
+              : result.projection_status ==
+                      core::SceneProjectionCommitStatusDTO::kFailedProjectionUncertain
+                  ? "unknown"
+                  : "refused",
+              result.error.has_value() ? &*result.error : nullptr,
+              result.success && result.committed_projection_revision.has_value()
+                  ? std::optional<std::uint64_t>(
+                        result.committed_projection_revision->scene_revision
+                            .revision_id)
+                  : std::nullopt);
         TrySendResponse(client.get(), SceneCommitResponse(command, result));
         return false;
       }
@@ -7745,6 +7814,11 @@ private:
   core::ExecutionEventChangeSignal status_signal_;
   ManagerStatusBoard status_board_;
   ManagerStatusStream status_stream_;
+  // OD-400: the `scene_changes` section's records; command strand only. The
+  // whole section always fits one status frame (1 KiB for its envelope).
+  static_assert(detail::kSceneChangesPayloadMaximumBytes + 1024U <=
+                ManagerStatusStream::kMaximumFrameBytes);
+  detail::SceneChangeRing scene_changes_;
   // OD-295 (3)(a): two liveness lanes. The Runner lane renews the Program
   // Runner; the host-liveness lane renews the native receivers and is the
   // only one to publish liveness and readiness to the Kernel. They meet only

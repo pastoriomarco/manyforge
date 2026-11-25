@@ -2039,6 +2039,40 @@ TEST(HeadlessApiCore, ManagerStatusSilenceIsNotAnsweringUntilANewTick) {
   ExpectManagerNotAnswering(core.RuntimeSnapshot());
 }
 
+// OD-400: a usable `scene_changes` section comes back from the frame's
+// application for History's recorder; any other frame returns null.
+TEST(HeadlessApiCore, ManagerStatusFrameReturnsUsableSceneChanges) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  ApplyStatusSubscription(core, 1U, 7U);
+  const auto record = CanonicalValue(CanonicalValue::Object{
+      {"duration_ms", CanonicalValue(1.5)},
+      {"error", CanonicalValue(nullptr)},
+      {"operation_kind", CanonicalValue("add_object")},
+      {"outcome", CanonicalValue("succeeded")},
+      {"principal_id", CanonicalValue(nullptr)},
+      {"request_id", CanonicalValue("req-1")},
+      {"scene_resource_id", CanonicalValue("box_1")},
+      {"scene_revision_id", CanonicalValue(2.0)},
+      {"sequence", CanonicalValue(1.0)},
+      {"source_label", CanonicalValue("composer_ui")},
+      {"transport", CanonicalValue("http")}});
+  const auto applied = core.ApplyManagerStatusFrame(test::StatusSectionFrame(
+      "scene_changes", 1U,
+      CanonicalValue(CanonicalValue::Object{
+          {"records", CanonicalValue(CanonicalValue::Array{record})}}),
+      1U));
+  const auto &changes = Member(applied, "scene_changes");
+  ASSERT_TRUE(changes.is_object());
+  EXPECT_EQ(Text(changes, "application_start_id"), test::kStatusFrameStart);
+  EXPECT_EQ(Array(changes, "records"), (CanonicalValue::Array{record}));
+  EXPECT_FALSE(std::get<bool>(Member(applied, "control_changed").storage()));
+  EXPECT_TRUE(Member(core.ApplyManagerStatusFrame(test::StatusKeepaliveFrame(2U)),
+                     "scene_changes")
+                  .is_null());
+  ExpectStatusSectionsFresh(core.RuntimeSnapshot(), 7U);
+}
+
 TEST(HeadlessApiCore, ManagerStatusErrorAndInvalidFramesThrowTheirCodes) {
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
@@ -2050,7 +2084,7 @@ TEST(HeadlessApiCore, ManagerStatusErrorAndInvalidFramesThrowTheirCodes) {
     }
     return "accepted";
   };
-  EXPECT_EQ(code(R"({"api_version":"manyforge.manager_status_stream.v1",)"
+  EXPECT_EQ(code(R"({"api_version":"manyforge.manager_status_stream.v2",)"
                  R"("error":{"code":"manager_status_subscribers_full",)"
                  R"("details":{},"message":"full"},"type":"error"})"),
             "manager_status_subscribers_full");
@@ -2584,7 +2618,7 @@ TEST(HeadlessApiCore, ComponentActionAndApplyOutcomesAreRecordedOnce) {
   };
   const auto action = [&](const std::string &outcome, CanonicalValue failure) {
     return CanonicalValue(CanonicalValue::Object{
-        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"schema_version", CanonicalValue("manyforge.activity_event.v2")},
         {"kind", CanonicalValue("component_action")},
         {"subject", CanonicalValue("lite6_arm")},
         {"action", CanonicalValue("enable")},
@@ -2604,7 +2638,7 @@ TEST(HeadlessApiCore, ComponentActionAndApplyOutcomesAreRecordedOnce) {
           .storage()));
   EXPECT_TRUE(std::get<bool>(
       Member(core.RecordActivity(CanonicalValue(CanonicalValue::Object{
-                 {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+                 {"schema_version", CanonicalValue("manyforge.activity_event.v2")},
                  {"kind", CanonicalValue("apply")},
                  {"subject", CanonicalValue("scenario_load")},
                  {"action", CanonicalValue(nullptr)},
@@ -2679,7 +2713,7 @@ TEST(HeadlessApiCore, ProgramResetOutcomesAreRecordedWithTheirFacts) {
   const auto reset = [](const std::string &outcome, CanonicalValue failure,
                         CanonicalValue reset_facts) {
     return CanonicalValue(CanonicalValue::Object{
-        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"schema_version", CanonicalValue("manyforge.activity_event.v2")},
         {"kind", CanonicalValue("program_reset")},
         {"subject", CanonicalValue("program_reset")},
         {"action", CanonicalValue(nullptr)},
@@ -2793,7 +2827,7 @@ TEST(HeadlessApiCore, NodeAttemptsAndSceneChangesAreRecordedWithTheirFacts) {
   const auto attempt = [](const std::string &outcome, CanonicalValue failure,
                           CanonicalValue facts) {
     return CanonicalValue(CanonicalValue::Object{
-        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"schema_version", CanonicalValue("manyforge.activity_event.v2")},
         {"kind", CanonicalValue("program_node_attempt")},
         {"subject", CanonicalValue("scene.add_object")},
         {"action", CanonicalValue(nullptr)},
@@ -2803,18 +2837,25 @@ TEST(HeadlessApiCore, NodeAttemptsAndSceneChangesAreRecordedWithTheirFacts) {
         {"message", CanonicalValue("Node add_box (scene.add_object) " + outcome)},
         {"attempt", std::move(facts)}});
   };
-  const auto change_facts = [](CanonicalValue scene_revision_id) {
+  // OD-400: the Manager start and the change's sequence in it, both null
+  // or both set.
+  const auto change_facts = [](CanonicalValue scene_revision_id,
+                               CanonicalValue manager_start_id =
+                                   CanonicalValue(nullptr),
+                               CanonicalValue sequence = CanonicalValue(nullptr)) {
     return CanonicalValue(CanonicalValue::Object{
         {"scene_resource_id", CanonicalValue("box_1")},
         {"source_label", CanonicalValue("composer_ui")},
         {"principal_id", CanonicalValue(nullptr)},
         {"duration_ms", CanonicalValue(12.5)},
-        {"scene_revision_id", std::move(scene_revision_id)}});
+        {"scene_revision_id", std::move(scene_revision_id)},
+        {"manager_start_id", std::move(manager_start_id)},
+        {"sequence", std::move(sequence)}});
   };
   const auto change = [](const std::string &subject, const std::string &outcome,
                          CanonicalValue failure, CanonicalValue facts) {
     return CanonicalValue(CanonicalValue::Object{
-        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"schema_version", CanonicalValue("manyforge.activity_event.v2")},
         {"kind", CanonicalValue("scene_change")},
         {"subject", CanonicalValue(subject)},
         {"action", CanonicalValue(nullptr)},
@@ -2832,7 +2873,11 @@ TEST(HeadlessApiCore, NodeAttemptsAndSceneChangesAreRecordedWithTheirFacts) {
         change("add_object", "succeeded", CanonicalValue(nullptr),
                change_facts(CanonicalValue(4.0))),
         change("add_object", "refused", error,
-               change_facts(CanonicalValue(nullptr)))}) {
+               change_facts(CanonicalValue(nullptr))),
+        change("add_object", "succeeded", CanonicalValue(nullptr),
+               change_facts(CanonicalValue(5.0),
+                            CanonicalValue("0123456789abcdef"),
+                            CanonicalValue(3.0)))}) {
     EXPECT_TRUE(std::get<bool>(
         Member(core.RecordActivity(std::move(valid)), "recorded").storage()));
   }
@@ -2858,7 +2903,18 @@ TEST(HeadlessApiCore, NodeAttemptsAndSceneChangesAreRecordedWithTheirFacts) {
         change("add_object", "succeeded", CanonicalValue(nullptr),
                change_facts(CanonicalValue(0.0))),
         change("add_object", "unknown", CanonicalValue(nullptr),
-               change_facts(CanonicalValue(nullptr)))}) {
+               change_facts(CanonicalValue(nullptr))),
+        // Only one of the Manager start and the sequence, or no sequence.
+        change("add_object", "succeeded", CanonicalValue(nullptr),
+               change_facts(CanonicalValue(4.0),
+                            CanonicalValue("0123456789abcdef"))),
+        change("add_object", "succeeded", CanonicalValue(nullptr),
+               change_facts(CanonicalValue(4.0), CanonicalValue(nullptr),
+                            CanonicalValue(3.0))),
+        change("add_object", "succeeded", CanonicalValue(nullptr),
+               change_facts(CanonicalValue(4.0),
+                            CanonicalValue("0123456789abcdef"),
+                            CanonicalValue(0.0)))}) {
     try {
       static_cast<void>(core.RecordActivity(std::move(invalid)));
       FAIL() << "an invalid node attempt or scene change record was accepted";
@@ -2873,10 +2929,10 @@ TEST(HeadlessApiCore, NodeAttemptsAndSceneChangesAreRecordedWithTheirFacts) {
   CanonicalValue page;
   do {
     page = core.HistoryPage(query);
-    if (Array(page, "events").size() == 4U) break;
+    if (Array(page, "events").size() == 5U) break;
     std::this_thread::yield();
   } while (std::chrono::steady_clock::now() < deadline);
-  ASSERT_EQ(Array(page, "events").size(), 4U);
+  ASSERT_EQ(Array(page, "events").size(), 5U);
   std::map<std::string, std::string> severities;
   for (const auto &stored : Array(page, "events")) {
     const auto &event = Member(stored, "event");
@@ -2919,7 +2975,7 @@ TEST(HeadlessApiCore, CommandsOutputWritesAndRunEventsAreRecordedWithCallers) {
                          const std::string &facts_name, Object facts,
                          std::optional<CanonicalValue> who = std::nullopt) {
     Object fields{
-        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"schema_version", CanonicalValue("manyforge.activity_event.v2")},
         {"kind", CanonicalValue(kind)},
         {"subject", CanonicalValue(subject)},
         {"action", CanonicalValue(nullptr)},
@@ -2957,7 +3013,7 @@ TEST(HeadlessApiCore, CommandsOutputWritesAndRunEventsAreRecordedWithCallers) {
   };
   // Any kind may name its caller.
   auto component = CanonicalValue(Object{
-      {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+      {"schema_version", CanonicalValue("manyforge.activity_event.v2")},
       {"kind", CanonicalValue("component_action")},
       {"subject", CanonicalValue("lite6_arm")},
       {"action", CanonicalValue("enable")},
@@ -3071,7 +3127,7 @@ TEST(HeadlessApiCore, LostRecordsAndCapturedMotionTracesAreRecordedAsWarnOrInfo)
                          const std::string &outcome, CanonicalValue failure,
                          const std::string &facts_name, Object facts) {
     return CanonicalValue(Object{
-        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"schema_version", CanonicalValue("manyforge.activity_event.v2")},
         {"kind", CanonicalValue(kind)},
         {"subject", CanonicalValue(subject)},
         {"action", CanonicalValue(nullptr)},

@@ -4301,6 +4301,66 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
     runtime.shutdown()
 
 
+def _scene_owner_failures() -> list[tuple[Exception, dict[str, str] | None]]:
+    from manyforge_behavior.production_ports import (
+        ProductionPortError,
+        SceneOwnerRefusedError,
+    )
+    from manyforge_program_runner.runtime import core
+
+    read_refused = ProductionPortError("logical-scene owner truth is unavailable")
+    read_refused.details = {"reason": "logical_scene_writes_fenced"}
+    return [
+        (
+            core.GatewayError(
+                "manager_command_unavailable", "Manager lost", producer="component_manager"
+            ),
+            {"cause_code": "manager_command_unavailable", "cause_producer": "component_manager"},
+        ),
+        (
+            SceneOwnerRefusedError(
+                {"code": "authoring_not_ready", "message": "refused"},
+                "execution_command_response_invalid", "authoring-admission read was refused",
+            ),
+            {"cause_code": "authoring_not_ready"},
+        ),
+        (read_refused, {"cause_code": "logical_scene_writes_fenced"}),
+        # A scene-port inconsistency without an owner code stays untyped.
+        (ProductionPortError("Program-run scene context was rebound"), {}),
+    ]
+
+
+@pytest.mark.parametrize(("failure", "cause"), _scene_owner_failures())
+def test_reset_scene_reload_failure_carries_the_typed_owner_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    failure: Exception,
+    cause: dict[str, str],
+) -> None:
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test",
+            application_start_id=_A,
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
+        admission_client=_Admission(),  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
+    )
+
+    def prepare_scene(**_kwargs: Any) -> None:
+        raise failure
+
+    monkeypatch.setattr(runtime, "_prepare_current_applied_scene", prepare_scene)
+    request = SimpleNamespace(program_run_id=1)
+    with pytest.raises(ProgramRunnerError) as failed:
+        runtime._prepare_scene_after_reset(request, None)  # noqa: SLF001
+    assert failed.value.code == "program_cycle_reset_scene_preparation_failed"
+    assert failed.value.details == cause
+    assert str(failed.value) == str(failure)
+    runtime.shutdown()
+
+
 def test_rejected_and_completed_resets_do_not_consume_inflight_capacity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

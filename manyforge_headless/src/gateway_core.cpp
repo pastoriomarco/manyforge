@@ -320,7 +320,9 @@ CanonicalValue Gateway::Manager(
 
 CanonicalValue Gateway::SceneCommit(
     CanonicalValue::Object transaction,
-    std::optional<std::string> principal_id) const {
+    std::optional<std::string> principal_id,
+    std::optional<std::string> request_id,
+    std::optional<std::string> transport) const {
   // Cross-field rules of HAPI service.scene_commit, before anything is sent.
   static constexpr std::array<std::string_view, 5> kAuthoredKinds{
       "add_object", "upsert_object", "remove_object", "update_object_pose",
@@ -389,6 +391,21 @@ CanonicalValue Gateway::SceneCommit(
     }
   transaction.emplace_back("attribution",
                            AttributionValue("http", principal_id));
+  // The HTTP caller in the request context (OD-400), outside the request
+  // digest; the Manager checks its form.
+  for (auto it = transaction.begin(); it != transaction.end(); ++it)
+    if (it->first == "request_context" && it->second.is_object()) {
+      auto context = it->second.as_object();
+      std::erase_if(context, [](const auto &member) {
+        return member.first == "request_id" || member.first == "transport";
+      });
+      if (request_id.has_value())
+        context.emplace_back("request_id", CanonicalValue(*request_id));
+      if (transport.has_value())
+        context.emplace_back("transport", CanonicalValue(*transport));
+      it->second = CanonicalValue(std::move(context));
+      break;
+    }
 
   if (!manager_root_)
     throw GatewayError("manager_command_unavailable",

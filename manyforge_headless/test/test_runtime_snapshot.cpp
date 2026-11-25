@@ -549,6 +549,109 @@ TEST(ManagerStatusMirror, ChangeFlagsFollowWhatEachConsumerShows) {
   EXPECT_TRUE(resubscribed.tick_advanced);
 }
 
+/// One `scene_changes` record (OD-400) with `sequence`.
+CanonicalValue SceneChangeRecordValue(const std::uint64_t sequence) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"duration_ms", CanonicalValue(1.5)},
+      {"error", CanonicalValue(nullptr)},
+      {"operation_kind", CanonicalValue("add_object")},
+      {"outcome", CanonicalValue("succeeded")},
+      {"principal_id", CanonicalValue(nullptr)},
+      {"request_id", CanonicalValue("req-1")},
+      {"scene_resource_id", CanonicalValue("box_1")},
+      {"scene_revision_id", CanonicalValue(static_cast<double>(sequence + 1U))},
+      {"sequence", CanonicalValue(static_cast<double>(sequence))},
+      {"source_label", CanonicalValue("composer_ui")},
+      {"transport", CanonicalValue("http")},
+  });
+}
+
+CanonicalValue SceneChangesPayload(const std::vector<std::uint64_t> &sequences) {
+  CanonicalValue::Array records;
+  for (const auto sequence : sequences)
+    records.push_back(SceneChangeRecordValue(sequence));
+  return CanonicalValue(
+      CanonicalValue::Object{{"records", CanonicalValue(std::move(records))}});
+}
+
+// OD-400: a usable `scene_changes` value is handed over with its Manager
+// start, never mirrored; an oversized or unusable one is skipped without
+// ending the subscription.
+TEST(ManagerStatusMirror, SceneChangesAreHandedOverNotMirrored) {
+  Harness h;
+  h.ConnectFullState(1U);
+  static_cast<void>(h.Apply(StatusSectionFrame(
+      "viewer_pose_sessions", 1U, ViewerPoseSessionsPayload(), 1U)));
+  const auto view_before = h.mirror.Load();
+  const auto known = h.Evaluate();
+
+  std::vector<std::uint64_t> full;
+  for (std::uint64_t sequence = 9U; sequence <= 40U; ++sequence)
+    full.push_back(sequence);
+  const auto payload = SceneChangesPayload(full);
+  const auto result =
+      h.Apply(StatusSectionFrame("scene_changes", 1U, payload, 1U));
+  ASSERT_TRUE(result.scene_changes.has_value());
+  EXPECT_EQ(RequiredMember(*result.scene_changes, "application_start_id")
+                .as_string(),
+            kStatusFrameStart);
+  EXPECT_EQ(RequiredMember(*result.scene_changes, "records"),
+            RequiredMember(payload, "records"));
+  EXPECT_EQ(result.scene_changes->as_object().size(), 2U);
+  EXPECT_FALSE(result.control_changed);
+  EXPECT_FALSE(result.viewer_changed);
+  EXPECT_FALSE(result.tick_advanced);
+
+  const auto skipped = [&](const std::string &frame) {
+    const auto applied = h.Apply(frame);
+    EXPECT_FALSE(applied.scene_changes.has_value()) << frame;
+    EXPECT_FALSE(applied.control_changed) << frame;
+    EXPECT_FALSE(applied.viewer_changed) << frame;
+  };
+  skipped(StatusOversizedSectionFrame("scene_changes", 2U, 1U));
+  // Non-consecutive sequences, more records than the ring holds, a record
+  // that is not the closed shape, and a payload that is not `{records}`.
+  skipped(StatusSectionFrame("scene_changes", 3U, SceneChangesPayload({1U, 3U}),
+                             1U));
+  skipped(StatusSectionFrame("scene_changes", 3U, SceneChangesPayload({0U}), 1U));
+  std::vector<std::uint64_t> too_many;
+  for (std::uint64_t sequence = 1U; sequence <= kSceneChangeRingCapacity + 1U;
+       ++sequence)
+    too_many.push_back(sequence);
+  skipped(StatusSectionFrame("scene_changes", 4U, SceneChangesPayload(too_many),
+                             1U));
+  auto short_record = SceneChangeRecordValue(1U).as_object();
+  short_record.pop_back();
+  skipped(StatusSectionFrame(
+      "scene_changes", 5U,
+      CanonicalValue(CanonicalValue::Object{
+          {"records", CanonicalValue(CanonicalValue::Array{
+                          CanonicalValue(std::move(short_record))})}}),
+      1U));
+  skipped(StatusSectionFrame(
+      "scene_changes", 6U,
+      WithMember(SceneChangesPayload({1U}), "extra", CanonicalValue(true)), 1U));
+
+  // The four mirrored sections are unchanged and the subscription goes on.
+  const auto view_after = h.mirror.Load();
+  for (std::size_t index = 0U; index < view_before->sections.size(); ++index) {
+    EXPECT_EQ(view_after->sections[index].last_valid,
+              view_before->sections[index].last_valid)
+        << index;
+    EXPECT_EQ(view_after->sections[index].current,
+              view_before->sections[index].current)
+        << index;
+    EXPECT_EQ(view_after->sections[index].problem,
+              view_before->sections[index].problem)
+        << index;
+  }
+  EXPECT_EQ(h.Evaluate().root, known.root);
+  EXPECT_TRUE(h.Apply(StatusKeepaliveFrame(2U)).tick_advanced);
+  const auto later = h.Apply(
+      StatusSectionFrame("scene_changes", 7U, SceneChangesPayload({41U}), 2U));
+  ASSERT_TRUE(later.scene_changes.has_value());
+}
+
 TEST(ManagerStatusMirror, ViewerPoseSourcesOnlyWhileAnsweringAndBothCurrent) {
   Harness h;
   EXPECT_FALSE(h.mirror.ViewerPoseSources().has_value());

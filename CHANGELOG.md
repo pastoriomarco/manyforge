@@ -13,11 +13,12 @@ Upgrading: Load refuses a Scenario saved with 0.3.x and offers **Upgrade and
 load**: after a confirmation that lists the conversions, it converts the
 Scenario folder in place (Program v4, Deployment intent v3, one name and
 description, the renamed Program profile, no lane labels; see Breaking changes
-and Renamed),
-keeps the original next to it as
-`<name>.scenario.before-0.4.0-<UTC date and time>` and loads the result. A
-part that cannot be converted is named (`scenario_upgrade_conversion_failed`)
-and nothing changes. For batch use the scripts remain:
+and Renamed), keeps the original next to it as
+`<name>.scenario.before-0.4.0-<UTC date and time>` and loads the result. Over
+the API: `GET /api/scenario-documents/upgrade` lists the conversions a
+Scenario needs, `POST /api/scenario-documents/upgrade` runs them. A part that
+cannot be converted is named (`scenario_upgrade_conversion_failed`) and
+nothing changes. For batch use the scripts remain:
 `python3 scripts/convert_scenario_od46.py <Scenario folder>`, then
 `python3 scripts/convert_scenarios_od369.py <Scenario folder>`.
 
@@ -35,10 +36,16 @@ and nothing changes. For batch use the scripts remain:
   by itself (into `previous-runs/`) and says so; one whose container may still
   run is refused with `development_workbench_session_marker_outdated`.
   History retention is `manyforge.historian_retention.v4` (three partitions, each with its own
-  `record_byte_limit`). The Program run status is
-  `manyforge.program_run_status.v6` (`node_running_since_utc_ns`,
-  `node_wait_values`). The History filter `collision_rule_id` is now `rule_id`;
-  the old name is refused.
+  `record_byte_limit`). The control WebSocket is
+  `manyforge.execution_control.v5`: in `component_state` and `cell_latch` a
+  component's `fault` and `stop` carry `since_utc_ns`, a fault its `details`
+  (a launch fault's `output_tail`); `GET /api/components` returns the same
+  rows (a plain list without a format version). History's activity records are
+  `manyforge.activity_event.v2` (`program_reset_finished` requires
+  `reset_stored_values`; this unreleased v2 also carries the new
+  `scene_change_finished` facts, with `manager_start_id` and `sequence`).
+  The Program run status is `manyforge.program_run_status.v6` (`node_running_since_utc_ns`,
+  `node_wait_values`).
 - **Launcher formats.** The Program runner no longer has an HTTP port (9011);
   Headless and the launcher reach it over local sockets, so a launch
   configuration lists two endpoints (`composer`, `headless`). The formats are
@@ -59,8 +66,8 @@ and nothing changes. For batch use the scripts remain:
   `program_revision`, retained bundle, graph revision): `program_id` and
   `deployment_artifact_id` are gone from the Apply, run, operation and status
   payloads too. Loading a Scenario that still has these fields is refused
-  (`scenario_document_dropped_fields`);
-  `python3 scripts/convert_scenarios_od369.py <Scenario folder>` removes them
+  (`scenario_document_dropped_fields`); Upgrade and load, or
+  `python3 scripts/convert_scenarios_od369.py <Scenario folder>`, removes them
   and updates `scenario.yaml`. The separate Program and Deployment saves
   (`POST /api/program/save`, `/api/program/save-as`, `/api/deployment/save`,
   `/api/deployment/save-as`, their assistant tool actions and the
@@ -108,7 +115,8 @@ and nothing changes. For batch use the scripts remain:
   - **File formats.** Program `manyforge.program.v4`, Deployment
     `manyforge.deployment_intent.v3`, Program Binding
     `manyforge.program_binding.v4`, node catalog content 4.0.0. Older files
-    are refused. Convert a saved Scenario (or a single Program file) once:
+    are refused. Load offers **Upgrade and load** (see Upgrading); for a
+    single Program file or batch use,
     `python3 scripts/convert_scenario_od46.py path/to/my.scenario`. The script
     rewrites `program.yaml` and `deployment.yaml` together, prints what it
     changed, and names what it cannot convert. The bundled examples are
@@ -137,19 +145,54 @@ and nothing changes. For batch use the scripts remain:
   with the square of its fixed objects.
 - **The scene store is in memory only.** `logical-scene.sqlite3` and the
   Manager option `--logical-scene-database` are gone; the previous-session
-  report is `manyforge.workbench_previous_session.v3` without a scene family
-  (a pending v2 report is still accepted). A scene larger than the status
-  stream can publish is refused at commit with `scene_too_large`.
+  report has no scene family (see Observability formats; a pending v2 report
+  is still accepted). A scene larger than the status stream can publish is
+  refused at commit with `scene_too_large`.
 - **Removed error codes:** `kinematic_receiver_time_skew_exceeded` (see
-  Changed) and `native_projection_effective_policy_mismatch`.
+  Changed), `native_projection_effective_policy_mismatch`,
+  `manager_scene_runtime_transport_invalid`, the separate-save codes
+  `program_saved_baseline_not_adopted` and
+  `deployment_saved_baseline_not_adopted`, and the contact-policy,
+  support-contact and contact-grasp codes replaced by the collision rules
+  (for example `invalid_contact_policy`, `unknown_contact_policy_id`,
+  `penetration_exceeds_policy`, `support_contact_reference_exists`,
+  `motion_clearance_invalid`). Renamed codes are listed under Renamed.
 - **Removed Headless routes:** `GET /api/scene/runtime-owner`,
   `POST /api/scene/runtime-latch` and `POST /api/scene/transactions/status`;
   the Program runner reads and latches the scene at the Manager directly.
-- The `restorationGates` / `restoration_gates` field is removed from Composer
-  /health, its 503 reply and the node-environment data (it carried only
-  placeholder values). The node-environment projection is
-  `manyforge.node_environment_projection.v4` and the Program runner's node
-  availability `manyforge.node_execution_availability.v2`.
+  The Manager commands are `manyforge.manager_command.v4`
+  (`scene_owner_read` takes optional `scene_resource_ids`, the rows to read;
+  a scene transaction's `request_context` may name the HTTP request and its
+  transport for History); an earlier command is refused. The replies stay
+  `manyforge.manager_command_response.v3`.
+- **Composer `/health` drops `restorationGates`.** The `restorationGates` /
+  `restoration_gates` field is removed from Composer `/health`, its 503 reply
+  and the node-environment data (it carried only placeholder values). The
+  node-environment projection is `manyforge.node_environment_projection.v4`
+  and the Program runner's node availability
+  `manyforge.node_execution_availability.v2`.
+- **Save writes only what is applied** (Save Scenario, Save Scenario as, and
+  the Program and Deployment Save into the open Scenario), so every saved
+  Scenario loads again. With Draft edits that are not applied, Save asks once
+  and writes the applied state; the Drafts keep the edits. Over the API the
+  request needs `confirmUnappliedExcluded: true`, else it is refused with
+  `scenario_save_unapplied_edits`. Such a save records the Scenario as
+  `ready`.
+- **Scenario lane labels removed** (file format change). The Program's
+  `compatibility.lanes` and the Deployment's `compatibility.lane` are gone,
+  with the **Supported lanes** checkboxes in Program settings; a Program or
+  Deployment that still names them is refused (Load of a saved Scenario with
+  `scenario_document_dropped_fields`). Upgrade and load, or
+  `scripts/convert_scenarios_od369.py`, removes them. Each
+  component's own lane is the only lane, and one Scenario may mix lanes.
+  Component-catalog entries from example Scenarios now carry their row's own
+  lane.
+- **Model sources and scene meshes only from allowed folders.** A Deployment
+  model source (`urdf`, `srdf`, `package_roots`) or a Program scene mesh
+  outside the allowed folders (the checkout, `examples/`, the site
+  `project_folders`) is now refused, naming the path and the allowed folders;
+  the Manager option `--scene-asset-root` is removed. See "Scene meshes from
+  any project folder" under Changed.
 
 ### Added
 
@@ -174,15 +217,22 @@ and nothing changes. For batch use the scripts remain:
     operation or an escalated Stop writes the trace automatically). Records
     name their caller (`request_id`, transport `http`/`ws`/`mcp`). Program
     node attempts have their own retention budget.
-  - Refusals carry their typed details (for example the age and limit of an
-    expired control); a launch fault carries the process's last output lines;
-    a fault and a component stop carry `since_utc_ns`.
+  - Refusals, the ones the Program runner receives included, carry their
+    typed code and details (for example the age and limit of an expired
+    control); a launch fault carries the process's last output lines; a fault
+    and a component stop carry `since_utc_ns`.
+  - A start that finds the previous container removed without its console
+    output says so (`previous container <id> was removed without console
+    evidence`) and continues; a start whose container exits or is not ready
+    prints its last 200 console lines with Docker's times.
   - `python -m manyforge_headless_api history export` and
     `./manyforge collect [--list]`; evidence captures have timestamps and are
     kept to the newest 10.
-  - Composer: History with UTC date and milliseconds, the recorded event with
-    Copy, Set filter, Follow and a run timeline; recent notices; waits show the
-    current value and how long they have waited.
+  - Composer: History shows local time with milliseconds (the date on each
+    row, the full UTC time in the tooltip); times are stored and exported in
+    UTC. Also the recorded event with Copy, Set filter, Follow and a run
+    timeline; recent notices; waiting conditions (see below). A fault's start,
+    a failure capture and a recent notice show local time the same way.
 - **Springs.** A contact rule with `max_compression_step_m` is a spring: the
   pair may press in up to `max_penetration_m` (the stroke), and the overlap
   may grow by at most the step limit between samples, checked at most 1 mm of
@@ -216,15 +266,14 @@ and nothing changes. For batch use the scripts remain:
   gripper's fingers and every carried object; a stale or missing peer follows
   the stream-stale rule.
 - **Waiting conditions are shown.** While a Program waits for a key value, an
-  input or a gripper state, the viewer's Activity row lists each condition and
-  the nodes waiting on it. An open operator question shows as a warning with
-  one button per answer.
+  input or a gripper state, the viewer's Activity row lists each condition,
+  its current value, how long it has waited and the nodes waiting on it. An
+  open operator question shows as a warning with one button per answer.
 - **A Scenario's default 3D view.** Viewer settings → Default view saves the
   camera; Load and Reset camera go to it.
 - **Program reference status on the Program tab:** a dot, green when every
   reference resolves, red with the count of issues, grey when unknown; it
   opens the list.
-
 - **Tools made from parameters.** The Tool model (`manyforge.tool`) makes a
   tool without a controller of its own from its parameters: a body, chains of
   fixed elements leading to its tool ends (jaw pairs, spring sliders, probe
@@ -241,7 +290,6 @@ and nothing changes. For batch use the scripts remain:
   Export names the meshes where they are, or copies them into the export
   folder.
   [Adding a component](docs/authoring/ADDING_A_COMPONENT.md#a-tool-from-its-parameters).
-
 - **Current key values in the Keys panel.** The viewer's **Keys** panel
   lists every declared key of the run with its type and current value
   (poses compact), re-read while the panel is open whenever the run's state
@@ -303,9 +351,8 @@ and nothing changes. For batch use the scripts remain:
   model `manyforge.io_bank_64x64` (`I0`-`I63`, `Q0`-`Q63`) is offered by Add
   component; Mock and Isaac lanes use the host's Mock I/O. `sim_plc` gains a
   bank mode (`mode: bank`) with test switches. The xArm's I/O read-back now
-  runs on the same shared bank tracker, unchanged. Guide:
-  docs/authoring/IO_BANKS.md, with a ROXSIE example.
-
+  runs on the same shared bank tracker, unchanged. See
+  [I/O banks](docs/authoring/IO_BANKS.md), with a ROXSIE example.
 - **A prebuilt ManyForge image.** GitHub builds the complete application
   (native programs, Python modules, the built GUI) for amd64 and arm64 on the
   release's ROS image and publishes it as
@@ -367,15 +414,40 @@ and nothing changes. For batch use the scripts remain:
   (node instance, node type, run, attempt, start time, duration, result with
   its typed error, and for a scene node the scene operation and object), and
   one `scene_change_finished` event per scene change made outside a Program
-  node (Composer, the assistant, MCP, any HTTP caller, and the Program
-  runner's own scene preparation and clears): the operation, object, caller,
-  time taken, result and committed scene revision.
-  A run's node timeline and its scene changes can be read afterwards; the
-  events stay within History's existing retention limits. See
+  node, whoever made it (Composer, the assistant, MCP, any HTTP caller, the
+  Program runner's own scene preparation and clears, the execution host):
+  the operation, object, caller, the Manager's commit time, result and
+  committed scene revision. Headless records them from the Manager's status
+  stream (`manyforge.manager_status_stream.v2`, new `scene_changes`
+  section); changes it could not read in time are one lost-records event.
+  A run's node timeline and its scene changes can be read afterwards. Node
+  attempt events have their own History retention budget (see Observability
+  formats). See
   [History](docs/operations/OBSERVABILITY.md).
 
 ### Changed
 
+- **Program steps are faster.** The Program runner no longer calls Headless
+  over HTTP: a C++ core in the runner (Headless uses the same one) sends each
+  effect over local sockets, scene reads, commits and the between-node latch
+  to the Manager, motion, gripper, I/O, value and rule requests to the
+  execution host. These calls no longer run on the Program tick, and an
+  owner's answer, or a change of an operation or planning job the run waits
+  for, wakes the run at once instead of at its next 10 ms tick. A Scene node
+  reads only its own object from the Manager, and a run's first frame-pose
+  read uses the run's sealed sources instead of reading the Program files
+  again. A scene change itself does less work: the
+  static-body class rule above, one validation and one digest per commit,
+  fewer Manager-to-host calls (the scene owner no longer holds its lock across
+  them; a concurrent change is refused as `stale_revision`), pose-only updates
+  without a policy projection, and a publication wait that reads only the
+  committed revision; GUI and API scene reads skip a second refresh whose
+  result was discarded. Results are unchanged: a refusal reaches the node with
+  its typed code and details, a value write returns the execution host's
+  result, and Resume, replanning, Retry and Continue after a Stop of one robot
+  work as before. The Program's own Stop nodes never wait behind the run's
+  other requests: they are sent at once and withdraw the motion and gripper
+  starts the run queued before them.
 - **Reset stored values is its own Reset option.** **Reload initial scene**
   now reloads only the Scene and keeps stored values. The new option
   **Reset stored values to their initial values** (off by default,
@@ -387,14 +459,6 @@ and nothing changes. For batch use the scripts remain:
   `reset_options` and History's `program_reset_finished` record carry it. A
   client that relied on Reload initial scene to reset stored values sends
   `reset_stored_values: true`.
-- **Scene changes are about three times faster.** A Program scene step
-  (add, move, remove, attach, detach) took 140-200 ms on a Jetson Thor and
-  now takes 35-60 ms: the static-body class rule above, one validation and
-  one digest per commit, fewer Manager-to-host calls (the scene owner no
-  longer holds its lock across them; a concurrent change is refused as
-  `stale_revision`), pose-only updates without a policy projection, the
-  Headless scene read without the discarded second refresh, and a
-  publication wait that reads only the committed revision.
 - **A component fault stops every robot in motion.** When any component
   (robot, tool or I/O device) enters a fault while motion runs, every moving
   robot stops with its fault Stop profile, as for a runtime collision, in
@@ -425,20 +489,11 @@ and nothing changes. For batch use the scripts remain:
 - **Keys panel:** a stored key offers Edit value, Edit initial (opens its
   declaration) and Reset to initial. The panels over the 3D viewer are
   semi-transparent.
-
-- **Save writes only what is applied** (Save Scenario, Save Scenario as, and
-  the Program and Deployment Save into the open Scenario), so every saved
-  Scenario loads again. With Draft edits that are not applied, Save asks once
-  and writes the applied state; the Drafts keep the edits. Over the API the
-  request needs `confirmUnappliedExcluded: true`, else it is refused with
-  `scenario_save_unapplied_edits`. Such a save records the Scenario as
-  `ready`.
 - **Collision geometry comes from the model.** A model-bearing component's
   collision links that no named body covers form its `default_collision` body;
   an unbound default contributes nothing.
 - **The runtime blackboard editor moved to the viewer's Keys panel** (with the
   stored values); Program run details keep the audit.
-
 - **Scene meshes from any project folder reach collision checks and the
   planner.** Apply (Load, Program Apply, Revert) stores a copy of every Program
   scene mesh in the activation, named by its content, as it does for model
@@ -449,17 +504,14 @@ and nothing changes. For batch use the scripts remain:
   in the viewer, Load, Apply and Export, for scene meshes and for Deployment
   model sources (`urdf`, `srdf`, `package_roots`): relative to the Scenario
   project folder, or absolute, inside an allowed folder (the checkout,
-  `examples/`, the site `project_folders`); a model source or mesh outside
-  them is now refused, naming the path and the allowed folders; no URI scheme
-  in a mesh path, no current-directory fallback. The planner worker keeps
-  running across projections whose scene content is unchanged. A re-Apply
-  uses the current file content (`scene_mesh_content_changed` is gone). The
-  bundled examples' mesh paths are now project-relative. Formats: activation
-  preparation request v5, prepared activation v8, logical-scene store v13,
-  planner worker protocol 17; the Manager option `--scene-asset-root` is
-  removed. See
+  `examples/`, the site `project_folders`; anything outside is refused, see
+  Breaking changes); no URI scheme in a mesh path, no current-directory
+  fallback. The planner worker keeps running across projections whose scene
+  content is unchanged. A re-Apply uses the current file content
+  (`scene_mesh_content_changed` is gone). The bundled examples' mesh paths are
+  now project-relative. Formats: activation preparation request v5, prepared
+  activation v8, planner worker protocol 17. See
   [Paths inside a project](docs/operations/DEVELOPMENT_WORKBENCH.md#paths-inside-a-project).
-
 - **Component descriptors are `manyforge.component_package.v2`** (file
   format change). Version 2 adds an optional `index` per signal of a
   model-form I/O device and leaves its `lanes.real` keys other than
@@ -474,15 +526,6 @@ and nothing changes. For batch use the scripts remain:
   mode does.
 - **`start --project` also accepts a project in a project folder**, by its
   absolute host path, besides `examples/`.
-- **Scenario lane labels removed** (file format change). The Program's
-  `compatibility.lanes` and the Deployment's `compatibility.lane` are gone,
-  with the **Supported lanes** checkboxes in Program settings; a Program or
-  Deployment that still names them is refused (Load of a saved Scenario with
-  `scenario_document_dropped_fields`). Upgrade and load, or
-  `scripts/convert_scenarios_od369.py`, removes them. Each
-  component's own lane is the only lane, and one Scenario may mix lanes.
-  Component-catalog entries from example Scenarios now carry their row's own
-  lane.
 - **`node_outcome.<node>` is `none` again at each new attempt** of the node
   (tree entry, operator Retry, a hold release, automatic retry); it still
   changes to the outcome when the node ends. Before, it kept the previous
@@ -502,6 +545,25 @@ and nothing changes. For batch use the scripts remain:
   by their Run or Resume); a `stop_program_selection` request from the
   Program runner may name `stopped_by_node_instance_id`. The group rows'
   `stopped_by` comes from there.
+- **ROS file logging is off.** No ROS node ManyForge launches writes log
+  files of its own; only the ROS 2 launch framework's `launch.log` stays.
+  Console output and `/rosout` are unchanged. See
+  [Development workbench](docs/operations/DEVELOPMENT_WORKBENCH.md#reference).
+- **Motion traces in the run's folder.** The operator launcher sets
+  `MANYFORGE_MOTION_TRACE_DIR` to `<instance>/current/motion-traces` by
+  default, up to 64 MiB of trace files per run. See the
+  [Operator runbook](docs/operations/MANYFORGE_OPERATOR_RUNBOOK.md).
+- **Program keys navigator.** In the Program tab, key rows use the full width
+  and show the key's type and value (`type: <type> - value: <value>`), a
+  search box filters the keys, a namespace group shows its keys' names
+  without the namespace, and the namespace headers stay pinned while the list
+  scrolls.
+- **Manager replies up to 400 KiB.** Headless and the Program runner accept
+  every Manager reply up to the Manager's one bound, 400 KiB (the largest
+  scene plus its envelope); before, Headless refused a reply over 64 KiB
+  (`manager_command_response_invalid`), for example the read of a large
+  scene. A reply that would be larger is the Manager's own
+  `manager_command_response_oversized` refusal.
 
 ### Renamed
 
@@ -512,8 +574,8 @@ aliases: an old name is unknown, and an old environment variable is ignored.
   (`program_profile`, the node catalog's `min_program_profile`, skills'
   `compatible_profiles`; `composable-cell-v2` is now `manyforge-cell-v2`). A
   Scenario saved with the old profile is refused
-  (`scenario_program_profile_renamed`);
-  `python3 scripts/convert_scenarios_od369.py <Scenario folder | Program file>`
+  (`scenario_program_profile_renamed`); Upgrade and load, or
+  `python3 scripts/convert_scenarios_od369.py <Scenario folder | Program file>`,
   converts it and recomputes the digests and `program_revision`.
 - **Error codes:**
   - `i6_command_schema_unsupported` → `gripper_command_schema_unsupported`
@@ -608,7 +670,6 @@ aliases: an old name is unknown, and an old environment variable is ignored.
 - **A scene request too large for the execution host is refused,**
   `native_projection_rpc_bound_exceeded`, instead of ending the execution
   host and the application.
-
 - **The look-ahead checks the other robots where they are now.** It had been
   checking with the path only, without the peers' live positions.
 - **Reference validation works for a Deployment that relies on defaults**
@@ -616,11 +677,9 @@ aliases: an old name is unknown, and an old environment variable is ignored.
 - **Viewer:** a group stopped by a Program node no longer stretches the Motion
   panel over its neighbour; scene meshes without normals or material are
   shaded like primitives.
-
 - **Export of a Deployment with `package://` model resources.** Export
   refused every such Scenario ("invalid transfer shape"); it now copies the
   resources into the exported project, which loads and activates on its own.
-
 - **New empties the Scene again.** Since 0.3.0 each New removed only one
   object from the Scene: the Program Runner's check of each removal's receipt
   expected the wrong request key, so the clear stopped after the first object
@@ -638,6 +697,11 @@ aliases: an old name is unknown, and an old environment variable is ignored.
 - **A Scene clear that fails is shown:** New ends failed with *Scene clear
   failed*, *Scene partly cleared* or *Scene clear outcome unknown*, and a Load
   stops at its New.
+- **An Apply reports success only once the cell takes the next request.** An
+  Apply was reported `succeeded` while the Manager still held its Apply
+  claim, so a request in that short window was refused `authoring_not_ready`
+  (for example the Scene clear of a Load right after another Apply). Apply
+  status and its replay now answer `pending` until the claim is released.
 - **xArm: Enable after an e-stop works the first time, and the control loop
   no longer stalls.** The vendor hardware plugin switched every controller off
   and on by itself from its control loop at each change of the robot's

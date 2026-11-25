@@ -110,6 +110,9 @@ public:
     bool viewer_changed{};
     /// The frame showed a new tick of the Manager's main loop.
     bool tick_advanced{};
+    /// A usable `scene_changes` value (OD-400), not mirrored:
+    /// `{application_start_id, records}` for History's recorder.
+    std::optional<manyforge::content_identity::CanonicalValue> scene_changes;
   };
 
   ManagerStatusMirror(std::string cell_id, std::int64_t manager_silence_ns,

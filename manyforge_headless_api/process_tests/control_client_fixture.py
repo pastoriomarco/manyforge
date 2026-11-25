@@ -14,7 +14,7 @@ from websockets.sync.client import connect
 
 @contextmanager
 def composer_snapshot_stream(composer_url: str, *, client_id: str):
-    protocol = "manyforge.execution_control.v4"
+    protocol = "manyforge.execution_control.v5"
     url = composer_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
     with connect(
         url.rstrip("/") + "/ws/control",

@@ -11,10 +11,11 @@
 // reader only holds its own writer.
 //
 // Manager -> client, one packet per frame, RFC 8785 canonical JSON, each
-//   {"api_version": "manyforge.manager_status_stream.v1",
+//   {"api_version": "manyforge.manager_status_stream.v2",
 //    "application_start_id": <A>, "tick": <u64>, "type": ...}:
-//   snapshot  {generations: {logical_scene, manager, scene_runtime,
-//             viewer_pose_sessions}}  first frame; then one `section` frame
+//   snapshot  {generations: {logical_scene, manager, scene_changes,
+//             scene_runtime, viewer_pose_sessions}}  first frame; then one
+//             `section` frame
 //             per section with generation >= 1, each at or above the listed
 //             generation.
 //   section   {name, section: {generation, observed_at_ns, oversized,
@@ -29,9 +30,16 @@
 // the loop ran since. Sections: `manager` (`manyforge.manager_source.v2`),
 // `logical_scene` (`manyforge.logical_scene_source.v1`), `scene_runtime`
 // (`manyforge.scene_runtime_source.v1`), `viewer_pose_sessions`
-// (`{runtime_identity, sessions}`, fixed by this stream's version). A
-// section's generation starts at 1 in this start and rises only when its
-// payload bytes change; `observed_at_ns` is the producer's time of that value.
+// (`{runtime_identity, sessions}`, fixed by this stream's version),
+// `scene_changes` (`{records}`, fixed by this stream's version, OD-400: the
+// last `kSceneChangeRingCapacity` scene commit outcomes the command lane
+// decided outside a Program node attempt, replays left out, oldest first;
+// each `{duration_ms, error, operation_kind, outcome, principal_id,
+// request_id, scene_resource_id, scene_revision_id, sequence, source_label,
+// transport}`, `sequence` rising by 1 from 1 in this start; its texts are
+// bounded so the whole section always fits one frame). A section's
+// generation starts at 1 in this start and rises only when its payload bytes
+// change; `observed_at_ns` is the producer's time of that value.
 // `logical_scene` and `scene_runtime` have concurrent producers: each value
 // carries the number of the read it was built from, and the board keeps the
 // value of the highest number (OD-302), so a section never goes back.
@@ -66,12 +74,14 @@ enum class ManagerStatusSection : std::size_t {
   kLogicalScene = 1U,
   kSceneRuntime = 2U,
   kViewerPoseSessions = 3U,
+  kSceneChanges = 4U,
 };
-inline constexpr std::size_t kManagerStatusSectionCount = 4U;
-/// Section names in the fixed order the writer sends them.
+inline constexpr std::size_t kManagerStatusSectionCount = 5U;
+/// Section names in the fixed order the writer sends them: `scene_changes`
+/// after `logical_scene`, so a reader has the scene a record names.
 inline constexpr std::array<std::string_view, kManagerStatusSectionCount>
     kManagerStatusSectionNames{"manager", "logical_scene", "scene_runtime",
-                               "viewer_pose_sessions"};
+                               "viewer_pose_sessions", "scene_changes"};
 
 /// The newest value of every section and the main loop's tick. Producers
 /// publish from any thread, also under their own lock: `Publish` is memory
@@ -108,7 +118,15 @@ public:
   std::uint64_t Publish(const ManagerStatusSection section,
                         const std::int64_t observed_at_ns,
                         const content_identity::CanonicalValue &payload) {
-    return Store(section, std::nullopt, observed_at_ns, payload);
+    return Store(section, std::nullopt, observed_at_ns, Encoded(payload));
+  }
+
+  /// As Publish, for a payload the producer already holds as canonical JSON
+  /// (`scene_changes`, built from its encoded records without re-encoding).
+  std::uint64_t PublishEncoded(const ManagerStatusSection section,
+                               const std::int64_t observed_at_ns,
+                               std::shared_ptr<const std::string> payload) {
+    return Store(section, std::nullopt, observed_at_ns, std::move(payload));
   }
 
   /// For a section with concurrent producers (`logical_scene`,
@@ -122,7 +140,7 @@ public:
                                const std::uint64_t order,
                                const std::int64_t observed_at_ns,
                                const content_identity::CanonicalValue &payload) {
-    return Store(section, order, observed_at_ns, payload);
+    return Store(section, order, observed_at_ns, Encoded(payload));
   }
 
   /// One status tick of the main loop (only the loop calls it).
@@ -155,12 +173,16 @@ public:
   }
 
 private:
+  [[nodiscard]] static std::shared_ptr<const std::string>
+  Encoded(const content_identity::CanonicalValue &payload) {
+    return std::make_shared<const std::string>(
+        content_identity::canonical_json(payload));
+  }
+
   std::uint64_t Store(const ManagerStatusSection section,
                       const std::optional<std::uint64_t> order,
                       const std::int64_t observed_at_ns,
-                      const content_identity::CanonicalValue &payload) {
-    auto bytes = std::make_shared<const std::string>(
-        content_identity::canonical_json(payload));
+                      std::shared_ptr<const std::string> bytes) {
     const auto index = static_cast<std::size_t>(section);
     auto current = view_.load();
     for (;;) {
@@ -311,10 +333,11 @@ private:
   }
 
   [[nodiscard]] std::string Snapshot(const ManagerStatusBoard::View &view) const {
-    // Canonical order of the four names.
+    // Canonical order of the five names.
     std::string generations = "\"generations\":{";
     generations += "\"logical_scene\":" + Number(view.sections[1].generation);
     generations += ",\"manager\":" + Number(view.sections[0].generation);
+    generations += ",\"scene_changes\":" + Number(view.sections[4].generation);
     generations += ",\"scene_runtime\":" + Number(view.sections[2].generation);
     generations +=
         ",\"viewer_pose_sessions\":" + Number(view.sections[3].generation);

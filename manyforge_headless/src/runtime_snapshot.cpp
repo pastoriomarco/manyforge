@@ -284,6 +284,33 @@ std::uint64_t StreamCounter(const CanonicalValue &object,
   return static_cast<std::uint64_t>(number);
 }
 
+/// The `scene_changes` section's value (OD-400): `{records}`, at most
+/// `kSceneChangeRingCapacity` closed records with consecutive sequences.
+/// The record's own fields are checked again where History takes it.
+void ValidateSceneChanges(const CanonicalValue &payload) {
+  static constexpr std::array<std::string_view, 11> kFields{
+      "duration_ms",       "error",           "operation_kind", "outcome",
+      "principal_id",      "request_id",      "scene_resource_id",
+      "scene_revision_id", "sequence",        "source_label",   "transport"};
+  Require(payload.is_object() && payload.as_object().size() == 1U,
+          "scene_changes is not the closed shape");
+  const auto &records = RequiredMember(payload, "records");
+  Require(records.is_array() &&
+              records.as_array().size() <= kSceneChangeRingCapacity,
+          "scene_changes records are invalid");
+  std::uint64_t previous = 0U;
+  for (const auto &record : records.as_array()) {
+    Require(record.is_object() && record.as_object().size() == kFields.size(),
+            "scene change record is not the closed shape");
+    for (const auto name : kFields)
+      static_cast<void>(RequiredMember(record, name));
+    const auto sequence = StreamCounter(record, "sequence");
+    Require(sequence >= 1U && (previous == 0U || sequence == previous + 1U),
+            "scene change sequences are not consecutive");
+    previous = sequence;
+  }
+}
+
 enum class Freshness {
   kFresh,
   kStale,
@@ -497,10 +524,12 @@ ManagerStatusMirror::Apply(const std::string_view frame) {
   if (kind == "snapshot") {
     const auto *generations = root.find_object_member("generations");
     if (root.as_object().size() != 5U || generations == nullptr ||
-        !generations->is_object() || generations->as_object().size() != kSectionCount)
-      StreamInvalid("snapshot frame is not the closed v1 shape");
+        !generations->is_object() ||
+        generations->as_object().size() != kSectionCount + 1U)
+      StreamInvalid("snapshot frame is not the closed v2 shape");
     for (const auto &role : kRoles)
       static_cast<void>(StreamCounter(*generations, role.name));
+    static_cast<void>(StreamCounter(*generations, "scene_changes"));
     // A new subscription: every section waits for its own frame.
     next->connection = Connection::kConnected;
     for (auto &section : next->sections) {
@@ -517,7 +546,7 @@ ManagerStatusMirror::Apply(const std::string_view frame) {
     if (advanced)
       next->last_tick_advance_ns = now;
     view_.store(std::move(next));
-    return {true, true, advanced};
+    return {true, true, advanced, std::nullopt};
   }
   if (current->connection != Connection::kConnected)
     StreamInvalid("frame before the snapshot");
@@ -530,17 +559,18 @@ ManagerStatusMirror::Apply(const std::string_view frame) {
   }
   if (kind == "keepalive") {
     if (root.as_object().size() != 4U)
-      StreamInvalid("keepalive frame is not the closed v1 shape");
+      StreamInvalid("keepalive frame is not the closed v2 shape");
   } else if (kind == "section") {
     const auto *name = root.find_object_member("name");
     const auto *value = root.find_object_member("section");
     if (root.as_object().size() != 6U || name == nullptr || !name->is_string() ||
         value == nullptr || !value->is_object() || value->as_object().size() != 4U)
-      StreamInvalid("section frame is not the closed v1 shape");
+      StreamInvalid("section frame is not the closed v2 shape");
+    const bool scene_changes = name->as_string() == "scene_changes";
     const auto role = std::find_if(kRoles.begin(), kRoles.end(), [&](const auto &entry) {
       return entry.name == name->as_string();
     });
-    if (role == kRoles.end())
+    if (role == kRoles.end() && !scene_changes)
       StreamInvalid("section frame names an unknown section");
     const auto index = static_cast<std::size_t>(role - kRoles.begin());
     const auto generation = StreamCounter(*value, "generation");
@@ -557,7 +587,24 @@ ManagerStatusMirror::Apply(const std::string_view frame) {
     }
     if (generation == 0U || oversized == nullptr || !oversized->is_bool() ||
         payload == nullptr || oversized->as_bool() != payload->is_null())
-      StreamInvalid("section value is not the closed v1 shape");
+      StreamInvalid("section value is not the closed v2 shape");
+    if (scene_changes) {
+      // Not mirrored: a usable value goes to History's recorder (OD-400). Its
+      // records are bounded so the section always fits a frame; an unusable
+      // value is skipped, and the next one still holds its records.
+      if (!oversized->as_bool()) {
+        try {
+          ValidateSceneChanges(*payload);
+          result.scene_changes = CanonicalValue(CanonicalValue::Object{
+              {"application_start_id", CanonicalValue(start->as_string())},
+              {"records", RequiredMember(*payload, "records")},
+          });
+        } catch (const std::exception &) {
+        }
+      }
+      view_.store(std::move(next));
+      return result;
+    }
     auto &section = next->sections[index];
     const auto before = section;
     section.current = true;

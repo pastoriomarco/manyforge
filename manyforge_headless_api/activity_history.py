@@ -34,7 +34,7 @@ from .control_protocol import is_stop_command
 from .execution_control import ExecutionControlBusyError
 from .identity import format_request_key, http_request_key, websocket_request_key
 
-SCHEMA_VERSION: Final = "manyforge.activity_event.v1"
+SCHEMA_VERSION: Final = "manyforge.activity_event.v2"
 APPLY_KINDS: Final = frozenset({
     "scenario_load", "scenario_new", "deployment_apply", "deployment_revert",
     "program_apply", "program_revert",
@@ -58,7 +58,7 @@ PROGRAM_NODE_ATTEMPT_FIELDS: Final = (
 SCENE_CHANGE_OUTCOMES: Final = frozenset({"succeeded", "refused", "failed", "unknown"})
 SCENE_CHANGE_FIELDS: Final = (
     "scene_resource_id", "source_label", "principal_id", "duration_ms",
-    "scene_revision_id",
+    "scene_revision_id", "manager_start_id", "sequence",
 )
 # The host's `component_action_interrupted_by_stop` failure reads as interrupted.
 INTERRUPTED_CODE: Final = "component_action_interrupted_by_stop"
@@ -298,8 +298,10 @@ def scene_change_record(
     operation_kind: str, outcome: str, error: Any, scene_change: Mapping[str, Any]
 ) -> dict[str, Any]:
     """One scene change outside a Program node (GUI, assistant, MCP, any HTTP
-    caller, the Program runner's own preparation and clears): the object, the
-    caller, the time it took and the scene revision it committed."""
+    caller, the Program runner, the execution host): the object, the caller,
+    the time it took, the scene revision it committed and, from the
+    Manager's stream, the Manager start and the change's sequence in it
+    (OD-400)."""
 
     typed = _typed_error(error) if outcome != "succeeded" else None
     facts = {name: scene_change.get(name) for name in SCENE_CHANGE_FIELDS}
@@ -320,6 +322,36 @@ def scene_change_record(
         "message": _bounded(" · ".join(parts), 4096),
         "scene_change": facts,
     }
+
+
+def scene_change_stream_record(
+    manager_start_id: str, change: Mapping[str, Any]
+) -> dict[str, Any]:
+    """One record of the Manager's ``scene_changes`` section (OD-400) as its
+    History event: the event its caller's scene commit recorded before,
+    with the caller the commit carried (request id and transport for an HTTP
+    caller), the Manager's commit time, the Manager start and the
+    sequence."""
+
+    return with_caller(scene_change_record(
+        change["operation_kind"], change["outcome"], change["error"], {
+            "scene_resource_id": change["scene_resource_id"],
+            "source_label": change["source_label"],
+            "principal_id": change["principal_id"],
+            "duration_ms": change["duration_ms"],
+            "scene_revision_id": change["scene_revision_id"],
+            "manager_start_id": manager_start_id,
+            "sequence": change["sequence"],
+        },
+    ), request_id=change["request_id"], transport=change["transport"],
+        source_label=change["source_label"], principal_id=change["principal_id"])
+
+
+def request_caller() -> dict[str, str]:
+    """The request this context serves (``request_id``, ``transport``), for a
+    scene commit to carry to the Manager (OD-400); empty outside a request."""
+
+    return dict(_REQUEST_CALLER.get() or {})
 
 
 def bind_request_caller(request_id: str, transport: str) -> Token:
@@ -656,8 +688,10 @@ __all__ = [
     "program_node_attempt_record",
     "program_reset_record",
     "record_activity",
+    "request_caller",
     "runner_reply_outcome",
     "scene_change_record",
+    "scene_change_stream_record",
     "unbind_request_caller",
     "with_caller",
 ]

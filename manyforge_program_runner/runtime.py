@@ -67,6 +67,7 @@ from manyforge_behavior.production_ports import (
     NativeKernelProgramPort,
     ProductionPortError,
     ProgramMotionPreviewUnavailableError,
+    SceneOwnerRefusedError,
     SimulationResetPoseSourceTaskPort,
 )
 from manyforge_behavior.program_run_owner import (
@@ -272,6 +273,23 @@ def _scheduling_cause(error: Exception) -> str | None:
     """The typed cause a tick-host refusal carries (OD-267), else None."""
 
     return error.code if isinstance(error, ProgramSchedulingError) else None
+
+
+def _typed_cause_details(error: Exception) -> dict[str, str] | None:
+    """An owner failure's typed cause, as a HeadlessClientError carried it:
+    its ``code`` (else its ``details.reason``) and its ``producer`` when known."""
+
+    code = getattr(error, "code", None)
+    if not isinstance(code, str) or not code:
+        details = getattr(error, "details", None)
+        code = details.get("reason") if isinstance(details, Mapping) else None
+    if not isinstance(code, str) or not code:
+        return None
+    cause = {"cause_code": code}
+    producer = getattr(error, "producer", None)
+    if isinstance(producer, str) and producer:
+        cause["cause_producer"] = producer
+    return cause
 
 
 # OD-214: the codes that decide a command row's outcome (contract §0.1).
@@ -750,7 +768,6 @@ class ProgramRuntime:
                 else None
             ),
             program_node_evidence=self._program_node_admission_evidence,
-            record_scene_change=self._record_scene_change,
             read_limit_s=min(config.headless_timeout_seconds, 30.0),
         )
         if follows_events:
@@ -2776,6 +2793,15 @@ class ProgramRuntime:
                 "program_cycle_reset_scene_preparation_failed",
                 str(error),
                 details={"cause_code": error.code, "cause_producer": error.producer},
+            ) from error
+        except (core.GatewayError, SceneOwnerRefusedError, ProductionPortError) as error:
+            # The owner reads and commits of the scene port (D1): a gateway
+            # failure, a typed owner refusal, or a refused scene read whose
+            # owner code is its ``details.reason``.
+            raise ProgramRunnerError(
+                "program_cycle_reset_scene_preparation_failed",
+                str(error) or type(error).__name__,
+                details=_typed_cause_details(error),
             ) from error
         except (ProgramRunOwnerError, ProgramSchedulingError) as error:
             cause = self._runner_error(error)
@@ -7250,22 +7276,6 @@ class ProgramRuntime:
             raise
         self._record_reset(request, None)
         return result
-
-    def _record_scene_change(self, record: Mapping[str, Any]) -> None:
-        """One scene change outside a Program node into History (OD-375): the
-        runner commits at the Manager, so it sends the record Headless's
-        scene route used to write for it."""
-
-        try:
-            self._headless.record_scene_change(
-                {**record, "application_start_id": self.application_start_id}
-            )
-        except Exception:  # noqa: BLE001 - a lost History line never fails the change
-            _LOGGER.warning(
-                "scene_change_record_failed",
-                extra={"operation_kind": record.get("operation_kind")},
-                exc_info=True,
-            )
 
     def _record_reset(
         self, request: ProgramCycleResetRequest, error: Exception | None

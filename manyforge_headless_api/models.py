@@ -3851,43 +3851,6 @@ class ProgramResetOutcomeRequest(StrictRequest):
     reset: ProgramResetFactsRequest
 
 
-class SceneChangeErrorRequest(StrictRequest):
-    """The typed error of a refused, failed or unknown scene change."""
-
-    code: Annotated[str, Field(min_length=1, max_length=256)]
-    message: _ActivityText | None = None
-    # The owner's structured details; History keeps them when they fit.
-    details: dict[str, Any] | None = None
-
-
-class SceneChangeFactsRequest(StrictRequest):
-    """What one scene change did: its object, its caller's source label, the
-    time the owner call took and the scene revision it committed."""
-
-    scene_resource_id: Annotated[str, Field(min_length=1, max_length=512)] | None = None
-    source_label: Annotated[str, Field(min_length=1, max_length=256)]
-    duration_ms: Annotated[float, Field(ge=0)]
-    scene_revision_id: _ResetNumber | None = None
-
-
-class SceneChangeRecordRequest(StrictRequest):
-    """`POST /api/execution/history/scene-changes`: one scene change the
-    Program Runner made outside a Program node attempt (its initial-scene
-    preparation, a Program Reset's reload, the empty-Apply clear), recorded
-    once in History."""
-
-    # Checked once at the route (contract 1.6).
-    application_start_id: str | None = Field(default=None, exclude=True)
-    operation_kind: Literal[
-        "add_object", "upsert_object", "remove_object", "update_object_pose",
-        "attach_carried_object", "detach_carried_object",
-        "detach_carried_object_at_current_pose", "set_collision_policy",
-    ]
-    outcome: Literal["succeeded", "refused", "failed", "unknown"]
-    error: SceneChangeErrorRequest | None = None
-    scene_change: SceneChangeFactsRequest
-
-
 # The wall-clock form History reads (RFC 3339 with an explicit offset).
 _WALL_TIME_PATTERN = (
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}:[0-9]{2}:[0-9]{2}"

@@ -3,6 +3,7 @@
 // real bounds; no forced deadlock, signal or resource exhaustion.
 
 #include "../src/manager_status_stream.hpp"
+#include "../src/scene_change_ring_internal.hpp"
 
 #include <gtest/gtest.h>
 
@@ -210,7 +211,7 @@ TEST(ManagerStatusStream, SendsTheFullStateAtConnect) {
   ASSERT_TRUE(snapshot.has_value());
   EXPECT_EQ(Type(*snapshot), "snapshot");
   EXPECT_EQ(snapshot->find_object_member("api_version")->as_string(),
-            "manyforge.manager_status_stream.v1");
+            "manyforge.manager_status_stream.v2");
   EXPECT_EQ(snapshot->find_object_member("application_start_id")->as_string(), kStart);
   EXPECT_EQ(Tick(*snapshot), 1U);
   const auto *generations = snapshot->find_object_member("generations");
@@ -218,6 +219,8 @@ TEST(ManagerStatusStream, SendsTheFullStateAtConnect) {
   EXPECT_EQ(generations->find_object_member("logical_scene")->as_number(), 0.0);
   EXPECT_EQ(generations->find_object_member("scene_runtime")->as_number(), 1.0);
   EXPECT_EQ(generations->find_object_member("viewer_pose_sessions")->as_number(), 0.0);
+  EXPECT_EQ(generations->find_object_member("scene_changes")->as_number(), 0.0);
+  EXPECT_EQ(generations->as_object().size(), 5U);
   const auto manager = Receive(client.get());
   ASSERT_TRUE(manager.has_value());
   EXPECT_EQ(Type(*manager), "section");
@@ -231,6 +234,52 @@ TEST(ManagerStatusStream, SendsTheFullStateAtConnect) {
   EXPECT_EQ(Name(*runtime), "scene_runtime");
   // Never published sections are not sent; nothing else follows.
   EXPECT_FALSE(Receive(client.get(), 150ms).has_value());
+}
+
+// OD-400: `scene_changes` is published as encoded bytes and sent as an
+// ordinary section frame, after the other four.
+TEST(ManagerStatusStream, SendsAnEncodedSceneChangesValueAsASectionFrame) {
+  Fixture fixture;
+  const auto records = std::make_shared<const std::string>(
+      R"({"records":[{"sequence":1}]})");
+  EXPECT_EQ(fixture.board.PublishEncoded(ManagerStatusSection::kSceneChanges, 3,
+                                         records),
+            1U);
+  // The same bytes again keep the generation.
+  EXPECT_EQ(fixture.board.PublishEncoded(
+                ManagerStatusSection::kSceneChanges, 4,
+                std::make_shared<const std::string>(*records)),
+            1U);
+  fixture.Publish(ManagerStatusSection::kViewerPoseSessions, "viewer");
+  const auto client = fixture.Subscribe();
+  const auto snapshot = Receive(client.get());
+  ASSERT_TRUE(snapshot.has_value());
+  const auto *generations = snapshot->find_object_member("generations");
+  ASSERT_NE(generations, nullptr);
+  ASSERT_EQ(generations->as_object().size(), 5U);
+  EXPECT_EQ(generations->find_object_member("scene_changes")->as_number(), 1.0);
+  const auto viewer = Receive(client.get());
+  ASSERT_TRUE(viewer.has_value());
+  EXPECT_EQ(Name(*viewer), "viewer_pose_sessions");
+  const auto changes = Receive(client.get());
+  ASSERT_TRUE(changes.has_value());
+  EXPECT_EQ(Type(*changes), "section");
+  EXPECT_EQ(Name(*changes), "scene_changes");
+  EXPECT_EQ(Generation(*changes), 1U);
+  EXPECT_EQ(Value(*changes).find_object_member("observed_at_ns")->as_number(), 3.0);
+  EXPECT_EQ(content_identity::canonical_json(
+                *Value(*changes).find_object_member("payload")),
+            *records);
+  // A new value is sent at once.
+  static_cast<void>(fixture.board.PublishEncoded(
+      ManagerStatusSection::kSceneChanges, 5,
+      std::make_shared<const std::string>(
+          R"({"records":[{"sequence":1},{"sequence":2}]})")));
+  fixture.board.NotifyIfChanged();
+  const auto next = Receive(client.get());
+  ASSERT_TRUE(next.has_value());
+  EXPECT_EQ(Name(*next), "scene_changes");
+  EXPECT_EQ(Generation(*next), 2U);
 }
 
 TEST(ManagerStatusStream, SendsAPartWhenItChangesAndNotOtherwise) {
@@ -409,6 +458,159 @@ TEST(ManagerStatusStream, AFifthSubscriberIsRefusedAndStopEndsEverySubscription)
   for (const auto &client : clients)
     EXPECT_FALSE(Receive(client.get(), 300ms).has_value());
   std::filesystem::remove_all(listener.directory);
+}
+
+
+// ---------------------------------------------------------------------------
+// The `scene_changes` section's records and ring (OD-400).
+// ---------------------------------------------------------------------------
+
+core::SceneTransactionRequestDTO SceneRequest(core::SceneOperationRequestDTO operation) {
+  core::SceneTransactionRequestDTO request{
+      core::PublicRequestContextDTO{core::RequestKey{}, "composer_ui"},
+      {},
+      {},
+      std::move(operation),
+      std::nullopt,
+  };
+  return request;
+}
+
+core::SceneTransactionRequestDTO AddObjectRequest() {
+  return SceneRequest(core::AddObjectRequestDTO{
+      core::SceneResourceId("box_1"),
+      core::BoxShapeDTO{{0.1, 0.2, 0.3}},
+      {},
+      core::CellSceneFrameRefDTO{core::CellId("cell-a")},
+  });
+}
+
+std::vector<double> Sequences(const std::string &payload) {
+  const auto value = parse_canonical_json(payload);
+  EXPECT_EQ(value.as_object().size(), 1U);
+  std::vector<double> sequences;
+  for (const auto &record : value.find_object_member("records")->as_array())
+    sequences.push_back(record.find_object_member("sequence")->as_number());
+  return sequences;
+}
+
+TEST(SceneChangeRing, KeepsTheLastRecordsOldestFirstWithConsecutiveSequences) {
+  detail::SceneChangeRing ring;
+  const auto request = AddObjectRequest();
+  EXPECT_EQ(ring.next_sequence(), 1U);
+  const auto first = ring.Add(detail::SceneChangeRecord(
+      ring.next_sequence(), request, "succeeded", nullptr, 1U, 1.0));
+  EXPECT_EQ(Sequences(*first), (std::vector<double>{1.0}));
+  std::shared_ptr<const std::string> payload;
+  for (std::uint64_t added = 2U; added <= 40U; ++added)
+    payload = ring.Add(detail::SceneChangeRecord(
+        ring.next_sequence(), request, "succeeded", nullptr, added, 1.0));
+  EXPECT_EQ(ring.next_sequence(), 41U);
+  std::vector<double> expected;
+  for (std::uint64_t sequence = 9U; sequence <= 40U; ++sequence)
+    expected.push_back(static_cast<double>(sequence));
+  ASSERT_EQ(expected.size(), kSceneChangeRingCapacity);
+  EXPECT_EQ(Sequences(*payload), expected);
+  // The payload is already canonical: the board stores it as sent.
+  EXPECT_EQ(content_identity::canonical_json(parse_canonical_json(*payload)),
+            *payload);
+}
+
+TEST(SceneChangeRecord, ASucceededAddCarriesItsRevisionAndCaller) {
+  auto request = AddObjectRequest();
+  request.request_id = "req-1";
+  request.request_transport = "http";
+  EXPECT_EQ(detail::SceneChangeRecord(7U, request, "succeeded", nullptr, 4U, 2.5),
+            R"({"duration_ms":2.5,"error":null,"operation_kind":"add_object",)"
+            R"("outcome":"succeeded","principal_id":null,"request_id":"req-1",)"
+            R"("scene_resource_id":"box_1","scene_revision_id":4,"sequence":7,)"
+            R"("source_label":"composer_ui","transport":"http"})");
+}
+
+TEST(SceneChangeRecord, ARefusedDetachNamesNoObjectAndCarriesItsTypedError) {
+  auto request = SceneRequest(core::DetachCarriedObjectRequestDTO{
+      core::CarriedObjectAttachmentId("attachment.1"),
+      core::CarriedObjectAttachmentRevision("revision.1"),
+      {},
+      core::CellSceneFrameRefDTO{core::CellId("cell-a")},
+  });
+  request.attribution.principal_id = "operator.7";
+  const core::ErrorDTO error{"carried_object_not_found", "No carried object",
+                             {{"attachment_id", "attachment.1"}}};
+  EXPECT_EQ(detail::SceneChangeRecord(1U, request, "refused", &error,
+                                      std::nullopt, 0.0),
+            R"({"duration_ms":0,"error":{"code":"carried_object_not_found",)"
+            R"("details":{"attachment_id":"attachment.1"},)"
+            R"("message":"No carried object"},)"
+            R"("operation_kind":"detach_carried_object","outcome":"refused",)"
+            R"("principal_id":"operator.7","request_id":null,)"
+            R"("scene_resource_id":null,"scene_revision_id":null,"sequence":1,)"
+            R"("source_label":"composer_ui","transport":null})");
+}
+
+TEST(SceneChangeRecord, BoundsTheMessageAtACodePointAndLeavesOutLongDetails) {
+  // "\xE2\x82\xAC" (3 bytes) straddles byte 2048: the cut ends before it.
+  const auto message = std::string(2047U, 'a') + "\xE2\x82\xAC" + "tail";
+  EXPECT_EQ(detail::SceneChangeText(message, detail::kSceneChangeTextBytes),
+            std::string(2047U, 'a'));
+  EXPECT_EQ(detail::SceneChangeText("short", detail::kSceneChangeTextBytes),
+            "short");
+  const core::ErrorDTO error{"scene_commit_failed", message,
+                             {{"blob", std::string(2100U, 'x')}}};
+  const auto record = parse_canonical_json(detail::SceneChangeRecord(
+      2U, AddObjectRequest(), "unknown", &error, std::nullopt, 1.0));
+  const auto &encoded = *record.find_object_member("error");
+  EXPECT_EQ(encoded.as_object().size(), 2U);
+  EXPECT_EQ(encoded.find_object_member("message")->as_string(),
+            std::string(2047U, 'a'));
+  EXPECT_EQ(encoded.find_object_member("details"), nullptr);
+  EXPECT_EQ(record.find_object_member("outcome")->as_string(), "unknown");
+}
+
+TEST(SceneChangeRecord, TheWholeSectionOfLargestRecordsAlwaysFitsOneFrame) {
+  // Every text at its bound in its most expensive encoding (control bytes
+  // are 6 bytes each, quotes and backslashes 2), details at their bound and
+  // the longest numbers: the static bound holds, so the section is never
+  // oversized (OD-400).
+  static_assert(detail::kSceneChangesPayloadMaximumBytes + 1024U <=
+                ManagerStatusStream::kMaximumFrameBytes);
+  auto request = AddObjectRequest();
+  request.request_context.source_label = std::string(400U, '\x01');
+  request.attribution.principal_id = std::string(400U, '"');
+  request.request_id = std::string(80U, 'r');
+  request.request_transport = "http";
+  std::get<core::AddObjectRequestDTO>(request.operation).scene_resource_id =
+      core::SceneResourceId(std::string(400U, '\\'));
+  const core::ErrorDTO error{std::string(400U, '\x01'), std::string(5000U, '\x01'),
+                             {{"k", std::string(2040U, 'x')}}};
+  detail::SceneChangeRing ring;
+  std::shared_ptr<const std::string> payload;
+  constexpr std::uint64_t kLargest = 9007199254740991ULL;
+  for (std::uint64_t index = 0U; index < 40U; ++index) {
+    auto record = detail::SceneChangeRecord(kLargest - 40U + index, request,
+                                            "succeeded", &error, kLargest,
+                                            -1.7976931348623157e308);
+    EXPECT_LE(record.size(), detail::kSceneChangeRecordMaximumBytes);
+    payload = ring.Add(std::move(record));
+  }
+  EXPECT_LE(payload->size(), detail::kSceneChangesPayloadMaximumBytes);
+  const auto value = parse_canonical_json(*payload);
+  const auto &records = value.find_object_member("records")->as_array();
+  ASSERT_EQ(records.size(), kSceneChangeRingCapacity);
+  const auto &first = records.front();
+  // The details at their bound are kept; each text is cut to its bound.
+  EXPECT_NE(first.find_object_member("error")->find_object_member("details"),
+            nullptr);
+  EXPECT_EQ(first.find_object_member("request_id")->as_string().size(), 64U);
+  EXPECT_EQ(first.find_object_member("source_label")->as_string().size(),
+            detail::kSceneChangeNameBytes / 6U);
+  EXPECT_EQ(first.find_object_member("principal_id")->as_string().size(),
+            detail::kSceneChangeNameBytes / 2U);
+  EXPECT_EQ(first.find_object_member("error")
+                ->find_object_member("message")
+                ->as_string()
+                .size(),
+            detail::kSceneChangeTextBytes / 6U);
 }
 
 } // namespace

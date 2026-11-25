@@ -247,7 +247,7 @@ def test_an_add_without_its_authorization_is_refused_before_any_capture(
 
     service, manager, preparer, _project, _site = cell
     recorded: list[object] = []
-    monkeypatch.setattr(service, "_record_scene_change", lambda *args: recorded.append(args))
+    monkeypatch.setattr(service, "_record_scene_change_failure", lambda *args: recorded.append(args))
 
     def refuse(request, *, trusted_principal_id, mesh_content_digest):
         manager.digests.append(mesh_content_digest)

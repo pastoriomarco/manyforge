@@ -26,7 +26,7 @@ from manyforge_headless_api.native import HeadlessApiError
 def _frame(kind: str, tick: int, **members: Any) -> bytes:
     return json.dumps(
         {
-            "api_version": "manyforge.manager_status_stream.v1",
+            "api_version": "manyforge.manager_status_stream.v2",
             "application_start_id": "0123456789abcdef",
             "tick": tick,
             "type": kind,
@@ -60,6 +60,13 @@ class FakeCore:
         section = value.get("name")
         return {
             "control_changed": section in ("manager", "logical_scene", "scene_runtime"),
+            # The native mirror hands a usable value over, not mirrored (OD-400).
+            "scene_changes": (
+                {"application_start_id": value["application_start_id"],
+                 "records": value["section"]["payload"]["records"]}
+                if section == "scene_changes" and not value["section"]["oversized"]
+                else None
+            ),
             "tick_advanced": advanced,
             "viewer_changed": section in ("scene_runtime", "viewer_pose_sessions"),
         }
@@ -147,7 +154,8 @@ def test_full_state_at_connect_and_each_change_reaches_the_mirror(run_root: Path
     try:
         connection = manager.accept()
         connection.send(_frame("snapshot", 1, generations={
-            "logical_scene": 1, "manager": 1, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+            "logical_scene": 1, "manager": 1, "scene_changes": 0, "scene_runtime": 0,
+            "viewer_pose_sessions": 0}))
         connection.send(_frame("section", 1, name="manager", section={
             "generation": 1, "observed_at_ns": 1, "oversized": False, "payload": {}}))
         assert _until(lambda: len(core.frames) == 2)
@@ -166,6 +174,37 @@ def test_full_state_at_connect_and_each_change_reaches_the_mirror(run_root: Path
         manager.close()
 
 
+def test_each_scene_changes_value_reaches_history_and_wakes_no_reader(run_root: Path) -> None:
+    manager = FakeManager(run_root)
+    core, wakes = FakeCore(), Wakes()
+    handed: list[dict[str, Any]] = []
+    follower = ManagerStatusFollower(
+        core, run_root, silence_seconds=0.4, on_control_change=wakes.on_control,
+        on_viewer_change=wakes.on_viewer, on_scene_changes=handed.append,
+        backoff_seconds=(0.02, 0.05),
+    )
+    follower.start()
+    try:
+        connection = manager.accept()
+        connection.send(_frame("snapshot", 1, generations={
+            "logical_scene": 0, "manager": 0, "scene_changes": 0, "scene_runtime": 0,
+            "viewer_pose_sessions": 0}))
+        assert wakes.wait(lambda: wakes.control == 1 and wakes.viewer == 1)
+        records = [{"sequence": 1}, {"sequence": 2}]
+        connection.send(_frame("section", 1, name="scene_changes", section={
+            "generation": 1, "observed_at_ns": 1, "oversized": False,
+            "payload": {"records": records}}))
+        connection.send(_frame("section", 1, name="scene_changes", section={
+            "generation": 2, "observed_at_ns": 1, "oversized": True, "payload": None}))
+        assert _until(lambda: len(core.frames) == 3)
+        assert handed == [{"application_start_id": "0123456789abcdef", "records": records}]
+        assert (wakes.control, wakes.viewer) == (1, 1)
+        connection.close()
+    finally:
+        follower.shutdown()
+        manager.close()
+
+
 def test_silence_marks_not_answering_once_and_a_new_tick_restores_it(run_root: Path) -> None:
     manager = FakeManager(run_root)
     core, wakes = FakeCore(), Wakes()
@@ -174,7 +213,8 @@ def test_silence_marks_not_answering_once_and_a_new_tick_restores_it(run_root: P
     try:
         connection = manager.accept()
         connection.send(_frame("snapshot", 1, generations={
-            "logical_scene": 0, "manager": 0, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+            "logical_scene": 0, "manager": 0, "scene_changes": 0, "scene_runtime": 0,
+            "viewer_pose_sessions": 0}))
         assert wakes.wait(lambda: wakes.control == 1)
         started = time.monotonic()
         # A frame with the same tick (a lane publishing while the loop is
@@ -204,7 +244,8 @@ def test_the_connection_end_is_lost_at_once_and_the_follower_resubscribes(run_ro
     try:
         first = manager.accept()
         first.send(_frame("snapshot", 5, generations={
-            "logical_scene": 0, "manager": 1, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+            "logical_scene": 0, "manager": 1, "scene_changes": 0, "scene_runtime": 0,
+            "viewer_pose_sessions": 0}))
         assert wakes.wait(lambda: wakes.control == 1)
         closed = time.monotonic()
         first.close()  # The Manager ended (or restarted).
@@ -214,7 +255,8 @@ def test_the_connection_end_is_lost_at_once_and_the_follower_resubscribes(run_ro
         # The restarted Manager: a new subscription and its new state.
         second = manager.accept()
         second.send(_frame("snapshot", 1, generations={
-            "logical_scene": 0, "manager": 1, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+            "logical_scene": 0, "manager": 1, "scene_changes": 0, "scene_runtime": 0,
+            "viewer_pose_sessions": 0}))
         second.send(_frame("section", 1, name="manager", section={
             "generation": 1, "observed_at_ns": 9, "oversized": False, "payload": {"new": True}}))
         assert _until(lambda: core.frames[-1].get("name") == "manager")
@@ -235,14 +277,15 @@ def test_an_error_frame_reconnects_and_an_absent_socket_is_retried(run_root: Pat
         manager = FakeManager(run_root)
         refused = manager.accept()
         refused.send(json.dumps({
-            "api_version": "manyforge.manager_status_stream.v1",
+            "api_version": "manyforge.manager_status_stream.v2",
             "error": {"code": "manager_status_subscribers_full", "details": {}, "message": "full"},
             "type": "error",
         }).encode())
         refused.close()
         served = manager.accept()  # The follower retried.
         served.send(_frame("snapshot", 1, generations={
-            "logical_scene": 0, "manager": 0, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+            "logical_scene": 0, "manager": 0, "scene_changes": 0, "scene_runtime": 0,
+            "viewer_pose_sessions": 0}))
         assert _until(lambda: core.frames and core.frames[-1]["type"] == "snapshot")
         served.close()
         manager.close()
@@ -258,7 +301,8 @@ def test_shutdown_ends_the_follower_within_one_receive_slice(run_root: Path) -> 
     try:
         connection = manager.accept()
         connection.send(_frame("snapshot", 1, generations={
-            "logical_scene": 0, "manager": 0, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+            "logical_scene": 0, "manager": 0, "scene_changes": 0, "scene_runtime": 0,
+            "viewer_pose_sessions": 0}))
         assert wakes.wait(lambda: wakes.control == 1)
         started = time.monotonic()
         follower.shutdown()
@@ -294,13 +338,15 @@ def test_a_reconnect_to_a_held_manager_wakes_the_readers_when_its_silence_ends(r
     try:
         first = manager.accept()
         first.send(_frame("snapshot", 5, generations={
-            "logical_scene": 0, "manager": 1, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+            "logical_scene": 0, "manager": 1, "scene_changes": 0, "scene_runtime": 0,
+            "viewer_pose_sessions": 0}))
         assert wakes.wait(lambda: wakes.control == 1)
         first.close()
         assert wakes.wait(lambda: wakes.control == 2)  # The connection end.
         second = manager.accept()
         second.send(_frame("snapshot", 5, generations={
-            "logical_scene": 0, "manager": 1, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+            "logical_scene": 0, "manager": 1, "scene_changes": 0, "scene_runtime": 0,
+            "viewer_pose_sessions": 0}))
         assert wakes.wait(lambda: wakes.control == 3)  # Answering again.
         assert wakes.wait(lambda: wakes.control == 4, timeout=2.0)  # Its silence ended.
         second.close()

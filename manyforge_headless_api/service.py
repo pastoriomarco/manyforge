@@ -10,7 +10,7 @@ import logging
 import math
 from threading import Condition, Event, Lock, Thread
 import time
-from typing import Any, Callable, Final, Sequence
+from typing import Any, Callable, Final, Mapping, Sequence
 
 import rfc8785
 from starlette.responses import JSONResponse
@@ -52,7 +52,6 @@ from .models import (
     ApplyOutcomeRequest,
     ProgramNodeAttemptBatchRequest,
     ProgramResetOutcomeRequest,
-    SceneChangeRecordRequest,
     IoSignalReadRequest,
     ManagerApplyRequest,
     ManagerApplyAcknowledgementContext,
@@ -519,6 +518,21 @@ _SCENE_COMMIT_RULE_REFUSALS: Final = frozenset({"invalid_request", "authoring_no
 # The end of an accepted empty Apply that a later one replaced before its
 # Scene clear began (OD-239).
 _EMPTY_APPLY_SUPERSEDED: Final = {"state": "superseded", "remaining": None, "reason": None}
+
+
+def _manager_refused_unread(response: Mapping[str, Any]) -> bool:
+    """The Manager's refusal of a scene command it could not read (its
+    request-validation refusal of the command itself): it decided no outcome
+    of the change, so none reaches its status stream (OD-400)."""
+
+    error = response.get("error")
+    return (
+        response.get("ok") is False
+        and "projection_status" not in response
+        and isinstance(error, Mapping)
+        and error.get("code") == "invalid_request"
+        and error.get("details") == {"command": "invalid"}
+    )
 
 
 class HeadlessService:
@@ -3443,19 +3457,6 @@ class HeadlessService:
             body["outcome"], body["error"], body["reset"]
         ))
 
-    def record_scene_change(self, request: SceneChangeRecordRequest) -> dict[str, Any]:
-        """One scene change the Program Runner made outside a Program node
-        into History (``activity_history``, OD-375): it commits at the
-        Manager, so it records here what this service's scene route records
-        for its own callers, its caller included. An internal caller has no
-        principal."""
-
-        body = request.model_dump(mode="json")
-        return self.core.record_activity(with_caller(scene_change_record(
-            body["operation_kind"], body["outcome"], body["error"],
-            {**body["scene_change"], "principal_id": None},
-        ), source_label=body["scene_change"]["source_label"]))
-
     def record_program_node_attempts(
         self, request: ProgramNodeAttemptBatchRequest
     ) -> dict[str, Any]:
@@ -3742,57 +3743,52 @@ class HeadlessService:
                     )
         except HeadlessApiError as error:
             if error.code not in _SCENE_COMMIT_RULE_REFUSALS:
-                self._record_scene_change(request, attribution, started_ns, None, error)
+                self._record_scene_change_failure(request, attribution, started_ns, "failed", {
+                    "code": error.code, "message": str(error), "details": error.details,
+                })
             raise
-        self._record_scene_change(request, attribution, started_ns, response, None)
+        if _manager_refused_unread(response):
+            self._record_scene_change_failure(
+                request, attribution, started_ns, "refused", response["error"]
+            )
         if response.get("ok") is True:
             self._await_scene_publication(
                 response["committed_projection_revision"], disconnects
             )
         return response
 
-    def _record_scene_change(
+    def _record_scene_change_failure(
         self,
         request: SceneTransactionRequest,
         attribution: TrustedAttribution,
         started_ns: int,
-        response: dict[str, Any] | None,
-        raised: HeadlessApiError | None,
+        outcome: str,
+        error: Mapping[str, Any],
     ) -> None:
-        """One History event per scene change this service commits outside a
-        Program node attempt (OD-375, OD-378). The Program Runner commits its
-        own scene changes at the Manager and records them through
-        ``record_scene_change``. A Program node's change is in its node
-        attempt event; a replayed retry changed nothing."""
+        """A scene change without a Manager outcome into History, outside a
+        Program node attempt: ``failed`` (its mesh capture, the exchange, an
+        unreadable reply) or ``refused`` by the Manager before it could read
+        the command. Every outcome the Manager decided reaches History from
+        its status stream (OD-400); after a reply lost in transit both may
+        name one change."""
 
-        if request.program_node_evidence is not None or (
-            response is not None and response.get("replay_status") == "replayed_exact"
-        ):
+        if request.program_node_evidence is not None:
             return
-        if raised is not None:
-            outcome, error = "failed", {
-                "code": raised.code, "message": str(raised), "details": raised.details,
-            }
-        elif response.get("ok") is True:
-            outcome, error = "succeeded", None
-        else:
-            outcome = (
-                "unknown"
-                if response.get("projection_status") == "failed_projection_uncertain"
-                else "refused"
-            )
-            error = response.get("error")
         operation = request.operation
         context = request.request_context
-        record_activity(self.core, with_caller(scene_change_record(operation.kind, outcome, error, {
-            "scene_resource_id": getattr(operation, "scene_resource_id", None)
-            or getattr(operation, "expected_scene_resource_id", None),
-            "source_label": context.source_label,
-            "principal_id": attribution.principal_id,
-            "duration_ms": (time.monotonic_ns() - started_ns) / 1e6,
-            "scene_revision_id": response["committed_projection_revision"][
-                "scene_revision"]["revision_id"] if outcome == "succeeded" else None,
-        }), source_label=context.source_label, principal_id=attribution.principal_id))
+        record_activity(self.core, with_caller(scene_change_record(
+            operation.kind, outcome, error,
+            {
+                "scene_resource_id": getattr(operation, "scene_resource_id", None)
+                or getattr(operation, "expected_scene_resource_id", None),
+                "source_label": context.source_label,
+                "principal_id": attribution.principal_id,
+                "duration_ms": (time.monotonic_ns() - started_ns) / 1e6,
+                "scene_revision_id": None,
+                "manager_start_id": None,
+                "sequence": None,
+            },
+        ), source_label=context.source_label, principal_id=attribution.principal_id))
 
     def _api_scene_mesh_capture(
         self, request: SceneTransactionRequest
