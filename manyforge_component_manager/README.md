@@ -1,7 +1,7 @@
 # ManyForge Component Manager C++ owner
 
 This ROS-free C++ package is the selected semantic owner for the
-Composable Cell Component Manager. It currently owns these bounded mechanisms:
+ManyForge Component Manager. It currently owns these bounded mechanisms:
 
 - receiver-local runtime-unit observation and convergence reduction;
 - a typed durable journal for one canonical-empty bootstrap intent and its

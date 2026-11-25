@@ -639,7 +639,7 @@ class FakeCore:
         return {
             "availability": {"implementations": [], "manager_runtime_converged": True},
             "capability_offers": list(self.capability_offers),
-            "schema_version": "manyforge.node_environment_projection.v3",
+            "schema_version": "manyforge.node_environment_projection.v4",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
             "environment_digest": self.node_environment_digest,
@@ -970,6 +970,18 @@ class FakeManager:
         )
         return status
 
+    def scene_projection_revision(self) -> dict[str, Any]:
+        # The revision FakeCore's mirror shows (OD-293).
+        return {
+            "retained_bundle_id": "sha256:" + "b" * 64,
+            "graph_revision": "sha256:" + "c" * 64,
+            "scene_revision": {
+                "scene_id": "sha256:" + "d" * 64,
+                "revision_id": 2,
+                "content_hash": "sha256:" + "c" * 64,
+            },
+        }
+
     def commit_scene_transaction(
         self,
         request: SceneTransactionRequest,
@@ -1270,7 +1282,7 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
         graph_revision=digest_a,
     )
     return {
-        "schema_version": "manyforge.program_run_status.v5",
+        "schema_version": "manyforge.program_run_status.v6",
         "owner_id": "program-runner.cell-a",
         "run_revision": 1,
         "state": state,
@@ -1300,6 +1312,8 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
         "halt": None,
         "node_status_revision": 1,
         "node_statuses": {"root": "running"},
+        "node_running_since_utc_ns": {"root": 1_795_000_000_000_000_000},
+        "node_wait_values": {},
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
@@ -1523,7 +1537,7 @@ def _node_availability_fixture(
             for entry in environment.catalog.entries
             for requirement in entry.required_capabilities
         }),
-        "schema_version": "manyforge.node_environment_projection.v3",
+        "schema_version": "manyforge.node_environment_projection.v4",
         "retained_bundle_id": applied["retained_bundle_id"],
         "graph_revision": applied["graph_revision"],
         "environment_digest": environment.manifest.environment_digest,
@@ -1534,7 +1548,6 @@ def _node_availability_fixture(
             "manager_runtime_converged": True,
             "portable_authoring_available": True,
             "reason_codes": ["program_binding_unselected"],
-            "restoration_gates": [],
         },
         "source": {
             "available": True,
@@ -1592,7 +1605,6 @@ class _ResetProgramRunner(FakeProgramRunner):
             raise ProgramRunnerClientError(
                 "program_cycle_reset_stale",
                 "Reset does not identify the current Program cycle",
-                409,
             )
         return _command_reply("reset", body["request_key"])
 
@@ -2175,7 +2187,7 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         context = client.get("/api/source-model-context").json()
         assert context["schema_version"] == "manyforge.source_model_context.v1"
         assert context["node_environment"]["schema_version"] == (
-            "manyforge.node_environment_projection.v3"
+            "manyforge.node_environment_projection.v4"
         )
         assert context["source_model"]["schema_version"] == (
             "manyforge.source_model_projection.v4"
@@ -2643,7 +2655,6 @@ def test_program_started_then_failed_preserves_owner_status_and_details(
             raise ProgramRunnerClientError(
                 code,
                 "Owner outcome",
-                status,
                 details=details,
             )
 
@@ -3539,7 +3550,7 @@ def test_a_status_read_wakes_the_runner_only_once_manager_source_names_it() -> N
 def test_a_failed_cleanup_never_changes_the_committed_apply_outcome() -> None:
     runner = _NotifiedRunner(
         ProgramRunnerClientError(
-            "persistent_key_storage_unavailable", "read-only file system", 503
+            "persistent_key_storage_unavailable", "read-only file system"
         )
     )
     manager = _CommittingManager("succeeded")
@@ -3670,7 +3681,7 @@ def test_failed_apply_scene_placement_is_not_retried_by_status_notification(capl
     attempts = []
     def failed(body):
         attempts.append(body)
-        raise ProgramRunnerClientError("program_scene_preparation_failed", "scene unavailable", 409)
+        raise ProgramRunnerClientError("program_scene_preparation_failed", "scene unavailable")
     runner.prepare_applied_scene = failed
     service.notify_committed_apply()
     service.notify_committed_apply()
@@ -3730,7 +3741,7 @@ def test_empty_apply_owner_unavailable_reports_failure_without_submission():
     def unavailable():
         raise CellAdmissionError("execution_owner_unavailable", "owner unavailable")
     def runner_unavailable(**_kwargs):
-        raise ProgramRunnerClientError("program_runner_unavailable", "owner unavailable", 503)
+        raise ProgramRunnerClientError("program_runner_unavailable", "owner unavailable")
     service.cell_admission.get = unavailable
     runner.cycle_status = runner_unavailable
     service.notify_committed_apply()
@@ -4159,7 +4170,7 @@ def test_direct_clear_busy_runner_is_failed_before_effect_not_unknown():
     def busy(_body):
         raise ProgramRunnerClientError(
             "execution_control_ingress_busy", "another Program command is in progress",
-            503, details={"command_in_progress": "start"},
+            details={"command_in_progress": "start"},
         )
 
     runner.prepare_applied_scene = busy
@@ -4278,28 +4289,6 @@ def test_scene_transaction_is_forwarded_with_adapter_only_attribution() -> None:
     assert manager.scene_requests[0][0].operation.scene_resource_id == "part.1"
     assert manager.scene_requests[0][1] == "operator.7"
     assert forged.status_code == 422
-
-
-def test_scene_result_lookup_never_submits_the_transaction(monkeypatch) -> None:
-    client, _core, manager = _client()
-    requests = []
-
-    def lookup(request):
-        requests.append(request)
-        return {
-            "api_version": "manyforge.manager_command_response.v3",
-            "ok": True,
-            "result": None,
-        }
-
-    monkeypatch.setattr(manager, "scene_transaction_status", lookup, raising=False)
-    with client:
-        response = client.post("/api/scene/transactions/status", json=_scene_body())
-    assert response.status_code == 200
-    assert response.json()["result"] is None
-    # The lookup names the request by its formed key (class 3).
-    assert requests[0].request_context.request_key == _FORMED_CALLER_KEY
-    assert manager.scene_requests == []
 
 
 def test_scene_pose_query_is_read_only_revision_fenced_and_canonical() -> None:
@@ -4628,7 +4617,7 @@ def test_skills_routes_use_exact_selected_environment_and_never_execute():
                 "base_frame": {"component_id": "robot", "frame_id": "base"},
             },
             "program_context": {
-                "api_version": "manyforge.program.v4", "program_profile": "composable-cell-v1",
+                "api_version": "manyforge.program.v4", "program_profile": "manyforge-cell-v1",
                 "catalog": {"api_version": "manyforge.node_catalog.v3", "content_version": "4.0.0"},
             },
         }
@@ -4974,14 +4963,15 @@ _STATUS_V4_REPLY: dict[str, Any] = {
 
 def test_execution_diagnostics_pass_the_v4_check_counts_unchanged() -> None:
     # The native client reads `status` and passes the reply as it came.
-    native = ExecutionCommandClient.__new__(ExecutionCommandClient)
     sent: list[dict[str, Any]] = []
 
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         sent.append(command)
         return copy.deepcopy(_STATUS_V4_REPLY)
 
-    native._exchange = exchange  # type: ignore[method-assign]
+    from manyforge_headless_api.tests.fake_gateway import FakeGateway
+
+    native = ExecutionCommandClient(FakeGateway(exchange))
     assert native.diagnostics() == _STATUS_V4_REPLY
     assert [command["command"] for command in sent] == ["status"]
 
@@ -5764,7 +5754,6 @@ class _PersistentValuesRunner:
             raise ProgramRunnerClientError(
                 "persistent_key_run_conflict",
                 "Program run 1 refused the edit",
-                409,
                 producer="kernel",
             )
         kind = {
@@ -6033,7 +6022,7 @@ def test_apply_scene_retries_only_readiness_with_backoff_and_a_key_per_attempt()
     def prepare(body):
         attempts.append(copy.deepcopy(body))
         if len(attempts) < 3:
-            raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+            raise ProgramRunnerClientError("authoring_not_ready", "not ready")
         return original(body)
 
     runner.prepare_applied_scene = prepare
@@ -6067,7 +6056,7 @@ def test_apply_scene_retries_a_busy_runner_and_succeeds_when_it_frees():
         if len(attempts) < 3:
             raise ProgramRunnerClientError(
                 "execution_control_ingress_busy", "another Program command is in progress",
-                503, details={"command_in_progress": "start"},
+                details={"command_in_progress": "start"},
             )
         return original(body)
 
@@ -6094,7 +6083,7 @@ def test_empty_apply_busy_runner_is_failed_before_effect_not_unknown():
         calls.append(body)
         raise ProgramRunnerClientError(
             "execution_control_ingress_busy", "another Program command is in progress",
-            503, details={"command_in_progress": "reset"},
+            details={"command_in_progress": "reset"},
         )
 
     runner.prepare_applied_scene = busy
@@ -6115,7 +6104,7 @@ def test_apply_scene_retry_stops_when_new_apply_is_committed():
     def prepare(body):
         attempts.append(copy.deepcopy(body))
         if len(attempts) == 1:
-            raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+            raise ProgramRunnerClientError("authoring_not_ready", "not ready")
         return original(body)
 
     def supersede():
@@ -6141,7 +6130,7 @@ def test_apply_scene_retry_stops_on_service_close():
 
     def prepare(body):
         attempts.append(body)
-        raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+        raise ProgramRunnerClientError("authoring_not_ready", "not ready")
 
     runner.prepare_applied_scene = prepare
     waiter = _SceneRetryWait(service.close)
@@ -6163,7 +6152,7 @@ def test_apply_scene_retry_has_no_time_limit():
     def prepare(body):
         attempts.append(body)
         if len(attempts) <= 200:
-            raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+            raise ProgramRunnerClientError("authoring_not_ready", "not ready")
         return original(body)
 
     runner.prepare_applied_scene = prepare
@@ -6258,7 +6247,7 @@ def test_initial_scene_failure_status_is_apply_scoped_and_runner_independent():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     def failed(_body):
-        raise ProgramRunnerClientError("program_scene_preparation_failed", "scene unavailable", 409)
+        raise ProgramRunnerClientError("program_scene_preparation_failed", "scene unavailable")
     runner.prepare_applied_scene = failed
     service.notify_committed_apply()
     runner.cycle_status = lambda **_kwargs: (_ for _ in ()).throw(
@@ -6276,7 +6265,7 @@ def test_initial_scene_status_preserves_condition_if_identity_read_fails():
     runner = _NotifiedRunner()
     service, _core = _scene_completion_service(runner)
     runner.prepare_applied_scene = lambda _body: (_ for _ in ()).throw(
-        ProgramRunnerClientError("program_scene_preparation_failed", "broken", 409))
+        ProgramRunnerClientError("program_scene_preparation_failed", "broken"))
     service.notify_committed_apply()
     original = service.committed_scenario_activation
     service.committed_scenario_activation = lambda: (_ for _ in ()).throw(
@@ -6613,8 +6602,11 @@ def test_manager_reference_refusal_crosses_socket_to_http(tmp_path: Path, monkey
         globals(), "build_node_environment",
         lambda: SimpleNamespace(manifest=SimpleNamespace(environment_digest="sha256:" + "1" * 64)),
     )
-    from manyforge_headless_api.manager import ManagerCommandClient
-    from manyforge_headless_api.tests.test_manager import _reference_error, _request
+    from manyforge_headless_api.tests.test_manager import (
+        _reference_error,
+        _request,
+        _socket_client,
+    )
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     path = tmp_path / "manager-command.sock"
@@ -6634,7 +6626,7 @@ def test_manager_reference_refusal_crosses_socket_to_http(tmp_path: Path, monkey
     worker = threading.Thread(target=serve, daemon=True)
     worker.start()
     try:
-        manager = ManagerCommandClient(tmp_path)
+        manager = _socket_client(tmp_path)
         with TestClient(create_app(service=_service(FakeCore(), manager))) as client:
             response = client.post(
                 "/api/manager/apply",
@@ -7292,3 +7284,7 @@ def test_a_control_command_is_aged_at_composers_forwarded_receipt_time() -> None
         )
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "control_freshness_expired"
+    assert response.json()["detail"]["details"] == {
+        "elapsed_ns": CONTROL_FRESHNESS_VALID_FOR_NS + 1,
+        "valid_for_ns": CONTROL_FRESHNESS_VALID_FOR_NS,
+    }

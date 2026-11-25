@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <utility>
@@ -51,12 +52,16 @@ const std::string &Text(const CanonicalValue &value, const std::string &label) {
          });
 }
 
-constexpr const char *kDiskMembers[] = {
-    "disk_max_percent", "disk_always_free_bytes", "disk_machine_minimum_bytes"};
+/// The members a `manyforge.site.v1` file cannot carry.
+constexpr const char *kVersionTwoMembers[] = {
+    "disk_max_percent", "disk_always_free_bytes", "disk_machine_minimum_bytes",
+    "core_dumps"};
+
+constexpr double kMaxExactInteger = 9007199254740991.0;  // 2^53 - 1
 
 /// The one C++ decision on which site settings schema lines are accepted;
-/// true when the schema carries the disk limits. Decided exception: version 1
-/// files carry no disk limits and use the defaults.
+/// true when the schema carries the disk limits and `core_dumps`. Decided
+/// exception: version 1 files carry neither and use the defaults.
 bool AcceptedSchemaHasDiskLimits(const std::string &schema) {
   if (schema == "manyforge.site.v2")
     return true;
@@ -80,12 +85,40 @@ void RequireInteger(const CanonicalValue &root, const char *name, double low,
          std::to_string(static_cast<long long>(high)));
 }
 
+/// `core_dumps`: absent, or exactly `enabled` (bool) and `max_bytes`
+/// (integer 1 to 2^53-1). The soft core-file size limit it asks for; 0 when
+/// absent or not enabled.
+std::uint64_t CoreDumpLimitBytes(const CanonicalValue &root) {
+  const auto *core_dumps = root.find_object_member("core_dumps");
+  if (core_dumps == nullptr)
+    return 0U;
+  const auto *enabled = core_dumps->is_object()
+                            ? core_dumps->find_object_member("enabled")
+                            : nullptr;
+  if (enabled == nullptr || !enabled->is_bool() ||
+      core_dumps->find_object_member("max_bytes") == nullptr ||
+      core_dumps->as_object().size() != 2U)
+    Fail("site settings core_dumps must be an object with exactly enabled "
+         "(true or false) and max_bytes");
+  RequireInteger(*core_dumps, "max_bytes", 1.0, kMaxExactInteger);
+  return enabled->as_bool()
+             ? static_cast<std::uint64_t>(
+                   core_dumps->find_object_member("max_bytes")->as_number())
+             : 0U;
+}
+
 } // namespace
 
 SiteSettings::SiteSettings(DeviceAddresses device_addresses,
-                           std::vector<std::string> project_folders)
+                           std::vector<std::string> project_folders,
+                           const std::uint64_t core_dump_limit_bytes)
     : device_addresses_(std::move(device_addresses)),
-      project_folders_(std::move(project_folders)) {}
+      project_folders_(std::move(project_folders)),
+      core_dump_limit_bytes_(core_dump_limit_bytes) {}
+
+std::uint64_t SiteSettings::core_dump_limit_bytes() const noexcept {
+  return core_dump_limit_bytes_;
+}
 
 const std::vector<std::string> &SiteSettings::project_folders() const noexcept {
   return project_folders_;
@@ -109,7 +142,7 @@ SiteSettings ParseSiteSettings(std::string_view bytes) {
     if (name != "schema" && name != "device_addresses" &&
         name != "project_folders" && name != "disk_max_percent" &&
         name != "disk_always_free_bytes" &&
-        name != "disk_machine_minimum_bytes")
+        name != "disk_machine_minimum_bytes" && name != "core_dumps")
       Fail("site settings has unknown field " + name);
   }
   const auto *schema = root.find_object_member("schema");
@@ -118,16 +151,16 @@ SiteSettings ParseSiteSettings(std::string_view bytes) {
   if (schema == nullptr)
     Fail("site settings requires schema");
   if (!AcceptedSchemaHasDiskLimits(Text(*schema, "site settings schema"))) {
-    for (const char *name : kDiskMembers)
+    for (const char *name : kVersionTwoMembers)
       if (root.find_object_member(name) != nullptr)
         Fail(std::string("site settings ") + name +
              " needs schema manyforge.site.v2: change the first line's schema "
              "to manyforge.site.v2; no other change is needed");
   }
-  constexpr double kMaxExactInteger = 9007199254740991.0;  // 2^53 - 1
   RequireInteger(root, "disk_max_percent", 1.0, 100.0);
   RequireInteger(root, "disk_always_free_bytes", 0.0, kMaxExactInteger);
   RequireInteger(root, "disk_machine_minimum_bytes", 0.0, kMaxExactInteger);
+  const std::uint64_t core_dump_limit_bytes = CoreDumpLimitBytes(root);
   SiteSettings::DeviceAddresses device_addresses;
   const auto entries =
       addresses == nullptr
@@ -159,7 +192,8 @@ SiteSettings ParseSiteSettings(std::string_view bytes) {
       project_folders.push_back(folder);
     }
   }
-  return SiteSettings(std::move(device_addresses), std::move(project_folders));
+  return SiteSettings(std::move(device_addresses), std::move(project_folders),
+                      core_dump_limit_bytes);
 }
 
 core::Result<std::string>
@@ -210,6 +244,11 @@ deployment::SiteFacts SiteFactsOfDocument(const std::optional<std::string> &docu
   return SiteFactsOf(document.has_value()
                          ? std::optional<SiteSettings>(ParseSiteSettings(*document))
                          : std::nullopt);
+}
+
+std::uint64_t CoreDumpLimitBytesOfDocument(const std::optional<std::string> &document) {
+  return document.has_value() ? ParseSiteSettings(*document).core_dump_limit_bytes()
+                              : 0U;
 }
 
 } // namespace manyforge::component_manager

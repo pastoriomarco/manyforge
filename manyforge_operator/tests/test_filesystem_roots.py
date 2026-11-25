@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import replace
 import importlib.util
+import os
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -92,6 +94,10 @@ def test_workbench_and_prebuilt_image_roots_resolve_shipped_model_sources(
         "manyforge_dev_workbench_roots", REPOSITORY_ROOT / "scripts/dev-workbench.py")
     assert spec is not None and spec.loader is not None
     workbench = importlib.util.module_from_spec(spec)
+    # Loading the script adds its source roots to sys.path and PYTHONPATH;
+    # undo both after this test so later tests import as before.
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setenv("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
     spec.loader.exec_module(workbench)
     monkeypatch.setattr(workbench, "WORKSPACE", REPOSITORY_ROOT)
     monkeypatch.delenv("MANYFORGE_DEV_PROJECT_ROOTS", raising=False)

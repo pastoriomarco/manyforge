@@ -196,20 +196,47 @@ export function codedErrorDetail(error: CodedError): string {
 
 export interface FaultPresentation {
   title: string;
+  /** The typed fault code, shown beside the catalogue text. */
+  code: string;
   detail: string;
   vendor: string | null;
   /** The action the fault names for the operator; null for `none`. */
   operatorAction: string | null;
+  /** When it began (`since … UTC (5 min ago)`); null when the owner sends no UTC time. */
+  since: string | null;
+  /** A launch fault's last process output lines; null without them. */
+  outputTail: string | null;
 }
 
-export function faultPresentation(fault: Fault): FaultPresentation {
+export function faultPresentation(fault: Fault, nowMs = Date.now()): FaultPresentation {
   const vendor = [fault.vendor_code, fault.vendor_text].filter((part) => part !== undefined && part !== '');
   return {
     title: codedErrorText(fault),
+    code: fault.code,
     detail: codedErrorDetail(fault),
     vendor: vendor.length === 0 ? null : `Vendor: ${vendor.join(' · ')}`,
     operatorAction: fault.operator_action === 'none' ? null : actionLabel(fault.operator_action),
+    since: fault.since_utc_ns === undefined ? null : sinceUtcText(fault.since_utc_ns, nowMs),
+    outputTail: fault.output_tail ?? null,
   };
+}
+
+/** A UTC nanosecond time (decimal text) with date and milliseconds: `2026-11-24 14:02:03.123 UTC`. */
+export function utcText(utcNs: string): string {
+  return `${new Date(Number(BigInt(utcNs) / 1_000_000n)).toISOString().replace('T', ' ').replace('Z', '')} UTC`;
+}
+
+/** A coarse elapsed time: `40 s`, `12 min`, `3 h 5 min`. */
+export function elapsedText(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+/** When a state began: `since 2026-11-24 14:02:03.123 UTC (12 min ago)`. */
+export function sinceUtcText(utcNs: string, nowMs: number): string {
+  return `since ${utcText(utcNs)} (${elapsedText(nowMs - Number(BigInt(utcNs) / 1_000_000n))} ago)`;
 }
 
 /** An e-stop as the operator reads it: "E-stop pressed or not yet cleared (C2)". */

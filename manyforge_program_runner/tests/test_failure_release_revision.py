@@ -245,7 +245,7 @@ def adapter():
     source = HeadlessControlStateSource(
         SimpleNamespace(),  # type: ignore[arg-type]
         ingress,
-        program_runner_websocket_url=None,
+        program_status=None,
         program_failure_observer=observer,
     )
     try:

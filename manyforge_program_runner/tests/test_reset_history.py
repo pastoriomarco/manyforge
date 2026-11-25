@@ -46,7 +46,7 @@ def _runtime(tmp_path, headless: _RecordingHeadless, *, authoring_allowed: bool 
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=headless, execution_transport=_Headless(),
+        headless_client=headless, gateway=_Headless(),
         admission_client=_AuthoringAdmission(authoring_allowed), cycle_journal=journal,
     )
     return runtime, journal
@@ -85,6 +85,7 @@ def test_a_reset_that_reloads_the_scene_records_what_it_used_and_left(monkeypatc
         "reset": {
             "reload_initial_scene": True,
             "reset_robot_position": False,
+            "reset_stored_values": False,
             "program_run_id": None,
             "program_revision": headless.program_applied()["program_revision"],
             "applied_record_digest": _DIGEST_B,

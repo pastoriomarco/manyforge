@@ -11,6 +11,7 @@ function retention() {
     retained_bytes: '300',
     pruned_count: '0',
     pruned_bytes: '0',
+    record_byte_limit: '16777216',
     last_pruned_sequence: null,
     unknown_time_count: '0',
     regressed_time_count: '0',
@@ -19,8 +20,8 @@ function retention() {
     last_recorded_utc_ns: null,
   });
   return {
-    schema_version: 'manyforge.historian_retention.v3',
-    partitions: [partition('routine'), partition('important')],
+    schema_version: 'manyforge.historian_retention.v4',
+    partitions: [partition('routine'), partition('important'), partition('node_attempts')],
     captures: {
       live_count: '1',
       open_count: '0',
@@ -34,7 +35,6 @@ function retention() {
       last_retired_capture_id: '2',
     },
     partition_row_limit: '100000',
-    partition_record_byte_limit: '16777216',
     database_page_byte_limit: '536870912',
     duration_guaranteed: false,
     prior_pruning_known: true,

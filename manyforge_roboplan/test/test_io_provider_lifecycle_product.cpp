@@ -183,7 +183,38 @@ TEST_F(IoProviderComponentAdapterTest, ExitedProcessIsAProcessExitedFault) {
   EXPECT_EQ(state.fault->message, "The simulated PLC exited");
   // Without the host's restart entry nothing can start it again.
   EXPECT_EQ(state.fault->operator_action, core::FaultOperatorAction::kNone);
+  EXPECT_TRUE(state.fault->details.empty());
   EXPECT_EQ(Run(ComponentAction::kPrepare).outcome, ActionOutcome::kFailed);
+
+  // An observer's exit carries its output tail into the component fault.
+  driver->SetSupervisedProcessFaultSource([] {
+    return std::optional<core::ErrorDTO>(core::ErrorDTO{
+        "pose_source_exited", "The observer exited", {{"output_tail", "observer crashed"}}});
+  });
+  EXPECT_EQ(driver->State(clock->now()).fault->details,
+            (std::map<std::string, std::string>{{"output_tail", "observer crashed"}}));
+}
+
+// The exit source takes its process's and output's own locks, so it runs
+// without the delivery lock; the exit of a source replaced meanwhile isn't
+// current and isn't shown.
+TEST_F(IoProviderComponentAdapterTest, ExitSourceRunsWithoutTheDeliveryLock) {
+  InstallMockInput();
+  int calls = 0;
+  driver->SetSupervisedProcessFaultSource([&]() -> std::optional<core::ErrorDTO> {
+    ++calls;
+    // Both take the delivery lock: this would block if it were held.
+    EXPECT_TRUE(driver->resources_installed());
+    driver->SetSupervisedProcessFaultSource([] { return std::optional<core::ErrorDTO>(); });
+    return core::ErrorDTO{"simulated_plc_exited", "The simulated PLC exited", {}};
+  });
+  const auto state = driver->State(clock->now());
+  EXPECT_EQ(calls, 1);
+  EXPECT_EQ(state.lifecycle, ComponentLifecycle::kNotPrepared);
+  EXPECT_FALSE(state.fault.has_value());
+  // The replacing source is current from then on.
+  EXPECT_FALSE(driver->State(clock->now()).fault.has_value());
+  EXPECT_EQ(calls, 1);
 }
 
 /// The supervised process of an I/O device (a simulated PLC) and the host's

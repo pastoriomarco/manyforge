@@ -75,6 +75,7 @@ ComponentProcessCommand pointcloud_bridge_command(const PointCloudSourceSettings
 
 core::ComponentState PointCloudSourceState(const bool process_started,
                                            const std::optional<std::string> &exit_reason,
+                                           std::string output_tail,
                                            const bool forwarding,
                                            const PointCloudBridgeObservation &observed,
                                            const std::int64_t stream_budget_ns,
@@ -96,6 +97,8 @@ core::ComponentState PointCloudSourceState(const bool process_started,
                               std::nullopt,
                               {},
                               now_ns};
+    if (!output_tail.empty())
+      state.fault->details.emplace("output_tail", std::move(output_tail));
   } else {
     state.lifecycle =
         forwarding ? core::ComponentLifecycle::kEnabled : core::ComponentLifecycle::kPrepared;
@@ -126,10 +129,28 @@ PointCloudSourceAdapter::PointCloudSourceAdapter(PointCloudSourceSettings settin
 
 core::ComponentState PointCloudSourceAdapter::State(const std::int64_t now_ns) const {
   const auto observed = link_->Observed();
-  const std::lock_guard lock(mutex_);
+  std::shared_ptr<IComponentProcess> process;
+  bool forwarding{};
+  {
+    const std::lock_guard lock(mutex_);
+    process = process_;
+    forwarding = forwarding_;
+  }
+  // The process is read without the adapter's lock (it takes its own).
+  auto exit_reason = process ? process->exited() : std::nullopt;
+  if (exit_reason) {
+    // An exit is reported only for the current process: one that Prepare or
+    // Recover replaced (and stopped) meanwhile reads as the current slot.
+    const std::lock_guard lock(mutex_);
+    if (process_ != process) {
+      process = process_;
+      forwarding = forwarding_;
+      exit_reason.reset();
+    }
+  }
   return PointCloudSourceState(
-      process_ != nullptr, process_ ? process_->exited() : std::nullopt, forwarding_, observed,
-      static_cast<std::int64_t>(settings_.stream_budget_s * 1e9), now_ns);
+      process != nullptr, exit_reason, exit_reason ? process->output_tail() : std::string(),
+      forwarding, observed, static_cast<std::int64_t>(settings_.stream_budget_s * 1e9), now_ns);
 }
 
 core::ActionResult PointCloudSourceAdapter::Run(const core::ComponentAction action,
@@ -152,7 +173,10 @@ core::ActionResult PointCloudSourceAdapter::Run(const core::ComponentAction acti
         forwarding_ = false;
       }
       link_->SetForwarding(false);
-      previous.reset();  // stops the old bridge
+      // Stops the old bridge on this (the action's) thread, outside the
+      // adapter lock: a State() reader's copy then only releases it.
+      if (previous) previous->stop();
+      previous.reset();
       try {
         auto started = start_process_(pointcloud_bridge_command(settings_, ros_namespace_, cell_id_));
         const std::lock_guard lock(mutex_);
@@ -170,13 +194,15 @@ core::ActionResult PointCloudSourceAdapter::Run(const core::ComponentAction acti
       {
         const std::lock_guard lock(mutex_);
         process = process_;
-        if (forwarding && (!process || process->exited())) {
-          fail("component_not_prepared", "Prepare the point-cloud source before enabling it.");
-          break;
-        }
+      }
+      // The process is asked outside the adapter lock (it takes its own).
+      if (forwarding && (!process || process->exited())) {
+        fail("component_not_prepared", "Prepare the point-cloud source before enabling it.");
+        break;
       }
       // State keeps the last completed forwarding value while middleware runs.
-      // The process pin prevents a replaced bridge from being destroyed here.
+      // A replaced bridge is stopped by its Prepare/Recover; this copy only
+      // releases it.
       link_->SetForwarding(forwarding);
       {
         const std::lock_guard lock(mutex_);

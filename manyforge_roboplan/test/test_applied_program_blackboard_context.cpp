@@ -41,7 +41,7 @@ ScalarProgram(const d::RetainedBundle &bundle,
   auto root = d::parse_strict_json_model_yaml(R"({
     "api_version":"manyforge.program.v4",
     "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "program_profile":"composable-cell-v1",
+    "program_profile":"manyforge-cell-v1",
     "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
     "blackboard":{"namespaces":[],"keys":[
       {"key":"count","type":"int64","access":"read_write","persistence":"run"},

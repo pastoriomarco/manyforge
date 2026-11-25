@@ -36,6 +36,17 @@ ErrorDTO fault(ErrorCode code, std::string message, const std::string& reason,
   return ErrorDTO{std::string(to_string(code)), std::move(message), std::move(details)};
 }
 
+// A failed controller result's details: the classified result, the goal and
+// the controller's own text when it gave one.
+std::map<std::string, std::string> ControllerResultDetails(
+    const ExecutionGoalObservationDTO& goal, ExecutionGoalResult result) {
+  std::map<std::string, std::string> details{
+      {"goal_result", std::string(to_string(result))},
+      {"mechanism_goal_id", MechanismGoalIdHex(goal.mechanism_goal_id)}};
+  if (goal.controller_error_text) details["controller_error_text"] = *goal.controller_error_text;
+  return details;
+}
+
 // Only a defect hands the locked rebind steps a stage other than the one just locked.
 void report_invalid_owner_rebind_stage(const char* check) noexcept {
   (void)std::fprintf(stderr, "manyforge_fault code=%.*s check=%s\n",
@@ -2402,9 +2413,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution, std::unique_lock<s
       Finish(execution, ExecutionState::kInterventionRequired,
              fault(ErrorCode::kExecutionAborted,
                    std::string("FollowJointTrajectory goal failed: ") + to_string(result),
-                   "controller_result_failed",
-                   {{"goal_result", to_string(result)},
-                    {"mechanism_goal_id", MechanismGoalIdHex(goal->mechanism_goal_id)}}));
+                   "controller_result_failed", ControllerResultDetails(*goal, result)));
       return;
     }
   }
@@ -2421,9 +2430,7 @@ void ExecutionPortParticipant::Evaluate(Execution& execution, std::unique_lock<s
                                                         : ExecutionState::kFailed,
            fault(ErrorCode::kExecutionAborted,
                  std::string("FollowJointTrajectory goal failed: ") + to_string(result),
-                 "controller_result_failed",
-                 {{"goal_result", to_string(result)},
-                  {"mechanism_goal_id", MechanismGoalIdHex(goal->mechanism_goal_id)}}));
+                 "controller_result_failed", ControllerResultDetails(*goal, result)));
     return;
   }
   // Completion: kSucceeded plus `main`'s authority check. Every lane

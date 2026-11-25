@@ -24,13 +24,16 @@ rules, so no rule catalog is installed and no state is sent). The mirror keeps
 the latest one read; its states are current only while that catalog proves
 their full context, and a waiting rule's state is unavailable, never clear.
 
-Delivery is a streaming subscription (``follow``): the host sends the
+Delivery is a streaming subscription (``follow``) of the core's event
+follower (``manyforge_headless_py.ExecutionEvents``): the host sends the
 reply's non-page facts as ``state`` when they change, after a first
-``snapshot``; every ready baseline in them is installed. A dead link makes
-the states unavailable until the next snapshot. ``poll`` stays the one-shot
-read for a caller that needs a fresh catalog at once; with a subscription it
-installs only a baseline of a context the mirror does not have yet, since a
-later ``state`` carries every change after it.
+``snapshot``; every ready baseline in them is installed. A lost link (the
+core's ``disconnected`` message) makes the states unavailable until the next
+snapshot. ``poll`` stays the one-shot read for a caller that needs a fresh
+catalog at once; with a subscription it installs only a baseline of a context
+the mirror does not have yet, since a later ``state`` carries every change
+after it. The poll's ``events`` request runs without the mirror's lock; its
+reply is recorded only if no stream message changed the mirror meanwhile.
 
 The same ``state`` (and ``snapshot``) carries ``program_run_hold``: the
 Kernel's in-memory hold state of the claimed run (null, or run, hold
@@ -49,7 +52,7 @@ from threading import Event, Lock
 from typing import Any, Final
 
 from manyforge_behavior.program_scheduling import ProgramRunHoldFacts
-from manyforge_headless_api.execution_event_stream import follow_execution_events
+from manyforge_headless_api.native import HeadlessApiError
 
 # The wire parsers are shared with the Headless GUI projection.
 from manyforge_headless_api.global_rule_status import (
@@ -64,6 +67,9 @@ from manyforge_headless_api.global_rule_status import (
 )
 
 _MAX_SAFE: Final = 9_007_199_254_740_991
+# A stop is seen within one receive slice (closing the core follower ends a
+# wait at once).
+RECEIVE_SLICE_SECONDS: Final = 0.25
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -179,7 +185,9 @@ class InterruptRuleStateMirror:
 
     ``read_events(after_sequence)`` is the existing events
     command; ``on_change(states)`` receives ``None`` (unavailable) or the
-    complete current rule_id → state mapping whenever that changes.
+    complete current rule_id → state mapping whenever that changes;
+    ``subscription`` is a core event subscription (``next(timeout_s)``,
+    ``resync()``).
     """
 
     def __init__(
@@ -187,7 +195,7 @@ class InterruptRuleStateMirror:
         *,
         read_events: Callable[[int], Mapping[str, Any]],
         on_change: Callable[[Mapping[str, str] | None], None],
-        subscribe: Callable[[int], Any] | None = None,
+        subscription: Any = None,
         on_carried_object_lost: Callable[[tuple[Mapping[str, Any], ...]], None] | None = None,
         on_program_run_hold: Callable[[ProgramRunHoldFacts], None] | None = None,
     ) -> None:
@@ -195,7 +203,7 @@ class InterruptRuleStateMirror:
         self._on_change = on_change
         # The event subscription (``follow``) and the latest
         # ``carried_object_lost_signals`` rows read, given to their consumer.
-        self._subscribe = subscribe
+        self._subscription = subscription
         self._on_carried_object_lost = on_carried_object_lost
         self._on_program_run_hold = on_program_run_hold
         # The last program-run hold facts handed out (False: none yet).
@@ -210,6 +218,10 @@ class InterruptRuleStateMirror:
         self._context: RuleStateContext | None = None
         # The journal position a poll reads its page after.
         self._cursor = 0
+        # Raised by every stream ``snapshot``/``state`` and loss: a poll
+        # records its reply only if nothing changed the mirror meanwhile.
+        self._generation = 0
+        self._polling = False
         self._states: dict[str, str] = {}
         self._published: Mapping[str, str] | None | bool = False
         # The latest installed global catalog read (None: none installed or
@@ -261,15 +273,29 @@ class InterruptRuleStateMirror:
         self._states = {}
 
     def poll(self) -> None:
-        """One bounded read on the existing cadence (never concurrent)."""
+        """One bounded read on the existing cadence (never concurrent). The
+        cursor is captured under the lock and the ``events`` request runs
+        without it; the reply is recorded only while still current."""
 
-        if not self._lock.acquire(blocking=False):
-            return
+        with self._lock:
+            if self._polling:
+                return
+            self._polling = True
+            cursor, generation = self._cursor, self._generation
+        response: Mapping[str, Any] | None = None
+        failure: Exception | None = None
         try:
-            self._poll_locked()
-            current, changed = self._publish_locked()
+            response = self._read_events(cursor)
+        except Exception as error:
+            failure = error
         finally:
-            self._lock.release()
+            with self._lock:
+                self._polling = False
+                if self._generation == generation and (
+                    response is not None or failure is not None
+                ):
+                    self._record_poll_locked(cursor, response, failure)
+                current, changed = self._publish_locked()
         if changed:
             self._on_change(current)
 
@@ -286,33 +312,51 @@ class InterruptRuleStateMirror:
         on_message: Callable[[Mapping[str, Any]], None] | None = None,
         on_disconnect: Callable[[BaseException], None] | None = None,
     ) -> None:
-        """Apply the event subscription until ``stop`` (reconnecting from the
-        last cursor, dead link after three missed heartbeats). ``on_read`` runs
-        after every message but a row or progress: a reading, also when
-        unchanged."""
+        """Apply the core subscription's messages until ``stop`` (the core
+        reconnects from the last cursor, dead link after three missed
+        heartbeats, and sends ``disconnected`` before the next snapshot).
+        ``on_read`` runs after every message but a row or progress: a
+        reading, also when unchanged. A message that cannot be applied here
+        (also by ``on_message`` or ``on_read``) asks the subscription for a
+        fresh snapshot: its ``disconnected`` makes the mirrors unavailable
+        like a lost link, and the snapshot and the messages from the one not
+        applied follow."""
 
-        if self._subscribe is None:
+        subscription = self._subscription
+        if subscription is None:
             return
-
-        def apply_message(message: Mapping[str, Any]) -> None:
-            self.apply_stream_message(message)
-            if on_message is not None:
-                on_message(message)
-            if message["type"] not in ("event", "progress") and on_read is not None:
-                on_read()
 
         def stream_lost(error: BaseException) -> None:
             self._stream_lost(error)
             if on_disconnect is not None:
-                on_disconnect(error)
+                try:
+                    on_disconnect(error)
+                except Exception:
+                    _LOGGER.exception("execution event stream disconnect handler failed")
 
-        follow_execution_events(
-            self._subscribe, apply_message, stop, on_disconnect=stream_lost
-        )
+        while not stop.is_set():
+            message = subscription.next(RECEIVE_SLICE_SECONDS)
+            if message is None:
+                continue
+            if message["type"] == "disconnected":
+                error = HeadlessApiError(message["code"], message["message"])
+                _LOGGER.warning("execution event stream reconnects: %s", error)
+                stream_lost(error)
+                continue
+            try:
+                self.apply_stream_message(message)
+                if on_message is not None:
+                    on_message(message)
+                if message["type"] not in ("event", "progress") and on_read is not None:
+                    on_read()
+            except Exception as error:
+                _LOGGER.warning("execution event stream message not applied: %s", error)
+                subscription.resync()
 
     def apply_stream_message(self, message: Mapping[str, Any]) -> None:
         """Apply one validated stream message. A malformed one makes the
-        states unavailable and raises (the subscription reconnects)."""
+        states unavailable and raises (``follow`` then asks the subscription
+        for a fresh snapshot)."""
 
         kind = message["type"]
         rows: Sequence[Any] | None = None
@@ -320,6 +364,8 @@ class InterruptRuleStateMirror:
         hold_changed = False
         hold: ProgramRunHoldFacts | None = None
         with self._lock:
+            if kind in ("snapshot", "state"):
+                self._generation += 1
             try:
                 if kind in ("snapshot", "state"):
                     hold = _program_run_hold(message["state"])
@@ -351,6 +397,7 @@ class InterruptRuleStateMirror:
 
     def _stream_lost(self, error: BaseException) -> None:
         with self._lock:
+            self._generation += 1
             # Unavailable, never stale, until the next snapshot.
             self._drop()
             self._catalog = None
@@ -413,22 +460,28 @@ class InterruptRuleStateMirror:
         with self._lock:
             return self._carried_object_lost
 
-    def _poll_locked(self) -> None:
+    def _record_poll_locked(
+        self, cursor: int, response: Mapping[str, Any] | None, failure: Exception | None
+    ) -> None:
         try:
-            response = self._read_events(self._cursor)
-            page = _page(response, self._cursor)
+            if failure is not None:
+                raise failure
+            assert response is not None
+            page = _page(response, cursor)
             self._apply_rule_states_locked(
                 response.get("interrupt_rule_catalog"),
                 response.get("interrupt_rule_state_baseline"),
-                new_context_only=self._subscribe is not None,
+                new_context_only=self._subscription is not None,
             )
-            self._cursor = page["next_after_sequence"]
+            # Stream rows may have moved the cursor meanwhile.
+            self._cursor = max(self._cursor, page["next_after_sequence"])
         except Exception as error:
             # Unreadable reply: recapture.
             self._recapture_locked(error)
 
 
 __all__ = [
+    "RECEIVE_SLICE_SECONDS",
     "InterruptRuleStateMirror",
     "InterruptStateWireError",
     "RULE_STATES",

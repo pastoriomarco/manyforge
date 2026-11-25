@@ -54,7 +54,7 @@ blackboard:
 | Persistence | Lifetime | Starting value at Run |
 | --- | --- | --- |
 | `run` | One Program run | `initial:`, otherwise empty |
-| `persistent` | Survives runs, Reset (unless Reset reloads the initial scene) and restarts | The stored value, otherwise `initial:`, otherwise empty |
+| `persistent` | Survives runs, Reset (unless the Reset resets stored values) and restarts | The stored value, otherwise `initial:`, otherwise empty |
 
 A key with no value yet can still be written; a node that **reads** it
 before any value exists fails, naming the key. Starting values are loaded by
@@ -82,15 +82,18 @@ the Program runner itself, so a key declared `read` still receives its
 - Stored values follow the Program the runner actually activates. An Apply
   that a later one replaced before the runner activated it has no effect on
   them.
-- A Reset with **Reload initial scene** also resets every persistent key,
-  whatever its access, to `initial:` (or empty). Its confirmation lists the
-  stored values it resets (current value → new value), and each reset is
-  recorded in the stored-value edits with that Reset. If they cannot be
-  reset, the Reset fails by name before the Scene is reloaded and the stored
-  values stay; Reset again to retry. The keys are reset before the Scene
-  reloads: if the Scene reload then fails, Reset again to finish it (after New
-  or Load instead, the keys stay reset although the Scene was not reloaded).
-  A Reset without that option keeps them.
+- A Reset with **Reset stored values to their initial values** (off by
+  default) resets every persistent key, whatever its access, to `initial:`
+  (or empty). The option is independent of **Reload initial scene** and
+  **Reset robot position**. Its confirmation lists the stored values it
+  resets (current value → new value), and each reset is recorded in the
+  stored-value edits with that Reset. If they cannot be reset, the Reset
+  fails by name before the Scene is reloaded or the robot moved, and the
+  stored values stay; Reset again to retry. The keys are reset first: if the
+  Scene reload or the position reset then fails, Reset again to finish it
+  (after New or Load instead, the keys stay reset although the Scene was not
+  reloaded). A Reset without that option, including one with **Reload initial
+  scene** alone, keeps them.
 - A persistent key cannot be a computed key.
 
 ## 5. Computed keys

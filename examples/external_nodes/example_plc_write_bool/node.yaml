@@ -16,7 +16,7 @@
 #     description: Request one semantic boolean output through its target owner.
 #     stability: experimental
 #     tags: [io, example]
-#     profiles: {min_program_profile: composable-cell-v1}
+#     profiles: {min_program_profile: manyforge-cell-v1}
 #     kind: leaf
 #     children: {min: 0, max: 0}
 #     parameters:

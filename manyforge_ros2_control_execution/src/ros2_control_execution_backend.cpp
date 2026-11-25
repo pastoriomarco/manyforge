@@ -258,8 +258,17 @@ struct Ros2ControlExecutionBackend::State {
     observation.phase = ExecutionGoalPhase::kTerminal;
     observation.result = ExecutionGoalResult::kEndedUnknown;
     observation.preempted_by.reset();
+    observation.controller_error_text.reset();
     if (!ready() || !terminal.result)
       return;
+    if (const auto &text = terminal.result->error_string; !text.empty()) {
+      // Bounded, cut on a UTF-8 boundary (History and the journal keep NFC text).
+      std::size_t size = std::min<std::size_t>(text.size(), 512U);
+      while (size < text.size() && size > 0U &&
+             (static_cast<unsigned char>(text[size]) & 0xC0U) == 0x80U)
+        --size;
+      observation.controller_error_text = text.substr(0, size);
+    }
     const int code = terminal.result->error_code;
     if (terminal.code == rclcpp_action::ResultCode::SUCCEEDED &&
         code == Action::Result::SUCCESSFUL)

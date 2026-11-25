@@ -18,6 +18,8 @@ struct Ros2ControlObservation final {
   std::optional<std::string> owner_stalled;
   /// The component's launch exited by itself.
   std::optional<std::string> process_fault;
+  /// With `process_fault`: the launch's `output_tail` fault detail.
+  std::string process_output_tail;
   /// One of its ROS transport executors failed (or its rebuild is not yet
   /// qualified); Recover rebuilds the transport.
   std::optional<std::string> transport_fault;
@@ -63,7 +65,7 @@ struct Ros2ControlObservation final {
 };
 
 /// The component state from one observation, in order:
-/// - an exited launch is `fault` (`fault_process_exited`);
+/// - an exited launch is `fault` (`fault_process_exited`, detail `output_tail`);
 /// - a guard or tool-context fault is `fault`, cleared by Recover;
 /// - a stale own stream is `fault` (`fault_stream_stale`), except in a
 ///   simulator;

@@ -1526,23 +1526,56 @@
   white-space: nowrap;
 }
 
-/* Declaration rows: the whole row selects; the selected one is lifted. */
+/* Declaration rows, also inside a namespace group: the whole row selects and
+   takes the column's full width; the selected one is lifted. */
+.program-declaration-navigator .dcard > details > button,
 .program-declaration-navigator .dcard > button:not(:first-child) {
   display: grid;
-  width: auto;
-  min-height: 2.2rem;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 2.4rem;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 0.35rem;
-  margin: 0 0.3rem;
-  padding: 0.3rem 0.35rem;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0.35rem 0.65rem;
   border: 0;
-  border-radius: var(--mf-radius-sm);
+  border-radius: 0;
   text-align: left;
 }
 
+/* The usage count sits at the row's right edge. */
+.program-declaration-navigator .dcard button > small:last-child {
+  justify-self: end;
+  font-size: var(--mf-font-size-068);
+}
+
+/* The card clips without becoming a scroll container, so a namespace header
+   can stay pinned at the top of the scrolling column. */
+.program-declaration-navigator .dcard {
+  overflow: clip;
+}
+
+.program-declaration-navigator .dcard > details > summary {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  padding: 0.4rem 0.65rem;
+  border-bottom: 1px solid var(--mf-border-neutral-19);
+  background: var(--mf-bg-neutral-11);
+  font-size: var(--mf-font-size-076);
+}
+
+.program-declaration-navigator .dcard > details > button + button,
 .program-declaration-navigator .dcard > button:not(:first-child) + button {
   border-top: 1px solid var(--mf-border-neutral-19);
+}
+
+.program-declaration-navigator .program-declaration-search {
+  box-sizing: border-box;
+  width: calc(100% - 1.3rem);
+  margin: 0.4rem 0.65rem;
+  font-size: var(--mf-font-size-076);
 }
 
 .program-declaration-navigator .dcard > header > h4 {
@@ -1568,12 +1601,12 @@
 }
 
 .program-declaration-navigator button strong {
-  font-size: var(--mf-font-size-068);
+  font-size: var(--mf-font-size-080);
 }
 
 .program-declaration-navigator button small {
-  color: var(--mf-text-neutral-51);
-  font-size: var(--mf-font-size-056);
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-068);
 }
 
 .program-declaration-columns {

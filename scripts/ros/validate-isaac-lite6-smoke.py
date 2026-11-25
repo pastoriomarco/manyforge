@@ -19,7 +19,7 @@ LITE6_ARM_JOINTS = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 LITE6_GRIPPER_JOINT = "right_finger_joint"
 RESULT_SCHEMA = "manyforge.isaac_lite6_live_smoke.v1"
 
-UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: live Isaac Lite6 smoke is not available yet"
 )

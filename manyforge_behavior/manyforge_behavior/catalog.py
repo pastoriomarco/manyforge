@@ -35,10 +35,10 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v3"
 EXPECTED_CONTENT_VERSION = "4.0.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:8ea501e0503f9dc6ebfe06ee0ad72e647d5afdb38a06608f98bfecba38480fbb"
+    "sha256:2800a9be389ec9297e69e20b4d7c83c7616c99df0696258815f946858663cf74"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
-_COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
+_PROGRAM_PROFILE_RE = re.compile(r"^manyforge-cell-v(\d+)$")
 _ID_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _ENTRY_KINDS = {"leaf", "decorator", "composite"}
 _STABILITY_LEVELS = {"stable", "experimental", "deprecated"}
@@ -327,7 +327,7 @@ class CatalogEntry:
     runner_implementation_ids: Mapping[str, str]
     stability: str = "stable"
     tags: tuple[str, ...] = ()
-    min_program_profile: str = "composable-cell-v1"
+    min_program_profile: str = "manyforge-cell-v1"
     blackboard_reads: tuple[CatalogBlackboardBinding, ...] = ()
     blackboard_writes: tuple[CatalogBlackboardBinding, ...] = ()
     owner_context: CatalogOwnerContext | None = None
@@ -809,7 +809,7 @@ class NodeCatalog:
         if stability not in _STABILITY_LEVELS:
             raise CatalogValidationError(f"{label}.stability is unsupported")
         tags = _unique_identifiers(raw["tags"], f"{label}.tags") if "tags" in raw else ()
-        min_profile = "composable-cell-v1"
+        min_profile = "manyforge-cell-v1"
         if "profiles" in raw:
             profiles = _mapping(raw["profiles"], f"{label}.profiles")
             _closed(
@@ -822,10 +822,10 @@ class NodeCatalog:
                 profiles["min_program_profile"],
                 f"{label}.profiles.min_program_profile",
             )
-            if min_profile != "composable-cell-v1":
+            if min_profile != "manyforge-cell-v1":
                 raise CatalogValidationError(
                     f"{label}.profiles.min_program_profile must be "
-                    "'composable-cell-v1' in the frozen packet"
+                    "'manyforge-cell-v1' in the frozen packet"
                 )
 
         reads: tuple[CatalogBlackboardBinding, ...] = ()
@@ -1382,8 +1382,8 @@ def profile_satisfied(min_profile: str, target: str) -> bool:
 
     if min_profile == target:
         return True
-    minimum = _COMPOSABLE_PROFILE_RE.fullmatch(min_profile)
-    selected = _COMPOSABLE_PROFILE_RE.fullmatch(target)
+    minimum = _PROGRAM_PROFILE_RE.fullmatch(min_profile)
+    selected = _PROGRAM_PROFILE_RE.fullmatch(target)
     if minimum is None or selected is None:
         return False
     return int(selected.group(1)) >= int(minimum.group(1))

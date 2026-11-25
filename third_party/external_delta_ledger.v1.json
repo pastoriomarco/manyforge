@@ -1,5 +1,5 @@
 {
-  "schema": "manyforge.composable_cell.e1.external_delta_ledger.v1",
+  "schema": "manyforge.external_delta_ledger.v1",
   "status": "frozen",
   "roboplan_decision": "adopt_roboplan_0_6_0",
   "roboplan_decision_record": {
@@ -119,7 +119,7 @@
       "role": "frozen RoboPlan 0.6.0 operator-directed restoration source retained until UA7 qualification"
     },
     {
-      "id": "roboplan_0_7_0_ua1_foundation",
+      "id": "roboplan_0_7_0_foundation",
       "identity": {
         "commit": "099dfa5ccd80b191eb3d6da9f4795f808a63913f",
         "source_content_sha256": "d117c17658a0765f66c39187739e7af4b6533dac68a8aeb5f7dabc3b8fc67bef",
@@ -210,7 +210,7 @@
       "role": "selected RoboPlan 0.6 time-parameterization dependency"
     },
     {
-      "id": "toppra_0_6_10_ua1_dependency",
+      "id": "toppra_0_6_10_dependency",
       "identity": {
         "commit": "8121e9af72f5aa589b515aa15e0dc408344c3220",
         "source_content_sha256": "f8f1f5e8cdc0eeac08dc3e2f9302324ccb58f172ec9045ceef7f35c54c34bb1f",
@@ -244,7 +244,7 @@
       "role": "qualified reduction base for the composable-cell xArm branch"
     },
     {
-      "id": "xarm_composable_cell_current",
+      "id": "xarm_current",
       "identity": {
         "commit": "c3172e57c1c1bb2982fc008304ad6bc886357c87",
         "tree": "00056796f565dddfa6098d1b1c2661de102671b6"
@@ -1162,7 +1162,7 @@
       "id": "roboplan_patch_0012_dynotree_variant_initialization",
       "dependency": "RoboPlan embedded DynoTree",
       "source_identity_refs": [
-        "roboplan_0_7_0_ua1_foundation"
+        "roboplan_0_7_0_foundation"
       ],
       "local_sources": [
         {
@@ -1253,7 +1253,7 @@
       "dependency": "RoboPlan Python distribution metadata",
       "source_identity_refs": [
         "roboplan_0_8_0_foundation",
-        "toppra_0_6_10_ua1_dependency"
+        "toppra_0_6_10_dependency"
       ],
       "local_sources": [
         {
@@ -1658,7 +1658,7 @@
       "dependency": "xarm_ros2",
       "source_identity_refs": [
         "xarm_jazzy_no_gazebo_base",
-        "xarm_composable_cell_current"
+        "xarm_current"
       ],
       "local_sources": [
         {
@@ -1694,7 +1694,7 @@
       "source_identity_refs": [
         "xarm_sdk_control",
         "xarm_sdk_current",
-        "xarm_composable_cell_current"
+        "xarm_current"
       ],
       "local_sources": [
         {
@@ -1726,7 +1726,7 @@
       "id": "xarm_fork_builder_surface",
       "dependency": "xarm_ros2 uf_ros_lib",
       "source_identity_refs": [
-        "xarm_composable_cell_current",
+        "xarm_current",
         "manymove_historical_acceptance"
       ],
       "local_sources": [

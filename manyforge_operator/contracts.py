@@ -36,10 +36,10 @@ from pydantic import (
 # Frozen schema identifiers
 # ---------------------------------------------------------------------------
 
-LAUNCH_CONTRACT_SCHEMA = "manyforge.operator_launch_contract.v2"
-CONFIGURATION_SCHEMA = "manyforge.operator_launch_configuration.v1"
-STATUS_SCHEMA = "manyforge.launch_instance_status.v2"
-RESULT_SCHEMA = "manyforge.operator_command_result.v2"
+LAUNCH_CONTRACT_SCHEMA = "manyforge.operator_launch_contract.v3"
+CONFIGURATION_SCHEMA = "manyforge.operator_launch_configuration.v2"
+STATUS_SCHEMA = "manyforge.launch_instance_status.v3"
+RESULT_SCHEMA = "manyforge.operator_command_result.v3"
 SOURCE_IDENTITY_SCHEMA = "manyforge.source_identity.v1"
 JSON_SCHEMA_DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
@@ -72,12 +72,10 @@ MAX_STATIC_PEERS = 16
 SERVICE_BIND_HOSTS: dict[str, str] = {
     "composer": "0.0.0.0",
     "headless": "127.0.0.1",
-    "program_runner": "127.0.0.1",
 }
 SERVICE_PORTS: dict[str, int] = {
     "composer": 9000,
     "headless": 9010,
-    "program_runner": 9011,
 }
 
 # ---------------------------------------------------------------------------
@@ -120,7 +118,6 @@ class HostRole(StrEnum):
 class ServiceKind(StrEnum):
     COMPOSER = "composer"
     HEADLESS = "headless"
-    PROGRAM_RUNNER = "program_runner"
 
 
 class LaunchInstanceState(StrEnum):
@@ -587,7 +584,7 @@ class LaunchConfiguration(StrictOperatorContract):
     artifacts: Annotated[
         list[RuntimeArtifactIdentity], Field(min_length=1, max_length=MAX_ARTIFACTS)
     ]
-    endpoints: Annotated[list[ServiceEndpoint], Field(min_length=3, max_length=3)]
+    endpoints: Annotated[list[ServiceEndpoint], Field(min_length=2, max_length=2)]
     ros_topology: RosTopology | None
     configuration_digest: str
 
@@ -657,8 +654,8 @@ class LaunchConfiguration(StrictOperatorContract):
 class ProcessResourceIdentity(StrictOperatorContract):
     """Exact mechanical identity of one owned process.
 
-    A record authorizes no action by itself; the O1.3+ orchestration
-    joins it to host boot identity and absence evidence before any stop.
+    A record authorizes no action by itself; the orchestration joins it
+    to host boot identity and absence evidence before any stop.
     """
 
     kind: Literal[ResourceKind.PROCESS]

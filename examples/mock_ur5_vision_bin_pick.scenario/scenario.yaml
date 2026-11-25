@@ -7,11 +7,11 @@
   "description": "Mock UR5 vision-guided bin pick. Needs one connected viewer snapshot source so assistant.query_model can attach a live scene snapshot. Load and Execute the Program.",
   "members": {
     "deployment.yaml": "sha256:ba333cbbcbd8f428aa08451ea353976e245a97eb8e756a555c541d41376e8d69",
-    "program.yaml": "sha256:9ce7622242f2f6d187d592d7304766466cffc00ec360ad40b47211fb8df6414a"
+    "program.yaml": "sha256:06f6145c0106e93cf2a86499e1ce030dc20a9dfcc44b70dae4e14f63d41f1865"
   },
   "name": "mock_ur5_vision_bin_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:951fecd47d4e4e17bf027606a87e48cf7c96049ecae9413e818a2a071af960b4",
+    "checked_content_digest": "sha256:7e2db637f08ee7202dbfb7d29f75cd32a5827679f2f0064721e71fd852817359",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

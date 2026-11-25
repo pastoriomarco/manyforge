@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.tests.fake_gateway import FakeGateway
 from manyforge_headless_api.models import TargetObservationQuery
 from manyforge_headless_api.native import HeadlessApiError
 
@@ -61,14 +62,13 @@ def _response(query, coordinate_kind="angular_rad"):
 
 
 def _client(response):
-    client = object.__new__(ExecutionCommandClient)
     requests = []
 
     def exchange(request):
         requests.append(deepcopy(request))
         return deepcopy(response)
 
-    client._exchange = exchange
+    client = ExecutionCommandClient(FakeGateway(exchange))
     return client, requests
 
 
@@ -133,61 +133,6 @@ def test_gripper_query_cannot_name_an_arbitrary_frame():
                 "relative_to_frame": {"component_id": "robot", "frame_id": "base"},
             }
         )
-
-
-@pytest.mark.parametrize(
-    "change",
-    [
-        {"source_epoch": "s" * 257},
-        {"source_epoch": "e\u0301"},
-        {"source_epoch": ""},
-        {"source_sequence": 0},
-        {"source_sequence": True},
-        {"source_sequence": 2**53},
-        {"extra": None},
-        {"value": None},
-    ],
-)
-def test_client_rejects_unqualified_or_mismatched_owner_response(change):
-    query = _query()
-    response = _response(query)
-    response["target_observation"].update(change)
-    client, _ = _client(response)
-    with pytest.raises(HeadlessApiError) as caught:
-        client.query_target(TargetObservationQuery.model_validate(query))
-    assert caught.value.code == "execution_target_observation_invalid"
-
-
-@pytest.mark.parametrize(
-    "kind,bad_value",
-    [
-        (
-            "frame_pose",
-            {
-                "position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.0},
-                "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 0.0},
-            },
-        ),
-        (
-            "gripper_status",
-            {
-                "state": "grasp_confirmed",
-                "command_id": 1,
-                "generation": 1,
-                "revision": 1,
-                "grasp_confirmed": "yes",
-                "observed_position": {"kind": "angular_rad", "value_m": 0.1},
-            },
-        ),
-    ],
-)
-def test_client_rejects_invalid_units_and_never_repairs_bad_evidence(kind, bad_value):
-    query = _query(kind)
-    response = _response(query)
-    response["target_observation"]["value"] = bad_value
-    client, _ = _client(response)
-    with pytest.raises(HeadlessApiError):
-        client.query_target(TargetObservationQuery.model_validate(query))
 
 
 def test_owner_rejection_is_not_retried_or_replaced_by_cached_state():
@@ -275,23 +220,3 @@ def test_frame_transform_query_is_closed(change):
         TargetObservationQuery.model_validate({**_query(), "pose": _transform_query()["pose"]})
 
 
-@pytest.mark.parametrize(
-    "change",
-    [
-        {"source_epoch": "source.1"},
-        {"evaluated_at_ns": -1},
-        {"scene_revision": None},
-        {"resolution_evidence_digests": ["sha256:" + "e" * 64] * 2},
-        {"resolution_evidence_digests": ["not a digest"]},
-        {"value": {"position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.0},
-                   "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 0.0}}},
-    ],
-)
-def test_frame_transform_answer_must_echo_one_evaluation(change):
-    query = _transform_query()
-    response = _transform_response(query)
-    response["target_observation"].update(change)
-    client, _ = _client(response)
-    with pytest.raises(HeadlessApiError) as caught:
-        client.query_target(TargetObservationQuery.model_validate(query))
-    assert caught.value.code == "execution_target_observation_invalid"

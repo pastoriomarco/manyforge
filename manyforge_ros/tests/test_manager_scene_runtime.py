@@ -4,21 +4,23 @@ import json
 import os
 from pathlib import Path
 import socket
-import stat
 import threading
+import time
 
 import pytest
 import rfc8785
 
 from manyforge_ros.manager_scene_runtime import (
-    MANAGER_COMMAND_VERSION,
-    MANAGER_RESPONSE_VERSION,
     ManagerSceneRuntimeClient,
     PoseObservationIntent,
     PoseObserverBinding,
     SceneRuntimeManagerError,
     SceneRuntimeOwnerSnapshot,
 )
+
+
+MANAGER_COMMAND_VERSION = "manyforge.manager_command.v2"
+MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v3"
 
 
 def _bindings() -> tuple[PoseObserverBinding, ...]:
@@ -260,7 +262,7 @@ def test_client_parses_and_cross_checks_committed_scene_application(
         }
     )
     responses.append(committed)
-    monkeypatch.setattr(client, "_exchange", lambda _command: responses.pop(0))
+    monkeypatch.setattr(client, "_exchange", lambda *_: responses.pop(0))
 
     owner = client.read_owner()
     session = client.open_observer(
@@ -295,7 +297,7 @@ def test_client_parses_and_cross_checks_committed_scene_application(
             "policy_id": "before_planning",
         }
     )
-    monkeypatch.setattr(client, "_exchange", lambda _command: latched)
+    monkeypatch.setattr(client, "_exchange", lambda *_: latched)
     latched_result = client.observe(
         session,
         source_sequence=1,
@@ -313,7 +315,7 @@ def test_client_parses_and_cross_checks_committed_scene_application(
 
     invalid = dict(committed)
     invalid["scene_update_status"] = None
-    monkeypatch.setattr(client, "_exchange", lambda _command: invalid)
+    monkeypatch.setattr(client, "_exchange", lambda *_: invalid)
     with pytest.raises(SceneRuntimeManagerError) as rejected:
         client.observe(
             session,
@@ -355,7 +357,7 @@ def test_client_accepts_unchanged_sample_with_unchanged_projection(
         }
     )
     responses = [_owner_response(), opened, confirmed]
-    monkeypatch.setattr(client, "_exchange", lambda _command: responses.pop(0))
+    monkeypatch.setattr(client, "_exchange", lambda *_: responses.pop(0))
     owner = client.read_owner()
     session = client.open_observer(
         owner,
@@ -386,7 +388,7 @@ def test_client_accepts_unchanged_sample_with_unchanged_projection(
 
     latched = dict(confirmed)
     latched.update({"disposition": "observed_only", "policy_id": "before_planning"})
-    monkeypatch.setattr(client, "_exchange", lambda _command: latched)
+    monkeypatch.setattr(client, "_exchange", lambda *_: latched)
     assert observe("before_planning").scene_application_status == (
         "unchanged"
     )
@@ -398,14 +400,14 @@ def test_client_accepts_unchanged_sample_with_unchanged_projection(
     ):
         invalid = dict(confirmed)
         invalid[field] = value
-        monkeypatch.setattr(client, "_exchange", lambda _command, r=invalid: r)
+        monkeypatch.setattr(client, "_exchange", lambda *_, r=invalid: r)
         with pytest.raises(SceneRuntimeManagerError) as rejected:
             observe("continuous_unattached")
         assert rejected.value.code == "manager_scene_runtime_response_invalid"
 
     buffered = dict(confirmed)
     buffered["disposition"] = "buffered"
-    monkeypatch.setattr(client, "_exchange", lambda _command: buffered)
+    monkeypatch.setattr(client, "_exchange", lambda *_: buffered)
     with pytest.raises(SceneRuntimeManagerError) as contradicted:
         observe("continuous_unattached")
     assert contradicted.value.code == "manager_scene_runtime_response_invalid"
@@ -444,6 +446,67 @@ def test_client_rejects_noncanonical_and_duplicate_responses(tmp_path: Path) -> 
         assert raised.value.code == "manager_scene_runtime_response_invalid"
 
 
+def test_client_reports_a_manager_that_closes_without_answering(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "manager-command.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    server.bind(str(socket_path))
+    os.chmod(socket_path, 0o600)
+    server.listen(1)
+
+    def serve() -> None:
+        connection, _address = server.accept()
+        with connection:
+            connection.recv(4096)
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    try:
+        with pytest.raises(SceneRuntimeManagerError) as raised:
+            ManagerSceneRuntimeClient(tmp_path).read_owner()
+    finally:
+        server.close()
+        worker.join(timeout=1.0)
+    # The dispatcher rejoins on this code.
+    assert raised.value.code == "manager_scene_runtime_unavailable"
+
+
+def test_a_silent_manager_ends_the_exchange_within_the_timeout(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "manager-command.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    server.bind(str(socket_path))
+    os.chmod(socket_path, 0o600)
+    server.listen(1)
+    release = threading.Event()
+
+    def serve() -> None:
+        connection, _address = server.accept()
+        with connection:
+            connection.recv(4096)
+            release.wait(5.0)  # Takes the request and never answers.
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(SceneRuntimeManagerError) as raised:
+            ManagerSceneRuntimeClient(tmp_path, timeout_s=0.2).read_owner()
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+        server.close()
+        worker.join(timeout=1.0)
+    # The dispatcher rejoins on this code.
+    assert raised.value.code == "manager_scene_runtime_unavailable"
+    assert 0.15 <= elapsed < 2.0
+    for invalid in (0.0, -1.0, 5.5, float("nan"), True):
+        with pytest.raises(ValueError, match="timeout_s"):
+            ManagerSceneRuntimeClient(tmp_path, timeout_s=invalid)
+
+
 def test_client_rejects_wrong_endpoint_and_response_shape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -462,17 +525,16 @@ def test_client_rejects_wrong_endpoint_and_response_shape(
             ManagerSceneRuntimeClient(tmp_path).read_owner()
     finally:
         server.close()
-    assert wrong_mode.value.code == "manager_scene_runtime_transport_invalid"
+    assert wrong_mode.value.code == "manager_scene_runtime_unavailable"
 
-    os.chmod(socket_path, 0o600)
     client = ManagerSceneRuntimeClient(tmp_path)
     owner_response = _owner_response()
-    monkeypatch.setattr(client, "_exchange", lambda _command: owner_response)
+    monkeypatch.setattr(client, "_exchange", lambda *_: owner_response)
     owner = client.read_owner()
     # Each exchange is its own connection: the echoed identity is not compared.
     echo_open = _open_response()
     echo_open["source_id"] = "another.observer"
-    monkeypatch.setattr(client, "_exchange", lambda _command: echo_open)
+    monkeypatch.setattr(client, "_exchange", lambda *_: echo_open)
     session = client.open_observer(
         owner,
         bindings=_bindings(),
@@ -482,7 +544,7 @@ def test_client_rejects_wrong_endpoint_and_response_shape(
     assert session.source_id == "isaac.observer"
     malformed_open = _open_response()
     del malformed_open["source_epoch_order"]
-    monkeypatch.setattr(client, "_exchange", lambda _command: malformed_open)
+    monkeypatch.setattr(client, "_exchange", lambda *_: malformed_open)
     with pytest.raises(SceneRuntimeManagerError) as malformed:
         client.open_observer(
             owner,
@@ -499,38 +561,18 @@ def test_client_rejects_unsafe_or_replaced_manager_run_root(
     unsafe = tmp_path / "unsafe"
     unsafe.mkdir(mode=0o700)
     unsafe.chmod(0o720)
-    with pytest.raises(SceneRuntimeManagerError, match="safe real"):
+    with pytest.raises(SceneRuntimeManagerError) as rejected:
         ManagerSceneRuntimeClient(unsafe)
+    assert rejected.value.code == "manager_scene_runtime_unavailable"
 
     run_root = tmp_path / "run"
     run_root.mkdir(mode=0o700)
     client = ManagerSceneRuntimeClient(run_root)
     run_root.rename(tmp_path / "retained-run")
     run_root.mkdir(mode=0o700)
-    with pytest.raises(SceneRuntimeManagerError, match="identity changed"):
+    with pytest.raises(SceneRuntimeManagerError, match="replaced") as replaced:
         client.read_owner()
-
-
-def test_client_pins_manager_run_root_through_socket_use(
-    tmp_path: Path,
-) -> None:
-    run_root = tmp_path / "run"
-    run_root.mkdir(mode=0o700)
-    socket_path = run_root / "manager-command.sock"
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    listener.bind(str(socket_path))
-    socket_path.chmod(0o600)
-    client = ManagerSceneRuntimeClient(run_root)
-
-    try:
-        with pytest.raises(SceneRuntimeManagerError, match="changed during use"):
-            with client._socket_address() as address:  # noqa: SLF001
-                retained_root = tmp_path / "retained-run"
-                run_root.rename(retained_root)
-                run_root.mkdir(mode=0o700)
-                assert stat.S_ISSOCK(os.stat(address).st_mode)
-    finally:
-        listener.close()
+    assert replaced.value.code == "manager_scene_runtime_unavailable"
 
 
 def test_observation_intent_and_sequence_are_strict_and_bounded(
@@ -565,15 +607,10 @@ def test_observation_intent_and_sequence_are_strict_and_bounded(
             payload={"value": "x" * (64 * 1024)},
         )
 
-    socket_path = tmp_path / "manager-command.sock"
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    server.bind(str(socket_path))
-    os.chmod(socket_path, 0o600)
-    server.listen(1)
     client = ManagerSceneRuntimeClient(tmp_path)
-    monkeypatch.setattr(client, "_exchange", lambda _command: _owner_response())
+    monkeypatch.setattr(client, "_exchange", lambda *_: _owner_response())
     owner = client.read_owner()
-    monkeypatch.setattr(client, "_exchange", lambda _command: _open_response())
+    monkeypatch.setattr(client, "_exchange", lambda *_: _open_response())
     session = client.open_observer(
         owner,
         bindings=_bindings(),
@@ -594,7 +631,6 @@ def test_observation_intent_and_sequence_are_strict_and_bounded(
             source_sequence=True,  # type: ignore[arg-type]
             intent=intent,
         )
-    server.close()
 
 
 @pytest.mark.parametrize("malformed", [False, True])

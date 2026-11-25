@@ -1,18 +1,15 @@
-"""I/O read and watch commands on the ordinary execution-command socket."""
+"""The Program runner's I/O read and watch commands through its gateway."""
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
 import pytest
 
-from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_behavior.kernel_client import ExecutionCommandError, KernelClient
 from manyforge_headless_api.models import IoWatchResult, TargetObservationQuery
-from manyforge_headless_api.native import HeadlessApiError
-from manyforge_program_runner.execution_transport import (
-    ProgramRunnerExecutionTransport,
-)
+
+from .fake_gateway import RecordingGateway
 
 _A = "sha256:" + "a" * 64
 _API = {"api_version": "manyforge.execution_command_response.v6"}
@@ -68,6 +65,15 @@ def _registration() -> dict[str, Any]:
     }
 
 
+def _client(replies: dict[str, Any]) -> tuple[KernelClient, RecordingGateway]:
+    gateway = RecordingGateway({
+        **{command: {**_API, "ok": True} for command in
+           ("identity", "submit", "read", "reset", "acknowledge_completed", "stop")},
+        **replies,
+    })
+    return KernelClient(gateway), gateway
+
+
 def _result(state: str = "pending") -> dict[str, Any]:
     return {"state": state, "observation": _value(quality="stale"), "matched_sample": None}
 
@@ -80,141 +86,44 @@ def test_query_requires_a_signal_only_for_io_signal() -> None:
         TargetObservationQuery.model_validate({**_query(), "kind": "gripper_status"})
 
 
-@pytest.mark.parametrize(
-    "bad",
-    [
-        {"extra_outer": True},
-        {"value": _value(quality="fresh", value=None)},
-        {"value": _value(source_sequence="07")},
-        {"value": _value(quality="unknown")},
-        {"value": _value(value_type="int")},
-        {"evaluated_at_ns": None},
-        {"evaluated_at_ns": "07"},
-        {"evaluated_at_ns": -1},
-        {"evaluated_at_ns": "9223372036854775808"},
-        {"drop_evaluated_at_ns": True},
-    ],
-)
-def test_io_signal_answers_are_exact(monkeypatch, tmp_path, bad) -> None:
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    observation = {
-        **_query(),
-        "schema_version": "manyforge.target_observation.v3",
-        # The actual host projection names its outer evaluation time.
-        "evaluated_at_ns": "9223372036854775807",
-        "value": _value(),
-    }
-    response = {**_API, "ok": True, "command": "query_target", "target_observation": observation}
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange", lambda *_: deepcopy(response))
-    assert transport.query_target(_query())["target_observation"]["value"]["value"] is False
-    stale = deepcopy(response)
-    stale["target_observation"]["value"] = _value(
-        quality="stale", value=True, source_epoch=None, source_sequence=None,
-        receipt_age_ns=None,
-    )
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange", lambda *_: deepcopy(stale))
-    assert transport.query_target(_query())["target_observation"]["value"]["quality"] == "stale"
-    broken = deepcopy(response)
-    if "extra_outer" in bad:
-        broken["target_observation"]["source_sequence"] = 1
-    elif "drop_evaluated_at_ns" in bad:
-        del broken["target_observation"]["evaluated_at_ns"]
-    else:
-        broken["target_observation"].update(bad)
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange", lambda *_: deepcopy(broken))
-    with pytest.raises(HeadlessApiError) as invalid:
-        transport.query_target(_query())
-    assert invalid.value.code == "execution_target_observation_invalid"
-
-
-def test_watch_commands_use_the_ordinary_socket_and_exact_token(monkeypatch, tmp_path) -> None:
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    sent: list[tuple[dict[str, Any], str]] = []
-    replies = {
+def test_watch_commands_send_the_request_and_the_exact_token() -> None:
+    client, gateway = _client({
         "register_io_watch": {
             **_API, "ok": True, "command": "register_io_watch",
             "registration": _registration(), "result": _result(),
         },
         "read_io_watch": {**_API, "ok": True, "command": "read_io_watch", "result": _result()},
         "release_io_watch": {**_API, "ok": True, "command": "release_io_watch"},
-    }
-
-    def exchange_on(_self, command, socket_path):
-        sent.append((deepcopy(command), socket_path.name))
-        return deepcopy(replies[command["command"]])
-
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange_on)
-    registered = transport.register_io_watch(_request())
-    assert registered["registration"] == _registration()
-    assert transport.read_io_watch(registered["registration"])["state"] == "pending"
-    transport.release_io_watch(registered["registration"])
-    assert [command["command"] for command, _ in sent] == [
-        "register_io_watch", "read_io_watch", "release_io_watch"
+    })
+    registered = client.register_io_watch(_request())
+    assert registered == {"registration": _registration(), "result": _result()}
+    assert client.read_io_watch(registered["registration"])["state"] == "pending"
+    client.release_io_watch(registered["registration"])
+    # The core adds the envelope, the internal attribution and the socket.
+    assert gateway.sent == [
+        ("register_io_watch", {"request": _request()}),
+        ("read_io_watch", {"registration": _registration()}),
+        ("release_io_watch", {"registration": _registration()}),
     ]
-    assert {socket for _, socket in sent} == {transport._socket_path.name}
-    assert sent[0][0]["request"] == _request()
-    assert sent[1][0]["registration"] == sent[2][0]["registration"] == _registration()
-    assert all(command["attribution"]["transport"] == "internal" for command, _ in sent)
 
 
-def test_registration_reply_must_carry_a_valid_result(monkeypatch, tmp_path) -> None:
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    result = {"state": "matched", "observation": _value(), "matched_sample": None}
-    monkeypatch.setattr(
-        ExecutionCommandClient,
-        "_exchange_on",
-        lambda *_: {
-            **_API,
-            "ok": True, "command": "register_io_watch",
-            "registration": _registration(), "result": result,
-        },
-    )
-    with pytest.raises(HeadlessApiError) as invalid:
-        transport.register_io_watch(_request())
-    assert invalid.value.code == "execution_command_response_invalid"
-
-
-def test_registration_echo_is_not_compared(monkeypatch, tmp_path) -> None:
+def test_registration_echo_is_not_compared() -> None:
     """Each exchange is its own connection: the echoed scope is not compared."""
 
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
     registration = _registration()
     registration["scope"]["node"]["node_attempt_id"] = 2
-    monkeypatch.setattr(
-        ExecutionCommandClient,
-        "_exchange_on",
-        lambda *_: {
-            **_API,
-            "ok": True, "command": "register_io_watch",
-            "registration": registration, "result": _result(),
-        },
-    )
-    assert transport.register_io_watch(_request())["registration"] == registration
+    client, _gateway = _client({"register_io_watch": {
+        **_API, "ok": True, "command": "register_io_watch",
+        "registration": registration, "result": _result(),
+    }})
+    assert client.register_io_watch(_request())["registration"] == registration
 
 
-def test_edge_conditions_never_reach_the_socket(monkeypatch, tmp_path) -> None:
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    monkeypatch.setattr(
-        ExecutionCommandClient, "_exchange_on",
-        lambda *_: pytest.fail("an edge watch must not be sent"),
-    )
-    request = _request()
-    request["condition"] = {"kind": "rising", "expected_value": True}
-    with pytest.raises(HeadlessApiError) as refused:
-        transport.register_io_watch(request)
-    assert refused.value.code == "execution_command_invalid"
-
-
-def test_actual_released_reply_carries_neither_observation_nor_sample(
-    monkeypatch, tmp_path
-) -> None:
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
+def test_actual_released_reply_carries_neither_observation_nor_sample() -> None:
     released = {"state": "released", "observation": None, "matched_sample": None}
-    monkeypatch.setattr(
-        ExecutionCommandClient, "_exchange_on",
-        lambda *_: {**_API, "ok": True, "command": "read_io_watch", "result": released},
-    )
-    assert transport.read_io_watch(_registration()) == released
+    client, _gateway = _client({"read_io_watch": {
+        **_API, "ok": True, "command": "read_io_watch", "result": released}})
+    assert client.read_io_watch(_registration()) == released
 
 
 @pytest.mark.parametrize(
@@ -248,15 +157,12 @@ def test_matched_sample_names_the_controllable_component() -> None:
 @pytest.mark.parametrize(
     ("command", "call"),
     [
-        ("register_io_watch", lambda transport: transport.register_io_watch(_request())),
-        ("read_io_watch", lambda transport: transport.read_io_watch(_registration())),
-        ("release_io_watch", lambda transport: transport.release_io_watch(_registration())),
+        ("register_io_watch", lambda client: client.register_io_watch(_request())),
+        ("read_io_watch", lambda client: client.read_io_watch(_registration())),
+        ("release_io_watch", lambda client: client.release_io_watch(_registration())),
     ],
 )
-def test_host_error_envelopes_keep_their_code_and_reason(
-    monkeypatch, tmp_path, command, call
-) -> None:
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
+def test_host_error_envelopes_keep_their_code_and_reason(command, call) -> None:
     # The actual host ErrorResponse: no `command`, the Core ErrorDTO verbatim.
     refusal = {
         **_API,
@@ -267,11 +173,12 @@ def test_host_error_envelopes_keep_their_code_and_reason(
             "details": {"reason": "io_watch_generation_stale"},
         },
     }
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", lambda *_: deepcopy(refusal))
-    with pytest.raises(HeadlessApiError) as refused:
-        call(transport)
+    client, _gateway = _client({command: refusal})
+    with pytest.raises(ExecutionCommandError) as refused:
+        call(client)
     assert refused.value.code == "stale_generation"
     assert refused.value.details == {"reason": "io_watch_generation_stale"}
+    assert refused.value.producer == "kernel"
 
 
 def _scope_request() -> dict[str, Any]:
@@ -285,65 +192,12 @@ def _scope_request() -> dict[str, Any]:
     }
 
 
-def test_scope_release_sends_the_closed_six_field_scope_request(
-    monkeypatch, tmp_path
-) -> None:
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    sent: list[dict[str, Any]] = []
-
-    def exchange_on(_self, command, socket_path):
-        sent.append(deepcopy(command))
-        assert socket_path.name == transport._socket_path.name
-        return {**_API, "ok": True, "command": "release_io_watch"}
-
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange_on)
-    assert transport.release_io_watch_scope(_scope_request()) is None
-    assert sent == [{
-        "api_version": "manyforge.execution_command.v4",
-        "command": "release_io_watch",
-        "attribution": sent[0]["attribution"],
-        "scope_request": _scope_request(),
-    }]
-    assert sent[0]["attribution"]["transport"] == "internal"
-    assert "registration" not in sent[0]
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [
-        {"extra": 1},
-        {"schema_version": "manyforge.io_watch_request.v1"},
-        {"claim_generation": 0},
-        {"claim_generation": 2**53},
-        {"program_binding_id": "sha256:short"},
-        {"drop": "node_attempt_id"},
-    ],
-)
-def test_scope_release_request_is_closed(monkeypatch, tmp_path, bad) -> None:
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    monkeypatch.setattr(
-        ExecutionCommandClient, "_exchange_on",
-        lambda *_: pytest.fail("an invalid scope release must not be sent"),
+def test_scope_release_sends_the_six_field_scope_request() -> None:
+    client, gateway = _client(
+        {"release_io_watch": {**_API, "ok": True, "command": "release_io_watch"}}
     )
-    request = _scope_request()
-    if "drop" in bad:
-        del request[bad["drop"]]
-    else:
-        request.update(bad)
-    with pytest.raises(HeadlessApiError) as refused:
-        transport.release_io_watch_scope(request)
-    assert refused.value.code == "execution_command_invalid"
-
-
-def test_scope_release_reply_must_name_its_command(monkeypatch, tmp_path) -> None:
-    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    monkeypatch.setattr(
-        ExecutionCommandClient, "_exchange_on",
-        lambda *_: {**_API, "ok": True, "command": "read_io_watch"},
-    )
-    with pytest.raises(HeadlessApiError) as invalid:
-        transport.release_io_watch_scope(_scope_request())
-    assert invalid.value.code == "execution_command_response_invalid"
+    assert client.release_io_watch_scope(_scope_request()) is None
+    assert gateway.sent == [("release_io_watch", {"scope_request": _scope_request()})]
 
 
 def test_matched_sample_source_epoch_is_opaque_and_its_sequence_a_counter() -> None:

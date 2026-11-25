@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string_view>
 #include <vector>
 
@@ -64,6 +65,10 @@ BuildManagerSourcePayload(
 
 /// As above, from an inventory the caller already read once from
 /// `apply_journal` (so a caller's own check and the payload see one read).
+/// `success_settlement_pending`: the Apply whose journaled success still
+/// awaits its admission claim release, read after the inventory; its record
+/// is published exactly as before its terminal record, so `succeeded` is
+/// published only once the claim is released (OD-387).
 [[nodiscard]] manyforge::content_identity::CanonicalValue
 BuildManagerSourcePayload(
     const manyforge::deployment::RetainedBundle &active_bundle,
@@ -75,7 +80,9 @@ BuildManagerSourcePayload(
         &apply_journal,
     const std::vector<manyforge::component_manager::PersistedManagerApplyStatus>
         &apply_inventory,
-    ManagerApplyMutationAvailability apply_availability);
+    ManagerApplyMutationAvailability apply_availability,
+    const std::optional<manyforge::core::ApplyId> &success_settlement_pending =
+        std::nullopt);
 
 /// Builds the separate logical-scene owner's immutable source value. The
 /// source remains absent until bootstrap Finalize has established a real

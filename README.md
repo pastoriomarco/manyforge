@@ -94,7 +94,8 @@ folder and run it:
 ```bash
 mkdir -p ~/manyforge && cd ~/manyforge
 docker run --rm --entrypoint tar ghcr.io/pastoriomarco/manyforge:<VERSION> \
-  -c -C /workspace VERSION manyforge scripts/compose-dev.sh scripts/lib manyforge_operator/run_session.py \
+  -c -C /workspace VERSION manyforge scripts/compose-dev.sh scripts/lib \
+  manyforge_operator/run_session.py manyforge_headless_api/history_export.py \
   | tar -x
 ./manyforge run --project examples/mock_lite6_pick_and_place.scenario
 ```

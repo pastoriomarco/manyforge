@@ -127,12 +127,16 @@ ControllerLaunchSupervisor::Ensured StartSimulatedPlcCandidate(
 
 std::function<std::optional<core::ErrorDTO>()>
 SimulatedPlcFaultSource(std::shared_ptr<ControllerLaunchProcess> process) {
-  return [source = ControllerLaunchSupervisor::fault_source(std::move(process))]()
+  auto source = ControllerLaunchSupervisor::fault_source(process);
+  return [process = std::move(process), source = std::move(source)]()
              -> std::optional<core::ErrorDTO> {
     auto reason = source();
     if (!reason)
       return std::nullopt;
-    return core::ErrorDTO{"simulated_plc_exited", std::move(*reason), {}};
+    core::ErrorDTO fault{"simulated_plc_exited", std::move(*reason), {}};
+    if (auto tail = process->output_tail_detail(); !tail.empty())
+      fault.details.emplace("output_tail", std::move(tail));
+    return fault;
   };
 }
 

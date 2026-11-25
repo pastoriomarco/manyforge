@@ -1,6 +1,7 @@
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include "execution_host_surface.hpp"
+#include <manyforge_core/process_diagnostics.hpp>
 #include "direct_control_manual_runs.hpp"
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 #include <manyforge_ros2_control_execution/volatile_motion_trace.hpp>
@@ -219,6 +220,13 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
       ::pthread_setname_np(::pthread_self(), "mf_io_out_lane");
       RunDeferredLane(io_output_lane_, stop_token);
     });
+    // Motion-trace snapshots: the ring is copied under its own lock, then
+    // encoded and written to the trace store here, off every lane that serves
+    // Stop, goals, projections or outputs.
+    std::jthread motion_trace_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_trace_lane");
+      RunDeferredLane(motion_trace_lane_, stop_token);
+    });
     // Subscriber writers never take a command lane or its locks while they
     // send; a slow subscriber only lags in the journal.
     std::jthread event_stream_thread([this](std::stop_token stop_token) {
@@ -261,12 +269,14 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     submission_ordered_thread.request_stop();
     scene_read_thread.request_stop();
     io_output_thread.request_stop();
+    motion_trace_thread.request_stop();
     runtime_scale_thread.request_stop();
     event_stream_thread.request_stop();
     event_stream_thread.join();
     submission_ordered_thread.join();
     scene_read_thread.join();
     io_output_thread.join();
+    motion_trace_thread.join();
     runtime_scale_thread.join();
     reconciliation_thread.join();
     control_thread.join();
@@ -436,6 +446,10 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
                           std::map<std::string, std::string> *failures) const {
     std::optional<ResolvedObservationOwner> match;
     bool ambiguous = false;
+    // OD-234: a read of the held run's Binding resolves from that run's capture.
+    const auto *kernel = composition.active_addressed_kernel();
+    const auto held_run = kernel != nullptr ? kernel->held_program_run_resolution_context()
+                                            : core::ProgramRunResolutionContext{};
     const auto inspect = [&](Composition &candidate) {
       const auto refuse = [&](std::string phase, const core::ErrorDTO *error = nullptr) {
         if (failures == nullptr)
@@ -514,7 +528,7 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
       const auto resolved =
           composition.target_resolver->ResolveObservationTarget(
               program_binding_id, target_ref, capability_id, physical,
-              representatives);
+              representatives, held_run);
       if (!resolved.ok()) {
         refuse("sealed_target_resolution_failed", &resolved.error());
         return;
@@ -3527,8 +3541,12 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
             return part->ros2_control_runtime_handle->ReadRobotTcps();
         return std::nullopt;
       };
+      // OD-234: a holder of the held run's Binding resolves from its capture.
+      const auto *kernel = composition.active_addressed_kernel();
       const auto frame = composition.target_resolver->ResolveAttachActiveTcp(
-          *command.attach_binding_id, *command.attach_holder, read);
+          *command.attach_binding_id, *command.attach_holder, read,
+          kernel != nullptr ? kernel->held_program_run_resolution_context()
+                            : core::ProgramRunResolutionContext{});
       if (!frame.ok())
         return ErrorResponse(frame.error().code, frame.error().message, frame.error().details);
       return CanonicalValue(CanonicalValue::Object{
@@ -4319,11 +4337,11 @@ void ExecutionCommandSurface::AcceptClient(const CommandSocket &socket,
           const char *lane_name = lane == CommandLane::kOrdinary ? "ordinary" :
               lane == CommandLane::kStop ? "stop" :
               lane == CommandLane::kComponent ? "component" : "observation";
-          std::ostringstream line;
-          line << "accept execution command client lane=" << lane_name
-               << " errno=" << error << " name=" << (name ? name : "unknown")
-               << ": " << std::strerror(error) << '\n';
-          std::cerr << line.str();
+          core::LogLine(core::LogSeverity::kError,
+                        core::LogText("accept execution command client lane=",
+                                      lane_name, " errno=", error, " name=",
+                                      name ? name : "unknown", ": ",
+                                      std::strerror(error)));
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));
         return;
@@ -4523,7 +4541,7 @@ bool ExecutionCommandSurface::ServeRequest(FileDescriptor &client,
                     "by the independent component socket");
               } else if (command.kind == CommandKind::kReadVolatileMotionTrace) {
                 if (ordinary)
-                  deferred.emplace(&scene_read_lane_, command);
+                  deferred.emplace(&motion_trace_lane_, command);
                 else
                   response = ReadVolatileMotionTrace(
                       command, AtomicResponseCapacity(client.get()));
@@ -4716,6 +4734,10 @@ void ExecutionCommandSurface::SendResponse(
   /// - Output lane: `set_io_output`, manual and Program alike. One worker,
   ///   FIFO in host enqueue order, one in flight; the Kernel admits each
   ///   write when it starts, and a started write completes.
+  /// - Motion-trace lane: `read_volatile_motion_trace` from the ordinary
+  ///   socket. One worker, FIFO; it copies the volatile ring under the
+  ///   trace's own lock (memory only), then encodes and writes the snapshot
+  ///   file holding no lock that execution takes.
   ///
   /// Cross-lane fences: Reset and recovery name the exact operation
   /// revision, Stop id and generation they act on, and their

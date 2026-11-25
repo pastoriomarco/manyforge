@@ -217,9 +217,9 @@ private:
 };
 
 constexpr std::string_view kExpectedSceneId =
-    "sha256:b6edf7957c79f97cabefc2c61056f0bb09e00d1cac1ff3080ed540b650346dad";
+    "sha256:8a7c7a8f2599db9875c56ead466924113cc28bc9f9c8f5ca18e2505a6c41af06";
 constexpr std::string_view kExpectedEmptySceneContentHash =
-    "sha256:84a0569fa0733fa8dcd5d34279f728d25e7f1fab03ceb56b6b6a593eecadad5c";
+    "sha256:b87f99e893eee703b197945f7d2b50bee8586ba49fccba8e27bca580b234dc52";
 constexpr std::int64_t kSustainedNoOpCommitP95BudgetNs = 50'000'000;
 
 static_assert(

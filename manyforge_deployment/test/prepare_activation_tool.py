@@ -1978,7 +1978,7 @@ def _write_manager_ros_apply_fixture(
     # This is the real runtime cell requested by the test, not a retained ID,
     # catalog seal, generation, owner epoch, or readiness observation.
     request["runtime_cell_id"] = (
-        "c1_build_authority_cell" if isaac else "manager_ros_apply_fixture"
+        "canonical_empty_cell" if isaac else "manager_ros_apply_fixture"
     )
     requested_root = (
         args.manager_isaac_apply_fixture_root

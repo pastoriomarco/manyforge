@@ -45,6 +45,61 @@ STABLE_ENTRIES = frozenset({
 })
 
 
+class SessionMarkerOutdated(ValueError):
+    """The previous session's marker has an older format and its session may
+    still be running: it is preserved and the operator is told what to do."""
+
+    code = "development_workbench_session_marker_outdated"
+
+
+def _older_marker(root: Path) -> dict | None:
+    """``current/session.json`` of another marker format, or None."""
+    try:
+        older = _read(root / "current/session.json")
+    except (OSError, ValueError):
+        return None
+    found = older.get("schema_version")
+    if (not isinstance(found, str) or found == run_session.MARKER_SCHEMA
+            or run_session.OLDER_MARKER_SCHEMA.fullmatch(found) is None):
+        return None
+    return older
+
+
+def _older_session_stopped(root: Path, older: dict) -> None:
+    """Prove a session of an older marker format stopped, from its own facts.
+
+    The caller holds the root's lifetime lock (a direct owner holds it while
+    it lives) and has proved that no live container binds the root. A
+    container the marker names must also be stopped or removed, and no live
+    container may carry the session's label.
+    """
+    found = older["schema_version"]
+
+    def refuse(reason: str) -> SessionMarkerOutdated:
+        return SessionMarkerOutdated(
+            f"previous session marker {root / 'current/session.json'} is {found} (an older "
+            f"build) and {reason}: stop it with the build that started it, then start again; "
+            "preserved")
+
+    boundary = older.get("process_boundary")
+    session_id = older.get("session_id")
+    if (isinstance(boundary, dict) and boundary.get("kind") == "docker"
+            and isinstance(session_id, str) and boundary.get("container_id")):
+        try:
+            _docker_boundary_stopped(root, {"session_id": session_id, "process_boundary": boundary})
+        except ValueError as error:
+            raise refuse(f"its session may still be running ({error})") from error
+    if isinstance(session_id, str) and re.fullmatch(r"[0-9a-f]{32}", session_id):
+        listed = subprocess.run(
+            ["docker", "ps", "--quiet", "--no-trunc", "--filter",
+             f"label=manyforge.workbench-session={session_id}"],
+            capture_output=True, text=True, check=False)
+        if listed.returncode != 0:
+            raise refuse("Docker could not list its containers")
+        if listed.stdout.strip():
+            raise refuse("a container of its session is running: " + listed.stdout.split()[0])
+
+
 def prepare_session(root: Path, session_id: str, *, lock_fd: int,
                     process_boundary: dict | None = None,
                     disk_limits: run_session.DiskLimits | None = None) -> dict:
@@ -72,6 +127,14 @@ def _docker_boundary_stopped(root: Path, marker: dict) -> None:
         listed = subprocess.run(["docker", "container", "ls", "--all", "--quiet", "--no-trunc"], capture_output=True, text=True, check=False)
         identities = listed.stdout.splitlines()
         if listed.returncode == 0 and all(re.fullmatch(r"[0-9a-f]{64}", value) for value in identities) and identity not in identities:
+            # The launcher removes a container after capturing its console
+            # into evidence/<UTC>/; any other removal lost that console.
+            evidence = root / "evidence"
+            if not (evidence.is_dir() and any(
+                    (run_session._session_metadata(folder / "docker-inspect.json") or {}).get("container_id") == identity
+                    for folder in evidence.iterdir()
+                    if not folder.name.endswith(".partial") and not folder.is_symlink())):
+                print(f"WARNING ManyForge previous container {identity} was removed without console evidence", file=sys.stderr)
             return
         raise ValueError("Docker could not prove recorded previous container terminated: " + identity)
     if len(inspected.stdout.encode()) > 64 * 1024:
@@ -94,22 +157,36 @@ def prepare_docker_session(root: Path, session_id: str, *, lock_fd: int,
     root = _safe_path(root)
     _check_root_identity(root, lock_fd)
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    older_archived = False
     marker = _marker(_safe_path(root / "current", root))
     if marker is not None:
         if marker.get("disposition") != "stopped" or marker.get("shutdown") != "clean":
             _docker_boundary_stopped(root, marker)
     elif (root / "current").exists() and not (root / ".session-selection.json").exists():
         if stopped_container_receipt is None:
-            raise ValueError("previous session has no exact stopped process-set proof; preserved")
-        receipt = _read(stopped_container_receipt)
-        state = receipt.get("state", {})
-        roots = [Path(mount["Source"]).resolve() for mount in receipt.get("mounts", []) if mount.get("Type") == "bind" and mount.get("Destination") == "/tmp/manyforge-state"]
-        if (re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("container_id", ""))) is None
-                or state.get("running") is not False or state.get("status") not in {"exited", "dead", "created"}
-                or roots != [root]):
-            raise ValueError("stopped-container receipt does not prove this root; preserved")
-    return prepare_session(root, session_id, lock_fd=lock_fd, process_boundary={"kind": "docker", "container_id": None},
-                           disk_limits=disk_limits)
+            # After an upgrade the previous session's marker has an older
+            # format: archive it when its own facts prove it stopped.
+            older = _older_marker(root)
+            if older is None:
+                raise ValueError("previous session has no exact stopped process-set proof; preserved")
+            _older_session_stopped(root, older)
+            older_archived = True
+        else:
+            receipt = _read(stopped_container_receipt)
+            state = receipt.get("state", {})
+            roots = [Path(mount["Source"]).resolve() for mount in receipt.get("mounts", []) if mount.get("Type") == "bind" and mount.get("Destination") == "/tmp/manyforge-state"]
+            if (re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("container_id", ""))) is None
+                    or state.get("running") is not False or state.get("status") not in {"exited", "dead", "created"}
+                    or roots != [root]):
+                raise ValueError("stopped-container receipt does not prove this root; preserved")
+    selected = prepare_session(root, session_id, lock_fd=lock_fd, process_boundary={"kind": "docker", "container_id": None},
+                               disk_limits=disk_limits)
+    if older_archived:
+        # The line names the archive and the marker format the report records.
+        report = selected["previous_session"]
+        print(f"ManyForge archived the previous session (marker {report['archived_older_marker']}, "
+              f"an older build) to {root / report['archive_relative_path']}", file=sys.stderr)
+    return selected
 
 
 def bind_container(root: Path, session_id: str, container_id: str, *, lock_fd: int) -> None:
@@ -179,8 +256,9 @@ class Session:
             os.close(descriptor)
             raise
 
-    def stopped(self, *, verified: bool) -> None:
-        record_stopped(self.root, self.fd, self.marker, verified=verified)
+    def stopped(self, *, verified: bool, manager_returncode: int | None = None) -> None:
+        record_stopped(self.root, self.fd, self.marker, verified=verified,
+                       manager_returncode=manager_returncode)
 
     def close(self) -> None:
         os.close(self.fd)
@@ -201,8 +279,8 @@ def main() -> int:
             return 0
         marker = prepare_docker_session(args.root, args.session_id, lock_fd=args.lock_fd, stopped_container_receipt=args.stopped_container_receipt,
                                         disk_limits=run_session.read_site_disk_limits(args.site_settings))
-    except run_session.DiskBelowFloor as error:
-        print(f"{error.code}: {error}", file=sys.stderr)
+    except (run_session.DiskBelowFloor, SessionMarkerOutdated) as error:
+        print(f"{error.code}: {str(error)[:1024]}", file=sys.stderr)
         return 69
     except (OSError, ValueError) as error:
         print("development_workbench_session_unavailable: " + str(error)[:1024], file=sys.stderr)

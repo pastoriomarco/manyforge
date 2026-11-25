@@ -881,9 +881,15 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
             for alias, component_id in sorted(mapping.items())
         }
     if "compatibility" in intent:
-        result["compatibility"] = deepcopy(
-            _require_object(intent["compatibility"], f"{source}: compatibility")
-        )
+        compatibility = _require_object(intent["compatibility"], f"{source}: compatibility")
+        # Scenario lane labels were removed (0.4.0): each component's own
+        # lane is the only lane.
+        if "lane" in compatibility:
+            _fail(
+                f"{source}: compatibility.lane is no longer part of a Deployment; "
+                "each component carries its own lane"
+            )
+        result["compatibility"] = deepcopy(compatibility)
     try:
         canonical_json_bytes(result)
     except StrictArtifactError as error:

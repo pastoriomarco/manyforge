@@ -218,6 +218,9 @@ public:
       return AppendStatus::kDuplicate;
     }
     events_.insert_or_assign(event.event_id, encoded);
+    if (event.event_type == "historian_records_lost") {
+      loss_rows_.push_back(event);
+    }
     return AppendStatus::kStored;
   }
 
@@ -288,6 +291,24 @@ public:
     return batch_sizes_;
   }
 
+  /// The written loss rows as "<lost_count> <reason_code>".
+  [[nodiscard]] std::vector<std::string> LossRows() const {
+    std::lock_guard lock(mutex_);
+    std::vector<std::string> rows;
+    for (const auto &row : loss_rows_) {
+      rows.push_back(
+          std::to_string(static_cast<std::uint64_t>(
+              row.payload.find_object_member("lost_count")->as_number())) +
+          " " + row.payload.find_object_member("reason_code")->as_string());
+    }
+    return rows;
+  }
+
+  [[nodiscard]] std::vector<HistorianEvent> LossEvents() const {
+    std::lock_guard lock(mutex_);
+    return loss_rows_;
+  }
+
 private:
   mutable std::mutex mutex_;
   std::condition_variable condition_;
@@ -298,6 +319,7 @@ private:
   std::string failure_code_{"injected_storage_failure"};
   std::size_t append_calls_{};
   std::vector<std::size_t> batch_sizes_;
+  std::vector<HistorianEvent> loss_rows_;
   std::map<std::string, std::string> events_;
 };
 
@@ -1039,6 +1061,19 @@ TEST(EventHistorian,
             "[origin / 1] runtime_collision_fault: Collision "
             "detected");
   EXPECT_TRUE(OperationFailureHistoryMessage(CanonicalValue(nullptr)).empty());
+  // A collision whose details name both bodies shows them.
+  const CanonicalValue collision(CanonicalValue::Object{
+      {"participants",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+           {"terminal_error",
+            CanonicalValue(CanonicalValue::Object{
+                {"code", CanonicalValue("runtime_collision_fault")},
+                {"details", CanonicalValue(CanonicalValue::Object{
+                                {"contact_a", CanonicalValue("arm/link_6")},
+                                {"contact_b", CanonicalValue("table")}})},
+                {"message", CanonicalValue("Collision detected")}})}})})}});
+  EXPECT_EQ(OperationFailureHistoryMessage(collision),
+            "runtime_collision_fault: Collision detected (arm/link_6 <-> table)");
 }
 
 TEST(EventHistorian, StoredSummariesMatchFullProjectionAcrossFiltersAndPages) {
@@ -1226,7 +1261,9 @@ TEST(EventHistorian,
   EXPECT_FALSE(health.error_code.has_value());
   EXPECT_FALSE(health.error_message.has_value());
   EXPECT_EQ(health.overflow_count, 2U);
-  EXPECT_EQ(store->StoredCount(), 2U);
+  // The two records written, and the episode's one loss row.
+  EXPECT_EQ(store->StoredCount(), 3U);
+  EXPECT_EQ(store->LossRows(), (std::vector<std::string>{"2 historian_queue_overflow"}));
   EXPECT_FALSE(store->Stored(Event(3U).event_id));
   EXPECT_FALSE(historian.DiskSignals().queue_full);
   historian.Shutdown();
@@ -1238,6 +1275,43 @@ TEST(EventHistorian,
     ++lines;
   }
   EXPECT_EQ(lines, 1U);
+}
+
+TEST(EventHistorian, AnEndedLossEpisodeIsPlacedInTheSequenceByOneWarnRow) {
+  auto store = std::make_shared<ControllableStore>();
+  AsyncEventHistorian historian(store, 4U);
+  historian.ReportDeliveryFailure("historian_projection_failure", "payload too large");
+  historian.ReportDeliveryFailure("historian_projection_failure", "payload too large");
+  ASSERT_TRUE(historian.TryEnqueue(Event(1U)));
+  ASSERT_TRUE(historian.WaitUntilIdle(2s));
+  const auto rows = store->LossEvents();
+  ASSERT_EQ(rows.size(), 1U);
+  const auto &row = rows.front();
+  // WARN, never ERROR: the row starts no failure capture.
+  EXPECT_EQ(row.severity, "WARN");
+  EXPECT_EQ(row.component, "manyforge.headless.historian");
+  EXPECT_EQ(row.event_type, "historian_records_lost");
+  EXPECT_EQ(row.payload.find_object_member("lost_count")->as_number(), 2.0);
+  EXPECT_EQ(row.payload.find_object_member("reason_code")->as_string(),
+            "historian_projection_failure");
+  const auto ns = [&row](const char *name) {
+    return content_identity::parse_nonnegative_int64(*row.payload.find_object_member(name));
+  };
+  EXPECT_LE(ns("first_lost_raw_monotonic_ns"), ns("last_lost_raw_monotonic_ns"));
+  EXPECT_LE(ns("last_lost_raw_monotonic_ns"), row.occurred_at_ns);
+  for (const auto *name : {"first_lost_wall", "last_lost_wall"}) {
+    EXPECT_TRUE(HistorianRecordedUtcNs(row.payload.find_object_member(name)->as_string())
+                    .has_value());
+  }
+  EXPECT_TRUE(HistorianRecordedUtcNs(row.occurred_at_wall).has_value());
+  const auto health = historian.Health();
+  EXPECT_TRUE(health.available);
+  EXPECT_EQ(health.accepted_count, health.delivered_count);
+  // A healthy write afterwards adds no further loss row.
+  ASSERT_TRUE(historian.TryEnqueue(Event(2U)));
+  ASSERT_TRUE(historian.WaitUntilIdle(2s));
+  EXPECT_EQ(store->LossEvents().size(), 1U);
+  EXPECT_EQ(store->StoredCount(), 3U);
 }
 
 TEST(EventHistorian, FailedWriteDropsAndCountsItsRecordAndTheWriterContinues) {
@@ -1266,7 +1340,9 @@ TEST(EventHistorian, FailedWriteDropsAndCountsItsRecordAndTheWriterContinues) {
   EXPECT_TRUE(recovered.available);
   EXPECT_FALSE(recovered.error_code.has_value());
   EXPECT_EQ(recovered.delivery_failure_count, 1U);
-  EXPECT_EQ(store->StoredCount(), 1U);
+  // Event 2 and the episode's loss row.
+  EXPECT_EQ(store->StoredCount(), 2U);
+  EXPECT_EQ(store->LossRows(), (std::vector<std::string>{"1 historian_storage_full"}));
   EXPECT_FALSE(store->Stored(Event(1U).event_id));
   EXPECT_FALSE(historian.DiskSignals().storage_full);
 }
@@ -1311,7 +1387,9 @@ TEST(EventHistorian, ARecordThatAlwaysFailsIsDroppedAloneAndLaterRecordsAreWritt
   EXPECT_FALSE(store->Stored(Event(2U).event_id));
   EXPECT_TRUE(store->Stored(Event(3U).event_id));
   EXPECT_EQ(health.delivery_failure_count, 1U);
-  EXPECT_EQ(health.delivered_count, 2U);
+  // Events 1 and 3, and the episode's loss row.
+  EXPECT_EQ(health.delivered_count, 3U);
+  EXPECT_EQ(store->LossRows(), (std::vector<std::string>{"1 injected_storage_failure"}));
   // Event 3 was written after the loss and left the queue empty.
   EXPECT_TRUE(health.available);
 }
@@ -1341,7 +1419,9 @@ TEST(EventHistorian, AFailedWriteDropsTheWholeBatchItAttempted) {
   ASSERT_TRUE(historian.WaitUntilIdle(2s));
   health = historian.Health();
   EXPECT_TRUE(health.available);
-  EXPECT_EQ(store->StoredCount(), 2U);
+  // Events 1 and 5, and the episode's loss row.
+  EXPECT_EQ(store->StoredCount(), 3U);
+  EXPECT_EQ(store->LossRows(), (std::vector<std::string>{"3 historian_storage_busy"}));
   EXPECT_TRUE(store->Stored(Event(5U).event_id));
 }
 
@@ -1519,7 +1599,7 @@ TEST(EventHistorian, FailureCaptureRetainsItsCauseAndBoundedContextAcrossPartiti
   EXPECT_NE(exported.find("\"contents\":\"retained_event_context\""), std::string::npos);
   EXPECT_NE(exported.find("\"capture_id\":\"1\""), std::string::npos);
   const auto retention = content_identity::canonical_json(page.retention);
-  EXPECT_NE(retention.find("\"schema_version\":\"manyforge.historian_retention.v3\""), std::string::npos);
+  EXPECT_NE(retention.find("\"schema_version\":\"manyforge.historian_retention.v4\""), std::string::npos);
   EXPECT_NE(retention.find("\"protected_count\":\"6\""), std::string::npos);
   query.capture_id = 99U;
   ExpectHistorianError([&] { static_cast<void>(store.Query(query)); }, "historian_capture_not_found");
@@ -1821,7 +1901,7 @@ TEST(EventHistorian, EarlierHistoryFilesAreListedButNeverOpened) {
   SqliteEventHistoryStore store(directory.path(), kStart);
   ASSERT_EQ(store.Append(Event(1U)), IEventHistoryStore::AppendStatus::kStored);
   const auto retention = store.Query(HistorianQuery{}).retention;
-  EXPECT_EQ(Field(retention, "schema_version").as_string(), "manyforge.historian_retention.v3");
+  EXPECT_EQ(Field(retention, "schema_version").as_string(), "manyforge.historian_retention.v4");
   const auto &older = Field(retention, "older_history_files").as_array();
   ASSERT_EQ(older.size(), 2U);
   EXPECT_EQ(Field(older[0], "file_name").as_string(), "history.sqlite3");
@@ -1850,6 +1930,116 @@ TEST(EventHistorian, AFileOfTheCurrentNameHoldingAnotherFormatIsRefused) {
   ExpectHistorianError([&] { SqliteEventHistoryStore rejected(directory.path(), kStart); }, "historian_storage_foreign");
   // Refused, not converted: the file keeps its format.
   EXPECT_EQ(UserVersion(path), format - 1);
+}
+
+// ---------------------------------------------------------------------------
+// A Program's node attempts are a retention class of their own (format 10).
+
+HistorianEvent NodeAttemptEvent(const std::uint64_t index, std::string severity = "INFO",
+                                const std::size_t data_bytes = 0U) {
+  CanonicalValue::Object payload{{"index", CanonicalValue(static_cast<double>(index))}};
+  if (data_bytes != 0U) payload.emplace_back("data", CanonicalValue(std::string(data_bytes, 'n')));
+  return MakeHistorianEvent("manyforge.program_runner", "program_node_attempt_finished", std::move(severity),
+                            static_cast<std::int64_t>(index), "2026-11-24T00:00:00Z",
+                            CanonicalValue(std::move(payload)));
+}
+
+const CanonicalValue &RetentionPart(const CanonicalValue &retention, const std::size_t index) {
+  return Field(retention, "partitions").as_array().at(index);
+}
+
+std::uint64_t PartCount(const CanonicalValue &retention, const std::size_t index, std::string_view name) {
+  return std::stoull(Field(RetentionPart(retention, index), name).as_string());
+}
+
+TEST(EventHistorian, NodeAttemptRowsArePrunedOnlyWithinTheirOwnClass) {
+  TemporaryDirectory directory;
+  const auto important = MakeHistorianEvent("manyforge.runtime", "stop_requested", "INFO", 1,
+                                            "2026-11-24T00:00:00Z", CanonicalValue(CanonicalValue::Object{}));
+  {
+    SqliteEventHistoryStore store(directory.path(), kStart, 3U, TriggerOnlyCaptureLimits());
+    ASSERT_EQ(store.Append(important), IEventHistoryStore::AppendStatus::kStored);
+    for (std::uint64_t index = 1; index <= 3; ++index)
+      ASSERT_EQ(store.Append(Event(index, "manyforge.runtime", "apply_finished")), IEventHistoryStore::AppendStatus::kStored);
+    // A failed attempt (WARN) is a node attempt row too.
+    for (std::uint64_t index = 10; index <= 29; ++index)
+      ASSERT_EQ(store.Append(NodeAttemptEvent(index, index % 2 == 0 ? "INFO" : "WARN")),
+                IEventHistoryStore::AppendStatus::kStored);
+    const auto retention = store.Query(HistorianQuery{}).retention;
+    EXPECT_EQ(Field(retention, "schema_version").as_string(), "manyforge.historian_retention.v4");
+    ASSERT_EQ(Field(retention, "partitions").as_array().size(), 3U);
+    EXPECT_EQ(Field(RetentionPart(retention, 2), "partition").as_string(), "node_attempts");
+    EXPECT_EQ(PartCount(retention, 2, "retained_count"), 3U);
+    EXPECT_EQ(PartCount(retention, 2, "pruned_count"), 17U);
+    // Node churn never prunes the Applies before it, nor the important row.
+    EXPECT_EQ(PartCount(retention, 0, "retained_count"), 3U);
+    EXPECT_EQ(PartCount(retention, 0, "pruned_count"), 0U);
+    EXPECT_EQ(PartCount(retention, 1, "retained_count"), 1U);
+    EXPECT_EQ(PartCount(retention, 1, "pruned_count"), 0U);
+    for (std::uint64_t sequence = 1; sequence <= 4; ++sequence) EXPECT_TRUE(store.Read(sequence)) << sequence;
+    EXPECT_FALSE(store.Read(5U));
+    EXPECT_TRUE(store.Read(24U));
+  }
+  // Reopening rebuilds the per-class usage from the stored class of each row.
+  SqliteEventHistoryStore reopened(directory.path(), kStart, 3U, TriggerOnlyCaptureLimits());
+  ASSERT_EQ(reopened.Append(NodeAttemptEvent(30)), IEventHistoryStore::AppendStatus::kStored);
+  const auto retention = reopened.Query(HistorianQuery{}).retention;
+  EXPECT_EQ(PartCount(retention, 2, "pruned_count"), 18U);
+  EXPECT_EQ(PartCount(retention, 0, "pruned_count"), 0U);
+  EXPECT_FALSE(reopened.Read(22U));
+  EXPECT_TRUE(reopened.Read(2U));
+}
+
+TEST(EventHistorian, NodeAttemptsHaveTheirOwnRecordByteBudget) {
+  TemporaryDirectory directory;
+  SqliteEventHistoryStore store(directory.path(), kStart, 100000U);
+  const auto large = [](std::uint64_t index, bool node) {
+    return node ? NodeAttemptEvent(index, "INFO", 250000U)
+                : MakeHistorianEvent("manyforge.runtime", "operation_progressed", "INFO",
+                                     static_cast<std::int64_t>(index), "2026-11-24T00:00:00Z",
+                                     CanonicalValue(CanonicalValue::Object{{"data", CanonicalValue(std::string(250000, 'x'))}}));
+  };
+  // 60 routine rows (about 15 MiB) fit the 16 MiB routine budget.
+  for (std::uint64_t index = 1; index <= 60; ++index)
+    ASSERT_EQ(store.Append(large(index, false)), IEventHistoryStore::AppendStatus::kStored);
+  // 140 node rows (about 35 MiB) exceed the 32 MiB node budget.
+  for (std::uint64_t index = 61; index <= 200; ++index)
+    ASSERT_EQ(store.Append(large(index, true)), IEventHistoryStore::AppendStatus::kStored);
+  HistorianQuery empty;
+  empty.components = {"absent"};
+  const auto retention = store.Query(empty).retention;
+  EXPECT_EQ(Field(RetentionPart(retention, 0), "record_byte_limit").as_string(), "16777216");
+  EXPECT_EQ(Field(RetentionPart(retention, 2), "record_byte_limit").as_string(), "33554432");
+  EXPECT_EQ(retention.find_object_member("partition_record_byte_limit"), nullptr);
+  EXPECT_EQ(PartCount(retention, 0, "retained_count"), 60U);
+  EXPECT_EQ(PartCount(retention, 0, "pruned_count"), 0U);
+  EXPECT_GT(PartCount(retention, 2, "pruned_count"), 0U);
+  // Well above the routine budget, within its own.
+  EXPECT_GT(PartCount(retention, 2, "retained_bytes"), 16777216U);
+  EXPECT_LE(PartCount(retention, 2, "retained_bytes"), 33554432U);
+  EXPECT_EQ(PartCount(retention, 2, "retained_count") + PartCount(retention, 2, "pruned_count"), 140U);
+  EXPECT_TRUE(store.Read(1U));
+  EXPECT_FALSE(store.Read(61U));
+  EXPECT_TRUE(store.Read(200U));
+}
+
+TEST(EventHistorian, AFailureCaptureProtectsNodeAttemptRowsAsBefore) {
+  TemporaryDirectory directory;
+  FakeWriterClock clock;
+  SqliteEventHistoryStore store(directory.path(), kStart, 4U, SmallCaptureLimits(), clock.Clock());
+  for (std::uint64_t index = 1; index <= 6; ++index)
+    ASSERT_EQ(store.Append(NodeAttemptEvent(index)), IEventHistoryStore::AppendStatus::kStored);
+  ASSERT_EQ(store.Append(ErrorEvent(7)), IEventHistoryStore::AppendStatus::kStored);
+  for (std::uint64_t index = 8; index <= 30; ++index)
+    ASSERT_EQ(store.Append(NodeAttemptEvent(index)), IEventHistoryStore::AppendStatus::kStored);
+  // Three preceding node rows, the trigger and a two-row tail stay protected.
+  for (std::uint64_t sequence = 4; sequence <= 9; ++sequence) EXPECT_TRUE(store.Read(sequence)) << sequence;
+  EXPECT_FALSE(store.Read(3U));
+  EXPECT_FALSE(store.Read(10U));
+  const auto retention = store.Query(HistorianQuery{}).retention;
+  EXPECT_EQ(Field(Field(retention, "captures"), "protected_count").as_string(), "6");
+  EXPECT_EQ(PartCount(retention, 2, "retained_count"), 4U);
+  EXPECT_EQ(PartCount(retention, 0, "retained_count"), 0U);
 }
 
 // ---------------------------------------------------------------------------
@@ -1912,6 +2102,32 @@ TEST(EventHistorian, IdFiltersFindIntegerIdsByTheirDecimalText) {
   }
 }
 
+TEST(EventHistorian, RuleFilterFindsTheRuleIdKeyAndTheOldNameIsRefused) {
+  TemporaryDirectory directory;
+  SqliteEventHistoryStore store(directory.path(), kStart);
+  const auto rule = [](const std::string &rule_id, std::int64_t at) {
+    return MakeHistorianEvent(
+        "manyforge.runtime", "io_rule_changed", "INFO", at, "2026-08-05T00:00:00Z",
+        CanonicalValue(CanonicalValue::Object{{"rule_id", CanonicalValue(rule_id)}}));
+  };
+  ASSERT_EQ(store.Append(rule("gripper_contact", 1)), IEventHistoryStore::AppendStatus::kStored);
+  ASSERT_EQ(store.Append(rule("table_contact", 2)), IEventHistoryStore::AppendStatus::kStored);
+  HistorianQuery query;
+  query.correlations = {{"rule_id", "gripper_contact"}};
+  const auto page = store.Query(query);
+  ASSERT_EQ(page.events.size(), 1U);
+  EXPECT_EQ(page.events.front().event.event_id, rule("gripper_contact", 1).event_id);
+  query.correlations = {{"rule_id", "other_rule"}};
+  EXPECT_TRUE(store.Query(query).events.empty());
+  const auto discovered = store.Discover("rule_id", "", 8U);
+  EXPECT_EQ(discovered.find_object_member("values")->as_array().size(), 2U);
+  // The earlier filter name is refused like any unknown filter.
+  query.correlations = {{"collision_rule_id", "gripper_contact"}};
+  ExpectHistorianError([&] { static_cast<void>(store.Query(query)); }, "historian_query_invalid");
+  ExpectHistorianError([&] { static_cast<void>(store.Discover("collision_rule_id", "", 8U)); },
+                       "historian_query_invalid");
+}
+
 TEST(EventHistorian, TheSameNumberUnderTwoStartIdentitiesIsToldApart) {
   TemporaryDirectory directory;
   const std::string other_start = "fedcba9876543210";
@@ -1944,7 +2160,7 @@ TEST(EventHistorian, TheSameNumberUnderTwoStartIdentitiesIsToldApart) {
 
 TEST(EventHistorian, AFormatSixFileIsListedAndNeverOpened) {
   TemporaryDirectory directory;
-  ASSERT_EQ(SqliteEventHistoryStore::DatabasePath(directory.path()).filename().string(), "history.v9.sqlite3");
+  ASSERT_EQ(SqliteEventHistoryStore::DatabasePath(directory.path()).filename().string(), "history.v10.sqlite3");
   const auto v6 = directory.path() / "history.v6.sqlite3";
   sqlite3 *database = nullptr;
   ASSERT_EQ(sqlite3_open(v6.c_str(), &database), SQLITE_OK);
@@ -1968,7 +2184,7 @@ TEST(EventHistorian, AFormatSixFileIsListedAndNeverOpened) {
   EXPECT_EQ(read(), before);
   EXPECT_FALSE(std::filesystem::exists(directory.path() / "history.v6.sqlite3-wal"));
   EXPECT_FALSE(std::filesystem::exists(directory.path() / "history.v6.sqlite3-shm"));
-  EXPECT_EQ(UserVersion(SqliteEventHistoryStore::DatabasePath(directory.path())), 9);
+  EXPECT_EQ(UserVersion(SqliteEventHistoryStore::DatabasePath(directory.path())), 10);
 }
 
 // ---------------------------------------------------------------------------

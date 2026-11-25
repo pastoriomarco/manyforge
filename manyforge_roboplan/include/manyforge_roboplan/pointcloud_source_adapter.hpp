@@ -65,14 +65,15 @@ class IPointCloudBridgeLink {
 };
 
 /// The component's state: no process → `not_prepared`; an exited process →
-/// `fault_process_exited` (Recover restarts it); else `enabled` while
+/// `fault_process_exited` (Recover restarts it) with detail `output_tail`
+/// (absent when empty); else `enabled` while
 /// forwarding, `prepared` otherwise. Activity is always idle (no requests).
 /// The `pointcloud` stream is freshness only, never a fault:
 /// `none` while the bridge isn't watching, `fresh` while the last cloud is
 /// within the budget, `stale` otherwise.
 [[nodiscard]] core::ComponentState PointCloudSourceState(
-    bool process_started, const std::optional<std::string> &exit_reason, bool forwarding,
-    const PointCloudBridgeObservation &observed, std::int64_t stream_budget_ns,
+    bool process_started, const std::optional<std::string> &exit_reason,
+    std::string output_tail, bool forwarding, const PointCloudBridgeObservation &observed, std::int64_t stream_budget_ns,
     std::int64_t now_ns);
 
 /// The adapter: `prepare`/`recover` (re)start the bridge with forwarding off,

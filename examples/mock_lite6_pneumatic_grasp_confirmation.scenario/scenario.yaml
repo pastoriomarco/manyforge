@@ -7,11 +7,11 @@
   "description": "Mock pneumatic Lite6 pick and place with grasp confirmation required on the lite_gripper tool. Close succeeds only if the mapped workpiece_grasped input is true when it completes; otherwise it fails with grasp_not_confirmed and nothing is attached. The Mock I/O device echoes the valve to that input after 100 ms, so the evidence is synthetic, not a physical grasp.",
   "members": {
     "deployment.yaml": "sha256:446d24ff78fadb2996e758473699e7fdce9a73d31527af067c3e548ab5144ca5",
-    "program.yaml": "sha256:4283f7393f3253c00040b679eb531f2fc2ab8162ddc4369af4cc271f2b447e84"
+    "program.yaml": "sha256:46ebbaa32706d3b8d17c6b68ef4443b15a05cfd00288d9e3f69f352c982330d7"
   },
   "name": "mock_lite6_pneumatic_grasp_confirmation",
   "saved_status": {
-    "checked_content_digest": "sha256:6c17f049c11831b89e954759ecf2b0ed3e33eeefaa830b61b14cc84eebb1992b",
+    "checked_content_digest": "sha256:728d5922b8947c3b1930b2d344a27d06be5f0b948ffbf74622696e6855bb726f",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

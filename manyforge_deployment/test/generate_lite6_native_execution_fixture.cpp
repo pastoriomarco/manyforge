@@ -183,7 +183,7 @@ void write_exact_file(const std::filesystem::path &path,
   CanonicalValue::Object root{
       {"api_version", CanonicalValue("manyforge.program.v4")},
       {"program_revision", CanonicalValue(std::string(kZeroDigest))},
-      {"program_profile", CanonicalValue("composable-cell-v1")},
+      {"program_profile", CanonicalValue("manyforge-cell-v1")},
       {"catalog",
        CanonicalValue(CanonicalValue::Object{
            {"api_version", CanonicalValue("manyforge.node_catalog.v3")},
@@ -249,7 +249,7 @@ make_empty_scene(const core::CellId &cell_id) {
   core::LogicalSceneSnapshotDTO snapshot{
       core::SceneRevision{
           core::logical_scene_identity::MintSceneId(
-              {cell_id, core::BootstrapId("i6_native_execution_fixture"),
+              {cell_id, core::BootstrapId("native_execution_fixture"),
                core::BootstrapGeneration(1U)}),
           1U, core::ContentDigest(std::string(kZeroDigest))},
       cell_id,
@@ -418,7 +418,7 @@ int main(int argc, char **argv) {
     const auto receipt = publication_store.PublishActiveBundle(
         core::ActiveBundlePublicationRequestDTO{
             core::BootstrapPublicationTransactionDTO{
-                core::BootstrapId("i6_native_execution_fixture"),
+                core::BootstrapId("native_execution_fixture"),
                 core::BootstrapGeneration(1U)},
             projection,
             bundle.retained_bundle_id(),
@@ -441,7 +441,7 @@ int main(int argc, char **argv) {
     if (gripper_target) components.insert(gripper_target->component_id.value());
     for (const auto &id : components) component_ids.emplace_back(id);
     CanonicalValue::Object manifest_members{
-        {"api_version", CanonicalValue("manyforge.i6.native-execution-fixture.v2")},
+        {"api_version", CanonicalValue("manyforge.native-execution-fixture.v2")},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
         {"retained_bundle_id", CanonicalValue(bundle.retained_bundle_id().value())},
         {"graph_revision", CanonicalValue(bundle.value().cell_graph.graph_revision.value())},

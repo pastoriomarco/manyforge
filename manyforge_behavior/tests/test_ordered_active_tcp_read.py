@@ -3,6 +3,7 @@
 import pytest
 
 from manyforge_behavior.kernel_client import KernelClient
+from .gateway_fakes import transport_gateway
 
 
 class _Transport:
@@ -23,7 +24,7 @@ class _Transport:
 
 def test_ordered_is_explicit_and_plain_reads_remain_ordinary():
     transport = _Transport()
-    kernel = KernelClient(transport)
+    kernel = KernelClient(transport_gateway(transport))
     assert kernel.read_active_tcp()["robots"] == []
     assert kernel.read_active_tcp(ordered=True)["robots"] == []
     assert transport.reads == [False, True]

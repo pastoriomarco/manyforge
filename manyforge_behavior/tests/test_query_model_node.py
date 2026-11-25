@@ -345,12 +345,12 @@ def test_provider_call_and_node_fail_before_secrets_or_inputs() -> None:
     poison = _PoisonInput()
     with pytest.raises(
         ModelNodeUnavailableError,
-        match="composable_cell_model_node_unavailable",
+        match="model_node_unavailable",
     ):
         _call_model(provider=poison, prompt=poison)
     with pytest.raises(
         ModelNodeUnavailableError,
-        match="composable_cell_model_node_unavailable",
+        match="model_node_unavailable",
     ):
         QueryModelNode(poison, endpoint=poison)
 

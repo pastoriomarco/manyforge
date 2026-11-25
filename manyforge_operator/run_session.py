@@ -26,13 +26,23 @@ import tempfile
 from typing import Callable, Mapping
 import uuid
 
-MARKER_SCHEMA = "manyforge.workbench_session.v2"
-SELECTION_SCHEMA = "manyforge.workbench_session_selection.v2"
+# v3: the marker carries the run's application end and the Manager's exit;
+# the selection, which holds a marker, follows it.
+MARKER_SCHEMA = "manyforge.workbench_session.v3"
+SELECTION_SCHEMA = "manyforge.workbench_session_selection.v3"
 # v2: the archive is previous-runs/<id>; unfinished operations are listed
 # (contract 1.7 "Session report", 1.14; BS 4.4). v3: three journal families;
-# the Scene is held in memory and leaves no journal. Headless still files a
-# pending v2 report (four families, "scene" among them) as recorded.
-REPORT_SCHEMA = "manyforge.workbench_previous_session.v3"
+# the Scene is held in memory and leaves no journal. v4: v3, the run's
+# application end and the older marker format of a session archived at an
+# upgrade. Headless still files a pending v3 or v2 report as recorded.
+REPORT_SCHEMA = "manyforge.workbench_previous_session.v4"
+# Any other marker format: a session of an older build, found after an upgrade.
+OLDER_MARKER_SCHEMA = re.compile(r"manyforge\.workbench_session\.v[0-9]{1,4}")
+# Written once by the Manager at the end of its stop sequence:
+# <manager-run-root>/application-end.json, below current/.
+APPLICATION_END_SCHEMA = "manyforge.application_end.v1"
+APPLICATION_END_RELATIVE_PATH = Path("manager-run/application-end.json")
+_APPLICATION_ENDED_BY = frozenset({"process_exit", "stop_signal", "shutdown_runtime", "manager_failure"})
 JOURNAL_FAMILIES = ("program_cycle", "manager", "kernel_operation")
 MAXIMUM_REPORTED_OPERATIONS = 64
 _TERMINAL_OPERATION_STATES = (
@@ -126,11 +136,55 @@ def _directory(root: Path, name: str) -> Path:
     return path
 
 
+def _optional_int(value: object) -> bool:
+    return value is None or type(value) is int
+
+
+def _application_end_value(value: object) -> bool:
+    """True for a ``manyforge.application_end.v1`` value."""
+    if (not isinstance(value, dict)
+            or set(value) != {"schema_version", "ended_by", "process", "ended_at_wall"}
+            or value["schema_version"] != APPLICATION_END_SCHEMA
+            or value["ended_by"] not in _APPLICATION_ENDED_BY
+            or not isinstance(value["ended_at_wall"], str)
+            or len(value["ended_at_wall"]) > 64
+            or not value["ended_at_wall"].endswith("Z")
+            or datetime.fromisoformat(value["ended_at_wall"]).utcoffset() is None):
+        return False
+    process = value["process"]
+    if process is None:
+        return value["ended_by"] != "process_exit"
+    return (value["ended_by"] == "process_exit"
+            and isinstance(process, dict)
+            and set(process) == {"role", "pid", "exit_status", "signal", "core_dumped"}
+            and isinstance(process["role"], str) and 1 <= len(process["role"]) <= 64
+            and type(process["pid"]) is int and process["pid"] > 0
+            and _optional_int(process["exit_status"]) and _optional_int(process["signal"])
+            and (process["exit_status"] is None) != (process["signal"] is None)
+            and type(process["core_dumped"]) is bool)
+
+
+def application_end(folder: Path) -> dict | None:
+    """The run's application end as the Manager wrote it; None when absent or invalid."""
+    try:
+        value = _read(_safe_path(folder / APPLICATION_END_RELATIVE_PATH, folder))
+        return value if _application_end_value(value) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _manager_exit_value(value: object) -> bool:
+    return (isinstance(value, dict) and set(value) == {"exit_status", "signal"}
+            and _optional_int(value["exit_status"]) and _optional_int(value["signal"]))
+
+
 def _marker(folder: Path) -> dict | None:
     try:
         marker = _read(folder / "session.json")
-        if (set(marker) != {"schema_version", "session_id", "started_at_wall", "disposition", "shutdown", "effects", "launcher_claimed", "previous_session", "process_boundary"}
+        if (set(marker) != {"schema_version", "session_id", "started_at_wall", "disposition", "shutdown", "effects", "launcher_claimed", "previous_session", "process_boundary", "application_end", "manager_exit"}
                 or marker.get("schema_version") != MARKER_SCHEMA
+                or (marker["application_end"] is not None and not _application_end_value(marker["application_end"]))
+                or (marker["manager_exit"] is not None and not _manager_exit_value(marker["manager_exit"]))
                 or not _ID.fullmatch(str(marker.get("session_id", "")))
                 or marker.get("disposition") not in {"started", "stopped"}
                 or marker.get("shutdown") not in {"unknown", "clean"}
@@ -152,6 +206,18 @@ def _marker(folder: Path) -> dict | None:
         return marker
     except (OSError, ValueError):
         return None
+
+
+def older_marker_schema(folder: Path) -> str | None:
+    """The marker format of ``folder``'s session when an older build wrote it, else None."""
+    try:
+        found = _read(folder / "session.json").get("schema_version")
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(found, str) or found == MARKER_SCHEMA
+            or OLDER_MARKER_SCHEMA.fullmatch(found) is None):
+        return None
+    return found
 
 
 def _seal_archive(folder: Path) -> None:
@@ -344,8 +410,13 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
         source = root / "current"
     effects, unknown, unresolved, incomplete = _effect_observations(source) if marker is not None else ("unknown", list(JOURNAL_FAMILIES), [], [])
     operations = _unfinished_operations(root, source) if marker is not None else None
+    # A session of an older build, archived at the upgrade: its marker is not
+    # trusted, so its shutdown stays unknown; the report names its format.
+    older = older_marker_schema(source) if marker is None else None
     message = (f"Previous ManyForge session {identity}: effects are {effects}"
                + ("; shutdown was unclean or could not be verified." if shutdown != "clean" else "; owned processes stopped normally.")
+               + (f" It ran an older build (marker {older}) and was archived to previous-runs/{identity}"
+                  " at the upgrade." if older else "")
                + " The new cell is empty; no previous state was adopted or replayed."
                + (" Unresolved journal families: " + ", ".join(unresolved) + "." if unresolved else "")
                + (" Unknown journal families: " + ", ".join(family + (_INCOMPLETE_REASON if family in incomplete else "") for family in unknown) + "." if unknown else "")
@@ -373,6 +444,16 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
         "unfinished_operation_count": None if operations is None else operations[1],
         # The start this report describes (null with the operations).
         "application_start_id": None if operations is None else operations[2],
+        # How the application ended, as the Manager recorded it (null when it
+        # wrote no record: it failed internally or was killed).
+        "application_end": application_end(source),
+        # The marker format of an older build's session archived at an
+        # upgrade (null otherwise).
+        "archived_older_marker": older,
+        # The previous session's start (null when its marker is unreadable),
+        # at which History files this report, and when this report was written.
+        "started_at_wall": marker["started_at_wall"] if marker is not None else None,
+        "reported_at_wall": datetime.now(timezone.utc).isoformat(),
     }
     reports = _directory(root, "session-reports")
     completed = reports / (identity + ".json")
@@ -380,6 +461,8 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
     existing = completed if completed.exists() or completed.is_symlink() else pending
     if existing.exists() or existing.is_symlink():
         recorded = _read(existing)
+        # The report time is when the report was first written.
+        value["reported_at_wall"] = recorded.get("reported_at_wall")
         # An interrupted selection can contain the exact old report text.
         # Keep that report byte-for-byte so the durable selection still matches.
         legacy = dict(value, message=legacy_message)
@@ -484,7 +567,8 @@ def prepare_session(root: Path, session_id: str, *, lock_fd: int,
               "started_at_wall": datetime.now(timezone.utc).isoformat(),
               "disposition": "started", "shutdown": "unknown", "effects": "unknown",
               "launcher_claimed": False, "previous_session": report,
-              "process_boundary": process_boundary or {"kind": "direct"}}
+              "process_boundary": process_boundary or {"kind": "direct"},
+              "application_end": None, "manager_exit": None}
     plan = {"schema_version": SELECTION_SCHEMA,
             "archive_id": archive_id, "marker": marker}
     _write(selection, plan)
@@ -499,11 +583,21 @@ def claim_selected(root: Path, marker: dict) -> dict:
     return claimed
 
 
-def record_stopped(root: Path, lock_fd: int, marker: dict, *, verified: bool) -> None:
-    """Close the session marker after every application process exited."""
+def record_stopped(root: Path, lock_fd: int, marker: dict, *, verified: bool,
+                   manager_returncode: int | None) -> None:
+    """Close the session marker after every application process exited.
+
+    ``manager_returncode`` is the Manager's ``Popen.returncode`` (negative:
+    the signal that ended it; None: it did not run or was not reaped). The
+    marker also takes the application end the Manager wrote, if any.
+    """
     _check_root_identity(root, lock_fd)
+    signaled = manager_returncode is not None and manager_returncode < 0
     stopped = dict(marker, disposition="stopped", shutdown="clean" if verified else "unknown",
-                   effects=classify_effects(root / "current"))
+                   effects=classify_effects(root / "current"),
+                   application_end=application_end(root / "current"),
+                   manager_exit={"exit_status": None if signaled else manager_returncode,
+                                 "signal": -manager_returncode if signaled else None})
     _write(root / "current/session.json", stopped)
 
 
@@ -893,23 +987,27 @@ class DiskLimits:
 
 
 # The site settings file (machine facts). The launchers read only its disk
-# members; the Manager and the execution host read the file themselves.
+# members and `core_dumps`; the Manager and the execution host read the file
+# themselves.
 SITE_SETTINGS_SCHEMA = "manyforge.site.v2"
 SITE_SETTINGS_MAX_BYTES = 1024 * 1024
 _SITE_MEMBERS = frozenset({"schema", "device_addresses", "project_folders",
-                           "disk_max_percent", "disk_always_free_bytes", "disk_machine_minimum_bytes"})
+                           "disk_max_percent", "disk_always_free_bytes", "disk_machine_minimum_bytes",
+                           "core_dumps"})
 # The largest integer a JSON number carries exactly.
 _SITE_MAX_BYTES_VALUE = 2 ** 53 - 1
 
 
-_SITE_DISK_MEMBERS = ("disk_max_percent", "disk_always_free_bytes", "disk_machine_minimum_bytes")
+# The members a manyforge.site.v1 file cannot carry.
+_SITE_VERSION_TWO_MEMBERS = ("disk_max_percent", "disk_always_free_bytes", "disk_machine_minimum_bytes",
+                             "core_dumps")
 
 
 def site_schema_has_disk_limits(schema: object) -> bool:
     """The one Python decision on which site settings schema lines are accepted.
 
-    True when the schema carries the disk limits. Decided exception: version 1
-    files carry no disk limits and use the defaults.
+    True when the schema carries the disk limits and ``core_dumps``. Decided
+    exception: version 1 files carry neither and use the defaults.
     """
     if schema == SITE_SETTINGS_SCHEMA:
         return True
@@ -918,28 +1016,52 @@ def site_schema_has_disk_limits(schema: object) -> bool:
     raise ValueError("site settings schema must be manyforge.site.v2")
 
 
-def _site_integer(site: Mapping[str, object], name: str, low: int, high: int, default: int) -> int:
+def _site_integer(site: Mapping[str, object], name: str, low: int, high: int, default: int,
+                  label: str | None = None) -> int:
     if name not in site:
         return default
     value = site[name]
     if (isinstance(value, bool) or not isinstance(value, (int, float))
             or (isinstance(value, float) and not value.is_integer()) or not low <= value <= high):
-        raise ValueError(f"site settings {name} must be an integer from {low} to {high}")
+        raise ValueError(f"site settings {label or name} must be an integer from {low} to {high}")
     return int(value)
 
 
-def site_disk_limits(site: object) -> DiskLimits:
-    """The disk limits of a decoded site settings document; absent members take their default."""
+def _checked_site(site: object) -> dict:
+    """A decoded site settings document whose schema line, members and ``core_dumps`` shape are valid."""
     if not isinstance(site, dict):
         raise ValueError("site settings must be a JSON object")
     unknown = site.keys() - _SITE_MEMBERS
     if unknown:
         raise ValueError(f"site settings has unknown fields: {', '.join(sorted(unknown))}")
     if not site_schema_has_disk_limits(site.get("schema")):
-        for name in _SITE_DISK_MEMBERS:
+        for name in _SITE_VERSION_TWO_MEMBERS:
             if name in site:
                 raise ValueError(f"site settings {name} needs schema manyforge.site.v2: change the first "
                                  "line's schema to manyforge.site.v2; no other change is needed")
+    if "core_dumps" in site:
+        core_dumps = site["core_dumps"]
+        if (not isinstance(core_dumps, dict) or set(core_dumps) != {"enabled", "max_bytes"}
+                or type(core_dumps["enabled"]) is not bool):
+            raise ValueError("site settings core_dumps must be an object with exactly enabled "
+                             "(true or false) and max_bytes")
+        _site_integer(core_dumps, "max_bytes", 1, _SITE_MAX_BYTES_VALUE, 0, label="core_dumps.max_bytes")
+    return site
+
+
+def site_core_dump_limit(site: object) -> int:
+    """The soft core-file size limit in bytes every ManyForge process starts with.
+
+    ``core_dumps.max_bytes`` when ``core_dumps.enabled``; otherwise 0 (core
+    dumps off). The spawn sites cap it at the hard limit, which they keep.
+    """
+    core_dumps = _checked_site(site).get("core_dumps")
+    return int(core_dumps["max_bytes"]) if core_dumps is not None and core_dumps["enabled"] else 0
+
+
+def site_disk_limits(site: object) -> DiskLimits:
+    """The disk limits of a decoded site settings document; absent members take their default."""
+    site = _checked_site(site)
     defaults = DiskLimits()
     return DiskLimits(
         _site_integer(site, "disk_max_percent", 1, 100, defaults.max_disk_percent),
@@ -948,10 +1070,7 @@ def site_disk_limits(site: object) -> DiskLimits:
                       defaults.machine_minimum_bytes))
 
 
-def read_site_disk_limits(path: Path | None) -> DiskLimits:
-    """The disk limits from the site settings file; without a file, the defaults."""
-    if path is None:
-        return DiskLimits()
+def _read_site(path: Path) -> object:
     if not Path(path).is_absolute():
         raise ValueError("site settings path must be absolute")
     with open(path, "rb") as source:
@@ -962,7 +1081,17 @@ def read_site_disk_limits(path: Path | None) -> DiskLimits:
         site = json.loads(data)
     except ValueError as error:
         raise ValueError(f"site settings file must be JSON: {error}") from error
-    return site_disk_limits(site)
+    return site
+
+
+def read_site_disk_limits(path: Path | None) -> DiskLimits:
+    """The disk limits from the site settings file; without a file, the defaults."""
+    return DiskLimits() if path is None else site_disk_limits(_read_site(path))
+
+
+def read_site_core_dump_limit(path: Path | None) -> int:
+    """The core-file size limit from the site settings file, read once at start; 0 without a file."""
+    return 0 if path is None else site_core_dump_limit(_read_site(path))
 
 
 @dataclass(frozen=True)

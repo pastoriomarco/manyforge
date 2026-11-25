@@ -12,6 +12,7 @@ from manyforge_headless_api.client import (
     MAX_HTTP_RESPONSE_BYTES,
     HeadlessClientError,
     HeadlessHttpClient,
+    outbound_headers,
 )
 from manyforge_headless_api.native import (
     MAX_NATIVE_RESPONSE_BYTES,
@@ -195,7 +196,7 @@ def test_client_uses_the_dedicated_node_environment_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.node_environment_projection.v3"},
+            json={"schema_version": "manyforge.node_environment_projection.v4"},
             request=request,
         )
 
@@ -205,7 +206,7 @@ def test_client_uses_the_dedicated_node_environment_route() -> None:
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        assert client.node_environment()["schema_version"].endswith("projection.v3")
+        assert client.node_environment()["schema_version"].endswith("projection.v4")
     finally:
         raw.close()
     assert [request.url.path for request in requests] == ["/api/node-environment"]
@@ -858,7 +859,6 @@ def test_command_calls_bound_only_the_connection_and_reads_keep_their_limit() ->
         "/api/activation-preparations",
         "/api/manager/apply",
         "/api/manager/apply/release-for-new",
-        "/api/scene/runtime-latch",
         "/api/scene/transactions",
     )
     try:
@@ -924,3 +924,35 @@ def test_a_control_command_carries_its_upstream_receipt_time() -> None:
         "123456789",
         None,
     ]
+
+
+def test_the_contexts_outbound_headers_ride_every_request_under_its_own() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"receipt": {}}, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test", transport=httpx.MockTransport(handler)
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    try:
+        client.runtime()
+        token = outbound_headers.set(
+            {"X-Request-ID": "composer.1", "X-ManyForge-Transport": "mcp"}
+        )
+        try:
+            client.runtime()
+            client.submit_control_command({}, received_monotonic_ns=5)
+        finally:
+            outbound_headers.reset(token)
+        client.runtime()
+    finally:
+        raw.close()
+    assert [
+        (r.headers.get("x-request-id"), r.headers.get("x-manyforge-transport"))
+        for r in requests
+    ] == [(None, None), ("composer.1", "mcp"), ("composer.1", "mcp"), (None, None)]
+    # The call's own header is kept beside them.
+    assert requests[2].headers["x-manyforge-received-monotonic-ns"] == "5"

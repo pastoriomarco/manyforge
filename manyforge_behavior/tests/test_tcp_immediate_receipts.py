@@ -6,6 +6,7 @@ from manyforge_behavior.kernel_client import (
     KernelClient, KernelClientResponseError, KernelImmediateStepFailedError,
     KernelOperationAdmissionRejectedError,
 )
+from .gateway_fakes import transport_gateway
 
 
 class _Transport:
@@ -37,14 +38,14 @@ def test_exact_immediate_receipt_is_admitted_failure():
     details = {"immediate_step": "admitted", "request_key": _KEY,
                "operation_id": 1, "reason": "tcp_offset_not_applied"}
     with pytest.raises(KernelImmediateStepFailedError) as failure:
-        KernelClient(_Transport(details)).execute(_intent())
+        KernelClient(transport_gateway(_Transport(details))).execute(_intent())
     assert failure.value.code == "execution_rejected"
     assert failure.value.details == details
 
 
 def test_no_receipt_remains_a_pre_admission_refusal():
     with pytest.raises(KernelOperationAdmissionRejectedError) as failure:
-        KernelClient(_Transport({"reason": "set_tcp_unavailable"})).execute(_intent())
+        KernelClient(transport_gateway(_Transport({"reason": "set_tcp_unavailable"}))).execute(_intent())
     assert failure.value.code == "execution_rejected"
     assert failure.value.details["reason"] == "set_tcp_unavailable"
 
@@ -55,7 +56,7 @@ def test_no_receipt_remains_a_pre_admission_refusal():
 ])
 def test_bad_immediate_receipt_leaves_outcome_unknown(details):
     with pytest.raises(KernelClientResponseError):
-        KernelClient(_Transport(details)).execute(_intent())
+        KernelClient(transport_gateway(_Transport(details))).execute(_intent())
 
 
 @pytest.mark.parametrize("details", [
@@ -65,13 +66,13 @@ def test_bad_immediate_receipt_leaves_outcome_unknown(details):
 ])
 def test_non_admitted_receipt_remains_pre_admission_refusal(details):
     with pytest.raises(KernelOperationAdmissionRejectedError) as failure:
-        KernelClient(_Transport(details)).execute(_intent())
+        KernelClient(transport_gateway(_Transport(details))).execute(_intent())
     assert failure.value.details == details
 
 
 def test_other_operations_keep_existing_refusal_handling():
     with pytest.raises(KernelOperationAdmissionRejectedError):
-        KernelClient(_Transport({"reason": "rejected"})).execute(_intent("motion"))
+        KernelClient(transport_gateway(_Transport({"reason": "rejected"}))).execute(_intent("motion"))
 
 
 def test_exception_transport_preserves_typed_set_tcp_code_and_reason():
@@ -84,6 +85,6 @@ def test_exception_transport_preserves_typed_set_tcp_code_and_reason():
             raise error
 
     with pytest.raises(KernelOperationAdmissionRejectedError) as failure:
-        KernelClient(Transport({})).execute(_intent())
+        KernelClient(transport_gateway(Transport({}))).execute(_intent())
     assert failure.value.code == "execution_rejected"
     assert failure.value.details["reason"] == "tcp_tool_not_mounted"

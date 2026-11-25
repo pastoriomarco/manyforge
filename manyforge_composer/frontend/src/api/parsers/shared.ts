@@ -87,6 +87,17 @@ export function nonnegativeInt64TextAt(value: unknown, path: string): string {
   return text;
 }
 
+/**
+ * A nonnegative int64 the owner sends as a JSON integer up to 2^53-1 and as
+ * decimal text above it (UTC nanoseconds are both), as decimal text.
+ */
+export function int64NumberOrTextAt(value: unknown, path: string): string {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value >= 0 ? BigInt(value).toString() : fail(path, 'a nonnegative integer');
+  }
+  return nonnegativeInt64TextAt(value, path);
+}
+
 function positiveUint64TextAt(value: unknown, path: string): string {
   const text = stringAt(value, path);
   if (

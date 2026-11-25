@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 import json
 import hashlib
+import queue
 import threading
 from types import SimpleNamespace
 from typing import Any
@@ -39,8 +40,9 @@ from manyforge_headless_api.control_state import (
 from manyforge_headless_api.component_overview import ComponentOverviewFacts
 from manyforge_headless_api.execution_control import ExecutionControlIngress
 from manyforge_headless_api.execution import ExecutionEventPump
-from manyforge_headless_api.tests.paged_event_stream import paged_subscription
+from manyforge_headless_api.tests.paged_event_stream import followed_pages
 from manyforge_headless_api.native import HeadlessApiError
+from manyforge_headless_api.program_runner_client import ProgramRunnerClientError
 from manyforge_headless_api.service import HeadlessService
 from manyforge_headless_api import control_state as control_state_module
 from manyforge_headless_api.program_cycle import (
@@ -110,7 +112,7 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
         }
     )
     run = {
-        "schema_version": "manyforge.program_run_status.v5",
+        "schema_version": "manyforge.program_run_status.v6",
         "owner_id": "runner",
         "run_revision": 1,
         "capture": capture,
@@ -119,6 +121,8 @@ def _running_cycle(node_revision: int) -> dict[str, Any]:
         "halt": None,
         "node_status_revision": node_revision,
         "node_statuses": {"root": "running"},
+        "node_running_since_utc_ns": {},
+        "node_wait_values": {},
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
@@ -426,7 +430,7 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
         source = HeadlessControlStateSource(
             SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=facts),
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         pump = ExecutionEventPump(
             SimpleNamespace(
@@ -438,13 +442,7 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
                     "changed": False,
                 },
             ),
-            execution := SimpleNamespace(
-                identity=identity,
-                events=events,
-                subscribe_events=lambda after_cursor: paged_subscription(
-                    execution, after_cursor
-                ),
-            ),
+            followed_pages(identity, events),
             application_start_id=APPLICATION_START_ID,
             poll_seconds=0.01,
         )
@@ -613,7 +611,7 @@ def test_operation_progress_reuses_cached_facts_and_sends_only_progress() -> Non
         ingress = _ingress([])
         source = HeadlessControlStateSource(
             SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=lambda **_kwargs: _facts_for_cycle(_cycle())),
-            ingress, program_runner_websocket_url=None,
+            ingress, program_status=None,
         )
         sample = {"operation_id": 7, "operation_revision": 1, "progress": 0.5}
         source.notify_operation_progress([{**sample, "progress": 0.1}])
@@ -644,7 +642,7 @@ def test_global_rules_ride_the_shell_beside_progress_without_owner_reads() -> No
         ingress = _ingress([])
         source = HeadlessControlStateSource(
             SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=lambda **_kwargs: _facts_for_cycle(_cycle())),
-            ingress, program_runner_websocket_url=None,
+            ingress, program_status=None,
         )
         rules = [{"rule_id": "door", "state": "inactive", "keys": []}]
         subscription = await source.subscribe()
@@ -1209,7 +1207,7 @@ def test_virtual_heartbeat_churn_never_reads_or_reduces_owner_state() -> None:
     source = HeadlessControlStateSource(
         NoReadService(),  # type: ignore[arg-type]
         ingress,
-        program_runner_websocket_url=None,
+        program_status=None,
     )
     source._cycle = _cycle()  # noqa: SLF001
     source._facts = _facts_for_cycle(_cycle())  # noqa: SLF001
@@ -1348,6 +1346,35 @@ def test_volatile_receiver_counters_do_not_create_a_cold_state_change() -> None:
     assert _shell_key(alarm_change) != _shell_key(first)
 
 
+class _Upstream:
+    """A pushed Program status subscription: frames of (cycle, class)."""
+
+    def __init__(self) -> None:
+        self.sequence = 0
+        self.frames: queue.Queue[tuple[dict[str, Any], Any] | None] = queue.Queue()
+
+    def next(self, timeout_s: float) -> dict[str, Any] | None:
+        try:
+            item = self.frames.get(timeout=timeout_s)
+        except queue.Empty:
+            return None
+        if item is None:
+            raise ProgramRunnerClientError(
+                "program_runner_unavailable", "the subscription was closed"
+            )
+        cycle, classification = item
+        self.sequence += 1
+        return {
+            "schema_version": "manyforge.program_control_state.v4",
+            "server_sequence": str(self.sequence),
+            **({"event_class": classification} if classification is not None else {}),
+            "program_cycle": cycle,
+        }
+
+    def close(self) -> None:
+        self.frames.put(None)
+
+
 def test_server_sequence_is_assigned_after_latest_slot_replacement() -> None:
     async def exercise() -> None:
         ingress = _ingress([])
@@ -1373,7 +1400,7 @@ def test_control_completion_wakes_non_program_facts_with_runner_stream() -> None
     source = HeadlessControlStateSource(
         object(),  # type: ignore[arg-type]
         ingress,
-        program_runner_websocket_url="ws://program-runner.test/ws/control-state",
+        program_status=lambda: _Upstream(),
     )
     wakes: list[bool] = []
     source.notify_cold = lambda: wakes.append(True)  # type: ignore[method-assign]
@@ -1396,7 +1423,7 @@ def test_no_control_client_creates_no_tasks_reads_or_timers() -> None:
         source = HeadlessControlStateSource(
             NoReadService(),  # type: ignore[arg-type]
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         assert source.active_clients == 0
         assert source._runner_task is None  # noqa: SLF001
@@ -1455,43 +1482,22 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
 ) -> None:
     async def exercise() -> None:
         ingress = _ingress([])
-        requests: asyncio.Queue[tuple[dict[str, Any], Any]] = asyncio.Queue()
         attempts: asyncio.Queue[int] = asyncio.Queue()
-        count = 0
+        loop = asyncio.get_running_loop()
+        upstreams: list[_Upstream] = []
 
-        class Upstream:
-            async def __aenter__(self):
-                nonlocal count
-                count += 1
-                self.sequence = 0
-                attempts.put_nowait(count)
-                return self
+        def subscribe() -> _Upstream:
+            upstreams.append(_Upstream())
+            loop.call_soon_threadsafe(attempts.put_nowait, len(upstreams))
+            return upstreams[-1]
 
-            async def __aexit__(self, *_args):
-                return None
+        class _Requests:
+            @staticmethod
+            def put_nowait(item: tuple[dict[str, Any], Any]) -> None:
+                upstreams[-1].frames.put(item)
 
-            def __aiter__(self):
-                return self
+        requests = _Requests()
 
-            async def __anext__(self):
-                cycle, classification = await requests.get()
-                self.sequence += 1
-                return json.dumps(
-                    {
-                        "schema_version": "manyforge.program_control_state.v4",
-                        "server_sequence": str(self.sequence),
-                        **(
-                            {"event_class": classification}
-                            if classification is not None
-                            else {}
-                        ),
-                        "program_cycle": cycle,
-                    }
-                )
-
-        monkeypatch.setattr(
-            control_state_module, "connect_websocket", lambda *_a, **_k: Upstream()
-        )
         monkeypatch.setattr(control_state_module, "_SOURCE_RETRY_INITIAL_SECONDS", 0)
         source = HeadlessControlStateSource(
             SimpleNamespace(
@@ -1501,7 +1507,7 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
                 ),
             ),
             ingress,
-            program_runner_websocket_url="ws://runner.test/state",
+            program_status=subscribe,
         )
         first = await source.subscribe()
         second = await source.subscribe()
@@ -1542,34 +1548,31 @@ def test_program_source_recovers_same_current_cycle_after_malformed_identity(
 def test_program_source_logs_typed_owner_error(monkeypatch, caplog) -> None:
     async def exercise() -> None:
         attempts: asyncio.Queue[int] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
         count = 0
 
-        class Upstream:
-            async def __aenter__(self):
-                nonlocal count
-                count += 1
-                attempts.put_nowait(count)
-                raise HeadlessApiError(
-                    "program_cycle_reset_phase_invalid", "secret-message", details={"secret": "secret-detail"},
-                    producer="program_runner",
-                )
+        def subscribe() -> _Upstream:
+            nonlocal count
+            count += 1
+            loop.call_soon_threadsafe(attempts.put_nowait, count)
+            raise ProgramRunnerClientError(
+                "program_cycle_reset_phase_invalid", "secret-message",
+                details={"secret": "secret-detail"}, producer="program_runner",
+            )
 
-            async def __aexit__(self, *_args):
-                return None
-
-        monkeypatch.setattr(
-            control_state_module, "connect_websocket", lambda *_a, **_k: Upstream()
-        )
         ingress = _ingress([])
         source = HeadlessControlStateSource(
             SimpleNamespace(program_cycle_status=_cycle), ingress,
-            program_runner_websocket_url="ws://runner.test/state",
+            program_status=subscribe,
         )
         subscription = await source.subscribe()
         try:
             assert await asyncio.wait_for(attempts.get(), 1) == 1
             assert await asyncio.wait_for(attempts.get(), 1) == 2
-            assert "type=HeadlessApiError code=program_cycle_reset_phase_invalid" in caplog.text
+            assert (
+                "type=ProgramRunnerClientError code=program_cycle_reset_phase_invalid"
+                in caplog.text
+            )
             assert "secret-message" not in caplog.text
             assert "secret-detail" not in caplog.text
             assert caplog.text.count("Program control source failure:") == 1
@@ -1581,38 +1584,37 @@ def test_program_source_logs_typed_owner_error(monkeypatch, caplog) -> None:
     asyncio.run(exercise())
 
 
-def test_program_source_logs_clean_peer_close(monkeypatch, caplog) -> None:
+def test_program_source_logs_runner_close(monkeypatch, caplog) -> None:
     async def exercise() -> None:
         attempts: asyncio.Queue[None] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
 
-        class Upstream:
-            async def __aenter__(self):
-                attempts.put_nowait(None)
-                return self
+        class Closed(_Upstream):
+            def next(self, timeout_s: float) -> dict[str, Any] | None:
+                raise ProgramRunnerClientError(
+                    "program_runner_unavailable",
+                    "independent Program runner is unavailable",
+                    details={"transport_error": "closed_by_runner"},
+                )
 
-            async def __aexit__(self, *_args):
-                return None
+        def subscribe() -> _Upstream:
+            loop.call_soon_threadsafe(attempts.put_nowait, None)
+            return Closed()
 
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                raise StopAsyncIteration
-
-        monkeypatch.setattr(
-            control_state_module, "connect_websocket", lambda *_a, **_k: Upstream()
-        )
         ingress = _ingress([])
         source = HeadlessControlStateSource(
             SimpleNamespace(program_cycle_status=_cycle), ingress,
-            program_runner_websocket_url="ws://runner.test/state",
+            program_status=subscribe,
         )
         subscription = await source.subscribe()
         try:
             await asyncio.wait_for(attempts.get(), 1)
             await asyncio.wait_for(attempts.get(), 1)
             await asyncio.wait_for(attempts.get(), 1)
-            assert "Program control source failure: type=peer_closed" in caplog.text
+            assert (
+                "Program control source failure: type=ProgramRunnerClientError "
+                "code=program_runner_unavailable" in caplog.text
+            )
             assert caplog.text.count("Program control source failure:") == 1
             assert source.semantic_context().status == "unavailable"
         finally:
@@ -1646,7 +1648,7 @@ def test_fallback_read_recovers_and_bursts_use_one_existing_task(monkeypatch) ->
                 ),
             ),
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         subscription = await source.subscribe()
         try:
@@ -1708,7 +1710,7 @@ def test_cold_source_failure_recovers_without_a_second_source_change(
                 program_cycle_status=_cycle, component_overview_facts=facts
             ),
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         records = []
         source.record_incident = lambda **record: records.append(record)  # type: ignore[method-assign]
@@ -1734,7 +1736,7 @@ def test_incident_recorder_failure_is_counted_and_logged_once_per_episode(
 ) -> None:
     ingress = _ingress([])
     source = HeadlessControlStateSource(
-        object(), ingress, program_runner_websocket_url=None
+        object(), ingress, program_status=None
     )
 
     def fail(**_record):
@@ -1771,7 +1773,7 @@ def test_last_client_teardown_finishes_before_a_new_source_generation() -> None:
         source = HeadlessControlStateSource(
             NoReadService(),  # type: ignore[arg-type]
             ingress,
-            program_runner_websocket_url="ws://program.test/control-state",
+            program_status=lambda: _Upstream(),
         )
         runner_started = asyncio.Event()
         runner_cancelled = asyncio.Event()
@@ -1853,7 +1855,7 @@ def test_last_client_drains_physical_read_and_cancels_remaining_capture() -> Non
                 return read
 
         source = HeadlessControlStateSource(
-            Service(), ingress, program_runner_websocket_url=None
+            Service(), ingress, program_status=None
         )
         first = await source.subscribe()
         await asyncio.wait_for(entered.wait(), 1)
@@ -1885,7 +1887,7 @@ def test_stop_rejection_does_not_require_initial_semantic_snapshot(
     async def exercise() -> None:
         ingress = _ingress([])
         source = HeadlessControlStateSource(
-            object(), ingress, program_runner_websocket_url=None
+            object(), ingress, program_status=None
         )
         session = ExecutionControlSession(_HandshakeSocket(), source, ingress)
         session_number = session._session_number  # noqa: SLF001
@@ -1950,7 +1952,7 @@ def test_control_source_rejects_clients_above_the_fixed_product_cap() -> None:
         source = HeadlessControlStateSource(
             NoReadService(),  # type: ignore[arg-type]
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         for _ in range(CONTROL_MAXIMUM_CLIENTS):
             source._subscriptions.add(
@@ -2022,7 +2024,7 @@ def test_client_incident_episode_survives_reconnect_without_duplicate_activation
     source = HeadlessControlStateSource(
         object(),  # type: ignore[arg-type]
         ingress,
-        program_runner_websocket_url=None,
+        program_status=None,
     )
     recorded: list[dict[str, Any]] = []
     source.record_incident = lambda **value: recorded.append(value)  # type: ignore[method-assign]
@@ -2072,7 +2074,7 @@ def test_incident_enqueue_uses_native_async_boundary_without_executor_queue() ->
         source = HeadlessControlStateSource(
             object(),  # type: ignore[arg-type]
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
             incident_recorder=lambda **value: recorded.append(value) or {},
         )
         source._loop = asyncio.get_running_loop()  # noqa: SLF001
@@ -2125,7 +2127,7 @@ def test_abandoned_client_incident_correlations_remain_bounded_for_years() -> No
     source = HeadlessControlStateSource(
         object(),  # type: ignore[arg-type]
         ingress,
-        program_runner_websocket_url=None,
+        program_status=None,
     )
     source.record_incident = lambda **_value: None  # type: ignore[method-assign]
     source._diagnostic_origin_ns = 0  # noqa: SLF001
@@ -2272,7 +2274,7 @@ def test_control_source_keeps_only_the_newest_unapplied_owner_frame() -> None:
         source = HeadlessControlStateSource(
             NoReadService(),  # type: ignore[arg-type]
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         subscription = ControlStateSubscription(asyncio.Event())
         source._subscriptions.add(subscription)  # noqa: SLF001
@@ -2313,7 +2315,7 @@ def test_slow_control_client_cannot_delay_or_backlog_another_client() -> None:
         source = HeadlessControlStateSource(
             NoReadService(),  # type: ignore[arg-type]
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         slow = ControlStateSubscription(asyncio.Event())
         current = ControlStateSubscription(asyncio.Event())
@@ -2361,7 +2363,7 @@ def test_control_source_reduces_new_cycle_from_cached_owner_facts() -> None:
         source = HeadlessControlStateSource(
             NoReadService(),  # type: ignore[arg-type]
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         subscription = ControlStateSubscription(asyncio.Event())
         source._subscriptions.add(subscription)  # noqa: SLF001
@@ -2433,7 +2435,7 @@ def test_settled_motion_publishes_rest_pose_that_samples_alone_do_not() -> None:
         source = HeadlessControlStateSource(
             SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=facts),
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         subscription = await source.subscribe()
         try:
@@ -2501,7 +2503,7 @@ def test_cold_reduction_refreshes_only_reset_robot_position_from_direct_read() -
         source = HeadlessControlStateSource(
             SimpleNamespace(program_cycle_status=read, component_overview_facts=facts),
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         subscription = await source.subscribe()
 
@@ -2573,7 +2575,7 @@ def test_cold_reduction_drops_direct_reset_read_overtaken_by_the_stream() -> Non
                 ),
             ),
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         subscription = await source.subscribe()
         try:
@@ -2625,7 +2627,7 @@ def test_cold_reduction_does_not_revive_an_invalidated_program_source() -> None:
                 ),
             ),
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
         )
         subscription = await source.subscribe()
         try:

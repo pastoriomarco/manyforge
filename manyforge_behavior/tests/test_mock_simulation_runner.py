@@ -16,7 +16,11 @@ from typing import Any, Mapping
 import py_trees
 import pytest
 
-from manyforge_behavior.kernel_client import KernelClient
+from manyforge_behavior.kernel_client import (
+    ExecutionCommandError,
+    KernelClient,
+    KernelClientResponseError,
+)
 from manyforge_behavior.nodes.v2_owner import (
     InterruptMotionTaskAdapter,
     IoInputWaitAdapter,
@@ -36,6 +40,7 @@ from manyforge_behavior.production_ports import NativeKernelProgramPort
 from manyforge_behavior.program_clock import ProgramClock
 
 from .v3_fixtures import signal, target_binding
+from .gateway_fakes import transport_gateway
 
 _RUNNING = py_trees.common.Status.RUNNING
 _SUCCESS = py_trees.common.Status.SUCCESS
@@ -72,6 +77,7 @@ class _MockPort:
     def request(self, identity, node_start_index, signals):
         self.built.append((identity.node_attempt_id, node_start_index))
         return {
+            "program_run_id": identity.program_run_id,
             "node_attempt_id": identity.node_attempt_id,
             "node_start_index": str(node_start_index),
             "signals": [dict(row) for row in signals],
@@ -79,6 +85,9 @@ class _MockPort:
 
     def end(self, start_request) -> None:
         self.log.append(("end", start_request["node_attempt_id"], start_request["node_start_index"]))
+
+    def resend_unknown_ends(self, program_run_id):
+        return ()  # Every END above is recorded as sent and ACKed.
 
     def start(self, request):
         self.sent.append(deepcopy(dict(request)))
@@ -502,15 +511,40 @@ _RESPONSE = "manyforge.execution_command_response.v6"
 _LOST = "lost"
 
 
+_MOCK_COMMANDS = frozenset(
+    {"start_mock_io_node_simulation", "end_mock_io_node_simulation", "set_mock_io_run_paused"}
+)
+# The attribution the core adds to these commands for the Program runner.
+_INTERNAL = {"transport": "internal", "assurance": "unverified", "principal_id": None}
+
+
 class _Host:
-    """The native command socket: scripted replies per command (a dict, or
-    _LOST for an unknown reply); otherwise the exact success echo."""
+    """The execution gateway of the Mock commands: each recorded as the
+    envelope the core sends, answered by scripted replies per command (a
+    dict, or _LOST for an unknown reply); otherwise the exact success echo.
+    Every other command goes to ``_Transport``."""
 
     def __init__(self) -> None:
         self.script: dict[str, list[Any]] = {}
         self.envelopes: list[dict[str, Any]] = []
+        self._other = transport_gateway(_Transport())
 
-    def __call__(self, command, _socket_path):
+    def __getattr__(self, command: str):
+        if command not in _MOCK_COMMANDS:
+            return getattr(self._other, command)
+
+        def call(members: Mapping[str, Any] = {}, principal_id: str | None = None):
+            del principal_id
+            return self._answer({
+                "api_version": "manyforge.execution_command.v4",
+                "attribution": dict(_INTERNAL),
+                "command": command,
+                **deepcopy(dict(members)),
+            })
+
+        return call
+
+    def _answer(self, command):
         self.envelopes.append(deepcopy(command))
         scripted = self.script.get(command["command"])
         reply = scripted.pop(0) if scripted else None
@@ -551,12 +585,7 @@ def _context() -> ProgramRunPortContext:
 
 
 class _Transport:
-    """The Runner transport's Mock commands over the real wire models."""
-
-    def __init__(self, wire) -> None:
-        self.start_mock_io_node_simulation = wire.start_mock_io_node_simulation
-        self.end_mock_io_node_simulation = wire.end_mock_io_node_simulation
-        self.set_mock_io_run_paused = wire.set_mock_io_run_paused
+    """Every Kernel call but the Mock commands (``_Host`` serves those)."""
 
     def submit(self, body):  # pragma: no cover - never used here
         raise AssertionError("Mock simulation never submits an operation")
@@ -578,17 +607,16 @@ class _Transport:
 
 
 def _wire(monkeypatch, tmp_path):
-    from manyforge_headless_api.execution import ExecutionCommandClient
-    from manyforge_program_runner.execution_transport import ProgramRunnerExecutionTransport
+    """The Kernel client over the gateway: what the Runner sends and reads."""
 
+    del monkeypatch, tmp_path
     host = _Host()
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", host)
-    return ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0), host
+    return KernelClient(host), host
 
 
 def _native(monkeypatch, tmp_path):
     wire, host = _wire(monkeypatch, tmp_path)
-    port = NativeKernelProgramPort(KernelClient(_Transport(wire)))
+    port = NativeKernelProgramPort(wire)
     port.bind(_context())
     return port, host
 
@@ -624,50 +652,12 @@ def test_end_wire_is_the_start_occurrence_with_its_schema(monkeypatch, tmp_path)
 
 
 def test_wire_error_keeps_its_code_and_details(monkeypatch, tmp_path) -> None:
-    from manyforge_headless_api.native import HeadlessApiError
-
     wire, host = _wire(monkeypatch, tmp_path)
     host.script["start_mock_io_node_simulation"] = [_ERROR]
-    with pytest.raises(HeadlessApiError) as caught:
+    with pytest.raises(ExecutionCommandError) as caught:
         wire.start_mock_io_node_simulation(deepcopy(_START["request"]))
     assert caught.value.code == "mock_simulation_stale"
     assert caught.value.details == {"reason": "mock_simulation_stale"}
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        {"node_start_index": 1},  # Not decimal text.
-        {"node_start_index": "0"},  # Not positive.
-        {"node_start_index": "01"},  # Not canonical.
-        {"node_start_index": str(2**64)},  # Beyond uint64.
-        {"signals": [{"signal": signal("io.1", "ready"),
-                      "start_value": False}]},  # change must be explicit.
-        {"signals": []},
-    ],
-)
-def test_start_wire_request_is_strict(monkeypatch, tmp_path, mutation) -> None:
-    from manyforge_headless_api.native import HeadlessApiError
-
-    wire, host = _wire(monkeypatch, tmp_path)
-    with pytest.raises(HeadlessApiError) as caught:
-        wire.start_mock_io_node_simulation({**_START["request"], **mutation})
-    assert caught.value.code == "execution_command_invalid"
-    assert host.envelopes == []
-
-
-@pytest.mark.parametrize(
-    "mutation", [{"run_revision": 1}, {"run_revision": "0"}, {"paused": 0},
-                 {"run_revision": str(2**64)}, {"held_node_instance_ids": ["b", "a"]},
-                 {"held_node_instance_ids": ["a", "a"]}]
-)
-def test_run_pause_wire_request_is_strict(monkeypatch, tmp_path, mutation) -> None:
-    from manyforge_headless_api.native import HeadlessApiError
-
-    wire, host = _wire(monkeypatch, tmp_path)
-    with pytest.raises(HeadlessApiError):
-        wire.set_mock_io_run_paused({**_PAUSE["request"], **mutation})
-    assert host.envelopes == []
 
 
 def test_wire_accepts_the_full_uint64_index(monkeypatch, tmp_path) -> None:
@@ -677,23 +667,11 @@ def test_wire_accepts_the_full_uint64_index(monkeypatch, tmp_path) -> None:
     assert host.envelopes[0]["request"]["node_start_index"] == top
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        {"command": "end_mock_io_node_simulation"},
-        {"started_at_ns": 1000000},
-        {"status": "superseded"},
-        {"result": {}},
-    ],
-)
-def test_wire_refuses_a_malformed_start_ack(monkeypatch, tmp_path, mutation) -> None:
-    from manyforge_headless_api.native import HeadlessApiError
-
+def test_wire_refuses_a_start_ack_that_accepts_nothing(monkeypatch, tmp_path) -> None:
     wire, host = _wire(monkeypatch, tmp_path)
-    host.script["start_mock_io_node_simulation"] = [{**_ACK, **mutation}]
-    with pytest.raises(HeadlessApiError) as caught:
+    host.script["start_mock_io_node_simulation"] = [{**_ACK, "status": "superseded"}]
+    with pytest.raises(KernelClientResponseError):
         wire.start_mock_io_node_simulation(deepcopy(_START["request"]))
-    assert caught.value.code == "execution_command_response_invalid"
 
 
 def test_native_port_builds_the_canonical_request_with_a_decimal_index(
@@ -826,21 +804,32 @@ def test_native_port_leaves_an_unknown_reply_unknown(monkeypatch, tmp_path) -> N
 
 
 def _run_cleanup(port) -> tuple[Any, list[dict[str, Any]]]:
-    """The Run's real per-tick Mock cleanup over this port."""
+    """The Run's real per-tick Mock cleanup over this port, its sender
+    making each request in place (at submission)."""
 
     from manyforge_behavior.program_runtime import ExecutableProgramRun
+    from manyforge_behavior.run_sender import RunSender
 
     events: list[dict[str, Any]] = []
-    run = SimpleNamespace(
-        _ports=SimpleNamespace(mock_simulation=port),
-        _capture=SimpleNamespace(program_run_id=1),
-        _mock_ends_reported=set(),
-        _record_node_history_event=events.append,
-    )
-    run._report_unconfirmed_pauses = (
-        lambda facts: ExecutableProgramRun._report_unconfirmed_pauses(run, facts)
-    )
-    return (lambda final: ExecutableProgramRun._settle_mock_ends(run, final=final)), events
+    run = ExecutableProgramRun.__new__(ExecutableProgramRun)
+    run._ports = SimpleNamespace(mock_simulation=port)
+    run._capture = SimpleNamespace(program_run_id=1)
+    run._mock_ends_reported = set()
+    run._record_node_history_event = events.append
+    run._sender = RunSender(1, spawn=lambda _name, work: work())
+    run._sender_open = True
+    run._mock_settlements = []
+    run._mock_ending = False
+    run._mock_final_settled = False
+    return (lambda final: run._settle_mock_ends(final=final)), events
+
+
+def _end(mock, start) -> None:
+    """A node's END: recorded in the port (memory only), then sent by the
+    send the node asks for on the run's sender."""
+
+    mock.end(start)
+    mock.resend_unknown_ends(start["program_run_id"])
 
 
 def _read_node(port):
@@ -878,12 +867,12 @@ def test_a_lost_end_is_resent_identically_on_the_next_tick_and_acked(
 def test_an_end_never_acked_is_reported_unconfirmed_once(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
     port.mock_simulation.set_run_paused(1, 1, False)
-    host.script["end_mock_io_node_simulation"] = [_LOST] * 4
+    host.script["end_mock_io_node_simulation"] = [_LOST] * 3
     node = _read_node(port.mock_simulation)
     _tick(node)
     cleanup, events = _run_cleanup(port.mock_simulation)
     cleanup(True)  # The tree ended with its END unanswered.
-    cleanup(True)
+    cleanup(True)  # Its final settlement was answered: nothing is resent.
     assert events == [{
         "kind": "program_node_mock_simulation_end_unconfirmed",
         "node_instance_id": "search_trip",
@@ -897,7 +886,7 @@ def test_an_end_never_acked_is_reported_unconfirmed_once(monkeypatch, tmp_path) 
     port.unbind(1)  # The next unbind resends: OK, so it succeeds.
     ends = [envelope["request"] for envelope in host.envelopes
             if envelope["command"] == "end_mock_io_node_simulation"]
-    assert ends == [_END] * 5
+    assert ends == [_END] * 4
 
 
 def test_an_unanswered_pause_is_reported_when_the_run_ends(monkeypatch, tmp_path) -> None:
@@ -987,6 +976,8 @@ def test_a_refused_end_stays_pending_and_is_resent_until_acked(
     mock, start = _started(port, host)
     host.script["end_mock_io_node_simulation"] = [refusal, refusal]
     mock.end(start)
+    assert "end_mock_io_node_simulation" not in host.commands()  # Recorded only.
+    assert mock.resend_unknown_ends(1)  # The node's send: refused, pending.
     cleanup, events = _run_cleanup(mock)
     cleanup(False)  # Refused again: still pending, never "cancelled".
     assert mock.resend_unknown_ends(1) == ()  # Exact OK ACK.
@@ -1006,7 +997,7 @@ def test_a_refused_end_never_acked_is_reported_when_the_run_ends(
     port, host = _native(monkeypatch, tmp_path)
     mock, start = _started(port, host)
     host.script["end_mock_io_node_simulation"] = [_refusal("mock_simulation_stale")] * 4
-    mock.end(start)
+    _end(mock, start)
     cleanup, events = _run_cleanup(mock)
     cleanup(True)
     assert [event["kind"] for event in events] == [
@@ -1029,7 +1020,7 @@ def test_a_new_start_waits_while_an_older_end_is_unanswered(monkeypatch, tmp_pat
     port, host = _native(monkeypatch, tmp_path)
     mock, start = _started(port, host)
     host.script["end_mock_io_node_simulation"] = [_LOST, _LOST]
-    mock.end(start)  # Lost.
+    _end(mock, start)  # Lost.
     second = mock.request(NodeAttemptIdentity(1, "search_trip", 2), 2,
                           _ROWS[:1])
     with pytest.raises(Exception) as caught:  # END resent, lost again: wait.
@@ -1065,7 +1056,7 @@ def test_a_lost_end_fails_unbind_until_the_next_unbind_gets_its_ack(
     port, host = _native(monkeypatch, tmp_path)
     mock, start = _started(port, host)
     host.script["end_mock_io_node_simulation"] = [_LOST, _LOST]
-    mock.end(start)  # Lost.
+    _end(mock, start)  # Lost.
     with pytest.raises(ProductionPortError, match="unconfirmed Mock simulation ends"):
         port.unbind(1)  # Resent, lost again: unbind fails.
     assert port._context(1) is not None  # Still bound.

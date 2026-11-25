@@ -64,7 +64,7 @@ _CANONICAL_EMPTY_INPUT = json.dumps(
     {
         "api_version": "manyforge.deployment.v1",
         "deployment_revision": _ZERO_DIGEST,
-        "cell_id": "c1_build_authority_cell",
+        "cell_id": "canonical_empty_cell",
         "catalogs": {"records": []},
         "graph": {
             "runtime_units": [],
@@ -83,18 +83,18 @@ _CANONICAL_EMPTY_INPUT = json.dumps(
 _CANONICAL_EMPTY_NORMALIZED = (
     '{"api_version":"manyforge.deployment.v1",'
     '"capability_provider_bindings":[],"catalogs":{"records":[]},'
-    '"cell_id":"c1_build_authority_cell",'
+    '"cell_id":"canonical_empty_cell",'
     '"deployment_revision":"sha256:'
-    '2b2ddbd2632ac30ce1ef06b528e84815678c36ff83496feb011d99ea54826f41",'
+    '34740358926192e76474268c2771eedd99f5af2d80e5d57a80cd29f9b1c7e633",'
     '"desired_control_configurations":[],"graph":'
     '{"component_attachments":[],"control_bindings":[],"control_domains":[],'
     '"controllable_components":[],"model_instances":[],"runtime_units":[]}}'
 )
 _EXPECTED_DEPLOYMENT_REVISION = (
-    "sha256:2b2ddbd2632ac30ce1ef06b528e84815678c36ff83496feb011d99ea54826f41"
+    "sha256:34740358926192e76474268c2771eedd99f5af2d80e5d57a80cd29f9b1c7e633"
 )
 _EXPECTED_GRAPH_REVISION = (
-    "sha256:e933b3c39ee2c8fe1e1f0f5c8133826d277e5664ff5448093624d5e348030704"
+    "sha256:67ce98f5ad51582a1d6829414018110433bf443e64a5c5a203b0c084f078ed5f"
 )
 _MODEL_ASSET_SCHEMA_REVISION = (
     "sha256:397af1d5fbe5d2e83d442565c9096637a26595d63b5d8e03012e8f2d082fa0b6"
@@ -988,7 +988,7 @@ def _write_case_evidence(
     global _EVIDENCE_ROOT_IDENTITY
     filename = f"{case_id}.json"
     payload = {
-        "schema_version": "manyforge.composable_cell_i2.direct_binding_case.v1",
+        "schema_version": "manyforge.direct_binding_case.v1",
         "case_id": case_id,
         "node_id": _NODE_PREFIX + case_id,
         "extension_sha256": _extension_sha256(),
@@ -1514,7 +1514,7 @@ def _compiler_observation(values: dict[str, Any]) -> dict[str, Any]:
 def _expected_compiler_observation() -> dict[str, Any]:
     return {
         "deployment_revision": _EXPECTED_DEPLOYMENT_REVISION,
-        "cell_id": "c1_build_authority_cell",
+        "cell_id": "canonical_empty_cell",
         "graph_revision": _EXPECTED_GRAPH_REVISION,
         "normalized_authored_canonical_json": _CANONICAL_EMPTY_NORMALIZED,
         "composition": {
@@ -2371,7 +2371,7 @@ def test_repeated_fresh_interpreter_import_use_and_clean_shutdown() -> None:
             observation = json.loads(result.stdout)
         except json.JSONDecodeError as error:
             _fail(f"fresh interpreter {index} did not emit exact JSON: {error}")
-        expected = {"module_file": str(extension), "module_origin": str(extension), "compiler_type": "CompilerQualifiedCellIr", "cell_id": "c1_build_authority_cell", "catalog_record_count": 0}
+        expected = {"module_file": str(extension), "module_origin": str(extension), "compiler_type": "CompilerQualifiedCellIr", "cell_id": "canonical_empty_cell", "catalog_record_count": 0}
         if observation != expected:
             _fail(f"fresh interpreter {index} use observation drifted: {observation}")
         runs.append({"index": index, "argv": argv[:5] + [str(extension), "<embedded-canonical-empty>"], "start_ns": start, "end_ns": end, "exit_status": result.returncode, "timed_out": timed_out, "stdout": observation, "stderr": result.stderr})
@@ -2394,7 +2394,7 @@ def test_generated_stub_inventory_and_documentation_parity() -> None:
     inventory = _strict_json(api_path)
     if set(inventory) != {"schema_version", "module", "framework", "python_abi", "exports"}:
         _fail("generated API inventory root keys drifted")
-    if inventory["schema_version"] != "manyforge.composable_cell_i2.binding_api_inventory.v1" or inventory["module"] != _MODULE_NAME or inventory["framework"] != "pybind11":
+    if inventory["schema_version"] != "manyforge.binding_api_inventory.v1" or inventory["module"] != _MODULE_NAME or inventory["framework"] != "pybind11":
         _fail("generated API inventory identity drifted")
     abi = inventory["python_abi"]
     expected_abi = {"implementation": platform.python_implementation(), "version": platform.python_version(), "soabi": sysconfig.get_config_var("SOABI"), "extension_suffix": sysconfig.get_config_var("EXT_SUFFIX"), "gil_disabled": False}

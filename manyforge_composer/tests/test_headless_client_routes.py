@@ -185,7 +185,9 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
     digest_b = "sha256:" + "b" * 64
     digest_c = "sha256:" + "c" * 64
     return {
-        "schema_version": "manyforge.program_run_status.v5",
+        "schema_version": "manyforge.program_run_status.v6",
+        "node_running_since_utc_ns": {},
+        "node_wait_values": {},
         "owner_id": "program-runner.cell-a",
         "run_revision": 1,
         "state": state,
@@ -233,7 +235,7 @@ def headless_client() -> (
         for item in build_executable_node_resolver(environment).dispositions
     }
     node_environment = {
-        "schema_version": "manyforge.node_environment_projection.v3",
+        "schema_version": "manyforge.node_environment_projection.v4",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
         "catalog_id": manifest.catalog_id,
@@ -285,7 +287,6 @@ def headless_client() -> (
                             ),
                         }
                     ),
-                    "restoration_gates": list(dispositions[row].restoration_gates),
                 }
                 for row in manifest.executable_registry
             ],
@@ -295,7 +296,6 @@ def headless_client() -> (
                 "program_binding_unselected",
                 "program_runtime_owner_unavailable",
             ],
-            "restoration_gates": ["I6", "N"],
         },
         "source": {
             "projection_generation": 4,
@@ -2152,7 +2152,7 @@ def test_composer_rejects_a_mismatched_local_adapter_disposition(
         for item in node_environment["availability"]["implementations"]
         if item["node_id"] == "simulation.reset"
     )
-    row["restoration_gates"] = ["I9", "N"]
+    row["adapter_build_qualified"] = False
 
     with _composer(client) as composer:
         response = composer.get("/api/catalog")
@@ -2313,7 +2313,7 @@ def test_composer_does_not_serve_removed_runtime_override_routes(headless_client
     assert [response.status_code for response in responses] == [503] * len(removed)
     assert {
         response.json()["detail"]["code"] for response in responses
-    } == {"composable_cell_runtime_unavailable"}
+    } == {"runtime_unavailable"}
     assert not any("runtime-override" in path for path in served)
     assert not any("runtime-override" in item["path"] for item in requests)
 

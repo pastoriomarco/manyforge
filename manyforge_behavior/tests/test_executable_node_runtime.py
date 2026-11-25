@@ -371,14 +371,14 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     assert sum(not item.adapter_build_qualified for item in dispositions) == 0
     assert all(
         (
-            (item.unavailable_reason_code is None and not item.restoration_gates)
+            (item.unavailable_reason_code is None)
             if item.adapter_build_qualified
-            else (item.unavailable_reason_code and item.restoration_gates)
+            else bool(item.unavailable_reason_code)
         )
         for item in dispositions
     )
     deferred = {
-        item.row.node_id: (item.unavailable_reason_code, item.restoration_gates)
+        item.row.node_id: item.unavailable_reason_code
         for item in dispositions
         if not item.adapter_build_qualified
     }
@@ -394,9 +394,10 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     assert owners["motion.stop_groups"] is None
 
 
-def _deferred_adapters(source: str) -> dict[str, tuple[str, ...]]:
+def _deferred_adapters(source: str) -> dict[str, str]:
     """The C++ ``kDeferredAdapters`` rows: an empty ``{}`` or ``{{...}}``
-    initializer whose rows are 4 strings each, matching the array extent."""
+    initializer whose rows are 2 strings each (node id, reason code),
+    matching the array extent."""
 
     match = re.search(
         r"std::array<DeferredAdapter,\s*(\d+)U?>\s*kDeferredAdapters"
@@ -406,10 +407,8 @@ def _deferred_adapters(source: str) -> dict[str, tuple[str, ...]]:
     )
     assert match is not None, "kDeferredAdapters initializer not found"
     fields = re.findall(r'"([^"]+)"', match.group(2) or "")
-    assert len(fields) == 4 * int(match.group(1))
-    rows = {
-        fields[index]: tuple(fields[index + 1 : index + 4]) for index in range(0, len(fields), 4)
-    }
+    assert len(fields) == 2 * int(match.group(1))
+    rows = {fields[index]: fields[index + 1] for index in range(0, len(fields), 2)}
     assert len(rows) == int(match.group(1))
     return rows
 
@@ -423,13 +422,13 @@ def test_deferred_adapter_parser_reads_empty_and_nonempty_initializers() -> None
     ) == {}
     nonempty = (
         "constexpr std::array<DeferredAdapter, 2U> kDeferredAdapters{{\n"
-        '    {"io.get_input", "reason_a", "gate_a",\n     "gate_b"},\n'
-        '    {"motion.probe_search", "reason_b", "gate_c", "gate_d"},\n'
+        '    {"io.get_input",\n     "reason_a"},\n'
+        '    {"motion.probe_search", "reason_b"},\n'
         "}};\nint y{{2}};"
     )
     assert _deferred_adapters(nonempty) == {
-        "io.get_input": ("reason_a", "gate_a", "gate_b"),
-        "motion.probe_search": ("reason_b", "gate_c", "gate_d"),
+        "io.get_input": "reason_a",
+        "motion.probe_search": "reason_b",
     }
     for malformed in (
         nonempty.replace("2U>", "3U>"),
@@ -443,10 +442,7 @@ def test_deferred_adapter_parser_reads_empty_and_nonempty_initializers() -> None
 def test_headless_static_projection_matches_the_closed_deferred_set() -> None:
     resolver = build_executable_node_resolver(build_node_environment())
     expected = {
-        item.row.node_id: (
-            item.unavailable_reason_code,
-            *item.restoration_gates,
-        )
+        item.row.node_id: item.unavailable_reason_code
         for item in resolver.dispositions
         if not item.adapter_build_qualified
     }
@@ -816,7 +812,6 @@ def test_availability_keeps_adapter_binding_owner_and_execution_separate() -> No
             "program_binding_unselected",
             "program_runtime_owner_unavailable",
         ],
-        "restoration_gates": [],
     }
     assert by_node["simulation.reset"]["authoring_available"] is True
     assert by_node["simulation.reset"]["adapter_build_qualified"] is True
@@ -1662,7 +1657,9 @@ def test_stopped_program_run_cannot_restart_effects() -> None:
         ports=_ports(task),
     )
 
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # The motion start is sent on the run's sender and read a tick later
+    # (OD-380 D2): the accepted task is what the Stop cancels.
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     run.stop()
     run.stop()
     assert len(task.cancellations) == 1
@@ -1697,8 +1694,10 @@ def test_retry_issues_a_fresh_attempt_identity_and_stop_cancels_active_work() ->
         ports=_ports(task),
     )
 
-    assert run.tick_once() is py_trees.common.Status.RUNNING
-    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    # Each attempt's start is read a tick after it is sent (OD-380 D2): the
+    # first attempt's failure is read, then the retried attempt succeeds.
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
+    assert _tick_answered(run) is py_trees.common.Status.SUCCESS
     assert [item[1].node_attempt_id for item in task.starts] == list(
         dict.fromkeys(item[1].node_attempt_id for item in task.starts)
     )
@@ -1712,7 +1711,7 @@ def test_retry_issues_a_fresh_attempt_identity_and_stop_cancels_active_work() ->
         readiness=_readiness(_DIGEST_A),
         ports=_ports(active_task),
     )
-    assert active_run.tick_once() is py_trees.common.Status.RUNNING
+    assert _tick_answered(active_run) is py_trees.common.Status.RUNNING
     active_run.stop()
     assert len(active_task.cancellations) == 1
 
@@ -2034,7 +2033,9 @@ def test_stopped_program_run_presents_running_cancellable_leaves_as_interrupted(
         readiness=_readiness(_DIGEST_A),
         ports=_ports(task),
     )
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # The motion start is sent on the run's sender and read a tick later
+    # (OD-380 D2): the accepted task is what the Stop cancels.
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     motion_id = motion["instance_id"]
     assert run.node_statuses[motion_id] == "running"
 
@@ -2068,7 +2069,9 @@ def test_stopped_program_run_presents_a_refused_cancellation_as_failure() -> Non
         readiness=_readiness(_DIGEST_A),
         ports=_ports(task),
     )
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # The motion start is sent on the run's sender and read a tick later
+    # (OD-380 D2): the accepted task is what the Stop asks to cancel.
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     motion_id = motion["instance_id"]
 
     run.stop()
@@ -2405,6 +2408,30 @@ def test_wait_for_value_reads_the_watched_key_fresh_on_every_tick() -> None:
     assert run.tick_once() is py_trees.common.Status.SUCCESS
 
 
+def test_a_running_wait_for_value_publishes_the_value_it_last_read() -> None:
+    """OD-382 C6: display only, from the read the wait already does; the
+    time is the first read of that value."""
+    program = _typed_program(
+        [_key("count", "int64")],
+        _leaf("logic.wait_for_value", "wait", key="count", operator=">=", value=3),
+    )
+    run = _run(program)
+    assert run.wait_observations == {}
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    empty = run.wait_observations["wait"]
+    assert {name: empty[name] for name in ("kind", "key")} == {"kind": "key", "key": "count"}
+    assert "value" not in empty
+    run.value_store.write("count", 2)
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    first = run.wait_observations["wait"]
+    assert first["value"] == 2 and first["observed_at_utc_ns"] >= empty["observed_at_utc_ns"]
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    assert run.wait_observations["wait"] is first
+    run.value_store.write("count", 3)
+    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert run.wait_observations == {}  # No longer running.
+
+
 def test_wait_for_value_times_out_on_the_program_clock_and_retry_is_fresh() -> None:
     now = [100.0]
     program = _typed_program(
@@ -2653,6 +2680,10 @@ def _tick_answered(run: ExecutableProgramRun) -> py_trees.common.Status:
         waiting = any(
             getattr(node, "_request", None) is not None
             for node in run._sender_adapters  # noqa: SLF001
+        ) or any(
+            # OD-380 D2: a pure node's frame transform is on the sender too.
+            getattr(node, "_transform", None) is not None
+            for node in run._tree.root.iterate()  # noqa: SLF001
         )
         if status is not py_trees.common.Status.RUNNING or not waiting:
             return status
@@ -3421,14 +3452,14 @@ def test_offset_pose_across_frames_fails_by_name_without_a_transform_owner() -> 
         ),
     )
     run = _framed_run(program, None)
-    assert run.tick_once() is py_trees.common.Status.FAILURE
+    assert _tick_answered(run) is py_trees.common.Status.FAILURE
     assert _feedback(run).startswith("frame_transform_unavailable:")
     assert not run.value_store.contains("out")
     refused = _FramePort(
         FrameTransformError("program_reference_robot_not_local", "robot is hosted elsewhere")
     )
     run = _framed_run(program, refused)
-    assert run.tick_once() is py_trees.common.Status.FAILURE
+    assert _tick_answered(run) is py_trees.common.Status.FAILURE
     assert run._tree.tip().failure_reason_code == "program_reference_robot_not_local"  # noqa: SLF001
     # The pose's own axes need no transform, whatever its frame.
     local = _typed_program(
@@ -3436,7 +3467,7 @@ def test_offset_pose_across_frames_fails_by_name_without_a_transform_owner() -> 
         _leaf("geometry.offset_pose", "offset", pose=_portable_pose(), offset=offset, output_key="out"),
     )
     run = _framed_run(local, None)
-    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    assert _tick_answered(run) is py_trees.common.Status.SUCCESS
     assert run.value_store.read("out")["frame_ref"] == _portable_pose()["frame_ref"]
     assert run.value_store.read("out")["position_m"] == pytest.approx([0.4, 0.0, 0.3])
 
@@ -3486,7 +3517,7 @@ def test_check_pose_bounds_expresses_the_pose_in_the_box_frame(base_x, inside) -
     )
     frames = _FramePort()
     expected = py_trees.common.Status.SUCCESS if inside else py_trees.common.Status.FAILURE
-    assert _framed_run(program, frames).tick_once() is expected
+    assert _tick_answered(_framed_run(program, frames)) is expected
     [(_identity, pose, target)] = frames.transforms
     assert pose["frame_ref"] == _portable_pose()["frame_ref"]
     assert target == {"kind": "cell_frame"}
@@ -3558,12 +3589,12 @@ def test_check_pose_distance_expresses_pose_b_in_pose_a_frame() -> None:
     frames = _FramePort()
     at_base = _cell_pose(position=(1.0, 0.0, 0.0), orientation={"rpy_deg": [0.0, 0.0, 90.0]})
     origin = _base_pose(position=(0.0, 0.0, 0.0), orientation={"rpy_deg": [0.0, 0.0, 0.0]})
-    assert distance(at_base, origin, frames).tick_once() is py_trees.common.Status.SUCCESS
+    assert _tick_answered(distance(at_base, origin, frames)) is py_trees.common.Status.SUCCESS
     [(_identity, pose, target)] = frames.transforms
     assert pose == origin and target == {"kind": "cell_frame"}
     # Equal coordinates in different frames are different places.
     far = distance(_cell_pose(position=(0.4, 0.0, 0.2)), _base_pose(), _FramePort())
-    assert far.tick_once() is py_trees.common.Status.FAILURE
+    assert _tick_answered(far) is py_trees.common.Status.FAILURE
 
 
 def test_get_object_pose_in_another_frame_is_one_owner_transform() -> None:
@@ -3975,7 +4006,9 @@ def test_behavior_stop_policy_oracle_for_partial_and_whole_subtrees(
     state = run._operator_stop_state  # noqa: SLF001
     state.publish(OperatorMotionStopSnapshot(1, selected))
     assert state.snapshot().held_nodes == selected
-    assert run.tick_once() is (
+    # The gripper starts are sent on the run's sender and read a tick later
+    # (OD-380 D2).
+    assert _tick_answered(run) is (
         py_trees.common.Status.SUCCESS if commands_sent else py_trees.common.Status.RUNNING
     ), selection_id
     expected = (
@@ -4031,7 +4064,8 @@ def test_behavior_stop_policy_oracle_for_inherited_chain_and_leaf_default(
     assert state.snapshot().held_nodes == selected
     # Releasing the exact hold dispatches the same real command adapter.
     state.publish(OperatorMotionStopSnapshot(2))
-    assert run.tick_once() is py_trees.common.Status.FAILURE  # inverter
+    # The gripper start is read a tick after it is sent (OD-380 D2).
+    assert _tick_answered(run) is py_trees.common.Status.FAILURE  # inverter
     assert [identity.node_instance_id for _, identity, _ in task.starts] == ["d_leaf"]
     assert task.starts[0][0] == "gripper.command_position"
     assert nodes["d_leaf"].decorated.status is py_trees.common.Status.SUCCESS
@@ -4078,7 +4112,9 @@ def test_behavior_stop_policy_oracle_for_explicit_overrides_and_mixed_ancestors(
     } == {"a_inherited_hold", "e_default_leaf", "f_explicit_hold", "z_root"}
     state = run._operator_stop_state  # noqa: SLF001
     state.publish(OperatorMotionStopSnapshot(1, selected))
-    assert run.tick_once() is (
+    # The gripper starts are sent on the run's sender and read a tick later
+    # (OD-380 D2).
+    assert _tick_answered(run) is (
         py_trees.common.Status.FAILURE if child_runs else py_trees.common.Status.RUNNING
     ), selection_id
     assert nodes["b_explicit_continue"].status is (
@@ -4104,7 +4140,8 @@ def test_behavior_stop_policy_oracle_for_inherited_leaf_root_default() -> None:
     assert not isinstance(node, OperatorMotionStopPolicy)
     state = run._operator_stop_state  # noqa: SLF001
     state.publish(OperatorMotionStopSnapshot(1, frozenset({"root"})))
-    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    # The gripper start is read a tick after it is sent (OD-380 D2).
+    assert _tick_answered(run) is py_trees.common.Status.SUCCESS
     assert [identity.node_instance_id for _, identity, _ in task.starts] == ["root"]
     assert task.starts[0][0] == "gripper.command_position"
     assert state.snapshot().held_nodes == frozenset({"root"})
@@ -4134,7 +4171,8 @@ def _program_dwell_run(now, *, dwell=2.0, mode=None, policy="hold", task=None):
 def test_pneumatic_program_dwell_starts_at_first_observed_success_and_ack_once():
     now = [100.0]
     run, task, _clock = _program_dwell_run(now)
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # The gripper start's tick, then the tick that reads it (OD-380 D2).
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     now[0] = 150.0  # Enqueue/active time is never backdated into dwell.
     assert run.tick_once() is py_trees.common.Status.RUNNING
     leaf = _leaf_node(run, "command")
@@ -4154,7 +4192,8 @@ def test_pneumatic_program_dwell_starts_at_first_observed_success_and_ack_once()
 def test_pneumatic_program_dwell_uses_timer_hold_and_continue_rules(mode, policy):
     now = [100.0]
     run, task, _clock = _program_dwell_run(now, mode=mode, policy=policy)
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # The gripper start's tick, then the tick that reads it (OD-380 D2).
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     assert run.tick_once() is py_trees.common.Status.RUNNING  # Delivery at 100.
     state = run._operator_stop_state
     now[0] = 100.5
@@ -4192,7 +4231,8 @@ def test_pneumatic_program_dwell_overlaps_pending_ack_and_halt(ack_at):
             super().acknowledge(task_id, identity)
     task = DelayedAck()
     run, task, clock = _program_dwell_run(now, task=task)
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # The gripper start's tick, then the tick that reads it (OD-380 D2).
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     clock.freeze()
     now[0] = 200.0
     assert run.tick_once() is py_trees.common.Status.RUNNING
@@ -4215,11 +4255,12 @@ def test_pneumatic_program_dwell_overlaps_pending_ack_and_halt(ack_at):
 def test_pneumatic_program_dwell_zero_and_final_delivery_failure(dwell):
     now = [100.0]
     run, task, _clock = _program_dwell_run(now, dwell=dwell)
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # The gripper start's tick, then the tick that reads it (OD-380 D2).
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     assert run.tick_once() is (py_trees.common.Status.SUCCESS if dwell == 0 else py_trees.common.Status.RUNNING)
     failed = _TaskPort((OwnerTaskState.FAILED,))
     run, failed, _clock = _program_dwell_run(now, dwell=dwell, task=failed)
-    assert run.tick_once() is py_trees.common.Status.FAILURE
+    assert _tick_answered(run) is py_trees.common.Status.FAILURE
     assert failed.acknowledgements == []
 
 
@@ -4227,7 +4268,8 @@ def test_position_command_keeps_owner_success_without_program_dwell():
     now = [100.0]
     run, task, _clock = _program_dwell_run(now)
     task.metadata = {"gripper_actuation_kind": "position_commanded", "gripper_dwell_s": None}
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # The gripper start's tick, then the tick that reads it (OD-380 D2).
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     assert run.tick_once() is py_trees.common.Status.SUCCESS
     assert len(task.acknowledgements) == 1
 
@@ -4235,7 +4277,8 @@ def test_position_command_keeps_owner_success_without_program_dwell():
 def test_program_stop_invalidates_dwell_and_retry_has_fresh_attempt():
     now = [100.0]
     run, task, _clock = _program_dwell_run(now)
-    assert run.tick_once() is py_trees.common.Status.RUNNING
+    # The gripper start's tick, then the tick that reads it (OD-380 D2).
+    assert _tick_answered(run) is py_trees.common.Status.RUNNING
     assert run.tick_once() is py_trees.common.Status.RUNNING
     leaf = _leaf_node(run, "command")
     original = leaf.attempt_identity
@@ -4244,7 +4287,11 @@ def test_program_stop_invalidates_dwell_and_retry_has_fresh_attempt():
     now[0] = 200.0
     assert _tick(leaf) is py_trees.common.Status.RUNNING
     assert leaf.attempt_identity != original
+    # The fresh attempt's start is sent on the run's sender and read on the
+    # next tick (OD-380 D2): its dwell starts at 200 as before.
+    _sender_idle(run)
     assert len(task.starts) == 2
+    assert _tick(leaf) is py_trees.common.Status.RUNNING
     now[0] = 202.0
     assert _tick(leaf) is py_trees.common.Status.SUCCESS
     assert len(task.acknowledgements) == 2
@@ -4426,6 +4473,8 @@ def test_planning_node_is_running_while_its_job_plans_and_reads_it_once_done() -
     assert task.finishes == []  # The read is queued on the sender.
     sender.drain()
     assert task.finishes == ["job-1"]
+    assert _tick(adapter) is py_trees.common.Status.RUNNING  # Its consumption is sent.
+    sender.drain()
     assert _tick(adapter) is py_trees.common.Status.FAILURE
     assert adapter.failure_reason_code == "no_feasible_candidate"
     assert task.planning_cancels == []
@@ -4442,6 +4491,8 @@ def test_planning_failure_reaches_the_tree_with_the_hosts_typed_code() -> None:
     _planning_job_known(task, sender, adapter)
     task.states["job-1"] = "failed"
     assert _tick(adapter) is py_trees.common.Status.RUNNING
+    sender.drain()
+    assert _tick(adapter) is py_trees.common.Status.RUNNING  # Its consumption is sent.
     sender.drain()
     assert _tick(adapter) is py_trees.common.Status.FAILURE
     assert adapter.failure_reason_code == "pick_planning_cancelled"
@@ -4464,6 +4515,8 @@ def test_planning_node_stays_running_while_the_stream_copy_cannot_show_its_job(
     task.unavailable = False
     task.states["job-1"] = "done"
     assert _tick(adapter) is py_trees.common.Status.RUNNING
+    sender.drain()
+    assert _tick(adapter) is py_trees.common.Status.RUNNING  # Its consumption is sent.
     sender.drain()
     assert _tick(adapter) is py_trees.common.Status.FAILURE
 
@@ -4561,6 +4614,8 @@ def test_a_run_halt_or_a_stop_hold_cancels_the_job_and_plans_again_after(freeze:
     assert _tick(adapter) is py_trees.common.Status.RUNNING
     sender.drain()
     assert task.finishes == ["job-2"]
+    assert _tick(adapter) is py_trees.common.Status.RUNNING  # Its consumption is sent.
+    sender.drain()
     assert _tick(adapter) is py_trees.common.Status.FAILURE
 
 

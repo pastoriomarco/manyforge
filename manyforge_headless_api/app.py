@@ -28,7 +28,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .component_model import RUN_REFUSAL_CODES, RunReadinessRequest
+from .activity_history import (
+    STOP_ROUTE_COMMANDS,
+    bind_request_caller,
+    caller,
+    unbind_request_caller,
+)
+from .client import TRANSPORT_HEADER
+from .component_model import RunReadinessRequest
+from .error_http_status import DEFAULT_HTTP_STATUS, HTTP_STATUS
 from .execution import ExecutionCommandClient, ExecutionEventPump
 from .manager_status_stream import ManagerStatusChanges, ManagerStatusFollower
 from .control_dispatch import HeadlessExecutionControlDispatch
@@ -69,6 +77,7 @@ from .models import (
     ApplyOutcomeRequest,
     ProgramNodeAttemptBatchRequest,
     ProgramResetOutcomeRequest,
+    SceneChangeRecordRequest,
     ComponentActionRequest,
     ComponentGroupActionRequest,
     RecoveryPreflightConfirmation,
@@ -116,7 +125,6 @@ from .models import (
     MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
     decode_runtime_scale_selector_query,
     SceneResourcePoseQuery,
-    SceneRuntimeLatchRequest,
     SceneTransactionRequest,
     StopIntentRequest,
 )
@@ -130,7 +138,7 @@ from .native import (
     strict_json_object,
 )
 from .service import HeadlessService, TrustedAttribution, warm_builtin_node_environment
-from .program_runner_client import ProgramRunnerHttpClient
+from .program_runner_client import ProgramRunnerClient
 from .cell_admission import CellAdmissionClient
 from .alarm_attention import OperatorAlarmAttentionPublisher
 from .activation_preparer import ActivationPreparer
@@ -346,126 +354,10 @@ class RequestBodyLimitMiddleware:
 
 
 def _error_status(code: str) -> int:
-    if code == "draft_candidate_response_too_large":
-        return 413
-    if code == "component_frame_lookup_invalid":
-        return 400
-    if code in {"component_frame_lookup_stale", "component_reference_missing", "frame_missing"}:
-        return 409
-    if code == "program_run_started_then_failed":
-        return 422
-    if code == "full_stack_restart_required":
-        return 409
-    if code in {
-        "headless_projection_response_invalid",
-        "headless_projection_response_oversized",
-        "manager_command_response_invalid",
-        "execution_command_response_invalid",
-        "node_environment_projection_invalid",
-        "assistant_mode_context_invalid",
-        "source_model_context_invalid",
-        "source_model_projection_invalid",
-        "program_applied_selection_invalid",
-        "program_runner_response_invalid",
-        "viewer_model_asset_invalid",
-        "assistant_mode_projection_invalid",
-    }:
-        return 502
-    if code == "headless_api_internal_failure":
-        return 500
-    if code.endswith("_not_found") or code in {
-        "missing_reference",
-        "operator_alarm_not_found",
-        "planning_job_unknown",
-    }:
-        return 404
-    if (
-        "conflict" in code
-        or "stale" in code
-        or "fence" in code
-        or code.startswith(("program_cycle_state_", "program_run_state_"))
-        or code
-        in {
-            "invalid_state_transition",
-            "command_not_allowed",
-            "manual_handover_required",
-            "object_already_exists",
-            "program_run_admission_failed",
-            "program_run_already_active",
-            "program_applied_non_executable",
-            "program_not_selected",
-            # Preparation runs before any claim or effect; it refuses the input.
-            "activation_preparation_failed",
-            "program_reference_validation_failed",
-            "prepared_activation_unverified",
-            "authoring_not_ready",
-            "program_run_draft_applied_mismatch",
-            "activation_preparer_busy",
-            "model_sources_unknown",
-            "program_node_preview_busy",
-            "deployment_candidate_cell_mismatch",
-            "persistent_key_request_replayed",
-            # An operator-alarm condition interlock refuses motion before any effect.
-            "operator_alarm_interlock_active",
-            "request_result_expired",
-            # Component model v2: refusals before dispatch.
-            "component_action_in_progress",
-            "component_action_unsupported",
-            "owner_not_prepared",
-            "io_output_controller_owned",
-            # A position reset while the simulation isn't playing.
-            "simulation_not_playing",
-            # An assistant mode read while the Deployment has no assistant.
-            "assistant_component_absent",
-            # Pick/place planning jobs: a held name, a release before the end.
-            "planning_job_exists",
-            "planning_job_unfinished",
-        }
-        # RunReadiness reasons and run refusals.
-        or code in RUN_REFUSAL_CODES
-    ):
-        return 409
-    if "unavailable" in code or code in {
-        "assistant_ai_model_absent",
-        "headless_api_closed",
-        "kernel_owner_unavailable",
-        "execution_owner_not_ready",
-        "operator_alarm_state_unavailable",
-        "program_applied_selection_not_active",
-        "program_runner_unavailable",
-        "program_run_scheduling_failed",
-        "program_cycle_reconciliation_required",
-        "request_ledger_full",
-        "scene_projection_commit_uncertain",
-        "execution_control_ingress_busy",
-        "execution_planning_jobs_busy",
-        # A runtime unit launching or preparing (contract 1.3).
-        "runtime_unit_launch_in_progress",
-    }:
-        return 503
-    if (
-        code == "invalid_request"
-        or code.endswith("_invalid")
-        or code.endswith("_rejected")
-    ):
-        return 400
-    if code in {
-        # A Scene change whose result would exceed the Scene size limit.
-        "scene_too_large",
-        "confirmation_required",
-        "request_key_required",
-        "start_identity_required",
-        "operator_alarm_acknowledgement_confirmation_required",
-        "operator_alarm_acknowledgement_reason_required",
-        "operator_alarm_acknowledge_all_confirmation_required",
-        "operator_alarm_acknowledge_all_duplicate_member",
-        "operator_alarm_limit_invalid",
-        "operator_alarm_state_filter_invalid",
-    }:
-        return 400
-    if code == "operator_alarm_membership_mismatch":
-        return 409
-    return 500
+    """The HTTP status of an error answer carrying `code` (the catalog's
+    generated table)."""
+
+    return HTTP_STATUS.get(code, DEFAULT_HTTP_STATUS)
 
 
 def _conditional_projection(
@@ -535,23 +427,37 @@ def create_app(
     viewer_pose_sources: Callable[[], tuple[str, str] | None] | None = None
     alarm_attention: OperatorAlarmAttentionPublisher | None = None
     disk_check: DiskRecordsCheck | None = None
-    program_runner_client: ProgramRunnerHttpClient | None = None
+    program_runner_client: ProgramRunnerClient | None = None
     if service is None:
         assert config is not None
         # Before serving: never on request threads while machines prepare.
         warm_builtin_node_environment()
         core = NativeHeadlessCore(config)
+        # Headless's gateway core: its owner commands, HTTP attribution.
+        import manyforge_headless_py
+
+        # Two gateways for base's two connect limits: the Manager client's
+        # and the execution client's.
         manager = ManagerCommandClient(
-            config.manager_run_root,
-            timeout_seconds=config.manager_timeout_seconds,
+            manyforge_headless_py.Gateway(
+                str(config.execution_run_root),
+                str(config.manager_run_root),
+                attribution="http",
+                connect_limit_s=config.manager_timeout_seconds,
+            )
         )
         execution = ExecutionCommandClient(
-            config.execution_run_root,
-            timeout_seconds=config.execution_timeout_seconds,
+            manyforge_headless_py.Gateway(
+                str(config.execution_run_root),
+                str(config.manager_run_root),
+                attribution="http",
+                connect_limit_s=config.execution_timeout_seconds,
+            ),
+            observation_run_root=config.execution_run_root,
         )
-        if config.program_runner_url is not None:
-            program_runner_client = ProgramRunnerHttpClient(
-                config.program_runner_url,
+        if config.program_runner_socket_root is not None:
+            program_runner_client = ProgramRunnerClient(
+                config.program_runner_socket_root,
                 timeout_seconds=config.program_runner_timeout_seconds,
             )
         activation_preparer = None
@@ -578,10 +484,6 @@ def create_app(
             application_start_id=config.application_start_id,
             scene_mesh_allowed_roots=config.scene_mesh_allowed_roots,
         )
-        event_execution = ExecutionCommandClient(
-            config.execution_run_root,
-            timeout_seconds=min(config.execution_timeout_seconds, 1.0),
-        )
         # OD-216: the Manager's state from its status stream, followed for the
         # application's lifetime; each change or liveness change wakes the
         # control state, the scene commits waiting for their publication
@@ -603,9 +505,12 @@ def create_app(
         viewer_pose_sources = core.viewer_pose_sources
         event_pump = ExecutionEventPump(
             core,
-            event_execution,
+            # The core's one event follower of this process.
+            manyforge_headless_py.ExecutionEvents(str(config.execution_run_root)),
             application_start_id=config.application_start_id,
             poll_seconds=config.execution_event_poll_milliseconds / 1_000.0,
+            # Motion-trace exports after a failure, on the capture's worker.
+            motion_trace_source=execution,
         )
         # Its own thread, reading the owner's published projection without the
         # core lock: neither event-pump work nor any core call can delay the
@@ -624,9 +529,12 @@ def create_app(
             # socket with the internal transport, as the Manager's Halt for a
             # late execution host; the journal's level comes from the pump.
             disk_halt = ExecutionCommandClient(
-                config.execution_run_root,
-                timeout_seconds=min(config.execution_timeout_seconds, 1.0),
-                attribution_transport="internal",
+                manyforge_headless_py.Gateway(
+                    str(config.execution_run_root),
+                    None,
+                    attribution="internal",
+                    connect_limit_s=min(config.execution_timeout_seconds, 1.0),
+                )
             )
             pump = event_pump
             disk_admission = service.admission
@@ -663,17 +571,17 @@ def create_app(
         application_start_id=admission.application_start_id,
         lanes=execution_controls,
     )
-    runner_control_url = getattr(
+    program_status = getattr(
         getattr(service, "program_runner", None),
-        "control_state_websocket_url",
+        "subscribe_status",
         None,
     )
-    if not isinstance(runner_control_url, str):
-        runner_control_url = None
+    if not callable(program_status):
+        program_status = None
     control_state_source = HeadlessControlStateSource(
         service,
         control_ingress,
-        program_runner_websocket_url=runner_control_url,
+        program_status=program_status,
         incident_recorder=getattr(service, "record_client_incident", None),
         # The owned native core raises the ordinary Program-failure alarm from
         # the accepted Run; an injected service keeps the demand-only reader.
@@ -841,6 +749,36 @@ def create_app(
             }
         )
 
+    async def submit_rest_command(
+        command: ExecutionCommandRequestDTO,
+        transport_request: Request,
+        received_monotonic_ns: int | None = None,
+    ):
+        """Submit one REST command; its History row once it is answered
+        (``record_activity`` never waits)."""
+
+        attribution = _trusted_attribution(transport_request, trusted_principal_adapter)
+        try:
+            submission = await control_ingress.submit(
+                command,
+                transport_kind="rest",
+                trusted_principal_id=attribution.principal_id,
+                assurance=attribution.assurance,
+                received_monotonic_ns=received_monotonic_ns,
+            )
+        except Exception as error:
+            service.command_history.control_command(
+                command, error=error, principal_id=attribution.principal_id
+            )
+            raise
+        service.command_history.control_command(
+            command,
+            receipt=submission.receipt,
+            result=submission.result,
+            principal_id=attribution.principal_id,
+        )
+        return submission
+
     async def rest_execution_command(
         *,
         command_kind: str,
@@ -883,13 +821,7 @@ def create_app(
                 "payload": dict(payload),
             }
         )
-        attribution = _trusted_attribution(transport_request, trusted_principal_adapter)
-        submission = await control_ingress.submit(
-            command,
-            transport_kind="rest",
-            trusted_principal_id=attribution.principal_id,
-            assurance=attribution.assurance,
-        )
+        submission = await submit_rest_command(command, transport_request)
         control_state_source.notify_control()
         if submission.receipt.disposition == "rejected" and not (
             isinstance(submission.result, dict) and submission.result.get("ok") is False
@@ -982,7 +914,16 @@ def create_app(
         raw_id = request.headers.get("x-request-id", "")
         request_id = _REQUEST_ID_PATTERN.sub("", raw_id)[:64]
         request.state.request_id = request_id or uuid.uuid4().hex[:16]
-        response = await call_next(request)
+        # The caller History records built while serving it name; the
+        # Composer MCP adapter marks its in-process requests.
+        token = bind_request_caller(
+            request.state.request_id,
+            "mcp" if request.headers.get(TRANSPORT_HEADER) == "mcp" else "http",
+        )
+        try:
+            response = await call_next(request)
+        finally:
+            unbind_request_caller(token)
         response.headers["X-Request-ID"] = request.state.request_id
         return response
 
@@ -1034,7 +975,7 @@ def create_app(
             content={
                 "detail": {
                     "code": error.code,
-                    "details": {},
+                    "details": error.details,
                     "message": str(error),
                     "producer": "headless_api",
                     "request_id": getattr(request.state, "request_id", None),
@@ -1079,6 +1020,22 @@ def create_app(
             response = await headless_error_handler(
                 request,
                 execution_error,
+            )
+            # A refused Stop's row, once its answer is formed.
+            service.command_history.finished(
+                STOP_ROUTE_COMMANDS[recognized_route],
+                "refused",
+                {
+                    "code": execution_error.code,
+                    "message": str(execution_error),
+                    "details": execution_error.details,
+                },
+                {"recognized_route": recognized_route, "reason": reason},
+                caller(
+                    request_key=request_key,
+                    source_label=source_label,
+                    principal_id=attribution.principal_id,
+                ),
             )
         if getattr(request.state, "recognized_stop_close_connection", False):
             response.headers["Connection"] = "close"
@@ -1459,14 +1416,7 @@ def create_app(
             ),
         ] = None,
     ) -> JSONResponse:
-        attribution = _trusted_attribution(request, trusted_principal_adapter)
-        submission = await control_ingress.submit(
-            body,
-            transport_kind="rest",
-            trusted_principal_id=attribution.principal_id,
-            assurance=attribution.assurance,
-            received_monotonic_ns=received_monotonic_ns,
-        )
+        submission = await submit_rest_command(body, request, received_monotonic_ns)
         control_state_source.notify_control()
         return JSONResponse(
             content={
@@ -1481,6 +1431,7 @@ def create_app(
             websocket,
             control_state_source,
             control_ingress,
+            command_history=service.command_history,
         )
 
     @app.get("/api/control/diagnostics")
@@ -1710,14 +1661,10 @@ def create_app(
             [source["source_content_digest"] for source in sources],
         )
 
-    @app.post("/api/manager/deployment-candidates/preview")
-    def manager_deployment_candidate_preview(
-        request: ManagerDeploymentCandidatePreviewRequest,
-    ) -> JSONResponse:
-        start_identity(request.application_start_id)
-        response = service.manager_deployment_candidate_preview(
-            request
-        )
+    def manager_reply(response: dict[str, Any], label: str) -> JSONResponse:
+        """A Manager reply as the route's answer: 200 when it succeeded, else
+        the status of its refusal's code."""
+
         if response.get("ok") is True:
             return JSONResponse(status_code=200, content=response)
         error = response.get("error")
@@ -1725,9 +1672,19 @@ def create_app(
         if not isinstance(code, str) or not code:
             raise HeadlessApiError(
                 "manager_command_response_invalid",
-                "Manager candidate rejection has no stable error code",
+                f"{label} has no stable error code",
             )
         return JSONResponse(status_code=_error_status(code), content=response)
+
+    @app.post("/api/manager/deployment-candidates/preview")
+    def manager_deployment_candidate_preview(
+        request: ManagerDeploymentCandidatePreviewRequest,
+    ) -> JSONResponse:
+        start_identity(request.application_start_id)
+        return manager_reply(
+            service.manager_deployment_candidate_preview(request),
+            "Manager candidate rejection",
+        )
 
     @app.post("/api/program/reference-validation")
     def validate_program_references(request: ProgramReferenceValidationRequest) -> dict[str, Any]:
@@ -1764,17 +1721,9 @@ def create_app(
 
     @app.post("/api/manager/apply")
     def manager_apply(request: ManagerApplyRequest) -> JSONResponse:
-        response = service.manager_apply(admitted(request))
-        if response.get("ok") is True:
-            return JSONResponse(status_code=200, content=response)
-        error = response.get("error")
-        code = error.get("code") if isinstance(error, dict) else None
-        if not isinstance(code, str) or not code:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager rejection has no stable error code",
-            )
-        return JSONResponse(status_code=_error_status(code), content=response)
+        return manager_reply(
+            service.manager_apply(admitted(request)), "Manager rejection"
+        )
 
     @app.get("/api/manager/apply/status")
     def manager_apply_status(
@@ -1788,25 +1737,16 @@ def create_app(
             HeadlessApiError("apply_status_not_found", "Apply status is not known"),
         )
         response = service.manager_apply_status(apply_id, apply_generation)
-        if response.get("ok") is True:
-            if response.get("state") == "succeeded":
-                # Carry Manager's committed publication to the Program runner
-                # after this response: the Apply outcome is already final and
-                # nothing the runner does can change or delay it. Manager's
-                # published source follows its journal, so the runner is woken
-                # only once that source names this Apply (see apply_follower).
-                background.add_task(
-                    service.follow_committed_apply, apply_id, apply_generation
-                )
-            return JSONResponse(status_code=200, content=response)
-        error = response.get("error")
-        code = error.get("code") if isinstance(error, dict) else None
-        if not isinstance(code, str) or not code:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager Apply status rejection has no stable error code",
+        if response.get("ok") is True and response.get("state") == "succeeded":
+            # Carry Manager's committed publication to the Program runner
+            # after this response: the Apply outcome is already final and
+            # nothing the runner does can change or delay it. Manager's
+            # published source follows its journal, so the runner is woken
+            # only once that source names this Apply (see apply_follower).
+            background.add_task(
+                service.follow_committed_apply, apply_id, apply_generation
             )
-        return JSONResponse(status_code=_error_status(code), content=response)
+        return manager_reply(response, "Manager Apply status rejection")
 
     @app.post("/api/manager/apply/acknowledge")
     def manager_apply_acknowledge(
@@ -1814,19 +1754,12 @@ def create_app(
         apply_generation: Annotated[int, Query(ge=1, le=9_007_199_254_740_991)],
         request: ManagerApplyAcknowledgementRequest,
     ) -> JSONResponse:
-        response = service.manager_apply_acknowledge(
-            apply_id, apply_generation, admitted(request).request_context
+        return manager_reply(
+            service.manager_apply_acknowledge(
+                apply_id, apply_generation, admitted(request).request_context
+            ),
+            "Manager Apply acknowledgement rejection",
         )
-        if response.get("ok") is True:
-            return JSONResponse(status_code=200, content=response)
-        error = response.get("error")
-        code = error.get("code") if isinstance(error, dict) else None
-        if not isinstance(code, str) or not code:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager Apply acknowledgement rejection has no stable error code",
-            )
-        return JSONResponse(status_code=_error_status(code), content=response)
 
     @app.post("/api/manager/apply/release-for-new")
     def manager_apply_release_for_new(
@@ -1835,19 +1768,12 @@ def create_app(
         """New: release the fence and claim a failed Apply still holds,
         whatever it changed; New's Apply then empties the cell."""
 
-        response = service.manager_apply_release_for_new(
-            admitted(request, start_value=False).request_context
+        return manager_reply(
+            service.manager_apply_release_for_new(
+                admitted(request, start_value=False).request_context
+            ),
+            "Manager Apply release for New rejection",
         )
-        if response.get("ok") is True:
-            return JSONResponse(status_code=200, content=response)
-        error = response.get("error")
-        code = error.get("code") if isinstance(error, dict) else None
-        if not isinstance(code, str) or not code:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager Apply release for New rejection has no stable error code",
-            )
-        return JSONResponse(status_code=_error_status(code), content=response)
 
     def execution_response(response: dict[str, Any]) -> JSONResponse:
         response = shown(response)
@@ -2256,39 +2182,17 @@ def create_app(
     ) -> dict[str, Any]:
         return service.scene_resource_poses(body)
 
-    @app.get("/api/scene/runtime-owner")
-    def scene_runtime_owner() -> dict[str, Any]:
-        return service.scene_runtime_owner()
-
-    @app.post("/api/scene/runtime-latch")
-    def scene_runtime_latch(body: SceneRuntimeLatchRequest) -> dict[str, Any]:
-        """The Program Runner's between-nodes latch (OD-294); answered once
-        the logical scene shows what it committed, like a Scene commit."""
-
-        return service.scene_runtime_latch_between_nodes(body)
-
     @app.post("/api/scene/transactions")
     def scene_commit(
         body: SceneTransactionRequest,
         request: Request,
     ) -> JSONResponse:
-        response = service.scene_commit(
-            admitted(body), _trusted_attribution(request, trusted_principal_adapter)
+        return manager_reply(
+            service.scene_commit(
+                admitted(body), _trusted_attribution(request, trusted_principal_adapter)
+            ),
+            "scene rejection",
         )
-        if response.get("ok") is True:
-            return JSONResponse(status_code=200, content=response)
-        error = response.get("error")
-        code = error.get("code") if isinstance(error, dict) else None
-        if not isinstance(code, str) or not code:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "scene rejection has no stable error code",
-            )
-        return JSONResponse(status_code=_error_status(code), content=response)
-
-    @app.post("/api/scene/transactions/status")
-    def scene_transaction_status(body: SceneTransactionRequest) -> dict[str, Any]:
-        return service.scene_transaction_status(admitted(body))
 
     @app.get("/api/execution/alarms")
     def alarms(
@@ -2428,6 +2332,14 @@ def create_app(
         Applied Program and reloaded scene revision), recorded by the Program
         Runner as `program_reset_finished` (OD-305)."""
         return service.record_program_reset_outcome(body)
+
+    @app.post("/api/execution/history/scene-changes")
+    def history_scene_change(body: SceneChangeRecordRequest) -> dict[str, Any]:
+        """One scene change the Program Runner made outside a Program node
+        (initial-scene preparation, Program Reset reload, empty-Apply clear),
+        recorded as `scene_change`."""
+        start_identity(body.application_start_id)
+        return service.record_scene_change(body)
 
     return app
 

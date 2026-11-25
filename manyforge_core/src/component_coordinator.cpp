@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <manyforge_core/component_coordinator.hpp>
 #include <pthread.h>
 
@@ -65,6 +66,38 @@ ComponentState without_ages(ComponentState state) {
   state.observed_at_ns = 0;
   for (auto& stream : state.streams) stream.age_ns.reset();
   return state;
+}
+
+/// The UTC clock, read next to the coordinator's clock (memory only).
+std::int64_t utc_now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+/// Stamps the UTC time of a fault's and a stop's `since_ns`: kept from
+/// `previous` (the published state) while it shows the same condition (code
+/// and `since_ns`); otherwise the UTC clock read with `now`, back by the
+/// condition's age.
+void stamp_since_utc(ComponentState& state, const ComponentState* previous, const TimePoint now,
+                     const std::int64_t utc_now) {
+  const auto utc_of = [&](const std::int64_t since_ns) {
+    return std::max<std::int64_t>(utc_now - (now - since_ns), 0);
+  };
+  if (state.fault) {
+    const Fault* before = previous && previous->fault ? &*previous->fault : nullptr;
+    state.fault->since_utc_ns =
+        before && before->code == state.fault->code && before->since_ns == state.fault->since_ns
+            ? before->since_utc_ns
+            : utc_of(state.fault->since_ns);
+  }
+  if (state.stop) {
+    const ComponentStop* before = previous && previous->stop ? &*previous->stop : nullptr;
+    state.stop->since_utc_ns =
+        before && before->code == state.stop->code && before->since_ns == state.stop->since_ns
+            ? before->since_utc_ns
+            : utc_of(state.stop->since_ns);
+  }
 }
 
 bool same_states(const std::vector<ComponentState>& left, const std::vector<ComponentState>& right) {
@@ -231,8 +264,10 @@ Result<ComponentRecoveryPreflight> ComponentCoordinator::RecoveryPreflight(
     }
   }
   const auto now = clock_.now();
+  const auto utc_now = utc_now_ns();
   const auto read = [&](const Row& row) {
     auto state = row.adapter->State(now);
+    stamp_since_utc(state, nullptr, now, utc_now);
     state.component_id = row.component_id;
     state.owner_id = row.owner_id;
     state.role = row.role;
@@ -839,6 +874,7 @@ void ComponentCoordinator::Refresh() {
     }
   }
   const auto now = clock_.now();
+  const auto utc_now = utc_now_ns();
   std::vector<ComponentState> states;
   states.reserve(snapshots.size());
   for (auto& snapshot : snapshots) {
@@ -875,7 +911,13 @@ void ComponentCoordinator::Refresh() {
   }
   {
     std::lock_guard lock(mutex_);
-    if (closing_ || same_states(states, published_)) return;
+    if (closing_) return;
+    for (auto& state : states) {
+      const auto previous = std::find_if(published_.begin(), published_.end(),
+          [&](const auto& row) { return row.component_id == state.component_id; });
+      stamp_since_utc(state, previous == published_.end() ? nullptr : &*previous, now, utc_now);
+    }
+    if (same_states(states, published_)) return;
     published_ = states;
   }
   publish_(states);

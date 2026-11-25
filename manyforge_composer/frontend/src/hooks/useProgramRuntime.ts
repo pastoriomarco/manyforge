@@ -493,6 +493,7 @@ export type ProgramResetExpectation = Pick<
 export interface ProgramResetOptions {
   reloadInitialScene?: boolean;
   resetRobotPosition?: boolean;
+  resetStoredValues?: boolean;
 }
 
 export interface ProgramResetCallOptions extends ProgramResetOptions {
@@ -540,6 +541,7 @@ export function buildProgramResetRequest(
     settlement_evidence_digest: cycle.terminalOrSettlementReference,
     reload_initial_scene: selected.reloadInitialScene ?? false,
     reset_robot_position: selected.resetRobotPosition ?? false,
+    reset_stored_values: selected.resetStoredValues ?? false,
   };
 }
 

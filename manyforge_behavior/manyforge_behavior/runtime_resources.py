@@ -15,7 +15,7 @@ from typing import Final, NoReturn
 
 
 RUNTIME_RESOURCE_BINDING_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_runtime_resource_binding_unavailable"
+    "runtime_resource_binding_unavailable"
 )
 
 

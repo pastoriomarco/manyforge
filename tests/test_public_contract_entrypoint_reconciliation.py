@@ -17,7 +17,7 @@ _GENERATOR = _REPO_ROOT / "scripts" / "regen-public-contracts.py"
 _FRESHNESS_WRAPPER = (
     _REPO_ROOT / "scripts" / "ci" / "check-public-contracts-fresh.sh"
 )
-_UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+_UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 
 
 def _load_generator_module() -> ModuleType:

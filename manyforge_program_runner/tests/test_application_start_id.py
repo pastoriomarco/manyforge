@@ -29,6 +29,7 @@ def test_invalid_or_zero_text_is_refused(text: str) -> None:
 
 def _argv(*extra: str) -> list[str]:
     return [
+        "--program-socket-root", "/run/manyforge/manager",
         "--execution-run-root", "/run/manyforge/execution",
         "--cycle-journal-path", "/var/lib/manyforge/program-cycle.sqlite3",
         *extra,

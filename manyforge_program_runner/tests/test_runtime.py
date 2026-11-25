@@ -7,7 +7,8 @@ import hashlib
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from threading import Barrier, Event, Thread, get_ident
+from threading import Barrier, Event, Lock, Thread, get_ident
+import time
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -72,7 +73,7 @@ from manyforge_program_runner.persistent_keys import (
 from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.program_cycle import ProgramCycleFrameDTO
 from manyforge_headless_api.component_model import run_cycle_facts
-from manyforge_headless_api.cell_admission import CellAdmissionError
+from manyforge_program_runner.cell_admission import CellAdmissionError
 from manyforge_program_runner.bbkey_publication import (
     FAULT_CODE as BBKEY_PUBLICATION_FAULT_CODE,
 )
@@ -240,11 +241,15 @@ class _Headless:
         self.rule_activations: list[tuple[str, bool]] = []
         self.outside_clears: list[tuple[str, str]] = []
         self.output_writes: list[tuple[str, Any]] = []
+        # Node-attempt history batches the runner's background publisher sends.
+        self.node_attempt_batches: list[dict[str, Any]] = []
 
     def apply_tool_payload(self) -> None:
         pass
 
-    def reset_active_tcp(self) -> dict[str, Any]:
+    # The execution gateway's commands (one method per wire command, taking
+    # its request members).
+    def reset_active_tcp(self, members: Mapping[str, Any] | None = None) -> dict[str, Any]:
         # A selected scene reload resets Active TCPs; no robot store is bound here.
         return {"ok": True, "robots": []}
 
@@ -289,7 +294,7 @@ class _Headless:
         assert path == "/api/cell/latch"
         return deepcopy(self.latch)
 
-    def identity(self) -> dict[str, Any]:
+    def identity(self, members: Mapping[str, Any] | None = None) -> dict[str, Any]:
         return {
             "ok": True,
             "identity": {
@@ -301,7 +306,7 @@ class _Headless:
             },
         }
 
-    def targets(self) -> dict[str, Any]:
+    def targets(self, members: Mapping[str, Any] | None = None) -> dict[str, Any]:
         """The execution owner's targets; tests set rows in ``target_components``."""
         return {
             "ok": True,
@@ -311,7 +316,8 @@ class _Headless:
             },
         }
 
-    def register_program_run_capture(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def register_program_run_capture(self, members: Mapping[str, Any]) -> dict[str, Any]:
+        body = members["capture"]
         self.registered_captures.append(deepcopy(dict(body)))
         return {
             "ok": True,
@@ -320,22 +326,34 @@ class _Headless:
             "claim_generation": body["claim_generation"],
         }
 
-    def reset_rule_activation(self) -> dict[str, Any]:
+    def reset_rule_activation(self, members: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self.rule_resets += 1
         return {"ok": True, "command": "reset_rule_activation"}
 
-    def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]:
-        self.rule_activations.append((rule_id, active))
+    def set_rule_active(self, members: Mapping[str, Any]) -> dict[str, Any]:
+        self.rule_activations.append((members["rule_id"], members["active"]))
         return {"ok": True, "command": "set_rule_active"}
 
-    def clear_outside_change(self, component_id: str, signal_name: str) -> dict[str, Any]:
-        self.outside_clears.append((component_id, signal_name))
+    def clear_outside_change(self, members: Mapping[str, Any]) -> dict[str, Any]:
+        self.outside_clears.append(
+            (members["controllable_component_id"], members["signal_name"])
+        )
         return {"ok": True, "command": "clear_outside_change"}
 
-    def set_io_output(self, signal_id: str, value: Any, *, origin: str) -> dict[str, Any]:
-        assert origin == "program"
-        self.output_writes.append((signal_id, value))
+    def set_io_output(self, members: Mapping[str, Any]) -> dict[str, Any]:
+        request = members["request"]
+        assert request["origin"] == "program"
+        self.output_writes.append((request["signal_id"], request["value"]))
         return {"ok": True, "command": "set_io_output", "result": {"outcome": "succeeded"}}
+
+    def record_program_node_attempts(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        """The Historian's answer: every attempt and run event recorded."""
+
+        self.node_attempt_batches.append(dict(batch))
+        return {
+            "schema_version": "manyforge.program_node_attempt_record.v1",
+            "recorded": len(batch["attempts"]) + len(batch["run_events"]),
+        }
 
     def __getattr__(self, name: str):
         if name not in self._PORT_METHODS:
@@ -448,7 +466,7 @@ def test_blocked_readiness_rejects_program_before_claim(
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=headless,  # type: ignore[arg-type]
-        execution_transport=headless,  # type: ignore[arg-type]
+        gateway=headless,  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -519,6 +537,14 @@ class _Snapshot:
         return self._value["run_revision"]
 
     @property
+    def node_status_revision(self) -> int:
+        return self._value["node_status_revision"]
+
+    @property
+    def node_statuses(self) -> dict[str, str]:
+        return dict(self._value["node_statuses"])
+
+    @property
     def operation_failures(self) -> tuple[dict[str, Any], ...]:
         # ProgramRunSnapshot's typed failure rows, as published by to_dict.
         return tuple(deepcopy(self._value.get("operation_failures", [])))
@@ -537,6 +563,7 @@ class _Owner:
         self.reads = 0
         self.attention_refusal: ProgramRunOwnerError | None = None
         self.attention_checks: list[tuple[str, str, str]] = []
+        self.wait_values: dict[str, dict[str, Any]] = {}
 
     def check_motion_attention(
         self, program_run_id: str, node_instance_id: str, request_id: str
@@ -586,6 +613,9 @@ class _Owner:
 
     def take_node_history_events(self, _program_run_id: str):
         return ()
+
+    def wait_observations(self, _program_run_id: str):
+        return self.wait_values
 
     def take_diagnostic(self, _program_run_id: str):
         return None
@@ -953,7 +983,7 @@ def _reconcile_runtime(
             cycle_journal_path=tmp_path / "cycle.sqlite3",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -1158,7 +1188,7 @@ def test_empty_scenario_clear_uses_current_apply_and_not_program_binding(monkeyp
     headless = EmptyHeadless()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=headless, execution_transport=_Headless(), admission_client=IdleAdmission(),
+        headless_client=headless, gateway=_Headless(), admission_client=IdleAdmission(),
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
     calls = []
@@ -1197,7 +1227,7 @@ def test_direct_empty_clear_accepts_bootstrap_and_checks_publication(monkeypatch
     headless = BootstrapHeadless()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=headless, execution_transport=_Headless(), admission_client=IdleAdmission(),
+        headless_client=headless, gateway=_Headless(), admission_client=IdleAdmission(),
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
     def clear(**kwargs):
@@ -1241,7 +1271,7 @@ def test_applied_activation_prepares_scene_while_idle_without_run_claim(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -1316,7 +1346,7 @@ def test_applied_scene_preparation_precedes_run_and_run_never_checks_scene(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -1403,7 +1433,7 @@ def test_immediate_run_after_idle_reset_uses_server_generation_and_exact_program
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=headless, execution_transport=_Headless(), admission_client=admission,
+        headless_client=headless, gateway=_Headless(), admission_client=admission,
         cycle_journal=journal,
     )
     runtime._host.shutdown()
@@ -1516,6 +1546,7 @@ def _carried_object_loss_runtime(
         snapshot, catalog=None
     )
     runtime._carried_object_lost_run_active = False  # noqa: SLF001
+    runtime._carried_object_losses_unusable = False  # noqa: SLF001
     run_ids = tuple(stores) if isinstance(stores, Mapping) else (1,)
     runtime._runtime_controls_lock = Lock()  # noqa: SLF001
     runtime._runtime_controls = {  # noqa: SLF001
@@ -1834,7 +1865,7 @@ def test_run_start_is_refused_before_claim_while_a_robot_has_no_end_effector_tcp
         "presentation": "motion",
         "command": {"tcp_frame": None},
     }
-    runtime._kernel._transport.target_components = [  # noqa: SLF001
+    runtime._kernel._gateway.target_components = [  # noqa: SLF001
         {"controllable_component_id": "lite6_robot", "targets": [motion]},
     ]
     try:
@@ -1848,7 +1879,7 @@ def test_run_start_is_refused_before_claim_while_a_robot_has_no_end_effector_tcp
 
         # With an End-effector TCP the same Run starts.
         motion["command"]["tcp_frame"] = {"component_id": "lite_gripper", "frame_id": "tcp"}
-        runtime._kernel._transport.target_components = [  # noqa: SLF001
+        runtime._kernel._gateway.target_components = [  # noqa: SLF001
             {"controllable_component_id": "lite6_robot", "targets": [motion]},
         ]
         result = runtime.start_run(_start_request(request_id="request.start.2"))
@@ -2077,6 +2108,31 @@ def test_carried_object_lost_invalid_key_is_logged_and_seen(
     assert "not a writable bool key" in caplog.text
 
 
+def test_unusable_last_losses_log_once_per_episode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """OD-381 L4: every mirror message re-reads the last losses; an unusable
+    set is one line per episode, not one per message."""
+
+    store = _CarriedObjectLossStore({"part_lost": _writable_bool_declaration()})
+    runtime, snapshot = _carried_object_loss_runtime((), store)
+    caplog.set_level("INFO", logger="manyforge_program_runner.runtime")
+    snapshot["last_losses"] = ({"loss_event_id": ""},)
+    for _ in range(5):
+        runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+    snapshot["last_losses"] = ()
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+    snapshot["last_losses"] = ({"loss_event_id": ""},)
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "carried-object last losses are not usable",
+        "carried-object last losses are usable again",
+        "carried-object last losses are not usable",
+    ]
+
+
 def test_old_attachment_loss_during_new_run_sets_current_key() -> None:
     prior_loss = _carried_object_last_loss("loss.first-run")
     loss_during_new_run = _carried_object_last_loss("loss.second-run")
@@ -2166,7 +2222,7 @@ def test_scene_preparation_failure_blocks_run_until_idle_reset_converges(
     admission = IdleAdmission()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(),
+        headless_client=_Headless(), gateway=_Headless(),
         admission_client=admission,
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -2259,7 +2315,7 @@ def _terminal_cycle_reset_runtime(
             headless_url="http://headless.test", application_start_id=_A
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -2384,7 +2440,7 @@ def test_reset_publishes_resetting_until_motion_is_terminal(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -2504,7 +2560,7 @@ def test_reset_fails_typed_on_failed_cleanup_and_the_next_reset_retries_it(
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -2568,7 +2624,7 @@ def test_run_does_not_compare_changed_authored_scene(
     admission = _Admission()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(), admission_client=admission,
+        headless_client=_Headless(), gateway=_Headless(), admission_client=admission,
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
     runtime._host.shutdown()
@@ -2583,6 +2639,70 @@ def test_run_does_not_compare_changed_authored_scene(
     assert runtime.cycle_status()["state"] == "running"
     assert len(admission.claims) == 1
     runtime.shutdown()
+
+
+def test_run_status_shows_since_when_nodes_run_and_what_waits_read_in_memory_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    """OD-382 C6: the served run status (v6) names since when each running
+    node runs (stamped when the observer first sees it running) and what
+    each running wait last read; neither reaches the cycle journal."""
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
+        headless_client=_Headless(), gateway=_Headless(),
+        admission_client=_Admission(), cycle_journal=journal,
+    )
+    runtime._host.shutdown()
+    owner = _ObservationOwner()
+    runtime._owner = owner
+    runtime._host = _Host(owner, owner_id=runtime.owner_id)
+    try:
+        runtime.start()
+        runtime.start_run(_start_request())
+        run_id = runtime.cycle_status()["program_run_id"]
+        before = time.time_ns()
+        snapshot = _Snapshot(run_id, owner_id=runtime.owner_id, state="running",
+                             revision=owner.rows[run_id].run_revision + 1)
+        snapshot._value["node_statuses"] = {"root": "running", "wait": "running", "done": "success"}
+        owner.rows[run_id] = snapshot
+        owner.wait_values = {
+            "wait": {"kind": "key", "key": "part_ready", "value": "x" * 300,
+                     "observed_at_utc_ns": 7},
+            "done": {"kind": "gripper", "component_id": "gripper", "state": "moving",
+                     "observed_at_utc_ns": 8},
+        }
+        runtime._observe_run_state(snapshot)  # noqa: SLF001
+        run = runtime.read_run(run_id)
+        assert run["schema_version"] == "manyforge.program_run_status.v6"
+        since = run["node_running_since_utc_ns"]
+        assert set(since) == {"root", "wait"}
+        assert before <= since["root"] == since["wait"] <= time.time_ns()
+        # Only a running wait shows; text is cut to 256 bytes.
+        assert run["node_wait_values"] == {"wait": {
+            "kind": "key", "key": "part_ready", "value": "x" * 256, "observed_at_utc_ns": 7}}
+        assert runtime.cycle_status()["run"]["node_running_since_utc_ns"] == since
+        # A node keeps its stamp while it runs; one that starts later is new.
+        later = _Snapshot(run_id, owner_id=runtime.owner_id, state="running",
+                          revision=snapshot.run_revision + 1)
+        later._value["node_statuses"] = {"root": "running", "wait": "success", "next": "running"}
+        owner.rows[run_id] = later
+        runtime._observe_run_state(later)  # noqa: SLF001
+        runtime._observe_run_state(snapshot)  # noqa: SLF001 - an older one changes nothing
+        again = runtime.read_run(run_id)["node_running_since_utc_ns"]
+        assert set(again) == {"root", "next"} and again["root"] == since["root"]
+        assert again["next"] >= since["root"]
+        assert runtime.read_run(run_id)["node_wait_values"] == {}
+        retained = journal.read_run_snapshot(run_id)
+        assert retained["node_running_since_utc_ns"] == {}
+        assert retained["node_wait_values"] == {}
+    finally:
+        runtime.shutdown()
 
 
 def test_host_start_without_a_result_retains_claim_for_reconciliation(
@@ -2602,7 +2722,7 @@ def test_host_start_without_a_result_retains_claim_for_reconciliation(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -2691,7 +2811,7 @@ def test_repeated_concurrent_run_observation_is_strictly_read_only(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         cycle_journal=journal,
     )
     runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
@@ -2769,7 +2889,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             application_start_id=_A,
         ),
         headless_client=headless,  # type: ignore[arg-type]
-        execution_transport=headless,  # type: ignore[arg-type]
+        gateway=headless,  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -2786,7 +2906,8 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     request = _start_request()
     register = headless.register_program_run_capture
 
-    def register_after_claim(body: Mapping[str, Any]) -> dict[str, Any]:
+    def register_after_claim(members: Mapping[str, Any]) -> dict[str, Any]:
+        body = members["capture"]
         assert host.start_admissions == []
         cycle = runtime._journal.read()
         assert cycle.state == "starting" and cycle.claim is not None
@@ -2794,7 +2915,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
         assert body["schema_version"] == "manyforge.program_run_execution_capture.v2"
         assert "program_runner_owner_epoch" not in body
         assert body["program_run_id"] == cycle.program_run_id
-        return register(body)
+        return register(members)
 
     monkeypatch.setattr(headless, "register_program_run_capture", register_after_claim)
     schedule = host.schedule
@@ -3418,7 +3539,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=(transport := _Headless()),  # type: ignore[arg-type]
+        gateway=(transport := _Headless()),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -3666,7 +3787,7 @@ def test_cycle_status_projects_pending_acquire_as_starting(tmp_path) -> None:
             headless_url="http://headless.test", application_start_id=_A
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -3696,7 +3817,7 @@ def test_key_values_read_projects_the_owner_store_under_the_run_identity(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -3739,7 +3860,7 @@ def test_runtime_controls_are_state_conditioned_and_project_current_controls(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(journal_path),
     )
@@ -3877,7 +3998,7 @@ def test_tree_refinement_never_widens_reconciliation_permissions(tmp_path) -> No
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -3974,7 +4095,7 @@ def test_release_failure_is_visible_and_only_known_rejection_can_resume(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -4061,7 +4182,7 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
             application_start_id=_A,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -4221,7 +4342,7 @@ def test_rejected_and_completed_resets_do_not_consume_inflight_capacity(
             maximum_inflight_commands=2,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -4590,7 +4711,7 @@ def test_draft_applied_mismatch_is_rechecked_without_retained_receipts(
             headless_url="http://headless.test", application_start_id=_A
         ),
         headless_client=headless,  # type: ignore[arg-type]
-        execution_transport=headless,  # type: ignore[arg-type]
+        gateway=headless,  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -4642,7 +4763,7 @@ def test_acquire_success_before_claim_journal_failure_latches_reconciliation(
             headless_url="http://headless.test", application_start_id=_A
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -4684,7 +4805,7 @@ def test_native_acquire_rejection_is_safe_to_recheck_without_retained_receipt(
             headless_url="http://headless.test", application_start_id=_A
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -4712,7 +4833,7 @@ def _running_cycle_runtime(tmp_path) -> tuple[ProgramRuntime, ProgramCycleJourna
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -4742,7 +4863,7 @@ def test_runtime_rejects_a_stale_applied_selection_before_tree_admission(
             application_start_id=_A,
         ),
         headless_client=headless,  # type: ignore[arg-type]
-        execution_transport=headless,  # type: ignore[arg-type]
+        gateway=headless,  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -4783,7 +4904,7 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
             application_start_id=_A,
         ),
         headless_client=headless,  # type: ignore[arg-type]
-        execution_transport=headless,  # type: ignore[arg-type]
+        gateway=headless,  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -4811,7 +4932,7 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
         return admitted
 
     availability = {
-        "schema_version": "manyforge.node_execution_availability.v1",
+        "schema_version": "manyforge.node_execution_availability.v2",
         "environment_digest": runtime._environment.environment_digest,  # noqa: SLF001
         "program_binding_id": _DIGEST_B,
         "required_node_ids": ["timer"],
@@ -4879,7 +5000,7 @@ def test_node_availability_marks_only_native_ports_unavailable_without_owner(
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
     )
     monkeypatch.setattr(
         runtime._kernel,  # noqa: SLF001
@@ -4917,7 +5038,7 @@ def test_runtime_injects_and_closes_the_focused_simulation_owner() -> None:
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         simulation_control=simulation,  # type: ignore[arg-type]
     )
 
@@ -4937,7 +5058,7 @@ def test_runtime_injects_and_closes_the_program_snapshot_source() -> None:
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=headless,  # type: ignore[arg-type]
-        execution_transport=headless,  # type: ignore[arg-type]
+        gateway=headless,  # type: ignore[arg-type]
         model_transport=model,  # type: ignore[arg-type]
         snapshot_source=snapshot,  # type: ignore[arg-type]
     )
@@ -5151,7 +5272,7 @@ def test_lifecycle_failure_before_or_after_claim_is_honest_and_resettable(monkey
     admission = _Admission()
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-                             headless_client=headless, execution_transport=_Headless(),
+                             headless_client=headless, gateway=_Headless(),
                              admission_client=admission, cycle_journal=journal)
     runtime._host.shutdown()
     owner = _ObservationOwner()
@@ -5211,7 +5332,7 @@ def test_scene_preparation_refuses_not_ready_but_not_a_moved_generation(monkeypa
     admission = ObservedAdmission()
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-                             headless_client=_Headless(), execution_transport=_Headless(),
+                             headless_client=_Headless(), gateway=_Headless(),
                              admission_client=admission, cycle_journal=journal)
     prepared: list[str] = []
     def scene_effect(**kwargs):
@@ -5262,7 +5383,7 @@ def test_unknown_host_start_keeps_claim_and_unresolved_request_without_resending
     headless, admission = _Headless(), _Admission()
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-                             headless_client=headless, execution_transport=headless,
+                             headless_client=headless, gateway=headless,
                              admission_client=admission, cycle_journal=journal)
     runtime._host.shutdown()
     owner = _ObservationOwner()
@@ -5374,7 +5495,7 @@ def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admiss
     }
     headless = _SimulationLaneHeadless(graph)
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=headless, execution_transport=headless,
+        headless_client=headless, gateway=headless,
         simulation_control=simulation, admission_client=admission, cycle_journal=journal)
     return runtime, headless, binding
 
@@ -6095,7 +6216,7 @@ def test_liveness_cycle_projection_keeps_one_snapshot_across_reset(monkeypatch, 
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(),
+        headless_client=_Headless(), gateway=_Headless(),
         admission_client=Admission(), cycle_journal=journal,
     )
     effect_entered, release_effect = Event(), Event()
@@ -6186,7 +6307,7 @@ def test_liveness_projection_answers_while_the_writer_and_a_runner_command_are_h
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(),
+        headless_client=_Headless(), gateway=_Headless(),
         admission_client=Admission(), cycle_journal=journal,
     )
     receiver = object.__new__(ProgramRunnerLivenessReceiver)
@@ -6276,8 +6397,8 @@ def test_reset_position_is_read_only_where_it_is_consumed(
 
     runtime, _owner = _running_control_runtime(monkeypatch, tmp_path)
     reads: list[int] = []
-    runtime._execution_transport.reset_robot_position_capability = lambda: (  # noqa: SLF001
-        reads.append(1) or {"reset_robot_position": {"available": True, "reason": None}})
+    runtime._gateway.reset_robot_position_capability = lambda _members=None: (  # noqa: SLF001
+        reads.append(1) or {"ok": True, "reset_robot_position": {"available": True, "reason": None}})
     status = runtime.cycle_status()
     assert len(reads) == 1
     assert status["reset_robot_position"] == {"available": True, "reason": None}
@@ -6301,7 +6422,7 @@ def _running_control_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path):
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -6312,6 +6433,34 @@ def _running_control_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path):
     runtime.start()
     runtime.start_run(_start_request())
     return runtime, owner
+
+
+def test_a_typed_owner_refusal_of_resume_keeps_its_code_and_details(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A selected Resume's typed owner refusal reaches the caller with its
+    catalog code and details, not the generic control rejection."""
+
+    runtime, _owner = _running_control_runtime(monkeypatch, tmp_path)
+
+    def refused(*_args, **_kwargs):
+        raise ProgramRunOwnerError(
+            "selected_owner_assessment_unavailable",
+            code="selected_owner_assessment_unavailable",
+            details={"node_instance_id": "move.1"},
+        )
+
+    runtime._host.resume_motion = refused  # type: ignore[method-assign]  # noqa: SLF001
+    try:
+        with pytest.raises(ProgramRunnerError) as rejected:
+            runtime.resume_motion(1, ProgramSelectionResumeRequest.model_validate({
+                "request_key": _key("typed.motion-resume"), "source_label": "operator_ui",
+                "program_run_id": 1, "expected_hold_revision": 0, "group_ids": ["arm"],
+            }))
+        assert rejected.value.code == "selected_owner_assessment_unavailable"
+        assert rejected.value.details == {"node_instance_id": "move.1"}
+    finally:
+        runtime.shutdown()
 
 
 def test_a_runner_command_meeting_another_is_refused_at_once_and_never_runs_later(
@@ -6459,7 +6608,7 @@ def test_execute_just_before_a_reset_marks_resetting_is_refused(
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(),
+        headless_client=_Headless(), gateway=_Headless(),
         admission_client=Admission(), cycle_journal=journal,
     )
     runtime.start()
@@ -6532,7 +6681,7 @@ def test_shutdown_writes_the_final_cycle_row_and_leaves_no_wal(tmp_path):
     journal = ProgramCycleJournal(path)
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(),
+        headless_client=_Headless(), gateway=_Headless(),
         admission_client=_Admission(), cycle_journal=journal,
     )
     failure = {"code": "program_scene_preparation_failed", "message": "Scene needs reload"}
@@ -6565,7 +6714,7 @@ def test_reset_selectors_order_and_plain_preservation(monkeypatch, tmp_path, idl
     admission = Admission()
     headless = _Headless()
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-                             headless_client=headless, execution_transport=_Headless(),
+                             headless_client=headless, gateway=_Headless(),
                              admission_client=admission, cycle_journal=journal)
     events = []
     def effect(name):
@@ -6607,7 +6756,7 @@ def test_position_reset_refuses_before_scene_effects(monkeypatch, tmp_path, idle
     reference = None if idle else _retain_terminal_cycle(journal, _program_cycle_claim())
     admission = _Admission()
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-                             headless_client=_Headless(), execution_transport=_Headless(),
+                             headless_client=_Headless(), gateway=_Headless(),
                              admission_client=admission, cycle_journal=journal)
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: pytest.fail("refused position Reset touched Scene"))
     runtime.start()
@@ -6645,13 +6794,14 @@ def test_disk_reason_refuses_position_reset_up_front_and_leaves_reset_without_it
     transport = _Headless()
     disk_reason = "reset_position_disk_cannot_keep_records"
     condition = {"active": True}
-    transport.reset_robot_position_capability = lambda: {
+    transport.reset_robot_position_capability = lambda _members=None: {
+        "ok": True,
         "reset_robot_position": (
             {"available": False, "reason": disk_reason} if condition["active"]
             else {"available": True, "reason": None}
         )}
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-                             headless_client=_Headless(), execution_transport=transport,
+                             headless_client=_Headless(), gateway=transport,
                              admission_client=admission, cycle_journal=journal)
     scene_calls = []
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: scene_calls.append("scene"))
@@ -6712,7 +6862,7 @@ def test_idle_reload_without_applied_scenario_is_refused_before_any_effect(monke
     admission = Admission()
     headless = EmptyCell()
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-                             headless_client=headless, execution_transport=_Headless(),
+                             headless_client=headless, gateway=_Headless(),
                              admission_client=admission, cycle_journal=journal)
     scenes = []
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: scenes.append("scene"))
@@ -6742,7 +6892,8 @@ def test_idle_reload_without_applied_scenario_is_refused_before_any_effect(monke
         headless.loaded = True
         result = runtime.reset_cycle(request.model_copy(update={"request_key": _key("reset.loaded")}))
         assert result["idle_cycle_generation"] == 2
-        assert scenes == ["keys", "scene"]
+        # Reload alone keeps stored values (OD-393).
+        assert scenes == ["scene"]
         assert journal.read().state == "idle_after_reset"
         assert len(admission.claims) == 1 and len(admission.releases) == 1
     finally:
@@ -6759,7 +6910,7 @@ def test_selected_reset_failure_retains_phase_and_original_options(monkeypatch, 
             return {"admission_generation": 1, "authoring_allowed": True}
     admission = Admission()
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-                             headless_client=_Headless(), execution_transport=_Headless(),
+                             headless_client=_Headless(), gateway=_Headless(),
                              admission_client=admission, cycle_journal=journal)
     events = []
     should_fail = True
@@ -6813,7 +6964,7 @@ def test_plain_idle_reset_preserves_scene_failure_without_observation(monkeypatc
     journal.record_scene_preparation_failure(expected_generation=1, failure=failure)
     headless = _Headless()
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-                             headless_client=headless, execution_transport=_Headless(),
+                             headless_client=headless, gateway=_Headless(),
                              admission_client=_Admission(), cycle_journal=journal)
     runtime.start()
     request = ProgramCycleResetRequest.model_validate({
@@ -6854,7 +7005,7 @@ def test_idle_reset_unknown_claim_outcome_retains_exact_intent_without_resend(mo
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     admission = Admission()
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(), admission_client=admission, cycle_journal=journal)
+        headless_client=_Headless(), gateway=_Headless(), admission_client=admission, cycle_journal=journal)
     effects = []
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: effects.append("scene"))
     runtime.start()
@@ -6922,7 +7073,7 @@ def _refused_idle_reset(monkeypatch, tmp_path):
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     admission = _RefusingResetAdmission(journal)
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(), admission_client=admission, cycle_journal=journal)
+        headless_client=_Headless(), gateway=_Headless(), admission_client=admission, cycle_journal=journal)
     effects = []
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda request, _auth: effects.append(request.request_key))
     writes = []
@@ -7008,7 +7159,7 @@ def test_position_only_idle_reset_preserves_prior_scene_failure_until_selected_r
     original = {"code": "program_scene_preparation_failed", "message": "original Scene failure"}
     journal.record_scene_preparation_failure(expected_generation=1, failure=original)
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(), admission_client=Admission(), cycle_journal=journal)
+        headless_client=_Headless(), gateway=_Headless(), admission_client=Admission(), cycle_journal=journal)
     scene_calls = []
     monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: None)
     def position(*_args):
@@ -7047,7 +7198,7 @@ def test_completed_reload_clears_prior_scene_fault_before_later_position_failure
     original = {"code": "program_scene_preparation_failed", "message": "Scene needs reload"}
     journal.record_scene_preparation_failure(expected_generation=1, failure=original)
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(), admission_client=Admission(), cycle_journal=journal)
+        headless_client=_Headless(), gateway=_Headless(), admission_client=Admission(), cycle_journal=journal)
     monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: None)
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: None)
     def position(*_args):
@@ -7070,18 +7221,18 @@ def test_completed_reload_clears_prior_scene_fault_before_later_position_failure
 
 def test_private_heartbeat_never_reads_position_capability_but_public_status_does(tmp_path):
     transport = _Headless()
-    def blocked_capability():
+    def blocked_capability(_members=None):
         raise AssertionError("Private heartbeat called the capability port")
     transport.reset_robot_position_capability = blocked_capability
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=transport, admission_client=_Admission(),
+        headless_client=_Headless(), gateway=transport, admission_client=_Admission(),
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"))
     runtime.start()
     reads = []
     try:
         assert runtime._current_cycle_status_projection()["accepted_reset"] is None
-        transport.reset_robot_position_capability = lambda: reads.append("current") or {
-            "reset_robot_position": {"available": True, "reason": None}}
+        transport.reset_robot_position_capability = lambda _members=None: reads.append("current") or {
+            "ok": True, "reset_robot_position": {"available": True, "reason": None}}
         assert runtime.cycle_status()["reset_robot_position"] == {"available": True, "reason": None}
         assert reads == ["current"]
     finally:
@@ -7104,7 +7255,7 @@ def test_selected_reload_after_proven_never_started_run_uses_reset_claim(monkeyp
         start_settlement=None if invalid == "missing" else settlement)
     admission = Admission()
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(), admission_client=admission, cycle_journal=journal)
+        headless_client=_Headless(), gateway=_Headless(), admission_client=admission, cycle_journal=journal)
     effects = []
     def scene(_request, authorization):
         assert journal.read().program_run_id == 61
@@ -7135,25 +7286,26 @@ def test_selected_reload_after_proven_never_started_run_uses_reset_claim(monkeyp
 
 @pytest.mark.parametrize("effect_disposition", ["known_no_effect", "unknown", None])
 def test_native_position_errors_preserve_known_vs_unknown_effect_policy(monkeypatch, tmp_path, effect_disposition):
-    from manyforge_headless_api.native import HeadlessApiError
     class Admission(_Admission):
         def get(self):
             return {"admission_generation": 1, "authoring_allowed": True}
     transport = _Headless()
     identity = {"application_start_id": "3f9a00000000002a", "active_publication_generation": 3,
                 "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B}
-    transport.reset_robot_position_capability = lambda: {
-        "reset_robot_position": {"available": True, "reason": None}, "identity": {**identity, "scene_revision": "ignored"}}
+    transport.reset_robot_position_capability = lambda _members=None: {
+        "ok": True, "reset_robot_position": {"available": True, "reason": None},
+        "identity": {**identity, "scene_revision": "ignored"}}
     effects = []
-    def position(body):
-        effects.append(body)
-        raise HeadlessApiError("position_failed", "Native position failure",
-            details={} if effect_disposition is None else {"effect_disposition": effect_disposition})
+    def position(members):
+        effects.append(members)
+        # The host's refusal reply.
+        return {"ok": False, "error": {"code": "position_failed", "message": "Native position failure",
+            "details": {} if effect_disposition is None else {"effect_disposition": effect_disposition}}}
     transport.reset_robot_position = position
     admission = Admission()
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=transport, admission_client=admission, cycle_journal=journal)
+        headless_client=_Headless(), gateway=transport, admission_client=admission, cycle_journal=journal)
     runtime.start()
     request = ProgramCycleResetRequest.model_validate({"request_key": _key("reset.position"),
         "source_label": "operator_ui", "program_run_id": None,
@@ -7448,6 +7600,12 @@ def _run_end_runtime(headless: _Headless) -> ProgramRuntime:
     runtime._kernel = KernelClient(headless)  # type: ignore[arg-type]  # noqa: SLF001
     runtime._journal = None  # noqa: SLF001
     runtime._run_ends = {}  # noqa: SLF001
+    runtime._run_finished_event_id = None  # noqa: SLF001
+    runtime._run_finished_event_lock = Lock()  # noqa: SLF001
+    runtime.run_events = []  # type: ignore[attr-defined]
+    runtime._node_attempts = SimpleNamespace(  # noqa: SLF001
+        submit_run_event=runtime.run_events.append,  # type: ignore[attr-defined]
+    )
     return runtime
 
 
@@ -7466,6 +7624,12 @@ def test_a_run_that_ends_while_the_cell_is_latched_ends_by_a_cell_fault() -> Non
     expected = {"end_reason": "cell_fault", "details": {"component_id": "robot.1"}}
     assert runtime._project_run(_terminal("failed", failed))["run_end"] == expected  # noqa: SLF001
     assert headless.rule_resets == 1
+    # History's one end event names the cell fault (OD-381 P2).
+    [finished] = runtime.run_events  # type: ignore[attr-defined]
+    assert (finished["event"], finished["outcome"], finished["facts"]) == (
+        "program_run_finished", "failed",
+        {"end_reason": "cell_fault", "component_id": "robot.1"})
+    assert finished["error"]["code"] == "program_tree_failed"
 
 
 @pytest.mark.parametrize(("state", "run_end"), [
@@ -7499,7 +7663,7 @@ def test_start_refuses_a_set_rule_active_naming_an_unknown_rule(monkeypatch, tmp
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=headless,  # type: ignore[arg-type]
-        execution_transport=headless,  # type: ignore[arg-type]
+        gateway=headless,  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -7708,7 +7872,7 @@ def test_reset_replays_unknown_cycle_acquire_once_per_press(monkeypatch, tmp_pat
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -7796,7 +7960,7 @@ def test_reset_settles_unknown_run_release_from_receipt_before_any_resend(
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -7880,7 +8044,7 @@ def test_no_run_reset_settles_unknown_reset_claim_exchange(monkeypatch, tmp_path
     admission = Admission()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(),
+        headless_client=_Headless(), gateway=_Headless(),
         admission_client=admission, cycle_journal=journal,
     )
     effects = []
@@ -7948,7 +8112,7 @@ def test_mock_position_failure_after_possible_effect_is_retried_by_reset(monkeyp
     admission = Admission()
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(),
+        headless_client=_Headless(), gateway=_Headless(),
         admission_client=admission, cycle_journal=journal,
     )
     monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: None)
@@ -8164,7 +8328,7 @@ def test_load_collects_once_while_idle_and_holding_the_runner(monkeypatch, tmp_p
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=IdleAdmission(),  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -8195,7 +8359,7 @@ def test_load_collects_once_while_idle_and_holding_the_runner(monkeypatch, tmp_p
 def test_idle_reset_collects_once_holding_the_runner(monkeypatch, tmp_path) -> None:
     runtime = ProgramRuntime(
         ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
-        headless_client=_Headless(), execution_transport=_Headless(),  # type: ignore[arg-type]
+        headless_client=_Headless(), gateway=_Headless(),  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / "cycle.sqlite3"),
     )
@@ -8483,3 +8647,76 @@ def test_the_end_of_a_row_follows_the_codes_of_the_contract() -> None:
     assert end(RuntimeError("boom")) == {
         "outcome": "unknown", "code": "program_runtime_control_outcome_unknown",
         "details": {"command_kind": "reset", "cause_code": "RuntimeError"}}
+
+
+@pytest.mark.parametrize(
+    ("state", "run_end", "error", "facts"),
+    [
+        ("succeeded", {"end_reason": "completed", "details": {}}, None,
+         {"run_revision": 2, "end_reason": "completed"}),
+        ("failed", {"end_reason": "failed", "details": {
+            "error": {"code": "motion_plan_failed", "message": "No path"},
+            "node_instance_id": "pick_1"}},
+         {"code": "motion_plan_failed", "message": "No path", "details": None},
+         {"run_revision": 2, "end_reason": "failed", "node_instance_id": "pick_1"}),
+        ("stopped", {"end_reason": "stopped", "details": {
+            "stopped_by": "rule", "rule_id": "door_open"}}, None,
+         {"run_revision": 2, "end_reason": "stopped", "stopped_by": "rule",
+          "rule_id": "door_open"}),
+        # The internal Forced Program End (no `run_end` from the fake host).
+        ("stopped", None, None, {"run_revision": 2}),
+    ],
+)
+def test_each_run_has_one_start_and_one_end_event_for_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, state, run_end, error, facts
+) -> None:
+    """OD-381 P2: Execute records the run's start; every end state records
+    one end, stamped when the Runner observes it; a repeated terminal
+    observation records nothing more."""
+
+    runtime, _journal, _admission, _owner, _host = _terminal_cycle_reset_runtime(
+        monkeypatch, tmp_path, finish_cycle=False
+    )
+    events: list[dict[str, Any]] = []
+    runtime._node_attempts = SimpleNamespace(  # noqa: SLF001
+        submit=lambda _facts: None, submit_run_event=events.append,
+        close=lambda: None, health=lambda: {},
+    )
+    try:
+        before_ns = time.monotonic_ns()
+        runtime.start_run(_start_request())
+        # The run's audit events go to History too (P3).
+        runtime._controls(1).audit_value(  # noqa: SLF001
+            "program_node_preempted", node_instance_id="pick_1", node_attempt_id=1)
+        if run_end is None:
+            runtime._stop_for_bbkey_publication_fault(1)  # noqa: SLF001
+        else:
+            terminal = _Snapshot(1, owner_id=runtime.owner_id, state=state, revision=2)
+            terminal._value.update(  # noqa: SLF001
+                run_end=run_end,
+                reason_code=None if error is None else error["code"],
+                message="" if error is None else error["message"],
+            )
+            runtime._record_terminal_snapshot(terminal.to_dict())  # noqa: SLF001
+            runtime._record_terminal_snapshot(terminal.to_dict())  # noqa: SLF001
+        after_ns = time.monotonic_ns()
+    finally:
+        runtime.shutdown()
+    assert [event["event"] for event in events] == [
+        "program_run_started", "program_node_preempted", "program_run_finished"]
+    started, audit, finished = events
+    assert (audit["program_run_id"], audit["outcome"], audit["facts"]) == (
+        1, "recorded", {"event_revision": 1, "node_instance_id": "pick_1", "node_attempt_id": 1})
+    assert started["program_run_id"] == 1 and started["outcome"] == "started"
+    assert started["error"] is None
+    assert started["facts"] == {
+        "scenario_id": "scenario.1", "program_revision": _DIGEST_A,
+        "applied_record_digest": _DIGEST_B, "program_binding_id": _DIGEST_B,
+        "request_key": _key("request.start.1"), "source_label": "operator_ui",
+    }
+    assert (finished["program_run_id"], finished["outcome"]) == (1, state)
+    assert finished["error"] == error
+    assert finished["facts"] == facts
+    for event in events:
+        assert before_ns <= int(event["occurred_at_ns"]) <= after_ns
+        assert event["occurred_at_wall"].endswith("+00:00")

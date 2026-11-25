@@ -7,7 +7,9 @@ from dataclasses import replace
 from pathlib import Path
 import signal
 import socket
+import threading
 import subprocess
+import sys
 
 from fastapi.testclient import TestClient
 import pytest
@@ -127,7 +129,15 @@ def test_native_commands_start_only_the_manager_with_the_ordered_process_list(
         config.execution_run_root
     )
     assert "--port 9010" in " ".join(headless)
-    assert "--port 9011" in " ".join(runner)
+    # The runner serves its command and status sockets in the Manager run
+    # root; Headless reaches them there.
+    assert "--port" not in runner
+    assert runner[runner.index("--program-socket-root") + 1] == str(
+        config.manager_run_root
+    )
+    assert headless[headless.index("--program-runner-socket-root") + 1] == str(
+        config.manager_run_root
+    )
     assert runner[runner.index("--snapshot-url") + 1] == (
         "http://127.0.0.1:9000/api/scene/snapshot/render"
     )
@@ -516,6 +526,101 @@ def test_an_application_process_exit_ends_the_start_with_a_typed_failure(
     assert "status 72" in raised.value.status.last_failure.detail
 
 
+def test_the_run_end_records_the_managers_application_end_and_signal(
+    tmp_path: Path, configuration_factory, monkeypatch, journald
+):
+    config, launcher, _spawned = _resident_launcher(
+        tmp_path, configuration_factory(), monkeypatch, [_Manager(-6), _Manager(0)]
+    )
+    end = {
+        "schema_version": "manyforge.application_end.v1",
+        "ended_by": "process_exit",
+        "process": {"role": "headless", "pid": 77, "exit_status": None, "signal": 11,
+                    "core_dumped": False},
+        "ended_at_wall": "2026-11-24T10:15:30.123Z",
+    }
+    original_wait = launcher._wait_on_manager
+
+    def wait_and_record(*args, **kwargs):
+        # The Manager writes its record before it exits.
+        (config.manager_run_root / "application-end.json").write_text(json.dumps(end))
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(launcher, "_wait_on_manager", wait_and_record)
+    with pytest.raises(LauncherError):
+        launcher.start()
+    first_run = json.loads((config.current_root / "session.json").read_text(encoding="utf-8"))
+    assert first_run["schema_version"] == "manyforge.workbench_session.v3"
+    assert first_run["application_end"] == end
+    assert first_run["manager_exit"] == {"exit_status": None, "signal": 6}
+    monkeypatch.setattr(launcher, "_wait_on_manager", original_wait)
+    launcher.start()
+    report = json.loads((config.current_root / "session.json").read_text(encoding="utf-8"))["previous_session"]
+    assert report["schema_version"] == "manyforge.workbench_previous_session.v4"
+    assert report["application_end"] == end
+    assert report["started_at_wall"] == first_run["started_at_wall"]
+
+
+def test_a_session_of_an_older_build_is_reported_as_archived_at_the_upgrade(
+    tmp_path: Path, configuration_factory, monkeypatch, journald
+):
+    config, launcher, _spawned = _resident_launcher(
+        tmp_path, configuration_factory(), monkeypatch, [_Manager(0), _Manager(0)]
+    )
+    launcher.start()
+    path = config.current_root / "session.json"
+    first_run = json.loads(path.read_text(encoding="utf-8"))
+    del first_run["application_end"], first_run["manager_exit"]
+    path.write_text(json.dumps(dict(first_run, schema_version="manyforge.workbench_session.v2")))
+    launcher.start()
+    report = json.loads(path.read_text(encoding="utf-8"))["previous_session"]
+    assert report["archive_relative_path"] == "previous-runs/" + report["session_id"]
+    assert report["archived_older_marker"] == "manyforge.workbench_session.v2"
+    assert report["shutdown"] == "unknown"
+    assert (" It ran an older build (marker manyforge.workbench_session.v2) and was archived to "
+            f"previous-runs/{report['session_id']} at the upgrade.") in report["message"]
+
+
+def test_native_python_processes_start_with_faulthandler_and_motion_traces_below_the_run(
+    tmp_path: Path, journald, monkeypatch
+):
+    monkeypatch.delenv("MANYFORGE_MOTION_TRACE_DIR", raising=False)
+    config = _config(tmp_path)
+    manager, processes = native_commands(config)
+    for process in processes:
+        argv = _unwrapped(process)
+        assert argv[1:5] == ("-X", "faulthandler", "-m", f"manyforge_{'headless_api' if process.role == 'headless' else process.role}")
+    # The execution host writes the traces and Headless reads them: both
+    # inherit the Manager's environment.
+    assert manager.environment["MANYFORGE_MOTION_TRACE_DIR"] == str(
+        config.current_root / "motion-traces")
+    monkeypatch.setenv("MANYFORGE_MOTION_TRACE_DIR", "")
+    assert native_commands(config)[0].environment["MANYFORGE_MOTION_TRACE_DIR"] == ""
+
+
+def test_the_launcher_starts_the_manager_with_core_dumps_off(tmp_path: Path):
+    from manyforge_operator.application_processes import parent_death_preexec
+
+    completed = subprocess.run(
+        ["/bin/sh", "-c", "ulimit -c"], capture_output=True, text=True, check=True,
+        preexec_fn=parent_death_preexec())
+    assert completed.stdout == "0\n"
+
+
+def test_the_launcher_starts_the_manager_with_the_site_core_dump_limit(tmp_path: Path):
+    import resource
+    from manyforge_operator.application_processes import parent_death_preexec
+
+    limit = 1_048_576
+    _soft, hard = resource.getrlimit(resource.RLIMIT_CORE)
+    completed = subprocess.run(
+        [sys.executable, "-c", "import resource; print(*resource.getrlimit(resource.RLIMIT_CORE))"],
+        capture_output=True, text=True, check=True, preexec_fn=parent_death_preexec(limit))
+    # Only the soft value changes, and never above the hard limit.
+    expected = limit if hard == resource.RLIM_INFINITY else min(limit, hard)
+    assert completed.stdout == f"{expected} {hard}\n"
+
+
 def test_a_signal_to_the_resident_launcher_asks_the_manager_to_stop(
     tmp_path: Path, configuration_factory, monkeypatch, journald
 ):
@@ -584,6 +689,7 @@ def test_an_incomplete_stop_is_unknown_and_reported_at_the_next_start(
         "its log names the step")
     first_run = json.loads((config.current_root / "session.json").read_text(encoding="utf-8"))
     assert first_run["disposition"] == "stopped" and first_run["shutdown"] == "unknown"
+    assert first_run["manager_exit"] == {"exit_status": MANAGER_STOP_INCOMPLETE, "signal": None}
 
     assert launcher.start().last_failure is None
     second_run = json.loads((config.current_root / "session.json").read_text(encoding="utf-8"))
@@ -850,6 +956,34 @@ def test_state_store_rejects_a_symlink_status_record_without_following_it(
     assert outside.read_text(encoding="utf-8") == "unchanged\n"
 
 
+def test_state_store_refuses_an_earlier_record_format_with_guidance(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    CellInstanceLayout.open_or_create(
+        cell_id=config.cell_id,
+        cell_root=config.instance_root,
+        install_root=config.install_root,
+    )
+    store = _StateStore(
+        root=config.instance_root / "operator",
+        lock_root=config.instance_root / "operator",
+    )
+    earlier = '{"schema_version":"manyforge.native_operator_instance.v2"}\n'
+    store.record_path.write_text(earlier, encoding="utf-8")
+    store.record_path.chmod(0o600)
+
+    with pytest.raises(LauncherError) as raised:
+        store.read()
+
+    assert raised.value.code == "status_record_invalid"
+    message = str(raised.value)
+    assert "manyforge.native_operator_instance.v2" in message
+    assert "not read or converted" in message
+    assert "new instance" in message
+    assert store.record_path.read_text(encoding="utf-8") == earlier
+
+
 def test_state_store_lock_never_recreates_a_missing_typed_run_root(
     tmp_path: Path,
 ) -> None:
@@ -948,11 +1082,12 @@ def test_readiness_uses_local_bind_addresses_for_publicly_advertised_stack(
 
     def response(url: str):
         urls.append(url)
-        if ":9011/" in url:
-            return {"started": True, "closed": False, "owner_id": "program"}
         return {"status": "ready", "headless_projection_ready": True, "owner_id": "owner"}
 
     launcher._response = response
+    launcher._program_runner_health = lambda: {
+        "started": True, "closed": False, "owner_id": "program"
+    }
     ready, rows, reason = launcher._readiness(configuration_factory())
 
     assert ready is True
@@ -961,9 +1096,62 @@ def test_readiness_uses_local_bind_addresses_for_publicly_advertised_stack(
     assert [row.component_id for row in rows] == ["headless", "program_runner", "composer"]
     assert urls == [
         "http://127.0.0.1:9010/api/health",
-        "http://127.0.0.1:9011/api/program/health",
         "http://127.0.0.1:9000/api/health",
     ]
+
+
+def test_readiness_reads_the_program_runner_over_its_command_socket(tmp_path: Path):
+    import manyforge_headless_py as core
+
+    launcher = NativeLauncher(_config(tmp_path))
+    root = launcher.config.manager_run_root
+    root.mkdir(parents=True, mode=0o700)
+    with pytest.raises(ValueError, match="program_runner_unavailable"):
+        launcher._program_runner_health()
+    server = core.ProgramCommandServer(str(root))
+    server.start()
+    try:
+        answer = threading.Thread(
+            target=lambda: server.reply(
+                *(lambda token, request: (
+                    token,
+                    {"ok": True, "value": {"started": True, "closed": False,
+                                           "seen": request}},
+                ))(*server.next(10.0))
+            )
+        )
+        answer.start()
+        assert launcher._program_runner_health() == {
+            "started": True,
+            "closed": False,
+            "seen": {"command": "health", "request": {}},
+        }
+        answer.join()
+    finally:
+        server.close()
+
+
+def test_the_program_runner_probe_ends_within_its_two_seconds(tmp_path: Path):
+    """As the former HTTP probe (2 s): a runner that never answers is
+    unavailable, not a readiness read that waits on."""
+
+    import time
+
+    import manyforge_headless_py as core
+
+    launcher = NativeLauncher(_config(tmp_path))
+    root = launcher.config.manager_run_root
+    root.mkdir(parents=True, mode=0o700)
+    server = core.ProgramCommandServer(str(root))
+    server.start()
+    try:
+        started = time.monotonic()
+        with pytest.raises(ValueError, match="program_runner_unavailable"):
+            launcher._program_runner_health()
+        assert 2.0 <= time.monotonic() - started < 10.0
+        assert server.next(10.0) is not None
+    finally:
+        server.close()
 
 
 @pytest.mark.parametrize("cat_present,socket_present", [(False, True), (True, False)])

@@ -9,17 +9,21 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from itertools import count
 import hashlib
+import json
 import logging
+import math
 from pathlib import Path
 import re
 import sqlite3
 from threading import Event, Lock, RLock, Thread, current_thread, get_ident, local
 import time
+import traceback
 from typing import Any, Final, NoReturn
 import unicodedata
 from urllib.parse import urlsplit
 
 import httpx
+import manyforge_headless_py as core
 import rfc8785
 
 from manyforge_behavior.assistant_program_port import (
@@ -32,7 +36,7 @@ from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
 )
 from manyforge_behavior.failure_details import exception_failure_details
-from manyforge_behavior.kernel_client import KernelClient, PushedOperationTable
+from manyforge_behavior.kernel_client import ExecutionCommandError, KernelClient
 from manyforge_behavior.node_availability import (
     AvailabilityFact,
     project_node_execution_availability,
@@ -76,6 +80,7 @@ from manyforge_behavior.program_run_owner import (
 )
 from manyforge_behavior.program_runtime import NodeInputProposalError
 from manyforge_behavior.recovery import is_non_moving_recovery, observed_state_refusal
+from manyforge_behavior.run_sender import RunSender
 from manyforge_behavior.request_keys import (
     RUNNER_KEYS,
     Part,
@@ -91,6 +96,7 @@ from manyforge_behavior.program_scheduling import (
 )
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.internal_http import INTERNAL_HTTP_CLIENT_LIMITS
+from manyforge_headless_api.native import DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS
 from manyforge_headless_api.program_cycle import (
     MAXIMUM_ENDED_COMMAND_ROWS,
     PROGRAM_COMMAND_REPLY_SCHEMA,
@@ -100,7 +106,6 @@ from manyforge_headless_api.component_model import (
     run_cycle_facts,
 )
 from manyforge_behavior.program_frame_facts import ProgramFrameFacts
-from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.models import (
     ManualProgramHandover,
     ProgramRunStartRequest,
@@ -114,10 +119,7 @@ from manyforge_headless_api.program_binding_projection import (
 )
 from manyforge_headless_api.program_binding_transport import ProgramBindingTransportError
 
-from manyforge_headless_api.cell_admission import (
-    CellAdmissionClient,
-    CellAdmissionError,
-)
+from .cell_admission import CellAdmission, CellAdmissionError
 from .cycle_journal import ProgramCycleJournal
 from .bbkey_publication import (
     FAULT_CODE as BBKEY_PUBLICATION_FAULT_CODE,
@@ -125,7 +127,6 @@ from .bbkey_publication import (
     ProgramBlackboardPublicationScope,
 )
 from .active_tcp_mirror import ActiveTcpMirror, ActiveTcpWireError, decode_active_tcp_rows
-from .execution_transport import ProgramRunnerExecutionTransport
 from .heap_settle import freeze_heap, settle_heap
 from .interrupt_state_mirror import InterruptRuleStateMirror, RuleCatalog
 from .liveness import (
@@ -163,13 +164,25 @@ from .runtime_controls import (
     ProgramRuntimeControls,
     manual_result_availability,
 )
-from .diagnostics import ProgramDiagnosticPublisher, ProgramNodeAttemptPublisher
+from .diagnostics import (
+    ProgramDiagnosticPublisher,
+    ProgramNodeAttemptPublisher,
+    program_run_event,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
 # A transport without the rule-state channel has no global rules to wait for.
 _NO_GLOBAL_RULES: Final = RuleCatalog(None, 1, "", "", (), ())
 PROGRAM_RUN_INDEX_VERSION: Final = "manyforge.program_run_index.v3"
+# The owner's run status joined with the Runner's in-memory presentation of
+# its running nodes: since when each runs, what each wait last read (v6).
+PROGRAM_RUN_STATUS_VERSION: Final = "manyforge.program_run_status.v6"
+_MAXIMUM_RUNNING_SINCE: Final = 64
+_MAXIMUM_WAIT_VALUES: Final = 32
+_WAIT_TEXT_BYTES: Final = 256
+_MAXIMUM_SAFE_INTEGER: Final = 2**53 - 1
+_TERMINAL_RUN_STATES: Final = frozenset({"stopped", "succeeded", "failed"})
 PERSISTENT_KEY_VALUES_VERSION: Final = "manyforge.persistent_key_values.v3"
 PERSISTENT_KEY_EDIT_VERSION: Final = "manyforge.persistent_key_edit.v2"
 PERSISTENT_KEY_RECONCILIATION_VERSION: Final = (
@@ -193,6 +206,37 @@ _MOTION_PRODUCING_RECOVERY_ACTIONS: Final = frozenset(
 )
 
 
+def _wait_text(value: str) -> str:
+    return value.encode("utf-8")[:_WAIT_TEXT_BYTES].decode("utf-8", errors="ignore")
+
+
+def _wait_value(observation: Mapping[str, Any]) -> dict[str, Any]:
+    """One wait node's last read as a run status shows it: its key and
+    value (a JSON scalar, else compact JSON text, text cut to 256 bytes) or
+    its gripper and state, and the UTC time that was first read."""
+
+    shown: dict[str, Any] = {"kind": observation["kind"]}
+    for name in ("key", "component_id", "state"):
+        if isinstance(observation.get(name), str):
+            shown[name] = _wait_text(observation[name])
+    if "value" in observation:
+        value = observation["value"]
+        if isinstance(value, str):
+            value = _wait_text(value)
+        elif not (
+            value is None
+            or isinstance(value, bool)
+            or (isinstance(value, int) and abs(value) <= _MAXIMUM_SAFE_INTEGER)
+            or (isinstance(value, float) and math.isfinite(value))
+        ):
+            value = _wait_text(
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str)
+            )
+        shown["value"] = value
+    shown["observed_at_utc_ns"] = observation["observed_at_utc_ns"]
+    return shown
+
+
 def _released_failure_hold(
     held: Sequence[Mapping[str, Any]], projected: Mapping[str, Any]
 ) -> bool:
@@ -200,6 +244,11 @@ def _released_failure_hold(
 
     remaining = projected.get("operation_failures") or ()
     return any(dict(row) not in remaining for row in held)
+
+
+# An execution host call's typed failures: the owner's refusal, or the
+# core's transport and envelope failure.
+_OWNER_CALL_ERRORS = (ExecutionCommandError, core.GatewayError)
 
 
 class ProgramRunnerError(RuntimeError):
@@ -389,6 +438,9 @@ class ProgramRunnerConfig:
     manager_liveness_socket: Path | None = None
     cell_id: str | None = None
     persistent_key_register_directory: Path | None = None
+    # The Manager run root (its manager-command.sock): the scene owner the
+    # runner's scene reads, commits and latch go to through the core (D1).
+    manager_run_root: Path | None = None
 
     def __post_init__(self) -> None:
         parsed = urlsplit(self.headless_url)
@@ -507,9 +559,9 @@ class ProgramRuntime:
         model_transport: ProgramModelTransport | None = None,
         snapshot_source: ProgramSnapshotSource | None = None,
         simulation_control: OwnerTaskPort | None = None,
-        admission_client: CellAdmissionClient | None = None,
+        admission_client: CellAdmission | None = None,
         cycle_journal: ProgramCycleJournal | None = None,
-        execution_transport: Any | None = None,
+        gateway: Any | None = None,
     ) -> None:
         if not isinstance(config, ProgramRunnerConfig):
             raise TypeError("Program runtime requires one ProgramRunnerConfig")
@@ -542,13 +594,34 @@ class ProgramRuntime:
             raise ProgramRunnerError(
                 "persistent_key_storage_unavailable", str(error)
             ) from error
-        self._admission = admission_client or (
-            None
-            if config.execution_run_root is None
-            else CellAdmissionClient(
-                config.execution_run_root,
-                timeout_seconds=min(config.headless_timeout_seconds, 30.0),
+        # The core's owner calls, in this process (OD-380): every execution
+        # host command, and the scene port's Manager reads, commits, lookups
+        # and latch (D1). Only connecting is time-limited (OD-214).
+        # The connect limits are base's: the host's as the runner's own
+        # transport had, the Manager's as Headless's Manager client had (the
+        # runner reached the Manager through Headless before OD-380 D1).
+        scene_gateway = gateway
+        if gateway is None and config.execution_run_root is not None:
+            manager_root = (
+                None if config.manager_run_root is None else str(config.manager_run_root)
             )
+            gateway = core.Gateway(
+                str(config.execution_run_root),
+                manager_root,
+                attribution="internal",
+                connect_limit_s=min(config.headless_timeout_seconds, 30.0),
+            )
+            # The scene port's (its admission read included).
+            scene_gateway = core.Gateway(
+                str(config.execution_run_root),
+                manager_root,
+                attribution="internal",
+                connect_limit_s=DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
+            )
+        self._gateway = gateway
+        self._scene_gateway = scene_gateway
+        self._admission = admission_client or (
+            None if config.execution_run_root is None else CellAdmission(gateway)
         )
         try:
             self._journal = cycle_journal or (
@@ -566,8 +639,8 @@ class ProgramRuntime:
             raise ProgramRunnerError(
                 "program_cycle_journal_unavailable", str(error)
             ) from error
-        # One synchronous BB key sender per captured Run.
-        # Key None is the cell-level source between Runs.
+        # One BB key source per captured Run; it sends on the Run's sender,
+        # then on its own. Key None is the cell-level source between Runs.
         self._bbkey_publishers: dict[int | None, ProgramBlackboardKeyPublisher] = {}
         # Sources whose baseline waits for the global rule catalog of
         # their own publication: (publisher, store, Program keys, deadline ns).
@@ -594,8 +667,12 @@ class ProgramRuntime:
         ] = {}
         self._active_tcp_mirror = ActiveTcpMirror(on_change=self._write_active_tcp)
         # One source creation at a time (check, retire, create, install,
-        # start). Held across I/O, so never the publishers lock above.
+        # capture the baseline): memory work only; the host reads a creation
+        # needs run before it is taken.
         self._bbkey_source_lock = RLock()
+        # The newest between-Runs identity installed (publication generation,
+        # cycle generation): a creation whose host reads are older drops.
+        self._bbkey_idle_installed: tuple[int, int] = (0, 0)
         # The publisher fence held by source faults until every loss is
         # confirmed or superseded by an ACKed successor.
         self._bbkey_fence_lock = Lock()
@@ -612,6 +689,13 @@ class ProgramRuntime:
         self._carried_object_lost_run_id: int | None = None
         self._carried_object_lost_run_active = False
         self._carried_object_lost_seen_event_ids: set[str] = set()
+        # True while the last losses are unreadable or unusable: one line
+        # per such episode, not one per mirror message.
+        self._carried_object_losses_unusable = False
+        # The run whose `program_run_finished` History event was produced
+        # (runs end one at a time; a repeated terminal observation adds none).
+        self._run_finished_event_id: int | None = None
+        self._run_finished_event_lock = Lock()
         # The mirror's event subscription (one thread, started with the Runner).
         self._interrupt_state_stop = Event()
         self._interrupt_state_follower: Thread | None = None
@@ -634,44 +718,46 @@ class ProgramRuntime:
             timeout_seconds=config.headless_timeout_seconds,
         )
         # A Runner under a Manager latches pose observations into Scene
-        # between nodes, through Headless (OD-294).
+        # between nodes, at the Manager (D1).
         scene_latch = config.manager_liveness_socket is not None
-        if execution_transport is None:
-            if config.execution_run_root is None:
-                raise ValueError(
-                    "Program runtime requires the private execution run root"
-                )
-            execution_transport = ProgramRunnerExecutionTransport(
-                config.execution_run_root,
-                timeout_seconds=min(config.headless_timeout_seconds, 30.0),
+        if gateway is None:
+            raise ValueError(
+                "Program runtime requires the private execution run root"
             )
-        # OD-213: the nodes read their operations from the event stream's
-        # pushed table, which the follower thread keeps; a runner without the
-        # follower (no Manager liveness or no subscription) reads instead.
-        self._operation_table = PushedOperationTable()
-        follows_events = (
+        # The runs woken by an owner answer or a pushed event (S2, D3).
+        self._wake_set = core.WakeSet()
+        # OD-213: the nodes read their operations and planning jobs from the
+        # core's event follower (one C++ thread, started with the Runner),
+        # which keeps the pushed table and wakes the runs watching a change;
+        # a runner without it (no Manager liveness or no execution run root)
+        # reads instead.
+        follows_events = callable(getattr(gateway, "events", None))
+        self._events: Any = None
+        if (
             self._liveness is not None
-            and callable(getattr(execution_transport, "read_interrupt_rule_state_events", None))
-            and callable(getattr(execution_transport, "subscribe_events", None))
-        )
-        self._kernel = KernelClient(
-            execution_transport,
-            self._operation_table if follows_events else None,
-        )
-        self._execution_transport = execution_transport
+            and config.execution_run_root is not None
+            and follows_events
+        ):
+            self._events = core.ExecutionEvents(
+                str(config.execution_run_root), wake_set=self._wake_set
+            )
+        self._kernel = KernelClient(gateway, self._events)
         self._scene = HeadlessSceneProgramPort(
-            self._headless,
-            resolve_attach_active_tcp=getattr(execution_transport, "resolve_attach_active_tcp", None),
+            self._scene_gateway,
+            resolve_attach_active_tcp=(
+                self._kernel.resolve_attach_active_tcp
+                if callable(getattr(gateway, "resolve_attach_active_tcp", None))
+                else None
+            ),
             program_node_evidence=self._program_node_admission_evidence,
-            application_start_id=self.application_start_id,
+            record_scene_change=self._record_scene_change,
+            read_limit_s=min(config.headless_timeout_seconds, 30.0),
         )
-        read_rule_states = getattr(execution_transport, "read_interrupt_rule_state_events", None)
-        if callable(read_rule_states):
-            subscribe = getattr(execution_transport, "subscribe_events", None)
+        if follows_events:
             self._interrupt_state_mirror = InterruptRuleStateMirror(
-                read_events=read_rule_states,
+                read_events=self._kernel.read_interrupt_rule_state_events,
                 on_change=self._apply_interrupt_states,
-                subscribe=subscribe if callable(subscribe) else None,
+                subscription=None if self._events is None else self._events.subscribe(),
                 on_carried_object_lost=self._mirror_carried_object_lost_signals,
                 on_program_run_hold=self._apply_program_run_hold,
             )
@@ -760,6 +846,7 @@ class ProgramRuntime:
             program_interventions=self._interventions,
             persistent_keys=self._persistent_keys,
             node_attempt_history=self._node_attempts.submit,
+            run_wake=self._wake_set,
         )
         self._owner_availability = self._build_owner_availability()
         self._owner = ProgramRunOwner(
@@ -776,6 +863,11 @@ class ProgramRuntime:
         self._forced_end_keys: dict[int, bytes] = {}
         # The latest run's `ProgramRunEnd` as observed at its end.
         self._run_ends: dict[str, dict[str, Any]] = {}
+        # Per run with running nodes: the node-status revision last observed
+        # and the UTC time each running node was first seen running (at most
+        # 64), memory only. The lock guards only this dict.
+        self._node_running_since: dict[int, tuple[int, dict[str, int]]] = {}
+        self._node_running_since_lock = Lock()
         self._pending_terminal_snapshots: dict[str, dict[str, Any]] = {}
         self._runtime_controls: dict[str, ProgramRuntimeControls] = {}
         self._runtime_controls_lock = RLock()
@@ -815,6 +907,7 @@ class ProgramRuntime:
             terminal_observer=self._record_terminal_snapshot,
             state_observer=self._observe_run_state,
             failure_observer=self._fence_tick_worker_failure,
+            wake_set=self._wake_set,
         )
         if self._journal is not None:
             self._journal.set_change_observer(self._notify_control_state_change)
@@ -1037,8 +1130,64 @@ class ProgramRuntime:
                 # later current-state wake repairs a missed notification.
                 continue
 
+    def _stamp_running_nodes(self, snapshot: Any) -> None:
+        """Stamp the UTC time a node is first seen running: every node-status
+        change reaches this observer right after the tick that made it."""
+
+        program_run_id = snapshot.capture.program_run_id
+        revision = snapshot.node_status_revision
+        with self._node_running_since_lock:
+            seen, previous = self._node_running_since.get(program_run_id, (0, {}))
+        if revision <= seen:
+            return
+        now = time.time_ns()
+        running: dict[str, int] = {}
+        for instance_id, status in snapshot.node_statuses.items():
+            if status == "running":
+                running[instance_id] = previous.get(instance_id, now)
+                if len(running) == _MAXIMUM_RUNNING_SINCE:
+                    break
+        with self._node_running_since_lock:
+            if self._node_running_since.get(program_run_id, (0, {}))[0] >= revision:
+                return
+            if running:
+                self._node_running_since[program_run_id] = (revision, running)
+            else:
+                self._node_running_since.pop(program_run_id, None)
+
+    def _running_node_facts(self, run: Mapping[str, Any]) -> dict[str, Any]:
+        """``node_running_since_utc_ns`` and ``node_wait_values`` of a run
+        status: from memory only, empty once the run has ended."""
+
+        capture = run.get("capture")
+        program_run_id = capture.get("program_run_id") if isinstance(capture, Mapping) else None
+        statuses = run.get("node_statuses")
+        since: dict[str, int] = {}
+        waits: dict[str, dict[str, Any]] = {}
+        if run.get("state") in _TERMINAL_RUN_STATES or not isinstance(statuses, Mapping):
+            return {"node_running_since_utc_ns": since, "node_wait_values": waits}
+        with self._node_running_since_lock:
+            stamps = self._node_running_since.get(program_run_id, (0, {}))[1]
+        since = {
+            instance_id: stamp
+            for instance_id, stamp in stamps.items()
+            if statuses.get(instance_id) == "running"
+        }
+        if since:
+            try:
+                observations = self._owner.wait_observations(program_run_id)
+            except ProgramRunOwnerError:
+                observations = {}
+            for instance_id, observation in observations.items():
+                if statuses.get(instance_id) == "running":
+                    waits[instance_id] = _wait_value(observation)
+                    if len(waits) == _MAXIMUM_WAIT_VALUES:
+                        break
+        return {"node_running_since_utc_ns": since, "node_wait_values": waits}
+
     def _observe_run_state(self, snapshot: Any) -> None:
         """Wake readers; selected holds do not transition the whole cycle."""
+        self._stamp_running_nodes(snapshot)
         self._notify_control_state_change()
         program_run_id = snapshot.capture.program_run_id
         for event in self._owner.take_node_history_events(program_run_id):
@@ -1076,7 +1225,18 @@ class ProgramRuntime:
         text = unicodedata.normalize(
             "NFC", f"{type(error).__name__}: {error}"
         ).encode("utf-8")[:1_024].decode("utf-8", errors="ignore")
-        fault = {"code": TICK_WORKER_FAULT_CODE, "message": text, "details": {}}
+        # Where it was raised: the last frame of its traceback.
+        frames = traceback.extract_tb(error.__traceback__)
+        details = (
+            {}
+            if not frames
+            else {
+                "last_frame": unicodedata.normalize(
+                    "NFC", f"{frames[-1].filename}:{frames[-1].lineno} {frames[-1].name}"
+                ).encode("utf-8")[:512].decode("utf-8", errors="ignore")
+            }
+        )
+        fault = {"code": TICK_WORKER_FAULT_CODE, "message": text, "details": details}
         self._liveness.latch_runner_fault(fault, self._digest(fault))
 
     def _current_cycle_status_projection(self) -> dict[str, Any]:
@@ -1447,7 +1607,7 @@ class ProgramRuntime:
             # deliberately non-executable.
             pass
 
-    def _require_cycle_owner(self) -> tuple[CellAdmissionClient, ProgramCycleJournal]:
+    def _require_cycle_owner(self) -> tuple[CellAdmission, ProgramCycleJournal]:
         if self._admission is None or self._journal is None:
             raise ProgramRunnerError(
                 "program_cycle_admission_unavailable",
@@ -1979,6 +2139,7 @@ class ProgramRuntime:
                 controls = ProgramRuntimeControls(
                     capture,
                     recovery_fences=recovery_fences,
+                    history=self._node_attempts.submit_run_event,
                 )
             except ValueError as error:
                 raise ProgramRunnerError(
@@ -2299,6 +2460,8 @@ class ProgramRuntime:
         if run_end is not None and projected.get("run_end") is not None:
             # The end observed with the cell latch (`cell_fault`).
             projected["run_end"] = deepcopy(run_end)
+        projected["schema_version"] = PROGRAM_RUN_STATUS_VERSION
+        projected.update(self._running_node_facts(projected))
         return projected
 
     def _terminalize_failed_start(
@@ -2805,7 +2968,7 @@ class ProgramRuntime:
         if (
             self._journal is None
             or self._persistent_keys is None
-            or not callable(getattr(self._execution_transport, "publish_program_bbkeys", None))
+            or not callable(getattr(self._gateway, "publish_program_bbkeys", None))
         ):
             return  # No between-Runs source can exist here.
 
@@ -3016,6 +3179,56 @@ class ProgramRuntime:
             "details": {"component_id": latch["causes"][0]["component_id"]},
         }
 
+    def _record_run_started(
+        self, capture: Mapping[str, Any], request: ProgramRunStartRequest
+    ) -> None:
+        """History's `program_run_started`: the run, the Applied Program it
+        runs and who started it (OD-381 P2). Never waits."""
+
+        self._node_attempts.submit_run_event(program_run_event(
+            capture["program_run_id"],
+            "program_run_started",
+            "started",
+            {
+                "scenario_id": capture["scenario_id"],
+                "program_revision": capture["program_revision"],
+                "applied_record_digest": capture["applied_record_digest"],
+                "program_binding_id": capture["program_binding_id"],
+                "request_key": request.request_key,
+                "source_label": request.source_label,
+            },
+        ))
+
+    def _record_run_finished(
+        self,
+        event: dict[str, Any],
+        value: Mapping[str, Any],
+        run_end: Mapping[str, Any] | None,
+    ) -> None:
+        """Complete History's one `program_run_finished` of a run (stamped
+        by the caller at the observed end): its end state, the run end's
+        reason and, for a failed run, its typed error. Never waits."""
+
+        end = run_end if run_end is not None else value.get("run_end")
+        details = end.get("details", {}) if isinstance(end, Mapping) else {}
+        facts = {
+            "run_revision": value.get("run_revision"),
+            "end_reason": end.get("end_reason") if isinstance(end, Mapping) else None,
+            **{
+                name: details[name]
+                for name in ("stopped_by", "rule_id", "component_id", "node_instance_id")
+                if isinstance(details.get(name), str)
+            },
+        }
+        event["facts"] = {name: fact for name, fact in facts.items() if fact is not None}
+        if value["state"] == "failed":
+            event["error"] = {
+                "code": value.get("reason_code") or "program_tree_failed",
+                "message": value.get("message") or None,
+                "details": value.get("details"),
+            }
+        self._node_attempts.submit_run_event(event)
+
     def _record_terminal_snapshot(self, snapshot: Any) -> None:
         value = (
             snapshot.to_dict()
@@ -3034,6 +3247,15 @@ class ProgramRuntime:
         program_run_id = capture.get("program_run_id")
         if type(program_run_id) is not int:
             return
+        with self._run_finished_event_lock:
+            first_end = self._run_finished_event_id != program_run_id
+            self._run_finished_event_id = program_run_id
+        # Stamped at the observed end, before the cell latch is read.
+        finished = (
+            program_run_event(program_run_id, "program_run_finished", value["state"], {})
+            if first_end
+            else None
+        )
         if program_run_id not in self._run_ends and value.get("run_end") is not None:
             # Once per run (only the latest run's end is kept): its end with
             # the cell latch, and every rule back to `active_at_start`.
@@ -3041,6 +3263,8 @@ class ProgramRuntime:
                 program_run_id: self._run_end_with_cell_fault(value["run_end"])
             }
             self._reset_rule_activation()
+        if finished is not None:
+            self._record_run_finished(finished, value, self._run_ends.get(program_run_id))
         value = self._project_run(value)
         if self._journal is None:
             return
@@ -3082,8 +3306,8 @@ class ProgramRuntime:
     def _new_bbkey_publisher(
         self, scope: ProgramBlackboardPublicationScope
     ) -> ProgramBlackboardKeyPublisher:
-        publish = getattr(self._execution_transport, "publish_program_bbkeys", None)
-        if not callable(publish):
+        publish = self._kernel.publish_program_bbkeys
+        if not callable(getattr(self._gateway, "publish_program_bbkeys", None)):
             raise ProgramRunnerError(
                 "program_bbkey_publication_unavailable",
                 "the execution transport cannot publish BB keys",
@@ -3143,9 +3367,18 @@ class ProgramRuntime:
             if current:
                 self._settle_superseded_bbkey_losses(ordinal)
 
+        run_id = scope.program_run_id
         publisher = ProgramBlackboardKeyPublisher(
             scope,
             publish=publish,
+            # A Run's frames stay ordered with its nodes' requests.
+            # A run built without a sender has none: its own then.
+            sender=(
+                (None if run_id is None else self._owner.run_sender(run_id))
+                or self._new_bbkey_source_sender(
+                    f"manyforge-bbkey-{'cell' if run_id is None else run_id}-sender"
+                )
+            ),
             submit=self._host.submit_run_work,
             stop_run=self._stop_for_bbkey_publication_fault,
             on_fault=on_fault,
@@ -3155,6 +3388,11 @@ class ProgramRuntime:
         )
         created.append(publisher)
         return publisher
+
+    @staticmethod
+    def _new_bbkey_source_sender(name: str) -> RunSender:
+        # One drain request at most is queued on it.
+        return RunSender(1, name=name)
 
     def _settle_superseded_bbkey_losses(self, successor_ordinal: int) -> None:
         """The Kernel ACKed the current between-Runs source's baseline: it
@@ -3206,15 +3444,17 @@ class ProgramRuntime:
         context: tuple[int, str, str],
         *,
         deadline_ns: int | None = None,
+        catalog_read: bool = False,
+        catalog: RuleCatalog | None = None,
     ) -> None:
-        """Send the baseline of the fixed union W = Program keys ∪ the global
-        rules' keys only once the catalog of this source's full context
-        (publication, bundle, graph) is known and
-        the Kernel has installed the source (no ``bb_source_not_ready``).
-        Until then the source is pending: its writes only commit, and the next
-        liveness observation starts it again with a baseline built from the
-        store then. A pending source keeps its original
-        ``deadline_ns``."""
+        """Capture the baseline of the fixed union W = Program keys ∪ the
+        global rules' keys only once the catalog of this source's full context
+        (publication, bundle, graph) is known (``catalog`` when the caller
+        already read it: ``catalog_read``, None while unknown), and keep the
+        source pending until the Kernel ACKs it. A source whose baseline the Kernel answered ``bb_source_not_ready``
+        stays pending: its writes only commit, and the next liveness
+        observation captures a baseline from the store then. A pending source
+        keeps its original ``deadline_ns``."""
 
         def pend() -> None:
             with self._bbkey_publishers_lock:
@@ -3224,7 +3464,8 @@ class ProgramRuntime:
                     if deadline_ns is None else deadline_ns,
                 )
 
-        catalog = self._catalog_for_context(context)
+        if not catalog_read:
+            catalog = self._catalog_for_context(context)
         if catalog is None:
             pend()
             return
@@ -3259,8 +3500,16 @@ class ProgramRuntime:
         for name, (publisher, store, program_keys, context, deadline_ns) in pending:
             with self._bbkey_publishers_lock:
                 current = self._bbkey_publishers.get(name) is publisher
-            if not current:
-                continue  # Retired by a Reset, a new Run or a new publication.
+            if not current or publisher.settled:
+                continue  # Retired by a Reset, a new Run or a new publication; or ACKed.
+            if publisher.baseline_in_flight:
+                # Its baseline is sent and awaits the reply (no time limit on
+                # a sent frame); it is looked at again at the next observation.
+                with self._bbkey_publishers_lock:
+                    self._bbkey_pending.setdefault(
+                        name, (publisher, store, program_keys, context, deadline_ns)
+                    )
+                continue
             if time.monotonic_ns() >= deadline_ns:
                 publisher.fail(
                     f"the BB key source of publication {context[0]} was not installed "
@@ -3297,61 +3546,45 @@ class ProgramRuntime:
         graph_revision: str,
         binding: Mapping[str, Any] | None = None,
     ) -> ProgramBlackboardKeyPublisher | None:
-        """Subscribe the Run's fixed key union and send its baseline first."""
+        """Subscribe the Run's fixed key union and capture its baseline first.
 
-        with self._bbkey_source_lock:
-            return self._start_run_bbkey_publication(
-                program_run_id,
-                claim_generation=claim_generation,
-                program_binding_id=program_binding_id,
-                active_publication_generation=active_publication_generation,
-                cycle_generation=cycle_generation,
-                keys=keys,
-                retained_bundle_id=retained_bundle_id,
-                graph_revision=graph_revision,
-                binding=binding,
-            )
+        The host reads (the Active TCP baseline, the rule catalog) run before
+        the source lock; under it only memory work and the baseline capture.
+        """
 
-    def _start_run_bbkey_publication(
-        self,
-        program_run_id: int,
-        *,
-        claim_generation: int,
-        program_binding_id: str,
-        active_publication_generation: int,
-        cycle_generation: int,
-        keys: tuple[str, ...],
-        retained_bundle_id: str,
-        graph_revision: str,
-        binding: Mapping[str, Any] | None = None,
-    ) -> ProgramBlackboardKeyPublisher | None:
-        # Previous sources (a reset Run's, the cell-level one) end here.
-        self._retire_bbkey_publishers()
-        self._interrupt_state_run_id = program_run_id
         context = (active_publication_generation, retained_bundle_id, graph_revision)
-        store = self._owner.value_store(program_run_id)
-        if binding is not None:
-            self._register_active_tcp_store(program_run_id, store, binding)
-        if self._applied_global_rule_ids():
-            self._seed_interrupt_states(store, context)
+        active_tcp = (
+            None if binding is None else self._read_active_tcp_baseline(ordered=True)
+        )
         catalog = self._catalog_for_context(context)
-        if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
-            return None  # No keys: no sender, no baseline.
-        publisher = self._new_bbkey_publisher(
-            ProgramBlackboardPublicationScope(
-                claim_generation=claim_generation,
-                program_run_id=program_run_id,
-                program_binding_id=program_binding_id,
-                active_publication_generation=active_publication_generation,
-                cycle_generation=cycle_generation,
+        rule_ids = self._applied_global_rule_ids()
+        with self._bbkey_source_lock:
+            # Previous sources (a reset Run's, the cell-level one) end here.
+            self._retire_bbkey_publishers()
+            self._interrupt_state_run_id = program_run_id
+            store = self._owner.value_store(program_run_id)
+            if binding is not None:
+                self._seed_active_tcp_store(program_run_id, store, binding, active_tcp)
+            if rule_ids:
+                self._seed_interrupt_states(store, context)
+            if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
+                return None  # No keys: no sender, no baseline.
+            publisher = self._new_bbkey_publisher(
+                ProgramBlackboardPublicationScope(
+                    claim_generation=claim_generation,
+                    program_run_id=program_run_id,
+                    program_binding_id=program_binding_id,
+                    active_publication_generation=active_publication_generation,
+                    cycle_generation=cycle_generation,
+                )
             )
-        )
-        with self._bbkey_publishers_lock:
-            self._bbkey_publishers[program_run_id] = publisher
-        self._start_or_defer_bbkey_source(
-            program_run_id, publisher, self._owner.value_store(program_run_id), keys, context
-        )
-        return publisher
+            with self._bbkey_publishers_lock:
+                self._bbkey_publishers[program_run_id] = publisher
+            self._start_or_defer_bbkey_source(
+                program_run_id, publisher, store, keys, context,
+                catalog_read=True, catalog=catalog,
+            )
+            return publisher
 
     def _start_idle_bbkey_publication(self, *, keys: tuple[str, ...]) -> None:
         """The cell-level source between Runs (after Reset or a cold Apply).
@@ -3361,11 +3594,15 @@ class ProgramRuntime:
         run-only keys their declared `initial` (else null), node_outcome.*
         `none`. Every new
         Applied publication is a new source; unchanged identity (a repeated
-        Apply notice) keeps the source.
+        Apply notice) keeps the source. The host reads run first, without the
+        source lock; under it the source is checked, created and its baseline
+        captured, and a creation whose reads are older than the installed
+        identity drops.
         """
 
         if self._journal is None or self._persistent_keys is None:
-            self._retire_bbkey_publishers(idle_only=True)
+            with self._bbkey_source_lock:
+                self._retire_bbkey_publishers(idle_only=True)
             return
         applied = self._headless.program_applied()
         publication_generation = self._applied_publication_generation(applied)
@@ -3380,23 +3617,26 @@ class ProgramRuntime:
             str(applied.get("graph_revision")),
         )
         cycle_generation = self._journal.read().cycle_generation
-        with self._bbkey_publishers_lock:
-            current = self._bbkey_publishers.get(None)
-        # An unchanged identity keeps its source before anything else.
-        # The Kernel keeps the baseline of this exact scope; a local retire
-        # followed by a new sender of the same scope (e.g. the no-keys case below on a
-        # transient catalog read) would send that baseline again, and the
-        # Kernel refuses the repeat (`program_bb_sequence_stale`).
-        if (
-            current is not None
-            and current.scope.program_binding_id == applied["program_binding_id"]
-            and current.scope.active_publication_generation == publication_generation
-            and current.scope.cycle_generation == cycle_generation
-        ):
+
+        def unchanged() -> bool:
+            # An unchanged identity keeps its source before anything else.
+            # The Kernel keeps the baseline of this exact scope; a local retire
+            # followed by a new sender of the same scope (e.g. the no-keys case
+            # below on a transient catalog read) would send that baseline
+            # again, and the Kernel refuses the repeat (`program_bb_sequence_stale`).
+            with self._bbkey_publishers_lock:
+                current = self._bbkey_publishers.get(None)
+            return (
+                current is not None
+                and current.scope.program_binding_id == applied["program_binding_id"]
+                and current.scope.active_publication_generation == publication_generation
+                and current.scope.cycle_generation == cycle_generation
+            )
+
+        if unchanged():
             return
         catalog = self._catalog_for_context(context)
         no_publisher = not keys and catalog is not None and not catalog.referenced_program_blackboard_keys
-        self._retire_bbkey_publishers(idle_only=True)
         program = self._with_global_rule_keys(
             Program.from_dict(deepcopy(applied["program"]), self._environment.catalog),
             retained_bundle_id=applied.get("retained_bundle_id"),
@@ -3418,26 +3658,46 @@ class ProgramRuntime:
             persistent_commit=lambda _declaration, _value, _metadata: None,
             persistent_forget=lambda _declaration, _metadata: None,
         )
-        self._register_active_tcp_store(None, store, applied["program_binding"])
-        if no_publisher:
-            return  # No keys: Active TCP is mirrored, but no BB source is sent.
-        # A fresh store: run-scoped keys hold their declared `initial`, or null
-        # when omitted (the value the next Run starts from),
-        # node_outcome.* `none`.
-        publisher = self._new_bbkey_publisher(
-            ProgramBlackboardPublicationScope(
-                claim_generation=None,
-                program_run_id=None,
-                program_binding_id=applied["program_binding_id"],
-                active_publication_generation=publication_generation,
-                cycle_generation=cycle_generation,
-            )
+        read_robots = self._read_active_tcp_baseline(
+            ordered=not self._has_active_tcp_follower()
         )
-        self._seed_interrupt_states(store, context)
-        with self._bbkey_publishers_lock:
-            self._bbkey_publishers[None] = publisher
-            self._bbkey_idle_store = store
-        self._start_or_defer_bbkey_source(None, publisher, store, keys, context)
+        identity = (publication_generation, cycle_generation)
+        with self._bbkey_source_lock:
+            # A newer Apply or Reset installed its source meanwhile.
+            older_reads = identity < self._bbkey_idle_installed
+            if not older_reads:
+                if unchanged():
+                    return  # Another follower installed this identity meanwhile.
+                self._bbkey_idle_installed = identity
+                self._retire_bbkey_publishers(idle_only=True)
+                self._seed_active_tcp_store(
+                    None, store, applied["program_binding"], read_robots
+                )
+                if no_publisher:
+                    return  # No keys: Active TCP is mirrored, but no BB source is sent.
+                # A fresh store: run-scoped keys hold their declared `initial`, or
+                # null when omitted (the value the next Run starts from),
+                # node_outcome.* `none`.
+                publisher = self._new_bbkey_publisher(
+                    ProgramBlackboardPublicationScope(
+                        claim_generation=None,
+                        program_run_id=None,
+                        program_binding_id=applied["program_binding_id"],
+                        active_publication_generation=publication_generation,
+                        cycle_generation=cycle_generation,
+                    )
+                )
+                self._seed_interrupt_states(store, context)
+                with self._bbkey_publishers_lock:
+                    self._bbkey_publishers[None] = publisher
+                    self._bbkey_idle_store = store
+                self._start_or_defer_bbkey_source(
+                    None, publisher, store, keys, context,
+                    catalog_read=True, catalog=catalog,
+                )
+        if older_reads:
+            # Printed after the source lock is released.
+            _LOGGER.info("between-Run BB key source of older host reads dropped")
 
     def _follow_idle_persistent_edit(self, key: str, value: Any, *, reset: bool) -> None:
         """Mirror an operator edit between Runs into the cell-level source."""
@@ -3448,14 +3708,18 @@ class ProgramRuntime:
             return
         try:
             if reset:
-                store.reset_to_initial(key)
+                receipt = store.reset_to_initial(key)
             else:
-                store.write(key, value)
+                receipt = store.write(key, value)
         except ProgramValueError as error:
             with self._bbkey_publishers_lock:
                 publisher = self._bbkey_publishers.get(None)
             if publisher is not None:
                 publisher.fail(f"between-Run edit of {key!r} cannot be published: {error}")
+            return
+        if receipt is not None:
+            # The edit's reply follows the host's answer (OD-213 part 3).
+            receipt.wait()
 
     def _applied_publication_generation(self, applied: Mapping[str, Any]) -> int | None:
         """The host's existing ``active_publication_generation`` for exactly
@@ -3526,14 +3790,14 @@ class ProgramRuntime:
         still holds, and a new Applied publication retires the old source in
         the Kernel itself. The next Reset or Run start establishes the source.
         Startup, Apply notices and Reset reach here on different workers: one
-        source creation at a time, so one scope never gets two senders.
+        source creation at a time (under the source lock, after the host
+        reads), so one scope never gets two senders.
         """
 
-        with self._bbkey_source_lock:
-            try:
-                self._start_idle_bbkey_publication(keys=self._cell_bbkey_union())
-            except Exception:
-                _LOGGER.exception("cell-level BB key source could not start")
+        try:
+            self._start_idle_bbkey_publication(keys=self._cell_bbkey_union())
+        except Exception:
+            _LOGGER.exception("cell-level BB key source could not start")
 
     # Active TCP values belong to robot handles, independent of BB publishing.
     @staticmethod
@@ -3565,11 +3829,9 @@ class ProgramRuntime:
             self._write_store_active_tcp(store, roles, robot, entry)
 
     def _has_active_tcp_follower(self) -> bool:
+        # The thread runs only over the core's event subscription.
         follower = self._interrupt_state_follower
-        return (
-            follower is not None and follower.is_alive()
-            and callable(getattr(self._execution_transport, "subscribe_events", None))
-        )
+        return follower is not None and follower.is_alive()
 
     def _apply_active_tcp_reading(self, response: Mapping[str, Any]) -> set[str]:
         readings = decode_active_tcp_rows(response.get("robots"))
@@ -3607,19 +3869,42 @@ class ProgramRuntime:
     def _register_active_tcp_store(
         self, name: str | None, store: ProgramValueStore, binding: Mapping[str, Any],
     ) -> None:
+        """Read the Active TCP baseline, then register the store from it."""
+
+        ordered = name is not None or not self._has_active_tcp_follower()
+        self._seed_active_tcp_store(
+            name, store, binding, self._read_active_tcp_baseline(ordered=ordered)
+        )
+
+    def _read_active_tcp_baseline(self, *, ordered: bool) -> set[str] | None:
+        """The one Active TCP read a new store starts from: the robots it
+        delivered into the mirror, or None when it is unavailable."""
+
+        try:
+            response = self._kernel.read_active_tcp(ordered=ordered)
+            return self._apply_active_tcp_reading(response)
+        except Exception:
+            # One read only: unavailable keys fail their ordinary Current
+            # input until a later confirmed stream or result supplies them.
+            _LOGGER.warning("Active TCP baseline read unavailable", exc_info=True)
+            return None
+
+    def _seed_active_tcp_store(
+        self,
+        name: str | None,
+        store: ProgramValueStore,
+        binding: Mapping[str, Any],
+        read_robots: set[str] | None,
+    ) -> None:
+        """Register the store and write the read robots' values into it
+        (memory only; the read ran before)."""
+
         roles = self._active_tcp_targets(binding)
         def register() -> None:
             with self._active_tcp_stores_lock:
                 self._active_tcp_stores[name] = (store, roles)
 
-        try:
-            ordered = name is not None or not self._has_active_tcp_follower()
-            response = self._kernel.read_active_tcp(ordered=ordered)
-            read_robots = self._apply_active_tcp_reading(response)
-        except Exception:
-            # One read only: unavailable keys fail their ordinary Current
-            # input until a later confirmed stream or result supplies them.
-            _LOGGER.warning("Active TCP baseline read unavailable", exc_info=True)
+        if read_robots is None:
             self._active_tcp_mirror.seed(lambda _robot, _entry: None, register=register)
             return
         self._active_tcp_mirror.seed(
@@ -3716,16 +4001,15 @@ class ProgramRuntime:
         return program.with_interrupt_state_keys(rule_ids) if rule_ids else program
 
     def _start_interrupt_state_follower(self) -> None:
-        """Follow the event subscription on its own thread (where the liveness
-        watchdog used to schedule a 250 ms poll), so changes arrive as the host
-        streams them; ``shutdown`` stops it within one receive slice."""
+        """Start the core's event follower and apply its subscription on this
+        process's own thread (where the liveness watchdog used to schedule a
+        250 ms poll), so changes arrive as the host streams them;
+        ``shutdown`` closes the follower, which ends the thread at once."""
 
         mirror = self._interrupt_state_mirror
-        if (
-            mirror is None or self._liveness is None or self._interrupt_state_follower is not None
-            or not callable(getattr(self._execution_transport, "subscribe_events", None))
-        ):
+        if mirror is None or self._events is None or self._interrupt_state_follower is not None:
             return
+        self._events.start()
         follower = Thread(
             target=mirror.follow,
             args=(self._interrupt_state_stop,),
@@ -3757,11 +4041,12 @@ class ProgramRuntime:
                 facts.hold_revision,
                 error,
             )
+        # The run ticks at once on the facts (D3).
+        self._wake_set.wake(facts.program_run_id)
 
     def _on_active_tcp_stream_lost(self, _error: BaseException) -> None:
+        # The core's pushed operations are unavailable on its own loss.
         self._active_tcp_mirror.stream_lost()
-        # OD-213: the pushed operations are unavailable until the next snapshot.
-        self._operation_table.stream_lost()
 
     def _on_active_tcp_message(self, message: Mapping[str, Any]) -> None:
         kind = message.get("type")
@@ -3771,8 +4056,6 @@ class ProgramRuntime:
             state = message.get("state")
             if not isinstance(state, Mapping):
                 raise ActiveTcpWireError("Active TCP stream state is invalid")
-            # OD-213: the nodes' operations, replaced whole (raises when malformed).
-            self._operation_table.apply_state(state)
             self._active_tcp_mirror.apply_rows(state.get("active_tcp_baseline"))
         else:
             event = message.get("event")
@@ -3928,14 +4211,22 @@ class ProgramRuntime:
         try:
             last_losses = mirror.carried_object_last_losses()
         except Exception:
-            _LOGGER.exception("carried-object last losses could not be read")
+            # Every mirror message comes here: one line per episode.
+            if not self._carried_object_losses_unusable:
+                self._carried_object_losses_unusable = True
+                _LOGGER.exception("carried-object last losses could not be read")
             return
         if last_losses is None:
             return
         event_ids = self._carried_object_loss_event_ids(last_losses)
         if event_ids is None:
-            _LOGGER.warning("carried-object last losses are not usable")
+            if not self._carried_object_losses_unusable:
+                self._carried_object_losses_unusable = True
+                _LOGGER.warning("carried-object last losses are not usable")
             return
+        if self._carried_object_losses_unusable:
+            self._carried_object_losses_unusable = False
+            _LOGGER.info("carried-object last losses are usable again")
         with self._grasp_lost_mirror_lock:
             program_run_id = self._carried_object_lost_run_id
             if program_run_id is None or not self._carried_object_lost_run_active:
@@ -4376,9 +4667,11 @@ class ProgramRuntime:
                         "Program owner did not retain the admitted Program-run identity",
                     )
                 started_snapshot = snapshot.to_dict()
+                self._record_run_started(started_snapshot["capture"], request)
                 controls = ProgramRuntimeControls(
                     snapshot.capture.to_dict(),
                     recovery_fences=recovery_fences,
+                    history=self._node_attempts.submit_run_event,
                 )
                 if self._persistent_keys is not None:
                     # Stored values dropped when this run's committed Program
@@ -6289,13 +6582,27 @@ class ProgramRuntime:
         self, request: ProgramCycleResetRequest, authorization: Mapping[str, Any] | None,
         journal: Any,
     ) -> Any:
-        """Run the selected stages once in order, retaining each completed phase."""
+        """Run the selected stages once in order, retaining each completed phase.
+
+        Reset stored values goes first, in the first phase this Reset runs
+        (OD-393): a refused key reset leaves the Scene and the robot as they
+        are, and the phase it failed in resumes with it.
+        """
         cycle = journal.read()
+        if (
+            request.reset_stored_values
+            and not request.reload_initial_scene
+            and cycle.reset_phase in {"restoring_position", "releasing"}
+        ):
+            # Without a Scene reload: before the position reset or the release.
+            # Resumed with the phase; a repeat finds nothing stored to reset.
+            self._reset_persistent_keys_to_initial(request)
         if cycle.reset_phase == "restoring_scene":
             try:
                 if request.reload_initial_scene:
                     # Keys first: a refused key reset leaves the Scene as it is.
-                    self._reset_persistent_keys_to_initial(request)
+                    if request.reset_stored_values:
+                        self._reset_persistent_keys_to_initial(request)
                     self._prepare_scene_after_reset(request, authorization)
                     try:
                         self._reset_active_tcp()
@@ -6341,8 +6648,9 @@ class ProgramRuntime:
         return cycle
 
     def _reset_persistent_keys_to_initial(self, request: ProgramCycleResetRequest) -> None:
-        """Reload initial scene also resets the Applied Scenario's persistent
-        keys: each starts again from `initial:` (or empty), whatever its access.
+        """Reset stored values to their initial values (OD-393): the Applied
+        Scenario's persistent keys each start again from `initial:` (or
+        empty), whatever its access.
 
         The register forgets the stored values in one write, audited with this
         Reset's request; a failure refuses this Reset by name and leaves both
@@ -6420,23 +6728,22 @@ class ProgramRuntime:
         # implicit-scene journals are rejected intact, never reinterpreted.
         return {
             key: row["intent"].get(key, False)
-            for key in ("reload_initial_scene", "reset_robot_position")
+            for key in ("reload_initial_scene", "reset_robot_position", "reset_stored_values")
         }
 
     def _reset_robot_position_availability(self) -> dict[str, Any]:
-        capability = getattr(self._execution_transport, "reset_robot_position_capability", None)
-        if not callable(capability):
+        if not callable(getattr(self._gateway, "reset_robot_position_capability", None)):
             return {"available": False, "reason": "The active Deployment has no qualified simulator position-reset capability"}
         try:
-            return capability()["reset_robot_position"]
-        except HeadlessApiError as error:
+            return self._kernel.reset_robot_position_capability()["reset_robot_position"]
+        except _OWNER_CALL_ERRORS as error:
             return {"available": False, "reason": f"Position-reset capability is unavailable ({error.code})"}
 
     def _require_reset_robot_position_available(self, request: ProgramCycleResetRequest) -> None:
-        capability = getattr(self._execution_transport, "reset_robot_position_capability", None)
+        capable = callable(getattr(self._gateway, "reset_robot_position_capability", None))
         try:
-            response = None if not callable(capability) else capability()
-        except HeadlessApiError as error:
+            response = self._kernel.reset_robot_position_capability() if capable else None
+        except _OWNER_CALL_ERRORS as error:
             raise ProgramRunnerError(
                 "program_cycle_reset_position_unavailable",
                 str(error),
@@ -6472,9 +6779,9 @@ class ProgramRuntime:
             "expected_deployment_identity": self._reset_position_identity,
         }
         try:
-            self._execution_transport.reset_robot_position(body)
+            self._kernel.reset_robot_position(body)
         except Exception as error:
-            if isinstance(error, HeadlessApiError) and error.details.get("effect_disposition") == "known_no_effect":
+            if isinstance(error, _OWNER_CALL_ERRORS) and error.details.get("effect_disposition") == "known_no_effect":
                 raise ProgramRunnerError(
                     error.code, str(error),
                     producer=error.producer,
@@ -6554,9 +6861,12 @@ class ProgramRuntime:
     def _require_same_reset_options(
         request: ProgramCycleResetRequest, accepted: ProgramCycleResetRequest
     ) -> None:
-        if (request.reload_initial_scene, request.reset_robot_position) != (
+        if (
+            request.reload_initial_scene, request.reset_robot_position, request.reset_stored_values,
+        ) != (
             accepted.reload_initial_scene,
             accepted.reset_robot_position,
+            accepted.reset_stored_values,
         ):
             raise ProgramRunnerError(
                 "program_run_request_conflict",
@@ -6787,6 +7097,10 @@ class ProgramRuntime:
                 released = self._release_reset_effect_claim(
                     admission, journal, settle_unknown=settle_unknown
                 )
+            elif request.reset_stored_values:
+                # No effect phase: a refusal leaves the cycle Idle and the
+                # values as they are; Reset again retries.
+                self._reset_persistent_keys_to_initial(request)
             result = {
                 "schema_version": "manyforge.program_cycle_reset_result.v1",
                 "program_run_id": None,
@@ -6937,6 +7251,22 @@ class ProgramRuntime:
         self._record_reset(request, None)
         return result
 
+    def _record_scene_change(self, record: Mapping[str, Any]) -> None:
+        """One scene change outside a Program node into History (OD-375): the
+        runner commits at the Manager, so it sends the record Headless's
+        scene route used to write for it."""
+
+        try:
+            self._headless.record_scene_change(
+                {**record, "application_start_id": self.application_start_id}
+            )
+        except Exception:  # noqa: BLE001 - a lost History line never fails the change
+            _LOGGER.warning(
+                "scene_change_record_failed",
+                extra={"operation_kind": record.get("operation_kind")},
+                exc_info=True,
+            )
+
     def _record_reset(
         self, request: ProgramCycleResetRequest, error: Exception | None
     ) -> None:
@@ -6949,6 +7279,7 @@ class ProgramRuntime:
             "reset": {
                 "reload_initial_scene": request.reload_initial_scene,
                 "reset_robot_position": request.reset_robot_position,
+                "reset_stored_values": request.reset_stored_values,
                 "program_run_id": request.program_run_id,
                 # Set only when this Reset reloaded and verified the scene.
                 **(_reset_of_thread.scene or dict.fromkeys((
@@ -7556,8 +7887,10 @@ class ProgramRuntime:
             self._control_state_observers.clear()
         errors: list[Exception] = []
         self._retire_bbkey_publishers()
-        # The subscription loop sees its flag within one receive slice.
+        # Closing the core's follower ends its subscription's wait at once.
         self._interrupt_state_stop.set()
+        if self._events is not None:
+            self._events.close()
         follower = self._interrupt_state_follower
         if follower is not None:
             follower.join()

@@ -29,6 +29,8 @@ SCHEMA_VERSION: Final = 12
 # How many of the most recent completed persistent-value requests are kept.
 MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS: Final = 16_384
 MAXIMUM_FINISHED_HISTORY_BYTES: Final = 256 * 1024 * 1024
+# Run-status members kept in memory only (``program_run_status.v6``).
+_MEMORY_ONLY_RUN_FIELDS: Final = ("node_running_since_utc_ns", "node_wait_values")
 _LOGGER = logging.getLogger(__name__)
 _REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
     "program_cycle_metadata": f"""
@@ -936,7 +938,9 @@ class ProgramCycleJournal:
                     # Missing selectors in a request mean off.
                     retained_intent = self._load(current[1])
                     compared_intent = dict(intent)
-                    for key in ("reload_initial_scene", "reset_robot_position"):
+                    for key in (
+                        "reload_initial_scene", "reset_robot_position", "reset_stored_values",
+                    ):
                         retained_intent.setdefault(key, False)
                         compared_intent.setdefault(key, False)
                     same_intent = self._dump(retained_intent) == self._dump(compared_intent)
@@ -1088,6 +1092,9 @@ class ProgramCycleJournal:
         stage = self._stage
         assert stage is not None
         program_run_id, revision = self._run_snapshot_identity(snapshot)
+        # The run status's running-node presentation is memory only: never
+        # written, and never part of a revision's retained identity.
+        snapshot = {**snapshot, **{name: {} for name in _MEMORY_ONLY_RUN_FIELDS if name in snapshot}}
         encoded = self._dump(snapshot)
         assert encoded is not None
         terminal = int(snapshot.get("state") in _TERMINAL_RUN_STATES)

@@ -18,6 +18,7 @@ from manyforge_operator import (
     ResourceKind,
     RuntimeArtifactIdentity,
     SERVICE_PORTS,
+    STATUS_SCHEMA,
     ServiceEndpoint,
     ServiceKind,
     SourceIdentityV1,
@@ -109,7 +110,6 @@ def make_configuration(
             bind_host={
                 ServiceKind.COMPOSER: "0.0.0.0",
                 ServiceKind.HEADLESS: "127.0.0.1",
-                ServiceKind.PROGRAM_RUNNER: "127.0.0.1",
             }[service],
             port=SERVICE_PORTS[service.value],
             advertised_host="runtime-host",
@@ -214,7 +214,7 @@ def make_status(
     ]
     readiness = [make_readiness()] if state is LaunchInstanceState.READY else []
     return LaunchInstanceStatus(
-        schema_version="manyforge.launch_instance_status.v2",
+        schema_version=STATUS_SCHEMA,
         launch_instance_id="launch-1",
         record_generation=1,
         configuration=configuration,

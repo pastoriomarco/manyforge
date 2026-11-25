@@ -2178,7 +2178,8 @@ TEST(RetainedRos2ControlRuntimeHandle, AProcessOnlyBindingObservesTheProcessWith
   const auto exited = std::make_shared<std::optional<std::string>>();
   handle->InstallControllerProcessFaultSource(
       [exited] { return *exited; },
-      [exited] { return core::Result<std::optional<std::string>>::Ok(*exited); });
+      [exited] { return core::Result<std::optional<std::string>>::Ok(*exited); },
+      [] { return std::string("driver: connection refused"); });
   handle->StartBackend();
   EXPECT_EQ(observe().lifecycle, core::ComponentLifecycle::kOffline);
   fake::FakeControllerManager manager(prefix + "/controller_manager", "arm_controller",
@@ -2188,9 +2189,13 @@ TEST(RetainedRos2ControlRuntimeHandle, AProcessOnlyBindingObservesTheProcessWith
   const auto running = handle->ReadObservation(clock->now());
   EXPECT_FALSE(running.controller_loaded);
   EXPECT_FALSE(running.process_fault.has_value());
+  EXPECT_TRUE(running.process_output_tail.empty());
   EXPECT_NE(observe().lifecycle, core::ComponentLifecycle::kOffline);
   *exited = "the launch exited";
-  EXPECT_EQ(observe().lifecycle, core::ComponentLifecycle::kFault);
+  const auto faulted = observe();
+  EXPECT_EQ(faulted.lifecycle, core::ComponentLifecycle::kFault);
+  // The exited launch's last output lines are the fault's detail.
+  EXPECT_EQ(faulted.fault->details.at("output_tail"), "driver: connection refused");
 }
 
 TEST(RetainedRos2ControlRuntimeHandle, MachineExecutorFaultNamesItsOwner) {

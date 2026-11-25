@@ -30,6 +30,16 @@ class OwnerTaskObservationUnavailableError(RuntimeError):
     """The exact accepted owner task is temporarily unavailable to observe."""
 
 
+class OwnerTaskReadRequiredError(RuntimeError):
+    """An owner task's observation needs a read from its owner, which a tick
+    never makes: ``read`` makes it (the node sends it on its run's sender)
+    and returns the task's snapshot, raising what an observation raises."""
+
+    def __init__(self, read: Callable[[], Any]) -> None:
+        super().__init__("the owner task observation needs a read from its owner")
+        self.read = read
+
+
 class ProgramSelectionReleaseRejectedError(RuntimeError):
     """The owner explicitly refused a selection release before changing holds.
 
@@ -493,13 +503,25 @@ class MockSimulationPort(Protocol):
     def start(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
     def end(self, start_request: Mapping[str, Any]) -> None:
-        """The attempt of this exact start ended (once per
-        attempt; never for a Halt). An unknown reply keeps that exact END
-        pending until ``resend_unknown_ends`` gets its ACK."""
+        """Memory only: the attempt of this exact start ended (once per
+        attempt; never for a Halt); its END is pending until
+        ``resend_unknown_ends`` gets its ACK."""
         ...
 
     def resend_unknown_ends(self, program_run_id: int) -> tuple[Mapping[str, Any], ...]:
-        """Resend the Run's pending ENDs unchanged; those still unanswered."""
+        """Send the Run's pending ENDs unchanged; those still unanswered."""
+        ...
+
+    def resend_run_pause(
+        self, program_run_id: int
+    ) -> tuple[tuple[Mapping[str, Any], ...], Mapping[str, Any] | None]:
+        """Send the Run's unanswered Halt state: (superseded states never
+        answered; the current state if still unanswered)."""
+        ...
+
+    def settlement_due(self, program_run_id: int) -> bool:
+        """Memory only: an END or Halt state of the Run is still to be sent
+        or reported."""
         ...
 
     def set_run_paused(
@@ -522,7 +544,7 @@ class MockSimulationPort(Protocol):
         held_node_instance_ids: Sequence[str] = (),
     ) -> None:
         """As ``set_run_paused``, but memory only: nothing is sent here; the
-        Run's tick sends it (``resend_run_pause``)."""
+        Run's sender sends it (``resend_run_pause``)."""
         ...
 
 
@@ -932,6 +954,10 @@ class NodeAdapterPorts:
     # The facts of each finished node attempt (OD-375), called on the run's
     # tick: it must not block. None records no attempts.
     node_attempt_history: Callable[[Mapping[str, Any]], None] | None = None
+    # The runs' wake set (S2: ``manyforge_headless_py.WakeSet``): each run's
+    # sender wakes its run with an answer and registers the operations and
+    # planning jobs whose pushed changes wake it. None: the period only.
+    run_wake: Any = None
 
 
 # The Kernel execution states of a failure and of an interruption.
@@ -1035,6 +1061,7 @@ __all__ = [
     "OwnerInvocationRefusedByPriorityError",
     "OwnerTaskPort",
     "OwnerTaskObservationUnavailableError",
+    "OwnerTaskReadRequiredError",
     "OwnerTaskSettlementPendingError",
     "PoseSourceLatchError",
     "OwnerTaskSnapshot",

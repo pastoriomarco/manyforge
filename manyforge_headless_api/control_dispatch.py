@@ -277,6 +277,7 @@ class HeadlessExecutionControlDispatch:
             selected = {
                 "reload_initial_scene": model.reload_initial_scene,
                 "reset_robot_position": model.reset_robot_position,
+                "reset_stored_values": model.reset_stored_values,
             }
             accepted = cycle.get("reset_options")
             if not isinstance(accepted, dict) or accepted != selected:

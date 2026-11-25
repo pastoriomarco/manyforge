@@ -332,6 +332,7 @@ from starlette.responses import JSONResponse
 
 from manyforge_headless_api import service as service_module
 from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.tests.fake_gateway import FakeGateway
 from manyforge_headless_api.service import (
     VOLATILE_MOTION_TRACE_MARGIN_BYTES,
     VOLATILE_MOTION_TRACE_MAX_BYTES,
@@ -454,10 +455,8 @@ def test_debug_export_replaces_whole_inflated_trace_by_marker(monkeypatch):
 
 
 def _trace_client(response):
-    client = object.__new__(ExecutionCommandClient)
-    client._attribution_transport = "internal"
     sent = []
-    client._exchange = lambda command: sent.append(command) or response
+    client = ExecutionCommandClient(FakeGateway(lambda command: sent.append(command) or response))
     return client, sent
 
 
@@ -473,15 +472,11 @@ def test_execution_client_reads_volatile_trace_with_attributed_allowance():
     assert sent == [
         {
             "api_version": "manyforge.execution_command.v4",
-            "attribution": {"transport": "internal", "assurance": "unverified", "principal_id": None},
             "command": "read_volatile_motion_trace",
             "allowance_bytes": 4096,
         }
     ]
     for bad in (
-        {**ok, "command": "status"},
-        {**ok, "trace": []},
-        {**ok, "trace": {**_TRACE, "schema_version": "manyforge.volatile_motion_trace.v1"}},
         {"api_version": ok["api_version"], "ok": False,
          "error": {"code": "unknown_command", "message": "unsupported"}},
     ):

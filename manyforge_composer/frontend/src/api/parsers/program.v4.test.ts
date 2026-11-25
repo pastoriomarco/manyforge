@@ -6,7 +6,7 @@ const node = { node_id: 'orchestration.wait', instance_id: 'wait', parameters: {
 const program = () => ({
   api_version: 'manyforge.program.v4',
   program_revision: `sha256:${'a'.repeat(64)}`,
-  program_profile: 'composable-cell-v1',
+  program_profile: 'manyforge-cell-v1',
   catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
   scene: [{
     scene_resource_id: 'table',

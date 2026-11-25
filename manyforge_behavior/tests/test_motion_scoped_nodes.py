@@ -22,7 +22,7 @@ def test_motion_scoped_nodes_fail_before_kernel_or_signal_access(node_type: type
     poison = PoisonInput()
     with pytest.raises(
         MotionScopedNodeUnavailableError,
-        match="composable_cell_motion_scoped_node_unavailable",
+        match="motion_scoped_node_unavailable",
     ):
         node_type(poison, kernel=poison, signal=poison)
 
@@ -34,6 +34,6 @@ def test_motion_transaction_fails_before_kernel_access() -> None:
 
     with pytest.raises(
         MotionTransactionOwnerUnavailableError,
-        match="composable_cell_motion_transaction_owner_unavailable",
+        match="motion_transaction_owner_unavailable",
     ):
         MotionExecutionCoordinator(PoisonKernel())

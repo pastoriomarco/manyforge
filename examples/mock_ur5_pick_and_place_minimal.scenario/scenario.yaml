@@ -7,11 +7,11 @@
   "description": "Mock UR5 pick and place with the smallest set of Program nodes. Load and Execute it to watch a single pick and place.",
   "members": {
     "deployment.yaml": "sha256:43e152c6662a53944c9201bd020d017d6354caabe21b75052c6644d41452b17b",
-    "program.yaml": "sha256:5e3bb183b90615bc4dd817af826a5736ba88fff77a2ff67d4789ed584273a988"
+    "program.yaml": "sha256:1221a466a4218eb4c7bb5793fa82d72f144666320783b3cf4c16b9f9036527bb"
   },
   "name": "mock_ur5_pick_and_place_minimal",
   "saved_status": {
-    "checked_content_digest": "sha256:b595b976b009eb30c56a8af24ecfc08b096cd9b61f481654d70b8d1787cab56b",
+    "checked_content_digest": "sha256:2656e9e0e9ec27f763a8de2788d8766be94eaf1351056b454e3be0b891b45481",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

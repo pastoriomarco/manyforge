@@ -1,30 +1,49 @@
-"""Private HTTP surface of the independently restartable Program runner."""
+"""The Program runner's private command and status sockets.
+
+Headless reaches the runner through two core-served sockets in the socket
+root (``manyforge_headless_py.ProgramCommandServer`` on
+``program-command.sock``, ``ProgramStatusPublisher`` on
+``program-status.sock``). This module dispatches each received command to the
+runtime and publishes the Program control state; the core moves the bytes.
+
+- Commands (Execute, Run, Resume, Reset, recovery, handover, value writes,
+  manual result) are answered at their acceptance through
+  ``runtime.run_command`` (OD-214), on the bounded ordinary lane: two
+  workers, two admitted, a third refused at once with
+  ``execution_control_ingress_busy``. The scene preparation and the
+  persistent-value reconciliation use the same lane.
+- Reads run concurrently on their own pool.
+- Status: one publisher thread follows the read requests of the core's
+  publisher (each runtime control-state wake, and a subscriber that connects
+  while the state is withdrawn), classifies each cycle against the last one
+  published, holds a ``node_progress``-only change until 50 ms after the last
+  publication unless a critical change comes, completes the cycle with the
+  Reset-position availability (one execution-host read, only for a cycle it
+  publishes) and hands it to the core, which sends the newest value to each
+  subscriber. A state it cannot read is withdrawn: the subscribers it reaches
+  end with its error, and each reconnecting one asks for a fresh read.
+- A socket another runner serves (or one that cannot be bound) refuses the
+  start with ``program_runner_socket_unavailable``.
+"""
 
 from __future__ import annotations
 
-import asyncio
-from contextlib import suppress
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-import json
-from threading import Lock
+import logging
+from pathlib import Path
+from threading import BoundedSemaphore, Thread
 import time
-from collections.abc import Callable
-from typing import Annotated, Any, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-from fastapi import FastAPI, Path, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ValidationError
 
-from manyforge_headless_api.app import RequestBodyLimitMiddleware
-from manyforge_headless_api.component_model import RUN_REFUSAL_CODES
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
-    ExecutionControlClient,
+    ExecutionControlLane,
 )
-from manyforge_headless_api.program_cycle import (
-    PROGRAM_CONTROL_STATE_SCHEMA,
-    program_cycle_event_class,
-)
+from manyforge_headless_api.program_cycle import program_cycle_event_class
 from manyforge_headless_api.models import (
     ProgramHaltResumeRequest,
     ProgramRunStartRequest,
@@ -49,192 +68,22 @@ from .heap_settle import settle_heap
 from .runtime import ProgramRunnerError
 
 
-_MAXIMUM_PROGRAM_CONTROL_CLIENTS = 4
-_MAXIMUM_PROGRAM_CONTROL_MESSAGE_BYTES = 16 * 1024 * 1024
+_LOGGER = logging.getLogger(__name__)
 _NODE_PROGRESS_PERIOD_NS = 50_000_000
+_MAXIMUM_PROGRAM_RUN_ID = 9_007_199_254_740_991
+# The ordinary lane of the former HTTP surface (ExecutionControlClient's
+# default ordinary lane): two workers, two admitted, no waiting.
+_LANE_WORKERS = 2
+# Concurrent reads: the worker bound the former HTTP surface ran its plain
+# reads on (the default thread limit of its server).
+_READ_WORKERS = 40
+# Headless's code and text for a request the runner refuses as malformed.
+_MALFORMED_REQUEST_CODE = "program_runner_http_error"
+_MALFORMED_REQUEST_MESSAGE = "Program runner returned HTTP 422"
 
 
-@dataclass(eq=False)
-class _ProgramControlSubscription:
-    wake: asyncio.Event
-    closed: bool = False
-
-
-class ProgramControlStateSource:
-    """Thread-safe capacity-one wake source over current Program owner state."""
-
-    def __init__(self, runtime: Any, *, clock_ns=time.monotonic_ns) -> None:
-        add = getattr(runtime, "add_control_state_observer", None)
-        remove = getattr(runtime, "remove_control_state_observer", None)
-        if not callable(add) or not callable(remove):
-            raise TypeError("Program runtime has no control-state observation port")
-        self._runtime = runtime
-        self._add = add
-        self._remove = remove
-        self._clock_ns = clock_ns
-        self._lock = Lock()
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._subscriptions: set[_ProgramControlSubscription] = set()
-        self._registered = False
-        self._closed = False
-
-    def subscribe(self) -> _ProgramControlSubscription:
-        loop = asyncio.get_running_loop()
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Program control-state source is closed")
-            if self._loop is not None and self._loop is not loop:
-                raise RuntimeError("Program control-state source crossed event loops")
-            if len(self._subscriptions) >= _MAXIMUM_PROGRAM_CONTROL_CLIENTS:
-                raise RuntimeError("Program control-state client limit reached")
-            self._loop = loop
-            subscription = _ProgramControlSubscription(asyncio.Event())
-            self._subscriptions.add(subscription)
-            register = not self._registered
-            if register:
-                self._registered = True
-        if register:
-            self._add(self.notify)
-        subscription.wake.set()
-        return subscription
-
-    def unsubscribe(self, subscription: _ProgramControlSubscription) -> None:
-        with self._lock:
-            subscription.closed = True
-            subscription.wake.set()
-            self._subscriptions.discard(subscription)
-            unregister = self._registered and not self._subscriptions
-            if unregister:
-                self._registered = False
-                self._loop = None
-        if unregister:
-            self._remove(self.notify)
-
-    def notify(self) -> None:
-        with self._lock:
-            loop = self._loop
-            subscriptions = tuple(self._subscriptions)
-        if loop is None:
-            return
-        for subscription in subscriptions:
-            if not subscription.closed:
-                loop.call_soon_threadsafe(subscription.wake.set)
-
-    def snapshot(self) -> tuple[dict[str, Any], int]:
-        """The cycle for classification; it lacks the Reset-position read."""
-        return self._runtime.cycle_projection(), self._clock_ns()
-
-    def complete(self, cycle: dict[str, Any]) -> dict[str, Any]:
-        """Add the Reset-position availability to the frame about to be sent."""
-        return self._runtime.add_reset_robot_position(cycle)
-
-    def clock_ns(self) -> int:
-        return self._clock_ns()
-
-    def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            subscriptions = tuple(self._subscriptions)
-        for subscription in subscriptions:
-            self.unsubscribe(subscription)
-
-
-async def _serve_program_control_state(
-    websocket: WebSocket,
-    source: ProgramControlStateSource,
-) -> None:
-    await websocket.accept()
-    try:
-        subscription = source.subscribe()
-    except RuntimeError:
-        # The peer may already have abandoned the handshake while overload is
-        # being rejected. Rejection must remain bounded and must not turn that
-        # ordinary race into an ASGI exception storm.
-        with suppress(RuntimeError, WebSocketDisconnect):
-            await websocket.close(
-                code=1013,
-                reason="Program control-state unavailable",
-            )
-        return
-    sequence = 0
-    previous_cycle: dict[str, Any] | None = None
-    last_node_send_ns = 0
-    disconnect = asyncio.create_task(websocket.receive())
-    try:
-        while not subscription.closed:
-            wake = asyncio.create_task(subscription.wake.wait())
-            ready, _pending = await asyncio.wait(
-                (wake, disconnect),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if disconnect in ready:
-                if not wake.done():
-                    wake.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await wake
-                message = disconnect.result()
-                if message.get("type") != "websocket.disconnect":
-                    await websocket.close(
-                        code=1008,
-                        reason="Program control state is server-only",
-                    )
-                return
-            subscription.wake.clear()
-            cycle, observed_ns = await asyncio.to_thread(source.snapshot)
-            event_class = program_cycle_event_class(previous_cycle, cycle)
-            node_only = event_class == "node_progress"
-            remaining_ns = _NODE_PROGRESS_PERIOD_NS - (observed_ns - last_node_send_ns)
-            if node_only and remaining_ns > 0:
-                deadline_ns = observed_ns + remaining_ns
-                while node_only:
-                    timeout = max(
-                        0.0,
-                        (deadline_ns - source.clock_ns()) / 1_000_000_000,
-                    )
-                    if timeout == 0.0:
-                        break
-                    try:
-                        await asyncio.wait_for(subscription.wake.wait(), timeout)
-                    except asyncio.TimeoutError:
-                        break
-                    subscription.wake.clear()
-                    cycle, observed_ns = await asyncio.to_thread(source.snapshot)
-                    node_only = (
-                        program_cycle_event_class(previous_cycle, cycle)
-                        == "node_progress"
-                    )
-                cycle, observed_ns = await asyncio.to_thread(source.snapshot)
-                event_class = program_cycle_event_class(previous_cycle, cycle)
-            cycle = await asyncio.to_thread(source.complete, cycle)
-            sequence += 1
-            payload = json.dumps(
-                {
-                    "schema_version": PROGRAM_CONTROL_STATE_SCHEMA,
-                    "server_sequence": str(sequence),
-                    "event_class": event_class,
-                    "program_cycle": cycle,
-                },
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            if len(payload.encode("utf-8")) > _MAXIMUM_PROGRAM_CONTROL_MESSAGE_BYTES:
-                await websocket.close(
-                    code=1009, reason="Program control state oversized"
-                )
-                return
-            await websocket.send_text(payload)
-            previous_cycle = cycle
-            last_node_send_ns = observed_ns
-    except (WebSocketDisconnect, RuntimeError):
-        pass
-    finally:
-        if not disconnect.done():
-            disconnect.cancel()
-            with suppress(asyncio.CancelledError):
-                await disconnect
-        source.unsubscribe(subscription)
+class _MalformedRequest(Exception):
+    """A request that does not fit its command (the former HTTP 422)."""
 
 
 @runtime_checkable
@@ -328,312 +177,483 @@ class ProgramRunnerApplicationPort(Protocol):
     ) -> dict[str, Any]: ...
 
 
-def _status(code: str) -> int:
-    if code == "program_run_started_then_failed":
-        return 422
-    if code.endswith("_not_found"):
-        return 404
-    if (
-        code.endswith("_stale")
-        or code.endswith("_conflict")
-        or code
-        in {
-            "authoring_not_ready",
-            "program_run_already_active",
-            "program_run_draft_applied_mismatch",
-            "persistent_key_request_replayed",
-            "stale_generation",
-        }
-        # RunReadiness reasons and run refusals.
-        or code in RUN_REFUSAL_CODES
-    ):
-        return 409
-    if (
-        "unavailable" in code
-        or code.endswith("_unknown")
-        or code.endswith("_uncertain")
-        or code.endswith("_in_progress")
-        or code.endswith("_ledger_full")
-        or code == "program_cycle_reconciliation_required"
-        or code == "execution_control_ingress_busy"
-    ):
-        return 503
-    if (
-        code.endswith("_invalid")
-        or code.endswith("_failed")
-        or code == "request_key_required"
-    ):
-        return 400
-    return 500
+# ---------------------------------------------------------------------------
+# Request decoding: each command's members, checked as the former routes did.
+# ---------------------------------------------------------------------------
 
 
-def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
-    if not isinstance(runtime, ProgramRunnerApplicationPort):
-        raise TypeError("Program-runner app requires one application port")
+def _members(request: Mapping[str, Any], names: set[str]) -> None:
+    if set(request) != names:
+        raise _MalformedRequest()
 
-    execution_controls = ExecutionControlClient(
-        thread_name_prefix="manyforge_program_runner_control",
+
+def _program_run_id(request: Mapping[str, Any]) -> int:
+    value = request.get("program_run_id")
+    if type(value) is not int or not 1 <= value <= _MAXIMUM_PROGRAM_RUN_ID:
+        raise _MalformedRequest()
+    return value
+
+
+def _body(model: type[BaseModel]) -> Callable[[Mapping[str, Any]], Any]:
+    def decode(request: Mapping[str, Any]) -> Any:
+        return model.model_validate(request)
+
+    return decode
+
+
+def _run_body(
+    model: type[BaseModel], mismatch: str | None = None
+) -> Callable[[Mapping[str, Any]], Any]:
+    """``{program_run_id, body}`` of a run-scoped request; ``mismatch``: the
+    body names its run too, and another one is refused with this text."""
+
+    def decode(request: Mapping[str, Any]) -> Any:
+        _members(request, {"program_run_id", "body"})
+        run_id = _program_run_id(request)
+        body = model.model_validate(request["body"])
+        if mismatch is not None and body.program_run_id != run_id:
+            raise ProgramRunnerError("program_run_path_invalid", mismatch)
+        return run_id, body
+
+    return decode
+
+
+def _run_only(request: Mapping[str, Any]) -> int:
+    _members(request, {"program_run_id"})
+    return _program_run_id(request)
+
+
+def _nothing(request: Mapping[str, Any]) -> None:
+    _members(request, set())
+
+
+def _runs_query(request: Mapping[str, Any]) -> tuple[bool, int]:
+    if not set(request) <= {"active_only", "limit"}:
+        raise _MalformedRequest()
+    active_only = request.get("active_only", False)
+    limit = request.get("limit", 128)
+    if type(active_only) is not bool or type(limit) is not int or not 1 <= limit <= 4_096:
+        raise _MalformedRequest()
+    return active_only, limit
+
+
+@dataclass(frozen=True, slots=True)
+class _Route:
+    """One command: how its request decodes and what answers it.
+
+    ``kind``: ``read`` (the read pool), ``lane`` (the ordinary lane, answered
+    after the work) or ``command`` (the ordinary lane, answered at the
+    command's acceptance through ``runtime.run_command``).
+    """
+
+    kind: str
+    decode: Callable[[Mapping[str, Any]], Any]
+    call: Callable[[Any, Any], Any]
+
+
+_PATH_MISMATCH = "Program-run path and body must match"
+
+
+def _routes() -> dict[str, _Route]:
+    def scoped(method: str):
+        def call(runtime: Any, decoded: Any) -> Any:
+            run_id, body = decoded
+            return body, lambda: getattr(runtime, method)(run_id, body)
+
+        return call
+
+    def unscoped(method: str):
+        def call(runtime: Any, body: Any) -> Any:
+            return body, lambda: getattr(runtime, method)(body)
+
+        return call
+
+    return {
+        "health": _Route("read", _nothing, lambda runtime, _: runtime.health()),
+        "diagnostic_health": _Route(
+            "read", _nothing, lambda runtime, _: runtime.diagnostic_health()
+        ),
+        "node_availability": _Route(
+            "read",
+            _body(ProgramNodeAvailabilityRequest),
+            lambda runtime, body: runtime.node_availability(body),
+        ),
+        "runs": _Route(
+            "read",
+            _runs_query,
+            lambda runtime, query: runtime.runs(active_only=query[0], limit=query[1]),
+        ),
+        "start_run": _Route(
+            "command", _body(ProgramRunStartRequest), unscoped("start_run")
+        ),
+        "prepare_applied_scene": _Route(
+            "lane",
+            _body(ProgramScenePreparationRequest),
+            lambda runtime, body: runtime.prepare_applied_scene(body),
+        ),
+        "read_run": _Route(
+            "read", _run_only, lambda runtime, run_id: runtime.read_run(run_id)
+        ),
+        # Effect-free preview intent of one held motion node; not a control.
+        "preview_node_correction": _Route(
+            "read",
+            _run_body(ProgramNodeCorrectionPreviewRequest),
+            lambda runtime, decoded: runtime.preview_node_correction(*decoded),
+        ),
+        "resume_motion": _Route(
+            "command",
+            _run_body(ProgramSelectionResumeRequest, _PATH_MISMATCH),
+            scoped("resume_motion"),
+        ),
+        "start_motion": _Route(
+            "command",
+            _run_body(ProgramSelectionStartRequest, _PATH_MISMATCH),
+            scoped("start_motion"),
+        ),
+        "prepare_manual_handover": _Route(
+            "command",
+            _run_body(ProgramManualHandoverRequest, _PATH_MISMATCH),
+            scoped("prepare_manual_handover"),
+        ),
+        "resume_halt": _Route(
+            "command",
+            _run_body(
+                ProgramHaltResumeRequest,
+                "Program-run identity in path and body must match",
+            ),
+            scoped("resume_halt"),
+        ),
+        "read_runtime_controls": _Route(
+            "read",
+            _run_only,
+            lambda runtime, run_id: runtime.read_runtime_controls(run_id),
+        ),
+        "read_runtime_blackboard": _Route(
+            "read",
+            _run_only,
+            lambda runtime, run_id: runtime.read_runtime_blackboard(run_id),
+        ),
+        "write_runtime_blackboard": _Route(
+            "command",
+            _run_body(RuntimeBlackboardWriteRequest),
+            scoped("write_runtime_blackboard"),
+        ),
+        "stage_manual_result": _Route(
+            "command",
+            _run_body(ManualResultStageRequest),
+            scoped("stage_manual_result"),
+        ),
+        # Values of the Applied Scenario project; an edit names the project
+        # folder the operator saw (`project_path`) and another one is refused.
+        "read_persistent_values": _Route(
+            "read", _nothing, lambda runtime, _: runtime.read_persistent_values()
+        ),
+        "set_persistent_value": _Route(
+            "command",
+            _body(PersistentKeyValueSetRequest),
+            unscoped("set_persistent_value"),
+        ),
+        "reset_persistent_value": _Route(
+            "command",
+            _body(PersistentKeyValueResetRequest),
+            unscoped("reset_persistent_value"),
+        ),
+        "clear_persistent_values": _Route(
+            "command",
+            _body(PersistentKeyValuesClearRequest),
+            unscoped("clear_persistent_values"),
+        ),
+        # Headless observed a committed Apply; the runner reads it itself.
+        "reconcile_persistent_values": _Route(
+            "lane",
+            _nothing,
+            lambda runtime, _: runtime.reconcile_persistent_values(),
+        ),
+        "apply_recovery_action": _Route(
+            "command",
+            _body(CycleRecoveryActionRequest),
+            unscoped("apply_recovery_action"),
+        ),
+        "reset_cycle": _Route(
+            "command", _body(ProgramCycleResetRequest), unscoped("reset_cycle")
+        ),
+        "cycle_status": _Route(
+            "read", _nothing, lambda runtime, _: runtime.cycle_status()
+        ),
+    }
+
+
+PROGRAM_RUNNER_COMMANDS = frozenset(_routes())
+
+
+def _error_reply(code: str, message: str, details: Mapping[str, Any], producer: str):
+    return {
+        "ok": False,
+        "error": {
+            "code": code,
+            "details": dict(details),
+            "message": message,
+            "producer": producer or "program_runner",
+        },
+    }
+
+
+def _reply_for(error: Exception) -> dict[str, Any]:
+    if isinstance(error, ProgramRunnerError):
+        return _error_reply(error.code, str(error), error.details, error.producer)
+    if isinstance(error, (ValidationError, _MalformedRequest)):
+        return _error_reply(
+            _MALFORMED_REQUEST_CODE, _MALFORMED_REQUEST_MESSAGE, {}, "program_runner"
+        )
+    # An unexpected failure: Headless reports the runner's answer invalid,
+    # as it did for the HTTP surface's plain-text 500.
+    _LOGGER.error("Program-runner command failed", exc_info=error)
+    return _error_reply(
+        "program_runner_response_invalid",
+        "Program runner returned an invalid response",
+        {},
+        "program_runner",
     )
-    try:
-        control_state_source: ProgramControlStateSource | None = (
-            ProgramControlStateSource(runtime)
-        )
-    except TypeError:
-        control_state_source = None
 
-    async def control_call(callback):
-        try:
-            # Keep JSON traversal/encoding in the bounded transport worker,
-            # off the shared ASGI loop.
-            return await execution_controls.ordinary(
-                lambda: JSONResponse(content=callback())
-            )
-        except ExecutionControlBusyError as error:
-            raise ProgramRunnerError(
-                "execution_control_ingress_busy",
-                str(error),
-                details={
-                    "lane": error.lane.value,
-                    "maximum_admitted": error.maximum_admitted,
-                },
-            ) from error
 
-    async def command_call(request: Any, command):
-        # OD-214: answered once the command is accepted (or ended at once);
-        # the command runs on to its end under the runner's slot.
-        return await control_call(
-            lambda: runtime.run_command(request.request_key, command)
+# ---------------------------------------------------------------------------
+# Status publication.
+# ---------------------------------------------------------------------------
+
+
+class _ProgramStatusPump:
+    """Publishes the Program control state on each read request (see module)."""
+
+    def __init__(self, runtime: Any, publisher: Any, *, clock_ns=time.monotonic_ns) -> None:
+        self._runtime = runtime
+        self._publisher = publisher
+        self._clock_ns = clock_ns
+        # One bound callable: the runtime's observer set removes the same one.
+        self._wake = publisher.request_read
+        self._stop = False
+        self._thread = Thread(
+            target=self._run, name="manyforge_program_runner_status", daemon=True
         )
 
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI):
-        runtime.start()
+    def start(self) -> None:
+        self._runtime.add_control_state_observer(self._wake)
+        self._wake()
+        self._thread.start()
+
+    def close(self) -> None:
+        self._runtime.remove_control_state_observer(self._wake)
+        self._stop = True
+        self._wake()
+        if self._thread.is_alive():
+            self._thread.join()
+
+    def _snapshot(self) -> tuple[dict[str, Any], int]:
+        """The cycle for classification; it lacks the Reset-position read."""
+
+        return self._runtime.cycle_projection(), self._clock_ns()
+
+    def _run(self) -> None:
+        previous: dict[str, Any] | None = None
+        last_publication_ns = 0
+        while True:
+            # False only once the publisher is closed.
+            if not self._publisher.wait_read_request() or self._stop:
+                return
+            try:
+                cycle, observed_ns = self._snapshot()
+                event_class = program_cycle_event_class(previous, cycle)
+                remaining_ns = _NODE_PROGRESS_PERIOD_NS - (
+                    observed_ns - last_publication_ns
+                )
+                if event_class == "node_progress" and remaining_ns > 0:
+                    deadline_ns = observed_ns + remaining_ns
+                    node_only = True
+                    while node_only:
+                        timeout = (deadline_ns - self._clock_ns()) / 1_000_000_000
+                        if timeout <= 0 or not self._publisher.wait_read_request(
+                            timeout
+                        ):
+                            break
+                        if self._stop:
+                            return
+                        cycle, observed_ns = self._snapshot()
+                        node_only = (
+                            program_cycle_event_class(previous, cycle)
+                            == "node_progress"
+                        )
+                    cycle, observed_ns = self._snapshot()
+                    event_class = program_cycle_event_class(previous, cycle)
+                cycle = self._runtime.add_reset_robot_position(cycle)
+                self._publisher.publish(cycle, event_class == "critical")
+            except Exception as error:
+                # Subscribers learn that the state is not readable; the next
+                # read request (a runtime wake, or a subscriber connecting
+                # while withdrawn) reads it again. ``previous`` stays the last
+                # published.
+                if not isinstance(error, ProgramRunnerError):
+                    _LOGGER.exception("Program control-state read failed")
+                self._publisher.withdraw(
+                    getattr(error, "code", "program_runner_response_invalid"),
+                    str(error) or type(error).__name__,
+                )
+                continue
+            previous = cycle
+            last_publication_ns = observed_ns
+
+
+# ---------------------------------------------------------------------------
+# The application.
+# ---------------------------------------------------------------------------
+
+
+class ProgramRunnerApplication:
+    """Serves the runtime on the core's Program command and status sockets."""
+
+    def __init__(self, runtime: ProgramRunnerApplicationPort, socket_root: Path) -> None:
+        if not isinstance(runtime, ProgramRunnerApplicationPort):
+            raise TypeError("Program-runner app requires one application port")
+        import manyforge_headless_py as core  # type: ignore[import-not-found]
+
+        self._gateway_error: type[Exception] = core.GatewayError
+        self._runtime = runtime
+        self._routes = _routes()
+        self._commands = core.ProgramCommandServer(str(socket_root))
+        observable = callable(getattr(runtime, "add_control_state_observer", None))
+        self._status = core.ProgramStatusPublisher(str(socket_root)) if observable else None
+        self._pump = (
+            _ProgramStatusPump(runtime, self._status) if self._status is not None else None
+        )
+        self._lane_capacity = BoundedSemaphore(_LANE_WORKERS)
+        self._lane = ThreadPoolExecutor(
+            max_workers=_LANE_WORKERS,
+            thread_name_prefix="manyforge_program_runner_control_ordinary",
+        )
+        self._reads = ThreadPoolExecutor(
+            max_workers=_READ_WORKERS, thread_name_prefix="manyforge_program_runner_read"
+        )
+        self._intake = Thread(
+            target=self._serve_commands,
+            name="manyforge_program_runner_commands",
+            daemon=True,
+        )
+        self._stopping = False
+        self._started = False
+
+    def start(self) -> None:
+        """Start the runtime, then serve (the sockets appear after the start)."""
+
+        self._runtime.start()
+        self._started = True
         # Started and not yet serving (OD-234): no run exists, so the pause
         # of the full collection falls before any command.
         settle_heap("start")
         try:
-            yield
+            if self._status is not None and self._pump is not None:
+                self._status.start()
+                self._pump.start()
+            self._commands.start()
+        except self._gateway_error as error:
+            raise ProgramRunnerError(
+                error.code, error.message, details=error.details, producer=error.producer
+            ) from error
+        self._intake.start()
+
+    def close(self) -> None:
+        """Stop serving, let started work end, then shut the runtime down."""
+
+        self._stopping = True
+        self._commands.close()
+        if self._intake.is_alive():
+            self._intake.join()
+        try:
+            self._lane.shutdown(wait=True)
+            self._reads.shutdown(wait=True)
+            if self._pump is not None:
+                self._pump.close()
+            if self._started:
+                self._runtime.shutdown()
         finally:
-            try:
-                runtime.shutdown()
-            finally:
-                if control_state_source is not None:
-                    control_state_source.close()
-                execution_controls.close()
+            if self._status is not None:
+                self._status.close()
 
-    app = FastAPI(
-        title="ManyForge Program Runner",
-        version="0.4.0",
-        lifespan=lifespan,
-    )
-    app.add_middleware(
-        RequestBodyLimitMiddleware,
-        maximum_bytes=1024 * 1024,
-        error_code="program_runner_request_body_oversized",
-        error_message="Program-runner request body exceeds its byte bound",
-    )
+    def _serve_commands(self) -> None:
+        while not self._stopping:
+            received = self._commands.next(3600.0)
+            if received is None:
+                continue
+            token, envelope = received
+            self._dispatch(token, envelope["command"], envelope["request"])
 
-    @app.exception_handler(ProgramRunnerError)
-    async def program_runner_error(
-        _request: Request,
-        error: ProgramRunnerError,
-    ) -> JSONResponse:
-        return JSONResponse(
-            status_code=_status(error.code),
-            content={
-                "detail": {
-                    "code": error.code,
-                    "details": error.details,
-                    "message": str(error),
-                    "producer": error.producer,
-                }
-            },
-        )
+    def _reply(self, token: int, reply: dict[str, Any]) -> None:
+        try:
+            self._commands.reply(token, reply)
+        except (TypeError, ValueError) as error:
+            # The value has no JSON form: answer the failure instead.
+            self._commands.reply(token, _reply_for(error))
 
-    @app.get("/api/program/health")
-    def health() -> dict[str, Any]:
-        return runtime.health()
-
-    @app.get("/api/program/diagnostics/health")
-    def diagnostic_health() -> dict[str, Any]:
-        return runtime.diagnostic_health()
-
-    @app.post("/api/program/node-availability")
-    def node_availability(
-        request: ProgramNodeAvailabilityRequest,
-    ) -> dict[str, Any]:
-        return runtime.node_availability(request)
-
-    @app.get("/api/program/runs")
-    def runs(
-        active_only: bool = False,
-        limit: Annotated[int, Query(ge=1, le=4_096)] = 128,
-    ) -> dict[str, Any]:
-        return runtime.runs(active_only=active_only, limit=limit)
-
-    @app.post("/api/program/runs")
-    async def start_run(request: ProgramRunStartRequest) -> dict[str, Any]:
-        return await command_call(request, lambda: runtime.start_run(request))
-
-    @app.post("/api/program/scene-preparations")
-    async def prepare_applied_scene(
-        request: ProgramScenePreparationRequest,
-    ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.prepare_applied_scene(request))
-
-    @app.get("/api/program/runs/{program_run_id}")
-    def read_run(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-    ) -> dict[str, Any]:
-        return runtime.read_run(program_run_id)
-
-    @app.post("/api/program/runs/{program_run_id}/node-correction-previews")
-    def preview_node_correction(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-        request: ProgramNodeCorrectionPreviewRequest,
-    ) -> dict[str, Any]:
-        """Effect-free preview intent of one held motion node; not a control."""
-        return runtime.preview_node_correction(program_run_id, request)
-
-    @app.post("/api/program/runs/{program_run_id}/motion-resume")
-    async def resume_motion(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-        request: ProgramSelectionResumeRequest,
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid", "Program-run path and body must match"
-            )
-        return await command_call(
-            request, lambda: runtime.resume_motion(program_run_id, request)
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/motion-start")
-    async def start_motion(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-        request: ProgramSelectionStartRequest,
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid", "Program-run path and body must match"
-            )
-        return await command_call(
-            request, lambda: runtime.start_motion(program_run_id, request)
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/manual-handover")
-    async def prepare_manual_handover(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-        request: ProgramManualHandoverRequest,
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid", "Program-run path and body must match"
-            )
-        return await command_call(
-            request, lambda: runtime.prepare_manual_handover(program_run_id, request)
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/resume-halt")
-    async def resume_halt(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-        request: ProgramHaltResumeRequest,
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
-            )
-        return await command_call(
-            request, lambda: runtime.resume_halt(program_run_id, request)
-        )
-
-    @app.get("/api/program/runs/{program_run_id}/runtime-controls")
-    def read_runtime_controls(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-    ) -> dict[str, Any]:
-        return runtime.read_runtime_controls(program_run_id)
-
-    @app.get("/api/program/runs/{program_run_id}/blackboard-values")
-    def read_runtime_blackboard(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-    ) -> dict[str, Any]:
-        return runtime.read_runtime_blackboard(program_run_id)
-
-    @app.post("/api/program/runs/{program_run_id}/blackboard-values")
-    async def write_runtime_blackboard(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-        request: RuntimeBlackboardWriteRequest,
-    ) -> dict[str, Any]:
-        return await command_call(
-            request, lambda: runtime.write_runtime_blackboard(program_run_id, request)
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/manual-result")
-    async def stage_manual_result(
-        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
-        request: ManualResultStageRequest,
-    ) -> dict[str, Any]:
-        return await command_call(
-            request, lambda: runtime.stage_manual_result(program_run_id, request)
-        )
-
-    # Values of the Applied Scenario project; an edit names the project
-    # folder the operator saw (`project_path`) and another one is refused.
-    @app.get("/api/program/persistent-values")
-    def read_persistent_values() -> dict[str, Any]:
-        return runtime.read_persistent_values()
-
-    @app.post("/api/program/persistent-values")
-    async def set_persistent_value(
-        request: PersistentKeyValueSetRequest,
-    ) -> dict[str, Any]:
-        return await command_call(request, lambda: runtime.set_persistent_value(request))
-
-    @app.post("/api/program/persistent-values/reset")
-    async def reset_persistent_value(
-        request: PersistentKeyValueResetRequest,
-    ) -> dict[str, Any]:
-        return await command_call(request, lambda: runtime.reset_persistent_value(request))
-
-    @app.post("/api/program/persistent-values/clear")
-    async def clear_persistent_values(
-        request: PersistentKeyValuesClearRequest,
-    ) -> dict[str, Any]:
-        return await command_call(request, lambda: runtime.clear_persistent_values(request))
-
-    @app.post("/api/program/persistent-values/reconcile")
-    async def reconcile_persistent_values() -> dict[str, Any]:
-        """Headless observed a committed Apply; the runner reads it itself."""
-
-        return await control_call(runtime.reconcile_persistent_values)
-
-    @app.post("/api/cycle/recovery-actions")
-    async def apply_recovery_action(
-        request: CycleRecoveryActionRequest,
-    ) -> dict[str, Any]:
-        return await command_call(request, lambda: runtime.apply_recovery_action(request))
-
-    @app.post("/api/program/cycle/reset")
-    async def reset_cycle(request: ProgramCycleResetRequest) -> dict[str, Any]:
-        return await command_call(request, lambda: runtime.reset_cycle(request))
-
-    @app.get("/api/cycle/status")
-    def cycle_status() -> dict[str, Any]:
-        return runtime.cycle_status()
-
-    @app.websocket("/ws/program/control-state")
-    async def program_control_state(websocket: WebSocket) -> None:
-        if control_state_source is None:
-            await websocket.close(code=1008, reason="Program control state unavailable")
+    def _dispatch(self, token: int, command: str, request: dict[str, Any]) -> None:
+        route = self._routes.get(command)
+        if route is None:
+            self._reply(token, _reply_for(_MalformedRequest()))
             return
-        await _serve_program_control_state(websocket, control_state_source)
+        if route.kind == "read":
+            self._reads.submit(self._answer_read, token, route, request)
+            return
+        try:
+            decoded = route.decode(request)
+        except Exception as error:
+            self._reply(token, _reply_for(error))
+            return
+        if not self._lane_capacity.acquire(blocking=False):
+            busy = ExecutionControlBusyError(ExecutionControlLane.ORDINARY, _LANE_WORKERS)
+            self._reply(
+                token,
+                _reply_for(
+                    ProgramRunnerError(
+                        "execution_control_ingress_busy",
+                        str(busy),
+                        details={
+                            "lane": busy.lane.value,
+                            "maximum_admitted": busy.maximum_admitted,
+                        },
+                    )
+                ),
+            )
+            return
+        try:
+            self._lane.submit(self._answer_lane, token, route, decoded)
+        except BaseException:
+            self._lane_capacity.release()
+            raise
 
-    return app
+    def _answer_read(self, token: int, route: _Route, request: dict[str, Any]) -> None:
+        try:
+            reply = {"ok": True, "value": route.call(self._runtime, route.decode(request))}
+        except Exception as error:
+            reply = _reply_for(error)
+        self._reply(token, reply)
+
+    def _answer_lane(self, token: int, route: _Route, decoded: Any) -> None:
+        try:
+            try:
+                if route.kind == "command":
+                    body, command = route.call(self._runtime, decoded)
+                    # OD-214: answered once the command is accepted (or ended
+                    # at once); the command runs on to its end under the
+                    # runner's slot.
+                    value = self._runtime.run_command(body.request_key, command)
+                else:
+                    value = route.call(self._runtime, decoded)
+                reply = {"ok": True, "value": value}
+            except Exception as error:
+                reply = _reply_for(error)
+            self._reply(token, reply)
+        finally:
+            self._lane_capacity.release()
 
 
 __all__ = [
-    "ProgramControlStateSource",
+    "PROGRAM_RUNNER_COMMANDS",
+    "ProgramRunnerApplication",
     "ProgramRunnerApplicationPort",
-    "create_app",
 ]

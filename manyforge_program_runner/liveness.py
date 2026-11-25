@@ -33,6 +33,7 @@ PUBLISHER_FAULT_CODE: Final = "program_bbkey_publication_failed"
 TICK_WORKER_FAULT_CODE: Final = "program_tick_worker_failed"
 RUNNER_FAULT_CODES: Final = frozenset({PUBLISHER_FAULT_CODE, TICK_WORKER_FAULT_CODE})
 _MAXIMUM_RUNNER_FAULT_MESSAGE_BYTES: Final = 1_024
+_MAXIMUM_RUNNER_FAULT_FRAME_BYTES: Final = 512
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -315,10 +316,21 @@ class ProgramRunnerLivenessReceiver:
 
         code = fault.get("code")
         message = fault.get("message")
+        details = fault.get("details")
+        # A tick worker fault may name where it was raised (`last_frame`).
+        frame = details.get("last_frame") if isinstance(details, dict) else None
         if (
             set(fault) != {"code", "message", "details"}
             or code not in RUNNER_FAULT_CODES
-            or fault.get("details") != {}
+            or not isinstance(details, dict)
+            or (details and (
+                set(details) != {"last_frame"}
+                or code != TICK_WORKER_FAULT_CODE
+                or not isinstance(frame, str)
+                or not frame
+                or len(frame.encode("utf-8")) > _MAXIMUM_RUNNER_FAULT_FRAME_BYTES
+                or unicodedata.normalize("NFC", frame) != frame
+            ))
             or not isinstance(message, str)
             or not message
             or len(message.encode("utf-8")) > _MAXIMUM_RUNNER_FAULT_MESSAGE_BYTES
@@ -337,7 +349,7 @@ class ProgramRunnerLivenessReceiver:
             self._runner_fault = {
                 "code": code,
                 "message": message,
-                "details": {},
+                "details": dict(details),
             }
             self._runner_fault_reference = reference
             if self._receiver_status_sequence < MAXIMUM_SEQUENCE:

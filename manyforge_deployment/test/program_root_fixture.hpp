@@ -104,7 +104,7 @@ text_array(const std::vector<std::string> &values) {
   CanonicalValue::Object root{
       {"api_version", CanonicalValue("manyforge.program.v4")},
       {"program_revision", CanonicalValue(std::string(kProgramFixtureZeroDigest))},
-      {"program_profile", CanonicalValue("composable-cell-v1")},
+      {"program_profile", CanonicalValue("manyforge-cell-v1")},
       {"catalog",
        CanonicalValue(CanonicalValue::Object{
            {"api_version", CanonicalValue("manyforge.node_catalog.v3")},

@@ -10,6 +10,7 @@ import {
 } from 'react';
 
 import { api, composerSettingsConflict } from '../api/client';
+import { errorMessage } from '../state/structuralResource';
 import {
   DEFAULT_COMPOSER_SETTINGS,
   type ComposerSettings,
@@ -125,7 +126,7 @@ export function rebaseSettings(
 }
 
 function message(error: unknown): string {
-  return error instanceof Error ? error.message : 'Settings request failed.';
+  return errorMessage(error, 'Settings request failed.');
 }
 
 export function ComposerSettingsProvider({ children }: { children: ReactNode }) {

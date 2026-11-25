@@ -59,7 +59,6 @@ from manyforge_behavior.request_keys import (
     Part,
     Phase,
     format_request_key,
-    http_client_key,
     parse_request_key,
     program_key,
     with_part,
@@ -79,6 +78,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
+    OwnerTaskReadRequiredError,
     OwnerTaskSettlementPendingError,
     OwnerTaskSnapshot,
     OwnerTaskState,
@@ -92,11 +92,6 @@ from manyforge_behavior.orchestration_ports import (
     describe_owner_failure,
 )
 from manyforge_behavior.recovery import OWNER_RECOVERY_ACTIONS
-from manyforge_behavior.scene_client import (
-    SceneClient,
-    SceneOutcomeUnknownError,
-    SceneTransactionRejectedError,
-)
 
 
 _ACTIVE_STATES: Final = frozenset(
@@ -177,57 +172,12 @@ _AUTHORED_SCENE_OPERATIONS: Final = frozenset(
         "set_collision_policy",
     }
 )
-_SCENE_RUNTIME_RESPONSE_VERSION: Final = "manyforge.manager_command_response.v3"
-_SCENE_RUNTIME_IDENTITY_FIELDS: Final = frozenset(
-    {
-        "retained_bundle_id",
-        "graph_revision",
-        "deployment_generation",
-        "program_generation",
-        "runtime_generation",
-    }
-)
 _SCENE_PROJECTION_REVISION_FIELDS: Final = frozenset(
     {"retained_bundle_id", "graph_revision", "scene_revision"}
 )
 _SCENE_REVISION_FIELDS: Final = frozenset(
     {"scene_id", "revision_id", "content_hash"}
 )
-_SCENE_RUNTIME_LATCH_RESPONSE_FIELDS: Final = frozenset(
-    {
-        "already_applied_observation_count",
-        "api_version",
-        "committed_observation_count",
-        "initial_projection_revision",
-        "latched_observation_count",
-        "ok",
-        "projection_revision",
-        "runtime_identity",
-        "scene_runtime_source_generation",
-        "skipped_attached_observation_count",
-    }
-)
-
-
-def _scene_runtime_identity_value(value: object, *, field: str) -> dict[str, Any]:
-    record = _mapping(value, field=field)
-    if set(record) != _SCENE_RUNTIME_IDENTITY_FIELDS:
-        raise ProductionPortError(f"{field} has an unknown or missing field")
-    identity = {
-        "retained_bundle_id": _text(
-            record.get("retained_bundle_id"), field=f"{field}.retained_bundle_id"
-        ),
-        "graph_revision": _text(
-            record.get("graph_revision"), field=f"{field}.graph_revision"
-        ),
-    }
-    for name in ("deployment_generation", "program_generation", "runtime_generation"):
-        value = record.get(name)
-        minimum = 1 if name == "runtime_generation" else 0
-        if type(value) is not int or not minimum <= value <= 9_007_199_254_740_991:
-            raise ProductionPortError(f"{field}.{name} is not an exact safe integer")
-        identity[name] = value
-    return identity
 
 
 def _scene_projection_revision_value(value: object, *, field: str) -> dict[str, Any]:
@@ -294,6 +244,15 @@ def _text(value: object, *, field: str, maximum_bytes: int = 512) -> str:
     if not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum_bytes:
         raise ProductionPortError(f"{field} must be bounded non-empty text")
     return value
+
+
+def _names_scene_object(value: object) -> bool:
+    """Whether ``value`` can name a Scene object: the owner's identity rule
+    (printable ASCII, at most 256 bytes)."""
+    return (
+        isinstance(value, str) and 0 < len(value) <= 256
+        and all("!" <= character <= "~" for character in value)
+    )
 
 
 def _operation_number(value: object, *, field: str) -> int:
@@ -876,12 +835,31 @@ class _BoundContext:
     signals: Mapping[tuple[str, str], _SignalBinding]
 
 
-class _SceneProgramTransport(Protocol):
-    def authoring_admission(self) -> dict[str, Any]: ...
+class _SceneGateway(Protocol):
+    """The gateway core calls of the scene port (``manyforge_headless_py.Gateway``):
+    each returns the owner's reply, ok true or false."""
 
-    def scene(self) -> dict[str, Any]: ...
+    def scene_owner_read(
+        self, members: Mapping[str, Any] = ...
+    ) -> dict[str, Any]: ...
 
-    def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+    def cell_admission_get(self) -> dict[str, Any]: ...
+
+    def scene_commit(self, transaction: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def scene_transaction_status(self, members: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def scene_pose_query(self, members: Mapping[str, Any]) -> dict[str, Any]: ...
+
+    def scene_runtime_owner_read(self) -> dict[str, Any]: ...
+
+    def scene_runtime_latch_between_nodes(
+        self, members: Mapping[str, Any]
+    ) -> dict[str, Any]: ...
+
+    def manager(
+        self, command: str, members: Mapping[str, Any], limit_s: float | None = None
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -3108,16 +3086,33 @@ class NativeKernelProgramPort:
         return chains
 
     def _observation(
-        self, task: _OperationTask, *, pushed: bool = False, wait: bool = True
+        self,
+        task: _OperationTask,
+        *,
+        pushed: bool = False,
+        wait: bool = True,
+        reads: bool = True,
     ) -> tuple[dict[str, Any], OwnerTaskSnapshot, Mapping[str, Any]]:
         """The operation's state and the node's snapshot of it. ``pushed``:
         from the event stream's operations table (OD-213), for the per-tick
         observation and the halt's cancel; ``wait`` False reads instead while
-        the table predates the acceptance. Otherwise one ``read``."""
+        the table predates the acceptance. Otherwise one ``read``.
+
+        ``reads`` False (the tick's observation, OD-380 D2): memory only.
+        Where a read from the host would be made (the operation the pushed
+        table does not show, a held preparation's identity and scope, the
+        recovery assessment of an interrupted or failed operation, an
+        interrupt motion's Stop stages) it raises
+        ``OwnerTaskReadRequiredError``, whose ``read`` is the whole
+        observation with its reads (the node sends it on its run's sender)."""
 
         shared = task.operation
         if shared is None:
             raise ProductionPortError("coordinated operation has not been admitted")
+
+        def read_required() -> OwnerTaskReadRequiredError:
+            task_id = task.task_id
+            return OwnerTaskReadRequiredError(lambda: self._observe_task(task_id, reads=True))
 
         def observed(*, read: bool) -> tuple[dict[str, Any], Mapping[str, Any]]:
             try:
@@ -3125,13 +3120,15 @@ class NativeKernelProgramPort:
                     self._kernel.operation(shared.operation_id)
                     if read
                     else self._kernel.observed_operation(
-                        shared.operation_id, shared.accepted_change, wait=wait
+                        shared.operation_id, shared.accepted_change, wait=wait, read=reads
                     )
                 )
             except KernelOperationObservationUnavailableError as exc:
                 raise OwnerTaskObservationUnavailableError(
                     "accepted native operation is temporarily unavailable to observe"
                 ) from exc
+            if envelope is None:
+                raise read_required()
             operation = dict(_mapping(envelope.get("operation"), field="operation"))
             if (
                 operation.get("operation_id") != shared.operation_id
@@ -3144,6 +3141,8 @@ class NativeKernelProgramPort:
         if (task.held_preparation is not None or (
             task.gripper_timing is not None and task.gripper_timing[0] == "pneumatic"
             and operation.get("state") == ExecutionState.CANCELLED_PRE_DISPATCH.value)):
+            if not reads:
+                raise read_required()
             if pushed and self._kernel.pushes_operations:
                 # The held preparation keeps an exact `read` reply: its
                 # cleanup compares a later read with it.
@@ -3168,6 +3167,8 @@ class NativeKernelProgramPort:
             }
             if state not in _ACTIVE_STATES:
                 if task.interrupt_stop_chain is None:
+                    if not reads:
+                        raise read_required()
                     task.interrupt_stop_chain = self._interrupt_stop_chains(
                         task, operation
                     )
@@ -3200,6 +3201,8 @@ class NativeKernelProgramPort:
                 metadata=metadata,
             )
         elif state in _INTERRUPTED_STATES:
+            if not reads:
+                raise read_required()  # The recovery assessment's read.
             assessment = self._observed_recovery_assessment(
                 operation, shared.operation_id, metadata
             )
@@ -3233,6 +3236,8 @@ class NativeKernelProgramPort:
                 details=details,
             )
         elif state in _FAILED_STATES:
+            if not reads:
+                raise read_required()  # The recovery assessment's read.
             assessment = self._observed_recovery_assessment(
                 operation, shared.operation_id, metadata
             )
@@ -4228,7 +4233,12 @@ class NativeKernelProgramPort:
                         self._scope_stops.pop(program_run_id)
         return self._observe_scope(program_run_id)
 
-    def _observe_task(self, task_id: int | str) -> OwnerTaskSnapshot:
+    def _observe_task(self, task_id: int | str, *, reads: bool = False) -> OwnerTaskSnapshot:
+        """The task's observation. Per tick, drain and halt reconciliation:
+        the pushed table (OD-213), memory only; a read it needs raises
+        ``OwnerTaskReadRequiredError`` (OD-380 D2). ``reads``: with them
+        (the node's read on its run's sender)."""
+
         task = self._task(task_id)
         if task.held_before_admission:
             with self._lock:
@@ -4236,8 +4246,7 @@ class NativeKernelProgramPort:
             raise OwnerInvocationHeldError(0)
         if task.terminal is not None and (task.operation is None or task.tcp_robot_id is None):
             return task.terminal
-        # Per tick, drain and halt reconciliation: the pushed table (OD-213).
-        operation, snapshot, envelope = self._observation(task, pushed=True)
+        operation, snapshot, envelope = self._observation(task, pushed=True, reads=reads)
         if task.tcp_robot_id is not None and operation.get("state") not in _ACTIVE_STATES:
             try:
                 if self._active_tcp_result is None:
@@ -4454,9 +4463,17 @@ class _NativeKernelControlTaskPort:
                     self._owner._tasks.pop(operation_id, None)
         return result
 
-    def observe(self, task_id: int | str) -> OwnerTaskSnapshot:
+    def observe(self, task_id: int | str, *, reads: bool = False) -> OwnerTaskSnapshot:
+        """The control's observation. A Program Stop's status is read at once
+        on the Stop control socket (OD-119). Otherwise the tick's (OD-380 D2)
+        is memory only: an operation the pushed table no longer shows raises
+        ``OwnerTaskReadRequiredError``; its ``read`` observes with ``reads``
+        (on the node's run's sender)."""
+
         try:
-            return self._observe(task_id)
+            return self._observe(task_id, reads=reads)
+        except OwnerTaskReadRequiredError:
+            raise
         except KernelOperationObservationUnavailableError as error:
             raise OwnerTaskObservationUnavailableError(str(error)) from error
         except Exception as error:
@@ -4469,7 +4486,7 @@ class _NativeKernelControlTaskPort:
                 self._pending.pop(task_id, None)
             raise
 
-    def _observe(self, task_id: int | str) -> OwnerTaskSnapshot:
+    def _observe(self, task_id: int | str, *, reads: bool) -> OwnerTaskSnapshot:
         with self._owner._lock:
             task = self._pending.get(task_id)
         if task is None:
@@ -4477,7 +4494,13 @@ class _NativeKernelControlTaskPort:
         kernel = self._owner._kernel
         state = OwnerTaskState.ACTIVE
         reason = None
+
+        def read_required() -> OwnerTaskReadRequiredError:
+            return OwnerTaskReadRequiredError(lambda: self.observe(task_id, reads=True))
+
         if task.node_id in {"kernel.stop_operation", "kernel.cell_stop"}:
+            # The Program's Stop reads its status on the tick, on the host's
+            # Stop control socket, as it sent the Stop (OD-119).
             event_id = task.accepted.get("event_id")
             if type(event_id) is not int or event_id < 1:
                 raise ProductionPortError("control Stop event is invalid")
@@ -4494,8 +4517,10 @@ class _NativeKernelControlTaskPort:
         else:
             # The pushed table (OD-213), current once it includes the control.
             envelope = kernel.observed_operation(
-                task.operation["operation_id"], task.accepted_change
+                task.operation["operation_id"], task.accepted_change, read=reads
             )
+            if envelope is None:
+                raise read_required()  # Not shown (a Reset retired it): read.
             operation = _mapping(envelope.get("operation"), field="operation")
             if (
                 operation.get("operation_id") != task.operation["operation_id"]
@@ -5064,9 +5089,10 @@ class _NativeMockSimulationPort:
 
     def __init__(self, owner: NativeKernelProgramPort) -> None:
         self._owner = owner
-        # Ends whose reply is unknown, resent unchanged before the next
-        # Mock call and at Run teardown; bounded (the host also cancels a
-        # retired Run's pending changes).
+        # Ends recorded by their nodes (memory only) and not yet OK-ACKed:
+        # sent on the Run's sender, resent unchanged until ACKed (also
+        # before the next Mock START and at Run teardown); bounded (the host
+        # also cancels a retired Run's pending changes).
         self._unknown_ends: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._refusal_logged: set[tuple[str, str, str]] = set()
         # Per Run: the latest Halt state {revision, paused, request, settled};
@@ -5121,8 +5147,8 @@ class _NativeMockSimulationPort:
         establishes its Mock context (then exactly once, the current state,
         just before that START); afterwards each change is sent. Never
         raises. An unanswered state (lost reply, or an explicit error, which
-        had no effect) is resent unchanged on the Run's ticks and before the
-        next START, never with a fresh revision; one superseded while
+        had no effect) is resent unchanged on the Run's sender (its ticks
+        ask for that) and before the next START, never with a fresh revision; one superseded while
         unanswered is reported unconfirmed. Returns whether the Run's Mock
         context is established (the state is then due to be sent)."""
 
@@ -5223,8 +5249,8 @@ class _NativeMockSimulationPort:
     def resend_run_pause(
         self, program_run_id: int
     ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any] | None]:
-        """The Run's tick resend: (superseded states never answered, to
-        record now; the current state if still unanswered)."""
+        """The Run's resend, on its sender: (superseded states never
+        answered, to record now; the current state if still unanswered)."""
 
         with self._owner._lock:
             superseded = tuple(self._unconfirmed_pauses.pop(program_run_id, ()))
@@ -5281,12 +5307,21 @@ class _NativeMockSimulationPort:
         }
 
     def end(self, start_request: Mapping[str, Any]) -> None:
+        """Memory only: the attempt that sent ``start_request`` ended, so
+        its END is pending; ``resend_unknown_ends`` sends it (the node asks
+        for that on the Run's sender, off the tick)."""
+
         request = self.end_request(start_request)
-        self.resend_unknown_ends(request["program_run_id"])
-        self._send_end(request)
+        key = (
+            request["program_run_id"], request["node_instance_id"], request["node_start_index"]
+        )
+        with self._owner._lock:
+            if key not in self._unknown_ends and len(self._unknown_ends) >= _MAX_IO_WATCHES:
+                raise ProductionPortError("Mock end retention is full")
+            self._unknown_ends[key] = request
 
     def _send_end(self, request: dict[str, Any]) -> bool:
-        """Send one exact END; only its exact OK ACK settles it (True).
+        """Send one exact pending END; only its exact OK ACK settles it (True).
 
         A lost reply and every refusal (no refusal proves the entry
         absent) keep that END pending, resent unchanged; a refusal is logged
@@ -5305,9 +5340,6 @@ class _NativeMockSimulationPort:
                 code not in EXECUTION_TRANSPORT_FAILURE_CODES
             )
             with self._owner._lock:
-                if key not in self._unknown_ends and len(self._unknown_ends) >= _MAX_IO_WATCHES:
-                    raise ProductionPortError("Mock end retention is full") from error
-                self._unknown_ends[key] = request
                 warn = refused and key not in self._refusal_logged
                 if warn:
                     self._refusal_logged.add(key)
@@ -5326,9 +5358,9 @@ class _NativeMockSimulationPort:
         return True
 
     def resend_unknown_ends(self, program_run_id: int) -> tuple[dict[str, Any], ...]:
-        """Resend this Run's unanswered ENDs unchanged (the tree tick, each
-        Mock START/END and the Run's unbind call this); those still
-        unanswered afterwards."""
+        """Send this Run's pending ENDs, each unchanged (the Run's sender
+        after a node's END and while any is pending, each Mock START and the
+        Run's unbind call this); those still unanswered afterwards."""
 
         with self._owner._lock:
             pending = [
@@ -5336,6 +5368,22 @@ class _NativeMockSimulationPort:
                 if key[0] == program_run_id
             ]
         return tuple(request for request in pending if not self._send_end(request))
+
+    def settlement_due(self, program_run_id: int) -> bool:
+        """Memory only: the Run has an END pending, a Halt state due to be
+        sent or unanswered, or a superseded unanswered one to report; the
+        Run's sender then sends them (``resend_unknown_ends``,
+        ``resend_run_pause``)."""
+
+        with self._owner._lock:
+            if self._unconfirmed_pauses.get(program_run_id) or any(
+                key[0] == program_run_id for key in self._unknown_ends
+            ):
+                return True
+            state = self._run_pause.get(program_run_id)
+            return (
+                state is not None and state["established"] and state["outcome"] != "settled"
+            )
 
     def release_run(self, program_run_id: int) -> None:
         """The Run's unbind succeeded, so none of its ENDs is pending (an
@@ -5418,8 +5466,10 @@ class _NativeKernelOperationTaskPort:
         return {"outputs": [row[3] for row in outputs], "inputs": required,
                 "logical": OwnerNodeInputs(logical, inputs.blackboard), "dwell_s": dwell}
 
-    def observe(self, task_id: int | str) -> OwnerTaskSnapshot:
-        return self._owner._observe_task(task_id)
+    def observe(self, task_id: int | str, *, reads: bool = False) -> OwnerTaskSnapshot:
+        """Memory only (a Program tick's, OD-380 D2) unless ``reads``: a read
+        it needs raises ``OwnerTaskReadRequiredError``."""
+        return self._owner._observe_task(task_id, reads=reads)
 
     # Pick/place planning jobs (OD-213 (1)). `send_planning` and
     # `finish_planning` are exchanges the node makes on its run's sender;
@@ -5543,48 +5593,138 @@ class _NativeKernelProgramScopePort:
         return self._owner._reset_scope(program_run_id)
 
 
+class SceneOutcomeUnknownError(RuntimeError):
+    """A sent scene transaction has no trustworthy terminal owner result.
+
+    ``cause_code`` (with ``cause_details``) names the typed cause when one is
+    known. It is not ``code``: callers retry proven owner refusals by
+    ``code``, which is not safe for an unknown outcome.
+    """
+
+    def __init__(
+        self, message: str, cause_code: object = None, cause_details: object = None
+    ) -> None:
+        known = isinstance(cause_code, str) and bool(cause_code)
+        super().__init__(f"{message}: {cause_code}" if known else message)
+        self.cause_code = cause_code if known else None
+        self.cause_details = (
+            dict(cause_details) if known and isinstance(cause_details, Mapping) else None
+        )
+
+
+class SceneTransactionRejectedError(RuntimeError):
+    """The scene owner proved the transaction had no effect."""
+
+    def __init__(self, result: Mapping[str, Any]) -> None:
+        self.code = result["error"]["code"]
+        self.response = dict(result)
+        super().__init__(result["error"]["message"])
+
+
+class SceneOwnerRefusedError(RuntimeError):
+    """A typed owner refusal of an admission read or a pose query."""
+
+    def __init__(self, error: object, default_code: str, default_message: str) -> None:
+        error = error if isinstance(error, Mapping) else {}
+        code, message, details = error.get("code"), error.get("message"), error.get("details")
+        self.code = code if isinstance(code, str) and code else default_code
+        self.details = dict(details) if isinstance(details, Mapping) else None
+        super().__init__(message if isinstance(message, str) and message else default_message)
+
+
+def _scene_result(value: Mapping[str, Any]) -> dict[str, Any]:
+    """The outcome one scene commit reply decides: committed (returned), a
+    proven no-effect refusal or no proven result (raised)."""
+
+    error = value.get("error")
+    if (
+        value.get("ok") is False
+        and value.get("projection_status") in {"not_attempted", "rejected_rollback_proven"}
+        and isinstance(error, Mapping)
+        and isinstance(error.get("code"), str)
+        and isinstance(error.get("message"), str)
+    ):
+        raise SceneTransactionRejectedError(value)
+    if (
+        value.get("ok") is not True
+        or value.get("projection_status") != "committed"
+        or not isinstance(value.get("committed_projection_revision"), Mapping)
+    ):
+        if isinstance(error, Mapping):
+            raise SceneOutcomeUnknownError(
+                "Scene effect has no proven terminal result",
+                error.get("code"), error.get("details"),
+            )
+        raise SceneOutcomeUnknownError("Scene effect has no proven terminal result")
+    return dict(value)
+
+
+# The scene transaction attribution of a status lookup: not mutation intent;
+# the form the commit carries (``Gateway.scene_commit``: http, no principal).
+_SCENE_LOOKUP_ATTRIBUTION: Final = {
+    "assurance": "unverified", "principal_id": None, "transport": "http",
+}
+
+
 class HeadlessSceneProgramPort:
     """Stateless scene intents plus captured Program-reference translation.
 
-    The native logical-scene owner remains the only scene authority. This port
-    keeps only immutable Program Binding context and reads fresh owner truth for
-    every preparation, verification, or node attempt.
+    The native logical-scene owner (the Manager) remains the only scene
+    authority. Every read, commit, lookup and latch is one call of the gateway
+    core straight to it (D1); this port keeps only immutable Program Binding
+    context and reads fresh owner truth for every preparation, verification
+    or node attempt.
     """
 
     def __init__(
         self,
-        transport: _SceneProgramTransport,
+        gateway: _SceneGateway,
         *,
         resolve_attach_active_tcp: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
         program_node_evidence: (
             Callable[[NodeAttemptIdentity, str], Mapping[str, Any]] | None
         ) = None,
-        application_start_id: str | None = None,
+        record_scene_change: Callable[[Mapping[str, Any]], None] | None = None,
+        read_limit_s: float | None = None,
     ) -> None:
-        for method in (
-            "authoring_admission",
-            "scene",
-            "commit_scene_transaction",
-        ):
-            if not callable(getattr(transport, method, None)):
-                raise TypeError(f"scene transport has no callable {method}")
-        self._transport = transport
+        self._gateway = gateway
+        # The limit on the reply of each Manager read (owner, runtime owner,
+        # result lookup, pose query): the Program runner's read limit, kept
+        # from its reads through Headless (OD-214 T8: the only detector here
+        # of a silent Manager). A commit and a latch wait for their reply.
+        self._read_limit_s = read_limit_s
         self._resolve_attach_active_tcp = resolve_attach_active_tcp
         self._program_node_evidence = program_node_evidence
-        # The ``A`` a Scene transaction names: its request key is minted in
-        # this application start (contract 1.6).
-        self._application_start_id = application_start_id
-        if program_node_evidence is not None and not callable(
-            getattr(transport, "scene_transaction_status", None)
-        ):
-            raise TypeError("runtime Scene transport has no exact result lookup")
-        self._scene = SceneClient(transport)
+        # History of the commits outside a Program node attempt (OD-375):
+        # called with one scene-change record after each such commit.
+        self._record_scene_change = record_scene_change
         # Keyed by scene context id: ("run", run number) or ("apply", Apply number).
         self._contexts: dict[tuple[str, int], _SceneBoundContext] = {}
         # Scene node commit keys: (run, node attempt, admission generation).
         self._scene_node_keys: dict[tuple[int, int, int], bytes] = {}
         self._lock = RLock()
-        self._pose_source_latch_lock = RLock()
+
+    def _read(
+        self, command: str, members: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """One Manager read; with ``read_limit_s`` an unanswered read ends as
+        the runner's timed-out Headless read did (``headless_http_timeout``)."""
+
+        if self._read_limit_s is None:
+            call = getattr(self._gateway, command)
+            return call() if members is None else call(members)
+        try:
+            return self._gateway.manager(
+                command, {} if members is None else dict(members),
+                limit_s=self._read_limit_s,
+            )
+        except Exception as error:
+            details = getattr(error, "details", None)
+            if isinstance(details, Mapping) and details.get("reason") == "limit_expired":
+                raise type(error)(
+                    "headless_http_timeout", f"Manager {command} timed out: {error}"
+                ) from error
+            raise
 
     def bind(self, context: ProgramRunPortContext) -> None:
         if not isinstance(context, ProgramRunPortContext):
@@ -5610,7 +5750,8 @@ class HeadlessSceneProgramPort:
     def _scene_node_key(self, identity: NodeAttemptIdentity, generation: int) -> bytes:
         """One class 1 key per (node attempt, admission generation) (BS 11.6):
         a resend under the same generation replays; a newer generation, after
-        a stale-admission rejection, is a new request."""
+        a stale-admission rejection, is a new request. The Manager sees it
+        unchanged."""
         slot = (identity.program_run_id, identity.node_attempt_id, generation)
         with self._lock:
             key = self._scene_node_keys.get(slot)
@@ -5626,19 +5767,16 @@ class HeadlessSceneProgramPort:
     ) -> None:
         """Apply one exact Manager between-nodes latch to authoritative Scene.
 
-        Sent through Headless, which answers once its logical-scene view shows
-        what the latch committed (OD-294). Manager captures the current Scene
-        at the command boundary. The exact runtime identity fences the
-        captured deployment; ordinary object-pose updates do not invalidate an
-        earlier, unnecessary Scene pre-read.
+        Two gateway calls to the Manager: its scene-runtime identity, then the
+        latch fenced by that identity. The Manager captures the current Scene
+        at the command boundary and refuses a latch whose identity no longer
+        holds, so nothing here orders two latches. The next node reads the
+        Scene at the Manager, after the latch committed. Ordinary object-pose
+        updates do not invalidate an earlier, unnecessary Scene pre-read.
         """
 
         if not isinstance(identity, NodeAttemptIdentity):
             raise PoseSourceLatchError("between-nodes latch has no exact node identity")
-        read_owner = getattr(self._transport, "scene_runtime_owner", None)
-        latch = getattr(self._transport, "latch_scene_runtime_between_nodes", None)
-        if not callable(read_owner) or not callable(latch):
-            raise PoseSourceLatchError("scene-runtime latch is unavailable")
         resource_ids: tuple[str, ...] | None = None
         if scene_resource_ids is not None:
             try:
@@ -5657,153 +5795,72 @@ class HeadlessSceneProgramPort:
                     details={"reason": "scene_resource_ids_invalid"},
                 )
 
-        with self._pose_source_latch_lock:
-            try:
-                with self._lock:
-                    context = self._contexts.get(("run", identity.program_run_id))
-                if context is None:
-                    raise ProductionPortError(
-                        "between-nodes latch has no captured Program-run context"
-                    )
-                owner = read_owner()
-                self._raise_pose_latch_refusal(owner, phase="Manager identity read")
-                if set(owner) != {
-                    "api_version",
-                    "cell_id",
-                    "initialization_generation",
-                    "initialization_state",
-                    "ok",
-                    "runtime_identity",
-                }:
-                    raise ProductionPortError(
-                        "scene-runtime owner response has an unknown or missing field"
-                    )
-                if owner.get("api_version") != _SCENE_RUNTIME_RESPONSE_VERSION or owner.get(
-                    "ok"
-                ) is not True:
-                    raise ProductionPortError("scene-runtime owner response is invalid")
-                _text(owner.get("cell_id"), field="scene-runtime cell_id")
-                state_generation = owner.get("initialization_generation")
-                if (
-                    type(state_generation) is not int
-                    or not 0 <= state_generation <= 9_007_199_254_740_991
-                ):
-                    raise ProductionPortError(
-                        "scene-runtime initialization generation is invalid"
-                    )
-                _text(
-                    owner.get("initialization_state"),
-                    field="scene-runtime initialization state",
+        try:
+            with self._lock:
+                context = self._contexts.get(("run", identity.program_run_id))
+            if context is None:
+                raise ProductionPortError(
+                    "between-nodes latch has no captured Program-run context"
                 )
-                runtime_identity = _scene_runtime_identity_value(
-                    owner.get("runtime_identity"), field="scene-runtime identity"
+            owner = self._read("scene_runtime_owner_read")
+            self._raise_pose_latch_refusal(owner, phase="Manager identity read")
+            runtime_identity = dict(owner["runtime_identity"])
+            if (
+                runtime_identity["retained_bundle_id"]
+                != context.capture.retained_bundle_id
+                or runtime_identity["graph_revision"] != context.capture.graph_revision
+            ):
+                raise ProductionPortError(
+                    "scene-runtime owner and captured Program deployment disagree"
                 )
-                if (
-                    runtime_identity["retained_bundle_id"]
-                    != context.capture.retained_bundle_id
-                    or runtime_identity["graph_revision"] != context.capture.graph_revision
-                ):
-                    raise ProductionPortError(
-                        "scene-runtime owner and captured Program deployment disagree"
-                    )
 
-                request: dict[str, Any] = {
-                    "expected_runtime_identity": runtime_identity,
-                }
-                if resource_ids is not None:
-                    request["scene_resource_ids"] = list(resource_ids)
-                response = latch(request)
-                self._raise_pose_latch_refusal(response, phase="between-nodes latch")
-                if (
-                    set(response) != _SCENE_RUNTIME_LATCH_RESPONSE_FIELDS
-                    or response.get("api_version") != _SCENE_RUNTIME_RESPONSE_VERSION
-                    or response.get("ok") is not True
-                ):
-                    raise ProductionPortError(
-                        "between-nodes latch response has an unknown or missing field"
-                    )
-                echoed_identity = _scene_runtime_identity_value(
-                    response.get("runtime_identity"),
-                    field="between-nodes latch runtime identity",
+            request: dict[str, Any] = {
+                "expected_runtime_identity": runtime_identity,
+            }
+            if resource_ids is not None:
+                request["scene_resource_ids"] = list(resource_ids)
+            response = self._gateway.scene_runtime_latch_between_nodes(request)
+            self._raise_pose_latch_refusal(response, phase="between-nodes latch")
+            if response["runtime_identity"] != runtime_identity:
+                raise ProductionPortError(
+                    "between-nodes latch response selected another runtime"
                 )
-                if echoed_identity != runtime_identity:
-                    raise ProductionPortError(
-                        "between-nodes latch response selected another runtime"
-                    )
-                initial_projection = _scene_projection_revision_value(
-                    response.get("initial_projection_revision"),
-                    field="between-nodes initial projection revision",
+            initial_projection = response["initial_projection_revision"]
+            if (
+                initial_projection["retained_bundle_id"] != context.capture.retained_bundle_id
+                or initial_projection["graph_revision"] != context.capture.graph_revision
+            ):
+                raise ProductionPortError(
+                    "between-nodes latch started from another captured deployment"
                 )
-                if (
-                    initial_projection["retained_bundle_id"] != context.capture.retained_bundle_id
-                    or initial_projection["graph_revision"] != context.capture.graph_revision
-                ):
-                    raise ProductionPortError(
-                        "between-nodes latch started from another captured deployment"
-                    )
-                projection = _scene_projection_revision_value(
-                    response.get("projection_revision"),
-                    field="between-nodes projection revision",
+            projection = response["projection_revision"]
+            if (
+                projection["retained_bundle_id"] != initial_projection["retained_bundle_id"]
+                or projection["graph_revision"] != initial_projection["graph_revision"]
+                or projection["scene_revision"]["scene_id"]
+                != initial_projection["scene_revision"]["scene_id"]
+                or projection["scene_revision"]["revision_id"]
+                < initial_projection["scene_revision"]["revision_id"]
+            ):
+                raise ProductionPortError(
+                    "between-nodes latch response changed Scene lineage"
                 )
-                if (
-                    projection["retained_bundle_id"]
-                    != initial_projection["retained_bundle_id"]
-                    or projection["graph_revision"] != initial_projection["graph_revision"]
-                    or projection["scene_revision"]["scene_id"]
-                    != initial_projection["scene_revision"]["scene_id"]
-                    or projection["scene_revision"]["revision_id"]
-                    < initial_projection["scene_revision"]["revision_id"]
-                ):
-                    raise ProductionPortError(
-                        "between-nodes latch response changed Scene lineage"
+        except PoseSourceLatchError:
+            raise
+        except Exception as error:
+            reason = getattr(error, "code", None)
+            raise PoseSourceLatchError(
+                f"between-nodes pose-source apply failed: {str(error) or type(error).__name__}",
+                details={
+                    "reason": (
+                        reason if isinstance(reason, str) and reason
+                        else "scene_runtime_latch_failed"
                     )
-                counters: dict[str, int] = {}
-                for name in (
-                    "latched_observation_count",
-                    "committed_observation_count",
-                    "already_applied_observation_count",
-                    "skipped_attached_observation_count",
-                    "scene_runtime_source_generation",
-                ):
-                    value = response.get(name)
-                    minimum = 1 if name == "scene_runtime_source_generation" else 0
-                    if (
-                        type(value) is not int
-                        or not minimum <= value <= 9_007_199_254_740_991
-                    ):
-                        raise ProductionPortError(
-                            f"between-nodes latch {name} is invalid"
-                        )
-                    counters[name] = value
-                if counters["latched_observation_count"] != sum(
-                    counters[name]
-                    for name in (
-                        "committed_observation_count",
-                        "already_applied_observation_count",
-                        "skipped_attached_observation_count",
-                    )
-                ):
-                    raise ProductionPortError(
-                        "between-nodes latch observation counts do not reconcile"
-                    )
-            except PoseSourceLatchError:
-                raise
-            except Exception as error:
-                reason = getattr(error, "code", None)
-                raise PoseSourceLatchError(
-                    f"between-nodes pose-source apply failed: {str(error) or type(error).__name__}",
-                    details={
-                        "reason": (
-                            reason if isinstance(reason, str) and reason
-                            else "scene_runtime_latch_failed"
-                        )
-                    },
-                ) from error
+                },
+            ) from error
 
     @staticmethod
-    def _raise_pose_latch_refusal(response: object, *, phase: str) -> None:
-        if not isinstance(response, Mapping):
-            raise ProductionPortError(f"{phase} response is not an object")
+    def _raise_pose_latch_refusal(response: Mapping[str, Any], *, phase: str) -> None:
         if response.get("ok") is not False:
             return
         error = response.get("error")
@@ -5811,12 +5868,10 @@ class HeadlessSceneProgramPort:
             not isinstance(error, Mapping)
             or not isinstance(error.get("code"), str)
             or not error["code"]
-            or not isinstance(error.get("message"), str)
-            or not error["message"]
         ):
             raise ProductionPortError(f"{phase} refusal is malformed")
         raise PoseSourceLatchError(
-            f"{phase} was refused ({error['code']}): {error['message']}",
+            f"{phase} was refused ({error['code']}): {error.get('message')}",
             details={"reason": error["code"]},
         )
 
@@ -5926,83 +5981,50 @@ class HeadlessSceneProgramPort:
                 raise ProductionPortError("Program-run scene context is not initialized") from exc
 
     def _read_view(
-        self, context: _SceneBoundContext, *, require_writes: bool = True
+        self, context: _SceneBoundContext, scene_resource_id: object = None
     ) -> _SceneView:
-        projection = self._scene.snapshot()
-        logical = _mapping(projection.get("logical_scene"), field="logical_scene")
-        if (
-            logical.get("available") is not True
-            or logical.get("freshness") != "fresh"
-            or list(_sequence(logical.get("known_gaps"), field="known_gaps"))
-        ):
-            raise ProductionPortError("logical-scene owner truth is not fresh")
-        payload = _mapping(logical.get("payload"), field="logical_scene.payload")
-        if payload.get("api_version") != "manyforge.logical_scene_source.v1":
-            raise ProductionPortError("logical-scene payload version is unsupported")
-        access = _mapping(payload.get("access"), field="logical_scene.access")
-        if require_writes and (
-            access.get("scene_writes_open") is not True
-            or access.get("projection_leases_open") is not True
-        ):
-            raise ProductionPortError("logical-scene writes are fenced")
-        active = dict(
-            _mapping(
-                access.get("active_projection"),
-                field="logical_scene.active_projection",
-            )
+        """The Scene at its owner (D1): one narrow Manager read. The owner
+        answers only while its projection is available and its writes are
+        open; any other answer fails this read. The refusal's typed code is
+        its cause (``details.reason``); the node's own reason stays
+        ``scene_program_request_failed``.
+
+        A Scene node names its one object (``scene_resource_id``): the owner
+        answers that object only, with its attachment (OD-380); the node
+        reads nothing else of the Scene. A value no Scene object can have
+        (the owner's identity rule) reads the whole Scene, as before."""
+
+        reply = self._read(
+            "scene_owner_read",
+            {"scene_resource_ids": [scene_resource_id]}
+            if _names_scene_object(scene_resource_id) else None,
         )
+        if reply.get("ok") is not True:
+            error = reply.get("error")
+            code = error.get("code") if isinstance(error, Mapping) else None
+            refused = ProductionPortError(
+                f"logical-scene owner truth is unavailable or its writes are fenced ({code})"
+            )
+            if isinstance(code, str) and code:
+                refused.details = {"reason": code}
+            raise refused
+        active = dict(reply["projection_revision"])
         if (
-            active.get("retained_bundle_id") != context.capture.retained_bundle_id
-            or active.get("graph_revision") != context.capture.graph_revision
+            active["retained_bundle_id"] != context.capture.retained_bundle_id
+            or active["graph_revision"] != context.capture.graph_revision
         ):
             raise ProductionPortError(
                 "logical-scene owner and captured Program deployment disagree"
             )
-        active_scene = _mapping(active.get("scene_revision"), field="active scene revision")
-        _text(active_scene.get("scene_id"), field="scene_id")
-        _text(active_scene.get("content_hash"), field="scene content_hash")
-        if type(active_scene.get("revision_id")) is not int or active_scene["revision_id"] < 1:
-            raise ProductionPortError("active scene revision is invalid")
-        snapshot = _mapping(payload.get("snapshot"), field="logical_scene.snapshot")
-        if dict(_mapping(snapshot.get("revision"), field="snapshot revision")) != dict(
-            active_scene
-        ):
-            raise ProductionPortError("logical-scene snapshot and active projection disagree")
-        cell_id = _text(snapshot.get("cell_id"), field="cell_id")
-        objects: dict[str, Mapping[str, Any]] = {}
-        object_ids: list[str] = []
-        for index, raw_object in enumerate(
-            _sequence(snapshot.get("objects"), field="scene objects")
-        ):
-            scene_object = _mapping(raw_object, field=f"scene objects[{index}]")
-            scene_resource_id = _text(
-                scene_object.get("scene_resource_id"), field="scene_resource_id"
-            )
-            object_ids.append(scene_resource_id)
-            objects[scene_resource_id] = scene_object
-        if object_ids != sorted(object_ids) or len(object_ids) != len(objects):
-            raise ProductionPortError("logical-scene objects are not canonical")
-        attachments: list[Mapping[str, Any]] = []
-        attachment_ids: list[str] = []
-        for index, raw_attachment in enumerate(
-            _sequence(
-                snapshot.get("carried_object_attachments"),
-                field="carried_object_attachments",
-            )
-        ):
-            attachment = _mapping(raw_attachment, field=f"carried_object_attachments[{index}]")
-            attachment_ids.append(
-                _text(
-                    attachment.get("carried_object_attachment_id"),
-                    field="carried_object_attachment_id",
-                )
-            )
-            attachments.append(attachment)
-        if attachment_ids != sorted(attachment_ids) or len(attachment_ids) != len(
-            set(attachment_ids)
-        ):
-            raise ProductionPortError("logical-scene attachments are not canonical")
-        return _SceneView(active, cell_id, objects, tuple(attachments))
+        snapshot = reply["logical_scene"]
+        objects = {
+            scene_object["scene_resource_id"]: scene_object
+            for scene_object in snapshot["objects"]
+        }
+        return _SceneView(
+            active, snapshot["cell_id"], objects,
+            tuple(snapshot["carried_object_attachments"]),
+        )
 
     def _commit(
         self,
@@ -6019,6 +6041,9 @@ class HeadlessSceneProgramPort:
         key of the admission or claim generation the commit is sent under:
         a stale-admission rejection is replayed only for that generation."""
         key_for_generation = request_key if callable(request_key) else None
+        # The wire transaction: both nullable members always present, absent
+        # optional members absent (the core keeps this form, adds the
+        # attribution and applies today's cross-field rules).
         body: dict[str, Any] = {
             "request_context": {
                 "request_key": (
@@ -6030,16 +6055,16 @@ class HeadlessSceneProgramPort:
             },
             "expected_projection_revision": dict(expected_projection_revision),
             "operation": dict(operation),
+            "expected_admission_generation": None,
+            "program_reset_scene_authorization": None,
         }
-        if self._application_start_id is not None:
-            body["application_start_id"] = self._application_start_id
         if program_node_evidence is not None:
             body["program_node_evidence"] = dict(program_node_evidence)
         if operation.get("kind") in _AUTHORED_SCENE_OPERATIONS or program_node_evidence is not None:
             if program_reset_scene_authorization is not None:
                 authorization = dict(program_reset_scene_authorization)
                 # Both variants carry the runner's current cycle status (OD-139);
-                # the Headless model validates its exact shape.
+                # the owner's strict decode validates its exact shape.
                 if "reset_claim" in authorization:
                     if set(authorization) != {"cycle_generation", "reset_claim", "program_cycle_status"}:
                         raise ProductionPortError("Idle Program Reset scene authorization is malformed")
@@ -6095,12 +6120,13 @@ class HeadlessSceneProgramPort:
                         key_for_generation(generation)
                     )
             else:
-                admission = self._transport.authoring_admission()
-                generation = admission.get("admission_generation")
-                if type(generation) is not int or not 1 <= generation <= 9_007_199_254_740_991:
-                    raise ProductionPortError(
-                        "authoring-admission owner omitted its current generation"
+                admission = self._gateway.cell_admission_get()
+                if admission.get("ok") is not True:
+                    raise SceneOwnerRefusedError(
+                        admission.get("error"), "execution_command_response_invalid",
+                        "authoring-admission read was refused",
                     )
+                generation = admission["authoring_admission"]["admission_generation"]
                 # A no-effect stale-admission rejection is durably replayed by the
                 # logical-scene owner: every caller sends each attempt with its
                 # own class 1 key, so a retry is never trapped behind it.
@@ -6109,14 +6135,10 @@ class HeadlessSceneProgramPort:
                     body["request_context"]["request_key"] = format_request_key(
                         key_for_generation(generation)
                     )
-        # The owner names the key Headless formed for this HTTP request (class 3).
-        receipt_key = (
-            format_request_key(http_client_key(
-                parse_request_key(body["request_context"]["request_key"])))
-            if verify_receipt else None
-        )
+        # The owner names the key it was sent.
+        receipt_key = body["request_context"]["request_key"] if verify_receipt else None
         try:
-            response = self._scene.commit(body)
+            response = self._send_commit(body, recorded=program_node_evidence is None)
         except SceneTransactionRejectedError as error:
             if verify_receipt and error.response.get("request_key") != receipt_key:
                 raise SceneOutcomeUnknownError("Scene refusal names another request") from error
@@ -6129,7 +6151,7 @@ class HeadlessSceneProgramPort:
             # reads its result; it never sends the transaction a second time.
             def observe() -> OwnerInvocationResult | None:
                 try:
-                    response = self._scene.receipt(body)
+                    response = self._receipt(body)
                 except SceneTransactionRejectedError as rejected:
                     self._raise_if_stop_prevented_admission(rejected)
                     return OwnerInvocationResult(
@@ -6158,6 +6180,93 @@ class HeadlessSceneProgramPort:
         if verify_receipt and response.get("request_key") != receipt_key:
             raise SceneOutcomeUnknownError("Scene receipt names another request")
         return self._committed_revision(context, expected_projection_revision, response), response
+
+    def _send_commit(self, body: Mapping[str, Any], *, recorded: bool) -> dict[str, Any]:
+        """One gateway scene commit and the outcome its reply decides. A
+        failure of the call itself (transport, envelope or a refused local
+        rule) leaves the outcome unknown, with its typed cause. A ``recorded``
+        commit (outside a Program node attempt) is also recorded in History
+        (OD-375): its outcome, its error and what it changed."""
+
+        started_ns = time.monotonic_ns()
+        try:
+            reply = self._gateway.scene_commit(body)
+        except Exception as error:
+            if recorded:
+                self._record_commit(body, started_ns, None, error)
+            raise SceneOutcomeUnknownError(
+                f"Scene transaction delivery/outcome is unconfirmed: {error}",
+                getattr(error, "code", None), getattr(error, "details", None),
+            ) from error
+        if recorded:
+            self._record_commit(body, started_ns, reply, None)
+        return _scene_result(reply)
+
+    def _receipt(self, body: Mapping[str, Any]) -> dict[str, Any] | None:
+        """The exact result of a sent transaction; absence never permits
+        another submission."""
+
+        reply = self._read(
+            "scene_transaction_status",
+            {"transaction": {**body, "attribution": dict(_SCENE_LOOKUP_ATTRIBUTION)}}
+        )
+        if reply.get("ok") is not True:
+            raise SceneOutcomeUnknownError("Scene result lookup is unavailable")
+        return None if reply["result"] is None else _scene_result(reply["result"])
+
+    def _record_commit(
+        self,
+        body: Mapping[str, Any],
+        started_ns: int,
+        reply: Mapping[str, Any] | None,
+        raised: BaseException | None,
+    ) -> None:
+        """One History record of a scene change outside a Program node: the
+        Program runner's initial-scene preparation, a Program Reset's reload
+        and the empty-Apply clear (OD-375, OD-378). A replayed retry changed
+        nothing and is not recorded."""
+
+        if self._record_scene_change is None or (
+            reply is not None and reply.get("replay_status") == "replayed_exact"
+        ):
+            return
+        duration_ms = (time.monotonic_ns() - started_ns) / 1e6
+        if raised is not None:
+            details = getattr(raised, "details", None)
+            outcome, error = "failed", {
+                "code": getattr(raised, "code", None) or "scene_program_request_failed",
+                # History keeps the first 2 KiB of each text.
+                "message": (str(raised) or type(raised).__name__)[:2048],
+                "details": dict(details) if isinstance(details, Mapping) else None,
+            }
+        elif reply.get("ok") is True:
+            outcome, error = "succeeded", None
+        else:
+            outcome = (
+                "unknown"
+                if reply.get("projection_status") == "failed_projection_uncertain"
+                else "refused"
+            )
+            owner_error = reply.get("error")
+            error = None if not isinstance(owner_error, Mapping) else {
+                "code": owner_error.get("code"),
+                "message": str(owner_error.get("message") or "")[:2048] or None,
+                "details": owner_error.get("details"),
+            }
+        operation = body["operation"]
+        self._record_scene_change({
+            "operation_kind": operation["kind"],
+            "outcome": outcome,
+            "error": error,
+            "scene_change": {
+                "scene_resource_id": operation.get("scene_resource_id")
+                or operation.get("expected_scene_resource_id"),
+                "source_label": body["request_context"]["source_label"],
+                "duration_ms": duration_ms,
+                "scene_revision_id": reply["committed_projection_revision"][
+                    "scene_revision"]["revision_id"] if outcome == "succeeded" else None,
+            },
+        })
 
     @staticmethod
     def _raise_if_stop_prevented_admission(error: SceneTransactionRejectedError) -> None:
@@ -6306,35 +6415,16 @@ class HeadlessSceneProgramPort:
     ) -> bool:
         scene_resource_id = _text(operation.get("scene_resource_id"), field="scene_resource_id")
         current = view.objects.get(scene_resource_id)
-        # Commands use the binding DTO spelling; snapshots use the Scene
-        # owner's public representation (owner_publication.cpp). Compare in
-        # snapshot form rather than treating identical geometry as an edit.
-        shape = operation["shape"]
-        kind = shape["type"]
-        if kind == "box":
-            expected_shape = {
-                "type": kind,
-                "dimensions_m": {axis: shape["box_dimensions_m"][f"{axis}_m"] for axis in "xyz"},
-            }
-        elif kind == "sphere":
-            expected_shape = {"type": kind, "radius_m": shape["sphere_radius_m"]}
-        elif kind == "cylinder":
-            expected_shape = {
-                "type": kind, "radius_m": shape["cylinder_radius_m"],
-                "height_m": shape["cylinder_height_m"],
-            }
-        elif kind == "mesh":
-            expected_shape = {
-                "type": kind, "resource_uri": shape["mesh_resource_uri"],
-                "scale": {axis: shape["mesh_scale"][f"{axis}_m"] for axis in "xyz"},
-            }
-        else:
-            raise ProductionPortError("initial Scene operation has an unsupported shape")
-        if current is None or (
-            list(_sequence(current.get("collision_shapes"), field="collision_shapes"))
-            != [expected_shape]
-            or current.get("provider_evidence") is not None
-        ):
+        # The owner's snapshot spells shapes and poses as a transaction does;
+        # a mesh's content digest is resolved content, not intent, and is not
+        # compared (identical geometry is not an edit).
+        if current is None or current.get("provider_evidence") is not None:
+            return False
+        shapes = [
+            {name: value for name, value in shape.items() if name != "mesh_content_digest"}
+            for shape in current["collision_shapes"]
+        ]
+        if shapes != [operation["shape"]]:
             return False
         frame_ref = _mapping(operation.get("frame_ref"), field="frame_ref")
         # Component-frame intent is resolved by the native owner and cannot
@@ -6344,12 +6434,7 @@ class HeadlessSceneProgramPort:
         return current.get("placement") == {
             "kind": "cell_fixed",
             "cell_id": view.cell_id,
-            "pose_in_cell": {
-                "position_m": {
-                    axis: operation["pose"]["position_m"][f"{axis}_m"] for axis in "xyz"
-                },
-                "orientation_xyzw": [operation["pose"]["orientation"][axis] for axis in "xyzw"],
-            },
+            "pose_in_cell": operation["pose"],
         }
 
     @staticmethod
@@ -6729,7 +6814,7 @@ class HeadlessSceneProgramPort:
         A fixed object's pose is owner truth in the cell frame. A carried
         object's pose is composed by the native owner, never in Python.
         """
-        view = self._read_view(context, require_writes=False)
+        view = self._read_view(context, parameters.get("scene_resource_id"))
         resource_id = _text(parameters.get("scene_resource_id"), field="scene_resource_id")
         scene_object = view.objects.get(resource_id)
         if scene_object is None:
@@ -6741,53 +6826,45 @@ class HeadlessSceneProgramPort:
         if kind == "cell_fixed":
             if placement.get("cell_id") != view.cell_id:
                 raise ProductionPortError("scene resource is fixed in another cell")
-            pose = placement.get("pose_in_cell")
+            # The owner's snapshot form (as a transaction names a pose).
+            pose = placement["pose_in_cell"]
+            position = [pose["position_m"][f"{axis}_m"] for axis in "xyz"]
+            orientation = [pose["orientation"][axis] for axis in "xyzw"]
         elif kind == "carried":
-            resolve = getattr(self._transport, "resolve_scene_resources", None)
-            if not callable(resolve):
-                raise ProductionPortError("native carried-object pose projection is unavailable")
-            response = _mapping(
-                resolve(
-                    {
-                        "api_version": "manyforge.scene_resource_pose_query.v1",
-                        "expected_projection_revision": view.projection_revision,
-                        "scene_resource_ids": [resource_id],
-                    }
-                ),
-                field="scene resource pose response",
-            )
-            rows = _sequence(response.get("poses"), field="resolved poses", length=1)
-            row = _mapping(rows[0], field="resolved pose")
+            response = self._read("scene_pose_query", {
+                "expected_projection_revision": view.projection_revision,
+                "scene_resource_ids": [resource_id],
+            })
+            if response.get("ok") is not True:
+                raise SceneOwnerRefusedError(
+                    response.get("error"), "scene_pose_unavailable",
+                    "Manager scene pose query was rejected",
+                )
+            row = _sequence(response["poses"], field="resolved poses", length=1)[0]
             # The owner resolves against its current projection; a newer
             # revision of the same Scene is the latest truth.
             if (
-                response.get("api_version") != "manyforge.scene_resource_pose_response.v1"
-                or not _projection_same_or_forward(
-                    response.get("projection_revision"), view.projection_revision
+                not _projection_same_or_forward(
+                    response["projection_revision"], view.projection_revision
                 )
-                or row.get("scene_resource_id") != resource_id
+                or row["scene_resource_id"] != resource_id
             ):
                 raise ProductionPortError("native scene pose projection changed owner revision")
-            pose = row.get("pose_in_cell")
+            pose = row["pose_in_cell"]
+            position = [pose["position_m"][axis] for axis in "xyz"]
+            orientation = pose["orientation_xyzw"]
         else:
             raise ProductionPortError("scene resource placement is unsupported")
-        pose = _mapping(pose, field="pose_in_cell")
-        position = _mapping(pose.get("position_m"), field="pose_in_cell.position_m")
         return OwnerInvocationResult(
             True,
             output={
                 "frame_ref": {"kind": "cell_frame"},
                 "position_m": [
-                    _number(position.get(axis), field=f"pose_in_cell.position_m.{axis}")
-                    for axis in "xyz"
+                    _number(value, field="pose_in_cell.position_m") for value in position
                 ],
                 "orientation": {
                     "xyzw": normalize_quat(
-                        _sequence(
-                            pose.get("orientation_xyzw"),
-                            field="pose_in_cell.orientation_xyzw",
-                            length=4,
-                        )
+                        _sequence(orientation, field="pose_in_cell.orientation", length=4)
                     )
                 },
             },
@@ -6812,8 +6889,10 @@ class HeadlessSceneProgramPort:
                 else "scene.transaction"
             )
             evidence = self._program_node_evidence(identity, owner_api)
-            view = self._read_view(context)
             parameters = inputs.parameters
+            # Each Scene node reads its own object only: the owner checks the
+            # rest of the Scene at commit (OD-380).
+            view = self._read_view(context, parameters.get("scene_resource_id"))
             if node_id in {"scene.add_object", "scene.upsert_object"}:
                 pose, frame_ref = self._node_pose_and_frame(
                     context, view, parameters.get("pose"), field="pose"

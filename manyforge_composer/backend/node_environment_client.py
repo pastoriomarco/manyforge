@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_PROJECTION_VERSION = "manyforge.node_environment_projection.v3"
+_PROJECTION_VERSION = "manyforge.node_environment_projection.v4"
 _PROJECTION_FIELDS = {
     "availability",
     "catalog",
@@ -39,7 +39,6 @@ _AVAILABILITY_FIELDS = {
     "manager_runtime_converged",
     "portable_authoring_available",
     "reason_codes",
-    "restoration_gates",
 }
 _IMPLEMENTATION_FIELDS = {
     "adapter_build_qualified",
@@ -54,7 +53,6 @@ _IMPLEMENTATION_FIELDS = {
     "owner_health_available",
     "reason_codes",
     "reasons",
-    "restoration_gates",
 }
 
 
@@ -166,7 +164,6 @@ def _validate_availability(
         if not isinstance(availability[field], bool):
             raise _invalid(f"availability.{field} must be a boolean")
     _text_list(availability["reason_codes"], "availability.reason_codes")
-    _text_list(availability["restoration_gates"], "availability.restoration_gates")
 
     implementations = availability["implementations"]
     if not isinstance(implementations, list):
@@ -213,10 +210,6 @@ def _validate_availability(
             row["reason_codes"],
             f"availability.implementations[{index}].reason_codes",
         )
-        gates = _text_list(
-            row["restoration_gates"],
-            f"availability.implementations[{index}].restoration_gates",
-        )
         if not isinstance(row["reasons"], list) or any(
             not isinstance(reason, dict) for reason in row["reasons"]
         ):
@@ -233,16 +226,8 @@ def _validate_availability(
             )
         ):
             raise _invalid("availability execution claim lacks a required dimension")
-        if row["adapter_build_qualified"] == bool(gates):
-            raise _invalid(
-                "availability adapter disposition and restoration gates disagree"
-            )
         disposition = dispositions[registry_row]
-        if row[
-            "adapter_build_qualified"
-        ] is not disposition.adapter_build_qualified or gates != list(
-            disposition.restoration_gates
-        ):
+        if row["adapter_build_qualified"] is not disposition.adapter_build_qualified:
             raise _invalid(
                 "availability adapter disposition does not match the local "
                 "build-qualified resolver"

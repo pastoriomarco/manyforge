@@ -1,4 +1,4 @@
-# HISTORICAL / NON-OPERATIVE during the composable-cell runtime cutover.
+# HISTORICAL / NON-OPERATIVE.
 # Do not install or merge this policy until the assistant/headless endpoint
 # gate is qualified and the paths below are audited against its new contract.
 #

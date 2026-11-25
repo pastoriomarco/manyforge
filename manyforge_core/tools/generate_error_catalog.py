@@ -11,6 +11,9 @@ fresh by `--check` in CI; nothing reads the TSV at runtime.
   allocating; Stop event records store that index (stop state model §2.4).
 - Python: `manyforge_headless_api.error_codes.<UPPER_CODE>` code constants.
 - TypeScript: `ERROR_CATALOG` (code -> [compact, full]) for the GUI.
+- Python: `manyforge_headless_api.error_http_status.HTTP_STATUS`, the HTTP
+  status of every catalogued code (Headless's error answers), from the one
+  rule spec `http_status` below; `DEFAULT_HTTP_STATUS` for any other code.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ CATALOG = ROOT / "manyforge_core/resources/error_catalog.tsv"
 CPP = ROOT / "manyforge_core/include/manyforge_core/types/error_catalog.generated.hpp"
 PYTHON = ROOT / "manyforge_headless_api/error_codes.py"
 TYPESCRIPT = ROOT / "manyforge_composer/frontend/src/api/errorCatalog.generated.ts"
+HTTP_STATUS = ROOT / "manyforge_headless_api/error_http_status.py"
 
 _CODE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)+")
 _HEADER = "Generated from manyforge_core/resources/error_catalog.tsv by manyforge_core/tools/generate_error_catalog.py; do not edit."
@@ -45,6 +49,164 @@ def read_catalog(path: Path = CATALOG) -> list[tuple[str, str, str]]:
         seen.add(columns[0])
         rows.append((columns[0], columns[1], columns[2]))
     return sorted(rows)
+
+
+# ---------------------------------------------------------------------------
+# The HTTP status rule spec. Order matters: the first matching rule decides.
+# ---------------------------------------------------------------------------
+
+DEFAULT_HTTP_STATUS = 500
+
+# Typed refusals of Execute, Resume and a group's Run/Resume before any
+# effect: every RunReadiness reason and execution block, and the runner's own
+# run refusals; 409, never 5xx.
+RUN_REFUSAL_CODES = frozenset(
+    {
+        "cell_latched",
+        "component_not_enabled",
+        "component_unhealthy",
+        "rule_holds",
+        "rule_unknown",
+        "input_not_fresh",
+        "run_in_progress",
+        "program_motion_running",
+        "manual_operation_in_progress",
+        "program_not_executable",
+        "execution_host_internal_fault",
+        "manager_unavailable",
+        "program_scene_preparation_failed",
+        "program_cycle_reset_required",
+        "program_run_history_full",
+        "program_end_effector_tcp_unavailable",
+        "program_motion_resume_incomplete",
+        "io_manual_write_motion_executing",
+    }
+)
+
+
+def http_status(code: str) -> int:
+    """The HTTP status of an error answer carrying `code`."""
+
+    if code == "draft_candidate_response_too_large":
+        return 413
+    if code == "component_frame_lookup_invalid":
+        return 400
+    if code in {"component_frame_lookup_stale", "component_reference_missing", "frame_missing"}:
+        return 409
+    if code == "program_run_started_then_failed":
+        return 422
+    if code == "full_stack_restart_required":
+        return 409
+    if code in {
+        "headless_projection_response_invalid",
+        "headless_projection_response_oversized",
+        "manager_command_response_invalid",
+        "execution_command_response_invalid",
+        "node_environment_projection_invalid",
+        "assistant_mode_context_invalid",
+        "source_model_context_invalid",
+        "source_model_projection_invalid",
+        "program_applied_selection_invalid",
+        "program_runner_response_invalid",
+        "viewer_model_asset_invalid",
+        "assistant_mode_projection_invalid",
+    }:
+        return 502
+    if code == "headless_api_internal_failure":
+        return 500
+    if code.endswith("_not_found") or code in {
+        "missing_reference",
+        "operator_alarm_not_found",
+        "planning_job_unknown",
+    }:
+        return 404
+    if (
+        "conflict" in code
+        or "stale" in code
+        or "fence" in code
+        or code.startswith(("program_cycle_state_", "program_run_state_"))
+        or code
+        in {
+            "invalid_state_transition",
+            "command_not_allowed",
+            "manual_handover_required",
+            "object_already_exists",
+            "program_run_admission_failed",
+            "program_run_already_active",
+            "program_applied_non_executable",
+            "program_not_selected",
+            # Preparation runs before any claim or effect; it refuses the input.
+            "activation_preparation_failed",
+            "program_reference_validation_failed",
+            "prepared_activation_unverified",
+            "authoring_not_ready",
+            "program_run_draft_applied_mismatch",
+            "activation_preparer_busy",
+            "model_sources_unknown",
+            "program_node_preview_busy",
+            "deployment_candidate_cell_mismatch",
+            "persistent_key_request_replayed",
+            # An operator-alarm condition interlock refuses motion before any effect.
+            "operator_alarm_interlock_active",
+            "request_result_expired",
+            # Component model v2: refusals before dispatch.
+            "component_action_in_progress",
+            "component_action_unsupported",
+            "owner_not_prepared",
+            "io_output_controller_owned",
+            # A position reset while the simulation isn't playing.
+            "simulation_not_playing",
+            # An assistant mode read while the Deployment has no assistant.
+            "assistant_component_absent",
+            # Pick/place planning jobs: a held name, a release before the end.
+            "planning_job_exists",
+            "planning_job_unfinished",
+        }
+        # RunReadiness reasons and run refusals.
+        or code in RUN_REFUSAL_CODES
+    ):
+        return 409
+    if "unavailable" in code or code in {
+        "assistant_ai_model_absent",
+        "headless_api_closed",
+        "kernel_owner_unavailable",
+        "execution_owner_not_ready",
+        "operator_alarm_state_unavailable",
+        "program_applied_selection_not_active",
+        "program_runner_unavailable",
+        "program_run_scheduling_failed",
+        "program_cycle_reconciliation_required",
+        "request_ledger_full",
+        "scene_projection_commit_uncertain",
+        "execution_control_ingress_busy",
+        "execution_planning_jobs_busy",
+        # A runtime unit launching or preparing (contract 1.3).
+        "runtime_unit_launch_in_progress",
+    }:
+        return 503
+    if (
+        code == "invalid_request"
+        or code.endswith("_invalid")
+        or code.endswith("_rejected")
+    ):
+        return 400
+    if code in {
+        # A Scene change whose result would exceed the Scene size limit.
+        "scene_too_large",
+        "confirmation_required",
+        "request_key_required",
+        "start_identity_required",
+        "operator_alarm_acknowledgement_confirmation_required",
+        "operator_alarm_acknowledgement_reason_required",
+        "operator_alarm_acknowledge_all_confirmation_required",
+        "operator_alarm_acknowledge_all_duplicate_member",
+        "operator_alarm_limit_invalid",
+        "operator_alarm_state_filter_invalid",
+    }:
+        return 400
+    if code == "operator_alarm_membership_mismatch":
+        return 409
+    return DEFAULT_HTTP_STATUS
 
 
 def _camel(code: str) -> str:
@@ -118,12 +280,33 @@ def render_typescript(rows: list[tuple[str, str, str]]) -> str:
     return "\n".join(lines)
 
 
+def render_http_status(rows: list[tuple[str, str, str]]) -> str:
+    lines = [
+        f'"""{_HEADER}',
+        "",
+        "The HTTP status of Headless's error answer for each catalogued code;",
+        "any other code answers DEFAULT_HTTP_STATUS.",
+        '"""',
+        "",
+        "from types import MappingProxyType",
+        "from typing import Final, Mapping",
+        "",
+        f"DEFAULT_HTTP_STATUS: Final = {DEFAULT_HTTP_STATUS}",
+        "",
+        "HTTP_STATUS: Final[Mapping[str, int]] = MappingProxyType({",
+    ]
+    lines += [f'    "{code}": {http_status(code)},' for code, _compact, _full in rows]
+    lines += ["})", ""]
+    return "\n".join(lines)
+
+
 def outputs() -> dict[Path, str]:
     rows = read_catalog()
     return {
         CPP: render_cpp(rows),
         PYTHON: render_python(rows),
         TYPESCRIPT: render_typescript(rows),
+        HTTP_STATUS: render_http_status(rows),
     }
 
 

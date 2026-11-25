@@ -41,16 +41,9 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert health.json()["components"]["runtime"] == "unavailable"
     assert "assistant_bridge" not in health.json()["components"]
     assert health.json()["runtimeAvailability"]["code"] == (
-        "composable_cell_runtime_unavailable"
+        "runtime_unavailable"
     )
-    assert health.json()["runtimeAvailability"]["restorationGates"] == [
-        "N7",
-        "L0",
-        "P5",
-        "I",
-        "R",
-        "T",
-    ]
+    assert set(health.json()["runtimeAvailability"]) == {"code", "message"}
 
     catalog = client.get("/api/catalog")
     assert catalog.status_code == 200
@@ -116,7 +109,7 @@ def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None
         response = getattr(client, method)(path)
         assert response.status_code == 503
         assert response.json()["detail"]["code"] == (
-            "composable_cell_runtime_unavailable"
+            "runtime_unavailable"
         )
 
 

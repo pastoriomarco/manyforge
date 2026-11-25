@@ -53,10 +53,20 @@ class _Client:
         return {"can_execute": True, "can_resume": False, "blocked_reasons": []}
 
 
+_LOGGING: list[tuple[str, str]] = []
+
+
 @pytest.fixture(autouse=True)
 def _fake_client(monkeypatch: pytest.MonkeyPatch) -> None:
     _Client.calls = []
     monkeypatch.setattr(cli, "HeadlessHttpClient", _Client)
+    # The serve path configures the root logger; keep the test process's own.
+    _LOGGING.clear()
+    monkeypatch.setattr(
+        cli,
+        "setup_logging",
+        lambda level, *, process: _LOGGING.append((level, process)),
+    )
 
 
 @pytest.mark.parametrize("argv,call", [
@@ -126,3 +136,33 @@ def test_serve_refuses_the_removed_projection_root(
     with pytest.raises(SystemExit) as refused:
         cli.main([*args, "--projection-root", str(tmp_path / "projection")])
     assert refused.value.code == 2
+
+
+def _serve_args(root: Any) -> list[str]:
+    args = ["serve", "--cell-id", "cell_a", "--application-start-id", "3f9a0000000000a1"]
+    for flag in (
+        "install-root", "artifact-root", "node-catalog-path",
+        "node-environment-manifest-path", "alarm-catalog-path", "historian-directory",
+        "manager-run-root", "execution-run-root",
+    ):
+        args += [f"--{flag}", str(root / flag)]
+    return args
+
+
+@pytest.mark.parametrize("extra,level", [([], "INFO"), (["--log-level", "WARNING"], "WARNING")])
+def test_serve_configures_logging_before_the_app(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, extra: list[str], level: str
+) -> None:
+    order: list[str] = []
+    monkeypatch.setattr(
+        cli, "setup_logging", lambda level, *, process: order.append(f"log:{level}:{process}")
+    )
+    monkeypatch.setattr(cli, "create_app", lambda _config: order.append("app") or object())
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *_args, **_kwargs: None)
+    assert cli.main([*_serve_args(tmp_path), *extra]) == 0
+    assert order == [f"log:{level}:headless_api", "app"]
+
+
+def test_client_commands_leave_logging_unconfigured() -> None:
+    assert cli.main(["readiness"]) == 0
+    assert _LOGGING == []

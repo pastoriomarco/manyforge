@@ -6,6 +6,7 @@
 #include <iostream>
 #include <iterator>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/process_diagnostics.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/program_frame_identity.hpp>
@@ -1148,9 +1149,12 @@ create_retained_execution_host_participants(
     // Preserve the refusal while identifying the guard that rejected the
     // inventory; process startup otherwise reports only the shared message.
     if (registration_count > core::kMaxOperationParticipants) {
-      std::cerr << "native control inventory guard: registration_count="
-                << registration_count << " exceeds participant limit="
-                << core::kMaxOperationParticipants << '\n';
+      core::LogLine(core::LogSeverity::kError,
+                    core::LogText("native control inventory guard: "
+                                  "registration_count=",
+                                  registration_count,
+                                  " exceeds participant limit=",
+                                  core::kMaxOperationParticipants));
     } else {
       const auto bad_owner = std::find_if(
           input.control_binding_representatives.begin(),
@@ -1159,10 +1163,12 @@ create_retained_execution_host_participants(
                    representative_owner_count(candidate) != 1U;
           });
       if (bad_owner != input.control_binding_representatives.end()) {
-        std::cerr << "native control inventory guard: representative binding="
-                  << bad_owner->value().control_path->control_binding_id.value()
-                  << " owner count=" << representative_owner_count(*bad_owner)
-                  << '\n';
+        core::LogLine(
+            core::LogSeverity::kError,
+            core::LogText(
+                "native control inventory guard: representative binding=",
+                bad_owner->value().control_path->control_binding_id.value(),
+                " owner count=", representative_owner_count(*bad_owner)));
       } else {
         const auto duplicate = std::adjacent_find(
             input.control_binding_representatives.begin(),
@@ -1172,11 +1178,15 @@ create_retained_execution_host_participants(
                      right.value().control_path->control_binding_id;
             });
         if (duplicate != input.control_binding_representatives.end()) {
-          std::cerr << "native control inventory guard: duplicate representative binding="
-                    << duplicate->value().control_path->control_binding_id.value()
-                    << '\n';
+          core::LogLine(
+              core::LogSeverity::kError,
+              core::LogText(
+                  "native control inventory guard: duplicate representative "
+                  "binding=",
+                  duplicate->value().control_path->control_binding_id.value()));
         } else if (!contains_exact_representative(input.motion_binding)) {
-          std::cerr << "native control inventory guard: motion representative is not exact and unique\n";
+          core::LogLine(core::LogSeverity::kError, "native control inventory guard: motion "
+                            "representative is not exact and unique");
         } else {
           const auto alias = std::find_if(
               input.motion_binding_aliases.begin(),
@@ -1184,13 +1194,14 @@ create_retained_execution_host_participants(
                 return !program_view_within_physical_owner(
                     input.motion_binding, candidate);
               });
-          std::cerr << "native control inventory guard: motion alias crosses or widens physical binding";
+          std::string line = "native control inventory guard: motion alias "
+                             "crosses or widens physical binding";
           if (alias != input.motion_binding_aliases.end() &&
               alias->value().control_path.has_value()) {
-            std::cerr << " binding="
-                      << alias->value().control_path->control_binding_id.value();
+            line += " binding=" +
+                    alias->value().control_path->control_binding_id.value();
           }
-          std::cerr << '\n';
+          core::LogLine(core::LogSeverity::kError, line);
         }
       }
     }

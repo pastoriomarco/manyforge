@@ -482,6 +482,8 @@ private:
   DeferredLane scene_read_lane_{"execution_scene_read_lane_busy"};
   DeferredLane runtime_scale_lane_{"execution_runtime_scale_lane_busy"};
   DeferredLane io_output_lane_{"execution_io_output_lane_busy"};
+  // Motion-trace snapshot encoding and file writes; its own thread.
+  DeferredLane motion_trace_lane_{"motion_trace_store_busy"};
   // Event subscriptions: own socket, acceptor and one writer per subscriber.
   CommandSocket event_stream_socket_;
   ExecutionEventStream event_stream_{ExecutionEventStreamSource{

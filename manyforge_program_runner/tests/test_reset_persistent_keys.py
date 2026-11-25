@@ -1,4 +1,5 @@
-"""Reset with Reload initial scene resets the persistent keys' stored values."""
+"""Reset with Reset stored values returns the persistent keys to `initial:`,
+independently of Reload initial scene (OD-393)."""
 
 from __future__ import annotations
 
@@ -120,7 +121,7 @@ def test_register_resets_every_persistent_key_in_one_audited_write(tmp_path) -> 
         ("reset", "layer", "reset.1", "program_reset", 1),
         ("reset", "limit", "reset.1", "program_reset", 1),
     ]
-    assert resets[1]["detail"] == "Reset reloaded the initial scene; was 3"
+    assert resets[1]["detail"] == "Reset to the initial value; was 3"
     # Durable once written: a new register reads the same.
     assert register.wait_written(5.0)
     assert PersistentKeyRegister(register.path.parent, application_start_id=_A_TEXT).values(_PROJECT) == {}
@@ -165,6 +166,7 @@ def _reset_runtime(
     idle: bool,
     reload_scene: bool,
     events: list[str],
+    stored_values: bool = True,
 ) -> tuple[ProgramRuntime, ProgramCycleJournal, PersistentKeyRegister, ProgramCycleResetRequest]:
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
     reference = None if idle else _retain_terminal_cycle(journal, _program_cycle_claim())
@@ -180,7 +182,7 @@ def _reset_runtime(
             persistent_key_register_directory=tmp_path,
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Transport(),  # type: ignore[arg-type]
+        gateway=_Transport(),  # type: ignore[arg-type]
         admission_client=Admission(),  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -205,17 +207,19 @@ def _reset_runtime(
         "expected_cycle_generation": 1,
         "expected_claim_generation": None if idle else 1, "terminal_reference": reference,
         "settlement_evidence_digest": reference, "reload_initial_scene": reload_scene,
+        "reset_stored_values": stored_values,
     })
     return runtime, journal, register, request
 
 
+@pytest.mark.parametrize("reload_scene", [True, False])
 @pytest.mark.parametrize("idle", [False, True])
-def test_reset_with_reload_returns_persistent_keys_to_initial(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, idle: bool
+def test_reset_stored_values_returns_persistent_keys_to_initial(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, idle: bool, reload_scene: bool
 ) -> None:
     events: list[str] = []
     runtime, journal, register, request = _reset_runtime(
-        tmp_path, monkeypatch, idle=idle, reload_scene=True, events=events
+        tmp_path, monkeypatch, idle=idle, reload_scene=reload_scene, events=events
     )
     try:
         runtime.reset_cycle(request)
@@ -223,7 +227,9 @@ def test_reset_with_reload_returns_persistent_keys_to_initial(
         # Not stored any more: layer starts from `initial: 0`, counted
         # (no `initial:`) empty, and the read key limit from `initial: 0.5`.
         assert _values(register) == {}
-        assert events == ["scene:[]"]
+        # With Reload initial scene, keys first, then the Scene; without it,
+        # no Scene reload.
+        assert events == (["scene:[]"] if reload_scene else [])
         # Recorded with this Reset in the stored-value edits.
         assert [
             (
@@ -241,21 +247,26 @@ def test_reset_with_reload_returns_persistent_keys_to_initial(
         runtime.shutdown()
 
 
+@pytest.mark.parametrize("reload_scene", [False, True])
 @pytest.mark.parametrize("idle", [False, True])
-def test_reset_without_reload_keeps_persistent_keys(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, idle: bool
+def test_reset_without_stored_values_keeps_persistent_keys(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, idle: bool, reload_scene: bool
 ) -> None:
     events: list[str] = []
     runtime, journal, register, request = _reset_runtime(
-        tmp_path, monkeypatch, idle=idle, reload_scene=False, events=events
+        tmp_path, monkeypatch, idle=idle, reload_scene=reload_scene, events=events,
+        stored_values=False,
     )
     edits = register.edits(_PROJECT)
     try:
         runtime.reset_cycle(request)
         assert journal.read().state == "idle_after_reset"
+        # Reload initial scene reloads only the Scene (OD-393).
         assert _values(register) == {"counted": 7, "layer": 3, "limit": 0.7}
         assert register.edits(_PROJECT) == edits
-        assert events == []
+        assert events == (
+            ["scene:['counted', 'layer', 'limit']"] if reload_scene else []
+        )
     finally:
         runtime.shutdown()
 
@@ -286,6 +297,16 @@ def test_a_key_reset_that_cannot_be_stored_refuses_the_reset_before_the_scene(
         assert failed.reset_phase == "restoring_scene"
         assert failed.failure["code"] == "program_cycle_reset_persistent_keys_failed"
         assert failed.failure["failed_phase"] == "restoring_scene"
+        # The cycle status names the accepted options; a retry must carry them.
+        assert runtime.cycle_projection()["reset_options"] == {
+            "reload_initial_scene": True, "reset_robot_position": False,
+            "reset_stored_values": True,
+        }
+        with pytest.raises(ProgramRunnerError) as conflict:
+            runtime._require_same_reset_options(  # noqa: SLF001
+                request.model_copy(update={"reset_stored_values": False}), request
+            )
+        assert conflict.value.code == "program_run_request_conflict"
         # Nothing half-applied: values kept, Scene untouched.
         assert _values(register) == {"counted": 7, "layer": 3, "limit": 0.7}
         assert events == []
@@ -315,5 +336,77 @@ def test_the_refusal_names_the_storage_cause(tmp_path, monkeypatch: pytest.Monke
             runtime._reset_persistent_keys_to_initial(request)  # noqa: SLF001
         assert refused.value.code == "program_cycle_reset_persistent_keys_failed"
         assert refused.value.details == {"cause_code": "persistent_key_storage_unavailable"}
+    finally:
+        runtime.shutdown()
+
+
+def test_a_stored_values_only_idle_reset_that_cannot_be_stored_is_refused(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a selected effect the Reset has no phase: refused by name, the
+    cycle stays Idle and the values stay; Reset again retries."""
+
+    events: list[str] = []
+    runtime, journal, register, request = _reset_runtime(
+        tmp_path, monkeypatch, idle=True, reload_scene=False, events=events
+    )
+    reset_to_initial = register.reset_to_initial
+
+    def refuse(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise PersistentKeyRegisterError("read-only file system")
+
+    monkeypatch.setattr(register, "reset_to_initial", refuse)
+    try:
+        with pytest.raises(ProgramRunnerError) as refused:
+            runtime.reset_cycle(request)
+        assert refused.value.code == "program_cycle_reset_persistent_keys_failed"
+        assert journal.read().state == "idle_after_reset"
+        assert _values(register) == {"counted": 7, "layer": 3, "limit": 0.7}
+
+        monkeypatch.setattr(register, "reset_to_initial", reset_to_initial)
+        runtime.reset_cycle(request.model_copy(update={
+            "request_key": _key("reset.keys.again"),
+            "expected_cycle_generation": journal.read().cycle_generation,
+        }))
+        assert journal.read().state == "idle_after_reset"
+        assert _values(register) == {}
+        assert events == []
+    finally:
+        runtime.shutdown()
+
+
+def test_a_stored_values_only_run_reset_that_cannot_be_stored_resumes_its_phase(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a run, the keys are reset in the release phase, before the claim
+    is released; a refusal leaves that phase to resume."""
+
+    events: list[str] = []
+    runtime, journal, register, request = _reset_runtime(
+        tmp_path, monkeypatch, idle=False, reload_scene=False, events=events
+    )
+    reset_to_initial = register.reset_to_initial
+
+    def refuse(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise PersistentKeyRegisterError("read-only file system")
+
+    monkeypatch.setattr(register, "reset_to_initial", refuse)
+    try:
+        with pytest.raises(ProgramRunnerError) as refused:
+            runtime.reset_cycle(request)
+        assert refused.value.code == "program_cycle_recovery_required"
+        assert refused.value.details == {
+            "cause_code": "program_cycle_reset_persistent_keys_failed"
+        }
+        failed = journal.read()
+        assert failed.state == "recovery_required"
+        assert failed.failure["failed_phase"] == "releasing"
+        assert _values(register) == {"counted": 7, "layer": 3, "limit": 0.7}
+
+        monkeypatch.setattr(register, "reset_to_initial", reset_to_initial)
+        runtime.reset_cycle(request.model_copy(update={"request_key": _key("reset.keys.again")}))
+        assert journal.read().state == "idle_after_reset"
+        assert _values(register) == {}
+        assert events == []
     finally:
         runtime.shutdown()

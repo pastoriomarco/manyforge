@@ -7,9 +7,12 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <ctime>
 #include <exception>
 #include <iostream>
 #include <cstdint>
@@ -375,6 +378,17 @@ std::string OperationFailureHistoryMessage(const CanonicalValue &state) {
     }
     result += Utf8Prefix(*code, kMaximumSummaryTextCodePoints) + ": " +
               Utf8Prefix(*message, kMaximumSummaryTextCodePoints);
+    // A runtime collision names both bodies in its details.
+    const auto *details = error->find_object_member("details");
+    const auto *contact_a =
+        details == nullptr ? nullptr : StringMember(*details, "contact_a");
+    const auto *contact_b =
+        details == nullptr ? nullptr : StringMember(*details, "contact_b");
+    if (contact_a != nullptr && contact_b != nullptr && !contact_a->empty() &&
+        !contact_b->empty())
+      result += " (" + Utf8Prefix(*contact_a, kMaximumSummaryTextCodePoints) +
+                " <-> " + Utf8Prefix(*contact_b, kMaximumSummaryTextCodePoints) +
+                ")";
     if (result.size() >= kMaximumSummaryTextCodePoints)
       return Utf8Prefix(result, kMaximumSummaryTextCodePoints);
   }
@@ -762,6 +776,49 @@ void LowerWriterThreadPriority() {
   }
 }
 
+/// Host CLOCK_MONOTONIC and UTC nanoseconds, read back to back.
+std::pair<std::int64_t, std::int64_t> HostTimes() {
+  const auto monotonic = std::chrono::steady_clock::now().time_since_epoch();
+  const auto utc = std::chrono::system_clock::now().time_since_epoch();
+  return {std::chrono::duration_cast<std::chrono::nanoseconds>(monotonic).count(),
+          std::chrono::duration_cast<std::chrono::nanoseconds>(utc).count()};
+}
+
+std::string UtcText(const std::int64_t utc_ns) {
+  const std::time_t seconds = utc_ns / 1000000000LL;
+  std::tm value{};
+  static_cast<void>(::gmtime_r(&seconds, &value));
+  std::array<char, 64> output{};
+  const auto count = std::snprintf(
+      output.data(), output.size(), "%04d-%02d-%02dT%02d:%02d:%02d.%09lldZ",
+      value.tm_year + 1900, value.tm_mon + 1, value.tm_mday, value.tm_hour,
+      value.tm_min, value.tm_sec,
+      static_cast<long long>(utc_ns % 1000000000LL));
+  return std::string(output.data(), static_cast<std::size_t>(count));
+}
+
+/// The History row that places one ended loss episode in the sequence.
+HistorianEvent LossRecord(const std::uint64_t lost, const std::string &cause,
+                          const std::pair<std::int64_t, std::int64_t> &first,
+                          const std::pair<std::int64_t, std::int64_t> &last) {
+  const auto now = HostTimes();
+  return MakeHistorianEvent(
+      "manyforge.headless.historian", "historian_records_lost", "WARN",
+      now.first, UtcText(now.second),
+      CanonicalValue(CanonicalValue::Object{
+          {"first_lost_raw_monotonic_ns",
+           content_identity::nonnegative_int64_value(first.first)},
+          {"first_lost_wall", CanonicalValue(UtcText(first.second))},
+          {"last_lost_raw_monotonic_ns",
+           content_identity::nonnegative_int64_value(last.first)},
+          {"last_lost_wall", CanonicalValue(UtcText(last.second))},
+          {"lost_count", Number(lost, "lost_count")},
+          {"message", CanonicalValue("History lost " + std::to_string(lost) +
+                                     " records (" + cause + ")")},
+          {"reason_code", CanonicalValue(cause)},
+      }));
+}
+
 std::pair<std::string, std::string> StoreFailure(const std::exception_ptr &failure) {
   try {
     std::rethrow_exception(failure);
@@ -885,8 +942,10 @@ void AsyncEventHistorian::Shutdown() {
 
 void AsyncEventHistorian::MarkLossLocked(std::string code,
                                          std::string message) {
+  last_loss_ = HostTimes();
   if (!loss_active_) {
     loss_active_ = true;
+    first_loss_ = last_loss_;
     unlogged_loss_ = "code=" + code + " detail=" + message;
     condition_.notify_one();
   }
@@ -984,9 +1043,24 @@ void AsyncEventHistorian::Run() {
         // Written empty again: the loss episode, if any, ends here.
         if (loss_active_) {
           loss_active_ = false;
+          const auto losses = overflow_count_ + delivery_failure_count_;
+          const auto lost = losses - reported_losses_;
+          reported_losses_ = losses;
+          const auto cause = error_code_.value_or("historian_store_failure");
+          const auto first = first_loss_, last = last_loss_;
           error_code_.reset();
           error_message_.reset();
           Advance(health_generation_);
+          // This thread places the episode in the sequence with one row,
+          // made outside the lock; it is written with the next commit.
+          write_in_flight_ = true;
+          lock.unlock();
+          auto record = LossRecord(lost, cause, first, last);
+          lock.lock();
+          write_in_flight_ = false;
+          queued_ids_.insert(record.event_id);
+          queue_.push_back(std::move(record));
+          Advance(accepted_count_);
         }
         idle_condition_.notify_all();
       }

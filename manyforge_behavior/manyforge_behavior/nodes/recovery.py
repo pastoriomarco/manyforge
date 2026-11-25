@@ -6,7 +6,7 @@ from typing import Final
 
 
 RECOVERY_NODE_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_recovery_node_unavailable"
+    "recovery_node_unavailable"
 )
 
 

@@ -316,7 +316,6 @@ def _non_executable_applied_context(
         return None, {
             "code": error.code,
             "message": str(error),
-            "restorationGates": [],
         }
     program = status.get("program") if isinstance(status, dict) else None
     publication = None
@@ -346,7 +345,6 @@ def _non_executable_applied_context(
         return None, {
             "code": "program_applied_selection_invalid",
             "message": "headless API returned an invalid Applied Program status",
-            "restorationGates": [],
         }
     return (
         _AppliedContext(
@@ -369,7 +367,6 @@ def _applied_context(
         return None, {
             "code": "program_apply_unavailable",
             "message": "authoritative Program Apply requires a configured headless API",
-            "restorationGates": [],
         }
     try:
         applied = state.headless_client.program_applied()
@@ -381,13 +378,11 @@ def _applied_context(
         return None, {
             "code": error.code,
             "message": str(error),
-            "restorationGates": [],
         }
     if not isinstance(applied, dict):
         return None, {
             "code": "program_applied_selection_invalid",
             "message": "headless API returned an invalid Applied Program projection",
-            "restorationGates": [],
         }
     source = applied.get("source")
     program = applied.get("program")
@@ -419,7 +414,6 @@ def _applied_context(
         return None, {
             "code": "program_applied_selection_invalid",
             "message": "headless API returned an invalid Applied Program projection",
-            "restorationGates": [],
         }
     return (
         _AppliedContext(

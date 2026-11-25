@@ -33,6 +33,8 @@ _DRIVE = {
     "vendor_text": "Joint 2 overcurrent",
     "concerns": ["lite6_arm", "lite6_io"],
     "since_ns": 5,
+    "since_utc_ns": "1795122990477663500",
+    "details": {"output_tail": "driver: joint 2 overcurrent"},
 }
 
 
@@ -48,7 +50,7 @@ def _pump(core: _RecordingCore) -> ExecutionEventPump:
     )
 
 
-def test_faults_are_passed_without_their_time_and_without_simulators() -> None:
+def test_faults_are_passed_without_their_times_details_and_simulators() -> None:
     core = _ChangedCore()
     pump = _pump(core)
     changes: list[None] = []

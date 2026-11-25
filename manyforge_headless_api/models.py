@@ -833,6 +833,8 @@ class ProgramSelectionStartRequest(ProgramSelectionResumeRequest):
 class ProgramCycleResetRequest(CallerAttributionRequest):
     reload_initial_scene: bool = False
     reset_robot_position: bool = False
+    # OD-393: every persistent key returns to `initial:` (or empty).
+    reset_stored_values: bool = False
     program_run_id: ProgramRunNumber | None
     expected_cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     expected_claim_generation: (
@@ -1430,33 +1432,6 @@ class SceneResourcePoseQuery(StrictRequest):
         if normalized != sorted(set(normalized)):
             raise ValueError("scene_resource_ids must be strictly sorted and unique")
         return normalized
-
-
-class SceneRuntimeIdentityRequest(StrictRequest):
-    """The Manager's scene-runtime identity, as `GET /api/scene/runtime-owner` reads it."""
-
-    retained_bundle_id: Annotated[str, Field(min_length=1, max_length=MAX_IDENTITY_BYTES)]
-    graph_revision: Annotated[str, Field(min_length=1, max_length=MAX_IDENTITY_BYTES)]
-    deployment_generation: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
-    program_generation: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
-    runtime_generation: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
-
-
-class SceneRuntimeLatchRequest(StrictRequest):
-    """One Program Runner between-nodes latch of pose observations (OD-294)."""
-
-    expected_runtime_identity: SceneRuntimeIdentityRequest
-    scene_resource_ids: (
-        Annotated[list[str], Field(min_length=1, max_length=MAX_SCENE_POSE_QUERY_RESOURCES)]
-        | None
-    ) = None
-
-    @field_validator("scene_resource_ids")
-    @classmethod
-    def validate_scene_resource_ids(cls, values: list[str] | None) -> list[str] | None:
-        if values is not None and values != sorted(set(values)):
-            raise ValueError("scene_resource_ids must be strictly sorted and unique")
-        return values
 
 
 class Vector3Request(StrictRequest):
@@ -3736,7 +3711,17 @@ class RecoveryCause(StrictRequest):
 class RecoveryStop(StrictRequest):
     code: Literal["estop"]
     message: str
-    since_ns: Annotated[int, Field(ge=0)]
+    # Steady-clock ns: an integer, or its decimal text above 2^53 - 1.
+    since_ns: (
+        Annotated[int, Field(ge=0)]
+        | Annotated[str, Field(pattern=r"^(0|[1-9][0-9]*)$")]
+    )
+    # The UTC time of `since_ns`, encoded the same way.
+    since_utc_ns: (
+        Annotated[int, Field(ge=0)]
+        | Annotated[str, Field(pattern=r"^(0|[1-9][0-9]*)$")]
+        | None
+    ) = None
     vendor_code: str | None = None
     vendor_text: str | None = None
 
@@ -3847,6 +3832,7 @@ class ProgramResetFactsRequest(StrictRequest):
 
     reload_initial_scene: bool
     reset_robot_position: bool
+    reset_stored_values: bool
     program_run_id: _ResetNumber | None = None
     program_revision: _ResetText | None = None
     applied_record_digest: _ResetText | None = None
@@ -3863,6 +3849,43 @@ class ProgramResetOutcomeRequest(StrictRequest):
     outcome: Literal["succeeded", "refused", "failed", "unknown"]
     error: ActivityErrorRequest | None = None
     reset: ProgramResetFactsRequest
+
+
+class SceneChangeErrorRequest(StrictRequest):
+    """The typed error of a refused, failed or unknown scene change."""
+
+    code: Annotated[str, Field(min_length=1, max_length=256)]
+    message: _ActivityText | None = None
+    # The owner's structured details; History keeps them when they fit.
+    details: dict[str, Any] | None = None
+
+
+class SceneChangeFactsRequest(StrictRequest):
+    """What one scene change did: its object, its caller's source label, the
+    time the owner call took and the scene revision it committed."""
+
+    scene_resource_id: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+    source_label: Annotated[str, Field(min_length=1, max_length=256)]
+    duration_ms: Annotated[float, Field(ge=0)]
+    scene_revision_id: _ResetNumber | None = None
+
+
+class SceneChangeRecordRequest(StrictRequest):
+    """`POST /api/execution/history/scene-changes`: one scene change the
+    Program Runner made outside a Program node attempt (its initial-scene
+    preparation, a Program Reset's reload, the empty-Apply clear), recorded
+    once in History."""
+
+    # Checked once at the route (contract 1.6).
+    application_start_id: str | None = Field(default=None, exclude=True)
+    operation_kind: Literal[
+        "add_object", "upsert_object", "remove_object", "update_object_pose",
+        "attach_carried_object", "detach_carried_object",
+        "detach_carried_object_at_current_pose", "set_collision_policy",
+    ]
+    outcome: Literal["succeeded", "refused", "failed", "unknown"]
+    error: SceneChangeErrorRequest | None = None
+    scene_change: SceneChangeFactsRequest
 
 
 # The wall-clock form History reads (RFC 3339 with an explicit offset).
@@ -3941,16 +3964,71 @@ class ProgramNodeAttemptFacts(StrictRequest):
         return self
 
 
-class ProgramNodeAttemptBatchRequest(StrictRequest):
-    """`POST /api/program/node-attempts`: finished node attempts, recorded
-    once each in History by the Program Runner that ran them (OD-375)."""
+class ProgramRunEventFacts(StrictRequest):
+    """One Program run event: its start, its end or one of the Runner's
+    audit events (a recovery action, an operator answer, ...), stamped by the
+    Runner at production (its CLOCK_MONOTONIC and UTC)."""
 
-    schema_version: Literal["manyforge.program_node_attempt_batch.v1"]
+    program_run_id: ProgramRunNumber
+    event: Annotated[str, Field(pattern=r"^[a-z0-9_]{1,64}$")]
+    outcome: Annotated[str, Field(pattern=r"^[a-z_]{1,64}$")]
+    occurred_at_ns: Annotated[str, Field(pattern=r"^(0|[1-9][0-9]{0,18})$")]
+    occurred_at_wall: Annotated[str, Field(pattern=_WALL_TIME_PATTERN)]
+    error: ProgramNodeAttemptErrorRequest | None = None
+    # The event's own facts; History keeps them as bounded scalars.
+    facts: Annotated[dict[str, Any], Field(max_length=29)]
+
+    @field_validator("occurred_at_ns")
+    @classmethod
+    def exact_clock(cls, value: str) -> str:
+        nonnegative_int64(value)
+        return value
+
+    @field_validator("facts")
+    @classmethod
+    def bounded_fact_names(cls, value: dict[str, Any]) -> dict[str, Any]:
+        for name in value:
+            _bounded_nfc(name, label="fact name", maximum_bytes=64)
+        return value
+
+    @model_validator(mode="after")
+    def error_matches_outcome(self) -> "ProgramRunEventFacts":
+        if (self.error is not None) != (self.outcome == "failed"):
+            raise ValueError("a run event carries its error exactly when it failed")
+        return self
+
+
+class ProgramNodeAttemptLossFacts(StrictRequest):
+    """The node attempts and run events the Program Runner dropped (queue
+    full or closed, delivery failed) since its last delivered batch."""
+
+    count: Annotated[int, Field(strict=True, ge=1, le=9_007_199_254_740_991)]
+    first_lost_wall: Annotated[str, Field(pattern=_WALL_TIME_PATTERN)]
+    last_lost_wall: Annotated[str, Field(pattern=_WALL_TIME_PATTERN)]
+
+
+class ProgramNodeAttemptBatchRequest(StrictRequest):
+    """`POST /api/program/node-attempts`: finished node attempts and Program
+    run events, recorded once each in History by the Program Runner that
+    produced them (OD-375). At most 64 entries in all."""
+
+    schema_version: Literal["manyforge.program_node_attempt_batch.v2"]
     # Checked once at the route (contract 1.6).
     application_start_id: str | None = Field(default=None, exclude=True)
     attempts: Annotated[
-        list[ProgramNodeAttemptFacts], Field(min_length=1, max_length=64)
-    ]
+        list[ProgramNodeAttemptFacts], Field(max_length=64)
+    ] = Field(default_factory=list)
+    run_events: Annotated[
+        list[ProgramRunEventFacts], Field(max_length=64)
+    ] = Field(default_factory=list)
+    # The Runner's entries lost since its last delivered batch.
+    lost_since_last_batch: ProgramNodeAttemptLossFacts | None = None
+
+    @model_validator(mode="after")
+    def bounded_batch(self) -> "ProgramNodeAttemptBatchRequest":
+        if not 1 <= len(self.attempts) + len(self.run_events) <= 64:
+            raise ValueError("a batch carries 1 to 64 entries")
+        return self
 
 
 class SetOutputRequest(StrictRequest):

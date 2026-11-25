@@ -2656,6 +2656,10 @@ TEST(ManagerNamedApplyCoordinator,
     bool successor_renewal_available = !defer_renewal;
     std::vector<ManagerApplySettlementAttempt> settlement_attempts;
     std::optional<ManagerApplyIntentDTO> settlement_successor;
+    // OD-387: replays made inside the success settlement, while the Apply
+    // step holds the lane and the success is already journaled.
+    std::optional<ManagerNamedApplyRequestDTO> replay_in_window;
+    std::vector<ManagerNamedApplyResult> replays_in_window;
     ManagerNamedApplyCoordinator coordinator(
         journal, active_plan_source, bundle_source,
         *package.artifact_source, publication_store, scene_owner, nullptr,
@@ -2693,6 +2697,10 @@ TEST(ManagerNamedApplyCoordinator,
           EXPECT_EQ(publication_store.publish_calls, 1);
           EXPECT_EQ(cell_admission.release_calls, refused_release_calls);
           EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+          // Status reads the journal, then this fact: still `pending`.
+          EXPECT_TRUE(coordinator.SuccessSettlementPending(intent.apply_id));
+          if (replay_in_window)
+            replays_in_window.push_back(coordinator.AcceptOrReplay(*replay_in_window));
           return successor_renewal_available;
         });
     const ManagerNamedApplyRequestDTO request{
@@ -2705,6 +2713,7 @@ TEST(ManagerNamedApplyCoordinator,
         cell_admission.GetAuthoringAdmission().admission_generation,
         std::nullopt,
     };
+    replay_in_window = request;
 
     int prepare_acknowledgements = 0;
     const auto accepted = coordinator.AcceptOrReplay(request,
@@ -2763,13 +2772,21 @@ TEST(ManagerNamedApplyCoordinator,
       ASSERT_TRUE(durable_success->terminal_outcome.succeeded());
       EXPECT_EQ(cell_admission.release_calls, 0);
       EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+      // OD-387: the success is journaled but its claim is not released, so
+      // Apply status (journal, then this fact) reads `pending` and the
+      // published Apply record is not yet terminal.
+      EXPECT_TRUE(coordinator.SuccessSettlementPending(completed->apply_id));
+      EXPECT_EQ(coordinator.SuccessSettlementPendingApply(),
+                std::optional(completed->apply_id));
 
       // Apply progression and request replay do not invent another heartbeat.
       const auto progression = coordinator.RecoverIncompleteApply();
       ASSERT_TRUE(progression.has_value());
       EXPECT_TRUE(progression->settlement_pending);
       const auto waiting_replay = coordinator.AcceptOrReplay(request);
+      EXPECT_EQ(waiting_replay.state, ManagerNamedApplyResultState::kPending);
       EXPECT_TRUE(waiting_replay.settlement_pending);
+      EXPECT_FALSE(waiting_replay.terminal_outcome.has_value());
       EXPECT_EQ(settlement_attempts.size(), 1U);
       EXPECT_EQ(runtime_ports.ensure_calls, 1);
       EXPECT_EQ(runtime_composition.calls, 1);
@@ -2828,6 +2845,7 @@ TEST(ManagerNamedApplyCoordinator,
             *heartbeat_reference);
         ASSERT_TRUE(unreadable.has_value());
         EXPECT_TRUE(unreadable->settlement_pending);
+        EXPECT_TRUE(coordinator.SuccessSettlementPending(completed->apply_id));
         EXPECT_EQ(coordinator.PendingSettlementForHeartbeat(), heartbeat_reference);
         EXPECT_EQ(settlement_attempts, attempts_before_read_error);
         EXPECT_EQ(cell_admission.release_calls, 0);
@@ -2850,6 +2868,7 @@ TEST(ManagerNamedApplyCoordinator,
             *heartbeat_reference);
         ASSERT_TRUE(refused.has_value());
         EXPECT_TRUE(refused->settlement_pending);
+        EXPECT_TRUE(coordinator.SuccessSettlementPending(completed->apply_id));
         EXPECT_EQ(coordinator.PendingSettlementForHeartbeat(), heartbeat_reference);
         EXPECT_EQ(cell_admission.release_calls, 1);
         EXPECT_FALSE(cell_admission.last_release.has_value());
@@ -2864,6 +2883,9 @@ TEST(ManagerNamedApplyCoordinator,
         ASSERT_TRUE(settled.has_value());
         EXPECT_EQ(settled->state, ManagerNamedApplyResultState::kSucceeded);
         EXPECT_FALSE(settled->settlement_pending);
+        EXPECT_FALSE(coordinator.SuccessSettlementPending(completed->apply_id));
+        EXPECT_EQ(coordinator.AcceptOrReplay(request).state,
+                  ManagerNamedApplyResultState::kSucceeded);
         EXPECT_FALSE(coordinator.PendingSettlementForHeartbeat().has_value());
         EXPECT_EQ(cell_admission.release_calls, 2);
         EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
@@ -2898,6 +2920,17 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_FALSE(completed->settlement_pending);
     EXPECT_EQ(cell_admission.release_calls, 1);
     EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+    // OD-387: released, so status and replay now read `succeeded`; every
+    // replay inside the settlement window answered `pending`.
+    EXPECT_FALSE(coordinator.SuccessSettlementPending(completed->apply_id));
+    EXPECT_FALSE(coordinator.SuccessSettlementPendingApply().has_value());
+    EXPECT_EQ(replays_in_window.size(), settlement_attempts.size());
+    for (const auto &in_window : replays_in_window) {
+      EXPECT_EQ(in_window.state, ManagerNamedApplyResultState::kPending);
+      EXPECT_TRUE(in_window.settlement_pending);
+      EXPECT_TRUE(in_window.request_replayed);
+      EXPECT_FALSE(in_window.terminal_outcome.has_value());
+    }
     const auto settled_attempts = settlement_attempts;
     EXPECT_FALSE(coordinator.PendingSettlementForHeartbeat().has_value());
     EXPECT_FALSE(coordinator.RetryPendingSettlementOnHeartbeat(

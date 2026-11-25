@@ -10,6 +10,7 @@ from manyforge_headless_api.control_protocol import (
     ExecutionIngressStamp,
 )
 from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.tests.fake_gateway import FakeGateway
 from manyforge_headless_api.identity import RequestAdmission
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.tests.test_execution_events import (
@@ -82,8 +83,7 @@ def _payload(model):
 
 
 def _client(exchange, calls, result):
-    client = object.__new__(ExecutionCommandClient)
-    client._exchange = exchange
+    client = ExecutionCommandClient(FakeGateway(exchange))
     client.submit = lambda request, **_kwargs: (calls.append("submit") or result)
     client.stop = lambda request, **_kwargs: (calls.append("stop") or {"ok": True})
     return client

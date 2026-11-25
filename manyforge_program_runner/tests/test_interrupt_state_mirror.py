@@ -8,10 +8,10 @@ from typing import Any
 
 import pytest
 
+from manyforge_behavior.kernel_client import ExecutionCommandError, KernelClient
 from manyforge_behavior.orchestration_values import ProgramValueError
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_program_runner.bbkey_publication import ProgramBlackboardPublicationScope
-from manyforge_program_runner.execution_transport import ProgramRunnerExecutionTransport
 from manyforge_program_runner.interrupt_state_mirror import (
     InterruptRuleStateMirror,
     InterruptStateWireError,
@@ -19,6 +19,7 @@ from manyforge_program_runner.interrupt_state_mirror import (
     parse_baseline,
     parse_catalog,
 )
+from manyforge_program_runner.tests.fake_gateway import RecordingGateway
 from manyforge_program_runner.tests.test_bbkey_publication import _store
 
 
@@ -287,24 +288,23 @@ def test_mirror_changes_reach_the_published_key_stream() -> None:
     assert published == [[("interrupt_state.door", False)], ("inactive", True), (None, False)]
 
 
-def test_transport_reads_the_existing_events_command_whole() -> None:
-    transport = object.__new__(ProgramRunnerExecutionTransport)
-    sent: list[dict[str, Any]] = []
+def test_kernel_client_reads_the_existing_events_command_whole() -> None:
     reply = _Kernel()(0)
-    transport._exchange = lambda command: sent.append(command) or dict(reply)  # type: ignore[method-assign]  # noqa: SLF001
-    assert transport.read_interrupt_rule_state_events(7) == reply
-    assert sent == [{
-        "api_version": "manyforge.execution_command.v4",
-        "after_sequence": 7,
-        "command": "events",
-        "limit": 16,
-    }]
-    transport._exchange = lambda command: {  # type: ignore[method-assign]  # noqa: SLF001
+    gateway = RecordingGateway({
+        **{command: {"ok": True} for command in
+           ("identity", "submit", "read", "reset", "acknowledge_completed", "stop")},
+        "events": dict(reply),
+    })
+    client = KernelClient(gateway)
+    assert client.read_interrupt_rule_state_events(7) == reply
+    # The core adds the envelope; the page is the fixed 16-event page.
+    assert gateway.sent == [("events", {"after_sequence": 7, "limit": 16})]
+    gateway.replies["events"] = {
         "ok": False, "error": {"code": "execution_event_cursor_unavailable",
                                "message": "gap", "details": {}},
     }
-    with pytest.raises(HeadlessApiError) as error:
-        transport.read_interrupt_rule_state_events(7)
+    with pytest.raises(ExecutionCommandError) as error:
+        client.read_interrupt_rule_state_events(7)
     assert error.value.code == "execution_event_cursor_unavailable"
 
 
@@ -409,9 +409,13 @@ class _Publisher:
         self.started: tuple[str, ...] | None = None
         self.retired = False
         self.failed: str | None = None
+        # Not started yet: nothing in flight, nothing settled.
+        self.baseline_in_flight = False
+        self.settled = False
 
     def start(self, store, keys) -> bool:
         self.started = keys
+        self.settled = True
         return True
 
     def retire(self) -> None:
@@ -705,37 +709,43 @@ def _streamed(event: dict[str, Any]) -> dict[str, Any]:
 
 
 class _StreamHost:
-    """Scripted subscriptions (one script per connection; an exception in a
-    script drops the link); the follow loop ends when the scripts run out."""
+    """A scripted core event subscription (``next``): one script per
+    connection; the end of a script, or an error in it, is the core's
+    ``disconnected`` message before the next script's snapshot. ``stop`` is
+    set once the scripts run out, which ends the follow loop. ``resync``
+    drops the rest of the current script: ``disconnected``, then the next
+    script (its fresh snapshot)."""
 
     def __init__(self, *scripts: list[Any]) -> None:
-        self.scripts = list(scripts)
-        self.subscriptions: list[int] = []
+        self.scripts = [list(script) for script in scripts]
+        self.stop = threading.Event()
+        self.resyncs = 0
+        self._resynced = False
 
-    def subscribe(self, after_cursor: int):
-        from contextlib import contextmanager
+    def resync(self) -> None:
+        self.resyncs += 1
+        self._resynced = True
 
-        @contextmanager
-        def opened():
-            self.subscriptions.append(after_cursor)
-            script = self.scripts.pop(0)
-
-            class _Subscription:
-                def receive(self, stop: Any = None) -> Any:
-                    if not script:
-                        if not host.scripts:
-                            stop.set()
-                            return None
-                        raise HeadlessApiError("execution_owner_unavailable", "closed")
-                    item = script.pop(0)
-                    if isinstance(item, Exception):
-                        raise item
+    def next(self, timeout_s: float) -> Any:
+        if self._resynced:
+            self._resynced = False
+            self.scripts.pop(0)
+            return {"type": "disconnected", "code": "execution_event_stream_invalid",
+                    "message": "resync"}
+        while self.scripts:
+            script = self.scripts[0]
+            if script:
+                item = script.pop(0)
+                if not isinstance(item, HeadlessApiError):
                     return item
-
-            yield _Subscription()
-
-        host = self
-        return opened()
+                self.scripts.pop(0)
+                return {"type": "disconnected", "code": item.code, "message": str(item)}
+            self.scripts.pop(0)
+            if self.scripts:
+                return {"type": "disconnected", "code": "execution_owner_unavailable",
+                        "message": "event stream closed"}
+        self.stop.set()
+        return None
 
 
 def test_notify_rule_state_stream_updates_reserved_key_only() -> None:
@@ -757,7 +767,7 @@ def test_notify_rule_state_stream_updates_reserved_key_only() -> None:
     runtime = _hook_runtime(None)
     runtime._interrupt_state_stores = lambda: []  # type: ignore[method-assign]  # noqa: SLF001
     mirror = InterruptRuleStateMirror(
-        read_events=kernel, subscribe=host.subscribe,
+        read_events=kernel, subscription=host,
         on_change=runtime._apply_interrupt_states,  # noqa: SLF001
     )
     runtime._interrupt_state_mirror = mirror  # noqa: SLF001
@@ -779,7 +789,7 @@ def test_notify_rule_state_stream_updates_reserved_key_only() -> None:
     )
     observed = []
     mirror.follow(
-        threading.Event(),
+        host.stop,
         on_message=lambda _message: observed.append(store.read("interrupt_state.advisory")),
     )
     assert observed == ["clear", "tripped", "tripped", "clear", "clear"]
@@ -827,9 +837,9 @@ def test_a_resubscribe_starts_from_its_snapshot_baseline() -> None:
     )
     changes: list[Any] = []
     mirror = InterruptRuleStateMirror(
-        read_events=_Kernel(), on_change=changes.append, subscribe=host.subscribe,
+        read_events=_Kernel(), on_change=changes.append, subscription=host,
     )
-    mirror.follow(threading.Event())
+    mirror.follow(host.stop)
     assert changes == [{"door": "clear"}, None, {"door": "tripped"}]
 
 
@@ -840,10 +850,10 @@ def test_shared_stream_callback_sees_each_message_after_interrupt_state() -> Non
     seen = []
     mirror = InterruptRuleStateMirror(
         read_events=_Kernel(),
-        subscribe=host.subscribe, on_change=lambda _states: None,
+        subscription=host, on_change=lambda _states: None,
     )
     mirror.follow(
-        threading.Event(),
+        host.stop,
         on_message=lambda message: seen.append((message["type"], mirror.current())),
     )
     assert seen == [("snapshot", {"door": "clear"}), ("state", {"door": "tripped"})]
@@ -855,9 +865,9 @@ def test_shared_stream_disconnect_keeps_existing_unavailable_path() -> None:
     lost = []
     mirror = InterruptRuleStateMirror(
         read_events=_Kernel(),
-        subscribe=host.subscribe, on_change=lambda _states: None,
+        subscription=host, on_change=lambda _states: None,
     )
-    mirror.follow(threading.Event(), on_disconnect=lost.append)
+    mirror.follow(host.stop, on_disconnect=lost.append)
     assert len(lost) == 1
     assert mirror.current() is None
 
@@ -876,14 +886,13 @@ def test_stream_applies_snapshot_then_each_state_and_never_the_rows() -> None:
     delivered: list[Any] = []
     mirror = InterruptRuleStateMirror(
         read_events=_Kernel(), on_change=changes.append,
-        subscribe=host.subscribe, on_carried_object_lost=delivered.append,
+        subscription=host, on_carried_object_lost=delivered.append,
     )
-    mirror.follow(threading.Event())
+    mirror.follow(host.stop)
     assert changes == [{"door": "clear", "zone": "clear"}, {"door": "tripped", "zone": "clear"}]
     # Rows on snapshot, state and heartbeat; unchanged rows are re-offered.
     assert delivered == [(), tuple(rows), tuple(rows)]
     assert mirror.carried_object_lost_signals() == tuple(rows)
-    assert host.subscriptions == [0]
 
 
 _LOSS_ROW = {
@@ -993,28 +1002,23 @@ def test_no_lock_is_held_while_the_stream_waits() -> None:
 
     receiving = threading.Event()
 
+    stop = threading.Event()
+
     class _Quiet:
         def __init__(self) -> None:
             self.script = [_snapshot(0, _ready({"door": "clear"}), _CATALOG_A)]
 
-        def receive(self, stop: Any = None) -> Any:
+        def next(self, timeout_s: float) -> Any:
             if self.script:
                 return self.script.pop(0)
             receiving.set()
             stop.wait()
             return None
 
-    from contextlib import contextmanager
-
-    @contextmanager
-    def subscribe(after_cursor: int):
-        yield _Quiet()
-
     mirror = InterruptRuleStateMirror(
         read_events=_Kernel(), on_change=lambda _s: None,
-        subscribe=subscribe,
+        subscription=_Quiet(),
     )
-    stop = threading.Event()
     follower = threading.Thread(target=mirror.follow, args=(stop,))
     follower.start()
     try:
@@ -1039,11 +1043,12 @@ def test_dead_link_is_unavailable_until_the_reconnect_snapshot() -> None:
     changes: list[Any] = []
     mirror = InterruptRuleStateMirror(
         read_events=_Kernel(), on_change=changes.append,
-        subscribe=host.subscribe,
+        subscription=host,
     )
-    mirror.follow(threading.Event())
+    mirror.follow(host.stop)
+    # The core resumes from the cursor (its own tests); the mirror sees the
+    # loss and the reconnect's snapshot.
     assert changes == [{"door": "inactive"}, None, {"door": "inactive"}]
-    assert host.subscriptions == [0, 4]  # Resumed.
 
 
 def test_with_a_subscription_a_poll_installs_only_a_context_it_lacks() -> None:
@@ -1054,7 +1059,7 @@ def test_with_a_subscription_a_poll_installs_only_a_context_it_lacks() -> None:
     kernel.baseline = _ready({"door": "tripped"})
     changes: list[Any] = []
     mirror = InterruptRuleStateMirror(
-        read_events=kernel, on_change=changes.append, subscribe=lambda _cursor: None,
+        read_events=kernel, on_change=changes.append, subscription=_StreamHost(),
     )
     mirror.apply_stream_message(_snapshot(0, _ready({"door": "clear"}), _CATALOG_A))
     mirror.apply_stream_message(_streamed(_other(7)))
@@ -1083,6 +1088,103 @@ def test_malformed_stream_state_recaptures_and_raises() -> None:
         mirror.apply_stream_message(_stream("state", state=_state(
             _ready({"door": "melted"}), _CATALOG_A)))
     assert changes == [{"door": "inactive"}, None]
+
+
+def test_a_message_the_mirror_cannot_apply_asks_for_a_fresh_snapshot() -> None:
+    # As a lost link: the states are unavailable until the subscription's
+    # fresh snapshot; the rest of the old feed is never applied.
+    host = _StreamHost(
+        [_snapshot(0, _ready({"door": "inactive"}), _CATALOG_A),
+         _stream("state", state=_state(_ready({"door": "melted"}), _CATALOG_A)),
+         _stream("state", state=_state(_ready({"door": "clear"}), _CATALOG_A))],
+        [_snapshot(0, _ready({"door": "tripped"}), _CATALOG_A)],
+    )
+    changes: list[Any] = []
+    lost: list[BaseException] = []
+    mirror = InterruptRuleStateMirror(
+        read_events=_Kernel(), on_change=changes.append, subscription=host,
+    )
+    mirror.follow(host.stop, on_disconnect=lost.append)
+    assert host.resyncs == 1
+    assert changes == [{"door": "inactive"}, None, {"door": "tripped"}]
+    assert [getattr(error, "code", None) for error in lost] == [
+        "execution_event_stream_invalid"]
+
+
+def test_a_failing_message_handler_reads_the_message_again() -> None:
+    # The core re-reads from before the message not applied (its own tests);
+    # here the handler sees it again after the fresh snapshot.
+    host = _StreamHost(
+        [_snapshot(0, _ready({"door": "clear"}), _CATALOG_A), _streamed(_other(1))],
+        [_snapshot(0, _ready({"door": "clear"}), _CATALOG_A), _streamed(_other(1))],
+    )
+    seen: list[Any] = []
+
+    def on_message(message: Any) -> None:
+        seen.append(message["type"])
+        if message["type"] == "event" and seen.count("event") == 1:
+            raise ValueError("not applied")
+
+    mirror = InterruptRuleStateMirror(
+        read_events=_Kernel(), on_change=lambda _states: None, subscription=host,
+    )
+    mirror.follow(host.stop, on_message=on_message)
+    assert host.resyncs == 1
+    assert seen == ["snapshot", "event", "snapshot", "event"]
+
+
+def test_a_disconnected_message_carries_its_typed_code() -> None:
+    host = _StreamHost(
+        [_snapshot(0, _ready({"door": "clear"}), _CATALOG_A),
+         HeadlessApiError("execution_event_stream_dead", "no heartbeat")],
+    )
+    lost: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        read_events=_Kernel(), on_change=lambda _s: None, subscription=host,
+    )
+    mirror.follow(host.stop, on_disconnect=lost.append)
+    assert [(error.code, str(error)) for error in lost] == [
+        ("execution_event_stream_dead", "no heartbeat")
+    ]
+    assert mirror.current() is None
+
+
+def test_poll_sends_its_request_without_the_lock_and_drops_a_stale_reply() -> None:
+    # The events request runs outside the mirror's lock; a stream state
+    # applied meanwhile wins over the reply read before it.
+    entered, release = threading.Event(), threading.Event()
+
+    class _Blocking(_Kernel):
+        def __call__(self, after: int) -> dict[str, Any]:
+            entered.set()
+            assert release.wait(5.0)
+            return super().__call__(after)
+
+    kernel = _Blocking()
+    kernel.baseline = _ready({"door": "inactive"}, active_publication_generation=4)
+    changes: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        read_events=kernel, on_change=changes.append, subscription=_StreamHost(),
+    )
+    mirror.apply_stream_message(_snapshot(0, _ready({"door": "clear"}), _CATALOG_A))
+    poller = threading.Thread(target=mirror.poll)
+    poller.start()
+    try:
+        assert entered.wait(5.0)
+        mirror.poll()  # Never concurrent: returns at once.
+        assert mirror.current() == {"door": "clear"}  # The lock is free.
+        mirror.apply_stream_message(_stream("state", state=_state(
+            _ready({"door": "tripped"}), _CATALOG_A)))
+    finally:
+        release.set()
+        poller.join(5.0)
+    assert not poller.is_alive()
+    assert kernel.reads == [0]
+    assert mirror.current() == {"door": "tripped"}
+    # Nothing changed during the next poll: its new context installs.
+    mirror.poll()
+    assert mirror.current() == {"door": "inactive"}
+    assert changes == [{"door": "clear"}, {"door": "tripped"}, {"door": "inactive"}]
 
 
 def test_pending_source_keeps_its_original_deadline(monkeypatch) -> None:
@@ -1471,3 +1573,72 @@ def test_the_old_fence_member_is_not_read() -> None:
     with pytest.raises(KeyError):
         mirror.apply_stream_message(_stream("state", state=state))
     assert facts == []
+
+
+def test_the_core_follower_feeds_the_mirror_its_table_and_the_wake_set(tmp_path) -> None:
+    # The runner's wiring over the real core: one C++ follower against a fake
+    # host socket, the mirror applying its subscription on a Python thread.
+    import json
+    import socket
+    import time
+
+    import manyforge_headless_py as core
+    import rfc8785
+
+    tmp_path.chmod(0o700)
+    endpoint = tmp_path / "execution-events.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(str(endpoint))
+    endpoint.chmod(0o600)
+    listener.listen(1)
+    wake = core.WakeSet()
+    wake.watch_operation(1, 4)
+    events = core.ExecutionEvents(str(tmp_path), wake_set=wake)
+    applied, lost = threading.Event(), threading.Event()
+    changes: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        read_events=_Kernel(), on_change=changes.append, subscription=events.subscribe(),
+    )
+    stop = threading.Event()
+    follower = threading.Thread(
+        target=mirror.follow, args=(stop,),
+        kwargs={"on_message": lambda _message: applied.set(),
+                "on_disconnect": lambda _error: lost.set()},
+    )
+    events.start()
+    follower.start()
+    connection, _address = listener.accept()
+    try:
+        assert json.loads(connection.recv(4096))["after_cursor"] == 0
+        entry = {"control_pending": False, "last_control": None, "operation_id": 4,
+                 "operation": {"operation_id": 4, "state": "executing"}}
+        state = {
+            **_state(_ready({"door": "clear"}), _CATALOG_A),
+            "active_tcp_baseline": [],
+            "operations": {"change": 3, "faulted": [], "faulted_total": 0,
+                           "resident": [entry], "resident_total": 1},
+            "planning_jobs": [{"job_id": "job", "kind": "pick", "program_run_id": 1,
+                               "state": "planning"}],
+        }
+        connection.send(rfc8785.dumps(_stream("snapshot", cursor=0, reason="subscribed",
+                                              state=state)))
+        assert applied.wait(30.0)
+        assert wake.wait(time.monotonic() + 30.0) == [1]
+        assert events.connected() and mirror.current() == {"door": "clear"}
+        assert events.operation_envelope(4, 3)["operation"] == entry["operation"]
+        assert events.planning_job_state("job") == "planning"
+        with pytest.raises(core.GatewayError) as behind:
+            events.operation_envelope(4, 4)
+        assert behind.value.code == "execution_event_mirror_behind"
+        connection.close()
+        assert lost.wait(30.0)
+        assert mirror.current() is None and changes == [{"door": "clear"}, None]
+        with pytest.raises(core.GatewayError) as unavailable:
+            events.planning_job_state("job")
+        assert unavailable.value.code == "execution_event_mirror_unavailable"
+    finally:
+        stop.set()
+        events.close()
+        follower.join(5.0)
+        listener.close()
+    assert not follower.is_alive()

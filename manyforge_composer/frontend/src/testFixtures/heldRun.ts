@@ -13,7 +13,7 @@ export function heldProgram(): ProgramDocument {
   return {
     api_version: 'manyforge.program.v4',
     program_revision: digest('a'),
-    program_profile: 'composable-cell-v1',
+    program_profile: 'manyforge-cell-v1',
     catalog: { api_version: 'manyforge.node_catalog.v3', content_version: 'fixture' },
     parameters: [{
       parameter_id: 'approach_height', type: 'float64', default: 0.1,

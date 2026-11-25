@@ -447,7 +447,7 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   }
   if (config_.application_start_id.value == 0U || config_.cell_id.empty() ||
       config_.request_replay_capacity == 0U ||
-      config_.request_replay_capacity > kMaxI6OperationReplayEntries ||
+      config_.request_replay_capacity > kMaxOperationReplayEntries ||
       config_.cell_admission_claim_capacity == 0U ||
       config_.cell_admission_claim_capacity > kMaximumCellAdmissionClaims) {
     throw std::invalid_argument(

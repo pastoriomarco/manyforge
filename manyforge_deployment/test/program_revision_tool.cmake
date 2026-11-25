@@ -8,7 +8,7 @@ file(MAKE_DIRECTORY "${MANYFORGE_TEST_BINARY_DIR}")
 set(program "${MANYFORGE_TEST_BINARY_DIR}/program.yaml")
 file(WRITE "${program}" [=[api_version: manyforge.program.v4
 program_revision: sha256:0000000000000000000000000000000000000000000000000000000000000000
-program_profile: composable-cell-v1
+program_profile: manyforge-cell-v1
 catalog: {api_version: manyforge.node_catalog.v3, content_version: 2.4.0}
 tree: {node_id: sequence, instance_id: root, parameters: {}, children: []}
 ]=])

@@ -6,7 +6,9 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/manager_liveness.hpp>
 
+#include <map>
 #include <optional>
+#include <string>
 #include <stdexcept>
 #include <utility>
 
@@ -49,9 +51,22 @@ DecodeProgramRunnerFault(const content_identity::CanonicalValue &value) {
       !IsProgramRunnerFaultCode(code->as_string()) || !message ||
       !message->is_string() || message->as_string().size() > 1024U ||
       !content_identity::is_utf8_nfc(message->as_string()) || !details ||
-      !details->is_object() || !details->as_object().empty())
+      !details->is_object())
     invalid();
-  return core::ErrorDTO{code->as_string(), message->as_string(), {}};
+  // A tick worker fault may name where it was raised: `last_frame`, the
+  // last traceback frame as "file:line function" (<= 512 bytes).
+  std::map<std::string, std::string> kept;
+  for (const auto &[name, value] : details->as_object()) {
+    if (name != "last_frame" ||
+        code->as_string() != "program_tick_worker_failed" ||
+        !value.is_string() || value.as_string().empty() ||
+        value.as_string().size() > 512U ||
+        !content_identity::is_utf8_nfc(value.as_string()))
+      invalid();
+    kept.emplace(name, value.as_string());
+  }
+  return core::ErrorDTO{code->as_string(), message->as_string(),
+                        std::move(kept)};
 }
 
 /// The Runner fault keeps its typed error; the text is only the diagnostic.

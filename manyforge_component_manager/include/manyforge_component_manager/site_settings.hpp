@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
@@ -37,13 +38,19 @@ public:
   /// Absolute host project folders, in file order (validated and carried
   /// only; the development launcher reads them).
   [[nodiscard]] const std::vector<std::string> &project_folders() const noexcept;
+  /// The soft core-file size limit, in bytes, every ManyForge process starts
+  /// with: `core_dumps.max_bytes` when `core_dumps.enabled`, otherwise 0
+  /// (core dumps off). The spawn sites cap it at the hard limit.
+  [[nodiscard]] std::uint64_t core_dump_limit_bytes() const noexcept;
 
 private:
   SiteSettings(DeviceAddresses device_addresses,
-               std::vector<std::string> project_folders);
+               std::vector<std::string> project_folders,
+               std::uint64_t core_dump_limit_bytes);
 
   DeviceAddresses device_addresses_;
   std::vector<std::string> project_folders_;
+  std::uint64_t core_dump_limit_bytes_{};
 
   friend SiteSettings ParseSiteSettings(std::string_view bytes);
 };
@@ -54,8 +61,10 @@ private:
 /// `project_folders` (unique absolute paths) and the optional disk limits
 /// `disk_max_percent` (integer 1-100), `disk_always_free_bytes` and
 /// `disk_machine_minimum_bytes` (integers 0 to 2^53-1), validated and not
-/// carried (the launchers read them). Schema `manyforge.site.v2`, or
-/// `manyforge.site.v1` without the disk limits.
+/// carried (the launchers read them), and the optional `core_dumps`
+/// (`{"enabled": bool, "max_bytes": integer 1 to 2^53-1}`, both members
+/// required). Schema `manyforge.site.v2`, or `manyforge.site.v1` without the
+/// disk limits and `core_dumps`.
 /// References are portable ids; addresses are non-empty host names or IPs of
 /// at most 253 characters from [A-Za-z0-9.:-]. Throws SiteSettingsError.
 [[nodiscard]] SiteSettings ParseSiteSettings(std::string_view bytes);
@@ -81,5 +90,9 @@ SiteFactsOf(const std::optional<SiteSettings> &settings);
 /// The same from the Manager-validated site document (absent: none).
 [[nodiscard]] deployment::SiteFacts
 SiteFactsOfDocument(const std::optional<std::string> &document);
+/// The core-file size limit of the Manager-validated site document; 0
+/// without one. Read once at start; the spawn sites get the number.
+[[nodiscard]] std::uint64_t
+CoreDumpLimitBytesOfDocument(const std::optional<std::string> &document);
 
 } // namespace manyforge::component_manager

@@ -7,11 +7,11 @@
   "description": "Mock UR5 pick and place with RoboPlan planning. Load and Execute the Program to watch the arm pick the part and place it.",
   "members": {
     "deployment.yaml": "sha256:43e152c6662a53944c9201bd020d017d6354caabe21b75052c6644d41452b17b",
-    "program.yaml": "sha256:37daab39fdbff0b0f7042b99945bc7f7d6352d0139b9ac6a761dcf38b8e51114"
+    "program.yaml": "sha256:6ed80c2d4e81ab4363a2d6e3aa52f00619fa8cc52890780920a75abe1176866d"
   },
   "name": "mock_ur5_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:150a8b134b5fc8853006db9f80b2028bb9b9b019995659262e7b8252997694a3",
+    "checked_content_digest": "sha256:e3456d53d36c031b17a491f0c1e2d51bb243d877396c37ac7274762bd7027526",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

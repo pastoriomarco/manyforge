@@ -11,7 +11,6 @@ import re
 import stat
 from typing import Any, Mapping, Protocol, Sequence
 import unicodedata
-from urllib.parse import urlsplit
 
 import rfc8785
 
@@ -90,7 +89,11 @@ class HeadlessApiConfig:
     execution_timeout_seconds: float = 10.0
     execution_event_poll_milliseconds: int = 100
     maximum_request_body_bytes: int = MAX_STANDARD_REQUEST_BODY_BYTES
-    program_runner_url: str | None = None
+    # The Program runner's socket root (its program-command.sock and
+    # program-status.sock); None: no runner is configured.
+    program_runner_socket_root: Path | None = None
+    # Limits connecting to the Program runner only; a connected command
+    # waits for its answer at acceptance (OD-214).
     program_runner_timeout_seconds: float = 30.0
     activation_preparer_path: Path | None = None
     activation_preparer_capability_root: Path | None = None
@@ -171,20 +174,11 @@ class HeadlessApiConfig:
         # currency bound and hold Program motion unreconciled.
         if not 10 <= self.execution_event_poll_milliseconds <= 250:
             raise ValueError("execution_event_poll_milliseconds must be between 10 and 250")
-        if self.program_runner_url is not None:
-            parsed_runner_url = urlsplit(self.program_runner_url)
-            if (
-                parsed_runner_url.scheme not in {"http", "https"}
-                or not parsed_runner_url.netloc
-                or parsed_runner_url.username is not None
-                or parsed_runner_url.password is not None
-                or parsed_runner_url.path not in {"", "/"}
-                or bool(parsed_runner_url.query)
-                or bool(parsed_runner_url.fragment)
-            ):
-                raise ValueError(
-                    "program_runner_url must be an absolute credential-free HTTP(S) URL"
-                )
+        if (
+            self.program_runner_socket_root is not None
+            and not self.program_runner_socket_root.is_absolute()
+        ):
+            raise ValueError("program_runner_socket_root must be absolute")
         if not 0 < self.program_runner_timeout_seconds <= 60:
             raise ValueError("program_runner_timeout_seconds must be in (0, 60]")
         preparer_parts = (

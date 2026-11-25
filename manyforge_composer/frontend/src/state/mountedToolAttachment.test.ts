@@ -17,7 +17,7 @@ import { sceneOwnerFacts } from './sceneAuthoring';
 // small KLT stays cell-fixed. Before the fix the gripper-relative row (policy
 // "scene") was rejected, the scene owner facts went unavailable and every
 // mesh object vanished from the viewer while the box was attached.
-const CELL = 'c1_build_authority_cell';
+const CELL = 'canonical_empty_cell';
 const BUNDLE = 'sha256:9a6355d1b1ee8f2b79f8176739e267634fccf770aecf4dc3a4c63f9552911c9d';
 const GRAPH = 'sha256:5b83362c6824f7f99d345196cd2cbfe591a476049df87438629ecc95f25fce95';
 const ARM_MODEL_REVISION = 'sha256:4d5eac92cf13634032aa1a55621458c0d5b429038c5cbcdec60abc1fc73dc344';
@@ -74,7 +74,7 @@ const LOGICAL_SCENE_PAYLOAD: Record<string, unknown> = {
         ]
       }
     ],
-    "cell_id": "c1_build_authority_cell",
+    "cell_id": "canonical_empty_cell",
     "configured_collision_policy": {},
     "objects": [
       {
@@ -95,7 +95,7 @@ const LOGICAL_SCENE_PAYLOAD: Record<string, unknown> = {
           "kind": "carried"
         },
         "provider_evidence": {
-          "provider_instance_id": "c1_build_authority_cell.logical_scene",
+          "provider_instance_id": "canonical_empty_cell.logical_scene",
           "provider_manifest_id": "manyforge.provider.logical_scene",
           "provider_manifest_revision": "sha256:352903171f0341c0f5c018fd2a363eb7b3a69ecdb3180dbc41772ad86908ec60",
           "provider_source_epoch": "sha256:33266401dce90e4524148c09b3ed1874dfe934b90e1b1e9cac819e87d68351f7"
@@ -115,7 +115,7 @@ const LOGICAL_SCENE_PAYLOAD: Record<string, unknown> = {
           }
         ],
         "placement": {
-          "cell_id": "c1_build_authority_cell",
+          "cell_id": "canonical_empty_cell",
           "kind": "cell_fixed",
           "pose_in_cell": {
             "orientation_xyzw": [
@@ -148,7 +148,7 @@ const LOGICAL_SCENE_PAYLOAD: Record<string, unknown> = {
 
 const SCENE_RUNTIME_PAYLOAD: Record<string, unknown> = {
   "api_version": "manyforge.scene_runtime_source.v1",
-  "cell_id": "c1_build_authority_cell",
+  "cell_id": "canonical_empty_cell",
   "state": {
     "active_replay_id": null,
     "api_version": "manyforge.scene_runtime_state.v2",

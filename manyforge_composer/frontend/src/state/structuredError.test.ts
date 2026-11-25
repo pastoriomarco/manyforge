@@ -107,6 +107,23 @@ describe('structured error display', () => {
     ]);
   });
 
+  it('shows a stale command\'s age and limit and a stale revision', () => {
+    expect(structuredErrorRows({
+      details: { elapsed_ns: 2_400_000_000, valid_for_ns: '1000000000', component_id: 'arm' },
+      origin: null,
+    })).toEqual([
+      { label: 'Age', value: '2.4 s, limit 1.0 s' },
+      { label: 'Component id', value: 'arm' },
+    ]);
+    expect(structuredErrorRows({
+      details: { expected_execution_control_revision: 3, current_execution_control_revision: '9007199254740993' },
+      origin: null,
+    })).toEqual([{ label: 'Control revision', value: 'expected 3, current 9007199254740993' }]);
+    // Only one of a pair: shown under its own key.
+    expect(structuredErrorRows({ details: { elapsed_ns: 5 }, origin: null }))
+      .toEqual([{ label: 'Elapsed ns', value: '5' }]);
+  });
+
   it('names a runner origin with or without one exact node', () => {
     expect(failureContextText({
       details: null,

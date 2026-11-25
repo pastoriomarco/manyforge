@@ -311,6 +311,9 @@ struct ExecutionGoalObservationDTO final {
   std::optional<ExecutionGoalResult> result{};
   /// Set only with `ExecutionGoalResult::kPreemptedBy`.
   std::optional<ControllerGoalId> preempted_by{};
+  /// The controller's own non-empty result text (JTC `error_string`), at most
+  /// 512 bytes cut on a UTF-8 boundary. Set only in `kTerminal`.
+  std::optional<std::string> controller_error_text{};
   /// Local monotonic time at which the acceptance was received.
   std::optional<TimePoint> accepted_stamp_ns{};
   /// Latest action feedback of this goal; absent before the first one.

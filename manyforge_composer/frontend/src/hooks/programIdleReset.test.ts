@@ -21,7 +21,7 @@ it('a failed Reset in recovery_required is retried with exactly its retained opt
     terminalOrSettlementReference: null, cycleGeneration: 7,
     currentCommandKind: 'program_reset', resetPhase: 'restoring_scene',
     failure: { failed_phase: 'restoring_scene' },
-    resetOptions: { reloadInitialScene: true, resetRobotPosition: true }, allowedCommands };
+    resetOptions: { reloadInitialScene: true, resetRobotPosition: true, resetStoredValues: true }, allowedCommands };
   const build = (cycle: object, options?: object) => buildProgramResetRequest(
     { programCycle: cycle } as unknown as ComposerHeadlessState, options);
   // (a) Run-less: sent with null run and the retained options, whatever the caller passes.
@@ -29,7 +29,7 @@ it('a failed Reset in recovery_required is retried with exactly its retained opt
     expect(build(failed, options)).toMatchObject({
       program_run_id: null, expected_cycle_generation: 7,
       expected_claim_generation: null, terminal_reference: null, settlement_evidence_digest: null,
-      reload_initial_scene: true, reset_robot_position: true });
+      reload_initial_scene: true, reset_robot_position: true, reset_stored_values: true });
   // (b) With a run: the cycle identity is kept and the retained options still win.
   expect(build({ ...failed, programRunId: 1, cycleClaimGeneration: 12,
     resetOptions: { reloadInitialScene: false, resetRobotPosition: true } },
@@ -65,5 +65,8 @@ it('idle Reset still uses the caller options, including the empty contract-141 R
   expect(buildProgramResetRequest(snapshot)).toMatchObject({
     program_run_id: null, reload_initial_scene: false, reset_robot_position: false });
   expect(buildProgramResetRequest(snapshot, { resetRobotPosition: true })).toMatchObject({
-    reload_initial_scene: false, reset_robot_position: true });
+    reload_initial_scene: false, reset_robot_position: true, reset_stored_values: false });
+  // Reset stored values is its own selector, independent of Reload initial scene (OD-393).
+  expect(buildProgramResetRequest(snapshot, { resetStoredValues: true })).toMatchObject({
+    reload_initial_scene: false, reset_robot_position: false, reset_stored_values: true });
 });

@@ -43,7 +43,7 @@ using namespace std::chrono_literals;
 
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-constexpr std::string_view kFixedCellId = "c1_build_authority_cell";
+constexpr std::string_view kFixedCellId = "canonical_empty_cell";
 
 static_assert(std::is_final_v<CanonicalEmptyRetainedBundleAdmission>);
 static_assert(!std::is_aggregate_v<
@@ -108,7 +108,7 @@ class ScopedTrustedRoot final {
 // the golden's own cell id is another deployment and is admitted as such.
 TEST(CanonicalEmptyAdmission, RosPackageForTheGoldenCellIsNotTheFixedGolden) {
   ScopedTrustedRoot root("ros-golden-cell");
-  const core::CellId cell("c1_build_authority_cell");
+  const core::CellId cell("canonical_empty_cell");
   const auto profile = detail::ros2_control_execution_runtime_profile_document();
   const auto admission = detail::generate_ros_empty_package(root.path(), cell, profile);
   EXPECT_EQ(admission.retained_bundle().value().cell_graph.cell_id, cell);
@@ -1154,7 +1154,7 @@ TEST_F(CanonicalEmptyAdmissionPackageTest,
       "compiler-tool:generate_canonical_empty_package"));
   EXPECT_TRUE(covers(
       "compiler-resource:"
-      "canonical_empty.c1_build_authority.deployment.json"));
+      "canonical_empty.canonical_empty_cell.deployment.json"));
   EXPECT_TRUE(covers(
       "build-template:embedded_canonical_empty_deployment"));
   EXPECT_TRUE(covers(

@@ -17,7 +17,7 @@ class SqliteRecordWriter;
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kActiveBundlePublicationStoreSchemaId =
-    "manyforge.internal.active-bundle-publication-store.i4.v4";
+    "manyforge.internal.active-bundle-publication-store.v4";
 /// v3: a named Apply's `transaction_id` is its decimal Apply number (contract
 /// 1.16.1). v4: metadata `records_lost`, set by the record writer when records
 /// of this start were not written. A store of any other version is refused,

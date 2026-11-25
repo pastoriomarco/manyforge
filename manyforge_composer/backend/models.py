@@ -27,11 +27,6 @@ class UnavailableDetail(BaseModel):
 
     code: str = Field(min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=2048)
-    restoration_gates: list[str] = Field(
-        default_factory=list,
-        alias="restorationGates",
-        max_length=16,
-    )
 
 
 class UnavailableResponse(BaseModel):

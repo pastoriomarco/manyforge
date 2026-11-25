@@ -69,7 +69,8 @@ there:
 ```bash
 mkdir -p ~/manyforge && cd ~/manyforge
 docker run --rm --entrypoint tar ghcr.io/pastoriomarco/manyforge:<VERSION> \
-  -c -C /workspace VERSION manyforge scripts/compose-dev.sh scripts/lib manyforge_operator/run_session.py \
+  -c -C /workspace VERSION manyforge scripts/compose-dev.sh scripts/lib \
+  manyforge_operator/run_session.py manyforge_headless_api/history_export.py \
   | tar -x
 ./manyforge run --project examples/mock_lite6_pick_and_place.scenario
 ```
@@ -83,6 +84,8 @@ launcher it uses (`scripts/compose-dev.sh` with its helpers):
 ./manyforge status
 ./manyforge logs [<docker logs option>...]
 ./manyforge stop
+./manyforge collect [--start <application start id> | --last] [--out <file.tar.gz>] [--max-bytes <bytes>]
+./manyforge collect --list
 ```
 
 `run` starts the image of the folder's `VERSION` (pulling it when absent);
@@ -96,8 +99,14 @@ workspace starts empty. The bundled `examples/` are read-only in the image:
 your Scenarios live, and are saved, in the host folders listed under
 `project_folders` in the [site settings](#site-settings) file. `status` prints
 the JSON of every owner (with `--project`, also the Scenario), `logs` passes
-its options to `docker logs` (for example `--tail 200` or `--follow`), and
-`stop` keeps the evidence as for the other options. The container is named
+its options to `docker logs` (for example `--tail 200` or `--follow`),
+`stop` keeps the evidence as for the other options, and `collect` writes one
+bounded bug-report bundle of one run (see
+[Capturing a bug report](OBSERVABILITY.md#capturing-a-bug-report)).
+`collect --list` writes nothing: it prints one line per run kept under the
+runtime state root, oldest first, with its session id, application start id,
+`started_at_wall`, shutdown, container id and console captures under
+`evidence/` (`-` where unknown). The container is named
 `manyforge`; Composer settings and runtime state stay under `.manyforge/` in
 the launcher folder. ManyForge and the development workbench of options 2 and
 3 never run at the same time, whatever their container names: `run` refuses
@@ -350,7 +359,8 @@ container name and the data folder.
 
 Machine facts live in one JSON file, `manyforge.site.v2`, never in a
 Scenario: robot addresses (`device_addresses`), the host project folders
-shown in Composer (`project_folders`) and the [disk limits](#disk-limits).
+shown in Composer (`project_folders`), the [disk limits](#disk-limits) and
+whether processes may write core dumps (`core_dumps`).
 For example:
 
 ```json
@@ -367,11 +377,12 @@ accepted:
 | `disk_max_percent` | `10` | The largest share of the disk ManyForge's own files may take, in percent; an integer from 1 to 100. |
 | `disk_always_free_bytes` | `10000000000` (10 GB) | The space that always stays free, in bytes; an integer from 0 to 9007199254740991. |
 | `disk_machine_minimum_bytes` | `0` | The space the machine itself needs besides ManyForge, in bytes, added to the free space a start needs; not determined yet. Same range. |
+| `core_dumps` | off | `{"enabled": true, "max_bytes": 1073741824}` lets every ManyForge process write a core dump of at most `max_bytes` (an integer from 1 to 9007199254740991; capped at the host's hard limit); both members are required, and `"enabled": false` keeps them off. Where a core goes and how long it is kept are decided by the host's `kernel.core_pattern` and its crash handler, not by ManyForge ([Crash output](OBSERVABILITY.md#crash-output)). |
 
 A missing member takes its default, so a file only needs the members it
 changes; without a file every default applies. A `manyforge.site.v1` file is
-still accepted and uses the default disk limits; a file with a disk member
-must say `manyforge.site.v2`. A Scenario names a `device_addresses` key (for
+still accepted and uses the default disk limits with core dumps off; a file
+with a disk member or `core_dumps` must say `manyforge.site.v2`. A Scenario names a `device_addresses` key (for
 example `lite6_main`), never the address. Set `MANYFORGE_DEV_SITE_SETTINGS`
 to the file's absolute host path before `start` (`MANYFORGE_SITE_SETTINGS`
 before `./manyforge run`). The file is read when the
@@ -659,6 +670,9 @@ By default, `start` keeps motion-trace snapshots for debug exports in
 the export then carries the trace inline, newest goals first, bounded by the execution socket's send buffer (twice
 `net.core.wmem_max`, about 416 KiB at the Linux default). The directory survives Workbench restarts;
 files are limited to 5 MiB each and 64 MiB in total, with oldest-first eviction.
+With a store set, a failed or interrupted motion operation, or an escalated
+Stop, also writes a trace there automatically, and History names it
+(`motion_trace_captured`).
 These are snapshots of the bounded volatile window (16 goals and the last 2,340
 controller samples: about 15 s at 150 Hz for one arm, about 8 s for two), with
 explicit coverage and omission counts, not complete Run journals.
@@ -695,11 +709,17 @@ active tuple.
 
 Every removal path (plain stop, failed developer start, exited-container
 replacement and operator stop) first stops the container and confirms it is
-stopped. It preserves the last 10,000,000 bytes of Docker console output plus
-a small image/mount/exit summary in the actual persistent root's
+stopped. It preserves the last 10,000,000 bytes of Docker console output, each
+line prefixed with the UTC time Docker received it (`docker logs
+--timestamps`), plus a small image/mount/exit summary in the actual persistent root's
 `evidence/<UTC timestamp>/`. Runtime state stays in its bind mount; it is not
 copied into that folder. `stop --keep-evidence` remains accepted and uses this
-same policy. The summary excludes container environment variables.
+same policy. The summary excludes container environment variables. When a
+start finds that the previous run's container was removed some other way
+(for example `docker rm`) without such a capture, it warns `previous
+container <id> was removed without console evidence` and continues: that
+console output is gone. A start whose container exits or does not become
+ready prints its last 200 console lines, also with Docker's times.
 
 Mounted capture reuses one `.mounted-<container-id>.partial/` folder with an
 exact matching receipt. It writes the current stopped-container summary first,
@@ -749,6 +769,12 @@ free-space floor uses the actual filesystem. Docker's existing `50m` × 3
 console rotation is independent; this is not machine-wide accounting or
 discovery of custom roots.
 
+Each pass also keeps at most 10 completed console captures of the root under
+`evidence/`, whatever the disk use: it first deletes the oldest ones beyond 10,
+within the pass's eight deletion attempts below. Partial captures and
+captures of unknown ownership are neither counted nor deleted, and the newest
+capture is never deleted.
+
 For space-pressure cleanup, only older completed console captures, superseded generated controller-launch
 artifact epochs, and older owned host ROS log sessions are eligible. ROS host
 logs use `current/execution-run/ros/<sequence>-<session-start-ns>`, stamped once before
@@ -766,9 +792,10 @@ reclamation of independently qualified older sessions. The stable runtime-wide
 and epochs and is never rotated. Controller child logs retain their existing
 per-artifact `ros` directory. The ROS 2 launch framework's `launch.log` is
 stored there and counted with its artifact epoch by pressure-based retention.
-External-library file logging is disabled for the simulated PLC, Program
-Runner rclpy node and managed-host rclcpp context; console output and `/rosout`
-remain enabled. Running a ROS host outside the supported workbench
+External-library file logging is disabled for every ROS node ManyForge
+launches and for the managed-host rclcpp context; only the launch
+framework's `launch.log` is written, and console output and `/rosout` remain
+enabled. Running a ROS host outside the supported workbench
 requires explicit owned `ROS_HOME` and `ROS_LOG_DIR` environment paths; the host
 provides no fallback path policy. Console chronology comes from
 the generated UTC capture name; artifact chronology comes from the write time
@@ -885,8 +912,9 @@ An unreadable settings file is never overwritten silently: Composer uses the
 defaults, keeps settings read-only and offers a reset that keeps the file as a
 `settings.json.bak-<time>` backup.
 
-The current fixed ports are frontend `3000`, Headless API `9010`, Program
-runner `9011`, and internal Composer API `9020`; `./manyforge run` (option 1) has no
+The current fixed ports are frontend `3000`, Headless API `9010` and internal
+Composer API `9020` (the Program runner has no port: Headless reaches it over
+private sockets); `./manyforge run` (option 1) has no
 frontend port and serves the GUI and Composer's API on `9000`. If one is
 occupied, startup fails with a direct diagnostic rather than taking over the
 process.
@@ -936,6 +964,16 @@ exported references. Do not use Save As as an asset-collection operation.
   come up **prepared**, never enabled. When the cell is not empty, New and
   Load ask once, listing what they stop; they also warn about unsaved Draft
   changes.
+- A Scenario saved by an earlier version in an older file format is refused
+  by Load, and the Load dialog offers **Upgrade and load**. Its confirmation
+  lists what the upgrade converts; confirmed, the project folder is converted
+  in place, the original is kept next to it as
+  `<name>.scenario.before-<version>-<UTC date and time>`, and the upgraded
+  Scenario is loaded. If a part cannot be converted, nothing is changed and
+  the dialog names that part. To go back, delete the upgraded folder and
+  rename the backup to `<name>.scenario`; an older version opens it. A
+  Scenario already in the current format is never offered an upgrade; other
+  refusals show their reason and what to do.
 - **Apply** (Deployment) makes the Draft the running configuration. Replaced
   and removed components are disabled and stopped first; affected components
   come back prepared. Apply is refused while a Program run is in progress.
@@ -949,7 +987,7 @@ exported references. Do not use Save As as an asset-collection operation.
   Deployment Apply and Revert, and on a Program Apply or Revert when the
   Program's initial scene changes. Once the Apply or Revert is Applied, a
   Reset with **Reload initial scene** follows, which puts every object back
-  to its start pose and returns persistent keys to their initial values.
+  to its start pose; stored values are kept.
   While it waits for the cycle to be Idle, the notice **Initial scene reload
   pending** is shown. If a run or another command starts first, the Reset is
   not sent and **Initial scene not reloaded** stays until acknowledged. If
@@ -985,6 +1023,11 @@ exported references. Do not use Save As as an asset-collection operation.
   controller is switched back on to hold them. On Isaac it is refused with
   **Simulation not playing** while the simulation isn't playing; play it, then
   reset.
+- **Reset stored values to their initial values** (a Reset option, off by
+  default, independent of the others) returns every persistent blackboard key
+  to its `initial:` value (or empty). The confirmation lists each stored value
+  it resets (current value → new value). **Reload initial scene** alone keeps
+  stored values ([Blackboard keys](../authoring/BLACKBOARD_KEYS.md)).
 - **Recover** (component page) clears a component fault; for a machine, Recover
   the owner, then Enable its arm. A component in fault blocks Execute. When a
   component faults while something executes, or is unhealthy after a Stop,
@@ -1265,11 +1308,12 @@ procedure for physical equipment.
 | Operator-mode start refused with `built Composer frontend is not a regular file: …/index.html` | The frontend build is missing: run the build step (`./scripts/compose-dev.sh build-native` in operator mode, which the operator launcher runs itself), or pass a built frontend with `--composer-static-dir` ([operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md)). |
 | Site settings refused at start | See [Site file errors](TROUBLESHOOTING.md#site-file-errors). |
 | Project source missing, invalid or changed | Preserve the diagnostic, inspect the named project/source path, and review changes before retrying. Do not bypass identity checks or delete caches blindly. |
-| Port occupied | Identify the listener on 3000/9010/9011/9020; do not kill an unrelated process. |
+| Port occupied | Identify the listener on 3000/9010/9020; do not kill an unrelated process. |
 | `run` refuses with `A development workbench is running (container …)`, or `start` with `ManyForge is running (container …)` (exit 69) | ManyForge (option 1) and the development workbench never run at the same time. Stop the named one (`./scripts/compose-dev.sh stop` or `./manyforge stop`, with its container name variable if it was overridden), then start the other. |
 | Different or unhealthy workbench already running | Read status/logs first. Stop only with authorization before switching scenarios; do not spawn another stack to hide the failure. |
 | Slow first start | Inspect build output. Lower `MANYFORGE_DEV_BUILD_JOBS` if compilation exhausts memory; avoid repeated startup attempts. |
 | `status` says stopped after a failed start | The launcher removed the container it created, with its logs. Read the start output you kept (`tee`), or start again with its output captured. |
+| `start` says `development_workbench_session_marker_outdated: previous session marker … is manyforge.workbench_session.v<N> (an older build) and …` (exit 69) | After an upgrade, `start` archives the previous session of an older build by itself (it prints `ManyForge archived the previous session … to <state root>/previous-runs/<id>`) once its container is stopped or removed and no container of that session runs; its shutdown is then unknown, and the previous-session alarm says it came from an older build and names the same archive. This refusal means that session may still be running: stop it with the build that started it, then start again. |
 | `Scenario project is outside allowed roots` (exit 69) | Pass a project folder inside `examples/`, the only root startup accepts; a scratch folder such as `.manyforge-dev/` is refused. |
 | Start refuses with `… node environment manifest is stale` | A generated source is out of date after a catalog or covered source change. Run `python3 scripts/regen.py --update` in the workbench image, review the diff, then `python3 scripts/regen.py --check` ([Identities and pins](../reference/IDENTITY_AND_PINNING.md)). |
 | Error-looking `Execution event pump unavailable` lines during start | Expected before the ROS host is up; see the everyday workflow. Investigate only if they continue after the start reports ready. |

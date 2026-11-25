@@ -1007,6 +1007,9 @@ public:
       : socket_path_(directory.program_runner_liveness_socket_path()),
         log_path_(directory.program_runner_log_path()) {
     const auto execution_run_root = directory.execution_run_root().string();
+    // program-command.sock and program-status.sock live in the Manager run
+    // root, as the workbench starts the runner.
+    const auto program_socket_root = directory.manager_run_root().string();
     const auto journal = directory.program_cycle_journal().string();
     const auto socket = socket_path_.string();
     pid_ = ::fork();
@@ -1037,8 +1040,9 @@ public:
       }
       ::execl(
           MANYFORGE_HEADLESS_TEST_PYTHON, MANYFORGE_HEADLESS_TEST_PYTHON, "-m",
-          "manyforge_program_runner", "--host", "127.0.0.1", "--port", "0",
-          "--headless-url", "http://127.0.0.1:1", "--execution-run-root",
+          "manyforge_program_runner", "--program-socket-root",
+          program_socket_root.c_str(), "--headless-url", "http://127.0.0.1:1",
+          "--execution-run-root",
           execution_run_root.c_str(), "--cycle-journal-path", journal.c_str(),
           "--manager-liveness-socket", socket.c_str(), "--cell-id",
           cell_id.c_str(), "--application-start-id", "3f9a00000000002a",
@@ -3131,6 +3135,26 @@ TEST(ManagerDaemonProcess,
                     "{\"api_version\":\"manyforge.manager_command.v2\","
                     "\"command\":\"scene_owner_read\"}");
     EXPECT_NE(owner_read.find("\"ok\":true"), std::string::npos);
+    // A read naming its resources (OD-380): the same reply with only their
+    // rows, here none. The selection decodes as scene_pose_query's does.
+    EXPECT_EQ(SendCommand(directory.socket_path(),
+                          R"({"api_version":"manyforge.manager_command.v2",)"
+                          R"("command":"scene_owner_read",)"
+                          R"("scene_resource_ids":["absent","box"]})"),
+              owner_read);
+    for (const auto *selection :
+         {R"("scene_resource_ids":[])", R"("scene_resource_ids":["b","a"])",
+          R"("scene_resource_ids":["a","a"])", R"("scene_resource_ids":"a")",
+          R"("unknown":true)"}) {
+      const auto refused = SendCommand(
+          directory.socket_path(),
+          std::string(R"({"api_version":"manyforge.manager_command.v2",)"
+                      R"("command":"scene_owner_read",)") +
+              selection + "}");
+      EXPECT_NE(refused.find("\"code\":\"invalid_request\""),
+                std::string::npos)
+          << selection << ": " << refused;
+    }
     const auto preview = SendCommand(
         directory.socket_path(),
         ScenePreviewRequest(*initial, "scene-process-preview.1", 1U));

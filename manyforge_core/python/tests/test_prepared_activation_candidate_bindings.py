@@ -126,7 +126,7 @@ def test_real_candidate_reports_node_parameter_for_unavailable_target_capability
     program = {
         "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "a" * 64,
-        "program_profile": "composable-cell-v1",
+        "program_profile": "manyforge-cell-v1",
         "catalog": {"api_version": catalog.api_version, "content_version": catalog.content_version},
         "tree": {"node_id": "motion.set_tcp", "instance_id": "set_tcp", "children": [],
                  "parameters": {"target": {"component_id": "station", "command_target_id": "io"},

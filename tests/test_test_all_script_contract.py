@@ -18,18 +18,18 @@ _TEST_ALL = _REPO_ROOT / "scripts" / "test-all.sh"
 _BENCHMARK = _REPO_ROOT / "tests" / "test_benchmark.py"
 _COLLISION_MAPPER_PERF = _REPO_ROOT / "scripts" / "run-collision-mapper-perf.sh"
 _UNAVAILABLE_MESSAGE = (
-    "composable_cell_runtime_unavailable: this legacy aggregate entrypoint has "
+    "runtime_unavailable: this legacy aggregate entrypoint has "
     "no single qualified current replacement; use the Component Manager, "
     "Headless, Program runner, and Composer entrypoints for maintained "
     "ManyForge-only runtime functions."
 )
 _BENCHMARK_UNAVAILABLE_MESSAGE = (
-    "composable_cell_runtime_unavailable: the addressed native benchmark "
+    "runtime_unavailable: the addressed native benchmark "
     "requires the build-qualified process fixture; run its RoboPlan process "
     "test in Docker."
 )
 _COLLISION_LOOKUP_DOCKER_MESSAGE = (
-    "composable_cell_collision_lookup_probe_requires_docker: rerun with "
+    "collision_lookup_probe_requires_docker: rerun with "
     "--in-container and MANYFORGE_BUILD_DIR set to an already qualified "
     "RoboPlan build"
 )
@@ -257,7 +257,7 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         "aa9f9ef9525a60f8becea322537dd1d6d1bf9123\n")
     for relative in (
         "scripts/test-all.sh", "scripts/ros/build-ros2-control-runtime.sh",
-        "scripts/lib/composable-cell-runtime-availability.sh",
+        "scripts/lib/runtime-availability.sh",
     ):
         source = (_REPO_ROOT / relative).read_text()
         source = source.replace('"/opt/ros/${ROS_DISTRO:-lyrical}/setup.bash"', str(setup))
@@ -631,8 +631,9 @@ def test_manyforge_image_builds_from_the_digest_pinned_ros_image() -> None:
     for path in paths:
         if path != "manyforge_composer/frontend/dist":
             assert (_REPO_ROOT / path).exists(), path
+    # manyforge_headless_api holds the kit's History reader (history_export.py).
     for path in ("VERSION", "manyforge", "scripts/compose-dev.sh", "scripts/lib", "manyforge_operator",
-                 "manyforge_composer/frontend/dist"):
+                 "manyforge_headless_api", "manyforge_composer/frontend/dist"):
         assert path in paths, path
 
 
@@ -706,8 +707,8 @@ def test_ros_runtime_wrappers_share_one_explicit_unavailable_boundary(
 ) -> None:
     path = _REPO_ROOT / relative
     source = path.read_text(encoding="utf-8")
-    assert "composable-cell-runtime-availability.sh" in source
-    assert "manyforge_fail_composable_cell_runtime_unavailable" in source
+    assert "runtime-availability.sh" in source
+    assert "manyforge_fail_runtime_unavailable" in source
     assert "manyforge_roboplan_py" not in source
 
     completed = subprocess.run(
@@ -725,7 +726,7 @@ def test_ros_runtime_wrappers_share_one_explicit_unavailable_boundary(
 def test_ros2_control_builder_selects_only_current_runtime_products() -> None:
     source = (_REPO_ROOT / "scripts/ros/build-ros2-control-runtime.sh").read_text(encoding="utf-8")
 
-    assert "manyforge_fail_composable_cell_runtime_unavailable" not in source
+    assert "manyforge_fail_runtime_unavailable" not in source
     assert "MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=ON" in source
     assert "manyforge_ros2_control_execution_host" in source
     assert "manyforge_roboplan_candidate_worker" in source
@@ -891,7 +892,7 @@ def test_ros_selector_builds_and_tests_the_ros_integration_graph() -> None:
     source = _TEST_ALL.read_text(encoding="utf-8")
     body = source.split("run_ros_tests() {", 1)[1].split("\n}\n", 1)[0]
 
-    assert "manyforge_fail_composable_cell_runtime_unavailable" not in body
+    assert "manyforge_fail_runtime_unavailable" not in body
     assert '"$WORKSPACE/scripts/ros/build-ros2-control-runtime.sh"' in body
     assert '--source-dir "$WORKSPACE/scripts/ros/ros-integration" --target all' in body
     assert '--topic-install "$ROS_INTEGRATION_TOPIC_INSTALL"' in body
@@ -927,7 +928,7 @@ def test_bindings_selector_routes_to_the_real_core_bindings_builder() -> None:
     assert '"$WORKSPACE/scripts/ci/run-core-bindings.sh"' in body
     assert '--build-root "$BUILD_DIR"' in body
     assert "arguments+=(--prepare-only)" in body
-    assert "manyforge_fail_composable_cell_runtime_unavailable" not in body
+    assert "manyforge_fail_runtime_unavailable" not in body
 
 
 def test_retained_bridge_suite_qualifies_protocol_without_live_bridge() -> None:
@@ -936,7 +937,7 @@ def test_retained_bridge_suite_qualifies_protocol_without_live_bridge() -> None:
 
     assert "manyforge_assistant_bridge/tests/" in body
     assert "pytest" in body
-    assert "manyforge_fail_composable_cell_runtime_unavailable" not in body
+    assert "manyforge_fail_runtime_unavailable" not in body
 
 
 def test_deployment_package_participates_in_repository_version_guard() -> None:

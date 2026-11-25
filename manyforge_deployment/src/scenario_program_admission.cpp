@@ -135,8 +135,8 @@ void verify_scenario_program_admission(
                                   "scenario.deployment_compatibility"));
 
   if (Text(Member(program, "program_profile", "Program"),
-           "Program.program_profile") != core::kComposableCellProgramProfile)
-    Fail("scenario Program does not use composable-cell-v1");
+           "Program.program_profile") != core::kProgramProfile)
+    Fail("scenario Program does not use manyforge-cell-v1");
   const auto &catalog = Member(program, "catalog", "Program");
   if (Text(Member(catalog, "api_version", "Program.catalog"),
            "Program.catalog.api_version") != "manyforge.node_catalog.v3" ||

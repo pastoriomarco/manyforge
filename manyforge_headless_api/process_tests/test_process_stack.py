@@ -22,9 +22,11 @@ import pytest
 from manyforge_headless_api.process_tests.control_client_fixture import composer_snapshot_stream
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+import manyforge_headless_py
+
 from manyforge_headless_api.manager import ManagerCommandClient
 from manyforge_headless_api.models import ManagerDeploymentCandidatePreviewRequest, PreparedScenarioOrigin
-from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
+from manyforge_headless_api.program_runner_client import ProgramRunnerClient
 from manyforge_operator.filesystem_roots import (
     filesystem_roots_value,
     launch_filesystem_roots,
@@ -40,6 +42,12 @@ NODE_CATALOG = Path("/workspace/manyforge_behavior/resources/node_catalog.yaml")
 NODE_ENVIRONMENT_MANIFEST = Path(
     "/workspace/manyforge_behavior/resources/node_environment_manifest.yaml"
 )
+
+
+def _manager_client(manager_run_root: Path) -> ManagerCommandClient:
+    return ManagerCommandClient(
+        manyforge_headless_py.Gateway(None, str(manager_run_root), attribution="http")
+    )
 
 
 def _application_start_id() -> str:
@@ -211,7 +219,7 @@ class ProcessStack:
         root: Path,
         *,
         package_root: Path | None = None,
-        cell_id: str = "c1_build_authority_cell",
+        cell_id: str = "canonical_empty_cell",
         program_path: Path | None = None,
         composer_fs_roots: tuple[Path, ...] | None = None,
         # The Manager's status tick advances every 500 ms; a budget below it
@@ -254,10 +262,8 @@ class ProcessStack:
         self.freshness_milliseconds = freshness_milliseconds
         self.enable_program_runner = enable_program_runner
         self.port = _free_loopback_port()
-        self.program_runner_port = _free_loopback_port()
         self.composer_port = _free_loopback_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
-        self.program_runner_url = f"http://127.0.0.1:{self.program_runner_port}"
         self.composer_url = f"http://127.0.0.1:{self.composer_port}"
         self.manager: subprocess.Popen[bytes] | None = None
         self.api: subprocess.Popen[bytes] | None = None
@@ -420,8 +426,8 @@ class ProcessStack:
         if self.enable_program_runner:
             command.extend(
                 (
-                    "--program-runner-url",
-                    self.program_runner_url,
+                    "--program-runner-socket-root",
+                    str(self.manager_run_root),
                     "--program-runner-timeout-s",
                     "8",
                 )
@@ -453,10 +459,8 @@ class ProcessStack:
                 sys.executable,
                 "-m",
                 "manyforge_program_runner",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.program_runner_port),
+                "--program-socket-root",
+                str(self.manager_run_root),
                 "--headless-url",
                 self.base_url,
                 "--execution-run-root",
@@ -487,8 +491,8 @@ class ProcessStack:
                     "Program runner exited with " f"{self.program_runner.returncode}"
                 )
             try:
-                with ProgramRunnerHttpClient(
-                    self.program_runner_url,
+                with ProgramRunnerClient(
+                    self.manager_run_root,
                     timeout_seconds=0.25,
                 ) as client:
                     return client.runs(active_only=True, limit=1)
@@ -830,7 +834,7 @@ def _assistant_stack(
             # Apply identity rather than using the authored-preparation owner.
             # Request its preview from Manager's private boundary; the public
             # Headless preview correctly requires a registered preparation.
-            preview = ManagerCommandClient(stack.manager_run_root).preview_deployment_candidate(
+            preview = _manager_client(stack.manager_run_root).preview_deployment_candidate(
                 ManagerDeploymentCandidatePreviewRequest.model_validate({
                     "deployment_revision": apply_body["deployment_revision"],
                     "candidate_retained_bundle_id": prepared_activation["retained_bundle_id"],
@@ -945,7 +949,7 @@ def _unavailable_candidate_preview(
     active = client.manager_status()["status"]["active"]
     # The private preview itself must reject a nonexistent candidate before
     # any public Apply can obtain a candidate receipt.
-    return ManagerCommandClient(manager_run_root).preview_deployment_candidate(
+    return _manager_client(manager_run_root).preview_deployment_candidate(
         ManagerDeploymentCandidatePreviewRequest.model_validate({
             "deployment_revision": "sha256:" + "a" * 64,
             "candidate_retained_bundle_id": "sha256:" + "b" * 64,
@@ -1426,7 +1430,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             )
             assert environment["catalog"]["catalog_digest"] == (environment["catalog_digest"])
             assert environment["availability"]["execution_available"] is False
-            assert client.manager_graph()["cell_graph"]["cell_id"] == ("c1_build_authority_cell")
+            assert client.manager_graph()["cell_graph"]["cell_id"] == ("canonical_empty_cell")
             assert client.manager_diff()["converged"] is True
             assert client.scene()["scene_runtime"]["payload"]["state"]["state"] == ("open")
 
@@ -1439,7 +1443,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
         stack.start_composer()
         assert stack.wait_composer()["application_start_id"] == owner_identity[0]
         with HeadlessHttpClient(stack.composer_url) as composer:
-            assert composer.manager_graph()["cell_graph"]["cell_id"] == ("c1_build_authority_cell")
+            assert composer.manager_graph()["cell_graph"]["cell_id"] == ("canonical_empty_cell")
             assert (
                 _owner_identity(
                     composer.runtime(),
@@ -1483,7 +1487,7 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
         cli_reads = {
             "health": "manyforge.headless_health.v1",
             "manager-graph": "manyforge.manager_graph_projection.v2",
-            "node-environment": "manyforge.node_environment_projection.v3",
+            "node-environment": "manyforge.node_environment_projection.v4",
             "source-model": "manyforge.source_model_projection.v4",
             "scene": "manyforge.scene_projection.v2",
             "alarms": "manyforge.operator_alarm_snapshot.v3",
@@ -1527,7 +1531,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
     import sqlite3
 
     from manyforge_headless_api.cell_admission import CellAdmissionClient
-    from manyforge_headless_api.execution import ExecutionCommandClient
+    from manyforge_headless_api.process_tests.host_probe import HostProbe
     from manyforge_headless_api.models import OperationIntentRequest, StopIntentRequest
     from manyforge_headless_api.process_tests.test_managed_execution_path import (
         TERMINAL_STATES, _direct_control_gripper_operation,
@@ -1800,7 +1804,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
         return projection
 
     def component_state() -> dict[str, Any]:
-        model = ExecutionCommandClient(run_root).component_model()
+        model = HostProbe(run_root).component_model()
         (state,) = [row for row in model["component_states"]
                     if row["component_id"] == component_id]
         return state
@@ -1808,7 +1812,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
     def lifecycle(action: str, _request_id: str) -> dict[str, Any]:
         """One component action; its result is `last_action`."""
         previous = component_state().get("last_action")
-        accepted = ExecutionCommandClient(run_root).component_action(component_id, action)
+        accepted = HostProbe(run_root).component_action(component_id, action)
         assert accepted["ok"] is True, accepted
         deadline = time.monotonic() + 10.0
         while True:
@@ -1834,7 +1838,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 assert stack.fixture_metadata is not None
                 assert all(stack.fixture_metadata[key] == value for key, value in metadata.items())
                 state_root, run_root = stack.execution_state_root, stack.execution_run_root
-                client = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+                client = HostProbe(run_root, timeout_seconds=2.0)
                 lifecycle("prepare", "robotiq.initial.prepare")
                 lifecycle("enable", "robotiq.initial.enable")
                 status = client.diagnostics()["status"]

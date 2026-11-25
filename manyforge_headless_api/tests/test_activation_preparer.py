@@ -124,7 +124,7 @@ def _preparer(tmp_path: Path) -> ActivationPreparer:
 @lru_cache(maxsize=1)
 def _admitted_program() -> dict[str, object]:
     catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
-    context = {"api_version": "manyforge.program.v4", "program_profile": "composable-cell-v1",
+    context = {"api_version": "manyforge.program.v4", "program_profile": "manyforge-cell-v1",
                "catalog": {"api_version": catalog.api_version,
                            "content_version": catalog.content_version}}
     skill = load_skill(default_skills_dir() / "move_to_named_config.skill.yaml")

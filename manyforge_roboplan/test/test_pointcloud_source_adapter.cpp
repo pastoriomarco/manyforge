@@ -6,11 +6,16 @@
 #include <manyforge_roboplan/pointcloud_source_adapter.hpp>
 
 #include <chrono>
+#include <functional>
 #include <future>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <utility>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
@@ -29,15 +34,28 @@ class FakeLink final : public IPointCloudBridgeLink {
 struct ProcessLog final {
   std::vector<ComponentProcessCommand> started;
   int stopped{};
+  std::vector<std::thread::id> stop_threads;
+  int released{};
   std::optional<std::string> exit;
+  /// Runs in exited() (e.g. to hold a State() reader there).
+  std::function<void()> on_exited;
+  std::string output_tail;
   bool refuse{};
 };
 
 class FakeProcess final : public IComponentProcess {
  public:
   explicit FakeProcess(std::shared_ptr<ProcessLog> log) : log_(std::move(log)) {}
-  ~FakeProcess() override { ++log_->stopped; }
-  std::optional<std::string> exited() override { return log_->exit; }
+  ~FakeProcess() override { ++log_->released; }
+  void stop() override {
+    ++log_->stopped;
+    log_->stop_threads.push_back(std::this_thread::get_id());
+  }
+  std::optional<std::string> exited() override {
+    if (log_->on_exited) log_->on_exited();
+    return log_->exit;
+  }
+  std::string output_tail() const override { return log_->output_tail; }
 
  private:
   std::shared_ptr<ProcessLog> log_;
@@ -164,13 +182,21 @@ TEST(PointCloudSourceAdapter, ProcessExitIsAFaultThatRecoverClears) {
   Fixture f;
   ASSERT_EQ(f.adapter.Run(core::ComponentAction::kPrepare, {}).outcome,
             core::ActionOutcome::kSucceeded);
+  f.log->output_tail = "bridge started";
+  EXPECT_FALSE(f.adapter.State(5).fault.has_value());
   f.log->exit = "exit code 1";
+  f.log->output_tail.clear();
   auto state = f.adapter.State(5);
   EXPECT_EQ(state.lifecycle, core::ComponentLifecycle::kFault);
   ASSERT_TRUE(state.fault.has_value());
   EXPECT_EQ(state.fault->code, core::FaultCode::kProcessExited);
   EXPECT_EQ(state.fault->operator_action, core::FaultOperatorAction::kRecover);
   EXPECT_TRUE(state.fault->clearable);
+  EXPECT_TRUE(state.fault->details.empty());
+  // The bridge's last output lines, when it left any.
+  f.log->output_tail = "point cloud bridge crashed";
+  EXPECT_EQ(f.adapter.State(5).fault->details,
+            (std::map<std::string, std::string>{{"output_tail", "point cloud bridge crashed"}}));
   EXPECT_EQ(f.adapter.Run(core::ComponentAction::kEnable, {}).error->code,
             "component_not_prepared");
   f.log->exit.reset();
@@ -179,6 +205,47 @@ TEST(PointCloudSourceAdapter, ProcessExitIsAFaultThatRecoverClears) {
   EXPECT_EQ(f.log->stopped, 1);
   EXPECT_EQ(f.log->started.size(), 2U);
   EXPECT_EQ(f.adapter.State(5).lifecycle, core::ComponentLifecycle::kPrepared);
+}
+
+TEST(PointCloudSourceAdapter, PrepareStopsTheOldBridgeOnItsThreadAStateReaderOnlyReleasesIt) {
+  Fixture f;
+  ASSERT_EQ(f.adapter.Run(core::ComponentAction::kPrepare, {}).outcome,
+            core::ActionOutcome::kSucceeded);
+  // A State() reader holds the old bridge's handle (in exited()) while Prepare
+  // replaces it.
+  std::promise<void> entered;
+  std::promise<void> release;
+  std::shared_future<void> gate{release.get_future().share()};
+  std::once_flag hold;
+  f.log->on_exited = [&] {
+    std::call_once(hold, [&] {
+      entered.set_value();
+      gate.wait();
+    });
+  };
+  auto reader = std::async(std::launch::async, [&] {
+    const auto state = f.adapter.State(0);
+    return std::pair{std::this_thread::get_id(), state.fault.has_value()};
+  });
+  entered.get_future().wait();
+  EXPECT_EQ(f.adapter.Run(core::ComponentAction::kPrepare, {}).outcome,
+            core::ActionOutcome::kSucceeded);
+  // Stopped once, on the Prepare caller's thread; the reader still holds it.
+  EXPECT_EQ(f.log->stopped, 1);
+  EXPECT_EQ(f.log->stop_threads, std::vector<std::thread::id>{std::this_thread::get_id()});
+  EXPECT_EQ(f.log->released, 0);
+  EXPECT_EQ(f.log->started.size(), 2U);
+  // The stopped bridge reports its exit to the reader, which is not a fault of
+  // the component: its process was replaced meanwhile.
+  f.log->exit = "stopped by Prepare";
+  release.set_value();
+  const auto [reader_thread, reader_fault] = reader.get();
+  EXPECT_NE(reader_thread, std::this_thread::get_id());
+  EXPECT_FALSE(reader_fault);
+  f.log->exit.reset();
+  // The reader's drop released it without stopping it again.
+  EXPECT_EQ(f.log->released, 1);
+  EXPECT_EQ(f.log->stopped, 1);
 }
 
 TEST(PointCloudSourceAdapter, PrepareStartFailureIsTyped) {

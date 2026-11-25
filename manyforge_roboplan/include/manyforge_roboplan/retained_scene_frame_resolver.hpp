@@ -399,7 +399,7 @@ public:
           {},
           graph_binding->control_interface_contract_id,
           graph_binding->control_interface_revision,
-          core::ActiveControlConfigurationId("active.i6.manager_native"),
+          core::ActiveControlConfigurationId("active.manager_native"),
           core::ActiveControlConfigurationGeneration(1U),
           graph_binding->provider_instance_id,
           graph_binding->provider_manifest_id,

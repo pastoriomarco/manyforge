@@ -39,6 +39,7 @@ import {
   booleanAt,
   exactKeysAt,
   fail,
+  int64NumberOrTextAt,
   numberAt,
   objectAt,
   stringArrayAt,
@@ -78,8 +79,18 @@ function withVendor<T extends object>(record: JsonObject, path: string, base: T)
   };
 }
 
+/** The UTC time of `since_ns`, when the owner sends it. */
+function sinceUtc(record: JsonObject, path: string): { since_utc_ns?: string } {
+  return record.since_utc_ns === undefined || record.since_utc_ns === null
+    ? {} : { since_utc_ns: int64NumberOrTextAt(record.since_utc_ns, `${path}.since_utc_ns`) };
+}
+
 export function parseFault(value: unknown, path: string): Fault {
   const record = objectAt(value, path);
+  // A launch fault's details carry the launched process's last output lines.
+  const details = record.details === undefined || record.details === null
+    ? undefined : objectAt(record.details, `${path}.details`);
+  const outputTail = details === undefined ? undefined : optionalString(details, 'output_tail', `${path}.details`);
   return withVendor(record, path, {
     code: stringAt(record.code, `${path}.code`),
     message: stringAt(record.message, `${path}.message`),
@@ -87,7 +98,10 @@ export function parseFault(value: unknown, path: string): Fault {
     operator_action: oneOf(FAULT_OPERATOR_ACTIONS, record.operator_action, `${path}.operator_action`),
     ...(record.concerns === undefined || record.concerns === null
       ? {} : { concerns: stringArrayAt(record.concerns, `${path}.concerns`) }),
-    since_ns: numberAt(record.since_ns, `${path}.since_ns`),
+    // An integer, or its decimal text above 2^53 - 1 (kept as a number).
+    since_ns: Number(int64NumberOrTextAt(record.since_ns, `${path}.since_ns`)),
+    ...sinceUtc(record, path),
+    ...(outputTail === undefined || outputTail === '' ? {} : { output_tail: outputTail }),
   });
 }
 
@@ -96,7 +110,9 @@ export function parseComponentStop(value: unknown, path: string): ComponentStop 
   return withVendor(record, path, {
     code: oneOf(['estop'] as const, record.code, `${path}.code`),
     message: stringAt(record.message, `${path}.message`),
-    since_ns: numberAt(record.since_ns, `${path}.since_ns`),
+    // An integer, or its decimal text above 2^53 - 1 (kept as a number).
+    since_ns: Number(int64NumberOrTextAt(record.since_ns, `${path}.since_ns`)),
+    ...sinceUtc(record, path),
   });
 }
 

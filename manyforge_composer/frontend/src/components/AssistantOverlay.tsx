@@ -18,7 +18,7 @@ import type {
   AssistantProviderStatus,
   AssistantToolCallResult,
 } from '../types/assistant';
-import type { StructuralResourceState } from '../state/structuralResource';
+import { errorMessage, type StructuralResourceState } from '../state/structuralResource';
 import { LIFECYCLE_LABELS } from '../state/componentPresentation';
 import { commandRefusalText } from '../state/commandRefusal';
 import type { ComponentLifecycle, ComponentState } from '../types/components';
@@ -579,7 +579,7 @@ export function AssistantOverlay({
         await reconcile(requestId);
         return;
       }
-      const detail = error instanceof Error ? error.message : 'Assistant request failed.';
+      const detail = errorMessage(error, 'Assistant request failed.');
       await finish({
         requestId: request.requestId,
         requestOwnerEpoch: request.requestOwnerEpoch,
@@ -604,7 +604,7 @@ export function AssistantOverlay({
       recovery.current = null;
       await finish(status);
     } catch (error) {
-      const detail = error instanceof Error ? error.message : 'Cancellation failed.';
+      const detail = errorMessage(error, 'Cancellation failed.');
       setNotice(detail);
       setOperationalError(detail);
     }

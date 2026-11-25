@@ -27,7 +27,7 @@ import sys
 
 
 _DIRECT_ENTRYPOINT_UNAVAILABLE_MESSAGE = (
-    "composable_cell_runtime_unavailable: the addressed native benchmark "
+    "runtime_unavailable: the addressed native benchmark "
     "requires the build-qualified process fixture; run its RoboPlan process "
     "test in Docker."
 )
@@ -44,33 +44,29 @@ from manyforge_behavior import kernel_client
 from manyforge_behavior.kernel_client import KernelClient
 
 
-class _Transport:
-    def identity(self):
+class _Gateway:
+    """The core gateway's calls the client makes: one method per command."""
+
+    def identity(self, members=None):
         return {"ok": True, "identity": {}}
 
-    def submit(self, body):
-        return {"ok": True, "accepted": {"request": body}}
+    def submit(self, members):
+        return {"ok": True, "accepted": {"request": members["operation"]}}
 
-    def read(self, operation_id):
-        return {"ok": True, "operation": {"operation_id": operation_id}}
+    def read(self, members):
+        return {"ok": True, "operation": {"operation_id": members["operation_id"]}}
 
-    def reset(self, operation_id, body):
-        return {"ok": True, "accepted": {"operation_id": operation_id, "request": body}}
+    def reset(self, members):
+        return {"ok": True, "accepted": {"request": members["request"]}}
 
     acknowledge_completed = reset
-
-    def stop(self, body):
-        operation_id = body["operations"][0]["operation_id"]
-        return {"ok": True, "accepted": {"operation_id": operation_id, "request": body}}
-
-    def get_runtime_scale(self, operation_id):
-        return {"ok": True, "runtime_scale": {"operation_id": operation_id}}
+    stop = reset
 
 
 def test_native_benchmark_client_is_now_only_a_headless_transport() -> None:
-    client = KernelClient(_Transport())
+    client = KernelClient(_Gateway())
     assert client.execute({"component_role_id": "robot"})["accepted"] == {
-        "request": {"component_role_id": "robot"}
+        "request": {"component_role_id": "robot", "program_run_id": None}
     }
 
 

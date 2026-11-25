@@ -22,7 +22,7 @@ from typing import Any, Final, NoReturn, Optional
 
 
 MODEL_NODE_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_model_node_unavailable"
+    "model_node_unavailable"
 )
 _MAX_TEMPLATE_CHARS: Final = 1_000_000
 _MAX_TEMPLATE_VARIABLES: Final = 256

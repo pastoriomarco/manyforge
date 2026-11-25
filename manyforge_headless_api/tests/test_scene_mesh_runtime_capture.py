@@ -36,17 +36,12 @@ class Core:
 class Manager:
     def __init__(self, events: list[str] | None = None) -> None:
         self.digests: list[str | None] = []
-        self.lookups: list[SceneTransactionRequest] = []
         self.events = events if events is not None else []
 
     def commit_scene_transaction(self, request, *, trusted_principal_id, mesh_content_digest):
         self.digests.append(mesh_content_digest)
         self.events.append("commit")
         return COMMITTED
-
-    def scene_transaction_status(self, request):
-        self.lookups.append(request)
-        return {"ok": True, "result": None}
 
 
 class Preparer:
@@ -118,10 +113,6 @@ def test_api_mesh_is_read_under_the_rule_and_its_digest_sent(cell) -> None:
         assert service.scene_commit(_request(_mesh(uri)), TrustedAttribution()) is COMMITTED
         assert preparer.stored[-1] == (value, uri)
         assert manager.digests[-1] == "sha256:" + hashlib.sha256(value).hexdigest()
-    # A result lookup names the request only: nothing is read or stored again.
-    stored = len(preparer.stored)
-    service.scene_transaction_status(_request(_mesh("meshes/part.stl")))
-    assert len(preparer.stored) == stored and len(manager.lookups) == 1
 
 
 def test_non_mesh_and_program_commits_send_no_digest(cell) -> None:
@@ -246,3 +237,31 @@ def test_content_writer_hold_defers_an_exclusive_collector(
         with preparer.content_writer_hold():  # Shared with a preparation.
             assert not collector_would_run()
     assert collector_would_run()
+
+
+def test_an_add_without_its_authorization_is_refused_before_any_capture(
+    cell, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core's cross-field rules refuse it (authoring_not_ready) before
+    anything is read, stored or sent; the refusal records nothing."""
+
+    service, manager, preparer, _project, _site = cell
+    recorded: list[object] = []
+    monkeypatch.setattr(service, "_record_scene_change", lambda *args: recorded.append(args))
+
+    def refuse(request, *, trusted_principal_id, mesh_content_digest):
+        manager.digests.append(mesh_content_digest)
+        raise HeadlessApiError(
+            "authoring_not_ready",
+            "authored-scene mutation requires exactly one ordinary or Program "
+            "Reset authorization",
+        )
+
+    monkeypatch.setattr(manager, "commit_scene_transaction", refuse)
+    with pytest.raises(HeadlessApiError) as refused:
+        service.scene_commit(
+            _request(_mesh("meshes/absent.stl"), expected_admission_generation=None),
+            TrustedAttribution(),
+        )
+    assert refused.value.code == "authoring_not_ready"
+    assert manager.digests == [None] and preparer.stored == [] and recorded == []

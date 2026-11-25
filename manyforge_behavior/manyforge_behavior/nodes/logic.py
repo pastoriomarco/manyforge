@@ -7,7 +7,7 @@ from typing import Final, Literal
 
 
 LOGIC_NODE_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_logic_node_binding_unavailable"
+    "logic_node_binding_unavailable"
 )
 BooleanEdge = Literal["rising", "falling", "either"]
 

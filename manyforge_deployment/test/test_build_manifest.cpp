@@ -240,7 +240,7 @@ static_assert(!std::is_default_constructible_v<
       "{\"api_version\":\"manyforge.deployment.v1\","
       "\"deployment_revision\":\"" +
       std::string(kZeroDigest) +
-      "\",\"cell_id\":\"c1_build_authority_cell\","
+      "\",\"cell_id\":\"canonical_empty_cell\","
       "\"catalogs\":{\"records\":[]},"
       "\"graph\":" +
       empty_graph() +

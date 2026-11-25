@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 
 import type {
   BlackboardKeyDeclaration,
@@ -39,6 +39,24 @@ interface ProgramDeclarationsNavigatorProps {
 }
 
 const NO_RULE_IDS: readonly string[] = [];
+const VALUE_TEXT_LIMIT = 40;
+
+/** A key's declared starting value as row text: short for the row, full for the tooltip. */
+export function keyValueText(key: BlackboardKeyDeclaration): { short: string; full: string } {
+  if (key.expression !== undefined) return { short: 'computed', full: `computed: ${key.expression}` };
+  if (key.initial === undefined) return { short: 'empty until written', full: 'empty until written' };
+  const full = typeof key.initial === 'string' ? `"${key.initial}"`
+    : typeof key.initial === 'object' ? JSON.stringify(key.initial)
+      : String(key.initial);
+  // A float's row text keeps 6 significant digits; the tooltip keeps all.
+  if (typeof key.initial === 'number' && !Number.isInteger(key.initial)) {
+    return { short: String(Number(key.initial.toPrecision(6))), full };
+  }
+  return {
+    short: full.length > VALUE_TEXT_LIMIT ? `${full.slice(0, VALUE_TEXT_LIMIT - 1)}…` : full,
+    full,
+  };
+}
 
 function selectedClass(
   selected: ProgramDeclarationSelection | null,
@@ -73,11 +91,25 @@ export function ProgramDeclarationsNavigator({
     () => programBlackboardKeys({ blackboard: { namespaces: [], keys }, forest: roots }, globalRuleIds),
     [globalRuleIds, keys, roots],
   );
-  const keyGroups = groupByNamespace(readableKeys, (key) => key.key);
+  const [keyQuery, setKeyQuery] = useState('');
+  const query = keyQuery.trim().toLowerCase();
+  const shownKeys = query === '' ? readableKeys : readableKeys.filter((key) => (
+    key.key.toLowerCase().includes(query)
+    || key.type.toLowerCase().includes(query)
+    || (key.description ?? '').toLowerCase().includes(query)
+  ));
+  const keyGroups = groupByNamespace(shownKeys, (key) => key.key);
+  // Inside a namespace group the group header names the namespace, so the row
+  // shows the rest of the key; the full key stays in the row's tooltip.
+  const grouped = groupByNamespace(readableKeys, (key) => key.key).length > 1;
   const keyRow = (key: BlackboardKeyDeclaration) => {
     const usages = (blackboardUsages[key.key]?.length ?? 0)
       + (formulaUsages.keys[key.key]?.length ?? 0);
     const namespace = keyNamespace(key.key);
+    const shownName = grouped && namespace !== '' ? key.key.slice(namespace.length + 1) : key.key;
+    const value = keyValueText(key);
+    const detail = `type: ${key.type} - value: ${value.short}`;
+    const usageTitle = `Used by ${usages} node${usages === 1 ? '' : 's'} or formula${usages === 1 ? '' : 's'}`;
     if (isSystemKey(key.key)) {
       const owner = namespace === NODE_OUTCOME_NAMESPACE ? 'written only by its motion node'
         : namespace === INTERRUPT_STATE_NAMESPACE ? 'published only by its Deployment global rule'
@@ -88,10 +120,10 @@ export function ProgramDeclarationsNavigator({
           type="button"
           className="dpick"
           disabled
-          title={`System-owned, ${owner}. ${key.description ?? ''}`}
+          title={`${key.key}\nSystem-owned, ${owner}. ${key.description ?? ''}`}
         >
-          <span><strong>{key.key}</strong><small>{key.type} · system</small></span>
-          <small>{usages}</small>
+          <span><strong>{shownName}</strong><small>{`type: ${key.type} - system`}</small></span>
+          <small title={usageTitle}>{usages}</small>
         </button>
       );
     }
@@ -100,10 +132,11 @@ export function ProgramDeclarationsNavigator({
         key={key.key}
         type="button"
         className={`dpick${selectedClass(selected, 'key', key.key)}`}
+        title={`${key.key}\ntype: ${key.type} - value: ${value.full}${key.description ? `\n${key.description}` : ''}`}
         onClick={() => onSelect({ kind: 'key', id: key.key })}
       >
-        <span><strong>{key.key}</strong><small>{key.type}</small></span>
-        <small>{usages}</small>
+        <span><strong>{shownName}</strong><small>{detail}</small></span>
+        <small title={usageTitle}>{usages}</small>
       </button>
     );
   };
@@ -173,12 +206,23 @@ export function ProgramDeclarationsNavigator({
             New
           </button>
         </header>
+        {readableKeys.length > 0 && (
+          <input
+            type="search"
+            className="program-declaration-search"
+            placeholder="Search keys"
+            aria-label="Search blackboard keys"
+            value={keyQuery}
+            onChange={(event) => setKeyQuery(event.target.value)}
+          />
+        )}
         {readableKeys.length === 0 && <p>No keys</p>}
-        {keyGroups.length === 1
-          ? keyGroups[0].items.map(keyRow)
+        {readableKeys.length > 0 && shownKeys.length === 0 && <p>No key matches “{keyQuery.trim()}”</p>}
+        {!grouped
+          ? keyGroups.flatMap((group) => group.items).map(keyRow)
           : keyGroups.map((group) => (
-            // Each namespace collapses; closed by default.
-            <details key={group.id}>
+            // Each namespace collapses; closed by default, open while searching.
+            <details key={`${group.id}${query === '' ? '' : ':search'}`} open={query !== '' || undefined}>
               <summary>{group.label} ({group.items.length})</summary>
               {group.items.map(keyRow)}
             </details>

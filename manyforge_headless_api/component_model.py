@@ -54,13 +54,20 @@ class Fault(TypedDict):
     vendor_text: NotRequired[str]
     # On an owner's fault, the members it concerns.
     concerns: NotRequired[list[str]]
-    since_ns: int
+    # Steady-clock ns: an int, or its decimal text above 2^53 - 1.
+    since_ns: int | str
+    # The UTC time of `since_ns`: an int, or its decimal text above 2^53 - 1.
+    since_utc_ns: NotRequired[int | str]
+    # Typed facts, e.g. `output_tail` (an exited launch's last output lines).
+    details: NotRequired[dict[str, str]]
 
 
 class ComponentStop(TypedDict):
     code: Literal["estop"]
     message: str
-    since_ns: int
+    # Steady-clock ns: an int, or its decimal text above 2^53 - 1.
+    since_ns: int | str
+    since_utc_ns: NotRequired[int | str]
     vendor_code: NotRequired[str]
     vendor_text: NotRequired[str]
 
@@ -223,16 +230,27 @@ def _rows(value: object, label: str) -> list[dict[str, Any]]:
     return value
 
 
+def _ns_value(value: object) -> bool:
+    """A nanosecond value (monotonic or UTC): a nonnegative int, or its
+    decimal text above 2^53 - 1 (the host's JSON encoding)."""
+
+    if type(value) is int:
+        return value >= 0
+    return isinstance(value, str) and value.isascii() and value.isdigit() and (
+        value == "0" or not value.startswith("0"))
+
+
 def _validate_stop(value: object) -> None:
     if (
         not isinstance(value, dict)
         or not {"code", "message", "since_ns"} <= value.keys()
-        or not value.keys() <= {"code", "message", "since_ns", "vendor_code", "vendor_text"}
+        or not value.keys()
+        <= {"code", "message", "since_ns", "since_utc_ns", "vendor_code", "vendor_text"}
         or value["code"] != "estop"
         or not isinstance(value["message"], str)
         or not value["message"]
-        or type(value["since_ns"]) is not int
-        or value["since_ns"] < 0
+        or not _ns_value(value["since_ns"])
+        or ("since_utc_ns" in value and not _ns_value(value["since_utc_ns"]))
         or any(key in value and not isinstance(value[key], str) for key in ("vendor_code", "vendor_text"))
     ):
         raise _invalid("component stop is invalid")

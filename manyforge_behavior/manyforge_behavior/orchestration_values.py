@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from math import isfinite
-from threading import RLock
+from threading import Event, RLock
 from types import MappingProxyType
 from typing import Any
 
@@ -271,6 +271,35 @@ class PublishedKeyChange:
     present: bool
 
 
+class PublicationReceipt:
+    """The host's answer to one committed write of a published key.
+
+    A write returns once committed; its frames leave on the source's sender.
+    ``answered`` becomes true when the host has answered the write's last
+    frame (or the frame is never sent: the source was retired, not installed
+    yet, or already lost), and after a refused frame only once the source is
+    declared lost and its containment was handed over, as when the write
+    itself waited for the host (OD-213 part 3). A node holds RUNNING until
+    then; a command thread waits for it before it replies.
+    """
+
+    __slots__ = ("_answered",)
+
+    def __init__(self) -> None:
+        self._answered = Event()
+
+    @property
+    def answered(self) -> bool:
+        return self._answered.is_set()
+
+    def wait(self) -> None:
+        """Block until answered (command threads only, never the tick)."""
+        self._answered.wait()
+
+    def answer(self) -> None:
+        self._answered.set()
+
+
 def _matches_scalar_type(value: object, declared_type: str) -> bool:
     if declared_type == "bool":
         return type(value) is bool
@@ -430,7 +459,9 @@ class ProgramValueStore:
         self._values: dict[str, ProgramValueRecord] = {}
         self._lock = RLock()
         self._published: frozenset[str] | None = None
-        self._on_published: Callable[[PublishedKeyChange], None] | None = None
+        self._on_published: (
+            Callable[[PublishedKeyChange], PublicationReceipt | None] | None
+        ) = None
         self._published_computed: dict[str, frozenset[str]] = {}
         self._published_computed_last: dict[str, tuple[bool, Any]] = {}
         persistent = {
@@ -614,7 +645,7 @@ class ProgramValueStore:
         keys: tuple[str, ...],
         *,
         baseline: Callable[[tuple[PublishedKeyChange, ...]], None],
-        on_change: Callable[[PublishedKeyChange], None],
+        on_change: Callable[[PublishedKeyChange], PublicationReceipt | None],
     ) -> None:
         """Fix the Run's referenced-key union once and capture its baseline.
 
@@ -624,9 +655,11 @@ class ProgramValueStore:
         section, so no commit falls between them. A computed key is recomputed
         by the existing evaluator whenever a stored key it reads commits, and
         is reported only when its value actually changes. Both callbacks run
-        under the store lock and forward synchronously: every writer
-        commits through this store, so the forwards keep commit order and a
-        write returns only after its forward.
+        under the store lock and only capture what they receive (no I/O, no
+        wait): every writer commits through this store, so the captures keep
+        commit order; the subscriber sends them after the lock is released.
+        ``on_change`` returns the receipt of the frame it captured (None when
+        nothing is sent); the write returns its last frame's receipt.
         """
 
         if not keys or keys != tuple(sorted(set(keys))):
@@ -677,8 +710,8 @@ class ProgramValueStore:
         self, baseline: Callable[[tuple[PublishedKeyChange, ...]], None]
     ) -> None:
         """Hand ``baseline`` every subscribed key's current value, under the
-        store lock: a source the Kernel installs later starts from the values
-        committed meanwhile."""
+        store lock (capture only): a source the Kernel installs later starts
+        from the values committed meanwhile."""
 
         with self._lock:
             if self._published is None:
@@ -716,11 +749,16 @@ class ProgramValueStore:
             for key in keys
         }
 
-    def _publish_locked(self, key: str, previous: ProgramValueRecord | None) -> None:
-        """Report one committed change of a subscribed key (store lock held)."""
+    def _publish_locked(
+        self, key: str, previous: ProgramValueRecord | None
+    ) -> PublicationReceipt | None:
+        """Report one committed change of a subscribed key (store lock held;
+        the subscriber captures it and sends it after the lock is released).
+        Returns the receipt of the last frame captured (frames are answered
+        in capture order), None when nothing is sent."""
 
         if self._published is None:
-            return
+            return None
         current = self._values.get(key)
         unchanged = (current is None and previous is None) or (
             current is not None
@@ -729,9 +767,10 @@ class ProgramValueStore:
             and current.value == previous.value
         )
         if unchanged:
-            return
+            return None
+        receipt: PublicationReceipt | None = None
         if key in self._published and key not in self._published_computed:
-            self._on_published(  # type: ignore[misc]
+            receipt = self._on_published(  # type: ignore[misc]
                 PublishedKeyChange(
                     key=key,
                     value_type=self._declarations[key].type,
@@ -743,7 +782,7 @@ class ProgramValueStore:
             name for name, inputs in self._published_computed.items() if key in inputs
         }
         if not dependent:
-            return
+            return receipt
         for name, (present, value) in sorted(
             self._published_computed_locked(dependent).items()
         ):
@@ -751,14 +790,15 @@ class ProgramValueStore:
             if last[0] == present and type(last[1]) is type(value) and last[1] == value:
                 continue
             self._published_computed_last[name] = (present, value)
-            self._on_published(  # type: ignore[misc]
+            receipt = self._on_published(  # type: ignore[misc]
                 PublishedKeyChange(
                     key=name,
                     value_type=self._declarations[name].type,
                     value=value,
                     present=present,
                 )
-            )
+            ) or receipt
+        return receipt
 
     def clear_run_values(self) -> None:
         """Reset: run-only stored keys lose their values; persistent keys keep
@@ -802,7 +842,11 @@ class ProgramValueStore:
         *,
         status: str = "succeeded",
         metadata: Mapping[str, Any] | None = None,
-    ) -> None:
+    ) -> PublicationReceipt | None:
+        """Commit one node or operator write. Returns the receipt of its
+        publication to the host (None when nothing is sent): the writer
+        holds its result until it is answered (OD-213 part 3)."""
+
         try:
             declaration = self._declarations[key]
         except KeyError as exc:
@@ -843,7 +887,7 @@ class ProgramValueStore:
                         f"blackboard key {key!r} could not be stored: {error}"
                     ) from error
             self._values[key] = record
-            self._publish_locked(key, current)
+            return self._publish_locked(key, current)
 
     def write_node_outcome(
         self,
@@ -851,7 +895,7 @@ class ProgramValueStore:
         outcome: str,
         *,
         metadata: Mapping[str, Any] | None = None,
-    ) -> None:
+    ) -> PublicationReceipt | None:
         """Store a motion node's outcome in its system-owned key.
 
         The one writer of the reserved namespace: the key is read-only for
@@ -869,7 +913,7 @@ class ProgramValueStore:
             self._values[key] = ProgramValueRecord(
                 status="succeeded", value=outcome, metadata=metadata or {}
             )
-            self._publish_locked(key, current)
+            return self._publish_locked(key, current)
 
     def reset_node_outcome(
         self,
@@ -977,7 +1021,7 @@ class ProgramValueStore:
 
     def reset_to_initial(
         self, key: str, *, metadata: Mapping[str, Any] | None = None
-    ) -> None:
+    ) -> PublicationReceipt | None:
         """Forget a persistent key's stored value and start it again from `initial:`.
 
         An operator value change like a write, so the key must be writable.
@@ -1009,7 +1053,7 @@ class ProgramValueStore:
                 self._load(declaration, declaration.initial, "initial", check_frame_facts=False)
             else:
                 self._values.pop(key, None)
-            self._publish_locked(key, current)
+            return self._publish_locked(key, current)
 
     def read_bundle(self, key: str) -> dict[str, Any]:
         """Return the atomic diagnostic record without changing logical reads."""
@@ -1677,6 +1721,7 @@ __all__ = [
     "ProgramValueError",
     "ProgramValueRecord",
     "ProgramValueStore",
+    "PublicationReceipt",
     "PublishedKeyChange",
     "describe_input_failure",
     "input_failure_details",

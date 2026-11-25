@@ -1,40 +1,45 @@
-"""Strict same-user client for Manager-owned scene-runtime observations.
+"""Manager-owned scene-runtime observations through the gateway core.
 
 The client is deliberately mechanical.  Manager assigns receive time,
 freshness, epoch order, acceptance, retention, and publication generation;
 ROS producers provide only source identity, sequence, lifetime intent, quality,
-eligibility, and a bounded canonical observation payload.
+eligibility, and a bounded canonical observation payload.  The exchange with
+the Manager (run root and socket checks, peer check, canonical JSON, the reply
+envelope) is the C++ gateway core of ``manyforge_headless_py``.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
 import math
-import os
 from pathlib import Path
-import socket
-import stat
-import struct
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
 import unicodedata
 
+import manyforge_headless_py as core
 import rfc8785
 
 from manyforge_behavior.reference_validation import validate_reference_refusal
 
 
-MANAGER_SOCKET_FILE = "manager-command.sock"
-# Stays v1: the command protocol version is unchanged.
-MANAGER_COMMAND_VERSION = "manyforge.manager_command.v2"
-MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v3"
-MAX_MANAGER_REQUEST_BYTES = 128 * 1024 + 4 * 1024
-MAX_MANAGER_RESPONSE_BYTES = 64 * 1024
 MAX_OBSERVATION_PAYLOAD_BYTES = 64 * 1024
 MAX_OBSERVATION_LIFETIME_NS = 60_000_000_000
 MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
+# The limit on each socket step of one Manager exchange (connect, send,
+# receive): the pose source's only detector of a silent Manager (OD-214 (2):
+# it stays). On expiry the exchange is `manager_scene_runtime_unavailable`
+# and the dispatcher rejoins.
 DEFAULT_TIMEOUT_S = 2.0
+
+# The core's exchange codes as this client reports them.
+_GATEWAY_CODES = {
+    "manager_command_unavailable": "manager_scene_runtime_unavailable",
+    "manager_command_transport_failure": "manager_scene_runtime_unavailable",
+    "manager_command_response_invalid": "manager_scene_runtime_response_invalid",
+    "manager_command_invalid": "manager_scene_runtime_request_invalid",
+    "manager_command_oversized": "manager_scene_runtime_request_invalid",
+}
 
 _MAX_IDENTITY_BYTES = 256
 _MAX_ERROR_MESSAGE_BYTES = 4096
@@ -240,8 +245,7 @@ class PoseObservationIntent:
         object.__setattr__(self, "_canonical_payload", encoded)
 
     def payload_value(self) -> dict[str, Any]:
-        value = _strict_json_object(self._canonical_payload)
-        return value
+        return json.loads(self._canonical_payload)
 
 
 @dataclass(frozen=True)
@@ -259,7 +263,7 @@ class PoseObservationResult:
 
 
 class ManagerSceneRuntimeClient:
-    """Exchange one bounded canonical packet at a time with Manager."""
+    """The scene-runtime commands of one Manager, one request at a time."""
 
     def __init__(
         self,
@@ -275,24 +279,19 @@ class ManagerSceneRuntimeClient:
             or timeout_s > 5.0
         ):
             raise ValueError("timeout_s must be finite and in (0, 5]")
-        self._run_root = Path(run_root)
-        self._socket_path = self._run_root / MANAGER_SOCKET_FILE
-        with self._open_root(expected_identity=None) as (_descriptor, root):
-            self._root_identity = (root.st_dev, root.st_ino)
-        if len(os.fsencode(self._socket_path)) >= 104:
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_transport_invalid",
-                "Manager command socket path exceeds the AF_UNIX bound",
-            )
         self._timeout_s = float(timeout_s)
+        try:
+            self._gateway = core.Gateway(
+                execution_run_root=None,
+                manager_run_root=str(run_root),
+                attribution="internal",
+                connect_limit_s=self._timeout_s,
+            )
+        except core.GatewayError as exc:
+            raise _gateway_error(exc) from exc
 
     def read_owner(self) -> SceneRuntimeOwnerSnapshot:
-        response = self._exchange(
-            {
-                "api_version": MANAGER_COMMAND_VERSION,
-                "command": "scene_runtime_owner_read",
-            }
-        )
+        response = self._exchange("scene_runtime_owner_read", {})
         record = _exact_object(
             response,
             {
@@ -347,14 +346,13 @@ class ManagerSceneRuntimeClient:
         if normalized_bindings != bindings or len(set(bindings)) != len(bindings):
             raise ValueError("bindings must be unique and canonically ordered")
         response = self._exchange(
+            "scene_runtime_observer_open",
             {
-                "api_version": MANAGER_COMMAND_VERSION,
                 "bindings": [binding.to_value() for binding in bindings],
-                "command": "scene_runtime_observer_open",
                 "expected_runtime_identity": owner.runtime_identity.to_value(),
                 "source_epoch": source_epoch,
                 "source_id": source_id,
-            }
+            },
         )
         record = _exact_object(
             response,
@@ -403,9 +401,8 @@ class ManagerSceneRuntimeClient:
             source_sequence, label="source_sequence"
         )
         response = self._exchange(
+            "scene_runtime_observe",
             {
-                "api_version": MANAGER_COMMAND_VERSION,
-                "command": "scene_runtime_observe",
                 "eligible": intent.eligible,
                 "expected_runtime_identity": session.runtime_identity.to_value(),
                 "lifetime_ns": intent.lifetime_ns,
@@ -417,7 +414,7 @@ class ManagerSceneRuntimeClient:
                 "source_epoch": session.source_epoch,
                 "source_id": session.source_id,
                 "source_sequence": source_sequence,
-            }
+            },
         )
         record = _exact_object(
             response,
@@ -545,186 +542,17 @@ class ManagerSceneRuntimeClient:
             scene_update_status=update_status,
         )
 
-    @contextmanager
-    def _open_root(
-        self,
-        *,
-        expected_identity: tuple[int, int] | None,
-    ) -> Iterator[tuple[int, os.stat_result]]:
-        try:
-            before = self._run_root.lstat()
-            canonical = self._run_root.resolve(strict=True)
-            descriptor = os.open(
-                self._run_root,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            )
-        except (OSError, RuntimeError) as exc:
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_transport_invalid",
-                "Manager run root is unavailable",
-            ) from exc
-        try:
-            try:
-                opened = os.fstat(descriptor)
-                after = self._run_root.lstat()
-            except OSError as exc:
-                raise SceneRuntimeManagerError(
-                    "manager_scene_runtime_transport_invalid",
-                    "Manager run root changed while opening",
-                ) from exc
-            identity = (before.st_dev, before.st_ino)
-            required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-            if (
-                expected_identity is not None
-                and identity != expected_identity
-            ):
-                raise SceneRuntimeManagerError(
-                    "manager_scene_runtime_transport_invalid",
-                    "Manager run root identity changed",
-                )
-            if (
-                not self._run_root.is_absolute()
-                or canonical != self._run_root
-                or any(
-                    not stat.S_ISDIR(metadata.st_mode)
-                    or metadata.st_uid != os.geteuid()
-                    or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                    or metadata.st_mode & required != required
-                    or (metadata.st_dev, metadata.st_ino) != identity
-                    for metadata in (before, opened, after)
-                )
-            ):
-                raise SceneRuntimeManagerError(
-                    "manager_scene_runtime_transport_invalid",
-                    "Manager run root is not one safe real same-user directory",
-                )
-            yield descriptor, opened
-            try:
-                final = self._run_root.lstat()
-            except OSError as exc:
-                raise SceneRuntimeManagerError(
-                    "manager_scene_runtime_transport_invalid",
-                    "Manager run root changed during use",
-                ) from exc
-            if (
-                not stat.S_ISDIR(final.st_mode)
-                or final.st_uid != os.geteuid()
-                or final.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                or final.st_mode & required != required
-                or (final.st_dev, final.st_ino) != identity
-            ):
-                raise SceneRuntimeManagerError(
-                    "manager_scene_runtime_transport_invalid",
-                    "Manager run root changed during use",
-                )
-        finally:
-            os.close(descriptor)
+    def _exchange(self, command: str, members: dict[str, Any]) -> dict[str, Any]:
+        """One Manager command; its refusal raises the Manager's typed code."""
 
-    @contextmanager
-    def _socket_address(self) -> Iterator[str]:
-        with self._open_root(
-            expected_identity=self._root_identity
-        ) as (descriptor, _root):
-            try:
-                metadata = os.stat(
-                    MANAGER_SOCKET_FILE,
-                    dir_fd=descriptor,
-                    follow_symlinks=False,
-                )
-            except OSError as exc:
-                raise SceneRuntimeManagerError(
-                    "manager_scene_runtime_unavailable",
-                    "Manager command socket is unavailable",
-                ) from exc
-            if (
-                not stat.S_ISSOCK(metadata.st_mode)
-                or metadata.st_uid != os.geteuid()
-                or metadata.st_nlink != 1
-                or stat.S_IMODE(metadata.st_mode) != 0o600
-            ):
-                raise SceneRuntimeManagerError(
-                    "manager_scene_runtime_transport_invalid",
-                    "Manager command endpoint is not the exact same-user socket",
-                )
-            yield f"/proc/self/fd/{descriptor}/{MANAGER_SOCKET_FILE}"
-
-    def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
         try:
-            request = rfc8785.dumps(command)
-        except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_request_invalid",
-                "Manager scene-runtime request is not canonically encodable",
-            ) from exc
-        if not request or len(request) > MAX_MANAGER_REQUEST_BYTES:
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_request_invalid",
-                "Manager scene-runtime request exceeds its byte bound",
-            )
-        try:
-            with self._socket_address() as socket_address:
-                with socket.socket(
-                    socket.AF_UNIX, socket.SOCK_SEQPACKET
-                ) as channel:
-                    channel.settimeout(self._timeout_s)
-                    channel.connect(socket_address)
-                    credentials = channel.getsockopt(
-                        socket.SOL_SOCKET,
-                        socket.SO_PEERCRED,
-                        struct.calcsize("3i"),
-                    )
-                    _pid, peer_uid, _gid = struct.unpack("3i", credentials)
-                    if peer_uid != os.geteuid():
-                        raise SceneRuntimeManagerError(
-                            "manager_scene_runtime_transport_invalid",
-                            "Manager command peer is not same-user",
-                        )
-                    sent = channel.send(request)
-                    if sent != len(request):
-                        raise OSError(
-                            "short Manager scene-runtime request send"
-                        )
-                    payload, _ancillary, flags, _address = channel.recvmsg(
-                        MAX_MANAGER_RESPONSE_BYTES + 1
-                    )
-        except SceneRuntimeManagerError:
-            raise
-        except (OSError, TimeoutError) as exc:
-            raise SceneRuntimeManagerError(
-                "manager_scene_runtime_unavailable",
-                "Manager scene-runtime exchange failed",
-            ) from exc
-        if (
-            not payload
-            or len(payload) > MAX_MANAGER_RESPONSE_BYTES
-            or flags & socket.MSG_TRUNC
-        ):
-            raise _response_invalid(
-                "Manager scene-runtime response is empty, truncated, or oversized"
-            )
-        response = _strict_json_object(payload)
-        try:
-            canonical = rfc8785.dumps(response)
-        except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
-            raise _response_invalid(
-                "Manager scene-runtime response cannot be canonicalized"
-            ) from exc
-        if canonical != payload:
-            raise _response_invalid(
-                "Manager scene-runtime response is not exact canonical JSON"
-            )
-        if response.get("api_version") != MANAGER_RESPONSE_VERSION:
-            raise _response_invalid(
-                "Manager scene-runtime response version is unsupported"
-            )
-        if type(response.get("ok")) is not bool:
-            raise _response_invalid(
-                "Manager scene-runtime response has no exact boolean result"
-            )
-        if response["ok"]:
-            return response
+            reply = self._gateway.manager(command, members, limit_s=self._timeout_s)
+        except core.GatewayError as exc:
+            raise _gateway_error(exc) from exc
+        if reply["ok"]:
+            return reply
         failure = _exact_object(
-            response,
+            reply,
             {"api_version", "error", "ok"},
             label="Manager scene-runtime failure response",
         )
@@ -753,32 +581,11 @@ class ManagerSceneRuntimeClient:
         raise SceneRuntimeManagerError(code, message)
 
 
-def _strict_json_object(payload: bytes) -> dict[str, Any]:
-    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError(f"duplicate object member {key!r}")
-            result[key] = value
-        return result
-
-    def reject_constant(value: str) -> None:
-        raise ValueError(f"unsupported JSON constant {value}")
-
-    try:
-        text = payload.decode("utf-8", errors="strict")
-        value = json.loads(
-            text,
-            object_pairs_hook=unique_object,
-            parse_constant=reject_constant,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise _response_invalid(
-            "Manager scene-runtime response is not strict UTF-8 JSON"
-        ) from exc
-    if not isinstance(value, dict):
-        raise _response_invalid("Manager scene-runtime response is not an object")
-    return value
+def _gateway_error(error: Exception) -> SceneRuntimeManagerError:
+    code = getattr(error, "code", "")
+    return SceneRuntimeManagerError(
+        _GATEWAY_CODES.get(code, code), getattr(error, "message", str(error))
+    )
 
 
 def _pose_observer_bindings(value: object) -> tuple[PoseObserverBinding, ...]:

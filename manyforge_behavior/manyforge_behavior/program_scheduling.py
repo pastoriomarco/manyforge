@@ -2,6 +2,15 @@
 
 The host owns tick cadence only.  Program state remains in ``ProgramRunOwner``
 and robot/scene/model semantics remain in their focused owners.
+
+The scheduler thread waits on the runs' wake set (S2, D3:
+``manyforge_headless_py.WakeSet``, the GIL released) until the next period
+or until a run is woken: a sender's answer, or a pushed change of an
+operation, a planning job or the run's hold facts. At the period it ticks
+every scheduled run, as before (timers and anything still read per tick); a
+woken run is ticked at once on a worker, or again right after the tick it
+is in (a run is never ticked twice at once). Woken ticks do not move the
+period.
 """
 
 from __future__ import annotations
@@ -39,6 +48,11 @@ _MAX_SCHEDULED_RUNS: Final = 4_096
 _MAX_TICK_WORKERS: Final = 32
 _MIN_TICK_INTERVAL_S: Final = 0.001
 _MAX_TICK_INTERVAL_S: Final = 1.0
+# Not a run number: wakes the scheduler thread for its own state (a run
+# scheduled, a tick ended, a worker failure, shutdown).
+_SCHEDULER_WAKE: Final = 0
+# The wake-set wait while no run is scheduled; every change wakes it first.
+_IDLE_WAIT_S: Final = 3_600.0
 # Late ticks (OD-213): the typed log line of an episode of a run's late
 # ticks. While one episode lasts, a line is also written every
 # `_LATE_TICK_LINE_EVERY` late ticks; a run writes at most
@@ -346,7 +360,12 @@ class ProgramRunTickHost:
         terminal_observer: Callable[[ProgramRunSnapshot], None] | None = None,
         state_observer: Callable[[ProgramRunSnapshot], None] | None = None,
         failure_observer: Callable[[Exception], None] | None = None,
+        wake_set: Any = None,
     ) -> None:
+        """``wake_set``: the runs' wake set the event follower and the run
+        senders wake (one is made when none is given: then only commands
+        and the period start ticks)."""
+
         if not isinstance(owner, ProgramRunOwner):
             raise TypeError("tick host requires one ProgramRunOwner")
         if (
@@ -375,6 +394,11 @@ class ProgramRunTickHost:
             raise TypeError("state observer must be callable")
         if failure_observer is not None and not callable(failure_observer):
             raise TypeError("failure observer must be callable")
+        if wake_set is None:
+            import manyforge_headless_py as core  # type: ignore[import-not-found]
+
+            wake_set = core.WakeSet()
+        self._wake = wake_set
         self._owner = owner
         self._tick_interval_s = float(tick_interval_s)
         self._maximum_scheduled_runs = maximum_scheduled_runs
@@ -479,6 +503,7 @@ class ProgramRunTickHost:
         self._scheduled[program_run_id] = self._schedule_revision
         self._ticks_enabled.add(program_run_id)
         self._condition.notify_all()
+        self._wake.wake(_SCHEDULER_WAKE)
 
     def start_run(
         self,
@@ -564,12 +589,20 @@ class ProgramRunTickHost:
             program_run_id, lambda: self._owner.finish_stop(program_run_id, sent)
         )
 
-    def _through_tick(self, program_run_id: int, apply: Callable[[], Any]) -> Any:
+    def _through_tick(
+        self,
+        program_run_id: int,
+        apply: Callable[[], Any],
+        *,
+        in_place: bool = False,
+    ) -> Any:
         """Hand one command to the run's tick and wait for its result
         (OD-146). Its refusal or error is raised here, as it was raised by
-        the command itself."""
+        the command itself. ``in_place``: the command asks other processes;
+        the tick makes those owner calls inside it, as base did
+        (``RunIntent``)."""
 
-        intent = self._owner.post_to_tick(program_run_id, apply)
+        intent = self._owner.post_to_tick(program_run_id, apply, in_place=in_place)
         try:
             self.schedule(program_run_id)
         except Exception:
@@ -607,6 +640,7 @@ class ProgramRunTickHost:
                     group_id=group_id,
                     reason=reason,
                 ),
+                in_place=True,
             )
         finally:
             # Cleanup or an explicit reconciliation may have changed the
@@ -634,6 +668,7 @@ class ProgramRunTickHost:
                     group_id=group_id,
                     reason=reason,
                 ),
+                in_place=True,
             )
         finally:
             # The release may have completed even if its reply was lost.
@@ -661,6 +696,7 @@ class ProgramRunTickHost:
                     request_key=request_key,
                     reason=reason,
                 ),
+                in_place=True,
             )
         finally:
             self._observe_after_motion_control(program_run_id)
@@ -685,6 +721,7 @@ class ProgramRunTickHost:
                 request_key=request_key,
                 reason=reason,
             ),
+            in_place=True,
         )
 
     def continue_failure_pause(
@@ -705,6 +742,7 @@ class ProgramRunTickHost:
                 request_key=request_key,
                 reason=reason,
             ),
+            in_place=True,
         )
 
     def answer_operator_question(
@@ -862,6 +900,7 @@ class ProgramRunTickHost:
         snapshot = self._through_tick(
             program_run_id,
             lambda: self._owner.resume_halt(program_run_id, reason=reason),
+            in_place=True,
         )
         self._schedule_or_stop(snapshot)
         self._observe_state(snapshot)
@@ -871,12 +910,12 @@ class ProgramRunTickHost:
         self, program_run_id: int, *, stop_request_key: bytes
     ) -> ProgramRunSnapshot:
         """Use existing workers/notifications to observe terminal Reset's Stop.
-        It waits until containment settles (see `wait_terminal`)."""
-        self._through_tick(
-            program_run_id,
-            lambda: self._owner.begin_reset_containment(
-                program_run_id, stop_request_key=stop_request_key
-            ),
+        The Stop is sent by this thread at once, never behind the run's tick
+        (OD-119); it waits until containment settles (see `wait_terminal`).
+        A tick host that cannot schedule the run refuses before the Stop."""
+        self.schedule(program_run_id)
+        self._owner.begin_reset_containment(
+            program_run_id, stop_request_key=stop_request_key
         )
         try:
             self.schedule(program_run_id)
@@ -1007,6 +1046,9 @@ class ProgramRunTickHost:
                 self._condition.wait()
 
     def _requires_advance(self, snapshot: ProgramRunSnapshot) -> bool:
+        if self._owner.tick_intents_pending(snapshot.capture.program_run_id):
+            # A command handed to the tick, or one waiting for its answer.
+            return True
         if snapshot.state is ProgramRunState.FINALIZING:
             # A failed cleanup waits for a Reset's retry (OD-279).
             return not self._owner.cleanup_failed(snapshot.capture.program_run_id)
@@ -1153,6 +1195,7 @@ class ProgramRunTickHost:
                 if first:
                     self._worker_failure = error
                 self._condition.notify_all()
+            self._wake.wake(_SCHEDULER_WAKE)
             if first:
                 self._report_worker_failure(error)
             raise ProgramSchedulingError("Program terminal observer failed") from error
@@ -1220,9 +1263,16 @@ class ProgramRunTickHost:
         self._owner.fail_tick_intents(unavailable)
 
     def _tick_loop(self) -> Exception | None:
-        """The scheduler loop; returns the worker failure it latched, if any."""
+        """The scheduler loop; returns the worker failure it latched, if any.
 
-        next_tick = self._monotonic()
+        It waits only on the wake set (memory, the GIL released), never on
+        another process; the ticks run on the pool.
+        """
+
+        # The wake set's clock: the period's deadlines are on it.
+        next_tick = time.monotonic()
+        # Woken runs not ticked yet: they were in a tick (or not scheduled).
+        woken: set[int] = set()
         while True:
             handed_off = False
             observed: list[ProgramRunSnapshot] = []
@@ -1258,45 +1308,48 @@ class ProgramRunTickHost:
                             continue
                     observed.append(snapshot)
 
-                now = self._monotonic()
-                delay = next_tick - now
-                if observed or handed_off:
-                    self._condition.notify_all()
-                elif not self._scheduled:
-                    self._condition.wait()
-                elif delay > 0.0:
-                    self._condition.wait(timeout=delay)
-                else:
+                now = time.monotonic()
+                if self._scheduled and next_tick <= now:
+                    # The period: every scheduled run not in a tick.
                     for program_run_id, schedule_revision in sorted(
                         self._scheduled.items()
                     ):
-                        if program_run_id in self._inflight:
-                            continue
-                        future = self._executor.submit(
-                            self._advance,
-                            program_run_id,
-                        )
-                        self._inflight[program_run_id] = (
-                            schedule_revision,
-                            future,
-                        )
-                        future.add_done_callback(
-                            lambda _future: self._notify_worker_completion()
-                        )
+                        if program_run_id not in self._inflight:
+                            self._submit_tick_locked(program_run_id, schedule_revision)
+                            woken.discard(program_run_id)
                     next_tick = now + self._tick_interval_s
+                for program_run_id in sorted(woken):
+                    if program_run_id in self._inflight:
+                        continue  # Ticked again once this tick ended.
+                    woken.discard(program_run_id)
+                    schedule_revision = self._scheduled.get(program_run_id)
+                    if schedule_revision is not None:
+                        self._submit_tick_locked(program_run_id, schedule_revision)
+                if observed or handed_off:
+                    self._condition.notify_all()
+                deadline = next_tick if self._scheduled else now + _IDLE_WAIT_S
             for line in lines:
                 _write_late_tick_line(line)
             self._observe_states(observed)
+            woken.update(
+                program_run_id
+                for program_run_id in self._wake.wait(deadline)
+                if program_run_id != _SCHEDULER_WAKE
+            )
 
-    def _notify_worker_completion(self) -> None:
-        with self._condition:
-            self._condition.notify_all()
+    def _submit_tick_locked(self, program_run_id: int, schedule_revision: int) -> None:
+        future = self._executor.submit(self._advance, program_run_id)
+        self._inflight[program_run_id] = (schedule_revision, future)
+        # The scheduler takes the ended tick at once (a woken run that was in
+        # it is ticked again).
+        future.add_done_callback(lambda _future: self._wake.wake(_SCHEDULER_WAKE))
 
     def shutdown(self) -> None:
         with self._condition:
             thread = self._thread
             self._shutdown = True
             self._condition.notify_all()
+        self._wake.wake(_SCHEDULER_WAKE)
         if thread is not None:
             thread.join()
         self._executor.shutdown(wait=True, cancel_futures=True)

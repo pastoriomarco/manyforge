@@ -20,7 +20,7 @@ from manyforge_behavior.geometry import (
 
 
 GEOMETRY_NODE_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_geometry_node_unavailable"
+    "geometry_node_unavailable"
 )
 
 

@@ -8,7 +8,7 @@ from manyforge_behavior.kernel_client import ActionSpan
 
 
 ACTION_SPAN_AUTHORING_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_action_span_authoring_unavailable"
+    "action_span_authoring_unavailable"
 )
 
 

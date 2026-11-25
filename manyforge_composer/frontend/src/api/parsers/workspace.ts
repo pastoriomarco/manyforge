@@ -17,6 +17,8 @@ import type {
   ScenarioDocumentExportResponse,
   ScenarioDocumentIndexResponse,
   ScenarioDocumentSaveResponse,
+  ScenarioUpgradeConversionKind,
+  ScenarioUpgradeResponse,
   ToolReplacementResponse,
 } from '../../types/api';
 import type { AuthoringWorkspaceContainment, AuthoringWorkspaceIdentity } from '../../types/headless';
@@ -690,6 +692,52 @@ export function parseScenarioDocumentExportResponse(
   const status = stringAt(record.status, `${path}.status`);
   if (status !== 'exported') return fail(`${path}.status`, 'exported');
   return { status, path: stringAt(record.path, `${path}.path`) };
+}
+
+const SCENARIO_UPGRADE_CONVERSIONS: readonly ScenarioUpgradeConversionKind[] = [
+  'collision_rules', 'scenario_identity', 'program_profile', 'lane_labels',
+];
+
+export function parseScenarioUpgradeResponse(value: unknown): ScenarioUpgradeResponse {
+  const path = 'scenarioUpgrade';
+  const record = objectAt(value, path);
+  exactKeysAt(record, [
+    'api_version', 'path', 'status', 'conversions', 'backup_pattern', 'backup_path',
+  ], path);
+  if (record.api_version !== 'manyforge.scenario_upgrade.v1') {
+    return fail(`${path}.api_version`, 'manyforge.scenario_upgrade.v1');
+  }
+  const status = stringAt(record.status, `${path}.status`);
+  if (status !== 'available' && status !== 'current' && status !== 'upgraded') {
+    return fail(`${path}.status`, 'available, current or upgraded');
+  }
+  const conversions = arrayAt(record.conversions, `${path}.conversions`).map((item, index) => {
+    const itemPath = `${path}.conversions[${index}]`;
+    const row = objectAt(item, itemPath);
+    exactKeysAt(row, ['conversion', 'changes'], itemPath);
+    const conversion = stringAt(row.conversion, `${itemPath}.conversion`);
+    if (!(SCENARIO_UPGRADE_CONVERSIONS as readonly string[]).includes(conversion)) {
+      return fail(`${itemPath}.conversion`, SCENARIO_UPGRADE_CONVERSIONS.join(', '));
+    }
+    return {
+      conversion: conversion as ScenarioUpgradeConversionKind,
+      changes: stringArrayAt(row.changes, `${itemPath}.changes`),
+    };
+  });
+  const backupPath = nullableStringAt(record.backup_path, `${path}.backup_path`);
+  if ((status === 'upgraded') !== (backupPath !== null)) {
+    return fail(`${path}.backup_path`, 'a backup exactly for an upgrade');
+  }
+  if ((status === 'current') !== (conversions.length === 0)) {
+    return fail(`${path}.conversions`, 'conversions exactly when not current');
+  }
+  return {
+    status,
+    path: stringAt(record.path, `${path}.path`),
+    conversions,
+    backupPattern: stringAt(record.backup_pattern, `${path}.backup_pattern`),
+    backupPath,
+  };
 }
 
 export function parseDeploymentWorkspaceResponse(

@@ -410,7 +410,7 @@ component_stream_absent	Component data stream absent	A data stream this componen
 component_stream_stale	Component data stream stale	A data stream this component needs stopped updating in time. Check that the component and its driver or simulation are running.
 component_unavailable	Launch not ready	The launch could not confirm that all its owned processes are present and ready, so it is degraded. The details give the reason.
 component_unhealthy	Component needs attention	A component in the cell isn't healthy; fix it before running.
-composable_cell_runtime_unavailable	Composer has no runtime	Composer does not own a runtime, so this action is unavailable. Configure the headless API to issue the owner's runtime and try again.
+runtime_unavailable	Composer has no runtime	Composer does not own a runtime, so this action is unavailable. Configure the headless API to issue the owner's runtime and try again.
 composer_applied_program_validation_failed	Applied Program is not valid here	The Applied Program does not validate against the current nodes, so the Draft could not return to it. The details name the problem.
 composer_authoring_child_capacity_exceeded	Too many child nodes	A Program node has more children than it accepts. Remove the extra children.
 composer_authoring_claim_invalid	Edit claim missing from reply	An internal check failed: the cell API reply to a Program edit omitted its authoring claim, so the edit was refused. Collect the logs and report it.
@@ -766,6 +766,7 @@ execution_command_transport_failure	Execution command not delivered	An internal 
 execution_component_command_unsupported	Command not accepted on the component channel	An internal check failed: a command was sent on the component channel, which accepts only component actions, the component model and alarm attention. Collect the logs and report it.
 execution_control_command_in_progress	Same command still in progress	The same Program command is already in progress and not yet resolved. Wait for it to finish.
 execution_control_command_unsupported	Command not accepted on the Stop channel	An internal check failed: a command was sent on a channel that does not accept it. Collect the logs and report it.
+execution_control_delivery_uncertain	Command outcome unknown	The command failed without a typed answer, so it is unknown whether it took effect; it is not sent again. Check the current state before sending it again; the message names the cause.
 execution_control_ingress_busy	Another command in progress	Another command is still in progress, or too many are waiting, so this one was refused and will not run later. Wait for the current command to finish and send it again.
 execution_control_payload_invalid	Control command content invalid	An internal check failed: a control command does not match its declared kind or lacks its owner details. Collect the logs and report it.
 execution_control_projection_capacity_invalid	Too many tracked operations	An internal check failed: the number of tracked operations exceeds its limit. Collect the logs and report it.
@@ -776,11 +777,14 @@ execution_deployment_draft_unapplied	Deployment Draft not applied	The Deployment
 execution_effect_uncertain	Command effect on the robot unknown	It is unknown whether the command reached the robot controller. Check the robot before continuing.
 execution_environment_epoch_changed	Component replaced after dispatch	A component used by this motion was replaced after the trajectory was dispatched, so the motion was refused. Check the components, then run the motion again.
 execution_environment_identity_missing	Lifecycle admission lacks component identity	An internal check failed: the lifecycle admission is missing a required component identity. Collect the logs and report it.
+execution_event_mirror_behind	Runtime state not current yet	The runtime state received from the execution host is older than the operation that was just accepted. It is used as soon as a newer state arrives.
+execution_event_mirror_unavailable	Runtime state not received	The runtime state from the execution host has not arrived yet, or its event stream was interrupted. It is used again once the stream reconnects.
 execution_event_stream_dead	Runtime events stopped arriving	The runtime event stream sent nothing within its time limit. Check that ManyForge is running.
 execution_event_stream_failed	Execution event stream failed	Reading the execution event stream failed, so the stream stopped. The message gives the cause.
 execution_event_stream_invalid	Runtime event message invalid	An internal check failed: a runtime event message could not be read. Collect the logs and report it.
 execution_event_subscribers_full	Too many execution event subscribers	The execution host already serves its maximum number of event subscribers, so this subscription was refused. Close another subscriber and try again.
 execution_event_subscription_invalid	Event subscription request malformed	The subscribe_events request is malformed, so the subscription was refused.
+execution_event_subscription_overflow	Runtime event reader fell behind	A reader of the runtime event stream did not keep up, so it was moved to its own connection and continues from the last event it read, losing nothing. Check the system load if it repeats.
 execution_frame_transform_unavailable	Frame positions unavailable	Frame positions cannot be computed because the cell has no current Scene. Wait until the Scene is ready and try again.
 execution_host_child_unavailable	Execution host child unavailable	The request needs the single managed execution host child, which is not available. Check that the execution host is running, then try again.
 execution_host_contract_offer_changed	Execution host contract changed	The execution host contract offer differs from the running one. Collect the logs and report it.
@@ -1007,12 +1011,12 @@ host_io_output_occurrence_conflict	Output provider instances conflict	An interna
 host_io_output_profile_unqualified	Output provider settings invalid	An internal check failed: an output signal's provider settings do not fit its provider type. Collect the logs and report it.
 host_io_output_publication_conflict	Output channel configurations differ	An internal check failed: aliases of one output channel come from different configurations. Collect the logs and report it.
 host_io_output_resource_conflict	Two outputs share one address	An internal check failed: two different output resources use the same provider address. Collect the logs and report it.
-i6_command_schema_unsupported	Gripper command schema unsupported	The command is not the qualified gripper position command schema, so it was refused. Use a standard gripper command.
-i6_gripper_command_scope_unsupported	Gripper needs one command resource	The retained gripper mechanism requires exactly one command resource, so the command was refused. Check the gripper configuration.
-i6_motion_model_group_cardinality_invalid	Motion needs one model group	The motion requires exactly one retained model group, so it was refused. Check the motion target configuration.
-i6_preview_capability_command_invalid	Command preview needs one command	A command preview requires exactly one independent capability command. Preview a single command.
-i6_preview_primary_motion_invalid	Preview needs one motion	A preview requires exactly one independent motion participant. Preview a single motion.
-i6_preview_single_participant_only	Preview limited to one participant	A preview admits only one independent participant. Preview a single step.
+gripper_command_schema_unsupported	Gripper command schema unsupported	The command is not the qualified gripper position command schema, so it was refused. Use a standard gripper command.
+gripper_command_scope_unsupported	Gripper needs one command resource	The retained gripper mechanism requires exactly one command resource, so the command was refused. Check the gripper configuration.
+motion_model_group_cardinality_invalid	Motion needs one model group	The motion requires exactly one retained model group, so it was refused. Check the motion target configuration.
+preview_capability_command_invalid	Command preview needs one command	A command preview requires exactly one independent capability command. Preview a single command.
+preview_primary_motion_invalid	Preview needs one motion	A preview requires exactly one independent motion participant. Preview a single motion.
+preview_single_participant_only	Preview limited to one participant	A preview admits only one independent participant. Preview a single step.
 identity_array_invalid	Identity list invalid	An internal check failed: a prepared operation has a missing or oversized identity list. Collect the logs and report it.
 ik_failed	Target unreachable	No joint configuration reaches the target pose. Choose a reachable target pose and try again.
 incompatible_owner	Existing launch has a different setup	A launch for this instance already exists with a different configuration, is stopping, or still runs processes. Stop it with the launcher before starting again.
@@ -1434,7 +1438,6 @@ manager_run_folder_holds_previous_run	Run folder holds a previous run	The Manage
 manager_scene_runtime_request_invalid	Pose observer request invalid	An internal check failed: a pose observer request to the Manager could not be encoded or is too large. Collect the logs and report it.
 manager_scene_runtime_response_identity_mismatch	Pose observer response mismatch	An internal check failed: the Manager answered a pose observer request for a different request. Collect the logs and report it.
 manager_scene_runtime_response_invalid	Pose observer response invalid	An internal check failed: the Manager returned a malformed answer to the pose observer. Collect the logs and report it.
-manager_scene_runtime_transport_invalid	Pose observer channel invalid	An internal check failed: the pose observer could not open a valid channel to the Manager. Collect the logs and report it.
 manager_scene_runtime_unavailable	Manager not reachable from pose source	The pose source could not reach the Manager. Check that the Manager is running.
 manager_source_absent	Manager data not published yet	The Manager has not published its data yet. Wait for it to start.
 manager_source_invalid	Manager state invalid	An internal check failed: the Manager state data is invalid or of an unsupported version. Collect the logs and report it.
@@ -1739,7 +1742,7 @@ motion_timeout_invalid	Motion timeouts invalid	The motion's timeouts must be fin
 motion_tolerance_invalid	Motion tolerances invalid	The motion's tolerances must be finite and not negative. Correct the joint, translation and rotation tolerances in the motion node.
 motion_trace_file_invalid	Motion trace file invalid	An internal check failed: a stored motion trace file is missing its description or its content does not match it. Collect the logs and report it.
 motion_trace_file_unavailable	Motion trace file unreadable	The stored motion trace file could not be read. Collect the logs and report it.
-motion_trace_store_busy	Motion trace store busy	Another reader or writer is using the motion trace store, so this trace was not saved. Try again in a moment.
+motion_trace_store_busy	Motion trace store busy	The motion trace store is busy: another reader or writer is using it, or its queue of trace requests is full, so this trace was not saved. Try again in a moment.
 motion_trace_store_full	Motion trace store full	The motion trace store is at its total size limit, so this trace was not saved.
 motion_value_above_program_limit	Move speed above Program limit	The move was refused before it started: its velocity or acceleration scale, read from a value source, is above the Program motion default of the same name. Lower the source value or raise the Program motion default.
 mount_primary_tool_required	Primary tool not chosen	Several tools are mounted on one interface, and exactly one of them must be the primary tool. Mark one of them as primary.
@@ -2514,7 +2517,7 @@ program_execution_scope_unavailable	Program scope not current	The Program execut
 program_execution_scope_unknown	Program node not recognized	The node transaction does not match its sealed owner API in the captured Program. Apply the Program again and retry.
 program_execution_synchronization_mismatch	Operation not a Program sync group	A coordinated operation does not match any synchronized group authored in the Program. Check the synchronization in the Program, then Apply.
 program_execution_synchronization_required	Program motion must be synchronized	This Program motion belongs to a synchronized group and cannot be dispatched on its own. Run it with its group.
-program_format_unsupported	Program format not supported	This Program uses an unsupported format. Convert the Scenario with scripts/convert_scenario_od46.py, or re-author the Program in the supported format.
+program_format_unsupported	Program format not supported	This Program uses an unsupported format. For a Scenario saved with an older version, use Upgrade and load in the Load dialog, or convert it with scripts/convert_scenario_od46.py; otherwise re-author the Program in the supported format.
 program_frame_resolution_context_invalid	Program reference context changed	The Program reference context differs from the one retained at admission, so the motion was refused. Try again.
 program_frame_role_ambiguous	Frame role matches several frames	The Program's frame role matches more than one frame in the applied component model. Correct the component descriptor.
 program_frame_role_missing	Frame role not found	The Program's frame role is not present in the applied component model. Check the role assignment and Apply again.
@@ -2581,6 +2584,7 @@ program_revert_nothing_to_revert	Nothing to revert	The saved Program already mat
 program_run_admission_failed	Program Run not admitted	The cell did not admit the Program Run. See the message for the cause.
 program_run_admission_in_flight	Program run still draining	A Program-run admission started before the Stop is still draining. Wait a moment and try again.
 program_run_admission_invariant	Program run admission conflict	An internal check failed: another Program-run admission was already being prepared. Collect the logs and report it.
+program_run_already_active	Program run already active	A Program run is already active, so another Run was not started. Wait until the run has ended, or Stop it.
 program_run_applied_selection_stale	Applied Program changed	The applied Program changed before the Run started. Refresh and run again.
 program_run_binding_invalid	Program component bindings invalid	The applied Program has invalid component requirements. Correct the Program and Apply.
 program_run_capture_invalid	Program run capture incomplete	An internal check failed: the Program run did not keep its captured data. Collect the logs and report it.
@@ -2644,6 +2648,7 @@ program_selection_unknown	Selected Program node not found	The selected Program n
 program_terminal_scope_not_settled	Program ended with operations still active	The Program tree ended before its operations settled, so the run was stopped.
 program_tick_worker_failed	Program Runner failed	The Program Runner failed and cannot run or Reset Programs until ManyForge restarts. Stop ManyForge, start it again, and report the logs.
 program_ticks_late	Program steps ran late	The Program runner needed longer than its step period for some steps, so the Program reacted later than intended. Nothing was stopped. The log line gives how many steps were late and the longest one. If it keeps happening, check the load on the controller computer.
+program_tree_failed	Program failed	The Program failed at a step that reported no reason of its own, so the run ended. Check that step and its settings, then reset the Program and run it again.
 program_workspace_invalid	Program workspace invalid	The Program workspace folder is missing, unsafe or changed while opening, so ManyForge did not start. Check the authoring state folder.
 progress_cursor_stale	Progress position too old	The progress cursor is older than its freshness budget, so the collision look-ahead could not trust it. It will retry with new progress.
 projection_bootstrap_prerequisite_mismatch	Scene start-up for another cell	An internal check failed: a Scene start-up query does not match this cell. Collect the logs and report it.
@@ -3186,7 +3191,7 @@ scenario_directory_not_found	Scenario folder not found	The Scenario folder does 
 scenario_directory_outside_roots	Scenario folder not allowed	The Scenario folder is outside the configured folders.
 scenario_discard_confirmation_required	Load would discard unsaved changes	Loading would replace unsaved Program or Deployment Draft changes. Save them, or confirm that they can be discarded.
 scenario_discard_nothing_to_discard	Nothing to discard	Every Draft already matches the applied configuration.
-scenario_document_dropped_fields	Scenario saved in an older format	The Scenario's Program or Deployment still has fields a Scenario no longer carries (Program program_id, name, description; Deployment deployment_artifact_id, name, description), so it was not loaded. A Scenario is named by its folder and described in scenario.yaml. Convert it with scripts/convert_scenarios_od369.py and load it again.
+scenario_document_dropped_fields	Scenario saved in an older format	The Scenario's Program or Deployment still has fields a Scenario no longer carries (Program program_id, name, description, compatibility.lanes; Deployment deployment_artifact_id, name, description, compatibility.lane), so it was not loaded. A Scenario is named by its folder and described in scenario.yaml. Use Upgrade and load in the Load dialog, or convert it with scripts/convert_scenario_od46.py and then scripts/convert_scenarios_od369.py, and load it again.
 scenario_export_asset_changed	Asset changed during export	A Scenario asset file changed while it was being exported. Export again.
 scenario_export_asset_invalid	Asset cannot be exported	A Scenario asset is a link, not a plain file within the size limit, or could not be read.
 scenario_export_failed	Scenario export failed	Writing the exported project failed. The details give the reason.
@@ -3199,6 +3204,7 @@ scenario_model_source_unavailable	Scenario model source unavailable	A model sour
 scenario_name_invalid	Scenario name invalid	A Scenario name may use letters, digits, '_' or '-', must start with a letter or digit and has a maximum length.
 scenario_new_required	Start a New Scenario first	A Scenario is still applied. Start a New Scenario, then Load.
 scenario_program_draft_invalid	Scenario Program draft is invalid	The Program draft stored in the Scenario project is invalid. The details name the problem.
+scenario_program_profile_renamed	Scenario saved with an old Program profile	The Scenario's Program declares a Program profile that was renamed, so it was not loaded. Use Upgrade and load in the Load dialog, or convert it with scripts/convert_scenarios_od369.py, and load it again.
 scenario_project_incomplete	Scenario project incomplete	A required file of the Scenario project is missing.
 scenario_project_name_invalid	Scenario folder name mismatch	A Scenario project folder must be named <name>.scenario, with the same Scenario id and name inside.
 scenario_project_read_only	Untitled Scenario is read-only	The Untitled Scenario is read-only. Use Save As to save it in a folder.
@@ -3209,6 +3215,7 @@ scenario_saved_baseline_not_adopted	Scenario written but not marked Saved	The Sc
 scenario_saved_path_unavailable	Scenario saved without a path	An internal check failed: Scenario Save completed without reporting its file path. Collect the logs and report it.
 scenario_source_changed	Referenced source changed	A source referenced by the Scenario was added, removed or changed since it was saved. Review it and save the Scenario again.
 scenario_source_invalid	Scenario model sources invalid	The model sources of the Scenario's Deployment could not be collected. The details give the reason.
+scenario_upgrade_conversion_failed	Scenario could not be upgraded	Part of the Scenario has no counterpart in the current file format, so the Scenario was not upgraded and nothing was changed. The details name that part and what to change before upgrading again.
 scenario_workspace_stale	Workspace changed during the request	The authoring workspace changed while this request was prepared. Refresh and try again.
 scene_adoption_end_failed	Scene adoption not closed	An internal check failed while the scene closed its part of a failed Apply. The scene may stay unavailable until ManyForge is restarted. Collect the logs and report it.
 scene_adoption_ended_without_publication	Apply ended before publication	The Apply ended before it published its configuration. The scene keeps its previous configuration.
@@ -3604,3 +3611,455 @@ xarm_service_timeout	xArm call timed out	The xArm driver service did not answer 
 xarm_service_unavailable	xArm service unavailable	The xArm driver service was not discovered, so the call was refused before any effect. Check that the driver is running.
 xarm_status_unavailable	Robot status not available	The xArm controller's status report is missing or out of date, or no report arrived after the driver restart. Check the connection, then Prepare or Recover the machine.
 zero_speed_hold_timeout	Zero-speed hold timed out	The motion stayed at zero speed longer than the allowed hold time and was ended. Raise the speed or restart the motion.
+active_bundle_publication_receipt_mismatch	Active configuration changed during start	The record of the active configuration changed while the Scene was starting, so the start was not completed. Start again from the current configuration.
+active_native_projection_unavailable	Scene state unavailable	The Scene could not report the state of its active configuration. Check the Scene component status; if it stays, collect the logs and report it.
+active_tcp_contact_bodies_unavailable	Active TCP contact bodies unavailable	The collision bodies of the robot's active TCP could not be read, so contact checking cannot use them. Check that the robot's TCP is configured and its component is running.
+ai_model_api_key_env_invalid	AI model API key variable invalid	The API key environment variable of an AI model component is not a valid variable name. Correct it in the Deployment and Apply.
+applied_program_status_projection_invalid	Applied Program status invalid	An internal check failed: the applied Program status read from the cell is not in its expected form. Collect the logs and report it.
+applied_program_unavailable	Applied Program unavailable	The applied Program could not be read from the cell, so its status is not shown. Check the cell status and try again.
+assistant_callback_rejected	Composer rejected assistant tool call	The Composer rejected an assistant tool call without a specific reason code. The message gives the cause.
+assistant_provider_rejected	Assistant service rejected request	The assistant service rejected the request from the Composer without a specific reason code. The message gives the cause.
+assistant_task_failed	AI model step failed	The AI model step failed with an unexpected error. The message gives the cause; if it repeats, collect the logs and report it.
+assistant_task_invalid	AI model step request invalid	The AI model step could not run because its settings or its Scene selection are invalid. The message gives the reason; correct the step and Apply.
+bb_source_not_ready	Program values source not ready	The Program values source is not ready: the matching Apply is still installing it, or the cell has not yet observed the newer Program cycle. Wait a moment and try again.
+cartesian_fidelity_evidence_invalid	Straight-path accuracy record invalid	An internal check failed: the accuracy record of a Cartesian path candidate is invalid. Collect the logs and report it.
+cartesian_path_too_dense	Cartesian path needs too many points	A segment of the Cartesian path needs more intermediate points than allowed. Shorten the segment named in the details, or split it with extra waypoints.
+cartesian_trajectory_interpolant_joint_mapping_invalid	Cartesian trajectory joint mapping invalid	An internal check failed: the Cartesian planner returned a trajectory whose joint mapping is invalid. Collect the logs and report it.
+catalog_schema_invalid_value	Value does not match its type	A value does not match the type declared for it in the node catalog. The message names the field; correct the value.
+client_incident_invalid	Client incident report invalid	An internal check failed: a client incident report has an unsupported kind or malformed text. Collect the logs and report it.
+collision_policy_content_hash_invalid	Collision policy digest invalid	An internal check failed: a collision policy record carries an invalid content digest. Collect the logs and report it.
+collision_resource_candidate_snapshot_unavailable	New collision world unavailable	The collision world snapshot of the configuration being applied could not be read, so its collision resources could not be checked. The details give the cause; try Apply again.
+collision_world_content_hash_invalid	Collision world digest invalid	An internal check failed: a collision world record carries an invalid content digest. Collect the logs and report it.
+component_lifecycle_effects_not_settled	Component action waits for settled work	The component lifecycle action requires motion and Program work to be settled first. Wait for motion to finish or Stop, then try again.
+component_lifecycle_resources_not_settled	Component resources still busy	A resource of the component is still in use by an operation, so the lifecycle action was refused. Wait for the operation to finish or Stop it, then try again.
+action_span_authoring_unavailable	Node attempt recording not available	An internal check failed: recording Program node attempts is not available in this runtime. Collect the logs and report it.
+blackboard_output_binding_unavailable	Bound node outputs not available	An internal check failed: bound node outputs are not available in this runtime. Collect the logs and report it.
+cycle_manager_unavailable	Program cycle requests not available	An internal check failed: Program cycle requests are not available in this runtime. Collect the logs and report it.
+cycle_recovery_owner_unavailable	Program recovery not available	An internal check failed: Program recovery is not available in this runtime. Collect the logs and report it.
+deployment_artifact_unavailable	Old Deployment format not available	An internal check failed: a Deployment in the removed single-robot format was requested; only component-based Deployments are available. Collect the logs and report it.
+geometry_node_unavailable	Geometry nodes not available	An internal check failed: geometry nodes are not available in this runtime. Collect the logs and report it.
+logic_node_binding_unavailable	Logic and gripper nodes not available	An internal check failed: bound logic and gripper nodes are not available in this runtime. Collect the logs and report it.
+model_node_unavailable	AI model nodes not available	An internal check failed: AI model nodes are not available in this runtime. Collect the logs and report it.
+motion_node_unavailable	Motion nodes not available	An internal check failed: motion nodes are not available in this runtime. Collect the logs and report it.
+motion_scoped_node_unavailable	Interrupt nodes not available	An internal check failed: bound interrupt nodes are not available in this runtime. Collect the logs and report it.
+motion_transaction_owner_unavailable	Motion transactions not available	An internal check failed: motion transactions are not available in this runtime. Collect the logs and report it.
+recovery_node_unavailable	Recovery nodes not available	An internal check failed: Program recovery nodes are not available in this runtime. Collect the logs and report it.
+runtime_pause_owner_unavailable	Pause and recovery not available	An internal check failed: pause and recovery are not available in this runtime. Collect the logs and report it.
+runtime_resource_binding_unavailable	Runtime resource binding not available	An internal check failed: binding Program nodes to runtime resources is not available in this runtime. Collect the logs and report it.
+simulation_node_unavailable	Simulator control nodes not available	An internal check failed: simulator control nodes are not available in this runtime. Collect the logs and report it.
+snapshot_client_unavailable	Snapshot needs the cell API	Snapshots need the cell API client, which the Composer does not have. Configure the headless API for the Composer and try again.
+confirmation_latency_negative	Stop confirmation time invalid	An internal check failed: a Stop result reports a negative confirmation time. Collect the logs and report it.
+control_projection_source_unavailable	Control state source unavailable	The control state could not be read from the cell. It is read again automatically; if it stays, check that ManyForge is running.
+control_session_ordinary_command_pending	Previous command still pending	A previous command from this control session has not been answered yet, so this one was refused. Wait for it to finish and send the command again.
+control_session_runtime_scale_pending	Previous speed change still pending	A previous speed change from this control session has not been answered yet, so this one was refused. Wait a moment and move the slider again.
+controlled_hard_stop_brake_invalid	Hard Stop braking path not usable	The controlled hard Stop could not compute its braking path from the running motion, so the controller's own cancel was used instead. Check the robot before any further motion.
+controlled_hard_stop_elapsed_invalid	Hard Stop start point not found	The controlled hard Stop could not place its start on the running motion, so the controller's own cancel was used instead. Check the robot before any further motion.
+controlled_hard_stop_limits_unavailable	Hard Stop deceleration limits missing	No deceleration limits are configured for the controlled hard Stop, so the controller's own cancel was used instead. Check the robot's Stop settings.
+controlled_stop_capability_unavailable	Controlled Stop not offered	The cell does not offer a controlled Stop for this robot, so only the hard Stop is available. Check the robot's Stop settings if a controlled Stop is expected.
+controlled_stop_error_invalid	Controlled Stop error incomplete	An internal check failed: a controlled Stop result carries an error without a code or message. Collect the logs and report it.
+controlled_stop_numeric_evidence_invalid	Controlled Stop figures invalid	An internal check failed: a controlled Stop result reports a stop distance or path deviation that is negative or not finite. Collect the logs and report it.
+critical_progress_stale	Component progress stalled	The component has not reported progress within its time limit, so it is reported as not healthy. Check the component and its log.
+diagnostic_command_source_reason_missing	Stop diagnostics lack a reason	An internal check failed: the diagnostics of a Stop result name neither a command source nor a reason. Collect the logs and report it.
+executed_stop_mode_invalid	Executed Stop mode unknown	An internal check failed: a Stop result names an unknown executed Stop mode. Collect the logs and report it.
+execution_backend_status_error_invalid	Motion backend status error misplaced	An internal check failed: a motion backend status carries an error in a state that allows none, or lacks one after a failure. Collect the logs and report it.
+execution_backend_status_identity_invalid	Motion backend status for another motion	An internal check failed: a motion backend status does not match the robot or controller goal it reports for. Collect the logs and report it.
+execution_backend_status_shape_invalid	Motion backend status malformed	An internal check failed: a motion backend status has invalid times, progress, counters or error fields. Collect the logs and report it.
+execution_backend_status_state_invalid	Motion backend state unknown	An internal check failed: a motion backend status names an unknown state. Collect the logs and report it.
+execution_command_rejected	Command refused	The command was refused without a specific reason code. The message gives the cause.
+execution_command_response_oversized	Execution response too large	An internal check failed: a response from the execution host exceeds its size limit. Collect the logs and report it.
+execution_observation_projection_invalid	Execution update invalid	An internal check failed: an execution update for the Composer could not be read. Collect the logs and report it.
+execution_port_backend_reset_unsupported	Controller reset not supported	An internal check failed: a reset was sent directly to the robot controller connection, which is reset only through the cell's Stop and retirement. Collect the logs and report it.
+execution_port_prepared_dispatch_required	Motion was not prepared	An internal check failed: the robot controller connection received a motion that was not prepared. Collect the logs and report it.
+execution_port_route_rebind_busy	Program routing busy with motion	The Program routing of the robot cannot change while a motion or a Stop is in progress. Wait until the robot is idle.
+execution_port_route_rebind_mismatch	Program routing crosses robot binding	An internal check failed: a Program routing update names resources outside the robot controller's binding. Collect the logs and report it.
+execution_progress_generation_unavailable	Lookahead has no motion progress	The runtime collision lookahead has no progress of the running motion yet, so the trajectory could not be certified. Try again; if it persists, collect the logs and report it.
+execution_target_unavailable	Program targets unavailable	The robots and tools that can be controlled could not be read, or none is configured. Check that the configuration is Applied and the components are Active.
+failed_validation_ack_rejected	Retry after Scene repair refused	The retry after Scene repair was refused. The details give the reason; check the run state and try again.
+frame_height_outside_range	Frame outside height range	The observed frame is outside the selected height range, so the check failed.
+frame_transform_failed	Frame transform failed	The pose could not be converted between frames. The message gives the cause; check the frames named in the step.
+full_stop_request_attribution_invalid	Stop request origin invalid	An internal check failed: a Stop request has an invalid origin. Collect the logs and report it.
+full_stop_request_context_invalid	Stop request context invalid	An internal check failed: a Stop request has an invalid request context. Collect the logs and report it.
+global_interrupt_group_invalid	Global interrupt group invalid	An internal check failed: a global interrupt rule names a group outside its compiled node table. Collect the logs and report it.
+global_interrupt_key_type_conflict	Program value key types conflict	A Program value key is read by global interrupt rules with two different types. Use one type for each key and Apply again.
+global_interrupt_scope_invalid	Global interrupt scope invalid	A global interrupt rule has an unsupported scope. Use everything, all motion or a list of execution groups, then Apply.
+goal_frame_start_state_unavailable	Start state for goal frame unavailable	The motion refers to a goal frame, but no current start state of the robot was available, so it was refused. Wait until the robot state is reported, then try again.
+gripper_command_subscriber_unavailable	Gripper command not received	Nothing receives the gripper commands, so the gripper is not ready. Check that the gripper controller or simulator is running.
+gripper_state_feedback_stale	Gripper feedback out of date	The gripper state feedback is older than allowed, so the gripper is not ready. Check that the gripper is connected and reporting.
+gripper_state_feedback_unavailable	Gripper state feedback missing	The gripper state feedback is not available, so the gripper is not ready. Check that the gripper is connected and reporting.
+gripper_state_publisher_unavailable	No gripper state publisher	Nothing publishes the gripper state, so its feedback is not available. Check that the gripper controller or simulator is running.
+gripper_status_not_matched	Gripper status not as expected	The gripper status does not match the expected status, so the status check failed.
+gripper_transport_kind_invalid	Gripper connection type unsupported	The gripper's connection type is not supported, so the gripper is not ready. Check the gripper component settings.
+headless_adapter_epoch_exhausted	Alarm source counter exhausted	An internal check failed: the operator alarm source counter is exhausted. Collect the logs and report it.
+headless_adapter_sequence_exhausted	Program alarm counter exhausted	An internal check failed: the Program operator alarm counter is exhausted. Collect the logs and report it.
+headless_api_closed	Cell API closed	The cell API is closed or shutting down, so the request was refused. Start ManyForge again if needed.
+headless_api_configuration_invalid	Cell API configuration incomplete	An internal check failed: the cell API was started without its required install, catalog or event history paths. Collect the logs and report it.
+headless_cli_invalid	Command line request invalid	The command line request is invalid. The message gives the cause.
+headless_http_error	Cell API request failed	The cell API returned an error without a specific reason code. The message gives the cause.
+headless_operation_event_identity_conflict	Operation event conflict	An internal check failed: one operation event number names two different contents. Collect the logs and report it.
+headless_operation_event_snapshot_incomplete	Operation events out of step	An internal check failed: the operation event snapshot does not match the events received. Collect the logs and report it.
+headless_value_invalid	Cell API number out of range	An internal check failed: a number from the cell API is outside the safe integer range. Collect the logs and report it.
+historian_capture_not_found	Failure capture not kept	The requested failure capture is no longer kept in the event history; it may have been retired. Choose a more recent capture.
+historian_closed	Event history closed	The event history no longer accepts events because it is shutting down.
+historian_configuration_invalid	Event history configuration invalid	An internal check failed: the event history was set up with a missing store or invalid limits. Collect the logs and report it.
+historian_event_identity_conflict	Event history entry conflict	An internal check failed: one event identity names two different contents. Collect the logs and report it.
+historian_event_not_found	History event not kept	The requested event is no longer kept in the event history. Refresh the event history.
+historian_internal_failure	Event history queue inconsistent	An internal check failed: the event history queue is inconsistent. Collect the logs and report it.
+historian_path_invalid	Event history path invalid	The event history database path is invalid, so the event history could not open. Check the configured storage location.
+historian_query_budget_exceeded	Event history query too long	The event history query took longer than allowed and was stopped. Narrow the filters and try again.
+historian_queue_overflow	Event history queue full	The event history queue was full, so events were lost. Check the disk and the system load if it repeats.
+historian_sequence_rollover_required	Event history numbering exhausted	The event history database has used up its event numbers and must be replaced. Collect the logs and report it.
+historian_storage_changed	Event history changed by another writer	The event history database was changed by another program, so it was not used. Make sure only one ManyForge uses this event history, then restart.
+historian_storage_foreign	Event history file not ManyForge's	The event history database file belongs to another application, so it was not used. Remove the file or choose another storage location.
+historian_storage_unsupported	Database library too old	The database library is older than version 3.37.0, which the event history requires. Collect the logs and report it.
+historian_timeout_invalid	Event history wait time invalid	An internal check failed: a wait for the event history used a negative time. Collect the logs and report it.
+historian_value_invalid	Event history number out of range	An internal check failed: a number for the event history is outside the safe integer range. Collect the logs and report it.
+interrupt_structured_value_empty	Interrupt details empty	An internal check failed: interrupt details that must have entries are empty. Collect the logs and report it.
+interrupt_structured_value_key_invalid	Interrupt detail name invalid	An internal check failed: interrupt details contain an invalid name. Collect the logs and report it.
+interrupt_structured_value_number_non_finite	Interrupt detail number invalid	An internal check failed: interrupt details contain a number that is not finite. Collect the logs and report it.
+interrupt_structured_value_string_not_nfc	Interrupt detail text not normalized	An internal check failed: interrupt details contain text that is not normalized Unicode. Collect the logs and report it.
+interrupt_structured_value_string_too_long	Interrupt detail text too long	An internal check failed: interrupt details contain text longer than allowed. Collect the logs and report it.
+interrupt_structured_value_too_many_entries	Too many interrupt details	An internal check failed: interrupt details have more entries than allowed. Collect the logs and report it.
+intervention_ack_rejected	Acknowledge and continue refused	The acknowledge and continue action was refused. The details give the reason; check the run state and try again.
+io_condition_string_bound_exceeded	I/O condition text too long	A text value read by the I/O condition is longer than allowed, so the condition could not be evaluated. Use shorter values.
+io_condition_value_nonfinite	I/O condition value not finite	A number read by the I/O condition is not finite, so the condition could not be evaluated. Check the signal or Program value it reads.
+io_input_not_matched	Input not as expected	The input signal does not have the expected value, so the check failed. The message gives both values.
+io_provider_transport_unavailable	I/O connection not ready	The ROS connection of an I/O provider is not ready, so its signals cannot be used. Check that the I/O provider is running.
+io_rule_outcome_invalid	I/O rule outcome invalid	An internal check failed: an I/O rule outcome could not be encoded or read. Collect the logs and report it.
+io_rule_state_acquisition_invalid	I/O rule trigger record invalid	An internal check failed: the trigger record of an I/O rule state is invalid. Collect the logs and report it.
+io_rule_state_context_invalid	I/O rule state context invalid	An internal check failed: the context of the I/O rule states is invalid. Collect the logs and report it.
+io_rule_state_row_invalid	I/O rule state invalid	An internal check failed: an I/O rule state row is inconsistent. Collect the logs and report it.
+io_rule_state_rows_not_canonical	I/O rule states out of order	An internal check failed: the I/O rule states are not in order or repeat a rule. Collect the logs and report it.
+late_control_cycle	Controller cycle too late	A controller cycle arrived later than the allowed margin, so the motion was stopped with a critical fault. Check the system load and the controller connection, then Recover.
+manager_runtime_unavailable	Manager runtime not ready	The Manager has not finished starting the runtime, so node execution is not available yet. Wait for it to finish, then try again.
+manual_handover_required	Manual control needs a handover	A Program cycle exists, so manual control must start through a handover from the held Program. Use the manual handover, or Reset the Program first.
+manual_operation_scope_stale	Manual operation no longer current	The manual operation command does not match a current manual operation. Refresh and try again.
+model_confidence_below_threshold	AI model confidence too low	The confidence in the AI model reply is below the step's minimum. The step failed.
+model_response_schema_invalid	AI model reply does not fit	The AI model reply does not match the step's response definition or names values the Program cannot use. The step failed.
+motion_no_signal_trip_mapped_failure	Move ended without signal	The move ended without the expected signal trip, and the step treats that as a failure. The step failed.
+motion_preempted	Motion preempted	The motion was preempted by a higher-priority motion node, so this node ended.
+motion_replacement_cursor_unavailable	Motion takeover progress not reported	The new motion did not take over the moving robot because the controller did not report its progress. Check the robot's motion state before sending another motion.
+motion_replacement_effect_uncertain	Motion takeover outcome unknown	It is unknown whether the new motion took over the moving robot. Check the robot before any further motion.
+motion_replacement_not_ready	Motion takeover no longer ready	The new motion did not take over the moving robot because its handover was no longer ready to commit. Try the motion again.
+motion_replacement_scale_unqualified	Motion takeover cannot keep speed change	The new motion did not take over the moving robot because it cannot continue the speed change in progress. Try again when the speed is steady.
+motion_replacement_send_threw	Motion takeover send outcome unknown	Sending the new motion to the controller failed, so it is unknown whether it took over the moving robot. Check the robot before any further motion.
+motion_replacement_source_unavailable	Running motion cannot be taken over	The running motion cannot provide a starting point for a takeover, so the new motion was not prepared.
+motion_replacement_stale	Motion takeover out of date	The motion takeover being checked is no longer the current one, so the request was refused.
+motion_replacement_stop_fenced	Stop blocked the motion takeover	A Stop was requested before the new motion was sent, so it did not take over the moving robot.
+motion_signal_trip_mapped_failure	Signal trip reported as failure	The motion's interrupt rule saw its signal and stopped the motion, and the node is set to report this end as a failure. If this end is expected, set the node to report success on a signal trip.
+motion_superseded	Motion replaced before it was sent	A higher-priority motion replaced this motion before it was sent to the robot, so the node ended without moving. No action needed if the replacement was intended.
+native_candidate_binding_invalid	Planner robot binding invalid	An internal check failed: the robot binding used for planning is incomplete or inconsistent. Collect the logs and report it.
+native_candidate_group_mismatch	Planner joint group mismatch	An internal check failed: the planner's joint group differs from the robot's retained joints. Collect the logs and report it.
+native_candidate_request_binding_mismatch	Planning request for another binding	An internal check failed: the planning request does not match the robot's exact binding. Collect the logs and report it.
+native_candidate_request_numeric_invalid	Planning settings invalid	The planning request has invalid tolerances, limits, timeout or planner settings, so no motion was planned. Check the motion's settings; if they look right, collect the logs and report it.
+native_candidate_start_state_binding_mismatch	Planning start state mismatch	An internal check failed: the start state of the planning request does not match the robot's exact binding. Collect the logs and report it.
+native_moving_connector_unqualified	No moving join to next motion	Planning found no allowed point to join the next motion while the robot is still moving, before the next motion's first target. Check the motion, or let the robot come to rest before it starts.
+natural_completion_result_invalid	Stop natural completion invalid	An internal check failed: a Stop result reported that the motion finished on its path where that was not allowed or not confirmed. Collect the logs and report it.
+noncollision_validation_cancelled	Motion validation cancelled	Validation of the motion was cancelled before it finished, so the motion was not used. The details give the cancellation reason.
+operation_cancelled_pre_dispatch	Operation cancelled before dispatch	The operation was cancelled before anything was sent to the robot, so nothing moved.
+operation_control_attribution_invalid	Operation control caller invalid	The operation control request carries invalid caller details. Retry from the GUI; if it persists, collect the logs and report it.
+operation_control_reason_invalid	Stop reason text invalid	The reason text of the operation control is too long or not valid text. Shorten or correct the reason and try again.
+operation_control_request_context_invalid	Operation control request context invalid	The operation control request has invalid request context. Retry from the GUI; if it persists, collect the logs and report it.
+operation_control_scope_invalid	Operation control node scope invalid	The operation control request names a malformed Program node scope. Retry from the GUI; if it persists, collect the logs and report it.
+operation_control_target_invalid	Operation control target invalid	The operation control request names no valid operation or revision. Refresh the operation status and try again; if it persists, collect the logs and report it.
+operation_failed	Operation failed	The operation did not succeed and gave no more specific reason. Check the robot and the logs, then choose an offered recovery action or Reset.
+operation_interrupted	Operation interrupted	The operation was interrupted before it completed. Check the robot, then choose an offered recovery action or Reset.
+operation_intervention_required	Operation needs operator decision	The operation ended and needs an operator decision before it can continue. Choose one of the offered recovery actions or Reset.
+operation_journal_clock_failure	Operation journal clock failed	An internal check failed: the operation journal could not convert the wall clock time. Collect the logs and report it.
+operation_journal_closed	Operation journal closed	An internal check failed: the operation journal was used after its database was closed. Collect the logs and report it.
+operation_journal_configuration_invalid	Operation journal setup invalid	An internal check failed: the operation journal was started with an invalid cell identity or history limit. Collect the logs and report it.
+operation_journal_event_query_invalid	Operation event query out of range	The operation event query starts beyond the valid range or asks for too large a page, so it was refused. Correct the query and try again.
+operation_journal_path_invalid	Operation journal path invalid	The operation journal database path is invalid or cannot be resolved. Check the configured data folder.
+operation_journal_payload_unsupported	Operation record content unsupported	An internal check failed: an operation record contains content the journal does not store. Collect the logs and report it.
+operation_journal_record_invalid	Operation record invalid	An internal check failed: an operation record has an invalid identity or a number out of range. Collect the logs and report it.
+operation_journal_record_too_large	Operation record too large	An internal check failed: an operation record exceeds the size limit of the journal. Collect the logs and report it.
+operation_journal_storage_foreign	Operation journal file not recognized	The operation journal database file belongs to another application or format, so it was not used. Check the database file in the configured data folder.
+operation_journal_storage_unsupported	Operation journal database too old	The installed SQLite library is older than the operation journal needs, so the journal could not start. Collect the logs and report it.
+operation_stopped	Operation stopped	The operation was stopped before it completed. Check the robot, then choose an offered recovery action or Reset.
+operator_alarm_acknowledge_all_confirmation_required	Confirm acknowledging all alarms	Acknowledging all alarms needs a confirmation. Confirm the action and try again.
+operator_alarm_acknowledge_all_duplicate_member	Acknowledge-all lists an alarm twice	The acknowledge-all request lists the same alarm more than once, so it was refused. Retry from the GUI; if it persists, collect the logs and report it.
+operator_alarm_acknowledge_all_members_invalid	Too many alarms to acknowledge	The acknowledge-all request lists more than 256 alarms, so it was refused. Acknowledge the alarms individually.
+operator_alarm_acknowledgement_confirmation_required	Confirm alarm acknowledgement	Acknowledging this alarm needs a confirmation. Confirm the action and try again.
+operator_alarm_acknowledgement_reason_required	Acknowledgement reason required	This alarm can only be acknowledged with a reason. Enter a reason and acknowledge again.
+operator_alarm_activation_stale	Alarm changed before acknowledgement	The alarm was raised again before the acknowledgement arrived, so it was not acknowledged. Refresh the alarm list and acknowledge again.
+operator_alarm_catalog_unavailable	Alarm definition missing	An internal check failed: a live operator alarm has no definition in the alarm catalog. Collect the logs and report it.
+operator_alarm_clock_invalid	Alarm clock invalid	An internal check failed: the operator alarm clock returned an invalid time. Collect the logs and report it.
+operator_alarm_condition_identity_mismatch	Alarm condition identity mismatch	An internal check failed: an operator alarm condition does not match its subject. Collect the logs and report it.
+operator_alarm_condition_update_invalid	Alarm update content invalid	An internal check failed: an operator alarm update has a field that is not a bounded object. Collect the logs and report it.
+operator_alarm_configuration_invalid	Alarm service setup invalid	An internal check failed: the operator alarm service was started with an invalid configuration. Collect the logs and report it.
+operator_alarm_definition_mismatch	Alarm update names wrong definition	An internal check failed: an operator alarm update names a different alarm definition than expected. Collect the logs and report it.
+operator_alarm_definition_unknown	Alarm update names unknown alarm	An internal check failed: an operator alarm update names an alarm definition that is not in the catalog. Collect the logs and report it.
+operator_alarm_identity_exhausted	Alarm numbering exhausted	An internal check failed: an operator alarm counter reached its limit. Collect the logs and report it.
+operator_alarm_limit_invalid	Alarm page size too large	The requested alarm page size exceeds 128. Request a smaller page.
+operator_alarm_membership_mismatch	Alarm list changed before acknowledgement	The acknowledge-all request does not list exactly the current unacknowledged alarms, so it was refused. Refresh the alarm list and acknowledge again.
+operator_alarm_not_found	Alarm no longer active	The alarm is no longer live, so it could not be acknowledged. Refresh the alarm list.
+operator_alarm_owner_generation_stale	Alarm list changed before acknowledgement	The unacknowledged alarms changed before acknowledge-all arrived, so nothing was acknowledged. Refresh the alarm list and acknowledge again.
+operator_alarm_record_revision_stale	Alarm changed before acknowledgement	The alarm changed before the acknowledgement arrived, so it was not acknowledged. Refresh the alarm list and acknowledge again.
+operator_alarm_scope_invalid	Alarm update scope invalid	An internal check failed: an operator alarm update names an invalid cell or resource scope. Collect the logs and report it.
+operator_alarm_source_adapter_mismatch	Alarm source not allowed for alarm	An internal check failed: an alarm source tried to update an alarm that belongs to another adapter. Collect the logs and report it.
+operator_alarm_source_adapter_unknown	Alarm source adapter unknown	An internal check failed: an alarm source registered with an adapter that is not catalogued for its domain. Collect the logs and report it.
+operator_alarm_source_authority_conflict	Alarm updated by another source	An internal check failed: an alarm source tried to update an alarm condition owned by another source. Collect the logs and report it.
+operator_alarm_source_epoch_conflict	Alarm source restart conflict	An internal check failed: an alarm source reused a restart order with a different identity. Collect the logs and report it.
+operator_alarm_source_epoch_stale	Alarm update from older source start	An alarm update came from an older start of its source than one already accepted, so it was refused.
+operator_alarm_source_registration_conflict	Alarm source registration conflict	An internal check failed: an alarm source registered again with a different domain or adapter. Collect the logs and report it.
+operator_alarm_source_sequence_conflict	Alarm updates conflict	An internal check failed: an alarm source sent two different updates with the same sequence number. Collect the logs and report it.
+operator_alarm_source_sequence_stale	Older alarm update refused	An alarm update arrived with an older sequence number than one already accepted, so it was refused.
+operator_alarm_source_unregistered	Alarm source not registered	An alarm update or snapshot came from a source that is not registered, so it was refused.
+operator_alarm_state_unavailable	Alarm state unavailable	The operator alarm state is not available, so active alarm interlocks could not be checked and motion was refused. Wait for the alarm service to recover, then try again.
+operator_alarm_value_invalid	Alarm text invalid	A text value for the operator alarm, such as an acknowledgement reason, is empty, too long or not valid text, so it was refused. Correct the text and try again.
+operator_intervention_required	Operator intervention required	The step needs an operator decision before the Program can continue. Choose one of the offered actions.
+owner_not_ready	Application service not ready	A ManyForge service of the launch has not reported ready, so the launch is degraded. Wait for it to start; if it stays not ready, check its logs.
+persistent_key_register_version_unsupported	Persistent key file format unsupported	The stored persistent key file uses a format this version cannot read, so it was left untouched and its values are not available. Collect the logs and report it.
+planning_contract_unavailable	Planner not available	The planner or collision checking is not available, so Plan and Preview cannot run. Wait for them to start; if they stay unavailable, check the execution host.
+planning_scene_projection_not_converged	Planning scene did not catch up	The local planning scene did not catch up with the current Scene in time, so planning did not start. Try again.
+planning_scene_synchronization_failed	Planning scene synchronization failed	Synchronizing the planning scene with the current Scene failed, so planning did not start. The details name the cause; try again.
+pointcloud_cell_identity_mismatch	Point cloud is for another cell	A point cloud observation was refused because it names a different cell than the running one. Check the sender configuration.
+pointcloud_sequence_conflict	Point cloud sequence reused	A point cloud observation was refused because it reuses a sequence number with different content. Check the sender.
+pointcloud_sequence_regressed	Point cloud out of order	A point cloud observation was refused because its sequence number is older than one already accepted. Check the sender.
+pointcloud_source_owner_mismatch	Point cloud from unexpected sender	A point cloud observation was refused because it does not come from the configured point cloud source. Check the sender configuration.
+pointcloud_stream_generation_regressed	Point cloud from older stream	A point cloud observation was refused because it belongs to an older stream than one already accepted. Check the sender.
+prepare_participant_result_identity_invalid	Preparation result identity invalid	An internal check failed: a component's preparation result does not match the operation it was prepared for. Collect the logs and report it.
+prepare_participant_result_presence_invalid	Preparation result incomplete	An internal check failed: a component's successful preparation result lacks its prepared contract or carries an error. Collect the logs and report it.
+prepare_participant_result_state_invalid	Preparation result state invalid	An internal check failed: a component's preparation result has an invalid state. Collect the logs and report it.
+prepared_contract_conflict	Prepared motion contract conflict	An internal check failed: one prepared operation revision was given two different contracts. Collect the logs and report it.
+prepared_execution_handle_membership_mismatch	Execution handle for another goal	An internal check failed: an execution handle does not match its controller goal or prepared contract. Collect the logs and report it.
+prepared_execution_handle_observer_missing	Execution handle cannot be observed	An internal check failed: an execution handle has no way to observe its progress. Collect the logs and report it.
+prepared_execution_handle_request_identity_invalid	Execution handle identity invalid	An internal check failed: an execution handle has an invalid operation or controller goal identity. Collect the logs and report it.
+prepared_execution_not_quiescent	Motion or Stop still in progress	The prepared motion could not be released because its motion or Stop is still in progress. Wait until motion has finished, then try again.
+prepared_execution_stale	Released motion out of date	An internal check failed: a finished motion takeover could not be released because its record is out of date. Collect the logs and report it.
+prepared_fault_stop_plan_encoding_invalid	Fault Stop plan not recorded	An internal check failed: the fault Stop plan of a prepared operation could not be encoded. Collect the logs and report it.
+prepared_ordinary_stop_plan_encoding_invalid	Stop plan could not be recorded	An internal check failed: the Stop plan of a prepared operation could not be encoded. Collect the logs and report it.
+prepared_participant_backend_activation_set_id_mismatch	Prepared command activation set differs	An internal check failed: the activation set of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_active_configuration_generation_mismatch	Prepared command configuration differs	An internal check failed: the active configuration generation of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_active_configuration_id_mismatch	Prepared command configuration differs	An internal check failed: the active configuration of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_capability_id_mismatch	Prepared command capability differs	An internal check failed: the capability of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_capability_provider_mismatch	Prepared command capability provider differs	An internal check failed: the capability provider of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_capability_revision_mismatch	Prepared command capability revision differs	An internal check failed: the capability revision of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_command_target_id_mismatch	Prepared command target differs	An internal check failed: the command target of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_component_id_mismatch	Prepared command component differs	An internal check failed: a prepared operation names a different component than the one it is sent to. Collect the logs and report it.
+prepared_participant_backend_component_type_id_mismatch	Prepared command component type differs	An internal check failed: the component type of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_component_type_revision_mismatch	Prepared command component type revision differs	An internal check failed: the component type revision of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_control_binding_id_mismatch	Prepared command control binding differs	An internal check failed: the control binding of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_control_binding_revision_mismatch	Prepared command control binding revision differs	An internal check failed: the control binding revision of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_control_domain_id_mismatch	Prepared command control domain differs	An internal check failed: the control domain of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_control_domain_revision_mismatch	Prepared command control domain revision differs	An internal check failed: the control domain revision of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_control_provider_mismatch	Prepared command control provider differs	An internal check failed: the control provider of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_control_route_id_mismatch	Prepared command control route differs	An internal check failed: the control route of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_controller_topology_id_mismatch	Prepared command controller layout differs	An internal check failed: the controller layout of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_frame_bindings_mismatch	Prepared command frames differ	An internal check failed: the frame bindings of a prepared operation do not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_graph_revision_mismatch	Prepared command Deployment revision differs	An internal check failed: the Deployment graph revision of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_interface_contract_id_mismatch	Prepared command control interface differs	An internal check failed: the control interface of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_interface_revision_mismatch	Prepared command interface revision differs	An internal check failed: the control interface revision of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_model_bindings_mismatch	Prepared command robot model differs	An internal check failed: the model bindings of a prepared operation do not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_program_binding_id_mismatch	Prepared command Program binding differs	An internal check failed: the Program binding of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_program_revision_mismatch	Prepared command Program revision differs	An internal check failed: the Program revision of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_resources_mismatch	Prepared command resources differ	An internal check failed: the resources of a prepared operation do not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_retained_bundle_id_mismatch	Prepared command configuration bundle differs	An internal check failed: the configuration bundle of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_runtime_unit_epochs_mismatch	Prepared command process starts differ	An internal check failed: the process starts recorded for a prepared operation do not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_shape_invalid	Prepared command shape invalid	An internal check failed: a prepared operation is incomplete, has no control path or has the wrong kind of command. Collect the logs and report it.
+prepared_participant_backend_stop_evidence_policy_id_mismatch	Prepared command Stop policy differs	An internal check failed: the Stop confirmation policy of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_stop_evidence_policy_revision_mismatch	Prepared command Stop policy revision differs	An internal check failed: the Stop confirmation policy revision of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_participant_backend_stop_plan_mismatch	Prepared command Stop plan differs	An internal check failed: the Stop plan of a prepared operation does not match its participant. Collect the logs and report it.
+prepared_participant_backend_topology_revision_mismatch	Prepared command controller layout revision differs	An internal check failed: the controller layout revision of a prepared operation does not match the component it is sent to. Collect the logs and report it.
+prepared_plan_request_encoding_invalid	Plan request could not be recorded	An internal check failed: the plan request of a prepared motion could not be encoded. Collect the logs and report it.
+prepared_planning_evidence_encoding_invalid	Planning results could not be recorded	An internal check failed: the planning results of a prepared motion could not be encoded. Collect the logs and report it.
+prepared_replacement_conflict	Another motion takeover pending	Another motion takeover with different content is already pending for this motion, so this one was refused.
+prepared_replacement_not_quiescent	Motion takeover Stop in progress	The motion takeover could not be released because its Stop is still in progress. Wait until motion has finished, then try again.
+prepared_replacement_stale	Motion takeover out of date	The motion takeover refers to a motion that is no longer current or is older than one already prepared, so it was refused.
+prepared_start_state_encoding_invalid	Start state could not be recorded	An internal check failed: the start state of a prepared motion could not be encoded. Collect the logs and report it.
+prepared_trajectory_encoding_invalid	Trajectory could not be recorded	An internal check failed: the trajectory of a prepared motion could not be encoded. Collect the logs and report it.
+prepared_validation_evidence_encoding_invalid	Validation results could not be recorded	An internal check failed: the validation results of a prepared motion could not be encoded. Collect the logs and report it.
+process_presence_stale	Process report outdated	The last presence report of a component process is older than allowed, so the process is not shown as ready. Check that the process is still running.
+program_applied_selection_unavailable	Applied Program not available	The applied Program could not be read because the cell manager's status is not current. Wait a moment and refresh; if it stays unavailable, check the cell status.
+program_cycle_state_idle_after_reset	Not available while Program idle	This command is not available while the Program cycle is idle after Reset. Start a Program run first.
+program_cycle_state_recovery_required	Not available until Program recovered	This command is not available while the Program cycle needs recovery. Recover or Reset the Program first, as offered.
+program_cycle_state_resetting	Not available while Program resets	This command is not available while the Program is resetting. Wait for Reset to finish.
+program_cycle_state_running	Not available while Program runs	This command is not available while a Program run is in progress. Stop the run and Reset the Program first.
+program_cycle_state_starting	Not available while Program starts	This command is not available while the Program cycle is starting. Wait for it to finish starting.
+program_cycle_state_terminal_awaiting_reset	Program run ended, Reset needed	This command is not available because the Program run has ended and waits for Reset. Reset the Program first.
+program_execution_owner_unavailable	Execution host not reachable	The Program runner could not confirm the execution host's current state, so commands that need it are unavailable. Check that the execution host is running, then try again.
+program_halt_resume_unavailable	Resume not available after Halt	The Halt has settled, but at least one held task cannot be resumed from the robot's current state. Reset the Program to continue.
+program_halt_task_observation_pending	Halt still settling	The robot has stopped for the Halt, but accepted Program work is still being confirmed. Wait a moment before choosing Resume or Reset.
+program_halt_task_state_unknown	Halt task state unknown	While the Program run was halting, the state of its node tasks could not be determined, so the run was marked failed. Check the robot, then Reset the Program.
+program_manual_result_forbidden	Manual result not allowed	A manual result is not available for the held node attempt, so it was refused. Choose another offered recovery action or Reset the Program.
+program_node_failed	Program node failed	A Program node failed, so the Program run waits for a recovery decision. Check the node and the cell, then choose an offered recovery action or Reset.
+program_node_invalid	Program node invalid	A Program node does not match its node definition. The message names the node and field; correct the Program and Apply again.
+program_node_io_source_unavailable	Watched input unavailable	The input signal a waiting Program node watches became unavailable, so the node keeps waiting. Check the I/O source.
+program_run_end_request_attribution_invalid	Program end request sender invalid	The request to end the Program run carries an invalid sender, so it was carried out as a Stop of the whole cell. Check the robot before continuing.
+program_run_end_request_context_invalid	Program end request label invalid	The request to end the Program run carries an invalid request label, so it was carried out as a Stop of the whole cell. Check the robot before continuing.
+program_run_end_run_invalid	Program end request run invalid	The request to end the Program run names an invalid Program run, so it was carried out as a Stop of the whole cell. Check the robot before continuing.
+program_run_state_failed	Program run has failed	The Program run has failed, so this command is not available. Reset the Program before running again.
+program_run_state_finalizing	Program run is finishing	The Program run is finishing, so this command is not available. Wait until the run has ended.
+program_run_state_halted	Program run is halted	The Program run is halted, so this command is not available. Choose a command offered for the halted run.
+program_run_state_halting	Program run is halting	The Program run is halting, so this command is not available. Wait until the Halt has finished.
+program_run_state_intervention_required	Program run needs intervention	The Program run is waiting for operator intervention, so this command is not available. Choose an offered recovery action or Reset the Program.
+program_run_state_running	Program run is running	The Program run is running, so this command is not available while it runs.
+program_run_state_stopped	Program run has stopped	The Program run has stopped, so this command is not available. Reset the Program to run it again.
+program_run_state_stopping	Program run is stopping	The Program run is stopping, so this command is not available. Wait until the Stop has finished.
+program_run_state_succeeded	Program run has finished	The Program run has finished, so this command is not available. Start a new run.
+program_run_state_unavailable	Program run state unavailable	No Program run state is available, so this command is not available. Refresh and try again.
+program_runner_configuration_invalid	Program runner settings invalid	The Program runner did not start because its settings are invalid. The message names the problem; check the ManyForge installation and settings, then start ManyForge again.
+program_runner_http_error	Program runner refused request	An internal check failed: the Program runner refused a request as malformed. Collect the logs and report it.
+program_runtime_control_rejected	Program command refused	The Program run refused this command in its current state. The message gives the reason; refresh and try again.
+program_runtime_owner_unavailable	Program node owner unavailable	A Program node type needs a runtime owner that is not available, so nodes of that type cannot run. Check the components the Program uses and Apply again.
+recognized_stop_ingress_attribution_invalid	Malformed Stop sender invalid	A malformed Stop request carries an invalid sender, so it was recorded as unverified. The Stop was still carried out.
+recognized_stop_ingress_label_invalid	Malformed Stop label invalid	An internal check failed: a malformed Stop request carries an invalid source label. The Stop was still carried out. Collect the logs and report it.
+recognized_stop_ingress_reason_invalid	Malformed Stop reason invalid	An internal check failed: a malformed Stop request carries an unknown reason. The Stop was still carried out. Collect the logs and report it.
+recognized_stop_ingress_route_invalid	Malformed Stop route invalid	An internal check failed: a malformed Stop request carries an invalid route. The Stop was still carried out. Collect the logs and report it.
+recoverable_substitution_reason_invalid	Stop fallback reason invalid	An internal check failed: a controlled Stop result names an invalid reason for using another Stop mode. Collect the logs and report it.
+recoverable_substitution_reason_without_mode_change	Stop fallback reason without fallback	An internal check failed: a controlled Stop result names a fallback reason although the Stop mode did not change. Collect the logs and report it.
+recovery_rejected	Recovery action refused	The recovery action applied by the Program was refused, so the node failed. The details give the cause; check the component state.
+rejected_result_cannot_be_confirmed	Refused Stop reported as confirmed	An internal check failed: a refused controlled Stop result also reports the Stop as confirmed. Collect the logs and report it.
+rejected_result_missing_error	Refused Stop has no error	An internal check failed: a refused controlled Stop result carries no error. Collect the logs and report it.
+relative_start_state_unavailable	Start state needed	Relative motion needs a fresh start state of the robot, and none is available. Wait for the robot state and try again.
+retained_global_rule_invalid	Global interrupt rule incomplete	An internal check failed: a global interrupt rule is missing a required field. Collect the logs and report it.
+retained_measured_robot_geometry_invalid	Robot measured joints do not match	The robot's measured joint states do not match its robot model, so the configuration was refused. The details name the robot and joint; check the robot's joint setup and Apply again.
+retained_runtime_collision_bundle_invalid	Collision data for motion invalid	An internal check failed: the collision world or policy data captured for the motion is incomplete. Collect the logs and report it.
+retained_runtime_collision_inventory_invalid	Collision inventory for motion invalid	An internal check failed: the collision data captured for the motion has no valid world, policy or projection. Collect the logs and report it.
+retained_state_publication_cancelled	Robot state publish cancelled	Publishing the robot state was cancelled before it finished, so the state was not updated. Try again.
+retained_state_publication_deadline_expired	Robot state publish too late	Publishing the robot state missed its deadline, so the state was not updated. If it repeats, check the machine load and collect the logs.
+retained_state_read_cancelled	Robot state read cancelled	Reading the robot state was cancelled before it finished, so no state was returned. Try again.
+retained_state_read_deadline_expired	Robot state read too late	Reading the robot state missed its deadline, so no state was returned. If it repeats, check the machine load and collect the logs.
+ros2_control_activation_refused	Controller activation refused	The controller manager refused to activate the controller. Check the robot's driver and controllers, then try again.
+ros2_control_deactivation_refused	Controller deactivation refused	The controller manager refused to deactivate the controller. Check the robot's driver and controllers before any further motion.
+ros2_control_hardware_activation_refused	Hardware activation refused	The controller manager refused to activate the robot hardware. Check the robot's driver and its hardware, then try again.
+ros2_control_hardware_deactivation_refused	Hardware deactivation refused	The controller manager refused to deactivate the robot hardware. Check the robot's driver and its hardware before continuing.
+ros_gripper_command_goal_rejected	Gripper command rejected	The gripper driver rejected the gripper command, so the pneumatic output was not confirmed and the step failed. Check the gripper and its driver, then run the step again.
+route_predecessor_gripper_kernel_refused	Gripper route not taken over	The gripper of the previous configuration could not be taken over during the configuration change, so the change was rolled back. Check the gripper component and Apply again.
+runtime_collision_lookahead_resource_conflict	Lookahead collision engine shared	The collision engine of the trajectory lookahead shares a resource with another collision engine, so collision checking was refused. Configure separate collision engines and Apply again.
+runtime_contact_release_policy_invalid	Contact release rule invalid	A contact release rule of the running move holds an invalid value, so the runtime collision check cannot use it. Correct the rule.
+runtime_contract_manifest_set_decode_failed	Runtime contract set unreadable	An internal check failed: a set of runtime contract records could not be decoded. Collect the logs and report it.
+runtime_contract_offer_decode_failed	Runtime contract offer unreadable	An internal check failed: a runtime contract offer could not be decoded. Collect the logs and report it.
+runtime_contract_requirement_decode_failed	Runtime contract requirement unreadable	An internal check failed: a runtime contract requirement could not be decoded. Collect the logs and report it.
+runtime_lookahead_projection_revision_unavailable	Lookahead collision state not current	The trajectory lookahead has no current collision state revision, so the trajectory could not be certified and the motion was stopped or refused. Try again; if it persists, collect the logs and report it.
+runtime_lookahead_trajectory_unavailable	Lookahead has no trajectory	An internal check failed: the trajectory lookahead has no trajectory to check, so the motion was stopped or refused. Collect the logs and report it.
+runtime_query_snapshot_invalid	Collision snapshot invalid	An internal check failed: the collision world snapshot for a runtime query is invalid. Collect the logs and report it.
+runtime_scale_bounds_invalid	Stop speed bounds invalid	An internal check failed: Stop planning got invalid speed-scaling bounds for the motion. Collect the logs and report it.
+runtime_scale_reconcile_unavailable	Speed status unavailable	The participant engine could not report its runtime speed status, so the speed change is marked failed. Set the speed scale again; if it persists, collect the logs and report it.
+scene_mesh_draft_invalid	Program Draft identity invalid	An internal check failed: the Program Draft identity used for a Scene mesh is invalid. Collect the logs and report it.
+scene_mesh_draft_revision_changed	Mesh is for an old Draft	The requested mesh belongs to an older revision of the Program Draft. Reload the view.
+scene_mesh_draft_unavailable	Program Draft unavailable	The Program Draft is not available, so the Scene mesh could not be served. Try again.
+scene_mesh_not_draft_authorized	Mesh not in Program Draft	The requested mesh is not used by the current Program Draft, so it was refused. Reload the view.
+scene_mesh_not_owner_authorized	Mesh not in current Scene	The requested mesh is not used by the current Scene, so it was refused. Reload the view.
+scene_mesh_owner_projection_invalid	Scene data format not supported	An internal check failed: the Scene data read for a mesh has an unsupported format. Collect the logs and report it.
+scene_mesh_owner_projection_stale	Scene data not current	The Scene data needed for the mesh is unavailable, out of date or incomplete. Wait a moment and reload the view.
+scene_mesh_owner_unavailable	Scene owner unavailable	The Scene owner is not available, so the mesh could not be served. Check that ManyForge is running and try again.
+scene_mesh_source_changed	Mesh file changed	The mesh file or its path changed after it was selected. Reload the view.
+scene_pose_source_relative_reference_gripper_link_invalid	Relative reference gripper not found	The simulation pose source's single relative reference cannot find the robot's gripper link. Set per-robot relative references in the simulation settings and Apply again.
+scene_pose_source_relative_references_conflict	Relative references set twice	The simulation pose source sets both per-robot relative references and the older single relative reference. Keep only the per-robot references and Apply again.
+scene_pose_unavailable	Scene object pose unavailable	The pose of a Scene object is not available. Check the Scene and try again.
+scene_projection_unavailable	Gripper position not shown in Scene	The commanded gripper position could not be applied to the Scene, so the gripper command failed. Check the Scene and the gripper, then run the step again.
+scene_projection_worker_unavailable	Gripper Scene update unavailable	An internal check failed: the worker that applies gripper positions to the Scene is not available, so the gripper position in the Scene was not updated. Collect the logs and report it.
+scene_runtime_latch_failed	Pose update between nodes failed	Updating Scene object poses from the pose source between Program nodes failed. The message gives the cause; check the pose source and the Scene, then try again.
+scene_state_unavailable	Scene state unavailable	The Scene state was not available, so the joint position could not be applied to it. Wait for the Scene to be ready and try again.
+scheduler_detach_pending	Motion scheduler detaching	The motion scheduler is still detaching, so the request was refused. Wait a moment and try again.
+selected_owner_assessment_unavailable	Node state could not be read	The current state of a selected held node could not be read, so it cannot be resumed now. Refresh and try again.
+selected_owner_recovery_unavailable	Selected node cannot be recovered	A selected node cannot be recovered, so it cannot be resumed. Reset the Program.
+selected_owner_work_pending	Node still working	A selected node's work has not ended yet, so it cannot be resumed now. Wait until it has ended, then try again.
+selected_stop_fault_requires_recovery	Stop faulted	The Stop of a selected node did not end cleanly, so it cannot be resumed. Check the robot, then Recover or Reset the Program.
+selection_release_unavailable	Node release blocked	An internal check failed: releasing the selected held nodes is blocked for an unknown reason. Collect the logs and report it.
+snapshot_unavailable	Collision world not available	No collision world snapshot is available, so the motion could not be collision checked and was refused. Wait for the Scene to be ready, then try again.
+soft_on_path_capability_config_invalid	On-path Stop settings invalid	The soft on-path Stop is enabled for this robot controller, but its settings are invalid, so this Stop mode is not offered. Correct the controller's soft on-path Stop settings and Apply again.
+soft_on_path_interpolation_invalid	On-path Stop ramp invalid	The soft on-path Stop ramp failed a check between waypoints on a joint, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+soft_on_path_join_failed	On-path Stop could not join motion	The soft on-path Stop ramp could not be joined to the running motion, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+soft_on_path_path_ramp_dispatch_failed	On-path Stop refused by controller	The controller did not accept the soft on-path Stop ramp, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+soft_on_path_path_ramp_dispatch_uncertain	On-path Stop send uncertain	Whether the controller received the soft on-path Stop ramp is unknown, so it may already affect the robot. Check the robot before any further motion.
+soft_on_path_stop_delta_budget_exceeded	On-path Stop starts too late	The soft on-path Stop could not take over within the Stop lead-in, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+source_report_stale	Component reports overdue	A component's status reports stopped arriving in time, so the component is shown as lost. Check that the component is running.
+spring_back_join_failed	Spring-back Stop could not join motion	The spring-back Stop ramp could not be joined to the running motion, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+spring_back_path_ramp_dispatch_failed	Spring-back Stop refused by controller	The controller did not accept the spring-back Stop ramp, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+spring_back_path_ramp_dispatch_uncertain	Spring-back Stop send uncertain	Whether the controller received the spring-back Stop ramp is unknown, so it may already affect the robot. Check the robot before any further motion.
+spring_back_return_acceleration_limit_exceeded	Spring-back return too fast	The return phase of the spring-back Stop exceeds a joint's acceleration limit, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+spring_back_return_interpolation_invalid	Spring-back return invalid	The return phase of the spring-back Stop failed a check between waypoints on a joint, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+spring_back_return_jerk_limit_exceeded	Spring-back return too abrupt	The return phase of the spring-back Stop exceeds a joint's jerk limit, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+spring_back_stop_delta_budget_exceeded	Spring-back Stop starts too late	The spring-back Stop could not take over within the Stop lead-in, so this Stop mode was not used: the next configured controlled Stop mode is tried, and the hard Stop follows if none is left. Check the robot before any further motion.
+startup_scenario_load_failed	Startup Scenario not loaded	The Scenario set to load at start-up could not be loaded. The message gives the reason; load the Scenario from the Composer.
+stop_accepted_covered_invalid	Stop reply operation invalid	An internal check failed: a Stop acceptance lists an operation with an invalid number. Collect the logs and report it.
+stop_accepted_identity_invalid	Stop reply identity invalid	An internal check failed: a Stop acceptance has an invalid request, replay status or event identity. Collect the logs and report it.
+stop_accepted_revision_or_time_invalid	Stop reply revision invalid	An internal check failed: a Stop acceptance has an invalid hold revision or acceptance time. Collect the logs and report it.
+stop_accepted_run_invalid	Stop reply run invalid	An internal check failed: a Stop acceptance names an invalid Program run. Collect the logs and report it.
+stop_accepted_stale_diagnostics_invalid	Stop reply diagnostics invalid	An internal check failed: a Stop acceptance has invalid entries for outdated targets. Collect the logs and report it.
+stop_accepted_widening_invalid	Stop reply scope inconsistent	An internal check failed: a Stop acceptance applied a different scope than requested without a widening reason. Collect the logs and report it.
+stop_command_source_invalid	Stop command source unknown	An internal check failed: a controlled Stop result names an unknown Stop command source. Collect the logs and report it.
+stop_component_target_invalid	Stop component target invalid	A Stop request names an invalid component target, so the Stop was widened to the whole cell. Check the robot before continuing.
+stop_component_targets_not_canonical	Stop component targets malformed	A Stop request lists no component targets, too many, or lists them out of order or twice, so the Stop was widened to the whole cell. Check the robot before continuing.
+stop_evidence_source_unavailable	No robot state after Stop	No robot state arrived after the Stop finished within the Stop time limit, so the Stop could not be confirmed. Check the robot; the cell needs Recover before further motion.
+stop_goal_terminal_state_mismatch	Stop end not reported	The controller did not report the final state of the Stop within the Stop time limit, so the Stop could not be confirmed. Check the robot; the cell needs Recover before further motion.
+stop_operation_target_invalid	Stop operation target invalid	A Stop request names an invalid operation target, so the Stop was widened to the whole cell. Check the robot before continuing.
+stop_operation_targets_not_canonical	Stop operation targets malformed	A Stop request lists no operation targets, too many, or lists them out of order or twice, so the Stop was widened to the whole cell. Check the robot before continuing.
+stop_reason_invalid	Stop reason invalid	The reason text of a Stop request is invalid or too long, so the Stop was widened to the whole cell. Check the robot before continuing.
+stop_request_attribution_invalid	Stop request sender invalid	A Stop request carries an invalid sender, so it was recorded as unverified and widened to the whole cell. Check the robot before continuing.
+stop_request_context_invalid	Stop request label invalid	A Stop request carries an invalid request label, so the Stop was widened to the whole cell. Check the robot before continuing.
+stop_resource_target_invalid	Stop resource target invalid	A Stop request names an invalid resource target, so the Stop was widened to the whole cell. Check the robot before continuing.
+stop_resource_targets_not_canonical	Stop resource targets malformed	A Stop request lists no resource targets, too many, or lists them out of order or twice, so the Stop was widened to the whole cell. Check the robot before continuing.
+stop_stage_superseded_before_dispatch	Stop stage superseded	A newer Stop superseded this Stop stage before it was sent to the robot. No action needed.
+tcp_linear_speed_limit_exceeded	TCP speed above limit	The TCP linear speed of the trajectory exceeds the configured limit, so the motion was refused. Lower the motion speed and try again.
+tcp_linear_speed_limit_invalid	TCP speed limit invalid	The configured TCP linear speed limit is not a finite, non-negative number. Correct the TCP speed limit.
+tcp_speed_frames_missing	TCP speed check frames missing	An internal check failed: the TCP speed check has no TCP or base frame. Collect the logs and report it.
+tcp_speed_validation_failed	TCP speed check failed	An internal check failed: the TCP speed of the trajectory could not be computed. Collect the logs and report it.
+tcp_speed_validation_nonfinite	TCP position not finite	An internal check failed: a TCP position computed for a replacement motion is not a finite number. Collect the logs and report it.
+trajectory_acceleration_limit_exceeded	Joint acceleration above limit	A joint acceleration of the trajectory exceeds the robot model limit, so the motion was refused. The details name the joint and waypoint; correct the trajectory.
+trajectory_empty	Trajectory empty	The trajectory has no joints or no waypoints. Correct the trajectory.
+trajectory_joint_group_incomplete	Trajectory misses group joints	The trajectory does not name every joint of the robot's planning group, so its TCP speed cannot be checked. Correct the trajectory.
+trajectory_joint_names_invalid	Trajectory joint names invalid	The joint names of the trajectory must be non-empty and unique. Correct the trajectory.
+trajectory_joint_not_in_group	Trajectory joint outside group	The trajectory contains a joint outside the robot's planning group. Use only joints of the group.
+trajectory_position_limit_exceeded	Joint position outside limit	A joint position of the trajectory is outside the robot model limits, so the motion was refused. The details name the joint and waypoint; correct the trajectory.
+trajectory_retained_prefix_boundary_missing	Replacement join point not a waypoint	An internal check failed: the join point of a replacement motion is not an exact waypoint of the current trajectory. Collect the logs and report it.
+trajectory_retained_prefix_invalid	Replacement join point invalid	An internal check failed: a replacement motion has no valid join point or TCP limits. Collect the logs and report it.
+trajectory_segment_acceleration_limit_exceeded	Segment acceleration above limit	A segment of the trajectory exceeds a joint's acceleration limit in the robot model, so the motion was refused. The details name the joint and segment; correct the trajectory.
+trajectory_segment_velocity_limit_exceeded	Segment velocity above limit	A segment of the trajectory exceeds a joint's velocity limit in the robot model, so the motion was refused. The details name the joint and segment; correct the trajectory.
+trajectory_splice_milestones_invalid	Straight path times invalid for splice	An internal check failed: the straight-path waypoint times of a trajectory to be spliced are invalid. Collect the logs and report it.
+trajectory_time_invalid	Trajectory times not increasing	Waypoint times of the trajectory must be finite and strictly increasing. Correct the trajectory.
+trajectory_velocity_limit_exceeded	Joint velocity above limit	A joint velocity of the trajectory exceeds the robot model limit, so the motion was refused. The details name the joint and waypoint; correct the trajectory.
+trajectory_waypoint_shape_mismatch	Waypoint size does not match joints	A waypoint of the trajectory has a different number of values than joint names. Correct the trajectory.
+unknown_fault	Fault without reason	A fault was reported without a specific reason. The details give what is known; collect the logs and report it.
+viewer_model_resource_not_found	Viewer model file not found	The requested file is not part of the active 3D view model. Reload the view.
+viewer_model_selection_stale	Viewer model outdated	The requested 3D view model belongs to a configuration that is no longer active. Reload the view.
+admission_unavailable	Authoring admission unknown	The authoring admission state could not be read, so the status cannot show whether Program and Deployment editing is open. Check the cell status and try again.
+alarm_owner_unavailable	Alarms unavailable for status	The active alarms could not be read for the status overview, so the alarm status is unknown. Check the cell status and try again.
+authored_scene_admission_reconciliation_failed	Scene edit claims not settled	An internal check failed: the claims left by earlier Scene edits could not be settled when the Scene was recovered. Collect the logs and report it.
+component_model_unavailable	Component states unavailable	The component states could not be read, so the status shows the components offline. Check the cell status and try again.
+component_route_unavailable	Component route not opened	The component's control route could not be opened when it was enabled; the details give the reason. Check the component and the applied configuration, then Enable again.
+component_stream_declaration_invalid	Component stream declaration invalid	An internal check failed: a component declares a data stream with an invalid id or time limit. Collect the logs and report it.
+component_stream_override_invalid	Component stream setting invalid	A component stream setting in the Deployment has no component, an invalid stream id or a non-positive time limit, or repeats a stream. Correct it and Apply again.
+configuration_apply_old_claims_changed	Earlier Apply claims changed	The claims of an earlier Apply changed while this Apply was finishing, so they were not released. Check the cell status, then Apply again.
+configuration_apply_old_domain_unavailable	Earlier Apply domain not configured	A control domain of an earlier Apply has no current configuration, so its claims could not be released. Restart ManyForge.
+configuration_apply_old_fence_held	Earlier Apply still holds the cell	An internal check failed: an earlier Apply still held the cell after it was released. Collect the logs and report it.
+configuration_apply_old_fence_unsettled	Earlier Apply not settled	An earlier Apply still has queued or active operations or is not reconciled, so its claims were not released. Wait for its operations to finish, then Apply again.
+configuration_apply_original_claim_unavailable	Earlier Apply claim not held	The earlier Apply that this Apply overlaps no longer holds its claim, so this Apply could not take over. Check the cell status, then Apply again.
+controlled_hard_stop_not_installed	Hard Stop brake did not take over	The controlled hard Stop brake did not take over within its lead-in time, so the Stop continued with a controller cancel. Check the robot before any further motion.
+controlled_hard_stop_rejected	Hard Stop brake rejected	The controller rejected the controlled hard Stop brake, so the Stop continued with a controller cancel. Check the robot before any further motion.
+controlled_stop_projection_invalid	Controlled Stop joints not mapped	The controlled Stop profile could not be mapped onto the robot's joints, so the controlled Stop could not be carried out. Check the robot's joint configuration and the robot before any further motion.
+emitted_trajectory_sample_invalid	Stop trajectory waypoint invalid	A waypoint of this controlled Stop candidate is incomplete or not a finite number, so the candidate is not used.
+gripper_display_owner_unavailable	Gripper display not updated	The pneumatic gripper's commanded position could not be shown because the gripper's runtime has already closed. Gripper commands are not affected.
+installed_process_inspection_unavailable	Process inspection not available	Inspecting the installed component processes is not available in this setup, so they could not be listed.
+interpolated_acceleration_limit_exceeded	Stop ramp exceeds acceleration limit	Between two waypoints of a controlled Stop trajectory, the acceleration exceeds a joint's limit, so that trajectory is not used. The details name the joint.
+interpolated_jerk_limit_exceeded	Stop ramp exceeds jerk limit	Between two waypoints of a controlled Stop trajectory, the jerk exceeds a joint's limit, so that trajectory is not used. The details name the joint.
+io_mock_input_required	Not a Mock input	The signal is not a Mock input of the current configuration, so it cannot be set. Choose a Mock input signal.
+io_owner_recovery_invalid	I/O recovery state invalid	An internal check failed: the I/O recovery after a ROS connection loss started from an invalid state. Collect the logs and report it.
+io_owner_recovery_stale	I/O changed during recovery	An I/O driver or output changed while its ROS connection was being recovered, so the recovery was not completed. Check the I/O components, then try again.
+io_resource_preparation_incomplete	I/O preparation failed earlier	An earlier preparation of this configuration's I/O resources failed, so the configuration cannot be used. Apply again.
+io_ros_output_setup_failed	ROS I/O output setup failed	A ROS I/O output could not be set up on its ROS connection; the details give the reason. Check the I/O component and its ROS connection, then try again.
+io_ros_owner_mismatch	I/O output on another connection	An internal check failed: a retained I/O output belongs to another ROS connection. Collect the logs and report it.
+io_ros_subscription_failed	ROS I/O input setup failed	A ROS I/O input could not subscribe on its ROS connection; the details give the reason. Check the I/O component and its ROS connection, then try again.
+io_signal_catalog_stale	I/O signals changed	The I/O signals or their source changed since this request was prepared, so it was refused. Read the signals again and retry.
+late_cancel_kernel_unavailable	Late gripper cancel not recorded	A late-cancelled gripper command could not be recorded because the motion controller is not available. Check the gripper state before any further motion.
+late_cancel_owner_changed	Gripper cancel recording owner changed	An internal check failed: the gripper's late-cancel recording was bound to a different owner. Collect the logs and report it.
+late_cancel_owner_unavailable	Late gripper cancel not recorded	A late-cancelled gripper command could not be recorded because the gripper or its execution service is no longer available. Check the gripper state before any further motion.
+late_cancel_session_unavailable	Gripper recovery session unavailable	A late-cancelled gripper command was recorded, but the gripper's recovery session is not available. Check the gripper state and use Recover before continuing.
+motion_trace_store_unavailable	Motion trace not saved	The motion trace could not be written to the motion trace store; the details give the reason. Collect the logs and report it if it persists.
+native_cell_registration_invalid	Cell component registrations invalid	An internal check failed: the cell's component registrations for the new configuration are incomplete or repeated, so it was not used. Collect the logs and report it.
+ordered_contact_summary_sequence_mismatch	Contact summaries out of order	An internal check failed: the ordered-contact summaries are out of order or use another collision policy revision, so the collision validation was refused. Collect the logs and report it.
+owner_response_rejected	Status request refused	The service behind this status refused the request, so the status shows it as unavailable. The details give the reason.
+program_reset_position_cancelled	Reset position interrupted	Reset position was interrupted before the arm confirmed its target. Check the arm, then run Reset position again.
+program_reset_position_timeout	Reset position not acknowledged	Reset position did not receive the arm's acknowledgment within its time limit. Check the arm's controllers, then try again.
+program_reset_position_unavailable	Reset position not carried out	Reset position could not be carried out for this arm; the details give the reason. Check the arm's status, then try again.
+program_runner_socket_unavailable	Program connection not opened	The Program runner could not open its local Program connection, for example because another Program runner already serves it; the details give the reason. Make sure only one ManyForge is running, then start ManyForge again.
+progress_cursor_invalid	Progress position invalid	The robot's progress position is not valid, so the collision lookahead could not check the upcoming trajectory.
+progress_generation_mismatch	Progress from another motion	The progress position belongs to a different motion than the one being checked, so the collision lookahead could not use it.
+retained_tool_context_invalid	Tool context invalid	An internal check failed: the robot's tool and TCP context is incomplete or names a TCP without its tool. Collect the logs and report it.
+runtime_measured_source_unavailable	Robot measured state unavailable	The robot's measured joint state is not available or changed while it was being prepared; the details give the reason. Check the robot's driver or simulation, then try again.
+source_model_unavailable	Viewer model unavailable	The current model for the viewer could not be read, so viewing and planning previews are not available. Check the cell status and try again.
+source_stale	Data source not current	A data source behind this status has not updated recently, so the status waits until fresh data arrives.
+spring_back_initial_state_invalid	Spring-back start state invalid	The spring-back Stop could not use the robot's current state as its starting point, so the Stop continued with its hard Stop. Check the robot before any further motion.
+stop_metadata_unavailable	Stop details unavailable	The Stop response of this robot target could not be read, so the target is shown without its Stop details.
+stop_state_unavailable	Stop state unavailable	The current controlled Stop state could not be read, so the status shows the controlled Stop as unavailable. Check the cell status and try again.

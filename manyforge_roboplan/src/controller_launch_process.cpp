@@ -1,4 +1,5 @@
 #include <manyforge_roboplan/controller_launch_process.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
 
 #include <manyforge_core/time/ischeduler.hpp>
 
@@ -943,6 +944,34 @@ bool ControllerLaunchProcess::append_incident_correlation(
 ControllerLaunchOutputSnapshot
 ControllerLaunchProcess::output_snapshot() const {
   return output_->read();
+}
+
+std::string LaunchOutputTailDetail(std::string_view retained) {
+  while (!retained.empty() && (retained.back() == '\n' || retained.back() == '\r' ||
+                               retained.back() == ' '))
+    retained.remove_suffix(1U);
+  if (retained.size() > kLaunchOutputTailBytes)
+    retained.remove_prefix(retained.size() - kLaunchOutputTailBytes);
+  std::size_t lines = 1U;
+  for (auto index = retained.size(); index > 0U; --index)
+    if (retained[index - 1U] == '\n' && ++lines > kLaunchOutputTailLines) {
+      retained.remove_prefix(index);
+      break;
+    }
+  while (!retained.empty() &&
+         (static_cast<unsigned char>(retained.front()) & 0xC0U) == 0x80U)
+    retained.remove_prefix(1U);
+  return content_identity::is_utf8_nfc(retained) ? std::string(retained) : std::string();
+}
+
+std::string ControllerLaunchProcess::output_tail_detail() const {
+  std::lock_guard lock(output_->mutex);
+  return LaunchOutputTailDetail(output_->snapshot.tail);
+}
+
+bool ControllerLaunchProcess::output_contains(const std::string_view text) const {
+  std::lock_guard lock(output_->mutex);
+  return output_->snapshot.tail.find(text) != std::string::npos;
 }
 
 ControllerLaunchForwardingCounters

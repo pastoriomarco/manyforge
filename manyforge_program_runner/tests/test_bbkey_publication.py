@@ -8,13 +8,22 @@ from pathlib import Path
 import itertools
 import logging
 import threading
+from types import SimpleNamespace
 from typing import Any
 
+import py_trees
 import pytest
 
 from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.nodes.v2_owner import OwnerInvocationAdapter
+from manyforge_behavior.nodes.v2_pure import LogicSetValue
+from manyforge_behavior.orchestration_ports import (
+    NodeAttemptIdentity,
+    OwnerInvocationResult,
+)
 from manyforge_behavior.orchestration_values import (
+    NodeAttemptInputResolver,
     ProgramValueError,
     ProgramValueStore,
 )
@@ -23,6 +32,8 @@ from manyforge_behavior.program_scheduling import (
     PROGRAM_TICK_WORKER_FAILED_CODE,
     ProgramSchedulingError,
 )
+from manyforge_behavior.kernel_client import ExecutionCommandError, KernelClient
+from manyforge_behavior.run_sender import RunSender
 from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_program_runner.bbkey_publication import (
@@ -31,15 +42,13 @@ from manyforge_program_runner.bbkey_publication import (
     ProgramBlackboardPublicationScope,
 )
 from manyforge_program_runner.active_tcp_mirror import ActiveTcpMirror
-from manyforge_program_runner.execution_transport import (
-    ProgramRunnerExecutionTransport,
-)
 from manyforge_program_runner.liveness import (
     TICK_WORKER_FAULT_CODE,
     ProgramRunnerLivenessError,
 )
 from manyforge_program_runner.runtime import ProgramRunnerError, ProgramRuntime
 
+from manyforge_program_runner.tests.fake_gateway import RecordingGateway
 from manyforge_program_runner.tests.test_liveness import _heartbeat, _receiver
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -125,12 +134,20 @@ class _Host:
         }
 
 
+def _inline_sender() -> RunSender:
+    """A source sender that drains on the submitting thread (synchronous)."""
+
+    return RunSender(1, spawn=lambda _name, work: work())
+
+
 def _publisher(
     host: _Host,
     submit: Callable[[Callable[[], None]], None],
     *,
     events: list[Any] | None = None,
     between_runs: bool = False,
+    source_sender: RunSender | None = None,
+    run_sender: RunSender | None = None,
 ) -> ProgramBlackboardKeyPublisher:
     events = [] if events is None else events
     return ProgramBlackboardKeyPublisher(
@@ -142,6 +159,7 @@ def _publisher(
             cycle_generation=7,
         ),
         publish=host,
+        sender=run_sender or source_sender or _inline_sender(),
         submit=submit,
         stop_run=lambda run_id: events.append(("stop", run_id)),
         on_fault=lambda fault, reference: events.append(("fault", fault, reference)),
@@ -160,10 +178,9 @@ def _rows(frame: dict[str, Any]) -> dict[str, Any]:
 _LOSS_SEQUENCE = str(2**64 - 1)
 
 
-def test_baseline_then_each_write_forwarded_before_it_returns() -> None:
-    # no pool, no queue: a write returns after its frame's ACK, so
-    # the writer's next step (a node's motion) follows the Kernel's
-    # evaluation of it. One frame per write, never merged.
+def test_baseline_then_each_write_forwarded_in_commit_order() -> None:
+    # A sender that drains on the writing thread: one frame per write,
+    # never merged, in commit order, sequence numbers without a gap.
     store = _store()
     host, queue = _Host(), _Queue()
     publisher = _publisher(host, queue)
@@ -214,34 +231,38 @@ def test_a_pulse_reaches_the_kernel_as_two_frames() -> None:
 
 def test_operator_write_then_tree_write_are_both_forwarded_in_order() -> None:
     # every writer commits through the one store. An operator write
-    # (runtime control) still in flight holds the tree's write until its
-    # frame is ACKed: the Kernel sees true, then false.
+    # (runtime control) whose frame is still in flight never holds the
+    # tree's write: it commits at once, and its frame follows in commit
+    # order. The Kernel sees true, then false.
     store = _store()
     host = _Host()
-    publisher = _publisher(host, _Queue())
-    publisher.start(store, ("door_open",))
-    in_flight, release = threading.Event(), threading.Event()
+    publisher = _publisher(
+        host, _Queue(), source_sender=RunSender(1, name="test-bbkey-sender")
+    )
+    in_flight, release, done = threading.Event(), threading.Event(), threading.Event()
 
     def hold_operator_frame(request: dict[str, Any]) -> None:
         if _rows(request) == {"door_open": True}:
             in_flight.set()
             assert release.wait(5.0)
+        if _rows(request) == {"door_open": False} and request["kind"] == "update":
+            done.set()
 
     host.during = hold_operator_frame
-    operator = threading.Thread(target=lambda: store.write(
+    publisher.start(store, ("door_open",))
+    store.write(
         "door_open", True,
         metadata={"program_run_id": 1, "request_key": "r-1",
                   "value_source": "runtime_control"},
-    ))
-    operator.start()
+    )
     assert in_flight.wait(5.0)
     tree = threading.Thread(target=lambda: store.write("door_open", False))
     tree.start()
-    tree.join(0.2)
-    assert tree.is_alive()  # The tree's write waits for the operator's ACK.
-    release.set()
-    operator.join(5.0)
     tree.join(5.0)
+    assert not tree.is_alive()  # The tree's write never waits for a frame.
+    assert store.read("door_open") is False
+    release.set()
+    assert done.wait(5.0)
     assert [_rows(frame) for frame in host.frames[1:]] == [
         {"door_open": True}, {"door_open": False},
     ]
@@ -283,13 +304,13 @@ def test_baseline_capture_is_atomic_with_concurrent_writes() -> None:
     assert publisher.fault is None
 
 
-def test_a_failed_forward_is_source_loss_before_the_write_returns(
+def test_a_failed_forward_is_source_loss_sent_next_on_the_same_drain(
     tmp_path: Path,
 ) -> None:
     # after the source exists, a refused or unanswered forward
-    # makes the Kernel's source unavailable (exact-sender gap) before the
-    # write returns, so its rules can't watch and hold their scope; then the
-    # Run's Program Stop, then the fault fences liveness. No resend.
+    # makes the Kernel's source unavailable (exact-sender gap) as the next
+    # frame of the same drain, so its rules can't watch and hold their scope;
+    # then the Run's Program Stop, then the fault fences liveness. No resend.
     receiver = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     events: list[Any] = []
@@ -300,6 +321,7 @@ def test_a_failed_forward_is_source_loss_before_the_write_returns(
             3, 1, "sha256:" + "d" * 64, 5, 7
         ),
         publish=host,
+        sender=_inline_sender(),
         submit=queue,
         stop_run=lambda run_id: events.append(("stop", run_id)),
         on_fault=lambda fault, reference: (
@@ -311,7 +333,7 @@ def test_a_failed_forward_is_source_loss_before_the_write_returns(
     publisher.start(store, _KEYS)
     host.fail_with = HeadlessApiError("execution_owner_unavailable", "lost")
     store.write("count", 1)
-    # The write has returned: the loss frame was already sent.
+    # The inline drain has ended: the loss frame was sent right after.
     assert [(f["message_sequence"], f["previous_sequence"]) for f in host.frames] == [
         ("1", "0"), ("2", "1"), (_LOSS_SEQUENCE, str(2**64 - 2)),
     ]
@@ -473,6 +495,34 @@ def test_runtime_fences_a_failed_tick_worker_and_refuses_with_its_code(
     )
 
 
+def test_a_tick_worker_fault_names_the_last_frame_of_its_traceback(
+    tmp_path: Path,
+) -> None:
+    # OD-382 F6: the latched fault keeps its message and names where the
+    # error was raised (file:line function) in its details.
+    receiver = _receiver(tmp_path)
+    receiver._handle(_heartbeat())  # noqa: SLF001
+    runtime, _hosts = _runtime(_Applied(), _Journal())
+    runtime._liveness = receiver  # noqa: SLF001
+
+    def failing_tick() -> None:
+        raise RuntimeError("boom")
+
+    try:
+        failing_tick()
+    except RuntimeError as error:
+        runtime._fence_tick_worker_failure(error)  # noqa: SLF001
+    fault = receiver._handle(_heartbeat(sequence=2))["runner_fault"]  # noqa: SLF001
+    assert fault["message"] == "RuntimeError: boom"
+    frame = fault["details"]["last_frame"]
+    assert frame.startswith(__file__ + ":") and frame.endswith(" failing_tick")
+    with pytest.raises(ProgramRunnerLivenessError):
+        receiver.latch_runner_fault(
+            {"code": FAULT_CODE, "message": "lost", "details": {"last_frame": "x:1 f"}},
+            "sha256:" + "e" * 64,
+        )
+
+
 def test_wrong_reply_kind_is_a_fault() -> None:
     events: list[Any] = []
     store = _store()
@@ -619,10 +669,7 @@ def test_subscription_is_fixed_once_and_scalar_only() -> None:
         )
 
 
-def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
-    transport = object.__new__(ProgramRunnerExecutionTransport)
-    transport._attribution_transport = "internal"  # noqa: SLF001
-    sent: list[dict[str, Any]] = []
+def test_kernel_client_sends_the_frame_and_checks_the_ack_sequence() -> None:
     frame = {
         "schema_version": "manyforge.program_bbkey_publication.v2",
         "claim_generation": 3,
@@ -647,67 +694,49 @@ def test_transport_sends_closed_frame_and_validates_the_ack() -> None:
         "source_epoch": "source-1",
         "accepted_sequence": "2",
     }
-    transport._exchange = lambda command: sent.append(command) or dict(reply)  # type: ignore[method-assign]  # noqa: SLF001
+    gateway = RecordingGateway({
+        **{command: {"ok": True} for command in
+           ("identity", "submit", "read", "reset", "acknowledge_completed", "stop")},
+        "publish_program_bbkeys": reply,
+    })
+    client = KernelClient(gateway)
 
-    assert transport.publish_program_bbkeys(frame)["accepted_sequence"] == "2"
-    assert sent[0]["command"] == "publish_program_bbkeys"
-    assert sent[0]["request"] == frame
-    assert len(sent[0]["request"]) == 10  # The closed request.
+    def answer(value: Any) -> None:
+        gateway.replies["publish_program_bbkeys"] = value
+
+    assert client.publish_program_bbkeys(frame)["accepted_sequence"] == "2"
+    # The frame as given; the core adds the envelope and the attribution.
+    assert gateway.sent == [("publish_program_bbkeys", {"request": frame})]
+    # Only a sequence matching the status is an ACK.
     for bad_reply in (
         {k: v for k, v in reply.items() if k != "status"},
-        {k: v for k, v in reply.items() if k != "cycle_generation"},
-        {k: v for k, v in reply.items() if k != "active_publication_generation"},
-        {**reply, "active_publication_generation": "5"},
         {**reply, "status": "queued"},
         {**reply, "accepted_sequence": None},
-        {**reply, "extra": 1},
     ):
-        transport._exchange = lambda command, r=bad_reply: dict(r)  # type: ignore[method-assign]  # noqa: SLF001
-        with pytest.raises(HeadlessApiError):
-            transport.publish_program_bbkeys(frame)
+        answer(bad_reply)
+        with pytest.raises(ExecutionCommandError) as invalid:
+            client.publish_program_bbkeys(frame)
+        assert invalid.value.code == "execution_command_response_invalid"
     # The owner's ErrorDTO keeps its code (a transient retry).
-    transport._exchange = lambda command: {  # type: ignore[method-assign]  # noqa: SLF001
+    answer({
         "api_version": "manyforge.execution_command_response.v6",
         "command": "publish_program_bbkeys",
         "ok": False,
         "error": {"code": "bb_source_not_ready", "message": "installing", "details": {}},
-    }
-    with pytest.raises(HeadlessApiError) as refused:
-        transport.publish_program_bbkeys(frame)
+    })
+    with pytest.raises(ExecutionCommandError) as refused:
+        client.publish_program_bbkeys(frame)
     assert refused.value.code == "bb_source_not_ready"
     # Superseded names the installed replacement, never this frame.
     superseded = {
         **reply, "status": "superseded", "accepted_sequence": None,
         "cycle_generation": 8, "program_run_id": None, "source_epoch": "source-2",
     }
-    transport._exchange = lambda command: dict(superseded)  # type: ignore[method-assign]  # noqa: SLF001
-    assert transport.publish_program_bbkeys(frame)["status"] == "superseded"
-    transport._exchange = lambda command: {**superseded, "accepted_sequence": "2"}  # type: ignore[method-assign]  # noqa: SLF001
-    with pytest.raises(HeadlessApiError):
-        transport.publish_program_bbkeys(frame)
-    transport._exchange = lambda command: sent.append(command) or dict(reply)  # type: ignore[method-assign]  # noqa: SLF001
-    unset = {**frame, "values": [{"name": "label", "value_type": "string", "value": None}]}
-    assert transport.publish_program_bbkeys(unset)["accepted_sequence"] == "2"
-    for bad in (
-        {"previous_sequence": "0"},
-        {"kind": "renewal"},
-        {"values": [{"name": "count", "value_type": "int64", "value": 4}]},
-        {"values": []},
-        {"values": [{"name": "count", "value_type": "bool", "value": "4"}]},
-        {"active_publication_generation": 0},
-        {"active_publication_generation": None},
-    ):
-        with pytest.raises(HeadlessApiError):
-            transport.publish_program_bbkeys({**frame, **bad})
-    between_runs = {**frame, "claim_generation": None, "program_run_id": None}
-    reply["program_run_id"] = None
-    assert transport.publish_program_bbkeys(between_runs)["program_run_id"] is None
-    with pytest.raises(HeadlessApiError):  # Claim and Run go together.
-        transport.publish_program_bbkeys({**frame, "claim_generation": None})
-    transport._exchange = lambda command: {**reply, "command": "events"}  # type: ignore[method-assign]  # noqa: SLF001
-    with pytest.raises(HeadlessApiError) as invalid:  # Wrong reply kind.
-        transport.publish_program_bbkeys(frame)
-    assert invalid.value.code == "execution_command_response_invalid"
+    answer(superseded)
+    assert client.publish_program_bbkeys(frame)["status"] == "superseded"
+    answer({**superseded, "accepted_sequence": "2"})
+    with pytest.raises(ExecutionCommandError):
+        client.publish_program_bbkeys(frame)
 
 
 def test_cell_level_source_between_runs_has_no_run_and_never_stops_one() -> None:
@@ -878,6 +907,10 @@ def _runtime(applied: _Applied, journal: _Journal) -> tuple[ProgramRuntime, list
     runtime._bbkey_open_losses = {}  # noqa: SLF001
     runtime._bbkey_fence_reference = None  # noqa: SLF001
     runtime._bbkey_source_ordinals = itertools.count(1)  # noqa: SLF001
+    runtime._bbkey_idle_installed = (0, 0)  # noqa: SLF001
+    runtime._new_bbkey_source_sender = lambda _name: _inline_sender()  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._owner = SimpleNamespace(run_sender=lambda _run_id: None)  # type: ignore[assignment]  # noqa: SLF001
+    runtime._interrupt_state_follower = None  # noqa: SLF001
     runtime._interrupt_state_mirror = None  # noqa: SLF001
     runtime._interrupt_state_run_id = None  # noqa: SLF001
     runtime._grasp_lost_mirror_lock = threading.Lock()  # noqa: SLF001
@@ -899,8 +932,8 @@ def _runtime(applied: _Applied, journal: _Journal) -> tuple[ProgramRuntime, list
         return _publisher_for(scope, host)
 
     runtime._new_bbkey_publisher = new_publisher  # type: ignore[method-assign]  # noqa: SLF001
-    runtime._execution_transport = type(  # type: ignore[assignment]  # noqa: SLF001
-        "Transport", (), {"publish_program_bbkeys": lambda self, body: {}}
+    runtime._gateway = type(  # type: ignore[assignment]  # noqa: SLF001
+        "Gateway", (), {"publish_program_bbkeys": lambda self, members: {}}
     )()
     return runtime, hosts
 
@@ -911,6 +944,7 @@ def _publisher_for(
     return ProgramBlackboardKeyPublisher(
         scope,
         publish=host,
+        sender=_inline_sender(),
         submit=_inline,
         stop_run=lambda _run_id: None,
         on_fault=lambda _fault, _reference: None,
@@ -1054,9 +1088,8 @@ def _fencing_runtime(
     runtime._bbkey_pending = {}  # noqa: SLF001
     runtime.config = type("Config", (), {"headless_timeout_seconds": 30.0})()  # type: ignore[assignment]
     runtime._stop_for_bbkey_publication_fault = stops.append  # type: ignore[method-assign]  # noqa: SLF001
-    runtime._execution_transport = type(  # type: ignore[assignment]  # noqa: SLF001
-        "Transport", (), {"publish_program_bbkeys": staticmethod(host)}
-    )()
+    # The Kernel client's publication (its reply check is the client's own).
+    applied.publish_program_bbkeys = host  # type: ignore[attr-defined]
     return runtime, applied, journal, receiver, stops
 
 
@@ -1430,3 +1463,508 @@ def test_a_source_not_ready_starts_later_from_the_values_committed_meanwhile(
     assert runtime._bbkey_pending == {} and stops == []  # noqa: SLF001
     assert runtime._bbkey_publishers[None].baseline_accepted  # noqa: SLF001
     assert receiver._handle(_heartbeat(sequence=2))["runner_fault"] is None  # noqa: SLF001
+
+
+# Captured under the store lock, sent off it, on one ordered sender -------
+
+
+class _ManualSpawn:
+    """A sender's thread start that runs nothing until the test drains it."""
+
+    def __init__(self) -> None:
+        self.pending: list[Callable[[], None]] = []
+
+    def __call__(self, _name: str, work: Callable[[], None]) -> None:
+        self.pending.append(work)
+
+    def run(self) -> None:
+        while self.pending:
+            self.pending.pop(0)()
+
+
+def _all_sent(host: _Host, count: int) -> threading.Event:
+    sent = threading.Event()
+    during = host.during
+
+    def observe(request: dict[str, Any]) -> None:
+        if during is not None:
+            during(request)
+        if len(host.frames) >= count:
+            sent.set()
+
+    host.during = observe
+    return sent
+
+
+def test_concurrent_writers_reach_the_wire_in_strictly_increasing_sequence() -> None:
+    store = _store()
+    host = _Host()
+    writes = {
+        "count": list(range(1, 101)),
+        "speed": [float(value) for value in range(1, 101)],
+        "label": [f"label-{value}" for value in range(100)],
+        "door_open": [value % 2 == 0 for value in range(100)],
+    }
+    sent = _all_sent(host, 1 + sum(len(values) for values in writes.values()))
+    publisher = _publisher(
+        host, _Queue(), source_sender=RunSender(1, name="test-bbkey-sender")
+    )
+    publisher.start(store, _KEYS)
+    writers = [
+        threading.Thread(
+            target=lambda key=key, values=values: [store.write(key, v) for v in values]
+        )
+        for key, values in writes.items()
+    ]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(10.0)
+    assert sent.wait(10.0)
+    sequences = [int(frame["message_sequence"]) for frame in host.frames]
+    assert sequences == list(range(1, len(host.frames) + 1))
+    assert all(
+        int(frame["previous_sequence"]) == int(frame["message_sequence"]) - 1
+        for frame in host.frames
+    )
+    # Each key's frames carry its writer's values in commit order.
+    for key, values in writes.items():
+        rows = [_rows(frame)[key] for frame in host.frames[1:] if key in _rows(frame)]
+        assert rows == [str(value) if key == "count" else value for value in values]
+    assert publisher.fault is None
+
+
+def test_no_lock_is_held_while_a_frame_is_sent() -> None:
+    store = _store()
+    host = _Host()
+    in_flight, release = threading.Event(), threading.Event()
+    store_lock_owned: list[bool] = []
+
+    def hold_update(request: dict[str, Any]) -> None:
+        # The sending thread holds no store lock, and the frame does not
+        # hold any writer or reader while it is in flight.
+        store_lock_owned.append(store._lock._is_owned())  # noqa: SLF001
+        if request["kind"] == "update" and request["message_sequence"] == "2":
+            in_flight.set()
+            assert release.wait(5.0)
+
+    host.during = hold_update
+    sent = _all_sent(host, 3)
+    publisher = _publisher(
+        host, _Queue(), source_sender=RunSender(1, name="test-bbkey-sender")
+    )
+    publisher.start(store, ("count",))
+    store.write("count", 1)
+    assert in_flight.wait(5.0)
+    writer = threading.Thread(target=lambda: store.write("count", 2))
+    writer.start()
+    writer.join(5.0)
+    assert not writer.is_alive() and store.read("count") == 2
+    release.set()
+    assert sent.wait(5.0)
+    assert store_lock_owned == [False, False, False]
+    assert [_rows(frame) for frame in host.frames[1:]] == [{"count": "1"}, {"count": "2"}]
+
+
+def test_a_refused_frame_drops_the_later_ones_and_declares_the_loss_next() -> None:
+    # The writer observes what it did before: the write commits and returns;
+    # the fault latches, the loss is the source's next frame, then Program
+    # Stop and the fault report run on the owner's pool.
+    events: list[Any] = []
+    store = _store()
+    host = _Host()
+    spawn, queue = _ManualSpawn(), _Queue()
+
+    def refuse_two(request: dict[str, Any]) -> None:
+        host.fail_with = _SCOPE_STALE if request["message_sequence"] == "2" else None
+
+    host.during = refuse_two
+    publisher = _publisher(
+        host, queue, events=events, source_sender=RunSender(1, spawn=spawn)
+    )
+    publisher.start(store, ("count",))
+    store.write("count", 1)
+    store.write("count", 2)  # Captured behind the refused frame.
+    assert host.frames == [] and store.read("count") == 2
+    spawn.run()
+    assert [frame["message_sequence"] for frame in host.frames] == ["1", "2", _LOSS_SEQUENCE]
+    assert publisher.fault is not None and "program_bb_scope_stale" in publisher.fault["message"]
+    store.write("count", 3)  # After the fault a write only commits.
+    spawn.run()
+    assert len(host.frames) == 3
+    queue.run()
+    assert [event[0] for event in events] == ["stop", "fault"]
+
+
+def test_writes_behind_an_unready_baseline_are_carried_by_the_next_one() -> None:
+    store = _store()
+    host = _ScriptedHost(HeadlessApiError("bb_source_not_ready", "installing"))
+    spawn = _ManualSpawn()
+    publisher = _publisher(
+        host, _Queue(), between_runs=True, source_sender=RunSender(1, spawn=spawn)
+    )
+    assert publisher.start(store, ("count",)) is False
+    assert publisher.baseline_in_flight
+    store.write("count", 4)  # Follows the baseline as update 2 ...
+    spawn.run()
+    # ... and is dropped with it: the source did not exist.
+    assert [frame["message_sequence"] for frame in host.frames] == ["1"]
+    assert not publisher.baseline_in_flight and not publisher.settled
+    assert publisher.start(store, ("count",)) is False
+    spawn.run()
+    assert [(f["kind"], f["message_sequence"], _rows(f)) for f in host.frames[1:]] == [
+        ("baseline", "1", {"count": "4"}),
+    ]
+    assert publisher.settled and publisher.fault is None
+
+
+def test_a_run_source_frame_reaches_the_host_before_the_next_run_request() -> None:
+    # A value a node writes before the next node's request is sent first:
+    # both leave on the Run's one sender, in that order.
+    store = _store()
+    wire: list[Any] = []
+    host = _Host()
+    host.during = lambda request: wire.append(request["message_sequence"])
+    run_spawn = _ManualSpawn()
+    run_sender = RunSender(4, spawn=run_spawn)
+    publisher = _publisher(host, _Queue(), run_sender=run_sender)
+    publisher.start(store, ("count",))
+    store.write("count", 1)
+    run_sender.submit(lambda: wire.append("motion start"))
+    run_spawn.run()
+    assert wire == ["1", "2", "motion start"]
+
+
+def test_halt_never_withdraws_a_publication_and_a_sent_one_completes() -> None:
+    # Values are state: a Halt or the Run's end withdraws the Run's queued
+    # requests but never a captured frame (a gap would lose the source). A
+    # frame already sent completes with its real reply. After the Run's
+    # sender closed, the source still drains on it (not withdrawable).
+    store = _store()
+    wire: list[Any] = []
+    host = _Host()
+    run_spawn = _ManualSpawn()
+    run_sender = RunSender(4, spawn=run_spawn)
+    publisher = _publisher(host, _Queue(), run_sender=run_sender)
+    publisher.start(store, ("count",))
+    run_spawn.run()
+    store.write("count", 1)  # Queued on the Run's sender ...
+    motion = run_sender.submit(lambda: wire.append("motion start"))
+    run_sender.withdraw_queued()  # ... when the Halt arrives.
+    assert motion.withdrawn
+    run_spawn.run()
+    assert [frame["message_sequence"] for frame in host.frames] == ["1", "2"]
+
+    def halt_and_end_while_sent(request: dict[str, Any]) -> None:
+        if request["message_sequence"] == "3":
+            run_sender.withdraw_queued()
+            run_sender.close()
+
+    host.during = halt_and_end_while_sent
+    store.write("count", 2)
+    run_spawn.run()
+    assert [frame["message_sequence"] for frame in host.frames] == ["1", "2", "3"]
+    assert publisher.fault is None
+    store.write("count", 3)  # The Run's sender is closed: still sent on it.
+    run_spawn.run()
+    assert [frame["message_sequence"] for frame in host.frames] == ["1", "2", "3", "4"]
+    assert publisher.fault is None and wire == []
+
+
+def test_source_creation_holds_no_lock_across_host_reads() -> None:
+    applied, journal = _Applied(), _Journal()
+    runtime, hosts = _runtime(applied, journal)
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    held: list[tuple[str, bool]] = []
+    program_applied, identity = applied.program_applied, applied.identity
+
+    def owned(name: str) -> None:
+        held.append((name, runtime._bbkey_source_lock._is_owned()))  # noqa: SLF001
+
+    applied.program_applied = lambda: (owned("applied"), program_applied())[1]  # type: ignore[method-assign]
+    applied.identity = lambda: (owned("identity"), identity())[1]  # type: ignore[method-assign]
+    applied.read_active_tcp = lambda *, ordered: (  # type: ignore[attr-defined]
+        owned("read_active_tcp"), {"robots": []}
+    )[1]
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    assert held == [("applied", False), ("identity", False), ("read_active_tcp", False)]
+    (between_runs,) = hosts
+    assert [frame["kind"] for frame in between_runs.frames] == ["baseline"]
+
+    held.clear()
+    store = _store()
+    runtime._owner = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        run_sender=lambda _run_id: None, value_store=lambda _run_id: store
+    )
+    runtime._start_bbkey_publication(  # noqa: SLF001
+        1, claim_generation=3, program_binding_id="sha256:" + "d" * 64,
+        active_publication_generation=5, cycle_generation=7, keys=("count",),
+        retained_bundle_id="bundle-1", graph_revision="graph-1",
+        binding={"target_bindings": []},
+    )
+    assert held == [("read_active_tcp", False)]
+    assert [frame["kind"] for frame in hosts[1].frames] == ["baseline"]
+    assert None not in runtime._bbkey_publishers  # The Run retired it.  # noqa: SLF001
+
+
+def test_a_creation_from_older_host_reads_drops() -> None:
+    # Follower A read publication 5, then B read publication 6 and installed
+    # it: A's later install would bring back the older source, so it drops.
+    applied, journal = _Applied(), _Journal()
+    runtime, hosts = _runtime(applied, journal)
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    a_reading, release_a = threading.Event(), threading.Event()
+
+    def read_active_tcp(*, ordered: bool) -> dict[str, Any]:
+        if threading.current_thread().name == "A":
+            a_reading.set()
+            assert release_a.wait(5.0)
+        return {"robots": []}
+
+    applied.read_active_tcp = read_active_tcp  # type: ignore[attr-defined]
+    first = threading.Thread(target=runtime._follow_cell_bbkey_source, name="A")  # noqa: SLF001
+    first.start()
+    assert a_reading.wait(5.0)
+    applied.generation = 6
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    release_a.set()
+    first.join(5.0)
+    assert not first.is_alive()
+    (newer,) = hosts
+    assert newer.frames[0]["active_publication_generation"] == 6
+    assert runtime._bbkey_publishers[None].scope.active_publication_generation == 6  # noqa: SLF001
+
+
+# --- A write returns its result after the host's answer (OD-213 part 3) ------
+#
+# Base sent each frame inside the store write, so a write (and the node or
+# command that made it) returned only after the Kernel answered it; a refused
+# frame was declared lost and its containment queued before the write
+# returned, and the write itself never raised. The send now leaves the tick;
+# the writer still returns that result only after the answer.
+
+_RUNNING = py_trees.common.Status.RUNNING
+_SUCCESS = py_trees.common.Status.SUCCESS
+_INVALID = py_trees.common.Status.INVALID
+
+
+class _ThreadedSpawn(_ManualSpawn):
+    """A run's sender whose queue is emptied on a thread of its own."""
+
+    def run(self) -> None:
+        while self.pending:
+            worker = threading.Thread(target=self.pending.pop(0))
+            worker.start()
+            worker.join(5.0)
+
+
+def _run_source(
+    host: _Host, *, events: list[Any] | None = None, queue: _Queue | None = None,
+) -> tuple[ProgramValueStore, RunSender, _ThreadedSpawn, ProgramBlackboardKeyPublisher]:
+    store = _store()
+    spawn = _ThreadedSpawn()
+    sender = RunSender(4, spawn=spawn)
+    publisher = _publisher(host, queue or _Queue(), events=events, run_sender=sender)
+    publisher.start(store, ("count", "label"))
+    spawn.run()
+    assert publisher.baseline_accepted
+    return store, sender, spawn, publisher
+
+
+def _set_value(store: ProgramValueStore, sender: RunSender, value: Any = 7) -> LogicSetValue:
+    node = LogicSetValue(
+        name="set_count",
+        parameters={"key": "count", "value": value},
+        value_sources={},
+        input_resolver=NodeAttemptInputResolver(
+            program=store.program, catalog=_CATALOG, value_store=store
+        ),
+        attempt_source=SimpleNamespace(
+            begin=lambda instance: NodeAttemptIdentity(1, instance, 1)
+        ),
+        run_sender=sender,
+    )
+    node.setup_with_descendants()
+    return node
+
+
+def test_a_write_is_answered_once_the_host_answered_its_frame() -> None:
+    host = _Host()
+    store, _sender, spawn, _publisher_ = _run_source(host)
+    receipt = store.write("count", 1)
+    assert receipt is not None and not receipt.answered
+    assert store.read("count") == 1 and len(host.frames) == 1  # Committed, not sent.
+    spawn.run()
+    assert receipt.answered and _rows(host.frames[-1]) == {"count": "1"}
+    # Nothing is sent: nothing to answer.
+    assert store.write("speed", 2.0) is None
+    assert store.write("count", 1) is None
+
+
+def test_a_refused_write_is_answered_after_the_loss_and_its_containment() -> None:
+    events: list[Any] = []
+    queue = _Queue()
+    host = _Host()
+    store, _sender, spawn, publisher = _run_source(host, events=events, queue=queue)
+    seen: list[tuple[bool, bool]] = []
+    receipts: list[Any] = []
+
+    def refuse_two(request: dict[str, Any]) -> None:
+        host.fail_with = _SCOPE_STALE if request["message_sequence"] == "2" else None
+        if request["message_sequence"] == _LOSS_SEQUENCE:
+            seen.append((receipts[0].answered, receipts[1].answered))
+
+    host.during = refuse_two
+    receipts.append(store.write("count", 1))
+    receipts.append(store.write("label", "later"))  # Dropped behind the refusal.
+    spawn.run()
+    # Both writers are answered only once the loss was declared and the
+    # containment handed over (queued, not run), as base's write returned.
+    assert seen == [(False, False)]
+    assert all(receipt.answered for receipt in receipts)
+    assert publisher.fault is not None and len(queue.work) == 1 and events == []
+    queue.run()
+    assert [event[0] for event in events] == ["stop", "fault"]
+    assert store.write("count", 3) is None  # After the fault a write only commits.
+
+
+def test_dropped_frames_are_answered_without_a_send() -> None:
+    # A source not installed yet, or retired by the Runner: the frame is
+    # never sent, and its writer is answered at once (base: only committed).
+    host = _ScriptedHost(HeadlessApiError("bb_source_not_ready", "installing"))
+    spawn = _ManualSpawn()
+    store = _store()
+    publisher = _publisher(
+        host, _Queue(), between_runs=True, source_sender=RunSender(1, spawn=spawn)
+    )
+    publisher.start(store, ("count",))
+    behind_baseline = store.write("count", 4)
+    assert behind_baseline is not None and not behind_baseline.answered
+    spawn.run()
+    assert behind_baseline.answered and len(host.frames) == 1
+    host2 = _Host()
+    store2, _sender2, spawn2, publisher2 = _run_source(host2)
+    queued = store2.write("count", 5)
+    publisher2.retire()
+    assert queued is not None and queued.answered
+    spawn2.run()
+    assert len(host2.frames) == 1
+
+
+def test_a_command_thread_write_replies_after_the_host_answer() -> None:
+    host = _Host()
+    store, _sender, spawn, _publisher_ = _run_source(host)
+    replied = threading.Event()
+
+    def command() -> None:
+        receipt = store.write("count", 9, metadata={"value_source": "runtime_control"})
+        assert receipt is not None
+        receipt.wait()
+        replied.set()
+
+    thread = threading.Thread(target=command)
+    thread.start()
+    assert not replied.wait(0.2)  # Committed; the reply waits for the host.
+    assert store.read("count") == 9
+    spawn.run()
+    assert replied.wait(5.0)
+    thread.join(5.0)
+
+
+def test_a_set_value_node_is_running_until_the_host_answered_its_value() -> None:
+    host = _Host()
+    send_threads: list[int] = []
+    host.during = lambda _request: send_threads.append(threading.get_ident())
+    store, sender, spawn, _publisher_ = _run_source(host)
+    node = _set_value(store, sender)
+    node.tick_once()
+    assert node.status is _RUNNING and store.read("count") == 7
+    node.tick_once()
+    assert node.status is _RUNNING and len(host.frames) == 1  # Nothing sent in the tick.
+    later = sender.submit(lambda: "next node's request")
+    spawn.run()
+    node.tick_once()
+    assert node.status is _SUCCESS
+    # The frame left before the later request, never on the tick's thread.
+    assert _rows(host.frames[-1]) == {"count": "7"} and later.answered
+    assert threading.get_ident() not in send_threads
+
+
+def test_a_refused_value_still_ends_the_node_as_base_did() -> None:
+    # Base: the write never raised; the node succeeded after the loss was
+    # declared, and the Run's Program Stop followed from the containment.
+    events: list[Any] = []
+    queue = _Queue()
+    host = _Host()
+    store, sender, spawn, publisher = _run_source(host, events=events, queue=queue)
+    host.fail_with = _SCOPE_STALE
+    node = _set_value(store, sender)
+    node.tick_once()
+    assert node.status is _RUNNING
+    spawn.run()
+    node.tick_once()
+    assert node.status is _SUCCESS and publisher.fault is not None
+    assert [frame["message_sequence"] for frame in host.frames][-1] == _LOSS_SEQUENCE
+    queue.run()
+    assert [event[0] for event in events] == ["stop", "fault"]
+
+
+def test_a_stop_after_the_write_ends_the_node_with_its_real_result() -> None:
+    host = _Host()
+    store, sender, spawn, _publisher_ = _run_source(host)
+    node = _set_value(store, sender)
+    node.tick_once()
+    assert node.status is _RUNNING
+    node.stop(_INVALID)  # Forced Program End: the committed value still goes.
+    assert node.settle_abandoned_request() is False
+    sender.close()
+    spawn.run()
+    assert _rows(host.frames[-1]) == {"count": "7"}
+    assert node.settle_abandoned_request() is True
+    assert node.status is _SUCCESS
+
+
+def test_an_invocation_stopped_after_its_send_writes_its_output() -> None:
+    # Base made the read and wrote its output inside one tick: a Stop could
+    # not fall between them. Now the stopped node's answered read still
+    # writes the output, and ends once the host answered that value.
+    host = _Host()
+    store, sender, spawn, _publisher_ = _run_source(host)
+
+    entered, release = threading.Event(), threading.Event()
+
+    class _Port:
+        def invoke(self, node_id, identity, inputs):
+            entered.set()
+            assert release.wait(5.0)
+            return OwnerInvocationResult(True, output="tripped")
+
+    node = OwnerInvocationAdapter(
+        name="read", node_id="io.get_input", node_instance_id="read",
+        port=_Port(), parameters={"output_key": "label"}, value_sources={},
+        output_key_parameter="output_key",
+        attempt_source=SimpleNamespace(begin=lambda instance: NodeAttemptIdentity(1, instance, 1)),
+        input_resolver=SimpleNamespace(
+            snapshot=lambda **kwargs: SimpleNamespace(
+                parameters=kwargs["parameters"], blackboard={}
+            ),
+            value_store=store,
+        ),
+        run_sender=sender,
+    )
+    node.setup_with_descendants()
+    node.tick_once()
+    assert node.status is _RUNNING
+    worker = threading.Thread(target=spawn.run)
+    worker.start()
+    assert entered.wait(5.0)  # The read is sent ...
+    node.stop(_INVALID)  # ... when the Forced Program End arrives.
+    sender.close()
+    assert node.settle_abandoned_request() is False
+    release.set()
+    worker.join(5.0)  # The read is answered.
+    assert node.settle_abandoned_request() is False  # Its output is on its way.
+    assert store.read("label") == "tripped"
+    spawn.run()
+    assert _rows(host.frames[-1]) == {"label": "tripped"}
+    assert node.settle_abandoned_request() is True and node.status is _SUCCESS

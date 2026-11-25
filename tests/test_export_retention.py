@@ -127,6 +127,48 @@ def test_pass_deletes_at_most_eight_closed_units(tmp_path):
     assert len(result.deleted)==8 and 'bounded deletion pass complete' in result.warning
 
 
+def roomy(root):
+    return retention.rotate_retained_logs(root, retention.SiteRetentionPolicy(10, 10),
+                                          disk_facts=lambda _: retention.DiskFacts(10**12, 10**12))
+
+
+def test_count_keeps_the_newest_ten_completed_owned_captures_without_pressure(tmp_path):
+    root = tmp_path / 'runtime'
+    folders = [capture(root, index) for index in range(13)]
+    partial = capture(root, 20)
+    partial.rename(partial.with_name(partial.name + '.partial'))
+    unknown = capture(root, 21)
+    (unknown / 'docker-inspect.json').write_text('{}')
+    result = roomy(root)
+    assert result.deleted == tuple(str(folder.relative_to(root)) for folder in folders[:3])
+    assert result.warning is None
+    assert all(folder.exists() for folder in folders[3:])
+    assert partial.with_name(partial.name + '.partial').exists() and unknown.exists()
+    assert roomy(root) == retention.RetentionResult()
+
+
+def test_count_stays_within_the_pass_deletion_limit(tmp_path):
+    root = tmp_path / 'runtime'
+    folders = [capture(root, index) for index in range(20)]
+    assert roomy(root).deleted == tuple(str(folder.relative_to(root)) for folder in folders[:8])
+    assert roomy(root).deleted == tuple(str(folder.relative_to(root)) for folder in folders[8:10])
+    assert all(folder.exists() for folder in folders[10:])
+
+
+def test_count_neither_counts_nor_deletes_partial_or_unknown_captures(tmp_path):
+    root = tmp_path / 'runtime'
+    folders = [capture(root, index) for index in range(10)]
+    for index in range(10, 20):
+        folder = capture(root, index)
+        if index % 2:
+            folder = folder.rename(folder.with_name(folder.name + '.partial'))
+        else:
+            (folder / 'docker-inspect.json').write_text('{}')
+        folders.append(folder)
+    assert roomy(root) == retention.RetentionResult()
+    assert all(folder.exists() for folder in folders)
+
+
 def test_default_aggregate_counts_but_never_deletes_sibling_root(tmp_path):
     base=tmp_path/'runtime'
     selected,sibling=base/'selected',base/'active-other'
@@ -146,7 +188,7 @@ def test_previous_session_journals_are_accounted_but_never_pruned_without_histor
     archive = root / 'previous-runs' / ('a' * 32)
     archive.mkdir(parents=True)
     (archive / 'session.json').write_text(json.dumps({
-        'schema_version': 'manyforge.workbench_session.v2', 'session_id': 'a' * 32,
+        'schema_version': 'manyforge.workbench_session.v3', 'session_id': 'a' * 32,
         'disposition': 'stopped', 'shutdown': 'clean', 'effects': effects,
     }))
     # Real allocated bytes, not sparse logical length, must count toward the retention bound.
@@ -1214,3 +1256,48 @@ def test_version_one_site_file_is_read_with_the_defaults(tmp_path):
     path.write_text(json.dumps({'schema': 'manyforge.site.v3'}))
     with pytest.raises(ValueError, match='site settings schema must be manyforge.site.v2'):
         run_session.read_site_disk_limits(path)
+
+
+def test_core_dumps_are_off_unless_the_site_file_enables_them(tmp_path):
+    assert run_session.read_site_core_dump_limit(None) == 0
+    assert run_session.read_site_core_dump_limit(_site(tmp_path)) == 0
+    assert run_session.read_site_core_dump_limit(
+        _site(tmp_path, core_dumps={'enabled': False, 'max_bytes': 1_000_000})) == 0
+    assert run_session.read_site_core_dump_limit(
+        _site(tmp_path, core_dumps={'enabled': True, 'max_bytes': 1_073_741_824})) == 1_073_741_824
+    assert run_session.read_site_core_dump_limit(
+        _site(tmp_path, core_dumps={'enabled': True, 'max_bytes': 2 ** 53 - 1})) == 2 ** 53 - 1
+    # The disk limits' reader accepts the member too (one validation).
+    assert run_session.read_site_disk_limits(
+        _site(tmp_path, core_dumps={'enabled': True, 'max_bytes': 4096})) == run_session.DiskLimits()
+
+
+@pytest.mark.parametrize('value, text', [
+    (True, 'core_dumps must be an object with exactly enabled'),
+    (None, 'core_dumps must be an object with exactly enabled'),
+    ({}, 'core_dumps must be an object with exactly enabled'),
+    ({'enabled': True}, 'core_dumps must be an object with exactly enabled'),
+    ({'max_bytes': 4096}, 'core_dumps must be an object with exactly enabled'),
+    ({'enabled': 1, 'max_bytes': 4096}, 'core_dumps must be an object with exactly enabled'),
+    ({'enabled': True, 'max_bytes': 4096, 'path': '/tmp'}, 'core_dumps must be an object with exactly enabled'),
+    ({'enabled': True, 'max_bytes': 0}, 'core_dumps.max_bytes must be an integer from 1 to 9007199254740991'),
+    ({'enabled': False, 'max_bytes': -1}, 'core_dumps.max_bytes must be an integer from 1 to 9007199254740991'),
+    ({'enabled': True, 'max_bytes': 10.5}, 'core_dumps.max_bytes must be an integer from 1 to 9007199254740991'),
+    ({'enabled': True, 'max_bytes': '4096'}, 'core_dumps.max_bytes must be an integer from 1 to 9007199254740991'),
+    ({'enabled': True, 'max_bytes': True}, 'core_dumps.max_bytes must be an integer from 1 to 9007199254740991'),
+    ({'enabled': True, 'max_bytes': 2 ** 53}, 'core_dumps.max_bytes must be an integer from 1 to 9007199254740991'),
+])
+def test_a_malformed_core_dumps_member_is_refused(tmp_path, value, text):
+    path = _site(tmp_path, core_dumps=value)
+    for reader in (run_session.read_site_core_dump_limit, run_session.read_site_disk_limits):
+        with pytest.raises(ValueError, match=text):
+            reader(path)
+
+
+def test_a_version_one_site_file_cannot_enable_core_dumps(tmp_path):
+    path = tmp_path / 'manyforge.site.json'
+    path.write_text(json.dumps({'schema': 'manyforge.site.v1', 'core_dumps': {'enabled': True, 'max_bytes': 4096}}))
+    with pytest.raises(ValueError) as refused:
+        run_session.read_site_core_dump_limit(path)
+    assert str(refused.value) == ("site settings core_dumps needs schema manyforge.site.v2: change the first "
+                                  "line's schema to manyforge.site.v2; no other change is needed")

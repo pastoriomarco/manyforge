@@ -96,7 +96,7 @@ def _runtime(
             persistent_key_register_directory=tmp_path,
         ),
         headless_client=headless,  # type: ignore[arg-type]
-        execution_transport=headless,  # type: ignore[arg-type]
+        gateway=headless,  # type: ignore[arg-type]
         admission_client=_Admission(),  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(tmp_path / f"{name}.sqlite3"),
     )
@@ -386,7 +386,7 @@ def test_another_register_version_refuses_the_runner_by_name(tmp_path: Path) -> 
                 persistent_key_register_directory=tmp_path,
             ),
             headless_client=_Headless(),  # type: ignore[arg-type]
-            execution_transport=_Headless(),  # type: ignore[arg-type]
+            gateway=_Headless(),  # type: ignore[arg-type]
             admission_client=_Admission(),  # type: ignore[arg-type]
         )
     assert refused.value.code == "persistent_key_register_version_unsupported"

@@ -13,7 +13,7 @@ from __future__ import annotations
 import sys
 
 
-UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: ros2_medkit fault publication requires the "
     "addressed runtime diagnostics source"

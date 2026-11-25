@@ -6,7 +6,7 @@ from typing import Final
 
 
 MOTION_TRANSACTION_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_motion_transaction_owner_unavailable"
+    "motion_transaction_owner_unavailable"
 )
 
 

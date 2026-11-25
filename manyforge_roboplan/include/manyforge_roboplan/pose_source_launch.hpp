@@ -111,13 +111,20 @@ pose_source_launch_command(const PoseSourcePlan &plan,
 pose_source_launch_survives(ControllerLaunchProcess *process,
                             const std::optional<PoseSourcePlan> &candidate);
 
-/// The typed fault of an exited observer: `pose_source_config_invalid` with
-/// the output tail (detail `output_tail`) for exit status 78 (directly, or as
-/// `ros2 launch` reports its child), otherwise `pose_source_exited`; for
-/// kAiModel `ai_model_config_invalid` / `ai_model_exited`.
+/// What `ros2 launch` prints when the observer exits with status 78: it ends
+/// normally itself and reports its child's status as
+/// "process has died [pid N, exit code 78, ...]".
+[[nodiscard]] std::string pose_source_child_config_invalid_text();
+
+/// The typed fault of an exited observer: `pose_source_config_invalid` for
+/// exit status 78 (directly, or `child_config_invalid`: its retained output
+/// contains `pose_source_child_config_invalid_text()`), otherwise
+/// `pose_source_exited`; for kAiModel `ai_model_config_invalid` /
+/// `ai_model_exited`. Each carries `output_tail` (the launch's
+/// `LaunchOutputTailDetail`) as detail `output_tail` (absent when empty).
 [[nodiscard]] core::ErrorDTO
 pose_source_exit_fault(std::string reason, std::optional<int> exit_status,
-                       std::string_view output_tail,
+                       bool child_config_invalid, std::string output_tail,
                        ControllerLaunchLane lane = ControllerLaunchLane::kPoseSource);
 
 /// The driver's supervised-process fault source for `process` (its lane

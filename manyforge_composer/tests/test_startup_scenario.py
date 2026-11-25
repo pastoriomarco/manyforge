@@ -550,7 +550,7 @@ def test_contradictory_applied_program_status_is_not_a_publication() -> None:
 
 
 @pytest.mark.parametrize("malformed_origin", [False, True])
-def test_h1a_restore_reads_checked_scenario_origin(monkeypatch, malformed_origin) -> None:
+def test_restore_reads_checked_scenario_origin(monkeypatch, malformed_origin) -> None:
     from manyforge_composer.backend import routes_draft
     program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
     selection = _selection(program.to_dict())

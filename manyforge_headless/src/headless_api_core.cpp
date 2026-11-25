@@ -141,22 +141,132 @@ std::uint64_t RequiredCounter(const CanonicalValue &root,
                               std::string_view name,
                               std::uint64_t minimum = 0U);
 
+// A safe integer (at least `minimum`) of a previous-session fact.
+bool PreviousSessionInteger(const CanonicalValue &value, const double minimum) {
+  const auto *number = std::get_if<double>(&value.storage());
+  return number != nullptr && std::isfinite(*number) && *number >= minimum &&
+         std::floor(*number) == *number &&
+         std::fabs(*number) <= static_cast<double>(kMaximumSafeInteger);
+}
+
+// UTC text ending in Z, as the launcher and the Manager write it.
+bool PreviousSessionUtcText(const CanonicalValue &value) {
+  const auto *text = std::get_if<std::string>(&value.storage());
+  return text != nullptr && text->size() <= 64U && text->ends_with('Z') &&
+         HistorianRecordedUtcNs(*text).has_value();
+}
+
+// The v4 report's `application_end` (schema manyforge.application_end.v1):
+// how the previous run ended, as the Manager recorded it, or null.
+void ValidateApplicationEnd(const CanonicalValue &end, const std::string &code) {
+  if (end.is_null()) return;
+  Require(end.is_object() && end.as_object().size() == 4U &&
+              RequiredString(end, "schema_version") == "manyforge.application_end.v1",
+          code, "previous-session application end is invalid");
+  const auto ended_by = RequiredString(end, "ended_by");
+  Require((ended_by == "process_exit" || ended_by == "stop_signal" ||
+           ended_by == "shutdown_runtime" || ended_by == "manager_failure") &&
+              PreviousSessionUtcText(RequiredMember(end, "ended_at_wall")),
+          code, "previous-session application end is invalid");
+  // A process exit names its process; every other ending names none.
+  const auto &process = RequiredMember(end, "process");
+  Require((ended_by == "process_exit") != process.is_null(), code,
+          "previous-session application end is invalid");
+  if (process.is_null()) return;
+  Require(process.is_object() && process.as_object().size() == 5U, code,
+          "previous-session ended process is invalid");
+  const auto role = RequiredString(process, "role");
+  const auto nullable_integer = [&](const std::string_view name) {
+    const auto &value = RequiredMember(process, name);
+    return value.is_null() || PreviousSessionInteger(value, -static_cast<double>(kMaximumSafeInteger));
+  };
+  Require(role.size() <= 256U && content_identity::is_utf8_nfc(role) &&
+              PreviousSessionInteger(RequiredMember(process, "pid"), 1.0) &&
+              nullable_integer("exit_status") && nullable_integer("signal") &&
+              std::holds_alternative<bool>(RequiredMember(process, "core_dumped").storage()),
+          code, "previous-session ended process is invalid");
+}
+
+// The v4 report's `archived_older_marker`: null, or the marker format of an
+// older build's session the launcher archived at an upgrade.
+bool PreviousSessionOlderMarker(const CanonicalValue &value) {
+  if (value.is_null()) return true;
+  constexpr std::string_view kPrefix = "manyforge.workbench_session.v";
+  const auto *text = std::get_if<std::string>(&value.storage());
+  return text != nullptr && text->size() <= 64U && text->size() > kPrefix.size() &&
+         text->starts_with(kPrefix) &&
+         std::all_of(text->begin() + static_cast<std::ptrdiff_t>(kPrefix.size()), text->end(),
+                     [](char c) { return c >= '0' && c <= '9'; });
+}
+
+// The previous-session alarm's headline when the report names an older
+// build's session archived at an upgrade (its marker format and archive),
+// the process that ended the run (its role, pid, signal or exit status and
+// time) or a Manager failure (its time).
+std::optional<std::string> PreviousSessionEndMessage(const CanonicalValue &report) {
+  constexpr std::string_view kKept =
+      ". The cell started empty; nothing from the previous session was resumed."
+      " Its records are kept; details in History.";
+  const auto *older = report.find_object_member("archived_older_marker");
+  if (older != nullptr && !older->is_null()) {
+    return "ManyForge was upgraded: the previous session ran an older build (marker " +
+           older->as_string() + ") and was archived to " +
+           RequiredString(report, "archive_relative_path") +
+           "; whether it closed correctly is unknown" + std::string(kKept);
+  }
+  const auto *end = report.find_object_member("application_end");
+  if (end == nullptr || end->is_null()) return std::nullopt;
+  if (RequiredString(*end, "ended_by") == "manager_failure") {
+    return "ManyForge did not close correctly last time: the Manager failed at " +
+           RequiredString(*end, "ended_at_wall") + std::string(kKept);
+  }
+  if (RequiredMember(*end, "process").is_null()) return std::nullopt;
+  const auto &process = RequiredMember(*end, "process");
+  const auto integer = [&](const std::string_view name) {
+    return std::to_string(static_cast<long long>(
+        std::get<double>(RequiredMember(process, name).storage())));
+  };
+  std::string how = "ended";
+  if (!RequiredMember(process, "signal").is_null()) {
+    how = "was ended by signal " + integer("signal");
+  } else if (!RequiredMember(process, "exit_status").is_null()) {
+    how = "exited with status " + integer("exit_status");
+  }
+  if (RequiredMember(process, "core_dumped").as_bool()) how += " (core dumped)";
+  return "ManyForge did not close correctly last time: " +
+         RequiredString(process, "role") + " (pid " + integer("pid") + ") " + how +
+         " at " + RequiredString(*end, "ended_at_wall") + std::string(kKept);
+}
+
 HistorianEvent PreviousSessionReportEvent(const CanonicalValue &report) {
   constexpr auto code = "headless_previous_session_report_invalid";
-  Require(report.is_object() && report.as_object().size() == 11U, code,
-          "previous-session report must contain its eleven fixed fields");
+  Require(report.is_object() &&
+              (report.as_object().size() == 11U || report.as_object().size() == 15U),
+          code, "previous-session report must contain its version's fixed fields");
   const auto text = [&](const std::string_view field) {
     const auto value = RequiredString(report, field);
     Require(value.size() <= 1024U && content_identity::is_utf8_nfc(value),
             code, "previous-session report text must be bounded NFC UTF-8");
     return value;
   };
-  // v3 is current. A v2 report was written while the Scene still had a
-  // journal; one left pending is filed as recorded, its "scene" family kept.
+  // v4 is current: v3, how the previous run ended (`application_end`), the
+  // marker format of an older build's session archived at an upgrade
+  // (`archived_older_marker`), its start and when the launcher wrote the
+  // report.
+  // A v2 report was written while the Scene still had a journal; one left
+  // pending is filed as recorded, its "scene" family kept.
   const auto version = text("schema_version");
   const bool version2 = version == "manyforge.workbench_previous_session.v2";
-  Require(version == "manyforge.workbench_previous_session.v3" || version2,
+  const bool version4 = version == "manyforge.workbench_previous_session.v4";
+  Require(version == "manyforge.workbench_previous_session.v3" || version2 || version4,
           code, "previous-session report version is unsupported");
+  Require(report.as_object().size() == (version4 ? 15U : 11U), code,
+          "previous-session report must contain its version's fixed fields");
+  if (version4) {
+    ValidateApplicationEnd(RequiredMember(report, "application_end"), code);
+    Require(PreviousSessionOlderMarker(RequiredMember(report, "archived_older_marker")), code,
+            "previous-session older marker format is invalid");
+  }
   const auto session_id = text("session_id");
   Require(session_id.size() == 32U &&
               std::all_of(session_id.begin(), session_id.end(), [](char c) {
@@ -219,10 +329,25 @@ HistorianEvent PreviousSessionReportEvent(const CanonicalValue &report) {
                 unfinished.as_array().size(),
             code, "previous-session unfinished operation count is invalid");
   }
-  // This report has no source occurrence clock. Keep it explicitly unknown
-  // and stable across Headless restarts; do not assign an old event a new time.
-  return MakeHistorianEvent("manyforge.workbench", "previous_session_report",
-                            "INFO", 0, "unknown", report);
+  // A v4 report is filed at the previous session's start (its UTC text; no
+  // monotonic clock of that run applies), the time unknown when the launcher
+  // could not read it; earlier versions keep the unknown time. Both times are
+  // part of the report file, so a repeated filing is an exact duplicate.
+  std::string occurred_at_wall = "unknown";
+  if (version4) {
+    const auto utc = [](const CanonicalValue &value) {
+      const auto *wall = std::get_if<std::string>(&value.storage());
+      return wall != nullptr && wall->size() <= 64U &&
+             HistorianRecordedUtcNs(*wall).has_value();
+    };
+    const auto &started = RequiredMember(report, "started_at_wall");
+    Require((started.is_null() || utc(started)) &&
+                utc(RequiredMember(report, "reported_at_wall")),
+            code, "previous-session report times are invalid");
+    if (!started.is_null()) occurred_at_wall = started.as_string();
+  }
+  return MakeHistorianEvent("manyforge.workbench", "previous_session_report", "INFO", 0,
+                            occurred_at_wall, report);
 }
 
 std::optional<std::string> OptionalStringMember(const CanonicalValue &root,
@@ -906,6 +1031,26 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
   alarm_owner_.CompleteSourceSnapshot(disk_records_adapter_.source_id,
                                       disk_records_adapter_.source_epoch,
                                       AlarmConditionQuality::kGood);
+  // One clock anchor per start: Headless's event clock, the host's raw
+  // CLOCK_MONOTONIC (the Kernel's and Runner's clock) and UTC, read back to
+  // back, so this start's rows can be ordered against theirs.
+  const auto owner_monotonic_ns = clocks_.monotonic_time_ns();
+  timespec raw{};
+  static_cast<void>(::clock_gettime(CLOCK_MONOTONIC, &raw));
+  const auto wall = clocks_.wall_time_text();
+  const auto clock_owner = "headless:" + config_.application_start_id;
+  static_cast<void>(historian_.TryEnqueue(MakeHistorianEvent(
+      "manyforge.headless", "clock_anchor", "INFO", owner_monotonic_ns, wall,
+      CanonicalValue(CanonicalValue::Object{
+          {"clock_owner", CanonicalValue(clock_owner)},
+          {"message", CanonicalValue("Clock anchor of " + clock_owner)},
+          {"owner_monotonic_ns",
+           content_identity::nonnegative_int64_value(owner_monotonic_ns)},
+          {"raw_monotonic_ns",
+           content_identity::nonnegative_int64_value(
+               static_cast<std::int64_t>(raw.tv_sec) * 1000000000LL +
+               raw.tv_nsec)},
+          {"utc_wall", CanonicalValue(wall)}}))));
 }
 
 HeadlessApiCore::~HeadlessApiCore() {
@@ -1560,11 +1705,17 @@ CanonicalValue HeadlessApiCore::ObserveWorkbenchPreviousSessionReport(CanonicalV
     RegisterAdapterEpochLocked(workbench_session_adapter_,
                                config_.application_start_id + ".workbench-session");
     const AlarmSubject subject{"workbench_session", identity, {}};
-    const CanonicalValue details(CanonicalValue::Object{
+    CanonicalValue::Object detail_fields{
         {"previous_session", report},
         {"failure_time", CanonicalValue(nullptr)},
         {"failure_time_status", CanonicalValue("unavailable")},
-    });
+    };
+    // The headline names the process that ended the run when it is known.
+    if (const auto ended = PreviousSessionEndMessage(report)) {
+      detail_fields.emplace_back(
+          "failure", CanonicalValue(CanonicalValue::Object{{"message", CanonicalValue(*ended)}}));
+    }
+    const CanonicalValue details(std::move(detail_fields));
     const CanonicalValue correlations(CanonicalValue::Object{
         {"incident_id", CanonicalValue(incident_id)},
     });
@@ -2674,12 +2825,32 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   const bool node_attempt =
       kind_text != nullptr && *kind_text == "program_node_attempt";
   const bool scene_change = kind_text != nullptr && *kind_text == "scene_change";
+  // An operator command's end, a manual output write, a Program run's
+  // start, end or audit event, a producer's lost records and a captured
+  // motion trace carry one flat object of scalar facts; any kind may name
+  // its caller.
+  const bool command_finished =
+      kind_text != nullptr && *kind_text == "command_finished";
+  const bool io_output = kind_text != nullptr && *kind_text == "io_output_written";
+  const bool run_event = kind_text != nullptr && *kind_text == "program_run_event";
+  const bool records_lost = kind_text != nullptr && *kind_text == "records_lost";
+  const bool motion_trace =
+      kind_text != nullptr && *kind_text == "motion_trace_captured";
+  const bool scalar_kind =
+      command_finished || io_output || run_event || records_lost || motion_trace;
+  const bool has_caller = record.find_object_member("caller") != nullptr;
   std::set<std::string> fields{"schema_version", "kind",   "subject",
                                "action",         "outcome", "error",
                                "components",     "message"};
   if (program_reset) fields.insert("reset");
   if (node_attempt) fields.insert("attempt");
   if (scene_change) fields.insert("scene_change");
+  if (command_finished) fields.insert("command");
+  if (io_output) fields.insert("io_output");
+  if (run_event) fields.insert("run_event");
+  if (records_lost) fields.insert("records_lost");
+  if (motion_trace) fields.insert("motion_trace");
+  if (has_caller) fields.insert("caller");
   Require(record.as_object().size() == fields.size(), code,
           "activity record fields are invalid");
   for (const auto &[name, value] : record.as_object()) {
@@ -2728,10 +2899,54 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   text("message", 4096U);
   const bool component_action = kind == "component_action";
   Require(component_action || kind == "apply" || program_reset ||
-              node_attempt || scene_change,
+              node_attempt || scene_change || scalar_kind,
           code, "activity record kind is unsupported");
+  if (has_caller) {
+    const auto &caller = RequiredMember(record, "caller");
+    Require(caller.is_object() && !caller.as_object().empty() &&
+                caller.as_object().size() <= 5U,
+            code, "activity record caller is invalid");
+    for (const auto &[name, value] : caller.as_object()) {
+      const auto *member = std::get_if<std::string>(&value.storage());
+      Require(member != nullptr &&
+                  (name == "request_id" || name == "request_key" ||
+                   name == "transport" || name == "source_label" ||
+                   name == "principal_id"),
+              code, "activity record caller field is invalid");
+      bounded(*member, 256U);
+      Require(name != "transport" || *member == "http" || *member == "ws" ||
+                  *member == "mcp",
+              code, "activity record caller transport is unsupported");
+    }
+  }
+  // A command or run event name, or a run event's outcome label.
+  const auto identifier = [](const std::string &value, const bool digits) {
+    return value.size() <= 64U &&
+           std::all_of(value.begin(), value.end(), [digits](const char c) {
+             return (c >= 'a' && c <= 'z') || c == '_' ||
+                    (digits && c >= '0' && c <= '9');
+           });
+  };
+  Require(!(command_finished || run_event) || identifier(subject, true), code,
+          "activity record subject is invalid");
+  // A producer name: lowercase letters, digits, '_' and '.'.
+  Require(!records_lost ||
+              (subject.size() <= 64U &&
+               std::all_of(subject.begin(), subject.end(), [](const char c) {
+                 return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                        c == '_' || c == '.';
+               })),
+          code, "activity record subject is invalid");
   const std::set<std::string> outcomes =
-      component_action
+      run_event ? std::set<std::string>{}
+      : records_lost ? std::set<std::string>{"lost"}
+      : motion_trace ? std::set<std::string>{"succeeded", "failed"}
+      : command_finished
+          ? std::set<std::string>{"succeeded", "accepted", "refused", "failed",
+                                  "unknown"}
+      : io_output
+          ? std::set<std::string>{"succeeded", "refused", "failed", "unknown"}
+      : component_action
           ? std::set<std::string>{"succeeded", "failed", "unknown", "refused",
                                   "interrupted"}
       : program_reset || scene_change
@@ -2740,8 +2955,8 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
           ? std::set<std::string>{"succeeded", "failed", "interrupted",
                                   "stopped", "preempted"}
           : std::set<std::string>{"succeeded", "accepted", "failed", "refused"};
-  Require(outcomes.contains(outcome), code,
-          "activity record outcome is unsupported");
+  Require(run_event ? identifier(outcome, false) : outcomes.contains(outcome),
+          code, "activity record outcome is unsupported");
   const auto &action = RequiredMember(record, "action");
   const auto &components = RequiredMember(record, "components");
   Require(components.is_array() && components.as_array().size() <= 256U, code,
@@ -2786,7 +3001,8 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
     Require(member != nullptr && std::isfinite(*member) && *member >= 0.0,
             code, "activity record duration is invalid");
   };
-  // A node attempt's end (Runner monotonic ns, UTC text): its event time.
+  // A node attempt's end or a run event (Runner monotonic ns, UTC text): its
+  // event time.
   std::optional<std::pair<std::int64_t, std::string>> attempt_end;
   if (component_action) {
     text("action", 64U);
@@ -2849,6 +3065,66 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
       fact_duration(change);
       fact_number(change, "scene_revision_id", true);
     }
+  } else if (scalar_kind) {
+    Require(std::holds_alternative<std::nullptr_t>(action.storage()) &&
+                components.as_array().empty(),
+            code, "a command, output write, run event, lost-records or motion "
+                  "trace record carries no action or component rows");
+    const auto &facts = RequiredMember(
+        record, command_finished ? "command"
+                : io_output      ? "io_output"
+                : run_event      ? "run_event"
+                : records_lost   ? "records_lost"
+                                 : "motion_trace");
+    Require(facts.is_object() &&
+                facts.as_object().size() >= (run_event ? 3U : 1U) &&
+                facts.as_object().size() <=
+                    (run_event ? 32U : records_lost ? 8U : 16U),
+            code, "activity record facts are invalid");
+    for (const auto &[name, value] : facts.as_object()) {
+      const auto *member = std::get_if<std::string>(&value.storage());
+      const auto *number = std::get_if<double>(&value.storage());
+      Require(member != nullptr
+                  ? member->size() <= 2048U && content_identity::is_utf8_nfc(*member)
+              : number != nullptr ? std::isfinite(*number)
+                                  : value.is_null() ||
+                                        std::holds_alternative<bool>(value.storage()),
+              code, "activity record facts value is invalid");
+    }
+    const auto required = [&](const std::string_view name) {
+      Require(facts.find_object_member(name) != nullptr, code,
+              "activity record facts field is missing");
+    };
+    if (command_finished) {
+      // Identical refusals coalesced into this row.
+      required("repeat_count");
+      fact_number(facts, "repeat_count", false);
+    } else if (records_lost) {
+      // How many records the producer dropped (its bounded queue was full).
+      required("lost_count");
+      fact_number(facts, "lost_count", false);
+    } else if (run_event) {
+      // Stamped by the Runner at production, on its clocks, like a node
+      // attempt's end.
+      required("program_run_id");
+      required("occurred_at_ns");
+      required("occurred_at_wall");
+      fact_number(facts, "program_run_id", false);
+      const auto *wall = std::get_if<std::string>(
+          &RequiredMember(facts, "occurred_at_wall").storage());
+      Require(wall != nullptr && wall->size() <= 64U &&
+                  HistorianRecordedUtcNs(*wall).has_value(),
+              code, "activity record run event time is invalid");
+      std::optional<std::int64_t> occurred_at_ns;
+      try {
+        occurred_at_ns = content_identity::parse_nonnegative_int64(
+            RequiredMember(facts, "occurred_at_ns"));
+      } catch (const content_identity::CanonicalValueError &) {
+      }
+      Require(occurred_at_ns.has_value(), code,
+              "activity record run event time is invalid");
+      attempt_end = std::pair{*occurred_at_ns, *wall};
+    }
   } else if (program_reset) {
     Require(subject == "program_reset", code,
             "activity record Program Reset subject is unsupported");
@@ -2859,9 +3135,9 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
     // scene revision the verified readback left (null when not reloaded).
     const auto &reset = RequiredMember(record, "reset");
     const std::set<std::string> reset_fields{
-        "reload_initial_scene",  "reset_robot_position", "program_run_id",
-        "program_revision",      "applied_record_digest", "scene_revision_id",
-        "scene_content_hash",    "cause_code"};
+        "reload_initial_scene", "reset_robot_position", "reset_stored_values",
+        "program_run_id",       "program_revision",     "applied_record_digest",
+        "scene_revision_id",    "scene_content_hash",   "cause_code"};
     Require(reset.is_object() &&
                 reset.as_object().size() == reset_fields.size(),
             code, "activity record reset facts are invalid");
@@ -2893,6 +3169,7 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
     };
     flag("reload_initial_scene");
     flag("reset_robot_position");
+    flag("reset_stored_values");
     optional_number("program_run_id");
     optional_text("program_revision");
     optional_text("applied_record_digest");
@@ -2932,14 +3209,25 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   // (a Stop or a preemption is no error).
   Require(has_error == (node_attempt
                             ? outcome == "failed" || outcome == "interrupted"
+                        : run_event ? outcome == "failed"
+                        : records_lost ? false
                             : outcome != "succeeded" && outcome != "accepted"),
           code, "activity record error does not match its outcome");
   Require(content_identity::canonical_json(record).size() <= 64U * 1024U, code,
           "activity record exceeds its byte bound");
   // A failed node attempt is WARN, never ERROR: a failed condition node is
   // ordinary control flow, and ERROR would start a failure capture.
+  // The command, output-write, run-event, lost-records and motion-trace
+  // kinds are never ERROR either.
   const auto severity =
-      node_attempt ? (outcome == "failed" ? "WARN" : "INFO")
+      scalar_kind ? (std::set<std::string>{"refused", "failed", "unknown",
+                                           "stopped", "halted", "held",
+                                           "intervention_required",
+                                           "interrupted", "lost"}
+                             .contains(outcome)
+                         ? "WARN"
+                         : "INFO")
+      : node_attempt ? (outcome == "failed" ? "WARN" : "INFO")
       : outcome == "succeeded" || outcome == "accepted" ? "INFO"
       : outcome == "refused" || outcome == "interrupted" ? "WARN"
                                                          : "ERROR";
@@ -2952,13 +3240,23 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   auto event = MakeHistorianEvent(
       component_action ? subject
-      : program_reset || node_attempt ? std::string("manyforge.program_runner")
-      : scene_change                  ? std::string("manyforge.scene")
-                                      : std::string("manyforge.composer"),
+      : program_reset || node_attempt || run_event
+          ? std::string("manyforge.program_runner")
+      : scene_change     ? std::string("manyforge.scene")
+      : records_lost     ? std::string(subject.starts_with("program_runner")
+                                           ? "manyforge.program_runner"
+                                           : "manyforge.headless")
+      : command_finished ? std::string("manyforge.headless")
+      : io_output        ? std::string("manyforge.io")
+      : motion_trace     ? std::string("manyforge.motion")
+                         : std::string("manyforge.composer"),
       component_action ? "component_action_finished"
       : program_reset  ? "program_reset_finished"
       : node_attempt   ? "program_node_attempt_finished"
       : scene_change   ? "scene_change_finished"
+      : run_event      ? subject
+      : records_lost   ? "historian_records_lost"
+      : scalar_kind    ? kind
                        : "apply_finished",
       severity,
       attempt_end ? attempt_end->first : clocks_.monotonic_time_ns(),

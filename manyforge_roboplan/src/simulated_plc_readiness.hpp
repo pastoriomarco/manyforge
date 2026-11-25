@@ -57,7 +57,9 @@ using SimulatedPlcWait = std::function<SimulatedPlcReadiness(
     const SimulatedPlcWait &wait);
 
 /// The drivers' exit source of a simulated PLC process: its unexpected exit
-/// as `simulated_plc_exited` (nothing while it runs or after an ordered stop).
+/// as `simulated_plc_exited` with the launch's `LaunchOutputTailDetail` as
+/// detail `output_tail` (absent when empty; nothing while it runs or after an
+/// ordered stop).
 [[nodiscard]] std::function<std::optional<core::ErrorDTO>()>
 SimulatedPlcFaultSource(std::shared_ptr<ControllerLaunchProcess> process);
 

@@ -227,10 +227,6 @@ export function parseHealthResponse(value: unknown): HealthResponse {
             availability.message,
             'health.runtimeAvailability.message',
           ),
-          restorationGates: stringArrayAt(
-            availability.restorationGates,
-            'health.runtimeAvailability.restorationGates',
-          ),
         },
     headless: record.headless === undefined
       ? null
@@ -725,8 +721,8 @@ export function parseProgramDocument(value: unknown, path = 'program'): ProgramD
     path,
   );
   const programProfile = stringAt(record.program_profile, `${path}.program_profile`);
-  if (programProfile !== 'composable-cell-v1') {
-    return fail(`${path}.program_profile`, 'the literal "composable-cell-v1"');
+  if (programProfile !== 'manyforge-cell-v1') {
+    return fail(`${path}.program_profile`, 'the literal "manyforge-cell-v1"');
   }
   const catalog = objectAt(record.catalog, `${path}.catalog`);
   exactKeysAt(catalog, ['api_version', 'content_version'], `${path}.catalog`);

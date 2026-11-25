@@ -21,6 +21,7 @@ inline constexpr std::string_view kAcceptedValidationEvidenceRequired{"accepted_
 inline constexpr std::string_view kActionNotAllowed{"action_not_allowed"};
 inline constexpr std::string_view kActionServerUnavailable{"action_server_unavailable"};
 inline constexpr std::string_view kActionSourceInvalid{"action_source_invalid"};
+inline constexpr std::string_view kActionSpanAuthoringUnavailable{"action_span_authoring_unavailable"};
 inline constexpr std::string_view kActivationAuthoringCaptureMismatch{"activation_authoring_capture_mismatch"};
 inline constexpr std::string_view kActivationDeploymentMissing{"activation_deployment_missing"};
 inline constexpr std::string_view kActivationInputChangedAfterConfirmation{"activation_input_changed_after_confirmation"};
@@ -42,13 +43,16 @@ inline constexpr std::string_view kActivationSourceProjectUnavailable{"activatio
 inline constexpr std::string_view kActiveBundlePublicationNotCurrent{"active_bundle_publication_not_current"};
 inline constexpr std::string_view kActiveBundlePublicationReadInvalid{"active_bundle_publication_read_invalid"};
 inline constexpr std::string_view kActiveBundlePublicationReadUncertain{"active_bundle_publication_read_uncertain"};
+inline constexpr std::string_view kActiveBundlePublicationReceiptMismatch{"active_bundle_publication_receipt_mismatch"};
 inline constexpr std::string_view kActiveConfigurationExpectationInvalid{"active_configuration_expectation_invalid"};
 inline constexpr std::string_view kActiveControlConfigurationGenerationInvalid{"active_control_configuration_generation_invalid"};
 inline constexpr std::string_view kActiveGroupContainsMimicOrFixedEntries{"active_group_contains_mimic_or_fixed_entries"};
 inline constexpr std::string_view kActiveGroupQIndexOutOfRange{"active_group_q_index_out_of_range"};
 inline constexpr std::string_view kActiveGroupUnavailable{"active_group_unavailable"};
 inline constexpr std::string_view kActiveNativeProjectionInitializationPending{"active_native_projection_initialization_pending"};
+inline constexpr std::string_view kActiveNativeProjectionUnavailable{"active_native_projection_unavailable"};
 inline constexpr std::string_view kActiveOperationLost{"active_operation_lost"};
+inline constexpr std::string_view kActiveTcpContactBodiesUnavailable{"active_tcp_contact_bodies_unavailable"};
 inline constexpr std::string_view kActiveTcpResetFailed{"active_tcp_reset_failed"};
 inline constexpr std::string_view kActiveTcpUnavailable{"active_tcp_unavailable"};
 inline constexpr std::string_view kActiveTcpUnknown{"active_tcp_unknown"};
@@ -77,11 +81,14 @@ inline constexpr std::string_view kAddressedParticipantStopSettlementNotReady{"a
 inline constexpr std::string_view kAddressedParticipantStopSettlementUnavailable{"addressed_participant_stop_settlement_unavailable"};
 inline constexpr std::string_view kAdmissionClosed{"admission_closed"};
 inline constexpr std::string_view kAdmissionGenerationExhausted{"admission_generation_exhausted"};
+inline constexpr std::string_view kAdmissionUnavailable{"admission_unavailable"};
+inline constexpr std::string_view kAiModelApiKeyEnvInvalid{"ai_model_api_key_env_invalid"};
 inline constexpr std::string_view kAiModelConfigInvalid{"ai_model_config_invalid"};
 inline constexpr std::string_view kAiModelConfigurationInvalid{"ai_model_configuration_invalid"};
 inline constexpr std::string_view kAiModelExited{"ai_model_exited"};
 inline constexpr std::string_view kAiModelOwnerMismatch{"ai_model_owner_mismatch"};
 inline constexpr std::string_view kAiModelTokenUnavailable{"ai_model_token_unavailable"};
+inline constexpr std::string_view kAlarmOwnerUnavailable{"alarm_owner_unavailable"};
 inline constexpr std::string_view kAlarmsProjectionInvalid{"alarms_projection_invalid"};
 inline constexpr std::string_view kAlarmsProjectionUnavailable{"alarms_projection_unavailable"};
 inline constexpr std::string_view kAliNoCandidate{"ali_no_candidate"};
@@ -94,6 +101,8 @@ inline constexpr std::string_view kApplicationExited{"application_exited"};
 inline constexpr std::string_view kApplicationStopIncomplete{"application_stop_incomplete"};
 inline constexpr std::string_view kApplicationStopping{"application_stopping"};
 inline constexpr std::string_view kAppliedProgramProjectionInvalid{"applied_program_projection_invalid"};
+inline constexpr std::string_view kAppliedProgramStatusProjectionInvalid{"applied_program_status_projection_invalid"};
+inline constexpr std::string_view kAppliedProgramUnavailable{"applied_program_unavailable"};
 inline constexpr std::string_view kApplyAcknowledgementOutcomeUnknown{"apply_acknowledgement_outcome_unknown"};
 inline constexpr std::string_view kApplyAdmissionFailed{"apply_admission_failed"};
 inline constexpr std::string_view kApplyBusy{"apply_busy"};
@@ -131,6 +140,7 @@ inline constexpr std::string_view kAssistantCallbackInvalid{"assistant_callback_
 inline constexpr std::string_view kAssistantCallbackModeRejected{"assistant_callback_mode_rejected"};
 inline constexpr std::string_view kAssistantCallbackOversized{"assistant_callback_oversized"};
 inline constexpr std::string_view kAssistantCallbackProgramIncompatible{"assistant_callback_program_incompatible"};
+inline constexpr std::string_view kAssistantCallbackRejected{"assistant_callback_rejected"};
 inline constexpr std::string_view kAssistantCallbackTimeout{"assistant_callback_timeout"};
 inline constexpr std::string_view kAssistantCallbackToolNotFound{"assistant_callback_tool_not_found"};
 inline constexpr std::string_view kAssistantCallbackToolUnavailable{"assistant_callback_tool_unavailable"};
@@ -152,6 +162,7 @@ inline constexpr std::string_view kAssistantProjectionInvalid{"assistant_project
 inline constexpr std::string_view kAssistantProjectionStale{"assistant_projection_stale"};
 inline constexpr std::string_view kAssistantProjectionUnavailable{"assistant_projection_unavailable"};
 inline constexpr std::string_view kAssistantProviderConfigurationInvalid{"assistant_provider_configuration_invalid"};
+inline constexpr std::string_view kAssistantProviderRejected{"assistant_provider_rejected"};
 inline constexpr std::string_view kAssistantProviderResponseInvalid{"assistant_provider_response_invalid"};
 inline constexpr std::string_view kAssistantProviderResponseOversized{"assistant_provider_response_oversized"};
 inline constexpr std::string_view kAssistantProviderTimeout{"assistant_provider_timeout"};
@@ -168,6 +179,8 @@ inline constexpr std::string_view kAssistantRequestUnavailable{"assistant_reques
 inline constexpr std::string_view kAssistantSchemaInvalid{"assistant_schema_invalid"};
 inline constexpr std::string_view kAssistantSkillBodyUnavailable{"assistant_skill_body_unavailable"};
 inline constexpr std::string_view kAssistantTaskCancelled{"assistant_task_cancelled"};
+inline constexpr std::string_view kAssistantTaskFailed{"assistant_task_failed"};
+inline constexpr std::string_view kAssistantTaskInvalid{"assistant_task_invalid"};
 inline constexpr std::string_view kAssistantTimeout{"assistant_timeout"};
 inline constexpr std::string_view kAssistantToolArgumentsInvalid{"assistant_tool_arguments_invalid"};
 inline constexpr std::string_view kAssistantToolEffectRejected{"assistant_tool_effect_rejected"};
@@ -176,6 +189,7 @@ inline constexpr std::string_view kAssistantToolOwnerUnavailable{"assistant_tool
 inline constexpr std::string_view kAttachActiveTcpNotHolder{"attach_active_tcp_not_holder"};
 inline constexpr std::string_view kAttachActiveTcpUnavailable{"attach_active_tcp_unavailable"};
 inline constexpr std::string_view kAttachHolderUnavailable{"attach_holder_unavailable"};
+inline constexpr std::string_view kAuthoredSceneAdmissionReconciliationFailed{"authored_scene_admission_reconciliation_failed"};
 inline constexpr std::string_view kAuthoringAdmissionProjectionInvalid{"authoring_admission_projection_invalid"};
 inline constexpr std::string_view kAuthoringAdmissionProjectionUnavailable{"authoring_admission_projection_unavailable"};
 inline constexpr std::string_view kAuthoringAdmissionUnavailable{"authoring_admission_unavailable"};
@@ -196,7 +210,9 @@ inline constexpr std::string_view kBackendPrepareRejected{"backend_prepare_rejec
 inline constexpr std::string_view kBackendPrepareResultInvalid{"backend_prepare_result_invalid"};
 inline constexpr std::string_view kBackendStopNotConfirmed{"backend_stop_not_confirmed"};
 inline constexpr std::string_view kBackendStoppedWithoutAddressedStop{"backend_stopped_without_addressed_stop"};
+inline constexpr std::string_view kBbSourceNotReady{"bb_source_not_ready"};
 inline constexpr std::string_view kBeforePlanningSceneLatchFailed{"before_planning_scene_latch_failed"};
+inline constexpr std::string_view kBlackboardOutputBindingUnavailable{"blackboard_output_binding_unavailable"};
 inline constexpr std::string_view kBooleanRequired{"boolean_required"};
 inline constexpr std::string_view kBootstrapRebuild{"bootstrap_rebuild"};
 inline constexpr std::string_view kBootstrapStatus{"bootstrap_status"};
@@ -252,6 +268,7 @@ inline constexpr std::string_view kCarrierFrameResolutionForeign{"carrier_frame_
 inline constexpr std::string_view kCarrierFrameResolutionMissing{"carrier_frame_resolution_missing"};
 inline constexpr std::string_view kCarrierStopUnavailable{"carrier_stop_unavailable"};
 inline constexpr std::string_view kCartesianFallbackInvalid{"cartesian_fallback_invalid"};
+inline constexpr std::string_view kCartesianFidelityEvidenceInvalid{"cartesian_fidelity_evidence_invalid"};
 inline constexpr std::string_view kCartesianFidelityMetricsInvalid{"cartesian_fidelity_metrics_invalid"};
 inline constexpr std::string_view kCartesianFrameUnknown{"cartesian_frame_unknown"};
 inline constexpr std::string_view kCartesianIkFailure{"cartesian_ik_failure"};
@@ -263,6 +280,7 @@ inline constexpr std::string_view kCartesianPathIncomplete{"cartesian_path_incom
 inline constexpr std::string_view kCartesianPathMovingTakeoverRefused{"cartesian_path_moving_takeover_refused"};
 inline constexpr std::string_view kCartesianPathParameterInvalid{"cartesian_path_parameter_invalid"};
 inline constexpr std::string_view kCartesianPathToleranceExceeded{"cartesian_path_tolerance_exceeded"};
+inline constexpr std::string_view kCartesianPathTooDense{"cartesian_path_too_dense"};
 inline constexpr std::string_view kCartesianRequestInvalid{"cartesian_request_invalid"};
 inline constexpr std::string_view kCartesianResourceBudgetExceeded{"cartesian_resource_budget_exceeded"};
 inline constexpr std::string_view kCartesianResumeProgressUnavailable{"cartesian_resume_progress_unavailable"};
@@ -272,11 +290,13 @@ inline constexpr std::string_view kCartesianTcpLinearSpeedMissing{"cartesian_tcp
 inline constexpr std::string_view kCartesianTimeParameterizationFailed{"cartesian_time_parameterization_failed"};
 inline constexpr std::string_view kCartesianTrackingStalled{"cartesian_tracking_stalled"};
 inline constexpr std::string_view kCartesianTrajectoryInterpolantInvalid{"cartesian_trajectory_interpolant_invalid"};
+inline constexpr std::string_view kCartesianTrajectoryInterpolantJointMappingInvalid{"cartesian_trajectory_interpolant_joint_mapping_invalid"};
 inline constexpr std::string_view kCartesianTrajectoryJointOrderInvalid{"cartesian_trajectory_joint_order_invalid"};
 inline constexpr std::string_view kCartesianTrajectorySampleInvalid{"cartesian_trajectory_sample_invalid"};
 inline constexpr std::string_view kCartesianTrajectoryShapeInvalid{"cartesian_trajectory_shape_invalid"};
 inline constexpr std::string_view kCartesianWaypointCorrespondenceInvalid{"cartesian_waypoint_correspondence_invalid"};
 inline constexpr std::string_view kCartesianWaypointNotFinite{"cartesian_waypoint_not_finite"};
+inline constexpr std::string_view kCatalogSchemaInvalidValue{"catalog_schema_invalid_value"};
 inline constexpr std::string_view kCellAdmissionLivenessPublicationUnsupported{"cell_admission_liveness_publication_unsupported"};
 inline constexpr std::string_view kCellAdmissionOperatorAlarmAttentionUnsupported{"cell_admission_operator_alarm_attention_unsupported"};
 inline constexpr std::string_view kCellAdmissionRequestFailed{"cell_admission_request_failed"};
@@ -294,12 +314,14 @@ inline constexpr std::string_view kClaimIdentityInvalid{"claim_identity_invalid"
 inline constexpr std::string_view kClaimReleaseNotExact{"claim_release_not_exact"};
 inline constexpr std::string_view kClampBoundsInverted{"clamp_bounds_inverted"};
 inline constexpr std::string_view kCleanupDeadlineExceeded{"cleanup_deadline_exceeded"};
+inline constexpr std::string_view kClientIncidentInvalid{"client_incident_invalid"};
 inline constexpr std::string_view kCoherentStateCaptureReadUnsupported{"coherent_state_capture_read_unsupported"};
 inline constexpr std::string_view kCoherentStateCaptureTimeMismatch{"coherent_state_capture_time_mismatch"};
 inline constexpr std::string_view kCollisionBodyMissing{"collision_body_missing"};
 inline constexpr std::string_view kCollisionBodyNotMounted{"collision_body_not_mounted"};
 inline constexpr std::string_view kCollisionGeometryMissingOrStale{"collision_geometry_missing_or_stale"};
 inline constexpr std::string_view kCollisionGeometryUnresolved{"collision_geometry_unresolved"};
+inline constexpr std::string_view kCollisionPolicyContentHashInvalid{"collision_policy_content_hash_invalid"};
 inline constexpr std::string_view kCollisionPolicyResolverNotInstalled{"collision_policy_resolver_not_installed"};
 inline constexpr std::string_view kCollisionPolicyRevisionIdInvalid{"collision_policy_revision_id_invalid"};
 inline constexpr std::string_view kCollisionProjectionException{"collision_projection_exception"};
@@ -311,6 +333,7 @@ inline constexpr std::string_view kCollisionResourceCandidateEngineMissing{"coll
 inline constexpr std::string_view kCollisionResourceCandidateInspectionFailed{"collision_resource_candidate_inspection_failed"};
 inline constexpr std::string_view kCollisionResourceCandidateInvalid{"collision_resource_candidate_invalid"};
 inline constexpr std::string_view kCollisionResourceCandidateSnapshotInvalid{"collision_resource_candidate_snapshot_invalid"};
+inline constexpr std::string_view kCollisionResourceCandidateSnapshotUnavailable{"collision_resource_candidate_snapshot_unavailable"};
 inline constexpr std::string_view kCollisionResourceGenerationExhausted{"collision_resource_generation_exhausted"};
 inline constexpr std::string_view kCollisionResourceKernelNotIdle{"collision_resource_kernel_not_idle"};
 inline constexpr std::string_view kCollisionResourceKernelTransitionActive{"collision_resource_kernel_transition_active"};
@@ -339,6 +362,7 @@ inline constexpr std::string_view kCollisionValidationCancelled{"collision_valid
 inline constexpr std::string_view kCollisionValidationSerialFallbackException{"collision_validation_serial_fallback_exception"};
 inline constexpr std::string_view kCollisionValidationTrajectoryUnsampleable{"collision_validation_trajectory_unsampleable"};
 inline constexpr std::string_view kCollisionValidationWorkerException{"collision_validation_worker_exception"};
+inline constexpr std::string_view kCollisionWorldContentHashInvalid{"collision_world_content_hash_invalid"};
 inline constexpr std::string_view kCollisionWorldRevisionIdInvalid{"collision_world_revision_id_invalid"};
 inline constexpr std::string_view kCollisionWorldRevisionMismatch{"collision_world_revision_mismatch"};
 inline constexpr std::string_view kCollisionWorldSnapshotPublisherException{"collision_world_snapshot_publisher_exception"};
@@ -387,11 +411,14 @@ inline constexpr std::string_view kComponentLaneUnknown{"component_lane_unknown"
 inline constexpr std::string_view kComponentLaunchNotSettled{"component_launch_not_settled"};
 inline constexpr std::string_view kComponentLifecycle{"component_lifecycle"};
 inline constexpr std::string_view kComponentLifecycleDeadlineExpired{"component_lifecycle_deadline_expired"};
+inline constexpr std::string_view kComponentLifecycleEffectsNotSettled{"component_lifecycle_effects_not_settled"};
+inline constexpr std::string_view kComponentLifecycleResourcesNotSettled{"component_lifecycle_resources_not_settled"};
 inline constexpr std::string_view kComponentLifecycleStepInFlight{"component_lifecycle_step_in_flight"};
 inline constexpr std::string_view kComponentLimitExceeded{"component_limit_exceeded"};
 inline constexpr std::string_view kComponentLocalStateHasNoModelProjection{"component_local_state_has_no_model_projection"};
 inline constexpr std::string_view kComponentManifestInvalid{"component_manifest_invalid"};
 inline constexpr std::string_view kComponentMeshUnresolved{"component_mesh_unresolved"};
+inline constexpr std::string_view kComponentModelUnavailable{"component_model_unavailable"};
 inline constexpr std::string_view kComponentModelUnreadable{"component_model_unreadable"};
 inline constexpr std::string_view kComponentMovedExternallyInMotion{"component_moved_externally_in_motion"};
 inline constexpr std::string_view kComponentNotEnabled{"component_not_enabled"};
@@ -411,15 +438,17 @@ inline constexpr std::string_view kComponentRecoveryConfirmationChanged{"compone
 inline constexpr std::string_view kComponentReferenceMissing{"component_reference_missing"};
 inline constexpr std::string_view kComponentRegistrationStale{"component_registration_stale"};
 inline constexpr std::string_view kComponentRoleUnknownLink{"component_role_unknown_link"};
+inline constexpr std::string_view kComponentRouteUnavailable{"component_route_unavailable"};
 inline constexpr std::string_view kComponentRuntimeScaleMismatch{"component_runtime_scale_mismatch"};
 inline constexpr std::string_view kComponentScenarioMismatch{"component_scenario_mismatch"};
 inline constexpr std::string_view kComponentSchemaRefuses{"component_schema_refuses"};
 inline constexpr std::string_view kComponentStateUnknown{"component_state_unknown"};
 inline constexpr std::string_view kComponentStreamAbsent{"component_stream_absent"};
+inline constexpr std::string_view kComponentStreamDeclarationInvalid{"component_stream_declaration_invalid"};
+inline constexpr std::string_view kComponentStreamOverrideInvalid{"component_stream_override_invalid"};
 inline constexpr std::string_view kComponentStreamStale{"component_stream_stale"};
 inline constexpr std::string_view kComponentUnavailable{"component_unavailable"};
 inline constexpr std::string_view kComponentUnhealthy{"component_unhealthy"};
-inline constexpr std::string_view kComposableCellRuntimeUnavailable{"composable_cell_runtime_unavailable"};
 inline constexpr std::string_view kComposerAppliedProgramValidationFailed{"composer_applied_program_validation_failed"};
 inline constexpr std::string_view kComposerAuthoringChildCapacityExceeded{"composer_authoring_child_capacity_exceeded"};
 inline constexpr std::string_view kComposerAuthoringClaimInvalid{"composer_authoring_claim_invalid"};
@@ -478,6 +507,11 @@ inline constexpr std::string_view kComputedCompletionAcknowledged{"computed_comp
 inline constexpr std::string_view kConfidenceBelowMin{"confidence_below_min"};
 inline constexpr std::string_view kConfigurationApplyDependenciesNotCurrent{"configuration_apply_dependencies_not_current"};
 inline constexpr std::string_view kConfigurationApplyForeignClaim{"configuration_apply_foreign_claim"};
+inline constexpr std::string_view kConfigurationApplyOldClaimsChanged{"configuration_apply_old_claims_changed"};
+inline constexpr std::string_view kConfigurationApplyOldDomainUnavailable{"configuration_apply_old_domain_unavailable"};
+inline constexpr std::string_view kConfigurationApplyOldFenceHeld{"configuration_apply_old_fence_held"};
+inline constexpr std::string_view kConfigurationApplyOldFenceUnsettled{"configuration_apply_old_fence_unsettled"};
+inline constexpr std::string_view kConfigurationApplyOriginalClaimUnavailable{"configuration_apply_original_claim_unavailable"};
 inline constexpr std::string_view kConfigurationApplyValidatorRequired{"configuration_apply_validator_required"};
 inline constexpr std::string_view kConfigurationFenceHeld{"configuration_fence_held"};
 inline constexpr std::string_view kConfigurationFenceIdentityInvalid{"configuration_fence_identity_invalid"};
@@ -496,6 +530,7 @@ inline constexpr std::string_view kConfiguredRobotGeometryMissing{"configured_ro
 inline constexpr std::string_view kConfiguredRobotMeasuredStateUnavailable{"configured_robot_measured_state_unavailable"};
 inline constexpr std::string_view kConfiguredRobotMembershipInvalid{"configured_robot_membership_invalid"};
 inline constexpr std::string_view kConfiguredRobotMissing{"configured_robot_missing"};
+inline constexpr std::string_view kConfirmationLatencyNegative{"confirmation_latency_negative"};
 inline constexpr std::string_view kConfirmationRequired{"confirmation_required"};
 inline constexpr std::string_view kConfirmationStale{"confirmation_stale"};
 inline constexpr std::string_view kConflictingActiveProjection{"conflicting_active_projection"};
@@ -523,19 +558,31 @@ inline constexpr std::string_view kControlFreshnessExpired{"control_freshness_ex
 inline constexpr std::string_view kControlFreshnessInvalid{"control_freshness_invalid"};
 inline constexpr std::string_view kControlMonotonicClockInvalid{"control_monotonic_clock_invalid"};
 inline constexpr std::string_view kControlPathRequired{"control_path_required"};
+inline constexpr std::string_view kControlProjectionSourceUnavailable{"control_projection_source_unavailable"};
 inline constexpr std::string_view kControlProjectionStale{"control_projection_stale"};
 inline constexpr std::string_view kControlProjectionSynchronizing{"control_projection_synchronizing"};
 inline constexpr std::string_view kControlProjectionUnavailable{"control_projection_unavailable"};
 inline constexpr std::string_view kControlSessionClosed{"control_session_closed"};
+inline constexpr std::string_view kControlSessionOrdinaryCommandPending{"control_session_ordinary_command_pending"};
+inline constexpr std::string_view kControlSessionRuntimeScalePending{"control_session_runtime_scale_pending"};
 inline constexpr std::string_view kControlledHardStopBrakeInputInvalid{"controlled_hard_stop_brake_input_invalid"};
+inline constexpr std::string_view kControlledHardStopBrakeInvalid{"controlled_hard_stop_brake_invalid"};
+inline constexpr std::string_view kControlledHardStopElapsedInvalid{"controlled_hard_stop_elapsed_invalid"};
+inline constexpr std::string_view kControlledHardStopLimitsUnavailable{"controlled_hard_stop_limits_unavailable"};
+inline constexpr std::string_view kControlledHardStopNotInstalled{"controlled_hard_stop_not_installed"};
+inline constexpr std::string_view kControlledHardStopRejected{"controlled_hard_stop_rejected"};
 inline constexpr std::string_view kControlledStopAppliedFactorZero{"controlled_stop_applied_factor_zero"};
+inline constexpr std::string_view kControlledStopCapabilityUnavailable{"controlled_stop_capability_unavailable"};
 inline constexpr std::string_view kControlledStopDeadlineExceeded{"controlled_stop_deadline_exceeded"};
+inline constexpr std::string_view kControlledStopErrorInvalid{"controlled_stop_error_invalid"};
 inline constexpr std::string_view kControlledStopFrozenFactorUnusable{"controlled_stop_frozen_factor_unusable"};
 inline constexpr std::string_view kControlledStopJerkProfileNotPrepared{"controlled_stop_jerk_profile_not_prepared"};
 inline constexpr std::string_view kControlledStopModesExhausted{"controlled_stop_modes_exhausted"};
 inline constexpr std::string_view kControlledStopNoObservedState{"controlled_stop_no_observed_state"};
+inline constexpr std::string_view kControlledStopNumericEvidenceInvalid{"controlled_stop_numeric_evidence_invalid"};
 inline constexpr std::string_view kControlledStopPlannerFailed{"controlled_stop_planner_failed"};
 inline constexpr std::string_view kControlledStopPortNotImplemented{"controlled_stop_port_not_implemented"};
+inline constexpr std::string_view kControlledStopProjectionInvalid{"controlled_stop_projection_invalid"};
 inline constexpr std::string_view kControllerActionBindingMismatch{"controller_action_binding_mismatch"};
 inline constexpr std::string_view kControllerBindingContractMismatch{"controller_binding_contract_mismatch"};
 inline constexpr std::string_view kControllerBindingGenerationChanged{"controller_binding_generation_changed"};
@@ -578,6 +625,7 @@ inline constexpr std::string_view kCoordinatedRuntimeScaleNotQualified{"coordina
 inline constexpr std::string_view kCoordinatedRuntimeScaleNotReady{"coordinated_runtime_scale_not_ready"};
 inline constexpr std::string_view kCovarianceExceeded{"covariance_exceeded"};
 inline constexpr std::string_view kCriticalProgressSequenceRegressed{"critical_progress_sequence_regressed"};
+inline constexpr std::string_view kCriticalProgressStale{"critical_progress_stale"};
 inline constexpr std::string_view kCurrentRouteMissing{"current_route_missing"};
 inline constexpr std::string_view kCurrentRouteReadFailed{"current_route_read_failed"};
 inline constexpr std::string_view kCurrentRouteUnqualified{"current_route_unqualified"};
@@ -587,8 +635,10 @@ inline constexpr std::string_view kCustomTcpDuplicate{"custom_tcp_duplicate"};
 inline constexpr std::string_view kCustomTcpInvalid{"custom_tcp_invalid"};
 inline constexpr std::string_view kCustomTcpNameCollision{"custom_tcp_name_collision"};
 inline constexpr std::string_view kCustomTcpParentUnknown{"custom_tcp_parent_unknown"};
+inline constexpr std::string_view kCycleManagerUnavailable{"cycle_manager_unavailable"};
 inline constexpr std::string_view kCycleRecoveryActionRejected{"cycle_recovery_action_rejected"};
 inline constexpr std::string_view kCycleRecoveryOfferStale{"cycle_recovery_offer_stale"};
+inline constexpr std::string_view kCycleRecoveryOwnerUnavailable{"cycle_recovery_owner_unavailable"};
 inline constexpr std::string_view kDeadlineExhausted{"deadline_exhausted"};
 inline constexpr std::string_view kDecelerationTimeNotLargerThanHandoff{"deceleration_time_not_larger_than_handoff"};
 inline constexpr std::string_view kDefaultTcpUnavailable{"default_tcp_unavailable"};
@@ -609,6 +659,7 @@ inline constexpr std::string_view kDeploymentArtifactReadFailed{"deployment_arti
 inline constexpr std::string_view kDeploymentArtifactRootsUnavailable{"deployment_artifact_roots_unavailable"};
 inline constexpr std::string_view kDeploymentArtifactSuffixInvalid{"deployment_artifact_suffix_invalid"};
 inline constexpr std::string_view kDeploymentArtifactTargetInvalid{"deployment_artifact_target_invalid"};
+inline constexpr std::string_view kDeploymentArtifactUnavailable{"deployment_artifact_unavailable"};
 inline constexpr std::string_view kDeploymentArtifactWriteFailed{"deployment_artifact_write_failed"};
 inline constexpr std::string_view kDeploymentCandidateCellMismatch{"deployment_candidate_cell_mismatch"};
 inline constexpr std::string_view kDeploymentCandidateCurrentChanged{"deployment_candidate_current_changed"};
@@ -659,6 +710,7 @@ inline constexpr std::string_view kDescriptorRobotNotConfigured{"descriptor_robo
 inline constexpr std::string_view kDesiredControlConfigurations{"desired_control_configurations"};
 inline constexpr std::string_view kDetectionNotFound{"detection_not_found"};
 inline constexpr std::string_view kDetectionTimeout{"detection_timeout"};
+inline constexpr std::string_view kDiagnosticCommandSourceReasonMissing{"diagnostic_command_source_reason_missing"};
 inline constexpr std::string_view kDiagnosticPlannerProjectionMismatch{"diagnostic_planner_projection_mismatch"};
 inline constexpr std::string_view kDiagnosticPlanningNotPreparable{"diagnostic_planning_not_preparable"};
 inline constexpr std::string_view kDirectControlCoordinationUnsupported{"direct_control_coordination_unsupported"};
@@ -745,6 +797,7 @@ inline constexpr std::string_view kEffectiveCollisionPolicyNotCanonical{"effecti
 inline constexpr std::string_view kEffectiveCollisionPolicyUnavailable{"effective_collision_policy_unavailable"};
 inline constexpr std::string_view kEffortKindInvalid{"effort_kind_invalid"};
 inline constexpr std::string_view kElementNotSpringSlider{"element_not_spring_slider"};
+inline constexpr std::string_view kEmittedTrajectorySampleInvalid{"emitted_trajectory_sample_invalid"};
 inline constexpr std::string_view kEmittedTrajectoryShapeInvalid{"emitted_trajectory_shape_invalid"};
 inline constexpr std::string_view kEmptyTrajectory{"empty_trajectory"};
 inline constexpr std::string_view kEndEffectorTcpUnavailable{"end_effector_tcp_unavailable"};
@@ -756,6 +809,7 @@ inline constexpr std::string_view kEvaluationStepLimit{"evaluation_step_limit"};
 inline constexpr std::string_view kEventSubscriberException{"event_subscriber_exception"};
 inline constexpr std::string_view kExecuteAdmissionRejected{"execute_admission_rejected"};
 inline constexpr std::string_view kExecuteControlUnavailable{"execute_control_unavailable"};
+inline constexpr std::string_view kExecutedStopModeInvalid{"executed_stop_mode_invalid"};
 inline constexpr std::string_view kExecutingTransitionRejected{"executing_transition_rejected"};
 inline constexpr std::string_view kExecutionAborted{"execution_aborted"};
 inline constexpr std::string_view kExecutionAdmissionBindingMismatch{"execution_admission_binding_mismatch"};
@@ -766,15 +820,22 @@ inline constexpr std::string_view kExecutionAdmissionStale{"execution_admission_
 inline constexpr std::string_view kExecutionAdmissionUnavailable{"execution_admission_unavailable"};
 inline constexpr std::string_view kExecutionAssistantTurnInProgress{"execution_assistant_turn_in_progress"};
 inline constexpr std::string_view kExecutionBackendFailed{"execution_backend_failed"};
+inline constexpr std::string_view kExecutionBackendStatusErrorInvalid{"execution_backend_status_error_invalid"};
+inline constexpr std::string_view kExecutionBackendStatusIdentityInvalid{"execution_backend_status_identity_invalid"};
+inline constexpr std::string_view kExecutionBackendStatusShapeInvalid{"execution_backend_status_shape_invalid"};
+inline constexpr std::string_view kExecutionBackendStatusStateInvalid{"execution_backend_status_state_invalid"};
 inline constexpr std::string_view kExecutionChanged{"execution_changed"};
 inline constexpr std::string_view kExecutionCommandInvalid{"execution_command_invalid"};
 inline constexpr std::string_view kExecutionCommandOversized{"execution_command_oversized"};
+inline constexpr std::string_view kExecutionCommandRejected{"execution_command_rejected"};
 inline constexpr std::string_view kExecutionCommandResponseIdentityMismatch{"execution_command_response_identity_mismatch"};
 inline constexpr std::string_view kExecutionCommandResponseInvalid{"execution_command_response_invalid"};
+inline constexpr std::string_view kExecutionCommandResponseOversized{"execution_command_response_oversized"};
 inline constexpr std::string_view kExecutionCommandTransportFailure{"execution_command_transport_failure"};
 inline constexpr std::string_view kExecutionComponentCommandUnsupported{"execution_component_command_unsupported"};
 inline constexpr std::string_view kExecutionControlCommandInProgress{"execution_control_command_in_progress"};
 inline constexpr std::string_view kExecutionControlCommandUnsupported{"execution_control_command_unsupported"};
+inline constexpr std::string_view kExecutionControlDeliveryUncertain{"execution_control_delivery_uncertain"};
 inline constexpr std::string_view kExecutionControlIngressBusy{"execution_control_ingress_busy"};
 inline constexpr std::string_view kExecutionControlPayloadInvalid{"execution_control_payload_invalid"};
 inline constexpr std::string_view kExecutionControlProjectionCapacityInvalid{"execution_control_projection_capacity_invalid"};
@@ -785,11 +846,14 @@ inline constexpr std::string_view kExecutionDeploymentDraftUnapplied{"execution_
 inline constexpr std::string_view kExecutionEffectUncertain{"execution_effect_uncertain"};
 inline constexpr std::string_view kExecutionEnvironmentEpochChanged{"execution_environment_epoch_changed"};
 inline constexpr std::string_view kExecutionEnvironmentIdentityMissing{"execution_environment_identity_missing"};
+inline constexpr std::string_view kExecutionEventMirrorBehind{"execution_event_mirror_behind"};
+inline constexpr std::string_view kExecutionEventMirrorUnavailable{"execution_event_mirror_unavailable"};
 inline constexpr std::string_view kExecutionEventStreamDead{"execution_event_stream_dead"};
 inline constexpr std::string_view kExecutionEventStreamFailed{"execution_event_stream_failed"};
 inline constexpr std::string_view kExecutionEventStreamInvalid{"execution_event_stream_invalid"};
 inline constexpr std::string_view kExecutionEventSubscribersFull{"execution_event_subscribers_full"};
 inline constexpr std::string_view kExecutionEventSubscriptionInvalid{"execution_event_subscription_invalid"};
+inline constexpr std::string_view kExecutionEventSubscriptionOverflow{"execution_event_subscription_overflow"};
 inline constexpr std::string_view kExecutionFrameTransformUnavailable{"execution_frame_transform_unavailable"};
 inline constexpr std::string_view kExecutionHostChildUnavailable{"execution_host_child_unavailable"};
 inline constexpr std::string_view kExecutionHostContractOfferChanged{"execution_host_contract_offer_changed"};
@@ -810,6 +874,7 @@ inline constexpr std::string_view kExecutionMotionNotAdmitted{"execution_motion_
 inline constexpr std::string_view kExecutionObservationCancelled{"execution_observation_cancelled"};
 inline constexpr std::string_view kExecutionObservationCommandUnsupported{"execution_observation_command_unsupported"};
 inline constexpr std::string_view kExecutionObservationCursorInvalid{"execution_observation_cursor_invalid"};
+inline constexpr std::string_view kExecutionObservationProjectionInvalid{"execution_observation_projection_invalid"};
 inline constexpr std::string_view kExecutionOperationContextAmbiguous{"execution_operation_context_ambiguous"};
 inline constexpr std::string_view kExecutionOperationContextInvalid{"execution_operation_context_invalid"};
 inline constexpr std::string_view kExecutionOperationContextUnavailable{"execution_operation_context_unavailable"};
@@ -820,14 +885,19 @@ inline constexpr std::string_view kExecutionOrdinaryCommandUnsupported{"executio
 inline constexpr std::string_view kExecutionOwnerNotReady{"execution_owner_not_ready"};
 inline constexpr std::string_view kExecutionOwnerUnavailable{"execution_owner_unavailable"};
 inline constexpr std::string_view kExecutionPlanningJobsBusy{"execution_planning_jobs_busy"};
+inline constexpr std::string_view kExecutionPortBackendResetUnsupported{"execution_port_backend_reset_unsupported"};
 inline constexpr std::string_view kExecutionPortExecutionInFlight{"execution_port_execution_in_flight"};
 inline constexpr std::string_view kExecutionPortLaneFactsMismatch{"execution_port_lane_facts_mismatch"};
 inline constexpr std::string_view kExecutionPortMissing{"execution_port_missing"};
 inline constexpr std::string_view kExecutionPortNotReady{"execution_port_not_ready"};
+inline constexpr std::string_view kExecutionPortPreparedDispatchRequired{"execution_port_prepared_dispatch_required"};
 inline constexpr std::string_view kExecutionPortRebindBusy{"execution_port_rebind_busy"};
+inline constexpr std::string_view kExecutionPortRouteRebindBusy{"execution_port_route_rebind_busy"};
+inline constexpr std::string_view kExecutionPortRouteRebindMismatch{"execution_port_route_rebind_mismatch"};
 inline constexpr std::string_view kExecutionPortStopInFlight{"execution_port_stop_in_flight"};
 inline constexpr std::string_view kExecutionPortSubmitRefused{"execution_port_submit_refused"};
 inline constexpr std::string_view kExecutionProgramDraftUnapplied{"execution_program_draft_unapplied"};
+inline constexpr std::string_view kExecutionProgressGenerationUnavailable{"execution_progress_generation_unavailable"};
 inline constexpr std::string_view kExecutionRejected{"execution_rejected"};
 inline constexpr std::string_view kExecutionRequestAttributionInvalid{"execution_request_attribution_invalid"};
 inline constexpr std::string_view kExecutionRuntimeScaleLaneBusy{"execution_runtime_scale_lane_busy"};
@@ -836,6 +906,7 @@ inline constexpr std::string_view kExecutionTargetFrameStateUnavailable{"executi
 inline constexpr std::string_view kExecutionTargetFrameUnavailable{"execution_target_frame_unavailable"};
 inline constexpr std::string_view kExecutionTargetObservationInvalid{"execution_target_observation_invalid"};
 inline constexpr std::string_view kExecutionTargetObservationUnavailable{"execution_target_observation_unavailable"};
+inline constexpr std::string_view kExecutionTargetUnavailable{"execution_target_unavailable"};
 inline constexpr std::string_view kExecutionTargetsProjectionInvalid{"execution_targets_projection_invalid"};
 inline constexpr std::string_view kExecutionTargetsUnavailable{"execution_targets_unavailable"};
 inline constexpr std::string_view kExecutionTimeout{"execution_timeout"};
@@ -862,6 +933,7 @@ inline constexpr std::string_view kExternalSourceResourceIdentityInvalid{"extern
 inline constexpr std::string_view kExternalSourceResourceShapeInvalid{"external_source_resource_shape_invalid"};
 inline constexpr std::string_view kFailedNotRetryable{"failed_not_retryable"};
 inline constexpr std::string_view kFailedPlanProjectionForbidden{"failed_plan_projection_forbidden"};
+inline constexpr std::string_view kFailedValidationAckRejected{"failed_validation_ack_rejected"};
 inline constexpr std::string_view kFailedValidationErrorMissing{"failed_validation_error_missing"};
 inline constexpr std::string_view kFailedValidationNotRetryable{"failed_validation_not_retryable"};
 inline constexpr std::string_view kFailedValidationRetryAcknowledged{"failed_validation_retry_acknowledged"};
@@ -886,10 +958,12 @@ inline constexpr std::string_view kFloatLiteralOutOfRange{"float_literal_out_of_
 inline constexpr std::string_view kForwardKinematicsBatchFailed{"forward_kinematics_batch_failed"};
 inline constexpr std::string_view kForwardKinematicsFailed{"forward_kinematics_failed"};
 inline constexpr std::string_view kFrameBindingsInvalid{"frame_bindings_invalid"};
+inline constexpr std::string_view kFrameHeightOutsideRange{"frame_height_outside_range"};
 inline constexpr std::string_view kFrameMissing{"frame_missing"};
 inline constexpr std::string_view kFrameNotMounted{"frame_not_mounted"};
 inline constexpr std::string_view kFrameOrPoseInvalid{"frame_or_pose_invalid"};
 inline constexpr std::string_view kFrameTagInvalid{"frame_tag_invalid"};
+inline constexpr std::string_view kFrameTransformFailed{"frame_transform_failed"};
 inline constexpr std::string_view kFrameTransformPoseInvalid{"frame_transform_pose_invalid"};
 inline constexpr std::string_view kFrameTransformQueryMismatch{"frame_transform_query_mismatch"};
 inline constexpr std::string_view kFrameTransformReferenceUnsupported{"frame_transform_reference_unsupported"};
@@ -898,19 +972,26 @@ inline constexpr std::string_view kFrameUnresolved{"frame_unresolved"};
 inline constexpr std::string_view kFreshApplySuccessForeignClaim{"fresh_apply_success_foreign_claim"};
 inline constexpr std::string_view kFreshApplySuccessNotExact{"fresh_apply_success_not_exact"};
 inline constexpr std::string_view kFullStackRestartRequired{"full_stack_restart_required"};
+inline constexpr std::string_view kFullStopRequestAttributionInvalid{"full_stop_request_attribution_invalid"};
+inline constexpr std::string_view kFullStopRequestContextInvalid{"full_stop_request_context_invalid"};
 inline constexpr std::string_view kGeneratedToolParametersRequired{"generated_tool_parameters_required"};
 inline constexpr std::string_view kGeneratedToolWiringInvalid{"generated_tool_wiring_invalid"};
 inline constexpr std::string_view kGeneratedToolWiringMissing{"generated_tool_wiring_missing"};
 inline constexpr std::string_view kGeneratedToolWiringUnknown{"generated_tool_wiring_unknown"};
+inline constexpr std::string_view kGeometryNodeUnavailable{"geometry_node_unavailable"};
+inline constexpr std::string_view kGlobalInterruptGroupInvalid{"global_interrupt_group_invalid"};
 inline constexpr std::string_view kGlobalInterruptGroupUnbound{"global_interrupt_group_unbound"};
+inline constexpr std::string_view kGlobalInterruptKeyTypeConflict{"global_interrupt_key_type_conflict"};
 inline constexpr std::string_view kGlobalInterruptOwnerNotCurrent{"global_interrupt_owner_not_current"};
 inline constexpr std::string_view kGlobalInterruptProgramBindingMissing{"global_interrupt_program_binding_missing"};
+inline constexpr std::string_view kGlobalInterruptScopeInvalid{"global_interrupt_scope_invalid"};
 inline constexpr std::string_view kGlobalRuleStateOperandUnsupported{"global_rule_state_operand_unsupported"};
 inline constexpr std::string_view kGoalFrameInlinePoseUnsupported{"goal_frame_inline_pose_unsupported"};
 inline constexpr std::string_view kGoalFrameMotionPreviewUnsupported{"goal_frame_motion_preview_unsupported"};
 inline constexpr std::string_view kGoalFrameMotionTypeUnsupported{"goal_frame_motion_type_unsupported"};
 inline constexpr std::string_view kGoalFrameReferenceContextUnavailable{"goal_frame_reference_context_unavailable"};
 inline constexpr std::string_view kGoalFrameRequiresAbsoluteTarget{"goal_frame_requires_absolute_target"};
+inline constexpr std::string_view kGoalFrameStartStateUnavailable{"goal_frame_start_state_unavailable"};
 inline constexpr std::string_view kGoalUnverifiable{"goal_unverifiable"};
 inline constexpr std::string_view kGraspConfirmationInvalid{"grasp_confirmation_invalid"};
 inline constexpr std::string_view kGraspConfirmationLost{"grasp_confirmation_lost"};
@@ -929,6 +1010,10 @@ inline constexpr std::string_view kGripperCommandFailedWithoutError{"gripper_com
 inline constexpr std::string_view kGripperCommandLost{"gripper_command_lost"};
 inline constexpr std::string_view kGripperCommandNotAuthorized{"gripper_command_not_authorized"};
 inline constexpr std::string_view kGripperCommandPositionInvalid{"gripper_command_position_invalid"};
+inline constexpr std::string_view kGripperCommandSchemaUnsupported{"gripper_command_schema_unsupported"};
+inline constexpr std::string_view kGripperCommandScopeUnsupported{"gripper_command_scope_unsupported"};
+inline constexpr std::string_view kGripperCommandSubscriberUnavailable{"gripper_command_subscriber_unavailable"};
+inline constexpr std::string_view kGripperDisplayOwnerUnavailable{"gripper_display_owner_unavailable"};
 inline constexpr std::string_view kGripperDwellTimeout{"gripper_dwell_timeout"};
 inline constexpr std::string_view kGripperFeedbackUnavailable{"gripper_feedback_unavailable"};
 inline constexpr std::string_view kGripperGoalAborted{"gripper_goal_aborted"};
@@ -945,8 +1030,12 @@ inline constexpr std::string_view kGripperRequestAckTimeout{"gripper_request_ack
 inline constexpr std::string_view kGripperRequestFailed{"gripper_request_failed"};
 inline constexpr std::string_view kGripperResultFailed{"gripper_result_failed"};
 inline constexpr std::string_view kGripperResultTimeout{"gripper_result_timeout"};
+inline constexpr std::string_view kGripperStateFeedbackStale{"gripper_state_feedback_stale"};
+inline constexpr std::string_view kGripperStateFeedbackUnavailable{"gripper_state_feedback_unavailable"};
 inline constexpr std::string_view kGripperStateNotFinite{"gripper_state_not_finite"};
+inline constexpr std::string_view kGripperStatePublisherUnavailable{"gripper_state_publisher_unavailable"};
 inline constexpr std::string_view kGripperStateUnavailable{"gripper_state_unavailable"};
+inline constexpr std::string_view kGripperStatusNotMatched{"gripper_status_not_matched"};
 inline constexpr std::string_view kGripperStatusUnavailable{"gripper_status_unavailable"};
 inline constexpr std::string_view kGripperStopBackendCommandMismatch{"gripper_stop_backend_command_mismatch"};
 inline constexpr std::string_view kGripperStopCancelledBeforeEffect{"gripper_stop_cancelled_before_effect"};
@@ -959,13 +1048,20 @@ inline constexpr std::string_view kGripperStopSessionMissing{"gripper_stop_sessi
 inline constexpr std::string_view kGripperStopStageInvalid{"gripper_stop_stage_invalid"};
 inline constexpr std::string_view kGripperStopTargetUnavailable{"gripper_stop_target_unavailable"};
 inline constexpr std::string_view kGripperStopUnconfirmed{"gripper_stop_unconfirmed"};
+inline constexpr std::string_view kGripperTransportKindInvalid{"gripper_transport_kind_invalid"};
 inline constexpr std::string_view kGripperWaitSourceUnavailable{"gripper_wait_source_unavailable"};
 inline constexpr std::string_view kGripperWaitStale{"gripper_wait_stale"};
 inline constexpr std::string_view kGripperWaitTimeout{"gripper_wait_timeout"};
 inline constexpr std::string_view kHardStopCancelNotDispatched{"hard_stop_cancel_not_dispatched"};
+inline constexpr std::string_view kHeadlessAdapterEpochExhausted{"headless_adapter_epoch_exhausted"};
+inline constexpr std::string_view kHeadlessAdapterSequenceExhausted{"headless_adapter_sequence_exhausted"};
+inline constexpr std::string_view kHeadlessApiClosed{"headless_api_closed"};
+inline constexpr std::string_view kHeadlessApiConfigurationInvalid{"headless_api_configuration_invalid"};
 inline constexpr std::string_view kHeadlessApiInternalFailure{"headless_api_internal_failure"};
+inline constexpr std::string_view kHeadlessCliInvalid{"headless_cli_invalid"};
 inline constexpr std::string_view kHeadlessComponentFaultInvalid{"headless_component_fault_invalid"};
 inline constexpr std::string_view kHeadlessDiskConditionInvalid{"headless_disk_condition_invalid"};
+inline constexpr std::string_view kHeadlessHttpError{"headless_http_error"};
 inline constexpr std::string_view kHeadlessHttpResponseInvalid{"headless_http_response_invalid"};
 inline constexpr std::string_view kHeadlessHttpResponseOversized{"headless_http_response_oversized"};
 inline constexpr std::string_view kHeadlessHttpTimeout{"headless_http_timeout"};
@@ -975,7 +1071,9 @@ inline constexpr std::string_view kHeadlessNativeInitializationFailed{"headless_
 inline constexpr std::string_view kHeadlessObservationStreamCancelled{"headless_observation_stream_cancelled"};
 inline constexpr std::string_view kHeadlessObservationStreamClosed{"headless_observation_stream_closed"};
 inline constexpr std::string_view kHeadlessObservationStreamInvalid{"headless_observation_stream_invalid"};
+inline constexpr std::string_view kHeadlessOperationEventIdentityConflict{"headless_operation_event_identity_conflict"};
 inline constexpr std::string_view kHeadlessOperationEventInvalid{"headless_operation_event_invalid"};
+inline constexpr std::string_view kHeadlessOperationEventSnapshotIncomplete{"headless_operation_event_snapshot_incomplete"};
 inline constexpr std::string_view kHeadlessOperationTableInvalid{"headless_operation_table_invalid"};
 inline constexpr std::string_view kHeadlessOwnerConflict{"headless_owner_conflict"};
 inline constexpr std::string_view kHeadlessOwnerLockUnavailable{"headless_owner_lock_unavailable"};
@@ -989,20 +1087,36 @@ inline constexpr std::string_view kHeadlessRuntimeFaultInvalid{"headless_runtime
 inline constexpr std::string_view kHeadlessRuntimeProjectionInvalid{"headless_runtime_projection_invalid"};
 inline constexpr std::string_view kHeadlessRuntimeSnapshotUnavailable{"headless_runtime_snapshot_unavailable"};
 inline constexpr std::string_view kHeadlessSourceInvalid{"headless_source_invalid"};
+inline constexpr std::string_view kHeadlessValueInvalid{"headless_value_invalid"};
 inline constexpr std::string_view kHeadlessViewerPoseCancelled{"headless_viewer_pose_cancelled"};
 inline constexpr std::string_view kHeadlessViewerPoseClosed{"headless_viewer_pose_closed"};
 inline constexpr std::string_view kHeadlessViewerPoseInvalid{"headless_viewer_pose_invalid"};
 inline constexpr std::string_view kHeartbeatFields{"heartbeat_fields"};
 inline constexpr std::string_view kHeartbeatInvalid{"heartbeat_invalid"};
+inline constexpr std::string_view kHistorianCaptureNotFound{"historian_capture_not_found"};
+inline constexpr std::string_view kHistorianClosed{"historian_closed"};
+inline constexpr std::string_view kHistorianConfigurationInvalid{"historian_configuration_invalid"};
+inline constexpr std::string_view kHistorianEventIdentityConflict{"historian_event_identity_conflict"};
 inline constexpr std::string_view kHistorianEventInvalid{"historian_event_invalid"};
+inline constexpr std::string_view kHistorianEventNotFound{"historian_event_not_found"};
+inline constexpr std::string_view kHistorianInternalFailure{"historian_internal_failure"};
+inline constexpr std::string_view kHistorianPathInvalid{"historian_path_invalid"};
 inline constexpr std::string_view kHistorianProjectionFailure{"historian_projection_failure"};
+inline constexpr std::string_view kHistorianQueryBudgetExceeded{"historian_query_budget_exceeded"};
 inline constexpr std::string_view kHistorianQueryInvalid{"historian_query_invalid"};
+inline constexpr std::string_view kHistorianQueueOverflow{"historian_queue_overflow"};
 inline constexpr std::string_view kHistorianResponseInvalid{"historian_response_invalid"};
+inline constexpr std::string_view kHistorianSequenceRolloverRequired{"historian_sequence_rollover_required"};
 inline constexpr std::string_view kHistorianStorageBusy{"historian_storage_busy"};
+inline constexpr std::string_view kHistorianStorageChanged{"historian_storage_changed"};
 inline constexpr std::string_view kHistorianStorageCorrupt{"historian_storage_corrupt"};
 inline constexpr std::string_view kHistorianStorageFailure{"historian_storage_failure"};
+inline constexpr std::string_view kHistorianStorageForeign{"historian_storage_foreign"};
 inline constexpr std::string_view kHistorianStorageFull{"historian_storage_full"};
+inline constexpr std::string_view kHistorianStorageUnsupported{"historian_storage_unsupported"};
 inline constexpr std::string_view kHistorianStoreFailure{"historian_store_failure"};
+inline constexpr std::string_view kHistorianTimeoutInvalid{"historian_timeout_invalid"};
+inline constexpr std::string_view kHistorianValueInvalid{"historian_value_invalid"};
 inline constexpr std::string_view kHostApplyParentReadUnavailable{"host_apply_parent_read_unavailable"};
 inline constexpr std::string_view kHostApplyPreparationFailureReadUnavailable{"host_apply_preparation_failure_read_unavailable"};
 inline constexpr std::string_view kHostIoOutputAddressConflict{"host_io_output_address_conflict"};
@@ -1016,12 +1130,6 @@ inline constexpr std::string_view kHostIoOutputOccurrenceConflict{"host_io_outpu
 inline constexpr std::string_view kHostIoOutputProfileUnqualified{"host_io_output_profile_unqualified"};
 inline constexpr std::string_view kHostIoOutputPublicationConflict{"host_io_output_publication_conflict"};
 inline constexpr std::string_view kHostIoOutputResourceConflict{"host_io_output_resource_conflict"};
-inline constexpr std::string_view kI6CommandSchemaUnsupported{"i6_command_schema_unsupported"};
-inline constexpr std::string_view kI6GripperCommandScopeUnsupported{"i6_gripper_command_scope_unsupported"};
-inline constexpr std::string_view kI6MotionModelGroupCardinalityInvalid{"i6_motion_model_group_cardinality_invalid"};
-inline constexpr std::string_view kI6PreviewCapabilityCommandInvalid{"i6_preview_capability_command_invalid"};
-inline constexpr std::string_view kI6PreviewPrimaryMotionInvalid{"i6_preview_primary_motion_invalid"};
-inline constexpr std::string_view kI6PreviewSingleParticipantOnly{"i6_preview_single_participant_only"};
 inline constexpr std::string_view kIdentityArrayInvalid{"identity_array_invalid"};
 inline constexpr std::string_view kIkFailed{"ik_failed"};
 inline constexpr std::string_view kIncompatibleOwner{"incompatible_owner"};
@@ -1038,6 +1146,7 @@ inline constexpr std::string_view kInputNotFresh{"input_not_fresh"};
 inline constexpr std::string_view kInstalledCatalogMismatch{"installed_catalog_mismatch"};
 inline constexpr std::string_view kInstalledComponentLifecycleUnavailable{"installed_component_lifecycle_unavailable"};
 inline constexpr std::string_view kInstalledProcessInspectionScopeStale{"installed_process_inspection_scope_stale"};
+inline constexpr std::string_view kInstalledProcessInspectionUnavailable{"installed_process_inspection_unavailable"};
 inline constexpr std::string_view kInstalledProcessInventoryExceedsBound{"installed_process_inventory_exceeds_bound"};
 inline constexpr std::string_view kInstalledProcessInventoryInvalid{"installed_process_inventory_invalid"};
 inline constexpr std::string_view kInstanceUnavailable{"instance_unavailable"};
@@ -1046,6 +1155,8 @@ inline constexpr std::string_view kIntegerLiteralOutOfRange{"integer_literal_out
 inline constexpr std::string_view kIntegerOverflow{"integer_overflow"};
 inline constexpr std::string_view kInterfacesInvalid{"interfaces_invalid"};
 inline constexpr std::string_view kInternalError{"internal_error"};
+inline constexpr std::string_view kInterpolatedAccelerationLimitExceeded{"interpolated_acceleration_limit_exceeded"};
+inline constexpr std::string_view kInterpolatedJerkLimitExceeded{"interpolated_jerk_limit_exceeded"};
 inline constexpr std::string_view kInterruptActivationModeInvalid{"interrupt_activation_mode_invalid"};
 inline constexpr std::string_view kInterruptArmTimeoutInvalid{"interrupt_arm_timeout_invalid"};
 inline constexpr std::string_view kInterruptConditionInvalid{"interrupt_condition_invalid"};
@@ -1065,6 +1176,13 @@ inline constexpr std::string_view kInterruptScopeStopProfileMismatch{"interrupt_
 inline constexpr std::string_view kInterruptScopeSuccessThroughInvalid{"interrupt_scope_success_through_invalid"};
 inline constexpr std::string_view kInterruptScopesInvalid{"interrupt_scopes_invalid"};
 inline constexpr std::string_view kInterruptSourceUnavailable{"interrupt_source_unavailable"};
+inline constexpr std::string_view kInterruptStructuredValueEmpty{"interrupt_structured_value_empty"};
+inline constexpr std::string_view kInterruptStructuredValueKeyInvalid{"interrupt_structured_value_key_invalid"};
+inline constexpr std::string_view kInterruptStructuredValueNumberNonFinite{"interrupt_structured_value_number_non_finite"};
+inline constexpr std::string_view kInterruptStructuredValueStringNotNfc{"interrupt_structured_value_string_not_nfc"};
+inline constexpr std::string_view kInterruptStructuredValueStringTooLong{"interrupt_structured_value_string_too_long"};
+inline constexpr std::string_view kInterruptStructuredValueTooManyEntries{"interrupt_structured_value_too_many_entries"};
+inline constexpr std::string_view kInterventionAckRejected{"intervention_ack_rejected"};
 inline constexpr std::string_view kInterventionAcknowledgedForRetry{"intervention_acknowledged_for_retry"};
 inline constexpr std::string_view kInterventionEvidenceInvalid{"intervention_evidence_invalid"};
 inline constexpr std::string_view kInterventionEvidencePresenceInvalid{"intervention_evidence_presence_invalid"};
@@ -1136,8 +1254,10 @@ inline constexpr std::string_view kIoConditionKeyInputInvalid{"io_condition_key_
 inline constexpr std::string_view kIoConditionOperandTypesIncompatible{"io_condition_operand_types_incompatible"};
 inline constexpr std::string_view kIoConditionPostorderInvalid{"io_condition_postorder_invalid"};
 inline constexpr std::string_view kIoConditionSignalInputInvalid{"io_condition_signal_input_invalid"};
+inline constexpr std::string_view kIoConditionStringBoundExceeded{"io_condition_string_bound_exceeded"};
 inline constexpr std::string_view kIoConditionUnreachableNode{"io_condition_unreachable_node"};
 inline constexpr std::string_view kIoConditionUnusedInput{"io_condition_unused_input"};
+inline constexpr std::string_view kIoConditionValueNonfinite{"io_condition_value_nonfinite"};
 inline constexpr std::string_view kIoConditionWorkspaceTooSmall{"io_condition_workspace_too_small"};
 inline constexpr std::string_view kIoCursorGenerationStale{"io_cursor_generation_stale"};
 inline constexpr std::string_view kIoCursorRangeInvalid{"io_cursor_range_invalid"};
@@ -1174,10 +1294,12 @@ inline constexpr std::string_view kIoGlobalRuleWaitingDefinitionInvalid{"io_glob
 inline constexpr std::string_view kIoGlobalRuleWaitingForProgram{"io_global_rule_waiting_for_program"};
 inline constexpr std::string_view kIoIngressLossInvalid{"io_ingress_loss_invalid"};
 inline constexpr std::string_view kIoInputHasOutputContract{"io_input_has_output_contract"};
+inline constexpr std::string_view kIoInputNotMatched{"io_input_not_matched"};
 inline constexpr std::string_view kIoInputUnavailable{"io_input_unavailable"};
 inline constexpr std::string_view kIoManualWriteMotionExecuting{"io_manual_write_motion_executing"};
 inline constexpr std::string_view kIoMockEchoOutputNotFound{"io_mock_echo_output_not_found"};
 inline constexpr std::string_view kIoMockInputInvalid{"io_mock_input_invalid"};
+inline constexpr std::string_view kIoMockInputRequired{"io_mock_input_required"};
 inline constexpr std::string_view kIoOutputAcceptanceUnknown{"io_output_acceptance_unknown"};
 inline constexpr std::string_view kIoOutputAliasPredecessorMismatch{"io_output_alias_predecessor_mismatch"};
 inline constexpr std::string_view kIoOutputAliasRebindStale{"io_output_alias_rebind_stale"};
@@ -1192,6 +1314,8 @@ inline constexpr std::string_view kIoOutputPublicationConflict{"io_output_public
 inline constexpr std::string_view kIoOutputPublicationInvalid{"io_output_publication_invalid"};
 inline constexpr std::string_view kIoOutputSourceRejected{"io_output_source_rejected"};
 inline constexpr std::string_view kIoOutputWriteFailed{"io_output_write_failed"};
+inline constexpr std::string_view kIoOwnerRecoveryInvalid{"io_owner_recovery_invalid"};
+inline constexpr std::string_view kIoOwnerRecoveryStale{"io_owner_recovery_stale"};
 inline constexpr std::string_view kIoProviderComponentAmbiguous{"io_provider_component_ambiguous"};
 inline constexpr std::string_view kIoProviderDeviceConfigurationInvalid{"io_provider_device_configuration_invalid"};
 inline constexpr std::string_view kIoProviderDeviceOutputBudgetInvalid{"io_provider_device_output_budget_invalid"};
@@ -1216,9 +1340,14 @@ inline constexpr std::string_view kIoProviderRuntimeProfileAmbiguous{"io_provide
 inline constexpr std::string_view kIoProviderSignalMembershipInvalid{"io_provider_signal_membership_invalid"};
 inline constexpr std::string_view kIoProviderSignalMembershipMissing{"io_provider_signal_membership_missing"};
 inline constexpr std::string_view kIoProviderTargetUnqualified{"io_provider_target_unqualified"};
+inline constexpr std::string_view kIoProviderTransportUnavailable{"io_provider_transport_unavailable"};
 inline constexpr std::string_view kIoReceiverTimestampInvalid{"io_receiver_timestamp_invalid"};
 inline constexpr std::string_view kIoReceiverTimestampRegressed{"io_receiver_timestamp_regressed"};
+inline constexpr std::string_view kIoResourcePreparationIncomplete{"io_resource_preparation_incomplete"};
 inline constexpr std::string_view kIoRosConnectionComponentHasControllerBinding{"io_ros_connection_component_has_controller_binding"};
+inline constexpr std::string_view kIoRosOutputSetupFailed{"io_ros_output_setup_failed"};
+inline constexpr std::string_view kIoRosOwnerMismatch{"io_ros_owner_mismatch"};
+inline constexpr std::string_view kIoRosSubscriptionFailed{"io_ros_subscription_failed"};
 inline constexpr std::string_view kIoRuleActivationUnsupported{"io_rule_activation_unsupported"};
 inline constexpr std::string_view kIoRuleActiveAtArm{"io_rule_active_at_arm"};
 inline constexpr std::string_view kIoRuleArmIdentityMismatch{"io_rule_arm_identity_mismatch"};
@@ -1232,6 +1361,7 @@ inline constexpr std::string_view kIoRuleNaturalCompletionNotAllowed{"io_rule_na
 inline constexpr std::string_view kIoRuleNaturalCompletionProofMissing{"io_rule_natural_completion_proof_missing"};
 inline constexpr std::string_view kIoRuleNominalStopNotProved{"io_rule_nominal_stop_not_proved"};
 inline constexpr std::string_view kIoRuleOrderingEvidenceMissing{"io_rule_ordering_evidence_missing"};
+inline constexpr std::string_view kIoRuleOutcomeInvalid{"io_rule_outcome_invalid"};
 inline constexpr std::string_view kIoRuleOutcomeMissing{"io_rule_outcome_missing"};
 inline constexpr std::string_view kIoRuleParticipantMissing{"io_rule_participant_missing"};
 inline constexpr std::string_view kIoRuleParticipantStateMismatch{"io_rule_participant_state_mismatch"};
@@ -1258,7 +1388,11 @@ inline constexpr std::string_view kIoRuleSourceDisableProgramActive{"io_rule_sou
 inline constexpr std::string_view kIoRuleSourceDisabled{"io_rule_source_disabled"};
 inline constexpr std::string_view kIoRuleSourceInvalid{"io_rule_source_invalid"};
 inline constexpr std::string_view kIoRuleSourceUnavailable{"io_rule_source_unavailable"};
+inline constexpr std::string_view kIoRuleStateAcquisitionInvalid{"io_rule_state_acquisition_invalid"};
+inline constexpr std::string_view kIoRuleStateContextInvalid{"io_rule_state_context_invalid"};
 inline constexpr std::string_view kIoRuleStateJournalUnsupported{"io_rule_state_journal_unsupported"};
+inline constexpr std::string_view kIoRuleStateRowInvalid{"io_rule_state_row_invalid"};
+inline constexpr std::string_view kIoRuleStateRowsNotCanonical{"io_rule_state_rows_not_canonical"};
 inline constexpr std::string_view kIoRuleStopDeclarationInvalid{"io_rule_stop_declaration_invalid"};
 inline constexpr std::string_view kIoRuleStopEntryBindingMismatch{"io_rule_stop_entry_binding_mismatch"};
 inline constexpr std::string_view kIoRuleStopEntryChainInvalid{"io_rule_stop_entry_chain_invalid"};
@@ -1285,6 +1419,7 @@ inline constexpr std::string_view kIoRuleTeardownRetireFailed{"io_rule_teardown_
 inline constexpr std::string_view kIoRuleTerminalWithoutResponseCertificate{"io_rule_terminal_without_response_certificate"};
 inline constexpr std::string_view kIoSampleShapeInvalid{"io_sample_shape_invalid"};
 inline constexpr std::string_view kIoSequenceExhausted{"io_sequence_exhausted"};
+inline constexpr std::string_view kIoSignalCatalogStale{"io_signal_catalog_stale"};
 inline constexpr std::string_view kIoSignalChangedOutsideUnavailable{"io_signal_changed_outside_unavailable"};
 inline constexpr std::string_view kIoSignalConfigurationInvalid{"io_signal_configuration_invalid"};
 inline constexpr std::string_view kIoSignalContractUnsupported{"io_signal_contract_unsupported"};
@@ -1394,15 +1529,21 @@ inline constexpr std::string_view kLaneGuardMotionNotAdmitted{"lane_guard_motion
 inline constexpr std::string_view kLateCancelExecutionIdentityMissing{"late_cancel_execution_identity_missing"};
 inline constexpr std::string_view kLateCancelExecutionUnmapped{"late_cancel_execution_unmapped"};
 inline constexpr std::string_view kLateCancelJournalUnavailable{"late_cancel_journal_unavailable"};
+inline constexpr std::string_view kLateCancelKernelUnavailable{"late_cancel_kernel_unavailable"};
 inline constexpr std::string_view kLateCancelOperationTerminal{"late_cancel_operation_terminal"};
 inline constexpr std::string_view kLateCancelOutcomeUnknown{"late_cancel_outcome_unknown"};
+inline constexpr std::string_view kLateCancelOwnerChanged{"late_cancel_owner_changed"};
+inline constexpr std::string_view kLateCancelOwnerUnavailable{"late_cancel_owner_unavailable"};
 inline constexpr std::string_view kLateCancelParticipantTerminal{"late_cancel_participant_terminal"};
 inline constexpr std::string_view kLateCancelProjectionPending{"late_cancel_projection_pending"};
+inline constexpr std::string_view kLateCancelSessionUnavailable{"late_cancel_session_unavailable"};
+inline constexpr std::string_view kLateControlCycle{"late_control_cycle"};
 inline constexpr std::string_view kLateGripperCancelOutcomeUnknown{"late_gripper_cancel_outcome_unknown"};
 inline constexpr std::string_view kLegacyAngularProjectionUnitMismatch{"legacy_angular_projection_unit_mismatch"};
 inline constexpr std::string_view kLegacyInterruptPolicyRuntimeUnsupported{"legacy_interrupt_policy_runtime_unsupported"};
 inline constexpr std::string_view kLifecycleHealthUnavailable{"lifecycle_health_unavailable"};
 inline constexpr std::string_view kLiveSceneSnapshotUnavailable{"live_scene_snapshot_unavailable"};
+inline constexpr std::string_view kLogicNodeBindingUnavailable{"logic_node_binding_unavailable"};
 inline constexpr std::string_view kLogicalSceneSourceAbsent{"logical_scene_source_absent"};
 inline constexpr std::string_view kLogicalSceneSourceInvalid{"logical_scene_source_invalid"};
 inline constexpr std::string_view kLookaheadCursorPrecedesTrajectoryAnchor{"lookahead_cursor_precedes_trajectory_anchor"};
@@ -1440,10 +1581,10 @@ inline constexpr std::string_view kManagerLivenessStatusNotStrict{"manager_liven
 inline constexpr std::string_view kManagerPlannedStopOverrun{"manager_planned_stop_overrun"};
 inline constexpr std::string_view kManagerProjectionUnavailable{"manager_projection_unavailable"};
 inline constexpr std::string_view kManagerRunFolderHoldsPreviousRun{"manager_run_folder_holds_previous_run"};
+inline constexpr std::string_view kManagerRuntimeUnavailable{"manager_runtime_unavailable"};
 inline constexpr std::string_view kManagerSceneRuntimeRequestInvalid{"manager_scene_runtime_request_invalid"};
 inline constexpr std::string_view kManagerSceneRuntimeResponseIdentityMismatch{"manager_scene_runtime_response_identity_mismatch"};
 inline constexpr std::string_view kManagerSceneRuntimeResponseInvalid{"manager_scene_runtime_response_invalid"};
-inline constexpr std::string_view kManagerSceneRuntimeTransportInvalid{"manager_scene_runtime_transport_invalid"};
 inline constexpr std::string_view kManagerSceneRuntimeUnavailable{"manager_scene_runtime_unavailable"};
 inline constexpr std::string_view kManagerSourceAbsent{"manager_source_absent"};
 inline constexpr std::string_view kManagerSourceInvalid{"manager_source_invalid"};
@@ -1470,6 +1611,7 @@ inline constexpr std::string_view kManualHandoverParentNotCurrent{"manual_handov
 inline constexpr std::string_view kManualHandoverProducerNotHeld{"manual_handover_producer_not_held"};
 inline constexpr std::string_view kManualHandoverProgramHalted{"manual_handover_program_halted"};
 inline constexpr std::string_view kManualHandoverQueryUnavailable{"manual_handover_query_unavailable"};
+inline constexpr std::string_view kManualHandoverRequired{"manual_handover_required"};
 inline constexpr std::string_view kManualHandoverScopeStale{"manual_handover_scope_stale"};
 inline constexpr std::string_view kManualHandoverStopUnsettled{"manual_handover_stop_unsettled"};
 inline constexpr std::string_view kManualHandoverTargetUnresolved{"manual_handover_target_unresolved"};
@@ -1479,6 +1621,7 @@ inline constexpr std::string_view kManualOperationClaimRequiresExecute{"manual_o
 inline constexpr std::string_view kManualOperationClaimStale{"manual_operation_claim_stale"};
 inline constexpr std::string_view kManualOperationInProgress{"manual_operation_in_progress"};
 inline constexpr std::string_view kManualOperationNotCleanTerminal{"manual_operation_not_clean_terminal"};
+inline constexpr std::string_view kManualOperationScopeStale{"manual_operation_scope_stale"};
 inline constexpr std::string_view kManualOperationSettlementNotProven{"manual_operation_settlement_not_proven"};
 inline constexpr std::string_view kManualRecoveryFailure{"manual_recovery_failure"};
 inline constexpr std::string_view kMeasuredControlPathMissing{"measured_control_path_missing"};
@@ -1558,12 +1701,15 @@ inline constexpr std::string_view kModelAuditIdentityMissing{"model_audit_identi
 inline constexpr std::string_view kModelAuditOutcomeInvalid{"model_audit_outcome_invalid"};
 inline constexpr std::string_view kModelAuditRecordInvalid{"model_audit_record_invalid"};
 inline constexpr std::string_view kModelBindingsInvalid{"model_bindings_invalid"};
+inline constexpr std::string_view kModelConfidenceBelowThreshold{"model_confidence_below_threshold"};
 inline constexpr std::string_view kModelContractUnavailable{"model_contract_unavailable"};
+inline constexpr std::string_view kModelNodeUnavailable{"model_node_unavailable"};
 inline constexpr std::string_view kModelOutputContractInvalid{"model_output_contract_invalid"};
 inline constexpr std::string_view kModelRequestCancelled{"model_request_cancelled"};
 inline constexpr std::string_view kModelRequestFailed{"model_request_failed"};
 inline constexpr std::string_view kModelRequestTimeout{"model_request_timeout"};
 inline constexpr std::string_view kModelResponseParseFailed{"model_response_parse_failed"};
+inline constexpr std::string_view kModelResponseSchemaInvalid{"model_response_schema_invalid"};
 inline constexpr std::string_view kModelSnapshotCaptureFailed{"model_snapshot_capture_failed"};
 inline constexpr std::string_view kModelSnapshotCaptureInvalid{"model_snapshot_capture_invalid"};
 inline constexpr std::string_view kModelSnapshotCaptureTimeout{"model_snapshot_capture_timeout"};
@@ -1637,7 +1783,10 @@ inline constexpr std::string_view kMotionInterruptStopResponseNotAdmitted{"motio
 inline constexpr std::string_view kMotionInterruptStopSettleOverrideInvalid{"motion_interrupt_stop_settle_override_invalid"};
 inline constexpr std::string_view kMotionInterruptStopSettleOverrideUnknownJoint{"motion_interrupt_stop_settle_override_unknown_joint"};
 inline constexpr std::string_view kMotionInterruptStopStateInvalid{"motion_interrupt_stop_state_invalid"};
+inline constexpr std::string_view kMotionModelGroupCardinalityInvalid{"motion_model_group_cardinality_invalid"};
 inline constexpr std::string_view kMotionNestedValueInvalid{"motion_nested_value_invalid"};
+inline constexpr std::string_view kMotionNoSignalTripMappedFailure{"motion_no_signal_trip_mapped_failure"};
+inline constexpr std::string_view kMotionNodeUnavailable{"motion_node_unavailable"};
 inline constexpr std::string_view kMotionPathPreviewUnavailable{"motion_path_preview_unavailable"};
 inline constexpr std::string_view kMotionPayloadFieldsInvalid{"motion_payload_fields_invalid"};
 inline constexpr std::string_view kMotionPayloadInvalid{"motion_payload_invalid"};
@@ -1646,6 +1795,7 @@ inline constexpr std::string_view kMotionPlannerCapabilityUnregistered{"motion_p
 inline constexpr std::string_view kMotionPlannerCapabilityUnresolved{"motion_planner_capability_unresolved"};
 inline constexpr std::string_view kMotionPlannerRuntimeJoinInvalid{"motion_planner_runtime_join_invalid"};
 inline constexpr std::string_view kMotionPlanningEvidenceJoinInvalid{"motion_planning_evidence_join_invalid"};
+inline constexpr std::string_view kMotionPreempted{"motion_preempted"};
 inline constexpr std::string_view kMotionPreviewBindingChanged{"motion_preview_binding_changed"};
 inline constexpr std::string_view kMotionPreviewCancelled{"motion_preview_cancelled"};
 inline constexpr std::string_view kMotionPreviewEngineChanged{"motion_preview_engine_changed"};
@@ -1678,8 +1828,10 @@ inline constexpr std::string_view kMotionReplacementComputationRetiring{"motion_
 inline constexpr std::string_view kMotionReplacementComputationStartFailed{"motion_replacement_computation_start_failed"};
 inline constexpr std::string_view kMotionReplacementConnectorBoundaryInvalid{"motion_replacement_connector_boundary_invalid"};
 inline constexpr std::string_view kMotionReplacementContextInvalid{"motion_replacement_context_invalid"};
+inline constexpr std::string_view kMotionReplacementCursorUnavailable{"motion_replacement_cursor_unavailable"};
 inline constexpr std::string_view kMotionReplacementDeliveryJoinFailed{"motion_replacement_delivery_join_failed"};
 inline constexpr std::string_view kMotionReplacementDeliveryLeadExpired{"motion_replacement_delivery_lead_expired"};
+inline constexpr std::string_view kMotionReplacementEffectUncertain{"motion_replacement_effect_uncertain"};
 inline constexpr std::string_view kMotionReplacementFutureLeadUnavailable{"motion_replacement_future_lead_unavailable"};
 inline constexpr std::string_view kMotionReplacementGoalCapacity{"motion_replacement_goal_capacity"};
 inline constexpr std::string_view kMotionReplacementGoalConflict{"motion_replacement_goal_conflict"};
@@ -1687,6 +1839,7 @@ inline constexpr std::string_view kMotionReplacementInFlight{"motion_replacement
 inline constexpr std::string_view kMotionReplacementJoinOriginExpired{"motion_replacement_join_origin_expired"};
 inline constexpr std::string_view kMotionReplacementMembershipChanged{"motion_replacement_membership_changed"};
 inline constexpr std::string_view kMotionReplacementMonitorContextChanged{"motion_replacement_monitor_context_changed"};
+inline constexpr std::string_view kMotionReplacementNotReady{"motion_replacement_not_ready"};
 inline constexpr std::string_view kMotionReplacementPayloadInvalid{"motion_replacement_payload_invalid"};
 inline constexpr std::string_view kMotionReplacementPlanningBudgetExpired{"motion_replacement_planning_budget_expired"};
 inline constexpr std::string_view kMotionReplacementPreparationBudgetExpired{"motion_replacement_preparation_budget_expired"};
@@ -1704,13 +1857,18 @@ inline constexpr std::string_view kMotionReplacementScaleHoldPinRefused{"motion_
 inline constexpr std::string_view kMotionReplacementScaleHoldSourceStale{"motion_replacement_scale_hold_source_stale"};
 inline constexpr std::string_view kMotionReplacementScaleHoldUnconfirmed{"motion_replacement_scale_hold_unconfirmed"};
 inline constexpr std::string_view kMotionReplacementScaleOrSourceUnqualified{"motion_replacement_scale_or_source_unqualified"};
+inline constexpr std::string_view kMotionReplacementScaleUnqualified{"motion_replacement_scale_unqualified"};
 inline constexpr std::string_view kMotionReplacementScopeMismatch{"motion_replacement_scope_mismatch"};
+inline constexpr std::string_view kMotionReplacementSendThrew{"motion_replacement_send_threw"};
 inline constexpr std::string_view kMotionReplacementSourceChanged{"motion_replacement_source_changed"};
 inline constexpr std::string_view kMotionReplacementSourceHazardAuthority{"motion_replacement_source_hazard_authority"};
 inline constexpr std::string_view kMotionReplacementSourceMissing{"motion_replacement_source_missing"};
 inline constexpr std::string_view kMotionReplacementSourceSampleInvalid{"motion_replacement_source_sample_invalid"};
 inline constexpr std::string_view kMotionReplacementSourceSampleMismatch{"motion_replacement_source_sample_mismatch"};
 inline constexpr std::string_view kMotionReplacementSourceStale{"motion_replacement_source_stale"};
+inline constexpr std::string_view kMotionReplacementSourceUnavailable{"motion_replacement_source_unavailable"};
+inline constexpr std::string_view kMotionReplacementStale{"motion_replacement_stale"};
+inline constexpr std::string_view kMotionReplacementStopFenced{"motion_replacement_stop_fenced"};
 inline constexpr std::string_view kMotionReplacementStopRevoked{"motion_replacement_stop_revoked"};
 inline constexpr std::string_view kMotionReplacementTargetNotResolved{"motion_replacement_target_not_resolved"};
 inline constexpr std::string_view kMotionReplacementTimeoutInvalid{"motion_replacement_timeout_invalid"};
@@ -1718,7 +1876,10 @@ inline constexpr std::string_view kMotionReplacementTrajectoryInvalid{"motion_re
 inline constexpr std::string_view kMotionResourceProjectionNotAllAngular{"motion_resource_projection_not_all_angular"};
 inline constexpr std::string_view kMotionRuntimeBindingIncomplete{"motion_runtime_binding_incomplete"};
 inline constexpr std::string_view kMotionRuntimeObjectBindingInvalid{"motion_runtime_object_binding_invalid"};
+inline constexpr std::string_view kMotionScopedNodeUnavailable{"motion_scoped_node_unavailable"};
+inline constexpr std::string_view kMotionSignalTripMappedFailure{"motion_signal_trip_mapped_failure"};
 inline constexpr std::string_view kMotionSpeedProfileInvalid{"motion_speed_profile_invalid"};
+inline constexpr std::string_view kMotionSuperseded{"motion_superseded"};
 inline constexpr std::string_view kMotionTagInvalid{"motion_tag_invalid"};
 inline constexpr std::string_view kMotionTakeoverAuthorityMissing{"motion_takeover_authority_missing"};
 inline constexpr std::string_view kMotionTakeoverCandidateStale{"motion_takeover_candidate_stale"};
@@ -1750,6 +1911,8 @@ inline constexpr std::string_view kMotionTraceFileInvalid{"motion_trace_file_inv
 inline constexpr std::string_view kMotionTraceFileUnavailable{"motion_trace_file_unavailable"};
 inline constexpr std::string_view kMotionTraceStoreBusy{"motion_trace_store_busy"};
 inline constexpr std::string_view kMotionTraceStoreFull{"motion_trace_store_full"};
+inline constexpr std::string_view kMotionTraceStoreUnavailable{"motion_trace_store_unavailable"};
+inline constexpr std::string_view kMotionTransactionOwnerUnavailable{"motion_transaction_owner_unavailable"};
 inline constexpr std::string_view kMotionValueAboveProgramLimit{"motion_value_above_program_limit"};
 inline constexpr std::string_view kMountPrimaryToolRequired{"mount_primary_tool_required"};
 inline constexpr std::string_view kMovingReplacementInputInvalid{"moving_replacement_input_invalid"};
@@ -1764,9 +1927,15 @@ inline constexpr std::string_view kMovingReplacementStartAuthorityMismatch{"movi
 inline constexpr std::string_view kMovingReplacementValidationContextMismatch{"moving_replacement_validation_context_mismatch"};
 inline constexpr std::string_view kNamedTargetResolutionUnavailable{"named_target_resolution_unavailable"};
 inline constexpr std::string_view kNativeCandidateAdapterFailure{"native_candidate_adapter_failure"};
+inline constexpr std::string_view kNativeCandidateBindingInvalid{"native_candidate_binding_invalid"};
+inline constexpr std::string_view kNativeCandidateGroupMismatch{"native_candidate_group_mismatch"};
+inline constexpr std::string_view kNativeCandidateRequestBindingMismatch{"native_candidate_request_binding_mismatch"};
+inline constexpr std::string_view kNativeCandidateRequestNumericInvalid{"native_candidate_request_numeric_invalid"};
 inline constexpr std::string_view kNativeCandidateSceneFrameClockFailed{"native_candidate_scene_frame_clock_failed"};
 inline constexpr std::string_view kNativeCandidateSceneFrameLeaseUnavailable{"native_candidate_scene_frame_lease_unavailable"};
 inline constexpr std::string_view kNativeCandidateSceneFrameReceiptInvalid{"native_candidate_scene_frame_receipt_invalid"};
+inline constexpr std::string_view kNativeCandidateStartStateBindingMismatch{"native_candidate_start_state_binding_mismatch"};
+inline constexpr std::string_view kNativeCellRegistrationInvalid{"native_cell_registration_invalid"};
 inline constexpr std::string_view kNativeCellStopSourceCoverageMissing{"native_cell_stop_source_coverage_missing"};
 inline constexpr std::string_view kNativeCellStopSourceEvidenceMissing{"native_cell_stop_source_evidence_missing"};
 inline constexpr std::string_view kNativeCellStopSourceOwnerMismatch{"native_cell_stop_source_owner_mismatch"};
@@ -1814,6 +1983,7 @@ inline constexpr std::string_view kNativeModelRefreshMotionNotIdle{"native_model
 inline constexpr std::string_view kNativeModelRefreshReadbackMismatch{"native_model_refresh_readback_mismatch"};
 inline constexpr std::string_view kNativeMotionTypeUnsupported{"native_motion_type_unsupported"};
 inline constexpr std::string_view kNativeMovingCartesianBlendProofUnavailable{"native_moving_cartesian_blend_proof_unavailable"};
+inline constexpr std::string_view kNativeMovingConnectorUnqualified{"native_moving_connector_unqualified"};
 inline constexpr std::string_view kNativeMovingIncomingLimitsViolated{"native_moving_incoming_limits_violated"};
 inline constexpr std::string_view kNativeMovingPositionBoundsUnqualified{"native_moving_position_bounds_unqualified"};
 inline constexpr std::string_view kNativeMovingSourceInvalid{"native_moving_source_invalid"};
@@ -1930,6 +2100,7 @@ inline constexpr std::string_view kNativeTimeParameterizationFailed{"native_time
 inline constexpr std::string_view kNativeTrajectorySampleInvalid{"native_trajectory_sample_invalid"};
 inline constexpr std::string_view kNativeTrajectoryShapeInvalid{"native_trajectory_shape_invalid"};
 inline constexpr std::string_view kNativeWorkerFailure{"native_worker_failure"};
+inline constexpr std::string_view kNaturalCompletionResultInvalid{"natural_completion_result_invalid"};
 inline constexpr std::string_view kNegativeRemainderOperand{"negative_remainder_operand"};
 inline constexpr std::string_view kNestingTooDeep{"nesting_too_deep"};
 inline constexpr std::string_view kNewActiveContactAfterClearStart{"new_active_contact_after_clear_start"};
@@ -1944,6 +2115,7 @@ inline constexpr std::string_view kNodeInputUnavailable{"node_input_unavailable"
 inline constexpr std::string_view kNodeMotionPreviewUnsupported{"node_motion_preview_unsupported"};
 inline constexpr std::string_view kNonFiniteCommandCursor{"non_finite_command_cursor"};
 inline constexpr std::string_view kNonFiniteResult{"non_finite_result"};
+inline constexpr std::string_view kNoncollisionValidationCancelled{"noncollision_validation_cancelled"};
 inline constexpr std::string_view kObjectAlreadyExists{"object_already_exists"};
 inline constexpr std::string_view kObjectNotFound{"object_not_found"};
 inline constexpr std::string_view kObjectRequired{"object_required"};
@@ -2006,40 +2178,59 @@ inline constexpr std::string_view kOperationActionSpanRunMismatch{"operation_act
 inline constexpr std::string_view kOperationAdmissionCapacityUnavailable{"operation_admission_capacity_unavailable"};
 inline constexpr std::string_view kOperationAdmissionOutcomeUnknown{"operation_admission_outcome_unknown"};
 inline constexpr std::string_view kOperationAttributionInvalid{"operation_attribution_invalid"};
+inline constexpr std::string_view kOperationCancelledPreDispatch{"operation_cancelled_pre_dispatch"};
 inline constexpr std::string_view kOperationCapacityFull{"operation_capacity_full"};
 inline constexpr std::string_view kOperationCloseCleanupFailed{"operation_close_cleanup_failed"};
 inline constexpr std::string_view kOperationCommitGuardMissing{"operation_commit_guard_missing"};
 inline constexpr std::string_view kOperationControlAdmissionPending{"operation_control_admission_pending"};
+inline constexpr std::string_view kOperationControlAttributionInvalid{"operation_control_attribution_invalid"};
 inline constexpr std::string_view kOperationControlBusy{"operation_control_busy"};
 inline constexpr std::string_view kOperationControlEffectHandoffFailed{"operation_control_effect_handoff_failed"};
 inline constexpr std::string_view kOperationControlEffectThrew{"operation_control_effect_threw"};
 inline constexpr std::string_view kOperationControlIncrementalUpdateFailed{"operation_control_incremental_update_failed"};
 inline constexpr std::string_view kOperationControlPartialResourceOwnership{"operation_control_partial_resource_ownership"};
+inline constexpr std::string_view kOperationControlReasonInvalid{"operation_control_reason_invalid"};
 inline constexpr std::string_view kOperationControlReconfigurationBusy{"operation_control_reconfiguration_busy"};
 inline constexpr std::string_view kOperationControlReconfigurationFailed{"operation_control_reconfiguration_failed"};
 inline constexpr std::string_view kOperationControlReconfigurationInProgress{"operation_control_reconfiguration_in_progress"};
+inline constexpr std::string_view kOperationControlRequestContextInvalid{"operation_control_request_context_invalid"};
 inline constexpr std::string_view kOperationControlRequestInvalid{"operation_control_request_invalid"};
 inline constexpr std::string_view kOperationControlResourceMissing{"operation_control_resource_missing"};
 inline constexpr std::string_view kOperationControlResourceOwnerMismatch{"operation_control_resource_owner_mismatch"};
+inline constexpr std::string_view kOperationControlScopeInvalid{"operation_control_scope_invalid"};
 inline constexpr std::string_view kOperationControlSettlementKindInvalid{"operation_control_settlement_kind_invalid"};
 inline constexpr std::string_view kOperationControlSettlementMissing{"operation_control_settlement_missing"};
 inline constexpr std::string_view kOperationControlStateInvalid{"operation_control_state_invalid"};
+inline constexpr std::string_view kOperationControlTargetInvalid{"operation_control_target_invalid"};
 inline constexpr std::string_view kOperationCoordinationShapeInvalid{"operation_coordination_shape_invalid"};
 inline constexpr std::string_view kOperationEffectInFlight{"operation_effect_in_flight"};
 inline constexpr std::string_view kOperationExecutionScopeInvalid{"operation_execution_scope_invalid"};
+inline constexpr std::string_view kOperationFailed{"operation_failed"};
 inline constexpr std::string_view kOperationIdConflict{"operation_id_conflict"};
 inline constexpr std::string_view kOperationIdEmpty{"operation_id_empty"};
 inline constexpr std::string_view kOperationIdExhausted{"operation_id_exhausted"};
 inline constexpr std::string_view kOperationIdInvalid{"operation_id_invalid"};
 inline constexpr std::string_view kOperationIdentityEmpty{"operation_identity_empty"};
+inline constexpr std::string_view kOperationInterrupted{"operation_interrupted"};
+inline constexpr std::string_view kOperationInterventionRequired{"operation_intervention_required"};
 inline constexpr std::string_view kOperationJournalBusy{"operation_journal_busy"};
+inline constexpr std::string_view kOperationJournalClockFailure{"operation_journal_clock_failure"};
+inline constexpr std::string_view kOperationJournalClosed{"operation_journal_closed"};
+inline constexpr std::string_view kOperationJournalConfigurationInvalid{"operation_journal_configuration_invalid"};
 inline constexpr std::string_view kOperationJournalCorrupt{"operation_journal_corrupt"};
+inline constexpr std::string_view kOperationJournalEventQueryInvalid{"operation_journal_event_query_invalid"};
 inline constexpr std::string_view kOperationJournalException{"operation_journal_exception"};
 inline constexpr std::string_view kOperationJournalFailure{"operation_journal_failure"};
 inline constexpr std::string_view kOperationJournalInternalFailure{"operation_journal_internal_failure"};
+inline constexpr std::string_view kOperationJournalPathInvalid{"operation_journal_path_invalid"};
+inline constexpr std::string_view kOperationJournalPayloadUnsupported{"operation_journal_payload_unsupported"};
+inline constexpr std::string_view kOperationJournalRecordInvalid{"operation_journal_record_invalid"};
+inline constexpr std::string_view kOperationJournalRecordTooLarge{"operation_journal_record_too_large"};
 inline constexpr std::string_view kOperationJournalRecordsLost{"operation_journal_records_lost"};
 inline constexpr std::string_view kOperationJournalStartInvalid{"operation_journal_start_invalid"};
 inline constexpr std::string_view kOperationJournalStorageFailure{"operation_journal_storage_failure"};
+inline constexpr std::string_view kOperationJournalStorageForeign{"operation_journal_storage_foreign"};
+inline constexpr std::string_view kOperationJournalStorageUnsupported{"operation_journal_storage_unsupported"};
 inline constexpr std::string_view kOperationNotResident{"operation_not_resident"};
 inline constexpr std::string_view kOperationPartialDispatch{"operation_partial_dispatch"};
 inline constexpr std::string_view kOperationParticipantCountInvalid{"operation_participant_count_invalid"};
@@ -2058,6 +2249,13 @@ inline constexpr std::string_view kOperationRevisionExhausted{"operation_revisio
 inline constexpr std::string_view kOperationRevisionInvalid{"operation_revision_invalid"};
 inline constexpr std::string_view kOperationSceneRevisionInvalid{"operation_scene_revision_invalid"};
 inline constexpr std::string_view kOperationSettlementFaultPersistenceThrew{"operation_settlement_fault_persistence_threw"};
+inline constexpr std::string_view kOperationStopped{"operation_stopped"};
+inline constexpr std::string_view kOperatorAlarmAcknowledgeAllConfirmationRequired{"operator_alarm_acknowledge_all_confirmation_required"};
+inline constexpr std::string_view kOperatorAlarmAcknowledgeAllDuplicateMember{"operator_alarm_acknowledge_all_duplicate_member"};
+inline constexpr std::string_view kOperatorAlarmAcknowledgeAllMembersInvalid{"operator_alarm_acknowledge_all_members_invalid"};
+inline constexpr std::string_view kOperatorAlarmAcknowledgementConfirmationRequired{"operator_alarm_acknowledgement_confirmation_required"};
+inline constexpr std::string_view kOperatorAlarmAcknowledgementReasonRequired{"operator_alarm_acknowledgement_reason_required"};
+inline constexpr std::string_view kOperatorAlarmActivationStale{"operator_alarm_activation_stale"};
 inline constexpr std::string_view kOperatorAlarmAttentionCellMismatch{"operator_alarm_attention_cell_mismatch"};
 inline constexpr std::string_view kOperatorAlarmAttentionConflict{"operator_alarm_attention_conflict"};
 inline constexpr std::string_view kOperatorAlarmAttentionGenerationConflict{"operator_alarm_attention_generation_conflict"};
@@ -2070,22 +2268,49 @@ inline constexpr std::string_view kOperatorAlarmAttentionMembershipUnsorted{"ope
 inline constexpr std::string_view kOperatorAlarmAttentionStale{"operator_alarm_attention_stale"};
 inline constexpr std::string_view kOperatorAlarmAttentionSubjectInvalid{"operator_alarm_attention_subject_invalid"};
 inline constexpr std::string_view kOperatorAlarmAttentionSubjectOversized{"operator_alarm_attention_subject_oversized"};
+inline constexpr std::string_view kOperatorAlarmCatalogUnavailable{"operator_alarm_catalog_unavailable"};
 inline constexpr std::string_view kOperatorAlarmClearQualityUnknown{"operator_alarm_clear_quality_unknown"};
+inline constexpr std::string_view kOperatorAlarmClockInvalid{"operator_alarm_clock_invalid"};
 inline constexpr std::string_view kOperatorAlarmConditionCapacityExhausted{"operator_alarm_condition_capacity_exhausted"};
+inline constexpr std::string_view kOperatorAlarmConditionIdentityMismatch{"operator_alarm_condition_identity_mismatch"};
+inline constexpr std::string_view kOperatorAlarmConditionUpdateInvalid{"operator_alarm_condition_update_invalid"};
+inline constexpr std::string_view kOperatorAlarmConfigurationInvalid{"operator_alarm_configuration_invalid"};
+inline constexpr std::string_view kOperatorAlarmDefinitionMismatch{"operator_alarm_definition_mismatch"};
+inline constexpr std::string_view kOperatorAlarmDefinitionUnknown{"operator_alarm_definition_unknown"};
+inline constexpr std::string_view kOperatorAlarmIdentityExhausted{"operator_alarm_identity_exhausted"};
 inline constexpr std::string_view kOperatorAlarmInterlockActive{"operator_alarm_interlock_active"};
+inline constexpr std::string_view kOperatorAlarmLimitInvalid{"operator_alarm_limit_invalid"};
+inline constexpr std::string_view kOperatorAlarmMembershipMismatch{"operator_alarm_membership_mismatch"};
 inline constexpr std::string_view kOperatorAlarmMetricsInvalid{"operator_alarm_metrics_invalid"};
+inline constexpr std::string_view kOperatorAlarmNotFound{"operator_alarm_not_found"};
 inline constexpr std::string_view kOperatorAlarmOrderingInvalid{"operator_alarm_ordering_invalid"};
+inline constexpr std::string_view kOperatorAlarmOwnerGenerationStale{"operator_alarm_owner_generation_stale"};
+inline constexpr std::string_view kOperatorAlarmRecordRevisionStale{"operator_alarm_record_revision_stale"};
 inline constexpr std::string_view kOperatorAlarmResourceRegistryUnavailable{"operator_alarm_resource_registry_unavailable"};
 inline constexpr std::string_view kOperatorAlarmScopeInactive{"operator_alarm_scope_inactive"};
+inline constexpr std::string_view kOperatorAlarmScopeInvalid{"operator_alarm_scope_invalid"};
+inline constexpr std::string_view kOperatorAlarmSourceAdapterMismatch{"operator_alarm_source_adapter_mismatch"};
+inline constexpr std::string_view kOperatorAlarmSourceAdapterUnknown{"operator_alarm_source_adapter_unknown"};
+inline constexpr std::string_view kOperatorAlarmSourceAuthorityConflict{"operator_alarm_source_authority_conflict"};
+inline constexpr std::string_view kOperatorAlarmSourceEpochConflict{"operator_alarm_source_epoch_conflict"};
+inline constexpr std::string_view kOperatorAlarmSourceEpochStale{"operator_alarm_source_epoch_stale"};
 inline constexpr std::string_view kOperatorAlarmSourceRefreshOverdue{"operator_alarm_source_refresh_overdue"};
+inline constexpr std::string_view kOperatorAlarmSourceRegistrationConflict{"operator_alarm_source_registration_conflict"};
+inline constexpr std::string_view kOperatorAlarmSourceSequenceConflict{"operator_alarm_source_sequence_conflict"};
+inline constexpr std::string_view kOperatorAlarmSourceSequenceStale{"operator_alarm_source_sequence_stale"};
+inline constexpr std::string_view kOperatorAlarmSourceUnregistered{"operator_alarm_source_unregistered"};
 inline constexpr std::string_view kOperatorAlarmStateFilterInvalid{"operator_alarm_state_filter_invalid"};
+inline constexpr std::string_view kOperatorAlarmStateUnavailable{"operator_alarm_state_unavailable"};
+inline constexpr std::string_view kOperatorAlarmValueInvalid{"operator_alarm_value_invalid"};
 inline constexpr std::string_view kOperatorChoiceFailed{"operator_choice_failed"};
 inline constexpr std::string_view kOperatorConfigurationInvalid{"operator_configuration_invalid"};
+inline constexpr std::string_view kOperatorInterventionRequired{"operator_intervention_required"};
 inline constexpr std::string_view kOperatorStopRequiresOwnerRecovery{"operator_stop_requires_owner_recovery"};
 inline constexpr std::string_view kOrderedContactRuleFinalizeException{"ordered_contact_rule_finalize_exception"};
 inline constexpr std::string_view kOrderedContactSummaryCoverageMismatch{"ordered_contact_summary_coverage_mismatch"};
 inline constexpr std::string_view kOrderedContactSummaryInvalid{"ordered_contact_summary_invalid"};
 inline constexpr std::string_view kOrderedContactSummaryMissing{"ordered_contact_summary_missing"};
+inline constexpr std::string_view kOrderedContactSummarySequenceMismatch{"ordered_contact_summary_sequence_mismatch"};
 inline constexpr std::string_view kOrderedContactSummaryStateMismatch{"ordered_contact_summary_state_mismatch"};
 inline constexpr std::string_view kOrdinaryMotionJerkDisabled{"ordinary_motion_jerk_disabled"};
 inline constexpr std::string_view kOrdinaryMotionJerkLimitExceeded{"ordinary_motion_jerk_limit_exceeded"};
@@ -2107,6 +2332,7 @@ inline constexpr std::string_view kOwnerCancellationFailed{"owner_cancellation_f
 inline constexpr std::string_view kOwnerClosing{"owner_closing"};
 inline constexpr std::string_view kOwnerEstopActive{"owner_estop_active"};
 inline constexpr std::string_view kOwnerNotPrepared{"owner_not_prepared"};
+inline constexpr std::string_view kOwnerNotReady{"owner_not_ready"};
 inline constexpr std::string_view kOwnerOutputRejected{"owner_output_rejected"};
 inline constexpr std::string_view kOwnerProjectionInvalid{"owner_projection_invalid"};
 inline constexpr std::string_view kOwnerRebindStageInvalid{"owner_rebind_stage_invalid"};
@@ -2114,6 +2340,7 @@ inline constexpr std::string_view kOwnerRebuildAssessmentUnavailable{"owner_rebu
 inline constexpr std::string_view kOwnerRebuildTakeoverCleanupUnresolved{"owner_rebuild_takeover_cleanup_unresolved"};
 inline constexpr std::string_view kOwnerRecoveryAssessmentInvalid{"owner_recovery_assessment_invalid"};
 inline constexpr std::string_view kOwnerRequestFailed{"owner_request_failed"};
+inline constexpr std::string_view kOwnerResponseRejected{"owner_response_rejected"};
 inline constexpr std::string_view kOwnerResultInvalid{"owner_result_invalid"};
 inline constexpr std::string_view kOwnerShutdownTimeoutChanged{"owner_shutdown_timeout_changed"};
 inline constexpr std::string_view kOwnerShutdownTimeoutInvalid{"owner_shutdown_timeout_invalid"};
@@ -2200,6 +2427,7 @@ inline constexpr std::string_view kPersistentKeyNotFound{"persistent_key_not_fou
 inline constexpr std::string_view kPersistentKeyProgramStale{"persistent_key_program_stale"};
 inline constexpr std::string_view kPersistentKeyProgramUnavailable{"persistent_key_program_unavailable"};
 inline constexpr std::string_view kPersistentKeyRegisterUnavailable{"persistent_key_register_unavailable"};
+inline constexpr std::string_view kPersistentKeyRegisterVersionUnsupported{"persistent_key_register_version_unsupported"};
 inline constexpr std::string_view kPersistentKeyRequestReplayed{"persistent_key_request_replayed"};
 inline constexpr std::string_view kPersistentKeyRunConflict{"persistent_key_run_conflict"};
 inline constexpr std::string_view kPersistentKeyScenarioConflict{"persistent_key_scenario_conflict"};
@@ -2275,11 +2503,14 @@ inline constexpr std::string_view kPlannerResultProjectionRevisionMismatch{"plan
 inline constexpr std::string_view kPlannerResultResourceProjectionMismatch{"planner_result_resource_projection_mismatch"};
 inline constexpr std::string_view kPlanningAttemptIndexInvalid{"planning_attempt_index_invalid"};
 inline constexpr std::string_view kPlanningCancelledByInterrupt{"planning_cancelled_by_interrupt"};
+inline constexpr std::string_view kPlanningContractUnavailable{"planning_contract_unavailable"};
 inline constexpr std::string_view kPlanningFailed{"planning_failed"};
 inline constexpr std::string_view kPlanningJobExists{"planning_job_exists"};
 inline constexpr std::string_view kPlanningJobUnfinished{"planning_job_unfinished"};
 inline constexpr std::string_view kPlanningJobUnknown{"planning_job_unknown"};
+inline constexpr std::string_view kPlanningSceneProjectionNotConverged{"planning_scene_projection_not_converged"};
 inline constexpr std::string_view kPlanningSceneSynchronizationException{"planning_scene_synchronization_exception"};
+inline constexpr std::string_view kPlanningSceneSynchronizationFailed{"planning_scene_synchronization_failed"};
 inline constexpr std::string_view kPlanningSceneSynchronizationInvalid{"planning_scene_synchronization_invalid"};
 inline constexpr std::string_view kPlanningSceneSynchronizationRaced{"planning_scene_synchronization_raced"};
 inline constexpr std::string_view kPlanningSceneSynchronizerTargetMissing{"planning_scene_synchronizer_target_missing"};
@@ -2294,11 +2525,16 @@ inline constexpr std::string_view kPneumaticIoPresetsCoincident{"pneumatic_io_pr
 inline constexpr std::string_view kPneumaticIoUnsupportedOnIsaac{"pneumatic_io_unsupported_on_isaac"};
 inline constexpr std::string_view kPneumaticNoneOwnerMismatch{"pneumatic_none_owner_mismatch"};
 inline constexpr std::string_view kPneumaticStopNotApplicable{"pneumatic_stop_not_applicable"};
+inline constexpr std::string_view kPointcloudCellIdentityMismatch{"pointcloud_cell_identity_mismatch"};
 inline constexpr std::string_view kPointcloudMediaTypeInvalid{"pointcloud_media_type_invalid"};
 inline constexpr std::string_view kPointcloudObservationInvalid{"pointcloud_observation_invalid"};
 inline constexpr std::string_view kPointcloudPacketOversized{"pointcloud_packet_oversized"};
 inline constexpr std::string_view kPointcloudSceneOwnerStale{"pointcloud_scene_owner_stale"};
 inline constexpr std::string_view kPointcloudSceneOwnerUnavailable{"pointcloud_scene_owner_unavailable"};
+inline constexpr std::string_view kPointcloudSequenceConflict{"pointcloud_sequence_conflict"};
+inline constexpr std::string_view kPointcloudSequenceRegressed{"pointcloud_sequence_regressed"};
+inline constexpr std::string_view kPointcloudSourceOwnerMismatch{"pointcloud_source_owner_mismatch"};
+inline constexpr std::string_view kPointcloudStreamGenerationRegressed{"pointcloud_stream_generation_regressed"};
 inline constexpr std::string_view kPolicyFields{"policy_fields"};
 inline constexpr std::string_view kPortOccupied{"port_occupied"};
 inline constexpr std::string_view kPoseFrameMismatch{"pose_frame_mismatch"};
@@ -2321,6 +2557,9 @@ inline constexpr std::string_view kPredecessorOrCandidateDomainsInvalid{"predece
 inline constexpr std::string_view kPredecessorSnapshotChanged{"predecessor_snapshot_changed"};
 inline constexpr std::string_view kPredecessorSnapshotInvalid{"predecessor_snapshot_invalid"};
 inline constexpr std::string_view kPredecessorSnapshotMissing{"predecessor_snapshot_missing"};
+inline constexpr std::string_view kPrepareParticipantResultIdentityInvalid{"prepare_participant_result_identity_invalid"};
+inline constexpr std::string_view kPrepareParticipantResultPresenceInvalid{"prepare_participant_result_presence_invalid"};
+inline constexpr std::string_view kPrepareParticipantResultStateInvalid{"prepare_participant_result_state_invalid"};
 inline constexpr std::string_view kPreparedActivationMismatch{"prepared_activation_mismatch"};
 inline constexpr std::string_view kPreparedActivationUnverified{"prepared_activation_unverified"};
 inline constexpr std::string_view kPreparedCancelTerminalFailed{"prepared_cancel_terminal_failed"};
@@ -2341,7 +2580,14 @@ inline constexpr std::string_view kPreparedCommandProductMismatch{"prepared_comm
 inline constexpr std::string_view kPreparedCommandSessionAllocationFailed{"prepared_command_session_allocation_failed"};
 inline constexpr std::string_view kPreparedCommandSessionBusy{"prepared_command_session_busy"};
 inline constexpr std::string_view kPreparedCommandSessionMissing{"prepared_command_session_missing"};
+inline constexpr std::string_view kPreparedContractConflict{"prepared_contract_conflict"};
 inline constexpr std::string_view kPreparedDispatchMembershipInvalid{"prepared_dispatch_membership_invalid"};
+inline constexpr std::string_view kPreparedExecutionHandleMembershipMismatch{"prepared_execution_handle_membership_mismatch"};
+inline constexpr std::string_view kPreparedExecutionHandleObserverMissing{"prepared_execution_handle_observer_missing"};
+inline constexpr std::string_view kPreparedExecutionHandleRequestIdentityInvalid{"prepared_execution_handle_request_identity_invalid"};
+inline constexpr std::string_view kPreparedExecutionNotQuiescent{"prepared_execution_not_quiescent"};
+inline constexpr std::string_view kPreparedExecutionStale{"prepared_execution_stale"};
+inline constexpr std::string_view kPreparedFaultStopPlanEncodingInvalid{"prepared_fault_stop_plan_encoding_invalid"};
 inline constexpr std::string_view kPreparedGoalNotActive{"prepared_goal_not_active"};
 inline constexpr std::string_view kPreparedMotionAlreadyDispatched{"prepared_motion_already_dispatched"};
 inline constexpr std::string_view kPreparedMotionAuthorityMismatch{"prepared_motion_authority_mismatch"};
@@ -2380,16 +2626,60 @@ inline constexpr std::string_view kPreparedMotionSessionAllocationFailed{"prepar
 inline constexpr std::string_view kPreparedMotionSessionMissing{"prepared_motion_session_missing"};
 inline constexpr std::string_view kPreparedMotionWorkerExitedBeforeDispatch{"prepared_motion_worker_exited_before_dispatch"};
 inline constexpr std::string_view kPreparedOperationParticipantInvalid{"prepared_operation_participant_invalid"};
+inline constexpr std::string_view kPreparedOrdinaryStopPlanEncodingInvalid{"prepared_ordinary_stop_plan_encoding_invalid"};
+inline constexpr std::string_view kPreparedParticipantBackendActivationSetIdMismatch{"prepared_participant_backend_activation_set_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendActiveConfigurationGenerationMismatch{"prepared_participant_backend_active_configuration_generation_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendActiveConfigurationIdMismatch{"prepared_participant_backend_active_configuration_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendCapabilityIdMismatch{"prepared_participant_backend_capability_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendCapabilityProviderMismatch{"prepared_participant_backend_capability_provider_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendCapabilityRevisionMismatch{"prepared_participant_backend_capability_revision_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendCommandTargetIdMismatch{"prepared_participant_backend_command_target_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendComponentIdMismatch{"prepared_participant_backend_component_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendComponentTypeIdMismatch{"prepared_participant_backend_component_type_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendComponentTypeRevisionMismatch{"prepared_participant_backend_component_type_revision_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendControlBindingIdMismatch{"prepared_participant_backend_control_binding_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendControlBindingRevisionMismatch{"prepared_participant_backend_control_binding_revision_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendControlDomainIdMismatch{"prepared_participant_backend_control_domain_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendControlDomainRevisionMismatch{"prepared_participant_backend_control_domain_revision_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendControlProviderMismatch{"prepared_participant_backend_control_provider_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendControlRouteIdMismatch{"prepared_participant_backend_control_route_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendControllerTopologyIdMismatch{"prepared_participant_backend_controller_topology_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendFrameBindingsMismatch{"prepared_participant_backend_frame_bindings_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendGraphRevisionMismatch{"prepared_participant_backend_graph_revision_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendInterfaceContractIdMismatch{"prepared_participant_backend_interface_contract_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendInterfaceRevisionMismatch{"prepared_participant_backend_interface_revision_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendModelBindingsMismatch{"prepared_participant_backend_model_bindings_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendProgramBindingIdMismatch{"prepared_participant_backend_program_binding_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendProgramRevisionMismatch{"prepared_participant_backend_program_revision_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendResourcesMismatch{"prepared_participant_backend_resources_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendRetainedBundleIdMismatch{"prepared_participant_backend_retained_bundle_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendRuntimeUnitEpochsMismatch{"prepared_participant_backend_runtime_unit_epochs_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendShapeInvalid{"prepared_participant_backend_shape_invalid"};
+inline constexpr std::string_view kPreparedParticipantBackendStopEvidencePolicyIdMismatch{"prepared_participant_backend_stop_evidence_policy_id_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendStopEvidencePolicyRevisionMismatch{"prepared_participant_backend_stop_evidence_policy_revision_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendStopPlanMismatch{"prepared_participant_backend_stop_plan_mismatch"};
+inline constexpr std::string_view kPreparedParticipantBackendTopologyRevisionMismatch{"prepared_participant_backend_topology_revision_mismatch"};
 inline constexpr std::string_view kPreparedParticipantCancelThrew{"prepared_participant_cancel_threw"};
 inline constexpr std::string_view kPreparedParticipantNotAdmitted{"prepared_participant_not_admitted"};
 inline constexpr std::string_view kPreparedParticipantReferentMismatch{"prepared_participant_referent_mismatch"};
 inline constexpr std::string_view kPreparedParticipantStopPlanDigestMismatch{"prepared_participant_stop_plan_digest_mismatch"};
 inline constexpr std::string_view kPreparedParticipantStopPlanInvalid{"prepared_participant_stop_plan_invalid"};
 inline constexpr std::string_view kPreparedParticipantStopPlanMismatch{"prepared_participant_stop_plan_mismatch"};
+inline constexpr std::string_view kPreparedPlanRequestEncodingInvalid{"prepared_plan_request_encoding_invalid"};
+inline constexpr std::string_view kPreparedPlanningEvidenceEncodingInvalid{"prepared_planning_evidence_encoding_invalid"};
 inline constexpr std::string_view kPreparedPlanningValueInvalid{"prepared_planning_value_invalid"};
+inline constexpr std::string_view kPreparedReplacementConflict{"prepared_replacement_conflict"};
+inline constexpr std::string_view kPreparedReplacementNotQuiescent{"prepared_replacement_not_quiescent"};
+inline constexpr std::string_view kPreparedReplacementStale{"prepared_replacement_stale"};
 inline constexpr std::string_view kPreparedRuntimeScaleBoundsMissing{"prepared_runtime_scale_bounds_missing"};
+inline constexpr std::string_view kPreparedStartStateEncodingInvalid{"prepared_start_state_encoding_invalid"};
+inline constexpr std::string_view kPreparedTrajectoryEncodingInvalid{"prepared_trajectory_encoding_invalid"};
 inline constexpr std::string_view kPreparedTrajectoryResourceScopeMismatch{"prepared_trajectory_resource_scope_mismatch"};
+inline constexpr std::string_view kPreparedValidationEvidenceEncodingInvalid{"prepared_validation_evidence_encoding_invalid"};
+inline constexpr std::string_view kPreviewCapabilityCommandInvalid{"preview_capability_command_invalid"};
 inline constexpr std::string_view kPreviewFailed{"preview_failed"};
+inline constexpr std::string_view kPreviewPrimaryMotionInvalid{"preview_primary_motion_invalid"};
+inline constexpr std::string_view kPreviewSingleParticipantOnly{"preview_single_participant_only"};
 inline constexpr std::string_view kPreviousPublicationHeadMismatch{"previous_publication_head_mismatch"};
 inline constexpr std::string_view kPrincipalIdMissing{"principal_id_missing"};
 inline constexpr std::string_view kPrivateCollisionHandlesMustBeNull{"private_collision_handles_must_be_null"};
@@ -2404,12 +2694,14 @@ inline constexpr std::string_view kProcessObserverSessionNotActive{"process_obse
 inline constexpr std::string_view kProcessObserverSessionRetired{"process_observer_session_retired"};
 inline constexpr std::string_view kProcessObserverSessionReused{"process_observer_session_reused"};
 inline constexpr std::string_view kProcessPresenceRuntimeUnitUndeclared{"process_presence_runtime_unit_undeclared"};
+inline constexpr std::string_view kProcessPresenceStale{"process_presence_stale"};
 inline constexpr std::string_view kProgramActivationInvalid{"program_activation_invalid"};
 inline constexpr std::string_view kProgramAppliedChanged{"program_applied_changed"};
 inline constexpr std::string_view kProgramAppliedNonExecutable{"program_applied_non_executable"};
 inline constexpr std::string_view kProgramAppliedSelectionInvalid{"program_applied_selection_invalid"};
 inline constexpr std::string_view kProgramAppliedSelectionNotActive{"program_applied_selection_not_active"};
 inline constexpr std::string_view kProgramAppliedSelectionNotFound{"program_applied_selection_not_found"};
+inline constexpr std::string_view kProgramAppliedSelectionUnavailable{"program_applied_selection_unavailable"};
 inline constexpr std::string_view kProgramApplyConfirmationRequired{"program_apply_confirmation_required"};
 inline constexpr std::string_view kProgramApplyNothingToApply{"program_apply_nothing_to_apply"};
 inline constexpr std::string_view kProgramApplyResponseInvalid{"program_apply_response_invalid"};
@@ -2500,6 +2792,12 @@ inline constexpr std::string_view kProgramCycleResetStopFailed{"program_cycle_re
 inline constexpr std::string_view kProgramCycleResetStopUnsettled{"program_cycle_reset_stop_unsettled"};
 inline constexpr std::string_view kProgramCycleResetting{"program_cycle_resetting"};
 inline constexpr std::string_view kProgramCycleSettlementInvalid{"program_cycle_settlement_invalid"};
+inline constexpr std::string_view kProgramCycleStateIdleAfterReset{"program_cycle_state_idle_after_reset"};
+inline constexpr std::string_view kProgramCycleStateRecoveryRequired{"program_cycle_state_recovery_required"};
+inline constexpr std::string_view kProgramCycleStateResetting{"program_cycle_state_resetting"};
+inline constexpr std::string_view kProgramCycleStateRunning{"program_cycle_state_running"};
+inline constexpr std::string_view kProgramCycleStateStarting{"program_cycle_state_starting"};
+inline constexpr std::string_view kProgramCycleStateTerminalAwaitingReset{"program_cycle_state_terminal_awaiting_reset"};
 inline constexpr std::string_view kProgramCycleStatusIdentityInvalid{"program_cycle_status_identity_invalid"};
 inline constexpr std::string_view kProgramCycleStatusShapeInvalid{"program_cycle_status_shape_invalid"};
 inline constexpr std::string_view kProgramDiagnosticInvalid{"program_diagnostic_invalid"};
@@ -2515,6 +2813,7 @@ inline constexpr std::string_view kProgramExecutionCaptureRebound{"program_execu
 inline constexpr std::string_view kProgramExecutionCaptureSelectionsInvalid{"program_execution_capture_selections_invalid"};
 inline constexpr std::string_view kProgramExecutionCaptureStale{"program_execution_capture_stale"};
 inline constexpr std::string_view kProgramExecutionCaptureSynchronizationInvalid{"program_execution_capture_synchronization_invalid"};
+inline constexpr std::string_view kProgramExecutionOwnerUnavailable{"program_execution_owner_unavailable"};
 inline constexpr std::string_view kProgramExecutionScopeCapacityExhausted{"program_execution_scope_capacity_exhausted"};
 inline constexpr std::string_view kProgramExecutionScopeDuplicate{"program_execution_scope_duplicate"};
 inline constexpr std::string_view kProgramExecutionScopeEffectMismatch{"program_execution_scope_effect_mismatch"};
@@ -2528,9 +2827,13 @@ inline constexpr std::string_view kProgramFrameResolutionContextInvalid{"program
 inline constexpr std::string_view kProgramFrameRoleAmbiguous{"program_frame_role_ambiguous"};
 inline constexpr std::string_view kProgramFrameRoleMissing{"program_frame_role_missing"};
 inline constexpr std::string_view kProgramHaltReleaseStale{"program_halt_release_stale"};
+inline constexpr std::string_view kProgramHaltResumeUnavailable{"program_halt_resume_unavailable"};
+inline constexpr std::string_view kProgramHaltTaskObservationPending{"program_halt_task_observation_pending"};
+inline constexpr std::string_view kProgramHaltTaskStateUnknown{"program_halt_task_state_unknown"};
 inline constexpr std::string_view kProgramInterventionPortUnavailable{"program_intervention_port_unavailable"};
 inline constexpr std::string_view kProgramInterventionRecordFailed{"program_intervention_record_failed"};
 inline constexpr std::string_view kProgramInterventionStateUnknown{"program_intervention_state_unknown"};
+inline constexpr std::string_view kProgramManualResultForbidden{"program_manual_result_forbidden"};
 inline constexpr std::string_view kProgramMotionBindingStale{"program_motion_binding_stale"};
 inline constexpr std::string_view kProgramMotionContinuationMismatch{"program_motion_continuation_mismatch"};
 inline constexpr std::string_view kProgramMotionLimitConflict{"program_motion_limit_conflict"};
@@ -2544,7 +2847,10 @@ inline constexpr std::string_view kProgramNodeClaimConflict{"program_node_claim_
 inline constexpr std::string_view kProgramNodeCycleNotCurrent{"program_node_cycle_not_current"};
 inline constexpr std::string_view kProgramNodeDependenciesNotCurrent{"program_node_dependencies_not_current"};
 inline constexpr std::string_view kProgramNodeEvidenceInvalid{"program_node_evidence_invalid"};
+inline constexpr std::string_view kProgramNodeFailed{"program_node_failed"};
 inline constexpr std::string_view kProgramNodeInterrupted{"program_node_interrupted"};
+inline constexpr std::string_view kProgramNodeInvalid{"program_node_invalid"};
+inline constexpr std::string_view kProgramNodeIoSourceUnavailable{"program_node_io_source_unavailable"};
 inline constexpr std::string_view kProgramNodeParentNotCurrent{"program_node_parent_not_current"};
 inline constexpr std::string_view kProgramNodePreviewAttemptStale{"program_node_preview_attempt_stale"};
 inline constexpr std::string_view kProgramNodePreviewBusy{"program_node_preview_busy"};
@@ -2581,6 +2887,9 @@ inline constexpr std::string_view kProgramResetClaimShapeInvalid{"program_reset_
 inline constexpr std::string_view kProgramResetEffectsNotSettled{"program_reset_effects_not_settled"};
 inline constexpr std::string_view kProgramResetNotCurrent{"program_reset_not_current"};
 inline constexpr std::string_view kProgramResetPositionAuthorizationInvalid{"program_reset_position_authorization_invalid"};
+inline constexpr std::string_view kProgramResetPositionCancelled{"program_reset_position_cancelled"};
+inline constexpr std::string_view kProgramResetPositionTimeout{"program_reset_position_timeout"};
+inline constexpr std::string_view kProgramResetPositionUnavailable{"program_reset_position_unavailable"};
 inline constexpr std::string_view kProgramResetResourcesNotSettled{"program_reset_resources_not_settled"};
 inline constexpr std::string_view kProgramResetSceneAuthorizationInvalid{"program_reset_scene_authorization_invalid"};
 inline constexpr std::string_view kProgramResetSceneNotSelected{"program_reset_scene_not_selected"};
@@ -2590,12 +2899,16 @@ inline constexpr std::string_view kProgramRevertNothingToRevert{"program_revert_
 inline constexpr std::string_view kProgramRunAdmissionFailed{"program_run_admission_failed"};
 inline constexpr std::string_view kProgramRunAdmissionInFlight{"program_run_admission_in_flight"};
 inline constexpr std::string_view kProgramRunAdmissionInvariant{"program_run_admission_invariant"};
+inline constexpr std::string_view kProgramRunAlreadyActive{"program_run_already_active"};
 inline constexpr std::string_view kProgramRunAppliedSelectionStale{"program_run_applied_selection_stale"};
 inline constexpr std::string_view kProgramRunBindingInvalid{"program_run_binding_invalid"};
 inline constexpr std::string_view kProgramRunCaptureInvalid{"program_run_capture_invalid"};
 inline constexpr std::string_view kProgramRunCleanupFailed{"program_run_cleanup_failed"};
 inline constexpr std::string_view kProgramRunContextUnavailable{"program_run_context_unavailable"};
 inline constexpr std::string_view kProgramRunDraftAppliedMismatch{"program_run_draft_applied_mismatch"};
+inline constexpr std::string_view kProgramRunEndRequestAttributionInvalid{"program_run_end_request_attribution_invalid"};
+inline constexpr std::string_view kProgramRunEndRequestContextInvalid{"program_run_end_request_context_invalid"};
+inline constexpr std::string_view kProgramRunEndRunInvalid{"program_run_end_run_invalid"};
 inline constexpr std::string_view kProgramRunHistoryFull{"program_run_history_full"};
 inline constexpr std::string_view kProgramRunIdInvalid{"program_run_id_invalid"};
 inline constexpr std::string_view kProgramRunIdentityMismatch{"program_run_identity_mismatch"};
@@ -2607,26 +2920,41 @@ inline constexpr std::string_view kProgramRunRequestConflict{"program_run_reques
 inline constexpr std::string_view kProgramRunSchedulingFailed{"program_run_scheduling_failed"};
 inline constexpr std::string_view kProgramRunScopeUnknown{"program_run_scope_unknown"};
 inline constexpr std::string_view kProgramRunStartedThenFailed{"program_run_started_then_failed"};
+inline constexpr std::string_view kProgramRunStateFailed{"program_run_state_failed"};
+inline constexpr std::string_view kProgramRunStateFinalizing{"program_run_state_finalizing"};
+inline constexpr std::string_view kProgramRunStateHalted{"program_run_state_halted"};
+inline constexpr std::string_view kProgramRunStateHalting{"program_run_state_halting"};
+inline constexpr std::string_view kProgramRunStateInterventionRequired{"program_run_state_intervention_required"};
+inline constexpr std::string_view kProgramRunStateRunning{"program_run_state_running"};
+inline constexpr std::string_view kProgramRunStateStopped{"program_run_state_stopped"};
+inline constexpr std::string_view kProgramRunStateStopping{"program_run_state_stopping"};
+inline constexpr std::string_view kProgramRunStateSucceeded{"program_run_state_succeeded"};
+inline constexpr std::string_view kProgramRunStateUnavailable{"program_run_state_unavailable"};
 inline constexpr std::string_view kProgramRunStopFenceActive{"program_run_stop_fence_active"};
 inline constexpr std::string_view kProgramRunStopGenerationMismatch{"program_run_stop_generation_mismatch"};
 inline constexpr std::string_view kProgramRunTerminalObserverUnavailable{"program_run_terminal_observer_unavailable"};
+inline constexpr std::string_view kProgramRunnerConfigurationInvalid{"program_runner_configuration_invalid"};
 inline constexpr std::string_view kProgramRunnerContactLossInvalid{"program_runner_contact_loss_invalid"};
 inline constexpr std::string_view kProgramRunnerContactLossStale{"program_runner_contact_loss_stale"};
 inline constexpr std::string_view kProgramRunnerContactLost{"program_runner_contact_lost"};
+inline constexpr std::string_view kProgramRunnerHttpError{"program_runner_http_error"};
 inline constexpr std::string_view kProgramRunnerManagerLivenessUnavailable{"program_runner_manager_liveness_unavailable"};
 inline constexpr std::string_view kProgramRunnerRequestBodyOversized{"program_runner_request_body_oversized"};
 inline constexpr std::string_view kProgramRunnerResponseInvalid{"program_runner_response_invalid"};
 inline constexpr std::string_view kProgramRunnerResponseOversized{"program_runner_response_oversized"};
 inline constexpr std::string_view kProgramRunnerShutdownFailed{"program_runner_shutdown_failed"};
 inline constexpr std::string_view kProgramRunnerSimulationOwnerUnavailable{"program_runner_simulation_owner_unavailable"};
+inline constexpr std::string_view kProgramRunnerSocketUnavailable{"program_runner_socket_unavailable"};
 inline constexpr std::string_view kProgramRunnerUnavailable{"program_runner_unavailable"};
 inline constexpr std::string_view kProgramRuntimeControlOutcomeUnknown{"program_runtime_control_outcome_unknown"};
+inline constexpr std::string_view kProgramRuntimeControlRejected{"program_runtime_control_rejected"};
 inline constexpr std::string_view kProgramRuntimeControlRevisionExhausted{"program_runtime_control_revision_exhausted"};
 inline constexpr std::string_view kProgramRuntimeControlStale{"program_runtime_control_stale"};
 inline constexpr std::string_view kProgramRuntimeControlsInvalid{"program_runtime_controls_invalid"};
 inline constexpr std::string_view kProgramRuntimeControlsUnavailable{"program_runtime_controls_unavailable"};
 inline constexpr std::string_view kProgramRuntimeFailed{"program_runtime_failed"};
 inline constexpr std::string_view kProgramRuntimeObjectMissing{"program_runtime_object_missing"};
+inline constexpr std::string_view kProgramRuntimeOwnerUnavailable{"program_runtime_owner_unavailable"};
 inline constexpr std::string_view kProgramRuntimeRetryCountExhausted{"program_runtime_retry_count_exhausted"};
 inline constexpr std::string_view kProgramRuntimeRetryForbiddenByPolicy{"program_runtime_retry_forbidden_by_policy"};
 inline constexpr std::string_view kProgramRuntimeRetryLimitReached{"program_runtime_retry_limit_reached"};
@@ -2653,8 +2981,11 @@ inline constexpr std::string_view kProgramSelectionUnknown{"program_selection_un
 inline constexpr std::string_view kProgramTerminalScopeNotSettled{"program_terminal_scope_not_settled"};
 inline constexpr std::string_view kProgramTickWorkerFailed{"program_tick_worker_failed"};
 inline constexpr std::string_view kProgramTicksLate{"program_ticks_late"};
+inline constexpr std::string_view kProgramTreeFailed{"program_tree_failed"};
 inline constexpr std::string_view kProgramWorkspaceInvalid{"program_workspace_invalid"};
+inline constexpr std::string_view kProgressCursorInvalid{"progress_cursor_invalid"};
 inline constexpr std::string_view kProgressCursorStale{"progress_cursor_stale"};
+inline constexpr std::string_view kProgressGenerationMismatch{"progress_generation_mismatch"};
 inline constexpr std::string_view kProjectionBootstrapPrerequisiteMismatch{"projection_bootstrap_prerequisite_mismatch"};
 inline constexpr std::string_view kProjectionRevisionInvalid{"projection_revision_invalid"};
 inline constexpr std::string_view kProjectionStateUncertain{"projection_state_uncertain"};
@@ -2673,12 +3004,18 @@ inline constexpr std::string_view kRebindInvalid{"rebind_invalid"};
 inline constexpr std::string_view kRebindStaleOrChanged{"rebind_stale_or_changed"};
 inline constexpr std::string_view kReceiverTimeInvalid{"receiver_time_invalid"};
 inline constexpr std::string_view kRecognizedStopBodyOversized{"recognized_stop_body_oversized"};
+inline constexpr std::string_view kRecognizedStopIngressAttributionInvalid{"recognized_stop_ingress_attribution_invalid"};
+inline constexpr std::string_view kRecognizedStopIngressLabelInvalid{"recognized_stop_ingress_label_invalid"};
+inline constexpr std::string_view kRecognizedStopIngressReasonInvalid{"recognized_stop_ingress_reason_invalid"};
+inline constexpr std::string_view kRecognizedStopIngressRouteInvalid{"recognized_stop_ingress_route_invalid"};
 inline constexpr std::string_view kRecognizedStopPayloadInvalid{"recognized_stop_payload_invalid"};
 inline constexpr std::string_view kRecognizedStopStartNotCurrent{"recognized_stop_start_not_current"};
 inline constexpr std::string_view kReconciliationEvidenceInvalid{"reconciliation_evidence_invalid"};
 inline constexpr std::string_view kReconciliationIdentityOrStateMismatch{"reconciliation_identity_or_state_mismatch"};
 inline constexpr std::string_view kRecontactAfterRelease{"recontact_after_release"};
 inline constexpr std::string_view kRecontactPenetrationExceedsPolicy{"recontact_penetration_exceeds_policy"};
+inline constexpr std::string_view kRecoverableSubstitutionReasonInvalid{"recoverable_substitution_reason_invalid"};
+inline constexpr std::string_view kRecoverableSubstitutionReasonWithoutModeChange{"recoverable_substitution_reason_without_mode_change"};
 inline constexpr std::string_view kRecoveryActionAccepted{"recovery_action_accepted"};
 inline constexpr std::string_view kRecoveryActionRejected{"recovery_action_rejected"};
 inline constexpr std::string_view kRecoveryAssessmentUnavailable{"recovery_assessment_unavailable"};
@@ -2690,6 +3027,7 @@ inline constexpr std::string_view kRecoveryFootprintExceeded{"recovery_footprint
 inline constexpr std::string_view kRecoveryFootprintInputInvalid{"recovery_footprint_input_invalid"};
 inline constexpr std::string_view kRecoveryLatchMissing{"recovery_latch_missing"};
 inline constexpr std::string_view kRecoveryLatchNotRetryable{"recovery_latch_not_retryable"};
+inline constexpr std::string_view kRecoveryNodeUnavailable{"recovery_node_unavailable"};
 inline constexpr std::string_view kRecoveryPortUnavailable{"recovery_port_unavailable"};
 inline constexpr std::string_view kRecoveryReceiptClaimInvalid{"recovery_receipt_claim_invalid"};
 inline constexpr std::string_view kRecoveryReceiptHeldClaimInvalid{"recovery_receipt_held_claim_invalid"};
@@ -2698,12 +3036,15 @@ inline constexpr std::string_view kRecoveryReceiptInventoryInvalid{"recovery_rec
 inline constexpr std::string_view kRecoveryReceiptReleaseInvalid{"recovery_receipt_release_invalid"};
 inline constexpr std::string_view kRecoveryReceiptReleaseNotExact{"recovery_receipt_release_not_exact"};
 inline constexpr std::string_view kRecoveryReceiptStatusShapeInvalid{"recovery_receipt_status_shape_invalid"};
+inline constexpr std::string_view kRecoveryRejected{"recovery_rejected"};
 inline constexpr std::string_view kRecoveryUnavailable{"recovery_unavailable"};
 inline constexpr std::string_view kReferenceAmbiguous{"reference_ambiguous"};
 inline constexpr std::string_view kReferenceRequired{"reference_required"};
 inline constexpr std::string_view kReferenceResolverTargetMissing{"reference_resolver_target_missing"};
 inline constexpr std::string_view kRefusedByPriority{"refused_by_priority"};
 inline constexpr std::string_view kRegionFrameMismatch{"region_frame_mismatch"};
+inline constexpr std::string_view kRejectedResultCannotBeConfirmed{"rejected_result_cannot_be_confirmed"};
+inline constexpr std::string_view kRejectedResultMissingError{"rejected_result_missing_error"};
 inline constexpr std::string_view kRelativeJointHasReference{"relative_joint_has_reference"};
 inline constexpr std::string_view kRelativeJointResultNotFinite{"relative_joint_result_not_finite"};
 inline constexpr std::string_view kRelativeJointStartStateDuplicateJoint{"relative_joint_start_state_duplicate_joint"};
@@ -2715,6 +3056,7 @@ inline constexpr std::string_view kRelativeMotionPreviewUnsupported{"relative_mo
 inline constexpr std::string_view kRelativeMotionTypeUnsupported{"relative_motion_type_unsupported"};
 inline constexpr std::string_view kRelativeNamedTargetUnsupported{"relative_named_target_unsupported"};
 inline constexpr std::string_view kRelativeReferenceContextUnavailable{"relative_reference_context_unavailable"};
+inline constexpr std::string_view kRelativeStartStateUnavailable{"relative_start_state_unavailable"};
 inline constexpr std::string_view kRelativeTargetReferenceMissing{"relative_target_reference_missing"};
 inline constexpr std::string_view kReleaseHoldEnded{"release_hold_ended"};
 inline constexpr std::string_view kReleaseIdentityInvalid{"release_identity_invalid"};
@@ -2829,12 +3171,16 @@ inline constexpr std::string_view kResumeIngressRejected{"resume_ingress_rejecte
 inline constexpr std::string_view kResumeStaleOrDisabled{"resume_stale_or_disabled"};
 inline constexpr std::string_view kRetainedFkBindingMismatch{"retained_fk_binding_mismatch"};
 inline constexpr std::string_view kRetainedFrameResolutionFailed{"retained_frame_resolution_failed"};
+inline constexpr std::string_view kRetainedGlobalRuleInvalid{"retained_global_rule_invalid"};
 inline constexpr std::string_view kRetainedJointLimitsBindingMismatch{"retained_joint_limits_binding_mismatch"};
 inline constexpr std::string_view kRetainedJointNamesBindingMismatch{"retained_joint_names_binding_mismatch"};
+inline constexpr std::string_view kRetainedMeasuredRobotGeometryInvalid{"retained_measured_robot_geometry_invalid"};
 inline constexpr std::string_view kRetainedNeutralStateProjectionFailed{"retained_neutral_state_projection_failed"};
 inline constexpr std::string_view kRetainedRenderBindingMismatch{"retained_render_binding_mismatch"};
 inline constexpr std::string_view kRetainedRenderCoordinatesMismatch{"retained_render_coordinates_mismatch"};
 inline constexpr std::string_view kRetainedRenderPositionsUnavailable{"retained_render_positions_unavailable"};
+inline constexpr std::string_view kRetainedRuntimeCollisionBundleInvalid{"retained_runtime_collision_bundle_invalid"};
+inline constexpr std::string_view kRetainedRuntimeCollisionInventoryInvalid{"retained_runtime_collision_inventory_invalid"};
 inline constexpr std::string_view kRetainedStateBindingMismatch{"retained_state_binding_mismatch"};
 inline constexpr std::string_view kRetainedStateBindingUnknown{"retained_state_binding_unknown"};
 inline constexpr std::string_view kRetainedStateBoundedPublicationUnavailable{"retained_state_bounded_publication_unavailable"};
@@ -2846,12 +3192,17 @@ inline constexpr std::string_view kRetainedStateProjectionFailed{"retained_state
 inline constexpr std::string_view kRetainedStateProjectionNotApplied{"retained_state_projection_not_applied"};
 inline constexpr std::string_view kRetainedStateProjectorMissing{"retained_state_projector_missing"};
 inline constexpr std::string_view kRetainedStateProjectorTargetMismatch{"retained_state_projector_target_mismatch"};
+inline constexpr std::string_view kRetainedStatePublicationCancelled{"retained_state_publication_cancelled"};
+inline constexpr std::string_view kRetainedStatePublicationDeadlineExpired{"retained_state_publication_deadline_expired"};
 inline constexpr std::string_view kRetainedStateQIndexInvalid{"retained_state_q_index_invalid"};
+inline constexpr std::string_view kRetainedStateReadCancelled{"retained_state_read_cancelled"};
+inline constexpr std::string_view kRetainedStateReadDeadlineExpired{"retained_state_read_deadline_expired"};
 inline constexpr std::string_view kRetainedStateReadFailed{"retained_state_read_failed"};
 inline constexpr std::string_view kRetainedStateRollbackFailed{"retained_state_rollback_failed"};
 inline constexpr std::string_view kRetainedStateRouteBusy{"retained_state_route_busy"};
 inline constexpr std::string_view kRetainedStateRouteRebindFailed{"retained_state_route_rebind_failed"};
 inline constexpr std::string_view kRetainedStaticBodyProjectionFailed{"retained_static_body_projection_failed"};
+inline constexpr std::string_view kRetainedToolContextInvalid{"retained_tool_context_invalid"};
 inline constexpr std::string_view kRetiredParticipantEngineAbsent{"retired_participant_engine_absent"};
 inline constexpr std::string_view kRetiredParticipantEngineInUse{"retired_participant_engine_in_use"};
 inline constexpr std::string_view kRetiredParticipantEngineSubscriptionAbsent{"retired_participant_engine_subscription_absent"};
@@ -2867,12 +3218,14 @@ inline constexpr std::string_view kRobotStateJointNamesRequired{"robot_state_joi
 inline constexpr std::string_view kRobotStateJointNotScalar{"robot_state_joint_not_scalar"};
 inline constexpr std::string_view kRobotStateJointUnknown{"robot_state_joint_unknown"};
 inline constexpr std::string_view kRobotStatePositionsEmpty{"robot_state_positions_empty"};
+inline constexpr std::string_view kRos2ControlActivationRefused{"ros2_control_activation_refused"};
 inline constexpr std::string_view kRos2ControlArmUnbound{"ros2_control_arm_unbound"};
 inline constexpr std::string_view kRos2ControlBindingEpochChanged{"ros2_control_binding_epoch_changed"};
 inline constexpr std::string_view kRos2ControlBindingEpochExhausted{"ros2_control_binding_epoch_exhausted"};
 inline constexpr std::string_view kRos2ControlControllerActiveUnrequested{"ros2_control_controller_active_unrequested"};
 inline constexpr std::string_view kRos2ControlControllerNotLoaded{"ros2_control_controller_not_loaded"};
 inline constexpr std::string_view kRos2ControlControllerStillActive{"ros2_control_controller_still_active"};
+inline constexpr std::string_view kRos2ControlDeactivationRefused{"ros2_control_deactivation_refused"};
 inline constexpr std::string_view kRos2ControlGripperBridgeBusy{"ros2_control_gripper_bridge_busy"};
 inline constexpr std::string_view kRos2ControlGripperBridgeCancelFailed{"ros2_control_gripper_bridge_cancel_failed"};
 inline constexpr std::string_view kRos2ControlGripperBridgeDisableUnsettled{"ros2_control_gripper_bridge_disable_unsettled"};
@@ -2895,6 +3248,8 @@ inline constexpr std::string_view kRos2ControlHandleClosing{"ros2_control_handle
 inline constexpr std::string_view kRos2ControlHandleDomainAlias{"ros2_control_handle_domain_alias"};
 inline constexpr std::string_view kRos2ControlHandleParticipantInvalid{"ros2_control_handle_participant_invalid"};
 inline constexpr std::string_view kRos2ControlHandleRetired{"ros2_control_handle_retired"};
+inline constexpr std::string_view kRos2ControlHardwareActivationRefused{"ros2_control_hardware_activation_refused"};
+inline constexpr std::string_view kRos2ControlHardwareDeactivationRefused{"ros2_control_hardware_deactivation_refused"};
 inline constexpr std::string_view kRos2ControlHardwareStateCancelled{"ros2_control_hardware_state_cancelled"};
 inline constexpr std::string_view kRos2ControlHardwareStateServiceUnavailable{"ros2_control_hardware_state_service_unavailable"};
 inline constexpr std::string_view kRos2ControlHardwareStateTimeout{"ros2_control_hardware_state_timeout"};
@@ -2912,6 +3267,7 @@ inline constexpr std::string_view kRos2ControlSwitchCancelled{"ros2_control_swit
 inline constexpr std::string_view kRos2ControlSwitchServiceUnavailable{"ros2_control_switch_service_unavailable"};
 inline constexpr std::string_view kRos2ControlSwitchTimeout{"ros2_control_switch_timeout"};
 inline constexpr std::string_view kRos2ControlSwitchUnavailable{"ros2_control_switch_unavailable"};
+inline constexpr std::string_view kRosGripperCommandGoalRejected{"ros_gripper_command_goal_rejected"};
 inline constexpr std::string_view kRosOutputAliasInvalid{"ros_output_alias_invalid"};
 inline constexpr std::string_view kRosOutputConfigurationInvalid{"ros_output_configuration_invalid"};
 inline constexpr std::string_view kRosOutputGenerationMismatch{"ros_output_generation_mismatch"};
@@ -2928,6 +3284,7 @@ inline constexpr std::string_view kRouteConfigurationResolutionInvalid{"route_co
 inline constexpr std::string_view kRoutePredecessorGripperBindingMismatch{"route_predecessor_gripper_binding_mismatch"};
 inline constexpr std::string_view kRoutePredecessorGripperBuilderFailed{"route_predecessor_gripper_builder_failed"};
 inline constexpr std::string_view kRoutePredecessorGripperInputInvalid{"route_predecessor_gripper_input_invalid"};
+inline constexpr std::string_view kRoutePredecessorGripperKernelRefused{"route_predecessor_gripper_kernel_refused"};
 inline constexpr std::string_view kRoutePredecessorGripperOwnerMissing{"route_predecessor_gripper_owner_missing"};
 inline constexpr std::string_view kRoutePredecessorGripperReadbackMismatch{"route_predecessor_gripper_readback_mismatch"};
 inline constexpr std::string_view kRoutePredecessorGripperRebindFailed{"route_predecessor_gripper_rebind_failed"};
@@ -2987,6 +3344,7 @@ inline constexpr std::string_view kRuntimeCollisionBundleLookupOrderInvalid{"run
 inline constexpr std::string_view kRuntimeCollisionCancelUnqualified{"runtime_collision_cancel_unqualified"};
 inline constexpr std::string_view kRuntimeCollisionChecksLate{"runtime_collision_checks_late"};
 inline constexpr std::string_view kRuntimeCollisionLookahead{"runtime_collision_lookahead"};
+inline constexpr std::string_view kRuntimeCollisionLookaheadResourceConflict{"runtime_collision_lookahead_resource_conflict"};
 inline constexpr std::string_view kRuntimeCollisionMonitor{"runtime_collision_monitor"};
 inline constexpr std::string_view kRuntimeCollisionMonitorPrepareFailed{"runtime_collision_monitor_prepare_failed"};
 inline constexpr std::string_view kRuntimeCollisionProjectionInvalidMapping{"runtime_collision_projection_invalid_mapping"};
@@ -3026,17 +3384,21 @@ inline constexpr std::string_view kRuntimeConfigurationStagingFailed{"runtime_co
 inline constexpr std::string_view kRuntimeConfigurationStagingFenceMissing{"runtime_configuration_staging_fence_missing"};
 inline constexpr std::string_view kRuntimeConfigurationStagingGateMissing{"runtime_configuration_staging_gate_missing"};
 inline constexpr std::string_view kRuntimeConfigurationStagingScopeInvalid{"runtime_configuration_staging_scope_invalid"};
+inline constexpr std::string_view kRuntimeContactReleasePolicyInvalid{"runtime_contact_release_policy_invalid"};
 inline constexpr std::string_view kRuntimeContactRuleInvalid{"runtime_contact_rule_invalid"};
 inline constexpr std::string_view kRuntimeContactStateIdentityInvalid{"runtime_contact_state_identity_invalid"};
 inline constexpr std::string_view kRuntimeContactStateUnavailable{"runtime_contact_state_unavailable"};
 inline constexpr std::string_view kRuntimeContainerUnready{"runtime_container_unready"};
 inline constexpr std::string_view kRuntimeContractIncompatible{"runtime_contract_incompatible"};
+inline constexpr std::string_view kRuntimeContractManifestSetDecodeFailed{"runtime_contract_manifest_set_decode_failed"};
 inline constexpr std::string_view kRuntimeContractManifestSetDigestMismatch{"runtime_contract_manifest_set_digest_mismatch"};
 inline constexpr std::string_view kRuntimeContractManifestSetInvalid{"runtime_contract_manifest_set_invalid"};
 inline constexpr std::string_view kRuntimeContractManifestSetNotCanonical{"runtime_contract_manifest_set_not_canonical"};
+inline constexpr std::string_view kRuntimeContractOfferDecodeFailed{"runtime_contract_offer_decode_failed"};
 inline constexpr std::string_view kRuntimeContractOfferDigestMismatch{"runtime_contract_offer_digest_mismatch"};
 inline constexpr std::string_view kRuntimeContractOfferInvalid{"runtime_contract_offer_invalid"};
 inline constexpr std::string_view kRuntimeContractOfferNotCanonical{"runtime_contract_offer_not_canonical"};
+inline constexpr std::string_view kRuntimeContractRequirementDecodeFailed{"runtime_contract_requirement_decode_failed"};
 inline constexpr std::string_view kRuntimeContractRequirementDigestMismatch{"runtime_contract_requirement_digest_mismatch"};
 inline constexpr std::string_view kRuntimeContractRequirementInvalid{"runtime_contract_requirement_invalid"};
 inline constexpr std::string_view kRuntimeContractRequirementNotCanonical{"runtime_contract_requirement_not_canonical"};
@@ -3053,10 +3415,13 @@ inline constexpr std::string_view kRuntimeLookaheadDeadlineExceeded{"runtime_loo
 inline constexpr std::string_view kRuntimeLookaheadEngineUnavailable{"runtime_lookahead_engine_unavailable"};
 inline constexpr std::string_view kRuntimeLookaheadInconclusive{"runtime_lookahead_inconclusive"};
 inline constexpr std::string_view kRuntimeLookaheadPolicyBindingUnavailable{"runtime_lookahead_policy_binding_unavailable"};
+inline constexpr std::string_view kRuntimeLookaheadProjectionRevisionUnavailable{"runtime_lookahead_projection_revision_unavailable"};
 inline constexpr std::string_view kRuntimeLookaheadQueryTimeout{"runtime_lookahead_query_timeout"};
 inline constexpr std::string_view kRuntimeLookaheadRevisionProbeFailed{"runtime_lookahead_revision_probe_failed"};
 inline constexpr std::string_view kRuntimeLookaheadRevisionSuperseded{"runtime_lookahead_revision_superseded"};
 inline constexpr std::string_view kRuntimeLookaheadSnapshotPrepareFailed{"runtime_lookahead_snapshot_prepare_failed"};
+inline constexpr std::string_view kRuntimeLookaheadTrajectoryUnavailable{"runtime_lookahead_trajectory_unavailable"};
+inline constexpr std::string_view kRuntimeMeasuredSourceUnavailable{"runtime_measured_source_unavailable"};
 inline constexpr std::string_view kRuntimeModelBindingInvalid{"runtime_model_binding_invalid"};
 inline constexpr std::string_view kRuntimeModelGroupInvalid{"runtime_model_group_invalid"};
 inline constexpr std::string_view kRuntimeMonitorChecksStopped{"runtime_monitor_checks_stopped"};
@@ -3101,6 +3466,7 @@ inline constexpr std::string_view kRuntimeParticipantStopReadinessMissing{"runti
 inline constexpr std::string_view kRuntimeParticipantSubscriptionCapacityUnavailable{"runtime_participant_subscription_capacity_unavailable"};
 inline constexpr std::string_view kRuntimeParticipantSubscriptionFailed{"runtime_participant_subscription_failed"};
 inline constexpr std::string_view kRuntimeParticipantUnavailable{"runtime_participant_unavailable"};
+inline constexpr std::string_view kRuntimePauseOwnerUnavailable{"runtime_pause_owner_unavailable"};
 inline constexpr std::string_view kRuntimeProductPublicationCommitFailed{"runtime_product_publication_commit_failed"};
 inline constexpr std::string_view kRuntimeProfileChanged{"runtime_profile_changed"};
 inline constexpr std::string_view kRuntimeProgramBindingCrossesPhysicalOwner{"runtime_program_binding_crosses_physical_owner"};
@@ -3110,7 +3476,9 @@ inline constexpr std::string_view kRuntimeProjectionInvalid{"runtime_projection_
 inline constexpr std::string_view kRuntimeProjectionUnavailable{"runtime_projection_unavailable"};
 inline constexpr std::string_view kRuntimeProviderEpochJoinInvalid{"runtime_provider_epoch_join_invalid"};
 inline constexpr std::string_view kRuntimeProviderPathInvalid{"runtime_provider_path_invalid"};
+inline constexpr std::string_view kRuntimeQuerySnapshotInvalid{"runtime_query_snapshot_invalid"};
 inline constexpr std::string_view kRuntimeResourceBindingInvalid{"runtime_resource_binding_invalid"};
+inline constexpr std::string_view kRuntimeResourceBindingUnavailable{"runtime_resource_binding_unavailable"};
 inline constexpr std::string_view kRuntimeResourceInventoryCountInvalid{"runtime_resource_inventory_count_invalid"};
 inline constexpr std::string_view kRuntimeResourceInventoryNoncanonical{"runtime_resource_inventory_noncanonical"};
 inline constexpr std::string_view kRuntimeResourceInventoryRemovesOccupiedResource{"runtime_resource_inventory_removes_occupied_resource"};
@@ -3139,6 +3507,7 @@ inline constexpr std::string_view kRuntimeRouteUnreconciledRegistrationPresent{"
 inline constexpr std::string_view kRuntimeScaleAcceptanceMismatch{"runtime_scale_acceptance_mismatch"};
 inline constexpr std::string_view kRuntimeScaleAcceptanceSequenceExhausted{"runtime_scale_acceptance_sequence_exhausted"};
 inline constexpr std::string_view kRuntimeScaleAcknowledgementStale{"runtime_scale_acknowledgement_stale"};
+inline constexpr std::string_view kRuntimeScaleBoundsInvalid{"runtime_scale_bounds_invalid"};
 inline constexpr std::string_view kRuntimeScaleControlActiveAmbiguous{"runtime_scale_control_active_ambiguous"};
 inline constexpr std::string_view kRuntimeScaleControlCapacityExhausted{"runtime_scale_control_capacity_exhausted"};
 inline constexpr std::string_view kRuntimeScaleControlGenerationExhausted{"runtime_scale_control_generation_exhausted"};
@@ -3157,6 +3526,7 @@ inline constexpr std::string_view kRuntimeScaleGroupMemberDuplicate{"runtime_sca
 inline constexpr std::string_view kRuntimeScaleGroupScopeBusy{"runtime_scale_group_scope_busy"};
 inline constexpr std::string_view kRuntimeScaleGroupStateInvalid{"runtime_scale_group_state_invalid"};
 inline constexpr std::string_view kRuntimeScaleMechanismUnsupported{"runtime_scale_mechanism_unsupported"};
+inline constexpr std::string_view kRuntimeScaleReconcileUnavailable{"runtime_scale_reconcile_unavailable"};
 inline constexpr std::string_view kRuntimeScaleRequestInvalid{"runtime_scale_request_invalid"};
 inline constexpr std::string_view kRuntimeScaleStateInvalid{"runtime_scale_state_invalid"};
 inline constexpr std::string_view kRuntimeScaleStatusBindingNotActive{"runtime_scale_status_binding_not_active"};
@@ -3169,6 +3539,7 @@ inline constexpr std::string_view kRuntimeScaleStatusUnavailable{"runtime_scale_
 inline constexpr std::string_view kRuntimeScaleUnsupported{"runtime_scale_unsupported"};
 inline constexpr std::string_view kRuntimeShuttingDown{"runtime_shutting_down"};
 inline constexpr std::string_view kRuntimeSupportingProviderPathInvalid{"runtime_supporting_provider_path_invalid"};
+inline constexpr std::string_view kRuntimeUnavailable{"runtime_unavailable"};
 inline constexpr std::string_view kRuntimeUnitEpochsInvalid{"runtime_unit_epochs_invalid"};
 inline constexpr std::string_view kRuntimeUnitIdChanged{"runtime_unit_id_changed"};
 inline constexpr std::string_view kRuntimeUnitLaunchInProgress{"runtime_unit_launch_in_progress"};
@@ -3208,6 +3579,7 @@ inline constexpr std::string_view kScenarioModelSourceUnavailable{"scenario_mode
 inline constexpr std::string_view kScenarioNameInvalid{"scenario_name_invalid"};
 inline constexpr std::string_view kScenarioNewRequired{"scenario_new_required"};
 inline constexpr std::string_view kScenarioProgramDraftInvalid{"scenario_program_draft_invalid"};
+inline constexpr std::string_view kScenarioProgramProfileRenamed{"scenario_program_profile_renamed"};
 inline constexpr std::string_view kScenarioProjectIncomplete{"scenario_project_incomplete"};
 inline constexpr std::string_view kScenarioProjectNameInvalid{"scenario_project_name_invalid"};
 inline constexpr std::string_view kScenarioProjectReadOnly{"scenario_project_read_only"};
@@ -3218,6 +3590,7 @@ inline constexpr std::string_view kScenarioSavedBaselineNotAdopted{"scenario_sav
 inline constexpr std::string_view kScenarioSavedPathUnavailable{"scenario_saved_path_unavailable"};
 inline constexpr std::string_view kScenarioSourceChanged{"scenario_source_changed"};
 inline constexpr std::string_view kScenarioSourceInvalid{"scenario_source_invalid"};
+inline constexpr std::string_view kScenarioUpgradeConversionFailed{"scenario_upgrade_conversion_failed"};
 inline constexpr std::string_view kScenarioWorkspaceStale{"scenario_workspace_stale"};
 inline constexpr std::string_view kSceneAdoptionEndFailed{"scene_adoption_end_failed"};
 inline constexpr std::string_view kSceneAdoptionEndedWithoutPublication{"scene_adoption_ended_without_publication"};
@@ -3258,7 +3631,16 @@ inline constexpr std::string_view kSceneMeshAssetUnknown{"scene_mesh_asset_unkno
 inline constexpr std::string_view kSceneMeshBoundsExceeded{"scene_mesh_bounds_exceeded"};
 inline constexpr std::string_view kSceneMeshConversionFailed{"scene_mesh_conversion_failed"};
 inline constexpr std::string_view kSceneMeshConversionTimeout{"scene_mesh_conversion_timeout"};
+inline constexpr std::string_view kSceneMeshDraftInvalid{"scene_mesh_draft_invalid"};
+inline constexpr std::string_view kSceneMeshDraftRevisionChanged{"scene_mesh_draft_revision_changed"};
+inline constexpr std::string_view kSceneMeshDraftUnavailable{"scene_mesh_draft_unavailable"};
 inline constexpr std::string_view kSceneMeshInputInvalid{"scene_mesh_input_invalid"};
+inline constexpr std::string_view kSceneMeshNotDraftAuthorized{"scene_mesh_not_draft_authorized"};
+inline constexpr std::string_view kSceneMeshNotOwnerAuthorized{"scene_mesh_not_owner_authorized"};
+inline constexpr std::string_view kSceneMeshOwnerProjectionInvalid{"scene_mesh_owner_projection_invalid"};
+inline constexpr std::string_view kSceneMeshOwnerProjectionStale{"scene_mesh_owner_projection_stale"};
+inline constexpr std::string_view kSceneMeshOwnerUnavailable{"scene_mesh_owner_unavailable"};
+inline constexpr std::string_view kSceneMeshSourceChanged{"scene_mesh_source_changed"};
 inline constexpr std::string_view kSceneMeshUnavailable{"scene_mesh_unavailable"};
 inline constexpr std::string_view kSceneObjectAttachmentPreconditionFailed{"scene_object_attachment_precondition_failed"};
 inline constexpr std::string_view kSceneObjectIsAttached{"scene_object_is_attached"};
@@ -3267,6 +3649,9 @@ inline constexpr std::string_view kSceneOutcomeUnknown{"scene_outcome_unknown"};
 inline constexpr std::string_view kSceneOwnerUnavailable{"scene_owner_unavailable"};
 inline constexpr std::string_view kScenePolicyProjectionAmbiguous{"scene_policy_projection_ambiguous"};
 inline constexpr std::string_view kScenePolicyProjectionInvalid{"scene_policy_projection_invalid"};
+inline constexpr std::string_view kScenePoseSourceRelativeReferenceGripperLinkInvalid{"scene_pose_source_relative_reference_gripper_link_invalid"};
+inline constexpr std::string_view kScenePoseSourceRelativeReferencesConflict{"scene_pose_source_relative_references_conflict"};
+inline constexpr std::string_view kScenePoseUnavailable{"scene_pose_unavailable"};
 inline constexpr std::string_view kSceneProductProjectionStagingFailed{"scene_product_projection_staging_failed"};
 inline constexpr std::string_view kSceneProgramRequestFailed{"scene_program_request_failed"};
 inline constexpr std::string_view kSceneProjectionAuthorityUnavailable{"scene_projection_authority_unavailable"};
@@ -3275,11 +3660,14 @@ inline constexpr std::string_view kSceneProjectionChanged{"scene_projection_chan
 inline constexpr std::string_view kSceneProjectionCommitUncertain{"scene_projection_commit_uncertain"};
 inline constexpr std::string_view kSceneProjectionContractViolation{"scene_projection_contract_violation"};
 inline constexpr std::string_view kSceneProjectionTakeFailed{"scene_projection_take_failed"};
+inline constexpr std::string_view kSceneProjectionUnavailable{"scene_projection_unavailable"};
+inline constexpr std::string_view kSceneProjectionWorkerUnavailable{"scene_projection_worker_unavailable"};
 inline constexpr std::string_view kSceneRequestAttributionInvalid{"scene_request_attribution_invalid"};
 inline constexpr std::string_view kSceneResourceIdsInvalid{"scene_resource_ids_invalid"};
 inline constexpr std::string_view kSceneResourceMissing{"scene_resource_missing"};
 inline constexpr std::string_view kSceneRevisionIdInvalid{"scene_revision_id_invalid"};
 inline constexpr std::string_view kSceneRuntimeIdentityChanged{"scene_runtime_identity_changed"};
+inline constexpr std::string_view kSceneRuntimeLatchFailed{"scene_runtime_latch_failed"};
 inline constexpr std::string_view kSceneRuntimeObservationExpiryInvalid{"scene_runtime_observation_expiry_invalid"};
 inline constexpr std::string_view kSceneRuntimeObservationNotDeclared{"scene_runtime_observation_not_declared"};
 inline constexpr std::string_view kSceneRuntimeObservationRequestConflict{"scene_runtime_observation_request_conflict"};
@@ -3313,8 +3701,10 @@ inline constexpr std::string_view kSceneRuntimePoseSceneUnavailable{"scene_runti
 inline constexpr std::string_view kSceneRuntimePoseWriterConflict{"scene_runtime_pose_writer_conflict"};
 inline constexpr std::string_view kSceneRuntimeSourceAbsent{"scene_runtime_source_absent"};
 inline constexpr std::string_view kSceneRuntimeSourceInvalid{"scene_runtime_source_invalid"};
+inline constexpr std::string_view kSceneStateUnavailable{"scene_state_unavailable"};
 inline constexpr std::string_view kSceneTooLarge{"scene_too_large"};
 inline constexpr std::string_view kSceneTransactionDraftStale{"scene_transaction_draft_stale"};
+inline constexpr std::string_view kSchedulerDetachPending{"scheduler_detach_pending"};
 inline constexpr std::string_view kSchedulerDetachTimeout{"scheduler_detach_timeout"};
 inline constexpr std::string_view kSchedulerNotReady{"scheduler_not_ready"};
 inline constexpr std::string_view kSealedChildOrResultMismatch{"sealed_child_or_result_mismatch"};
@@ -3327,10 +3717,14 @@ inline constexpr std::string_view kSelectedDomainOutsideParentScope{"selected_do
 inline constexpr std::string_view kSelectedMotionStopSettling{"selected_motion_stop_settling"};
 inline constexpr std::string_view kSelectedObjectIdEmpty{"selected_object_id_empty"};
 inline constexpr std::string_view kSelectedObjectNotInContext{"selected_object_not_in_context"};
+inline constexpr std::string_view kSelectedOwnerAssessmentUnavailable{"selected_owner_assessment_unavailable"};
+inline constexpr std::string_view kSelectedOwnerRecoveryUnavailable{"selected_owner_recovery_unavailable"};
+inline constexpr std::string_view kSelectedOwnerWorkPending{"selected_owner_work_pending"};
 inline constexpr std::string_view kSelectedRouteEndpointsInvalid{"selected_route_endpoints_invalid"};
 inline constexpr std::string_view kSelectedRouteEndpointsMissing{"selected_route_endpoints_missing"};
 inline constexpr std::string_view kSelectedRuntimeCompositionRequestFailed{"selected_runtime_composition_request_failed"};
 inline constexpr std::string_view kSelectedScopeOrOccurrenceShapeMismatch{"selected_scope_or_occurrence_shape_mismatch"};
+inline constexpr std::string_view kSelectedStopFaultRequiresRecovery{"selected_stop_fault_requires_recovery"};
 inline constexpr std::string_view kSelectionAmbiguous{"selection_ambiguous"};
 inline constexpr std::string_view kSelectionCandidatesUnavailable{"selection_candidates_unavailable"};
 inline constexpr std::string_view kSelectionContextOversized{"selection_context_oversized"};
@@ -3340,6 +3734,7 @@ inline constexpr std::string_view kSelectionNoMatch{"selection_no_match"};
 inline constexpr std::string_view kSelectionNotHeld{"selection_not_held"};
 inline constexpr std::string_view kSelectionObjectPoseUnavailable{"selection_object_pose_unavailable"};
 inline constexpr std::string_view kSelectionObjectSourceUnsupported{"selection_object_source_unsupported"};
+inline constexpr std::string_view kSelectionReleaseUnavailable{"selection_release_unavailable"};
 inline constexpr std::string_view kSelectionSceneProjectionInvalid{"selection_scene_projection_invalid"};
 inline constexpr std::string_view kSelectionSceneUnavailable{"selection_scene_unavailable"};
 inline constexpr std::string_view kSensorConfigurationInvalid{"sensor_configuration_invalid"};
@@ -3363,6 +3758,7 @@ inline constexpr std::string_view kSimulationControlException{"simulation_contro
 inline constexpr std::string_view kSimulationControlFailed{"simulation_control_failed"};
 inline constexpr std::string_view kSimulationEntityMismatch{"simulation_entity_mismatch"};
 inline constexpr std::string_view kSimulationNoResponse{"simulation_no_response"};
+inline constexpr std::string_view kSimulationNodeUnavailable{"simulation_node_unavailable"};
 inline constexpr std::string_view kSimulationNotPlaying{"simulation_not_playing"};
 inline constexpr std::string_view kSimulationPaused{"simulation_paused"};
 inline constexpr std::string_view kSimulationRequestCancelled{"simulation_request_cancelled"};
@@ -3377,18 +3773,26 @@ inline constexpr std::string_view kSiteSettingsUnavailable{"site_settings_unavai
 inline constexpr std::string_view kSkillEnvironmentStale{"skill_environment_stale"};
 inline constexpr std::string_view kSkillEnvironmentUnavailable{"skill_environment_unavailable"};
 inline constexpr std::string_view kSkillExpansionInvalid{"skill_expansion_invalid"};
+inline constexpr std::string_view kSnapshotClientUnavailable{"snapshot_client_unavailable"};
 inline constexpr std::string_view kSnapshotDeliveryRejected{"snapshot_delivery_rejected"};
 inline constexpr std::string_view kSnapshotImageOversized{"snapshot_image_oversized"};
 inline constexpr std::string_view kSnapshotIntegrityLost{"snapshot_integrity_lost"};
 inline constexpr std::string_view kSnapshotObserverUnavailable{"snapshot_observer_unavailable"};
 inline constexpr std::string_view kSnapshotRequestUnknown{"snapshot_request_unknown"};
+inline constexpr std::string_view kSnapshotUnavailable{"snapshot_unavailable"};
 inline constexpr std::string_view kSoftOnPathCannotStopOnPathWithinBudget{"soft_on_path_cannot_stop_on_path_within_budget"};
+inline constexpr std::string_view kSoftOnPathCapabilityConfigInvalid{"soft_on_path_capability_config_invalid"};
 inline constexpr std::string_view kSoftOnPathCoordinateKindUnsupported{"soft_on_path_coordinate_kind_unsupported"};
 inline constexpr std::string_view kSoftOnPathDecelerationTimeInfeasible{"soft_on_path_deceleration_time_infeasible"};
 inline constexpr std::string_view kSoftOnPathDecelerationTimeRequired{"soft_on_path_deceleration_time_required"};
+inline constexpr std::string_view kSoftOnPathInterpolationInvalid{"soft_on_path_interpolation_invalid"};
+inline constexpr std::string_view kSoftOnPathJoinFailed{"soft_on_path_join_failed"};
 inline constexpr std::string_view kSoftOnPathNaturalCompletionTimeout{"soft_on_path_natural_completion_timeout"};
+inline constexpr std::string_view kSoftOnPathPathRampDispatchFailed{"soft_on_path_path_ramp_dispatch_failed"};
+inline constexpr std::string_view kSoftOnPathPathRampDispatchUncertain{"soft_on_path_path_ramp_dispatch_uncertain"};
 inline constexpr std::string_view kSoftOnPathRemainingTimeShort{"soft_on_path_remaining_time_short"};
 inline constexpr std::string_view kSoftOnPathRetimerNotDispatchable{"soft_on_path_retimer_not_dispatchable"};
+inline constexpr std::string_view kSoftOnPathStopDeltaBudgetExceeded{"soft_on_path_stop_delta_budget_exceeded"};
 inline constexpr std::string_view kSourceAuthorityClassMismatch{"source_authority_class_mismatch"};
 inline constexpr std::string_view kSourceDirty{"source_dirty"};
 inline constexpr std::string_view kSourceError{"source_error"};
@@ -3399,13 +3803,16 @@ inline constexpr std::string_view kSourceIdentityUnavailable{"source_identity_un
 inline constexpr std::string_view kSourceModelContextInvalid{"source_model_context_invalid"};
 inline constexpr std::string_view kSourceModelProjectionInvalid{"source_model_projection_invalid"};
 inline constexpr std::string_view kSourceModelProjectionUnavailable{"source_model_projection_unavailable"};
+inline constexpr std::string_view kSourceModelUnavailable{"source_model_unavailable"};
 inline constexpr std::string_view kSourceRecovered{"source_recovered"};
 inline constexpr std::string_view kSourceReportRetiredIncarnation{"source_report_retired_incarnation"};
 inline constexpr std::string_view kSourceReportRuntimeUnitUndeclared{"source_report_runtime_unit_undeclared"};
 inline constexpr std::string_view kSourceReportSequenceConflict{"source_report_sequence_conflict"};
 inline constexpr std::string_view kSourceReportSequenceRegressed{"source_report_sequence_regressed"};
+inline constexpr std::string_view kSourceReportStale{"source_report_stale"};
 inline constexpr std::string_view kSourceReportWithoutMatchingProcessPresence{"source_report_without_matching_process_presence"};
 inline constexpr std::string_view kSourceResultMissing{"source_result_missing"};
+inline constexpr std::string_view kSourceStale{"source_stale"};
 inline constexpr std::string_view kSourceUnavailable{"source_unavailable"};
 inline constexpr std::string_view kSpringBackCoordinateKindUnsupported{"spring_back_coordinate_kind_unsupported"};
 inline constexpr std::string_view kSpringBackDecelerationTimeRequired{"spring_back_deceleration_time_required"};
@@ -3414,12 +3821,20 @@ inline constexpr std::string_view kSpringBackFastJointMappingInvalid{"spring_bac
 inline constexpr std::string_view kSpringBackForwardInterpolationInvalid{"spring_back_forward_interpolation_invalid"};
 inline constexpr std::string_view kSpringBackForwardPhaseNotAtRest{"spring_back_forward_phase_not_at_rest"};
 inline constexpr std::string_view kSpringBackForwardPlanEmpty{"spring_back_forward_plan_empty"};
+inline constexpr std::string_view kSpringBackInitialStateInvalid{"spring_back_initial_state_invalid"};
 inline constexpr std::string_view kSpringBackInvalidReturnDistance{"spring_back_invalid_return_distance"};
+inline constexpr std::string_view kSpringBackJoinFailed{"spring_back_join_failed"};
+inline constexpr std::string_view kSpringBackPathRampDispatchFailed{"spring_back_path_ramp_dispatch_failed"};
+inline constexpr std::string_view kSpringBackPathRampDispatchUncertain{"spring_back_path_ramp_dispatch_uncertain"};
 inline constexpr std::string_view kSpringBackPhaseTimeNotLargerThanHandoff{"spring_back_phase_time_not_larger_than_handoff"};
+inline constexpr std::string_view kSpringBackReturnAccelerationLimitExceeded{"spring_back_return_acceleration_limit_exceeded"};
 inline constexpr std::string_view kSpringBackReturnCursorInvalid{"spring_back_return_cursor_invalid"};
+inline constexpr std::string_view kSpringBackReturnInterpolationInvalid{"spring_back_return_interpolation_invalid"};
+inline constexpr std::string_view kSpringBackReturnJerkLimitExceeded{"spring_back_return_jerk_limit_exceeded"};
 inline constexpr std::string_view kSpringBackReturnRateCapInfeasible{"spring_back_return_rate_cap_infeasible"};
 inline constexpr std::string_view kSpringBackReturnTargetInvalid{"spring_back_return_target_invalid"};
 inline constexpr std::string_view kSpringBackStopDeadlineExceeded{"spring_back_stop_deadline_exceeded"};
+inline constexpr std::string_view kSpringBackStopDeltaBudgetExceeded{"spring_back_stop_delta_budget_exceeded"};
 inline constexpr std::string_view kSpringReturnActivationStale{"spring_return_activation_stale"};
 inline constexpr std::string_view kSpringReturnCancelled{"spring_return_cancelled"};
 inline constexpr std::string_view kSpringReturnCandidateIdentityChanged{"spring_return_candidate_identity_changed"};
@@ -3451,13 +3866,23 @@ inline constexpr std::string_view kStaleObservedRobotState{"stale_observed_robot
 inline constexpr std::string_view kStaleRevision{"stale_revision"};
 inline constexpr std::string_view kStartIdentityRequired{"start_identity_required"};
 inline constexpr std::string_view kStartStateMismatch{"start_state_mismatch"};
+inline constexpr std::string_view kStartupScenarioLoadFailed{"startup_scenario_load_failed"};
 inline constexpr std::string_view kStatusFields{"status_fields"};
 inline constexpr std::string_view kStatusRecordInvalid{"status_record_invalid"};
 inline constexpr std::string_view kStatusSequenceExhausted{"status_sequence_exhausted"};
+inline constexpr std::string_view kStopAcceptedCoveredInvalid{"stop_accepted_covered_invalid"};
+inline constexpr std::string_view kStopAcceptedIdentityInvalid{"stop_accepted_identity_invalid"};
+inline constexpr std::string_view kStopAcceptedRevisionOrTimeInvalid{"stop_accepted_revision_or_time_invalid"};
+inline constexpr std::string_view kStopAcceptedRunInvalid{"stop_accepted_run_invalid"};
+inline constexpr std::string_view kStopAcceptedStaleDiagnosticsInvalid{"stop_accepted_stale_diagnostics_invalid"};
+inline constexpr std::string_view kStopAcceptedWideningInvalid{"stop_accepted_widening_invalid"};
 inline constexpr std::string_view kStopAggregateOperationScopeMismatch{"stop_aggregate_operation_scope_mismatch"};
 inline constexpr std::string_view kStopAggregatePredecessorInvalid{"stop_aggregate_predecessor_invalid"};
 inline constexpr std::string_view kStopAggregatePredecessorMismatch{"stop_aggregate_predecessor_mismatch"};
 inline constexpr std::string_view kStopCertified{"stop_certified"};
+inline constexpr std::string_view kStopCommandSourceInvalid{"stop_command_source_invalid"};
+inline constexpr std::string_view kStopComponentTargetInvalid{"stop_component_target_invalid"};
+inline constexpr std::string_view kStopComponentTargetsNotCanonical{"stop_component_targets_not_canonical"};
 inline constexpr std::string_view kStopDeltaBudgetExceeded{"stop_delta_budget_exceeded"};
 inline constexpr std::string_view kStopEventRecordLost{"stop_event_record_lost"};
 inline constexpr std::string_view kStopEvidenceKindUnsupported{"stop_evidence_kind_unsupported"};
@@ -3466,25 +3891,35 @@ inline constexpr std::string_view kStopEvidenceRequirementInvalid{"stop_evidence
 inline constexpr std::string_view kStopEvidenceRequirementsMissing{"stop_evidence_requirements_missing"};
 inline constexpr std::string_view kStopEvidenceSourceMismatch{"stop_evidence_source_mismatch"};
 inline constexpr std::string_view kStopEvidenceSourceStale{"stop_evidence_source_stale"};
+inline constexpr std::string_view kStopEvidenceSourceUnavailable{"stop_evidence_source_unavailable"};
 inline constexpr std::string_view kStopExecutionIdentityMissing{"stop_execution_identity_missing"};
 inline constexpr std::string_view kStopFailed{"stop_failed"};
 inline constexpr std::string_view kStopFenceDegraded{"stop_fence_degraded"};
+inline constexpr std::string_view kStopGoalTerminalStateMismatch{"stop_goal_terminal_state_mismatch"};
 inline constexpr std::string_view kStopGoalToleranceViolated{"stop_goal_tolerance_violated"};
 inline constexpr std::string_view kStopJoinContinuationElapsed{"stop_join_continuation_elapsed"};
 inline constexpr std::string_view kStopJoinElapsedInputInvalid{"stop_join_elapsed_input_invalid"};
 inline constexpr std::string_view kStopJoinInputInvalid{"stop_join_input_invalid"};
 inline constexpr std::string_view kStopLaneIndexExhausted{"stop_lane_index_exhausted"};
+inline constexpr std::string_view kStopMetadataUnavailable{"stop_metadata_unavailable"};
 inline constexpr std::string_view kStopModeNotSoftOnPath{"stop_mode_not_soft_on_path"};
 inline constexpr std::string_view kStopModeNotSpringBackHold{"stop_mode_not_spring_back_hold"};
 inline constexpr std::string_view kStopNotCertified{"stop_not_certified"};
 inline constexpr std::string_view kStopNotContained{"stop_not_contained"};
 inline constexpr std::string_view kStopOperationNotFenceable{"stop_operation_not_fenceable"};
+inline constexpr std::string_view kStopOperationTargetInvalid{"stop_operation_target_invalid"};
+inline constexpr std::string_view kStopOperationTargetsNotCanonical{"stop_operation_targets_not_canonical"};
 inline constexpr std::string_view kStopOwnerActive{"stop_owner_active"};
 inline constexpr std::string_view kStopPathTimeConversionInvalid{"stop_path_time_conversion_invalid"};
 inline constexpr std::string_view kStopProfileDurationOutOfRange{"stop_profile_duration_out_of_range"};
 inline constexpr std::string_view kStopProgressException{"stop_progress_exception"};
 inline constexpr std::string_view kStopReadinessRetainedTimingMismatch{"stop_readiness_retained_timing_mismatch"};
+inline constexpr std::string_view kStopReasonInvalid{"stop_reason_invalid"};
 inline constexpr std::string_view kStopReplacementStartInvalid{"stop_replacement_start_invalid"};
+inline constexpr std::string_view kStopRequestAttributionInvalid{"stop_request_attribution_invalid"};
+inline constexpr std::string_view kStopRequestContextInvalid{"stop_request_context_invalid"};
+inline constexpr std::string_view kStopResourceTargetInvalid{"stop_resource_target_invalid"};
+inline constexpr std::string_view kStopResourceTargetsNotCanonical{"stop_resource_targets_not_canonical"};
 inline constexpr std::string_view kStopStageAttemptInfrastructureFailure{"stop_stage_attempt_infrastructure_failure"};
 inline constexpr std::string_view kStopStageAttemptPoolBusy{"stop_stage_attempt_pool_busy"};
 inline constexpr std::string_view kStopStageAttemptPoolConstructionFailed{"stop_stage_attempt_pool_construction_failed"};
@@ -3492,7 +3927,9 @@ inline constexpr std::string_view kStopStageAttemptPrequalificationExceeded{"sto
 inline constexpr std::string_view kStopStageAttemptPrequalificationFailed{"stop_stage_attempt_prequalification_failed"};
 inline constexpr std::string_view kStopStageCancelledAfterDispatch{"stop_stage_cancelled_after_dispatch"};
 inline constexpr std::string_view kStopStageCompletionException{"stop_stage_completion_exception"};
+inline constexpr std::string_view kStopStageSupersededBeforeDispatch{"stop_stage_superseded_before_dispatch"};
 inline constexpr std::string_view kStopStageWatchdogExpired{"stop_stage_watchdog_expired"};
+inline constexpr std::string_view kStopStateUnavailable{"stop_state_unavailable"};
 inline constexpr std::string_view kStopStatusNotResident{"stop_status_not_resident"};
 inline constexpr std::string_view kStopUnconfirmed{"stop_unconfirmed"};
 inline constexpr std::string_view kStoppedByEstop{"stopped_by_estop"};
@@ -3512,10 +3949,15 @@ inline constexpr std::string_view kSyntaxTreeTooLarge{"syntax_tree_too_large"};
 inline constexpr std::string_view kTcpDefinitionInvalid{"tcp_definition_invalid"};
 inline constexpr std::string_view kTcpEndpointAliasAmbiguous{"tcp_endpoint_alias_ambiguous"};
 inline constexpr std::string_view kTcpEndpointLegacyForm{"tcp_endpoint_legacy_form"};
+inline constexpr std::string_view kTcpLinearSpeedLimitExceeded{"tcp_linear_speed_limit_exceeded"};
+inline constexpr std::string_view kTcpLinearSpeedLimitInvalid{"tcp_linear_speed_limit_invalid"};
 inline constexpr std::string_view kTcpNameDuplicate{"tcp_name_duplicate"};
 inline constexpr std::string_view kTcpOffsetNotApplied{"tcp_offset_not_applied"};
 inline constexpr std::string_view kTcpParentUnknown{"tcp_parent_unknown"};
 inline constexpr std::string_view kTcpSelectorInvalid{"tcp_selector_invalid"};
+inline constexpr std::string_view kTcpSpeedFramesMissing{"tcp_speed_frames_missing"};
+inline constexpr std::string_view kTcpSpeedValidationFailed{"tcp_speed_validation_failed"};
+inline constexpr std::string_view kTcpSpeedValidationNonfinite{"tcp_speed_validation_nonfinite"};
 inline constexpr std::string_view kTcpToolNotMounted{"tcp_tool_not_mounted"};
 inline constexpr std::string_view kTerminalCleanupPending{"terminal_cleanup_pending"};
 inline constexpr std::string_view kTerminalPublicationInProgress{"terminal_publication_in_progress"};
@@ -3535,37 +3977,52 @@ inline constexpr std::string_view kToolPneumaticIoRequired{"tool_pneumatic_io_re
 inline constexpr std::string_view kToolUnknown{"tool_unknown"};
 inline constexpr std::string_view kTrackingErrorExceeded{"tracking_error_exceeded"};
 inline constexpr std::string_view kTrackingSampleInvalid{"tracking_sample_invalid"};
+inline constexpr std::string_view kTrajectoryAccelerationLimitExceeded{"trajectory_acceleration_limit_exceeded"};
 inline constexpr std::string_view kTrajectoryAccelerationSizeMismatch{"trajectory_acceleration_size_mismatch"};
 inline constexpr std::string_view kTrajectoryCartesianFidelityInvalid{"trajectory_cartesian_fidelity_invalid"};
 inline constexpr std::string_view kTrajectoryCartesianMilestonesInvalid{"trajectory_cartesian_milestones_invalid"};
+inline constexpr std::string_view kTrajectoryEmpty{"trajectory_empty"};
 inline constexpr std::string_view kTrajectoryEnvelopeInvalid{"trajectory_envelope_invalid"};
+inline constexpr std::string_view kTrajectoryJointGroupIncomplete{"trajectory_joint_group_incomplete"};
 inline constexpr std::string_view kTrajectoryJointNamesEmpty{"trajectory_joint_names_empty"};
+inline constexpr std::string_view kTrajectoryJointNamesInvalid{"trajectory_joint_names_invalid"};
 inline constexpr std::string_view kTrajectoryJointNotInActiveGroup{"trajectory_joint_not_in_active_group"};
+inline constexpr std::string_view kTrajectoryJointNotInGroup{"trajectory_joint_not_in_group"};
 inline constexpr std::string_view kTrajectoryJointOutsideBinding{"trajectory_joint_outside_binding"};
 inline constexpr std::string_view kTrajectoryNumberInvalid{"trajectory_number_invalid"};
+inline constexpr std::string_view kTrajectoryPositionLimitExceeded{"trajectory_position_limit_exceeded"};
 inline constexpr std::string_view kTrajectoryPositionSizeMismatch{"trajectory_position_size_mismatch"};
+inline constexpr std::string_view kTrajectoryRetainedPrefixBoundaryMissing{"trajectory_retained_prefix_boundary_missing"};
+inline constexpr std::string_view kTrajectoryRetainedPrefixInvalid{"trajectory_retained_prefix_invalid"};
 inline constexpr std::string_view kTrajectoryRuntimeScaleBoundsInvalid{"trajectory_runtime_scale_bounds_invalid"};
 inline constexpr std::string_view kTrajectoryRuntimeScaleDerivativesIncomplete{"trajectory_runtime_scale_derivatives_incomplete"};
 inline constexpr std::string_view kTrajectoryRuntimeScaleRestBoundaryRequired{"trajectory_runtime_scale_rest_boundary_required"};
+inline constexpr std::string_view kTrajectorySegmentAccelerationLimitExceeded{"trajectory_segment_acceleration_limit_exceeded"};
+inline constexpr std::string_view kTrajectorySegmentVelocityLimitExceeded{"trajectory_segment_velocity_limit_exceeded"};
 inline constexpr std::string_view kTrajectorySpliceArithmeticUnrepresentable{"trajectory_splice_arithmetic_unrepresentable"};
 inline constexpr std::string_view kTrajectorySpliceBindingMismatch{"trajectory_splice_binding_mismatch"};
 inline constexpr std::string_view kTrajectorySpliceBoundaryCoalesced{"trajectory_splice_boundary_coalesced"};
 inline constexpr std::string_view kTrajectorySpliceCurveInvalid{"trajectory_splice_curve_invalid"};
 inline constexpr std::string_view kTrajectorySpliceJoinFailed{"trajectory_splice_join_failed"};
+inline constexpr std::string_view kTrajectorySpliceMilestonesInvalid{"trajectory_splice_milestones_invalid"};
 inline constexpr std::string_view kTrajectorySpliceSampleUnrepresentable{"trajectory_splice_sample_unrepresentable"};
 inline constexpr std::string_view kTrajectorySpliceTimeInvalid{"trajectory_splice_time_invalid"};
 inline constexpr std::string_view kTrajectorySpliceTimePrecisionLost{"trajectory_splice_time_precision_lost"};
+inline constexpr std::string_view kTrajectoryTimeInvalid{"trajectory_time_invalid"};
 inline constexpr std::string_view kTrajectoryTimeNotStrictlyIncreasing{"trajectory_time_not_strictly_increasing"};
 inline constexpr std::string_view kTrajectoryTooShort{"trajectory_too_short"};
 inline constexpr std::string_view kTrajectoryValidationMetricsInvalid{"trajectory_validation_metrics_invalid"};
 inline constexpr std::string_view kTrajectoryValueNotFinite{"trajectory_value_not_finite"};
+inline constexpr std::string_view kTrajectoryVelocityLimitExceeded{"trajectory_velocity_limit_exceeded"};
 inline constexpr std::string_view kTrajectoryVelocitySizeMismatch{"trajectory_velocity_size_mismatch"};
 inline constexpr std::string_view kTrajectoryWaypointInvalid{"trajectory_waypoint_invalid"};
+inline constexpr std::string_view kTrajectoryWaypointShapeMismatch{"trajectory_waypoint_shape_mismatch"};
 inline constexpr std::string_view kTrajectoryWaypointsArrayRequired{"trajectory_waypoints_array_required"};
 inline constexpr std::string_view kTrustedAuthenticationAdapterInvalid{"trusted_authentication_adapter_invalid"};
 inline constexpr std::string_view kUnexpectedEnd{"unexpected_end"};
 inline constexpr std::string_view kUnexpectedToken{"unexpected_token"};
 inline constexpr std::string_view kUnknownEntry{"unknown_entry"};
+inline constexpr std::string_view kUnknownFault{"unknown_fault"};
 inline constexpr std::string_view kUnknownFunction{"unknown_function"};
 inline constexpr std::string_view kUnknownNonStdException{"unknown_non_std_exception"};
 inline constexpr std::string_view kUnknownOrMissingMember{"unknown_or_missing_member"};
@@ -3589,6 +4046,8 @@ inline constexpr std::string_view kValidationRevisionInvalid{"validation_revisio
 inline constexpr std::string_view kValueInvalid{"value_invalid"};
 inline constexpr std::string_view kViewerModelAssetInvalid{"viewer_model_asset_invalid"};
 inline constexpr std::string_view kViewerModelAssetUnavailable{"viewer_model_asset_unavailable"};
+inline constexpr std::string_view kViewerModelResourceNotFound{"viewer_model_resource_not_found"};
+inline constexpr std::string_view kViewerModelSelectionStale{"viewer_model_selection_stale"};
 inline constexpr std::string_view kVolatileMotionTraceUnavailable{"volatile_motion_trace_unavailable"};
 inline constexpr std::string_view kWaypointPositionCountMismatch{"waypoint_position_count_mismatch"};
 inline constexpr std::string_view kWorkerEnvelopeInvalid{"worker_envelope_invalid"};
@@ -3615,7 +4074,7 @@ inline constexpr std::string_view kXarmStatusUnavailable{"xarm_status_unavailabl
 inline constexpr std::string_view kZeroSpeedHoldTimeout{"zero_speed_hold_timeout"};
 
 /// Every catalogued code, sorted by code text (byte order).
-inline constexpr std::array<std::string_view, 3605> kSortedCodes{
+inline constexpr std::array<std::string_view, 4064> kSortedCodes{
     kAbsoluteMotionHasReference,
     kAbsoluteTargetHasReference,
     kAcceptanceException,
@@ -3629,6 +4088,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kActionNotAllowed,
     kActionServerUnavailable,
     kActionSourceInvalid,
+    kActionSpanAuthoringUnavailable,
     kActivationAuthoringCaptureMismatch,
     kActivationDeploymentMissing,
     kActivationInputChangedAfterConfirmation,
@@ -3650,13 +4110,16 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kActiveBundlePublicationNotCurrent,
     kActiveBundlePublicationReadInvalid,
     kActiveBundlePublicationReadUncertain,
+    kActiveBundlePublicationReceiptMismatch,
     kActiveConfigurationExpectationInvalid,
     kActiveControlConfigurationGenerationInvalid,
     kActiveGroupContainsMimicOrFixedEntries,
     kActiveGroupQIndexOutOfRange,
     kActiveGroupUnavailable,
     kActiveNativeProjectionInitializationPending,
+    kActiveNativeProjectionUnavailable,
     kActiveOperationLost,
+    kActiveTcpContactBodiesUnavailable,
     kActiveTcpResetFailed,
     kActiveTcpUnavailable,
     kActiveTcpUnknown,
@@ -3685,11 +4148,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kAddressedParticipantStopSettlementUnavailable,
     kAdmissionClosed,
     kAdmissionGenerationExhausted,
+    kAdmissionUnavailable,
+    kAiModelApiKeyEnvInvalid,
     kAiModelConfigInvalid,
     kAiModelConfigurationInvalid,
     kAiModelExited,
     kAiModelOwnerMismatch,
     kAiModelTokenUnavailable,
+    kAlarmOwnerUnavailable,
     kAlarmsProjectionInvalid,
     kAlarmsProjectionUnavailable,
     kAliNoCandidate,
@@ -3702,6 +4168,8 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kApplicationStopIncomplete,
     kApplicationStopping,
     kAppliedProgramProjectionInvalid,
+    kAppliedProgramStatusProjectionInvalid,
+    kAppliedProgramUnavailable,
     kApplyAcknowledgementOutcomeUnknown,
     kApplyAdmissionFailed,
     kApplyBusy,
@@ -3739,6 +4207,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kAssistantCallbackModeRejected,
     kAssistantCallbackOversized,
     kAssistantCallbackProgramIncompatible,
+    kAssistantCallbackRejected,
     kAssistantCallbackTimeout,
     kAssistantCallbackToolNotFound,
     kAssistantCallbackToolUnavailable,
@@ -3760,6 +4229,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kAssistantProjectionStale,
     kAssistantProjectionUnavailable,
     kAssistantProviderConfigurationInvalid,
+    kAssistantProviderRejected,
     kAssistantProviderResponseInvalid,
     kAssistantProviderResponseOversized,
     kAssistantProviderTimeout,
@@ -3776,6 +4246,8 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kAssistantSchemaInvalid,
     kAssistantSkillBodyUnavailable,
     kAssistantTaskCancelled,
+    kAssistantTaskFailed,
+    kAssistantTaskInvalid,
     kAssistantTimeout,
     kAssistantToolArgumentsInvalid,
     kAssistantToolEffectRejected,
@@ -3784,6 +4256,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kAttachActiveTcpNotHolder,
     kAttachActiveTcpUnavailable,
     kAttachHolderUnavailable,
+    kAuthoredSceneAdmissionReconciliationFailed,
     kAuthoringAdmissionProjectionInvalid,
     kAuthoringAdmissionProjectionUnavailable,
     kAuthoringAdmissionUnavailable,
@@ -3804,7 +4277,9 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kBackendPrepareResultInvalid,
     kBackendStopNotConfirmed,
     kBackendStoppedWithoutAddressedStop,
+    kBbSourceNotReady,
     kBeforePlanningSceneLatchFailed,
+    kBlackboardOutputBindingUnavailable,
     kBooleanRequired,
     kBootstrapRebuild,
     kBootstrapStatus,
@@ -3860,6 +4335,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kCarrierFrameResolutionMissing,
     kCarrierStopUnavailable,
     kCartesianFallbackInvalid,
+    kCartesianFidelityEvidenceInvalid,
     kCartesianFidelityMetricsInvalid,
     kCartesianFrameUnknown,
     kCartesianIkFailure,
@@ -3871,6 +4347,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kCartesianPathMovingTakeoverRefused,
     kCartesianPathParameterInvalid,
     kCartesianPathToleranceExceeded,
+    kCartesianPathTooDense,
     kCartesianRequestInvalid,
     kCartesianResourceBudgetExceeded,
     kCartesianResumeProgressUnavailable,
@@ -3880,11 +4357,13 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kCartesianTimeParameterizationFailed,
     kCartesianTrackingStalled,
     kCartesianTrajectoryInterpolantInvalid,
+    kCartesianTrajectoryInterpolantJointMappingInvalid,
     kCartesianTrajectoryJointOrderInvalid,
     kCartesianTrajectorySampleInvalid,
     kCartesianTrajectoryShapeInvalid,
     kCartesianWaypointCorrespondenceInvalid,
     kCartesianWaypointNotFinite,
+    kCatalogSchemaInvalidValue,
     kCellAdmissionLivenessPublicationUnsupported,
     kCellAdmissionOperatorAlarmAttentionUnsupported,
     kCellAdmissionRequestFailed,
@@ -3902,12 +4381,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kClaimReleaseNotExact,
     kClampBoundsInverted,
     kCleanupDeadlineExceeded,
+    kClientIncidentInvalid,
     kCoherentStateCaptureReadUnsupported,
     kCoherentStateCaptureTimeMismatch,
     kCollisionBodyMissing,
     kCollisionBodyNotMounted,
     kCollisionGeometryMissingOrStale,
     kCollisionGeometryUnresolved,
+    kCollisionPolicyContentHashInvalid,
     kCollisionPolicyResolverNotInstalled,
     kCollisionPolicyRevisionIdInvalid,
     kCollisionProjectionException,
@@ -3919,6 +4400,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kCollisionResourceCandidateInspectionFailed,
     kCollisionResourceCandidateInvalid,
     kCollisionResourceCandidateSnapshotInvalid,
+    kCollisionResourceCandidateSnapshotUnavailable,
     kCollisionResourceGenerationExhausted,
     kCollisionResourceKernelNotIdle,
     kCollisionResourceKernelTransitionActive,
@@ -3947,6 +4429,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kCollisionValidationSerialFallbackException,
     kCollisionValidationTrajectoryUnsampleable,
     kCollisionValidationWorkerException,
+    kCollisionWorldContentHashInvalid,
     kCollisionWorldRevisionIdInvalid,
     kCollisionWorldRevisionMismatch,
     kCollisionWorldSnapshotPublisherException,
@@ -3995,11 +4478,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kComponentLaunchNotSettled,
     kComponentLifecycle,
     kComponentLifecycleDeadlineExpired,
+    kComponentLifecycleEffectsNotSettled,
+    kComponentLifecycleResourcesNotSettled,
     kComponentLifecycleStepInFlight,
     kComponentLimitExceeded,
     kComponentLocalStateHasNoModelProjection,
     kComponentManifestInvalid,
     kComponentMeshUnresolved,
+    kComponentModelUnavailable,
     kComponentModelUnreadable,
     kComponentMovedExternallyInMotion,
     kComponentNotEnabled,
@@ -4019,15 +4505,17 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kComponentReferenceMissing,
     kComponentRegistrationStale,
     kComponentRoleUnknownLink,
+    kComponentRouteUnavailable,
     kComponentRuntimeScaleMismatch,
     kComponentScenarioMismatch,
     kComponentSchemaRefuses,
     kComponentStateUnknown,
     kComponentStreamAbsent,
+    kComponentStreamDeclarationInvalid,
+    kComponentStreamOverrideInvalid,
     kComponentStreamStale,
     kComponentUnavailable,
     kComponentUnhealthy,
-    kComposableCellRuntimeUnavailable,
     kComposerAppliedProgramValidationFailed,
     kComposerAuthoringChildCapacityExceeded,
     kComposerAuthoringClaimInvalid,
@@ -4086,6 +4574,11 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kConfidenceBelowMin,
     kConfigurationApplyDependenciesNotCurrent,
     kConfigurationApplyForeignClaim,
+    kConfigurationApplyOldClaimsChanged,
+    kConfigurationApplyOldDomainUnavailable,
+    kConfigurationApplyOldFenceHeld,
+    kConfigurationApplyOldFenceUnsettled,
+    kConfigurationApplyOriginalClaimUnavailable,
     kConfigurationApplyValidatorRequired,
     kConfigurationFenceHeld,
     kConfigurationFenceIdentityInvalid,
@@ -4104,6 +4597,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kConfiguredRobotMeasuredStateUnavailable,
     kConfiguredRobotMembershipInvalid,
     kConfiguredRobotMissing,
+    kConfirmationLatencyNegative,
     kConfirmationRequired,
     kConfirmationStale,
     kConflictingActiveProjection,
@@ -4131,19 +4625,31 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kControlFreshnessInvalid,
     kControlMonotonicClockInvalid,
     kControlPathRequired,
+    kControlProjectionSourceUnavailable,
     kControlProjectionStale,
     kControlProjectionSynchronizing,
     kControlProjectionUnavailable,
     kControlSessionClosed,
+    kControlSessionOrdinaryCommandPending,
+    kControlSessionRuntimeScalePending,
     kControlledHardStopBrakeInputInvalid,
+    kControlledHardStopBrakeInvalid,
+    kControlledHardStopElapsedInvalid,
+    kControlledHardStopLimitsUnavailable,
+    kControlledHardStopNotInstalled,
+    kControlledHardStopRejected,
     kControlledStopAppliedFactorZero,
+    kControlledStopCapabilityUnavailable,
     kControlledStopDeadlineExceeded,
+    kControlledStopErrorInvalid,
     kControlledStopFrozenFactorUnusable,
     kControlledStopJerkProfileNotPrepared,
     kControlledStopModesExhausted,
     kControlledStopNoObservedState,
+    kControlledStopNumericEvidenceInvalid,
     kControlledStopPlannerFailed,
     kControlledStopPortNotImplemented,
+    kControlledStopProjectionInvalid,
     kControllerActionBindingMismatch,
     kControllerBindingContractMismatch,
     kControllerBindingGenerationChanged,
@@ -4186,6 +4692,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kCoordinatedRuntimeScaleNotReady,
     kCovarianceExceeded,
     kCriticalProgressSequenceRegressed,
+    kCriticalProgressStale,
     kCurrentRouteMissing,
     kCurrentRouteReadFailed,
     kCurrentRouteUnqualified,
@@ -4195,8 +4702,10 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kCustomTcpInvalid,
     kCustomTcpNameCollision,
     kCustomTcpParentUnknown,
+    kCycleManagerUnavailable,
     kCycleRecoveryActionRejected,
     kCycleRecoveryOfferStale,
+    kCycleRecoveryOwnerUnavailable,
     kDeadlineExhausted,
     kDecelerationTimeNotLargerThanHandoff,
     kDefaultTcpUnavailable,
@@ -4217,6 +4726,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kDeploymentArtifactRootsUnavailable,
     kDeploymentArtifactSuffixInvalid,
     kDeploymentArtifactTargetInvalid,
+    kDeploymentArtifactUnavailable,
     kDeploymentArtifactWriteFailed,
     kDeploymentCandidateCellMismatch,
     kDeploymentCandidateCurrentChanged,
@@ -4267,6 +4777,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kDesiredControlConfigurations,
     kDetectionNotFound,
     kDetectionTimeout,
+    kDiagnosticCommandSourceReasonMissing,
     kDiagnosticPlannerProjectionMismatch,
     kDiagnosticPlanningNotPreparable,
     kDirectControlCoordinationUnsupported,
@@ -4353,6 +4864,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kEffectiveCollisionPolicyUnavailable,
     kEffortKindInvalid,
     kElementNotSpringSlider,
+    kEmittedTrajectorySampleInvalid,
     kEmittedTrajectoryShapeInvalid,
     kEmptyTrajectory,
     kEndEffectorTcpUnavailable,
@@ -4364,6 +4876,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kEventSubscriberException,
     kExecuteAdmissionRejected,
     kExecuteControlUnavailable,
+    kExecutedStopModeInvalid,
     kExecutingTransitionRejected,
     kExecutionAborted,
     kExecutionAdmissionBindingMismatch,
@@ -4374,15 +4887,22 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kExecutionAdmissionUnavailable,
     kExecutionAssistantTurnInProgress,
     kExecutionBackendFailed,
+    kExecutionBackendStatusErrorInvalid,
+    kExecutionBackendStatusIdentityInvalid,
+    kExecutionBackendStatusShapeInvalid,
+    kExecutionBackendStatusStateInvalid,
     kExecutionChanged,
     kExecutionCommandInvalid,
     kExecutionCommandOversized,
+    kExecutionCommandRejected,
     kExecutionCommandResponseIdentityMismatch,
     kExecutionCommandResponseInvalid,
+    kExecutionCommandResponseOversized,
     kExecutionCommandTransportFailure,
     kExecutionComponentCommandUnsupported,
     kExecutionControlCommandInProgress,
     kExecutionControlCommandUnsupported,
+    kExecutionControlDeliveryUncertain,
     kExecutionControlIngressBusy,
     kExecutionControlPayloadInvalid,
     kExecutionControlProjectionCapacityInvalid,
@@ -4393,11 +4913,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kExecutionEffectUncertain,
     kExecutionEnvironmentEpochChanged,
     kExecutionEnvironmentIdentityMissing,
+    kExecutionEventMirrorBehind,
+    kExecutionEventMirrorUnavailable,
     kExecutionEventStreamDead,
     kExecutionEventStreamFailed,
     kExecutionEventStreamInvalid,
     kExecutionEventSubscribersFull,
     kExecutionEventSubscriptionInvalid,
+    kExecutionEventSubscriptionOverflow,
     kExecutionFrameTransformUnavailable,
     kExecutionHostChildUnavailable,
     kExecutionHostContractOfferChanged,
@@ -4418,6 +4941,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kExecutionObservationCancelled,
     kExecutionObservationCommandUnsupported,
     kExecutionObservationCursorInvalid,
+    kExecutionObservationProjectionInvalid,
     kExecutionOperationContextAmbiguous,
     kExecutionOperationContextInvalid,
     kExecutionOperationContextUnavailable,
@@ -4428,14 +4952,19 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kExecutionOwnerNotReady,
     kExecutionOwnerUnavailable,
     kExecutionPlanningJobsBusy,
+    kExecutionPortBackendResetUnsupported,
     kExecutionPortExecutionInFlight,
     kExecutionPortLaneFactsMismatch,
     kExecutionPortMissing,
     kExecutionPortNotReady,
+    kExecutionPortPreparedDispatchRequired,
     kExecutionPortRebindBusy,
+    kExecutionPortRouteRebindBusy,
+    kExecutionPortRouteRebindMismatch,
     kExecutionPortStopInFlight,
     kExecutionPortSubmitRefused,
     kExecutionProgramDraftUnapplied,
+    kExecutionProgressGenerationUnavailable,
     kExecutionRejected,
     kExecutionRequestAttributionInvalid,
     kExecutionRuntimeScaleLaneBusy,
@@ -4444,6 +4973,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kExecutionTargetFrameUnavailable,
     kExecutionTargetObservationInvalid,
     kExecutionTargetObservationUnavailable,
+    kExecutionTargetUnavailable,
     kExecutionTargetsProjectionInvalid,
     kExecutionTargetsUnavailable,
     kExecutionTimeout,
@@ -4470,6 +5000,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kExternalSourceResourceShapeInvalid,
     kFailedNotRetryable,
     kFailedPlanProjectionForbidden,
+    kFailedValidationAckRejected,
     kFailedValidationErrorMissing,
     kFailedValidationNotRetryable,
     kFailedValidationRetryAcknowledged,
@@ -4494,10 +5025,12 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kForwardKinematicsBatchFailed,
     kForwardKinematicsFailed,
     kFrameBindingsInvalid,
+    kFrameHeightOutsideRange,
     kFrameMissing,
     kFrameNotMounted,
     kFrameOrPoseInvalid,
     kFrameTagInvalid,
+    kFrameTransformFailed,
     kFrameTransformPoseInvalid,
     kFrameTransformQueryMismatch,
     kFrameTransformReferenceUnsupported,
@@ -4506,19 +5039,26 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kFreshApplySuccessForeignClaim,
     kFreshApplySuccessNotExact,
     kFullStackRestartRequired,
+    kFullStopRequestAttributionInvalid,
+    kFullStopRequestContextInvalid,
     kGeneratedToolParametersRequired,
     kGeneratedToolWiringInvalid,
     kGeneratedToolWiringMissing,
     kGeneratedToolWiringUnknown,
+    kGeometryNodeUnavailable,
+    kGlobalInterruptGroupInvalid,
     kGlobalInterruptGroupUnbound,
+    kGlobalInterruptKeyTypeConflict,
     kGlobalInterruptOwnerNotCurrent,
     kGlobalInterruptProgramBindingMissing,
+    kGlobalInterruptScopeInvalid,
     kGlobalRuleStateOperandUnsupported,
     kGoalFrameInlinePoseUnsupported,
     kGoalFrameMotionPreviewUnsupported,
     kGoalFrameMotionTypeUnsupported,
     kGoalFrameReferenceContextUnavailable,
     kGoalFrameRequiresAbsoluteTarget,
+    kGoalFrameStartStateUnavailable,
     kGoalUnverifiable,
     kGraspConfirmationInvalid,
     kGraspConfirmationLost,
@@ -4537,6 +5077,10 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kGripperCommandLost,
     kGripperCommandNotAuthorized,
     kGripperCommandPositionInvalid,
+    kGripperCommandSchemaUnsupported,
+    kGripperCommandScopeUnsupported,
+    kGripperCommandSubscriberUnavailable,
+    kGripperDisplayOwnerUnavailable,
     kGripperDwellTimeout,
     kGripperFeedbackUnavailable,
     kGripperGoalAborted,
@@ -4553,8 +5097,12 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kGripperRequestFailed,
     kGripperResultFailed,
     kGripperResultTimeout,
+    kGripperStateFeedbackStale,
+    kGripperStateFeedbackUnavailable,
     kGripperStateNotFinite,
+    kGripperStatePublisherUnavailable,
     kGripperStateUnavailable,
+    kGripperStatusNotMatched,
     kGripperStatusUnavailable,
     kGripperStopBackendCommandMismatch,
     kGripperStopCancelledBeforeEffect,
@@ -4567,13 +5115,20 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kGripperStopStageInvalid,
     kGripperStopTargetUnavailable,
     kGripperStopUnconfirmed,
+    kGripperTransportKindInvalid,
     kGripperWaitSourceUnavailable,
     kGripperWaitStale,
     kGripperWaitTimeout,
     kHardStopCancelNotDispatched,
+    kHeadlessAdapterEpochExhausted,
+    kHeadlessAdapterSequenceExhausted,
+    kHeadlessApiClosed,
+    kHeadlessApiConfigurationInvalid,
     kHeadlessApiInternalFailure,
+    kHeadlessCliInvalid,
     kHeadlessComponentFaultInvalid,
     kHeadlessDiskConditionInvalid,
+    kHeadlessHttpError,
     kHeadlessHttpResponseInvalid,
     kHeadlessHttpResponseOversized,
     kHeadlessHttpTimeout,
@@ -4583,7 +5138,9 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kHeadlessObservationStreamCancelled,
     kHeadlessObservationStreamClosed,
     kHeadlessObservationStreamInvalid,
+    kHeadlessOperationEventIdentityConflict,
     kHeadlessOperationEventInvalid,
+    kHeadlessOperationEventSnapshotIncomplete,
     kHeadlessOperationTableInvalid,
     kHeadlessOwnerConflict,
     kHeadlessOwnerLockUnavailable,
@@ -4597,20 +5154,36 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kHeadlessRuntimeProjectionInvalid,
     kHeadlessRuntimeSnapshotUnavailable,
     kHeadlessSourceInvalid,
+    kHeadlessValueInvalid,
     kHeadlessViewerPoseCancelled,
     kHeadlessViewerPoseClosed,
     kHeadlessViewerPoseInvalid,
     kHeartbeatFields,
     kHeartbeatInvalid,
+    kHistorianCaptureNotFound,
+    kHistorianClosed,
+    kHistorianConfigurationInvalid,
+    kHistorianEventIdentityConflict,
     kHistorianEventInvalid,
+    kHistorianEventNotFound,
+    kHistorianInternalFailure,
+    kHistorianPathInvalid,
     kHistorianProjectionFailure,
+    kHistorianQueryBudgetExceeded,
     kHistorianQueryInvalid,
+    kHistorianQueueOverflow,
     kHistorianResponseInvalid,
+    kHistorianSequenceRolloverRequired,
     kHistorianStorageBusy,
+    kHistorianStorageChanged,
     kHistorianStorageCorrupt,
     kHistorianStorageFailure,
+    kHistorianStorageForeign,
     kHistorianStorageFull,
+    kHistorianStorageUnsupported,
     kHistorianStoreFailure,
+    kHistorianTimeoutInvalid,
+    kHistorianValueInvalid,
     kHostApplyParentReadUnavailable,
     kHostApplyPreparationFailureReadUnavailable,
     kHostIoOutputAddressConflict,
@@ -4624,12 +5197,6 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kHostIoOutputProfileUnqualified,
     kHostIoOutputPublicationConflict,
     kHostIoOutputResourceConflict,
-    kI6CommandSchemaUnsupported,
-    kI6GripperCommandScopeUnsupported,
-    kI6MotionModelGroupCardinalityInvalid,
-    kI6PreviewCapabilityCommandInvalid,
-    kI6PreviewPrimaryMotionInvalid,
-    kI6PreviewSingleParticipantOnly,
     kIdentityArrayInvalid,
     kIkFailed,
     kIncompatibleOwner,
@@ -4646,6 +5213,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kInstalledCatalogMismatch,
     kInstalledComponentLifecycleUnavailable,
     kInstalledProcessInspectionScopeStale,
+    kInstalledProcessInspectionUnavailable,
     kInstalledProcessInventoryExceedsBound,
     kInstalledProcessInventoryInvalid,
     kInstanceUnavailable,
@@ -4654,6 +5222,8 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kIntegerOverflow,
     kInterfacesInvalid,
     kInternalError,
+    kInterpolatedAccelerationLimitExceeded,
+    kInterpolatedJerkLimitExceeded,
     kInterruptActivationModeInvalid,
     kInterruptArmTimeoutInvalid,
     kInterruptConditionInvalid,
@@ -4673,6 +5243,13 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kInterruptScopeSuccessThroughInvalid,
     kInterruptScopesInvalid,
     kInterruptSourceUnavailable,
+    kInterruptStructuredValueEmpty,
+    kInterruptStructuredValueKeyInvalid,
+    kInterruptStructuredValueNumberNonFinite,
+    kInterruptStructuredValueStringNotNfc,
+    kInterruptStructuredValueStringTooLong,
+    kInterruptStructuredValueTooManyEntries,
+    kInterventionAckRejected,
     kInterventionAcknowledgedForRetry,
     kInterventionEvidenceInvalid,
     kInterventionEvidencePresenceInvalid,
@@ -4744,8 +5321,10 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kIoConditionOperandTypesIncompatible,
     kIoConditionPostorderInvalid,
     kIoConditionSignalInputInvalid,
+    kIoConditionStringBoundExceeded,
     kIoConditionUnreachableNode,
     kIoConditionUnusedInput,
+    kIoConditionValueNonfinite,
     kIoConditionWorkspaceTooSmall,
     kIoCursorGenerationStale,
     kIoCursorRangeInvalid,
@@ -4782,10 +5361,12 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kIoGlobalRuleWaitingForProgram,
     kIoIngressLossInvalid,
     kIoInputHasOutputContract,
+    kIoInputNotMatched,
     kIoInputUnavailable,
     kIoManualWriteMotionExecuting,
     kIoMockEchoOutputNotFound,
     kIoMockInputInvalid,
+    kIoMockInputRequired,
     kIoOutputAcceptanceUnknown,
     kIoOutputAliasPredecessorMismatch,
     kIoOutputAliasRebindStale,
@@ -4800,6 +5381,8 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kIoOutputPublicationInvalid,
     kIoOutputSourceRejected,
     kIoOutputWriteFailed,
+    kIoOwnerRecoveryInvalid,
+    kIoOwnerRecoveryStale,
     kIoProviderComponentAmbiguous,
     kIoProviderDeviceConfigurationInvalid,
     kIoProviderDeviceOutputBudgetInvalid,
@@ -4824,9 +5407,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kIoProviderSignalMembershipInvalid,
     kIoProviderSignalMembershipMissing,
     kIoProviderTargetUnqualified,
+    kIoProviderTransportUnavailable,
     kIoReceiverTimestampInvalid,
     kIoReceiverTimestampRegressed,
+    kIoResourcePreparationIncomplete,
     kIoRosConnectionComponentHasControllerBinding,
+    kIoRosOutputSetupFailed,
+    kIoRosOwnerMismatch,
+    kIoRosSubscriptionFailed,
     kIoRuleActivationUnsupported,
     kIoRuleActiveAtArm,
     kIoRuleArmIdentityMismatch,
@@ -4840,6 +5428,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kIoRuleNaturalCompletionProofMissing,
     kIoRuleNominalStopNotProved,
     kIoRuleOrderingEvidenceMissing,
+    kIoRuleOutcomeInvalid,
     kIoRuleOutcomeMissing,
     kIoRuleParticipantMissing,
     kIoRuleParticipantStateMismatch,
@@ -4866,7 +5455,11 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kIoRuleSourceDisabled,
     kIoRuleSourceInvalid,
     kIoRuleSourceUnavailable,
+    kIoRuleStateAcquisitionInvalid,
+    kIoRuleStateContextInvalid,
     kIoRuleStateJournalUnsupported,
+    kIoRuleStateRowInvalid,
+    kIoRuleStateRowsNotCanonical,
     kIoRuleStopDeclarationInvalid,
     kIoRuleStopEntryBindingMismatch,
     kIoRuleStopEntryChainInvalid,
@@ -4893,6 +5486,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kIoRuleTerminalWithoutResponseCertificate,
     kIoSampleShapeInvalid,
     kIoSequenceExhausted,
+    kIoSignalCatalogStale,
     kIoSignalChangedOutsideUnavailable,
     kIoSignalConfigurationInvalid,
     kIoSignalContractUnsupported,
@@ -5002,15 +5596,21 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kLateCancelExecutionIdentityMissing,
     kLateCancelExecutionUnmapped,
     kLateCancelJournalUnavailable,
+    kLateCancelKernelUnavailable,
     kLateCancelOperationTerminal,
     kLateCancelOutcomeUnknown,
+    kLateCancelOwnerChanged,
+    kLateCancelOwnerUnavailable,
     kLateCancelParticipantTerminal,
     kLateCancelProjectionPending,
+    kLateCancelSessionUnavailable,
+    kLateControlCycle,
     kLateGripperCancelOutcomeUnknown,
     kLegacyAngularProjectionUnitMismatch,
     kLegacyInterruptPolicyRuntimeUnsupported,
     kLifecycleHealthUnavailable,
     kLiveSceneSnapshotUnavailable,
+    kLogicNodeBindingUnavailable,
     kLogicalSceneSourceAbsent,
     kLogicalSceneSourceInvalid,
     kLookaheadCursorPrecedesTrajectoryAnchor,
@@ -5048,10 +5648,10 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kManagerPlannedStopOverrun,
     kManagerProjectionUnavailable,
     kManagerRunFolderHoldsPreviousRun,
+    kManagerRuntimeUnavailable,
     kManagerSceneRuntimeRequestInvalid,
     kManagerSceneRuntimeResponseIdentityMismatch,
     kManagerSceneRuntimeResponseInvalid,
-    kManagerSceneRuntimeTransportInvalid,
     kManagerSceneRuntimeUnavailable,
     kManagerSourceAbsent,
     kManagerSourceInvalid,
@@ -5078,6 +5678,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kManualHandoverProducerNotHeld,
     kManualHandoverProgramHalted,
     kManualHandoverQueryUnavailable,
+    kManualHandoverRequired,
     kManualHandoverScopeStale,
     kManualHandoverStopUnsettled,
     kManualHandoverTargetUnresolved,
@@ -5087,6 +5688,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kManualOperationClaimStale,
     kManualOperationInProgress,
     kManualOperationNotCleanTerminal,
+    kManualOperationScopeStale,
     kManualOperationSettlementNotProven,
     kManualRecoveryFailure,
     kMeasuredControlPathMissing,
@@ -5166,12 +5768,15 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kModelAuditOutcomeInvalid,
     kModelAuditRecordInvalid,
     kModelBindingsInvalid,
+    kModelConfidenceBelowThreshold,
     kModelContractUnavailable,
+    kModelNodeUnavailable,
     kModelOutputContractInvalid,
     kModelRequestCancelled,
     kModelRequestFailed,
     kModelRequestTimeout,
     kModelResponseParseFailed,
+    kModelResponseSchemaInvalid,
     kModelSnapshotCaptureFailed,
     kModelSnapshotCaptureInvalid,
     kModelSnapshotCaptureTimeout,
@@ -5245,7 +5850,10 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kMotionInterruptStopSettleOverrideInvalid,
     kMotionInterruptStopSettleOverrideUnknownJoint,
     kMotionInterruptStopStateInvalid,
+    kMotionModelGroupCardinalityInvalid,
     kMotionNestedValueInvalid,
+    kMotionNoSignalTripMappedFailure,
+    kMotionNodeUnavailable,
     kMotionPathPreviewUnavailable,
     kMotionPayloadFieldsInvalid,
     kMotionPayloadInvalid,
@@ -5254,6 +5862,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kMotionPlannerCapabilityUnresolved,
     kMotionPlannerRuntimeJoinInvalid,
     kMotionPlanningEvidenceJoinInvalid,
+    kMotionPreempted,
     kMotionPreviewBindingChanged,
     kMotionPreviewCancelled,
     kMotionPreviewEngineChanged,
@@ -5286,8 +5895,10 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kMotionReplacementComputationStartFailed,
     kMotionReplacementConnectorBoundaryInvalid,
     kMotionReplacementContextInvalid,
+    kMotionReplacementCursorUnavailable,
     kMotionReplacementDeliveryJoinFailed,
     kMotionReplacementDeliveryLeadExpired,
+    kMotionReplacementEffectUncertain,
     kMotionReplacementFutureLeadUnavailable,
     kMotionReplacementGoalCapacity,
     kMotionReplacementGoalConflict,
@@ -5295,6 +5906,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kMotionReplacementJoinOriginExpired,
     kMotionReplacementMembershipChanged,
     kMotionReplacementMonitorContextChanged,
+    kMotionReplacementNotReady,
     kMotionReplacementPayloadInvalid,
     kMotionReplacementPlanningBudgetExpired,
     kMotionReplacementPreparationBudgetExpired,
@@ -5312,13 +5924,18 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kMotionReplacementScaleHoldSourceStale,
     kMotionReplacementScaleHoldUnconfirmed,
     kMotionReplacementScaleOrSourceUnqualified,
+    kMotionReplacementScaleUnqualified,
     kMotionReplacementScopeMismatch,
+    kMotionReplacementSendThrew,
     kMotionReplacementSourceChanged,
     kMotionReplacementSourceHazardAuthority,
     kMotionReplacementSourceMissing,
     kMotionReplacementSourceSampleInvalid,
     kMotionReplacementSourceSampleMismatch,
     kMotionReplacementSourceStale,
+    kMotionReplacementSourceUnavailable,
+    kMotionReplacementStale,
+    kMotionReplacementStopFenced,
     kMotionReplacementStopRevoked,
     kMotionReplacementTargetNotResolved,
     kMotionReplacementTimeoutInvalid,
@@ -5326,7 +5943,10 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kMotionResourceProjectionNotAllAngular,
     kMotionRuntimeBindingIncomplete,
     kMotionRuntimeObjectBindingInvalid,
+    kMotionScopedNodeUnavailable,
+    kMotionSignalTripMappedFailure,
     kMotionSpeedProfileInvalid,
+    kMotionSuperseded,
     kMotionTagInvalid,
     kMotionTakeoverAuthorityMissing,
     kMotionTakeoverCandidateStale,
@@ -5358,6 +5978,8 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kMotionTraceFileUnavailable,
     kMotionTraceStoreBusy,
     kMotionTraceStoreFull,
+    kMotionTraceStoreUnavailable,
+    kMotionTransactionOwnerUnavailable,
     kMotionValueAboveProgramLimit,
     kMountPrimaryToolRequired,
     kMovingReplacementInputInvalid,
@@ -5372,9 +5994,15 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kMovingReplacementValidationContextMismatch,
     kNamedTargetResolutionUnavailable,
     kNativeCandidateAdapterFailure,
+    kNativeCandidateBindingInvalid,
+    kNativeCandidateGroupMismatch,
+    kNativeCandidateRequestBindingMismatch,
+    kNativeCandidateRequestNumericInvalid,
     kNativeCandidateSceneFrameClockFailed,
     kNativeCandidateSceneFrameLeaseUnavailable,
     kNativeCandidateSceneFrameReceiptInvalid,
+    kNativeCandidateStartStateBindingMismatch,
+    kNativeCellRegistrationInvalid,
     kNativeCellStopSourceCoverageMissing,
     kNativeCellStopSourceEvidenceMissing,
     kNativeCellStopSourceOwnerMismatch,
@@ -5422,6 +6050,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kNativeModelRefreshReadbackMismatch,
     kNativeMotionTypeUnsupported,
     kNativeMovingCartesianBlendProofUnavailable,
+    kNativeMovingConnectorUnqualified,
     kNativeMovingIncomingLimitsViolated,
     kNativeMovingPositionBoundsUnqualified,
     kNativeMovingSourceInvalid,
@@ -5538,6 +6167,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kNativeTrajectorySampleInvalid,
     kNativeTrajectoryShapeInvalid,
     kNativeWorkerFailure,
+    kNaturalCompletionResultInvalid,
     kNegativeRemainderOperand,
     kNestingTooDeep,
     kNewActiveContactAfterClearStart,
@@ -5552,6 +6182,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kNodeMotionPreviewUnsupported,
     kNonFiniteCommandCursor,
     kNonFiniteResult,
+    kNoncollisionValidationCancelled,
     kObjectAlreadyExists,
     kObjectNotFound,
     kObjectRequired,
@@ -5614,40 +6245,59 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kOperationAdmissionCapacityUnavailable,
     kOperationAdmissionOutcomeUnknown,
     kOperationAttributionInvalid,
+    kOperationCancelledPreDispatch,
     kOperationCapacityFull,
     kOperationCloseCleanupFailed,
     kOperationCommitGuardMissing,
     kOperationControlAdmissionPending,
+    kOperationControlAttributionInvalid,
     kOperationControlBusy,
     kOperationControlEffectHandoffFailed,
     kOperationControlEffectThrew,
     kOperationControlIncrementalUpdateFailed,
     kOperationControlPartialResourceOwnership,
+    kOperationControlReasonInvalid,
     kOperationControlReconfigurationBusy,
     kOperationControlReconfigurationFailed,
     kOperationControlReconfigurationInProgress,
+    kOperationControlRequestContextInvalid,
     kOperationControlRequestInvalid,
     kOperationControlResourceMissing,
     kOperationControlResourceOwnerMismatch,
+    kOperationControlScopeInvalid,
     kOperationControlSettlementKindInvalid,
     kOperationControlSettlementMissing,
     kOperationControlStateInvalid,
+    kOperationControlTargetInvalid,
     kOperationCoordinationShapeInvalid,
     kOperationEffectInFlight,
     kOperationExecutionScopeInvalid,
+    kOperationFailed,
     kOperationIdConflict,
     kOperationIdEmpty,
     kOperationIdExhausted,
     kOperationIdInvalid,
     kOperationIdentityEmpty,
+    kOperationInterrupted,
+    kOperationInterventionRequired,
     kOperationJournalBusy,
+    kOperationJournalClockFailure,
+    kOperationJournalClosed,
+    kOperationJournalConfigurationInvalid,
     kOperationJournalCorrupt,
+    kOperationJournalEventQueryInvalid,
     kOperationJournalException,
     kOperationJournalFailure,
     kOperationJournalInternalFailure,
+    kOperationJournalPathInvalid,
+    kOperationJournalPayloadUnsupported,
+    kOperationJournalRecordInvalid,
+    kOperationJournalRecordTooLarge,
     kOperationJournalRecordsLost,
     kOperationJournalStartInvalid,
     kOperationJournalStorageFailure,
+    kOperationJournalStorageForeign,
+    kOperationJournalStorageUnsupported,
     kOperationNotResident,
     kOperationPartialDispatch,
     kOperationParticipantCountInvalid,
@@ -5666,6 +6316,13 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kOperationRevisionInvalid,
     kOperationSceneRevisionInvalid,
     kOperationSettlementFaultPersistenceThrew,
+    kOperationStopped,
+    kOperatorAlarmAcknowledgeAllConfirmationRequired,
+    kOperatorAlarmAcknowledgeAllDuplicateMember,
+    kOperatorAlarmAcknowledgeAllMembersInvalid,
+    kOperatorAlarmAcknowledgementConfirmationRequired,
+    kOperatorAlarmAcknowledgementReasonRequired,
+    kOperatorAlarmActivationStale,
     kOperatorAlarmAttentionCellMismatch,
     kOperatorAlarmAttentionConflict,
     kOperatorAlarmAttentionGenerationConflict,
@@ -5678,22 +6335,49 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kOperatorAlarmAttentionStale,
     kOperatorAlarmAttentionSubjectInvalid,
     kOperatorAlarmAttentionSubjectOversized,
+    kOperatorAlarmCatalogUnavailable,
     kOperatorAlarmClearQualityUnknown,
+    kOperatorAlarmClockInvalid,
     kOperatorAlarmConditionCapacityExhausted,
+    kOperatorAlarmConditionIdentityMismatch,
+    kOperatorAlarmConditionUpdateInvalid,
+    kOperatorAlarmConfigurationInvalid,
+    kOperatorAlarmDefinitionMismatch,
+    kOperatorAlarmDefinitionUnknown,
+    kOperatorAlarmIdentityExhausted,
     kOperatorAlarmInterlockActive,
+    kOperatorAlarmLimitInvalid,
+    kOperatorAlarmMembershipMismatch,
     kOperatorAlarmMetricsInvalid,
+    kOperatorAlarmNotFound,
     kOperatorAlarmOrderingInvalid,
+    kOperatorAlarmOwnerGenerationStale,
+    kOperatorAlarmRecordRevisionStale,
     kOperatorAlarmResourceRegistryUnavailable,
     kOperatorAlarmScopeInactive,
+    kOperatorAlarmScopeInvalid,
+    kOperatorAlarmSourceAdapterMismatch,
+    kOperatorAlarmSourceAdapterUnknown,
+    kOperatorAlarmSourceAuthorityConflict,
+    kOperatorAlarmSourceEpochConflict,
+    kOperatorAlarmSourceEpochStale,
     kOperatorAlarmSourceRefreshOverdue,
+    kOperatorAlarmSourceRegistrationConflict,
+    kOperatorAlarmSourceSequenceConflict,
+    kOperatorAlarmSourceSequenceStale,
+    kOperatorAlarmSourceUnregistered,
     kOperatorAlarmStateFilterInvalid,
+    kOperatorAlarmStateUnavailable,
+    kOperatorAlarmValueInvalid,
     kOperatorChoiceFailed,
     kOperatorConfigurationInvalid,
+    kOperatorInterventionRequired,
     kOperatorStopRequiresOwnerRecovery,
     kOrderedContactRuleFinalizeException,
     kOrderedContactSummaryCoverageMismatch,
     kOrderedContactSummaryInvalid,
     kOrderedContactSummaryMissing,
+    kOrderedContactSummarySequenceMismatch,
     kOrderedContactSummaryStateMismatch,
     kOrdinaryMotionJerkDisabled,
     kOrdinaryMotionJerkLimitExceeded,
@@ -5715,6 +6399,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kOwnerClosing,
     kOwnerEstopActive,
     kOwnerNotPrepared,
+    kOwnerNotReady,
     kOwnerOutputRejected,
     kOwnerProjectionInvalid,
     kOwnerRebindStageInvalid,
@@ -5722,6 +6407,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kOwnerRebuildTakeoverCleanupUnresolved,
     kOwnerRecoveryAssessmentInvalid,
     kOwnerRequestFailed,
+    kOwnerResponseRejected,
     kOwnerResultInvalid,
     kOwnerShutdownTimeoutChanged,
     kOwnerShutdownTimeoutInvalid,
@@ -5808,6 +6494,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kPersistentKeyProgramStale,
     kPersistentKeyProgramUnavailable,
     kPersistentKeyRegisterUnavailable,
+    kPersistentKeyRegisterVersionUnsupported,
     kPersistentKeyRequestReplayed,
     kPersistentKeyRunConflict,
     kPersistentKeyScenarioConflict,
@@ -5883,11 +6570,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kPlannerResultResourceProjectionMismatch,
     kPlanningAttemptIndexInvalid,
     kPlanningCancelledByInterrupt,
+    kPlanningContractUnavailable,
     kPlanningFailed,
     kPlanningJobExists,
     kPlanningJobUnfinished,
     kPlanningJobUnknown,
+    kPlanningSceneProjectionNotConverged,
     kPlanningSceneSynchronizationException,
+    kPlanningSceneSynchronizationFailed,
     kPlanningSceneSynchronizationInvalid,
     kPlanningSceneSynchronizationRaced,
     kPlanningSceneSynchronizerTargetMissing,
@@ -5902,11 +6592,16 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kPneumaticIoUnsupportedOnIsaac,
     kPneumaticNoneOwnerMismatch,
     kPneumaticStopNotApplicable,
+    kPointcloudCellIdentityMismatch,
     kPointcloudMediaTypeInvalid,
     kPointcloudObservationInvalid,
     kPointcloudPacketOversized,
     kPointcloudSceneOwnerStale,
     kPointcloudSceneOwnerUnavailable,
+    kPointcloudSequenceConflict,
+    kPointcloudSequenceRegressed,
+    kPointcloudSourceOwnerMismatch,
+    kPointcloudStreamGenerationRegressed,
     kPolicyFields,
     kPortOccupied,
     kPoseFrameMismatch,
@@ -5929,6 +6624,9 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kPredecessorSnapshotChanged,
     kPredecessorSnapshotInvalid,
     kPredecessorSnapshotMissing,
+    kPrepareParticipantResultIdentityInvalid,
+    kPrepareParticipantResultPresenceInvalid,
+    kPrepareParticipantResultStateInvalid,
     kPreparedActivationMismatch,
     kPreparedActivationUnverified,
     kPreparedCancelTerminalFailed,
@@ -5949,7 +6647,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kPreparedCommandSessionAllocationFailed,
     kPreparedCommandSessionBusy,
     kPreparedCommandSessionMissing,
+    kPreparedContractConflict,
     kPreparedDispatchMembershipInvalid,
+    kPreparedExecutionHandleMembershipMismatch,
+    kPreparedExecutionHandleObserverMissing,
+    kPreparedExecutionHandleRequestIdentityInvalid,
+    kPreparedExecutionNotQuiescent,
+    kPreparedExecutionStale,
+    kPreparedFaultStopPlanEncodingInvalid,
     kPreparedGoalNotActive,
     kPreparedMotionAlreadyDispatched,
     kPreparedMotionAuthorityMismatch,
@@ -5988,16 +6693,60 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kPreparedMotionSessionMissing,
     kPreparedMotionWorkerExitedBeforeDispatch,
     kPreparedOperationParticipantInvalid,
+    kPreparedOrdinaryStopPlanEncodingInvalid,
+    kPreparedParticipantBackendActivationSetIdMismatch,
+    kPreparedParticipantBackendActiveConfigurationGenerationMismatch,
+    kPreparedParticipantBackendActiveConfigurationIdMismatch,
+    kPreparedParticipantBackendCapabilityIdMismatch,
+    kPreparedParticipantBackendCapabilityProviderMismatch,
+    kPreparedParticipantBackendCapabilityRevisionMismatch,
+    kPreparedParticipantBackendCommandTargetIdMismatch,
+    kPreparedParticipantBackendComponentIdMismatch,
+    kPreparedParticipantBackendComponentTypeIdMismatch,
+    kPreparedParticipantBackendComponentTypeRevisionMismatch,
+    kPreparedParticipantBackendControlBindingIdMismatch,
+    kPreparedParticipantBackendControlBindingRevisionMismatch,
+    kPreparedParticipantBackendControlDomainIdMismatch,
+    kPreparedParticipantBackendControlDomainRevisionMismatch,
+    kPreparedParticipantBackendControlProviderMismatch,
+    kPreparedParticipantBackendControlRouteIdMismatch,
+    kPreparedParticipantBackendControllerTopologyIdMismatch,
+    kPreparedParticipantBackendFrameBindingsMismatch,
+    kPreparedParticipantBackendGraphRevisionMismatch,
+    kPreparedParticipantBackendInterfaceContractIdMismatch,
+    kPreparedParticipantBackendInterfaceRevisionMismatch,
+    kPreparedParticipantBackendModelBindingsMismatch,
+    kPreparedParticipantBackendProgramBindingIdMismatch,
+    kPreparedParticipantBackendProgramRevisionMismatch,
+    kPreparedParticipantBackendResourcesMismatch,
+    kPreparedParticipantBackendRetainedBundleIdMismatch,
+    kPreparedParticipantBackendRuntimeUnitEpochsMismatch,
+    kPreparedParticipantBackendShapeInvalid,
+    kPreparedParticipantBackendStopEvidencePolicyIdMismatch,
+    kPreparedParticipantBackendStopEvidencePolicyRevisionMismatch,
+    kPreparedParticipantBackendStopPlanMismatch,
+    kPreparedParticipantBackendTopologyRevisionMismatch,
     kPreparedParticipantCancelThrew,
     kPreparedParticipantNotAdmitted,
     kPreparedParticipantReferentMismatch,
     kPreparedParticipantStopPlanDigestMismatch,
     kPreparedParticipantStopPlanInvalid,
     kPreparedParticipantStopPlanMismatch,
+    kPreparedPlanRequestEncodingInvalid,
+    kPreparedPlanningEvidenceEncodingInvalid,
     kPreparedPlanningValueInvalid,
+    kPreparedReplacementConflict,
+    kPreparedReplacementNotQuiescent,
+    kPreparedReplacementStale,
     kPreparedRuntimeScaleBoundsMissing,
+    kPreparedStartStateEncodingInvalid,
+    kPreparedTrajectoryEncodingInvalid,
     kPreparedTrajectoryResourceScopeMismatch,
+    kPreparedValidationEvidenceEncodingInvalid,
+    kPreviewCapabilityCommandInvalid,
     kPreviewFailed,
+    kPreviewPrimaryMotionInvalid,
+    kPreviewSingleParticipantOnly,
     kPreviousPublicationHeadMismatch,
     kPrincipalIdMissing,
     kPrivateCollisionHandlesMustBeNull,
@@ -6012,12 +6761,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kProcessObserverSessionRetired,
     kProcessObserverSessionReused,
     kProcessPresenceRuntimeUnitUndeclared,
+    kProcessPresenceStale,
     kProgramActivationInvalid,
     kProgramAppliedChanged,
     kProgramAppliedNonExecutable,
     kProgramAppliedSelectionInvalid,
     kProgramAppliedSelectionNotActive,
     kProgramAppliedSelectionNotFound,
+    kProgramAppliedSelectionUnavailable,
     kProgramApplyConfirmationRequired,
     kProgramApplyNothingToApply,
     kProgramApplyResponseInvalid,
@@ -6108,6 +6859,12 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kProgramCycleResetStopUnsettled,
     kProgramCycleResetting,
     kProgramCycleSettlementInvalid,
+    kProgramCycleStateIdleAfterReset,
+    kProgramCycleStateRecoveryRequired,
+    kProgramCycleStateResetting,
+    kProgramCycleStateRunning,
+    kProgramCycleStateStarting,
+    kProgramCycleStateTerminalAwaitingReset,
     kProgramCycleStatusIdentityInvalid,
     kProgramCycleStatusShapeInvalid,
     kProgramDiagnosticInvalid,
@@ -6123,6 +6880,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kProgramExecutionCaptureSelectionsInvalid,
     kProgramExecutionCaptureStale,
     kProgramExecutionCaptureSynchronizationInvalid,
+    kProgramExecutionOwnerUnavailable,
     kProgramExecutionScopeCapacityExhausted,
     kProgramExecutionScopeDuplicate,
     kProgramExecutionScopeEffectMismatch,
@@ -6136,9 +6894,13 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kProgramFrameRoleAmbiguous,
     kProgramFrameRoleMissing,
     kProgramHaltReleaseStale,
+    kProgramHaltResumeUnavailable,
+    kProgramHaltTaskObservationPending,
+    kProgramHaltTaskStateUnknown,
     kProgramInterventionPortUnavailable,
     kProgramInterventionRecordFailed,
     kProgramInterventionStateUnknown,
+    kProgramManualResultForbidden,
     kProgramMotionBindingStale,
     kProgramMotionContinuationMismatch,
     kProgramMotionLimitConflict,
@@ -6152,7 +6914,10 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kProgramNodeCycleNotCurrent,
     kProgramNodeDependenciesNotCurrent,
     kProgramNodeEvidenceInvalid,
+    kProgramNodeFailed,
     kProgramNodeInterrupted,
+    kProgramNodeInvalid,
+    kProgramNodeIoSourceUnavailable,
     kProgramNodeParentNotCurrent,
     kProgramNodePreviewAttemptStale,
     kProgramNodePreviewBusy,
@@ -6189,6 +6954,9 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kProgramResetEffectsNotSettled,
     kProgramResetNotCurrent,
     kProgramResetPositionAuthorizationInvalid,
+    kProgramResetPositionCancelled,
+    kProgramResetPositionTimeout,
+    kProgramResetPositionUnavailable,
     kProgramResetResourcesNotSettled,
     kProgramResetSceneAuthorizationInvalid,
     kProgramResetSceneNotSelected,
@@ -6198,12 +6966,16 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kProgramRunAdmissionFailed,
     kProgramRunAdmissionInFlight,
     kProgramRunAdmissionInvariant,
+    kProgramRunAlreadyActive,
     kProgramRunAppliedSelectionStale,
     kProgramRunBindingInvalid,
     kProgramRunCaptureInvalid,
     kProgramRunCleanupFailed,
     kProgramRunContextUnavailable,
     kProgramRunDraftAppliedMismatch,
+    kProgramRunEndRequestAttributionInvalid,
+    kProgramRunEndRequestContextInvalid,
+    kProgramRunEndRunInvalid,
     kProgramRunHistoryFull,
     kProgramRunIdInvalid,
     kProgramRunIdentityMismatch,
@@ -6215,26 +6987,41 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kProgramRunSchedulingFailed,
     kProgramRunScopeUnknown,
     kProgramRunStartedThenFailed,
+    kProgramRunStateFailed,
+    kProgramRunStateFinalizing,
+    kProgramRunStateHalted,
+    kProgramRunStateHalting,
+    kProgramRunStateInterventionRequired,
+    kProgramRunStateRunning,
+    kProgramRunStateStopped,
+    kProgramRunStateStopping,
+    kProgramRunStateSucceeded,
+    kProgramRunStateUnavailable,
     kProgramRunStopFenceActive,
     kProgramRunStopGenerationMismatch,
     kProgramRunTerminalObserverUnavailable,
+    kProgramRunnerConfigurationInvalid,
     kProgramRunnerContactLossInvalid,
     kProgramRunnerContactLossStale,
     kProgramRunnerContactLost,
+    kProgramRunnerHttpError,
     kProgramRunnerManagerLivenessUnavailable,
     kProgramRunnerRequestBodyOversized,
     kProgramRunnerResponseInvalid,
     kProgramRunnerResponseOversized,
     kProgramRunnerShutdownFailed,
     kProgramRunnerSimulationOwnerUnavailable,
+    kProgramRunnerSocketUnavailable,
     kProgramRunnerUnavailable,
     kProgramRuntimeControlOutcomeUnknown,
+    kProgramRuntimeControlRejected,
     kProgramRuntimeControlRevisionExhausted,
     kProgramRuntimeControlStale,
     kProgramRuntimeControlsInvalid,
     kProgramRuntimeControlsUnavailable,
     kProgramRuntimeFailed,
     kProgramRuntimeObjectMissing,
+    kProgramRuntimeOwnerUnavailable,
     kProgramRuntimeRetryCountExhausted,
     kProgramRuntimeRetryForbiddenByPolicy,
     kProgramRuntimeRetryLimitReached,
@@ -6261,8 +7048,11 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kProgramTerminalScopeNotSettled,
     kProgramTickWorkerFailed,
     kProgramTicksLate,
+    kProgramTreeFailed,
     kProgramWorkspaceInvalid,
+    kProgressCursorInvalid,
     kProgressCursorStale,
+    kProgressGenerationMismatch,
     kProjectionBootstrapPrerequisiteMismatch,
     kProjectionRevisionInvalid,
     kProjectionStateUncertain,
@@ -6281,12 +7071,18 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRebindStaleOrChanged,
     kReceiverTimeInvalid,
     kRecognizedStopBodyOversized,
+    kRecognizedStopIngressAttributionInvalid,
+    kRecognizedStopIngressLabelInvalid,
+    kRecognizedStopIngressReasonInvalid,
+    kRecognizedStopIngressRouteInvalid,
     kRecognizedStopPayloadInvalid,
     kRecognizedStopStartNotCurrent,
     kReconciliationEvidenceInvalid,
     kReconciliationIdentityOrStateMismatch,
     kRecontactAfterRelease,
     kRecontactPenetrationExceedsPolicy,
+    kRecoverableSubstitutionReasonInvalid,
+    kRecoverableSubstitutionReasonWithoutModeChange,
     kRecoveryActionAccepted,
     kRecoveryActionRejected,
     kRecoveryAssessmentUnavailable,
@@ -6298,6 +7094,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRecoveryFootprintInputInvalid,
     kRecoveryLatchMissing,
     kRecoveryLatchNotRetryable,
+    kRecoveryNodeUnavailable,
     kRecoveryPortUnavailable,
     kRecoveryReceiptClaimInvalid,
     kRecoveryReceiptHeldClaimInvalid,
@@ -6306,12 +7103,15 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRecoveryReceiptReleaseInvalid,
     kRecoveryReceiptReleaseNotExact,
     kRecoveryReceiptStatusShapeInvalid,
+    kRecoveryRejected,
     kRecoveryUnavailable,
     kReferenceAmbiguous,
     kReferenceRequired,
     kReferenceResolverTargetMissing,
     kRefusedByPriority,
     kRegionFrameMismatch,
+    kRejectedResultCannotBeConfirmed,
+    kRejectedResultMissingError,
     kRelativeJointHasReference,
     kRelativeJointResultNotFinite,
     kRelativeJointStartStateDuplicateJoint,
@@ -6323,6 +7123,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRelativeMotionTypeUnsupported,
     kRelativeNamedTargetUnsupported,
     kRelativeReferenceContextUnavailable,
+    kRelativeStartStateUnavailable,
     kRelativeTargetReferenceMissing,
     kReleaseHoldEnded,
     kReleaseIdentityInvalid,
@@ -6437,12 +7238,16 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kResumeStaleOrDisabled,
     kRetainedFkBindingMismatch,
     kRetainedFrameResolutionFailed,
+    kRetainedGlobalRuleInvalid,
     kRetainedJointLimitsBindingMismatch,
     kRetainedJointNamesBindingMismatch,
+    kRetainedMeasuredRobotGeometryInvalid,
     kRetainedNeutralStateProjectionFailed,
     kRetainedRenderBindingMismatch,
     kRetainedRenderCoordinatesMismatch,
     kRetainedRenderPositionsUnavailable,
+    kRetainedRuntimeCollisionBundleInvalid,
+    kRetainedRuntimeCollisionInventoryInvalid,
     kRetainedStateBindingMismatch,
     kRetainedStateBindingUnknown,
     kRetainedStateBoundedPublicationUnavailable,
@@ -6454,12 +7259,17 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRetainedStateProjectionNotApplied,
     kRetainedStateProjectorMissing,
     kRetainedStateProjectorTargetMismatch,
+    kRetainedStatePublicationCancelled,
+    kRetainedStatePublicationDeadlineExpired,
     kRetainedStateQIndexInvalid,
+    kRetainedStateReadCancelled,
+    kRetainedStateReadDeadlineExpired,
     kRetainedStateReadFailed,
     kRetainedStateRollbackFailed,
     kRetainedStateRouteBusy,
     kRetainedStateRouteRebindFailed,
     kRetainedStaticBodyProjectionFailed,
+    kRetainedToolContextInvalid,
     kRetiredParticipantEngineAbsent,
     kRetiredParticipantEngineInUse,
     kRetiredParticipantEngineSubscriptionAbsent,
@@ -6475,12 +7285,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRobotStateJointNotScalar,
     kRobotStateJointUnknown,
     kRobotStatePositionsEmpty,
+    kRos2ControlActivationRefused,
     kRos2ControlArmUnbound,
     kRos2ControlBindingEpochChanged,
     kRos2ControlBindingEpochExhausted,
     kRos2ControlControllerActiveUnrequested,
     kRos2ControlControllerNotLoaded,
     kRos2ControlControllerStillActive,
+    kRos2ControlDeactivationRefused,
     kRos2ControlGripperBridgeBusy,
     kRos2ControlGripperBridgeCancelFailed,
     kRos2ControlGripperBridgeDisableUnsettled,
@@ -6503,6 +7315,8 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRos2ControlHandleDomainAlias,
     kRos2ControlHandleParticipantInvalid,
     kRos2ControlHandleRetired,
+    kRos2ControlHardwareActivationRefused,
+    kRos2ControlHardwareDeactivationRefused,
     kRos2ControlHardwareStateCancelled,
     kRos2ControlHardwareStateServiceUnavailable,
     kRos2ControlHardwareStateTimeout,
@@ -6520,6 +7334,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRos2ControlSwitchServiceUnavailable,
     kRos2ControlSwitchTimeout,
     kRos2ControlSwitchUnavailable,
+    kRosGripperCommandGoalRejected,
     kRosOutputAliasInvalid,
     kRosOutputConfigurationInvalid,
     kRosOutputGenerationMismatch,
@@ -6536,6 +7351,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRoutePredecessorGripperBindingMismatch,
     kRoutePredecessorGripperBuilderFailed,
     kRoutePredecessorGripperInputInvalid,
+    kRoutePredecessorGripperKernelRefused,
     kRoutePredecessorGripperOwnerMissing,
     kRoutePredecessorGripperReadbackMismatch,
     kRoutePredecessorGripperRebindFailed,
@@ -6595,6 +7411,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRuntimeCollisionCancelUnqualified,
     kRuntimeCollisionChecksLate,
     kRuntimeCollisionLookahead,
+    kRuntimeCollisionLookaheadResourceConflict,
     kRuntimeCollisionMonitor,
     kRuntimeCollisionMonitorPrepareFailed,
     kRuntimeCollisionProjectionInvalidMapping,
@@ -6634,17 +7451,21 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRuntimeConfigurationStagingFenceMissing,
     kRuntimeConfigurationStagingGateMissing,
     kRuntimeConfigurationStagingScopeInvalid,
+    kRuntimeContactReleasePolicyInvalid,
     kRuntimeContactRuleInvalid,
     kRuntimeContactStateIdentityInvalid,
     kRuntimeContactStateUnavailable,
     kRuntimeContainerUnready,
     kRuntimeContractIncompatible,
+    kRuntimeContractManifestSetDecodeFailed,
     kRuntimeContractManifestSetDigestMismatch,
     kRuntimeContractManifestSetInvalid,
     kRuntimeContractManifestSetNotCanonical,
+    kRuntimeContractOfferDecodeFailed,
     kRuntimeContractOfferDigestMismatch,
     kRuntimeContractOfferInvalid,
     kRuntimeContractOfferNotCanonical,
+    kRuntimeContractRequirementDecodeFailed,
     kRuntimeContractRequirementDigestMismatch,
     kRuntimeContractRequirementInvalid,
     kRuntimeContractRequirementNotCanonical,
@@ -6661,10 +7482,13 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRuntimeLookaheadEngineUnavailable,
     kRuntimeLookaheadInconclusive,
     kRuntimeLookaheadPolicyBindingUnavailable,
+    kRuntimeLookaheadProjectionRevisionUnavailable,
     kRuntimeLookaheadQueryTimeout,
     kRuntimeLookaheadRevisionProbeFailed,
     kRuntimeLookaheadRevisionSuperseded,
     kRuntimeLookaheadSnapshotPrepareFailed,
+    kRuntimeLookaheadTrajectoryUnavailable,
+    kRuntimeMeasuredSourceUnavailable,
     kRuntimeModelBindingInvalid,
     kRuntimeModelGroupInvalid,
     kRuntimeMonitorChecksStopped,
@@ -6709,6 +7533,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRuntimeParticipantSubscriptionCapacityUnavailable,
     kRuntimeParticipantSubscriptionFailed,
     kRuntimeParticipantUnavailable,
+    kRuntimePauseOwnerUnavailable,
     kRuntimeProductPublicationCommitFailed,
     kRuntimeProfileChanged,
     kRuntimeProgramBindingCrossesPhysicalOwner,
@@ -6718,7 +7543,9 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRuntimeProjectionUnavailable,
     kRuntimeProviderEpochJoinInvalid,
     kRuntimeProviderPathInvalid,
+    kRuntimeQuerySnapshotInvalid,
     kRuntimeResourceBindingInvalid,
+    kRuntimeResourceBindingUnavailable,
     kRuntimeResourceInventoryCountInvalid,
     kRuntimeResourceInventoryNoncanonical,
     kRuntimeResourceInventoryRemovesOccupiedResource,
@@ -6747,6 +7574,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRuntimeScaleAcceptanceMismatch,
     kRuntimeScaleAcceptanceSequenceExhausted,
     kRuntimeScaleAcknowledgementStale,
+    kRuntimeScaleBoundsInvalid,
     kRuntimeScaleControlActiveAmbiguous,
     kRuntimeScaleControlCapacityExhausted,
     kRuntimeScaleControlGenerationExhausted,
@@ -6765,6 +7593,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRuntimeScaleGroupScopeBusy,
     kRuntimeScaleGroupStateInvalid,
     kRuntimeScaleMechanismUnsupported,
+    kRuntimeScaleReconcileUnavailable,
     kRuntimeScaleRequestInvalid,
     kRuntimeScaleStateInvalid,
     kRuntimeScaleStatusBindingNotActive,
@@ -6777,6 +7606,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kRuntimeScaleUnsupported,
     kRuntimeShuttingDown,
     kRuntimeSupportingProviderPathInvalid,
+    kRuntimeUnavailable,
     kRuntimeUnitEpochsInvalid,
     kRuntimeUnitIdChanged,
     kRuntimeUnitLaunchInProgress,
@@ -6816,6 +7646,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kScenarioNameInvalid,
     kScenarioNewRequired,
     kScenarioProgramDraftInvalid,
+    kScenarioProgramProfileRenamed,
     kScenarioProjectIncomplete,
     kScenarioProjectNameInvalid,
     kScenarioProjectReadOnly,
@@ -6826,6 +7657,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kScenarioSavedPathUnavailable,
     kScenarioSourceChanged,
     kScenarioSourceInvalid,
+    kScenarioUpgradeConversionFailed,
     kScenarioWorkspaceStale,
     kSceneAdoptionEndFailed,
     kSceneAdoptionEndedWithoutPublication,
@@ -6866,7 +7698,16 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSceneMeshBoundsExceeded,
     kSceneMeshConversionFailed,
     kSceneMeshConversionTimeout,
+    kSceneMeshDraftInvalid,
+    kSceneMeshDraftRevisionChanged,
+    kSceneMeshDraftUnavailable,
     kSceneMeshInputInvalid,
+    kSceneMeshNotDraftAuthorized,
+    kSceneMeshNotOwnerAuthorized,
+    kSceneMeshOwnerProjectionInvalid,
+    kSceneMeshOwnerProjectionStale,
+    kSceneMeshOwnerUnavailable,
+    kSceneMeshSourceChanged,
     kSceneMeshUnavailable,
     kSceneObjectAttachmentPreconditionFailed,
     kSceneObjectIsAttached,
@@ -6875,6 +7716,9 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSceneOwnerUnavailable,
     kScenePolicyProjectionAmbiguous,
     kScenePolicyProjectionInvalid,
+    kScenePoseSourceRelativeReferenceGripperLinkInvalid,
+    kScenePoseSourceRelativeReferencesConflict,
+    kScenePoseUnavailable,
     kSceneProductProjectionStagingFailed,
     kSceneProgramRequestFailed,
     kSceneProjectionAuthorityUnavailable,
@@ -6883,11 +7727,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSceneProjectionCommitUncertain,
     kSceneProjectionContractViolation,
     kSceneProjectionTakeFailed,
+    kSceneProjectionUnavailable,
+    kSceneProjectionWorkerUnavailable,
     kSceneRequestAttributionInvalid,
     kSceneResourceIdsInvalid,
     kSceneResourceMissing,
     kSceneRevisionIdInvalid,
     kSceneRuntimeIdentityChanged,
+    kSceneRuntimeLatchFailed,
     kSceneRuntimeObservationExpiryInvalid,
     kSceneRuntimeObservationNotDeclared,
     kSceneRuntimeObservationRequestConflict,
@@ -6921,8 +7768,10 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSceneRuntimePoseWriterConflict,
     kSceneRuntimeSourceAbsent,
     kSceneRuntimeSourceInvalid,
+    kSceneStateUnavailable,
     kSceneTooLarge,
     kSceneTransactionDraftStale,
+    kSchedulerDetachPending,
     kSchedulerDetachTimeout,
     kSchedulerNotReady,
     kSealedChildOrResultMismatch,
@@ -6935,10 +7784,14 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSelectedMotionStopSettling,
     kSelectedObjectIdEmpty,
     kSelectedObjectNotInContext,
+    kSelectedOwnerAssessmentUnavailable,
+    kSelectedOwnerRecoveryUnavailable,
+    kSelectedOwnerWorkPending,
     kSelectedRouteEndpointsInvalid,
     kSelectedRouteEndpointsMissing,
     kSelectedRuntimeCompositionRequestFailed,
     kSelectedScopeOrOccurrenceShapeMismatch,
+    kSelectedStopFaultRequiresRecovery,
     kSelectionAmbiguous,
     kSelectionCandidatesUnavailable,
     kSelectionContextOversized,
@@ -6948,6 +7801,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSelectionNotHeld,
     kSelectionObjectPoseUnavailable,
     kSelectionObjectSourceUnsupported,
+    kSelectionReleaseUnavailable,
     kSelectionSceneProjectionInvalid,
     kSelectionSceneUnavailable,
     kSensorConfigurationInvalid,
@@ -6971,6 +7825,7 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSimulationControlFailed,
     kSimulationEntityMismatch,
     kSimulationNoResponse,
+    kSimulationNodeUnavailable,
     kSimulationNotPlaying,
     kSimulationPaused,
     kSimulationRequestCancelled,
@@ -6985,18 +7840,26 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSkillEnvironmentStale,
     kSkillEnvironmentUnavailable,
     kSkillExpansionInvalid,
+    kSnapshotClientUnavailable,
     kSnapshotDeliveryRejected,
     kSnapshotImageOversized,
     kSnapshotIntegrityLost,
     kSnapshotObserverUnavailable,
     kSnapshotRequestUnknown,
+    kSnapshotUnavailable,
     kSoftOnPathCannotStopOnPathWithinBudget,
+    kSoftOnPathCapabilityConfigInvalid,
     kSoftOnPathCoordinateKindUnsupported,
     kSoftOnPathDecelerationTimeInfeasible,
     kSoftOnPathDecelerationTimeRequired,
+    kSoftOnPathInterpolationInvalid,
+    kSoftOnPathJoinFailed,
     kSoftOnPathNaturalCompletionTimeout,
+    kSoftOnPathPathRampDispatchFailed,
+    kSoftOnPathPathRampDispatchUncertain,
     kSoftOnPathRemainingTimeShort,
     kSoftOnPathRetimerNotDispatchable,
+    kSoftOnPathStopDeltaBudgetExceeded,
     kSourceAuthorityClassMismatch,
     kSourceDirty,
     kSourceError,
@@ -7007,13 +7870,16 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSourceModelContextInvalid,
     kSourceModelProjectionInvalid,
     kSourceModelProjectionUnavailable,
+    kSourceModelUnavailable,
     kSourceRecovered,
     kSourceReportRetiredIncarnation,
     kSourceReportRuntimeUnitUndeclared,
     kSourceReportSequenceConflict,
     kSourceReportSequenceRegressed,
+    kSourceReportStale,
     kSourceReportWithoutMatchingProcessPresence,
     kSourceResultMissing,
+    kSourceStale,
     kSourceUnavailable,
     kSpringBackCoordinateKindUnsupported,
     kSpringBackDecelerationTimeRequired,
@@ -7022,12 +7888,20 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kSpringBackForwardInterpolationInvalid,
     kSpringBackForwardPhaseNotAtRest,
     kSpringBackForwardPlanEmpty,
+    kSpringBackInitialStateInvalid,
     kSpringBackInvalidReturnDistance,
+    kSpringBackJoinFailed,
+    kSpringBackPathRampDispatchFailed,
+    kSpringBackPathRampDispatchUncertain,
     kSpringBackPhaseTimeNotLargerThanHandoff,
+    kSpringBackReturnAccelerationLimitExceeded,
     kSpringBackReturnCursorInvalid,
+    kSpringBackReturnInterpolationInvalid,
+    kSpringBackReturnJerkLimitExceeded,
     kSpringBackReturnRateCapInfeasible,
     kSpringBackReturnTargetInvalid,
     kSpringBackStopDeadlineExceeded,
+    kSpringBackStopDeltaBudgetExceeded,
     kSpringReturnActivationStale,
     kSpringReturnCancelled,
     kSpringReturnCandidateIdentityChanged,
@@ -7059,13 +7933,23 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kStaleRevision,
     kStartIdentityRequired,
     kStartStateMismatch,
+    kStartupScenarioLoadFailed,
     kStatusFields,
     kStatusRecordInvalid,
     kStatusSequenceExhausted,
+    kStopAcceptedCoveredInvalid,
+    kStopAcceptedIdentityInvalid,
+    kStopAcceptedRevisionOrTimeInvalid,
+    kStopAcceptedRunInvalid,
+    kStopAcceptedStaleDiagnosticsInvalid,
+    kStopAcceptedWideningInvalid,
     kStopAggregateOperationScopeMismatch,
     kStopAggregatePredecessorInvalid,
     kStopAggregatePredecessorMismatch,
     kStopCertified,
+    kStopCommandSourceInvalid,
+    kStopComponentTargetInvalid,
+    kStopComponentTargetsNotCanonical,
     kStopDeltaBudgetExceeded,
     kStopEventRecordLost,
     kStopEvidenceKindUnsupported,
@@ -7074,25 +7958,35 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kStopEvidenceRequirementsMissing,
     kStopEvidenceSourceMismatch,
     kStopEvidenceSourceStale,
+    kStopEvidenceSourceUnavailable,
     kStopExecutionIdentityMissing,
     kStopFailed,
     kStopFenceDegraded,
+    kStopGoalTerminalStateMismatch,
     kStopGoalToleranceViolated,
     kStopJoinContinuationElapsed,
     kStopJoinElapsedInputInvalid,
     kStopJoinInputInvalid,
     kStopLaneIndexExhausted,
+    kStopMetadataUnavailable,
     kStopModeNotSoftOnPath,
     kStopModeNotSpringBackHold,
     kStopNotCertified,
     kStopNotContained,
     kStopOperationNotFenceable,
+    kStopOperationTargetInvalid,
+    kStopOperationTargetsNotCanonical,
     kStopOwnerActive,
     kStopPathTimeConversionInvalid,
     kStopProfileDurationOutOfRange,
     kStopProgressException,
     kStopReadinessRetainedTimingMismatch,
+    kStopReasonInvalid,
     kStopReplacementStartInvalid,
+    kStopRequestAttributionInvalid,
+    kStopRequestContextInvalid,
+    kStopResourceTargetInvalid,
+    kStopResourceTargetsNotCanonical,
     kStopStageAttemptInfrastructureFailure,
     kStopStageAttemptPoolBusy,
     kStopStageAttemptPoolConstructionFailed,
@@ -7100,7 +7994,9 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kStopStageAttemptPrequalificationFailed,
     kStopStageCancelledAfterDispatch,
     kStopStageCompletionException,
+    kStopStageSupersededBeforeDispatch,
     kStopStageWatchdogExpired,
+    kStopStateUnavailable,
     kStopStatusNotResident,
     kStopUnconfirmed,
     kStoppedByEstop,
@@ -7120,10 +8016,15 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kTcpDefinitionInvalid,
     kTcpEndpointAliasAmbiguous,
     kTcpEndpointLegacyForm,
+    kTcpLinearSpeedLimitExceeded,
+    kTcpLinearSpeedLimitInvalid,
     kTcpNameDuplicate,
     kTcpOffsetNotApplied,
     kTcpParentUnknown,
     kTcpSelectorInvalid,
+    kTcpSpeedFramesMissing,
+    kTcpSpeedValidationFailed,
+    kTcpSpeedValidationNonfinite,
     kTcpToolNotMounted,
     kTerminalCleanupPending,
     kTerminalPublicationInProgress,
@@ -7143,37 +8044,52 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kToolUnknown,
     kTrackingErrorExceeded,
     kTrackingSampleInvalid,
+    kTrajectoryAccelerationLimitExceeded,
     kTrajectoryAccelerationSizeMismatch,
     kTrajectoryCartesianFidelityInvalid,
     kTrajectoryCartesianMilestonesInvalid,
+    kTrajectoryEmpty,
     kTrajectoryEnvelopeInvalid,
+    kTrajectoryJointGroupIncomplete,
     kTrajectoryJointNamesEmpty,
+    kTrajectoryJointNamesInvalid,
     kTrajectoryJointNotInActiveGroup,
+    kTrajectoryJointNotInGroup,
     kTrajectoryJointOutsideBinding,
     kTrajectoryNumberInvalid,
+    kTrajectoryPositionLimitExceeded,
     kTrajectoryPositionSizeMismatch,
+    kTrajectoryRetainedPrefixBoundaryMissing,
+    kTrajectoryRetainedPrefixInvalid,
     kTrajectoryRuntimeScaleBoundsInvalid,
     kTrajectoryRuntimeScaleDerivativesIncomplete,
     kTrajectoryRuntimeScaleRestBoundaryRequired,
+    kTrajectorySegmentAccelerationLimitExceeded,
+    kTrajectorySegmentVelocityLimitExceeded,
     kTrajectorySpliceArithmeticUnrepresentable,
     kTrajectorySpliceBindingMismatch,
     kTrajectorySpliceBoundaryCoalesced,
     kTrajectorySpliceCurveInvalid,
     kTrajectorySpliceJoinFailed,
+    kTrajectorySpliceMilestonesInvalid,
     kTrajectorySpliceSampleUnrepresentable,
     kTrajectorySpliceTimeInvalid,
     kTrajectorySpliceTimePrecisionLost,
+    kTrajectoryTimeInvalid,
     kTrajectoryTimeNotStrictlyIncreasing,
     kTrajectoryTooShort,
     kTrajectoryValidationMetricsInvalid,
     kTrajectoryValueNotFinite,
+    kTrajectoryVelocityLimitExceeded,
     kTrajectoryVelocitySizeMismatch,
     kTrajectoryWaypointInvalid,
+    kTrajectoryWaypointShapeMismatch,
     kTrajectoryWaypointsArrayRequired,
     kTrustedAuthenticationAdapterInvalid,
     kUnexpectedEnd,
     kUnexpectedToken,
     kUnknownEntry,
+    kUnknownFault,
     kUnknownFunction,
     kUnknownNonStdException,
     kUnknownOrMissingMember,
@@ -7197,6 +8113,8 @@ inline constexpr std::array<std::string_view, 3605> kSortedCodes{
     kValueInvalid,
     kViewerModelAssetInvalid,
     kViewerModelAssetUnavailable,
+    kViewerModelResourceNotFound,
+    kViewerModelSelectionStale,
     kVolatileMotionTraceUnavailable,
     kWaypointPositionCountMismatch,
     kWorkerEnvelopeInvalid,

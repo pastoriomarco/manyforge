@@ -40,6 +40,13 @@ TEST(Ros2ControlComponentState, AnExitedLaunchIsAFaultWithRecover) {
   EXPECT_EQ(state.fault->code, core::FaultCode::kProcessExited);
   EXPECT_EQ(state.fault->operator_action, core::FaultOperatorAction::kRecover);
   EXPECT_EQ(state.fault->since_ns, 3);
+  EXPECT_TRUE(state.fault->details.empty());
+
+  // The launch's last output lines are the fault's `output_tail` detail.
+  observation.process_output_tail = "[ros2_control_node-2]: driver failed";
+  EXPECT_EQ(ros2_control_component_state(observation, 3).fault->details,
+            (std::map<std::string, std::string>{
+                {"output_tail", "[ros2_control_node-2]: driver failed"}}));
 }
 
 // A failed ROS transport inside ManyForge is its own fault, not an exited

@@ -1,4 +1,5 @@
 import type { StructuredError } from '../types/api';
+import { ageText } from './componentPresentation';
 import { refusalMembershipConditionIds } from './operatorAlarmRefusal';
 
 /**
@@ -98,6 +99,26 @@ export function structuredErrorRows(
   if (interlocks !== null) {
     const conditions = refusalMembershipConditionIds(interlocks);
     if (conditions.length > 0) rows.push({ label: 'Alarm interlocks', value: conditions.join(', ') });
+  }
+  // A refusal's typed numbers: JSON integers, or decimal strings beyond 2^53-1.
+  const integer = (key: string): string | null => {
+    const value = details?.[key];
+    if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
+    return typeof value === 'string' && /^-?\d+$/.test(value) ? value : null;
+  };
+  // A stale control command: how old it was against its freshness limit.
+  const elapsed = integer('elapsed_ns');
+  const validFor = integer('valid_for_ns');
+  if (elapsed !== null && validFor !== null) {
+    rows.push({ label: 'Age', value: `${ageText(Number(elapsed))}, limit ${ageText(Number(validFor))}` });
+    shown.add('elapsed_ns').add('valid_for_ns');
+  }
+  // A command sent against an older execution-control revision.
+  const expectedRevision = integer('expected_execution_control_revision');
+  const currentRevision = integer('current_execution_control_revision');
+  if (expectedRevision !== null && currentRevision !== null) {
+    rows.push({ label: 'Control revision', value: `expected ${expectedRevision}, current ${currentRevision}` });
+    shown.add('expected_execution_control_revision').add('current_execution_control_revision');
   }
   const requiredAction = text('required_action');
   if (requiredAction !== null) {

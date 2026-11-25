@@ -21,6 +21,18 @@ function report(
 }
 
 describe('operational error lifecycle', () => {
+  it('keeps a report\'s typed code and reports again when only the code changes', () => {
+    const coded = (state: OperationalErrorState, code?: string) => reduceOperationalErrors(state, {
+      kind: 'report', source: 'composer.program_runtime', title: 'Run failed', message: 'Refused',
+      attentionPolicy: 'acknowledgement_required', code,
+    });
+    const first = coded(initialOperationalErrorState(), 'program_run_refused');
+    expect([...first.records.values()][0]).toMatchObject({ message: 'Refused', code: 'program_run_refused' });
+    expect(coded(first, 'program_run_refused')).toBe(first);
+    expect([...coded(first, 'control_freshness_expired').records.values()][0]?.code).toBe('control_freshness_expired');
+    expect([...coded(initialOperationalErrorState()).records.values()][0]).not.toHaveProperty('code');
+  });
+
   it('auto-resolves a transient error while durable trace remains backend-owned', () => {
     const active = report(initialOperationalErrorState(), 'composer.viewer', 'transient');
     const resolved = reduceOperationalErrors(active, {

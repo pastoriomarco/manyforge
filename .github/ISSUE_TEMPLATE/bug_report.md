@@ -42,7 +42,7 @@ filed here — email pastoriomarco@gmail.com (see SECURITY.md).
 
 ```text
 <paste relevant logs here — `./scripts/compose-dev.sh status` output,
- `docker logs --tail 200 manyforge-development-workbench`, or `journalctl -u <unit>`>
+ `docker logs --timestamps --tail 200 manyforge-development-workbench`, or `journalctl -u <unit>`>
 ```
 
 </details>

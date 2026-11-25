@@ -1,10 +1,13 @@
+from datetime import datetime, timezone
 from threading import Event, Semaphore, Thread
+import time
 
 import pytest
 
 from manyforge_program_runner.diagnostics import (
     ProgramDiagnosticPublisher,
     ProgramNodeAttemptPublisher,
+    program_run_event,
 )
 
 
@@ -213,10 +216,15 @@ def test_node_attempts_batch_bounded_and_never_block_the_producer():
         release.set()
         publisher.close()
     assert batches[0] == {
-        "schema_version": "manyforge.program_node_attempt_batch.v1",
+        "schema_version": "manyforge.program_node_attempt_batch.v2",
         "application_start_id": "0123456789abcdef",
         "attempts": [{"node_attempt_id": 0}],
+        "run_events": [],
+        "lost_since_last_batch": None,
     }
+    # The 488 dropped while the first send was in flight go with the next.
+    assert batches[1]["lost_since_last_batch"]["count"] == 488
+    assert [batch["lost_since_last_batch"] for batch in batches[2:]] == [None] * 7
     assert [len(batch["attempts"]) for batch in batches[1:]] == [64] * 8
     assert [fact["node_attempt_id"] for batch in batches for fact in batch["attempts"]] == list(
         range(513)
@@ -271,3 +279,110 @@ def test_node_attempts_close_drops_pending_and_waits_for_the_send_in_flight():
     closer.join(5)
     assert not closer.is_alive()
     assert [batch["attempts"] for batch in batches] == [[{"label": "in_flight"}]]
+
+
+def test_run_events_share_the_node_attempt_queue_batch_and_loss_count():
+    """OD-381 P2/P3: run events travel in the same bounded queue and batch
+    as node attempts, in their own list; a lost one is counted the same way."""
+    entered, release, drained = Event(), Event(), Event()
+    batches = []
+
+    def send(batch):
+        entered.set()
+        assert release.wait(5)
+        batches.append(batch)
+        if len(batches) == 2:
+            drained.set()
+        return {"recorded": len(batch["attempts"]) + len(batch["run_events"])}
+
+    publisher = ProgramNodeAttemptPublisher(send, "0123456789abcdef", capacity=3)
+    try:
+        publisher.submit({"node_attempt_id": 0})
+        assert entered.wait(5)
+        publisher.submit_run_event({"event": "program_run_started"})
+        publisher.submit({"node_attempt_id": 1})
+        publisher.submit_run_event({"event": "cycle_recovery_action_applied"})
+        publisher.submit_run_event({"event": "program_run_finished"})  # Full.
+        assert publisher.health()["lost_count"] == "1"
+        release.set()
+        assert drained.wait(5)
+    finally:
+        release.set()
+        publisher.close()
+    assert batches[1] == {
+        "schema_version": "manyforge.program_node_attempt_batch.v2",
+        "application_start_id": "0123456789abcdef",
+        "attempts": [{"node_attempt_id": 1}],
+        "run_events": [
+            {"event": "program_run_started"},
+            {"event": "cycle_recovery_action_applied"},
+        ],
+        "lost_since_last_batch": batches[1]["lost_since_last_batch"],
+    }
+    assert batches[1]["lost_since_last_batch"]["count"] == 1
+    assert publisher.health()["sent_count"] == "4"
+
+
+def test_losses_since_the_last_delivered_batch_go_with_the_next_batch():
+    """OD-382 P1c: the count and UTC span of the entries lost since the last
+    delivered batch ride in the next one; a failed batch hands its own
+    count and the one it carried on to the batch after it."""
+    answers = iter([{"recorded": 1}, OSError("headless unavailable"), {"recorded": 1},
+                    {"recorded": 1}])
+    entered, release = Event(), Event()
+    sends = Semaphore(0)
+    batches = []
+
+    def send(batch):
+        batches.append(batch)
+        entered.set()
+        assert release.wait(5)
+        sends.release()
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    before = datetime.now(timezone.utc)
+    publisher = ProgramNodeAttemptPublisher(send, "0123456789abcdef", capacity=1)
+    try:
+        publisher.submit({"node_attempt_id": 1})
+        assert entered.wait(5)
+        publisher.submit({"node_attempt_id": 2})  # Queued.
+        publisher.submit({"node_attempt_id": 3})  # Full: lost.
+        publisher.submit({"node_attempt_id": 4})  # Full: lost.
+        release.set()
+        assert sends.acquire(timeout=5) and sends.acquire(timeout=5)  # 1, then 2 fails.
+        publisher.submit({"node_attempt_id": 5})
+        assert sends.acquire(timeout=5)
+        publisher.submit({"node_attempt_id": 6})
+        assert sends.acquire(timeout=5)
+    finally:
+        release.set()
+        publisher.close()
+    losses = [batch["lost_since_last_batch"] for batch in batches]
+    assert losses[0] is None and losses[3] is None
+    assert losses[1]["count"] == 2
+    first = datetime.fromisoformat(losses[1]["first_lost_wall"])
+    last = datetime.fromisoformat(losses[1]["last_lost_wall"])
+    assert before <= first <= last <= datetime.now(timezone.utc)
+    # Batch 2 failed: its own entry and the two it carried go with batch 3.
+    assert losses[2]["count"] == 3
+    assert losses[2]["first_lost_wall"] == losses[1]["first_lost_wall"]
+    assert datetime.fromisoformat(losses[2]["last_lost_wall"]) >= last
+    assert publisher.health()["lost_count"] == "3"
+
+
+def test_program_run_event_is_stamped_at_production():
+    before_ns = time.monotonic_ns()
+    before_wall = datetime.now(timezone.utc)
+    event = program_run_event(7, "program_run_finished", "failed", {"run_revision": 3},
+                              {"code": "program_tree_failed", "message": "x"})
+    assert before_ns <= int(event["occurred_at_ns"]) <= time.monotonic_ns()
+    assert before_wall <= datetime.fromisoformat(event["occurred_at_wall"]) <= datetime.now(
+        timezone.utc)
+    assert {key: event[key] for key in ("program_run_id", "event", "outcome", "error", "facts")} == {
+        "program_run_id": 7, "event": "program_run_finished", "outcome": "failed",
+        "error": {"code": "program_tree_failed", "message": "x"},
+        "facts": {"run_revision": 3},
+    }

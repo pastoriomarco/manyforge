@@ -218,7 +218,7 @@ def test_v3_program_root_loads_without_role_declarations(tree):
     document = {
         "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "0" * 64,
-        "program_profile": "composable-cell-v1",
+        "program_profile": "manyforge-cell-v1",
         "catalog": {"api_version": catalog.api_version, "content_version": catalog.content_version},
         "tree": tree,
     }

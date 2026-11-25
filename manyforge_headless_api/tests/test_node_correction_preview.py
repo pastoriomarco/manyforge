@@ -248,7 +248,7 @@ def test_inexact_runner_preview_is_refused_before_the_native_owner(mutate) -> No
 def test_runner_refusal_and_path_mismatch_keep_their_codes() -> None:
     runner = _Runner(
         ProgramRunnerClientError(
-            "program_node_preview_input_invalid", "selects captured binding meaning", 400
+            "program_node_preview_input_invalid", "selects captured binding meaning"
         )
     )
     execution = FakeExecution()

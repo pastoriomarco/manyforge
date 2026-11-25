@@ -835,10 +835,10 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
         document.get("runtime_availability"),
         location="runtime_availability",
     )
-    if availability.get("status") != "temporarily_unavailable_composable_cell_rebuild":
+    if availability.get("status") != "temporarily_unavailable_runtime_rebuild":
         fail(
             failures,
-            "planner runtime availability must record the composable-cell outage",
+            "planner runtime availability must record the runtime outage",
         )
     if (
         availability.get("available_surface")
@@ -885,7 +885,7 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
         adapters.get("roboplan_0_8_0"),
         location="adapters.roboplan_0_8_0",
     )
-    if roboplan.get("status") != "temporarily_unavailable_composable_cell_rebuild":
+    if roboplan.get("status") != "temporarily_unavailable_runtime_rebuild":
         fail(failures, "RoboPlan runtime is not explicitly marked unavailable")
     if (
         roboplan.get("available_surface")
@@ -975,7 +975,7 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
     )
     if curobo.get("status") != "explicitly_unsupported_deferred":
         fail(failures, "cuRobo must remain explicitly unsupported and deferred")
-    if curobo.get("implementation_changes_in_rp5_6") != "none":
+    if curobo.get("implementation_changes") != "none":
         fail(failures, "no cuRobo adapter may be implemented or modified")
 
     evidence_count = _check_evidence(

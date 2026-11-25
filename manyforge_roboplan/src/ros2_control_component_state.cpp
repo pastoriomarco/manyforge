@@ -44,6 +44,8 @@ core::ComponentState ros2_control_component_state(const Ros2ControlObservation &
   } else if (observation.process_fault) {
     state.fault = fault(core::FaultCode::kProcessExited, *observation.process_fault,
                         Action::kRecover, now_ns);
+    if (!observation.process_output_tail.empty())
+      state.fault->details.emplace("output_tail", observation.process_output_tail);
   } else if (observation.guard_fault) {
     state.fault = fault(core::FaultCode::kCommunication, *observation.guard_fault,
                         Action::kRecover, now_ns);

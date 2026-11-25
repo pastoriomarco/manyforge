@@ -54,7 +54,7 @@ if [[ "$ALLOW_STRIPPED_GIT" != "0" && "$ALLOW_STRIPPED_GIT" != "1" ]]; then
 fi
 PROXSUITE_SOURCE_ID="${PROXSUITE_SOURCE_ID:-proxsuite_0_8_2_dependency}"
 JRL_CMAKEMODULES_SOURCE_ID="${JRL_CMAKEMODULES_SOURCE_ID:-jrl_cmakemodules_2_3_0_dependency}"
-TOPPRA_SOURCE_ID="${TOPPRA_SOURCE_ID:-toppra_0_6_10_ua1_dependency}"
+TOPPRA_SOURCE_ID="${TOPPRA_SOURCE_ID:-toppra_0_6_10_dependency}"
 NANOFLANN_SOURCE_ID="${NANOFLANN_SOURCE_ID:-nanoflann_2_0_1_dependency}"
 ROBOPLAN_SOURCE_ID="${ROBOPLAN_SOURCE_ID:-roboplan_0_8_0_foundation}"
 verifier_git_args=()

@@ -19,11 +19,14 @@ import time
 from typing import Any, Sequence
 
 # `docker exec` does not inherit shell exports made by the container
-# entrypoint. Keep this tool and every service it starts self-contained.
+# entrypoint. Keep this tool and every service it starts self-contained: the
+# source roots are those of the tree this script belongs to (/workspace in
+# the workbench and the image).
+_TREE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SOURCE_ROOTS = (
-    "/workspace",
-    "/workspace/manyforge_behavior",
-    "/workspace/manyforge_ros",
+    _TREE,
+    os.path.join(_TREE, "manyforge_behavior"),
+    os.path.join(_TREE, "manyforge_ros"),
 )
 for _source_root in _SOURCE_ROOTS:
     if _source_root not in sys.path:
@@ -82,7 +85,7 @@ SERVED_PYTHON_PACKAGES = (
 BOOTSTRAP_ROOT = CACHE_ROOT / "repository-bootstrap-package"
 # Installation configuration, independent of the optional startup project.
 # Preserve the existing workbench identity; never mint one per Load or restart.
-WORKBENCH_CELL_ID = "c1_build_authority_cell"
+WORKBENCH_CELL_ID = "canonical_empty_cell"
 BOOTSTRAP_ADMISSION = f"canonical-empty-admission.{WORKBENCH_CELL_ID}.json"
 ACTIVATION_PREPARER = (
     DEPLOYMENT_AUTHORING_BUILD / "manyforge_prepare_activation"
@@ -761,7 +764,25 @@ def _operator_manager_ready(manager: dict[str, Any]) -> bool:
             and source.get("known_gaps") == [] and payload.get("manager_ready") is True)
 
 
-def query_operator_status(*, headless_port: int, runner_port: int,
+def _program_runner_health() -> dict[str, Any]:
+    """The runner's health over its command socket in the Manager run root."""
+
+    if str(HEADLESS_BUILD) not in sys.path:
+        sys.path.insert(0, str(HEADLESS_BUILD))
+    from manyforge_headless_api.program_runner_client import (
+        ProgramRunnerClient,
+        ProgramRunnerClientError,
+    )
+
+    try:
+        return ProgramRunnerClient(
+            STATE_ROOT / "current/manager-run", timeout_seconds=1.0
+        ).health()
+    except ProgramRunnerClientError as error:
+        raise WorkbenchError(f"{error.code}: {error}") from error
+
+
+def query_operator_status(*, headless_port: int,
                           composer_port: int, scenario_id: str | None = None) -> dict[str, Any]:
     """Read real owner payloads; timing is never a readiness predicate.
 
@@ -771,8 +792,7 @@ def query_operator_status(*, headless_port: int, runner_port: int,
     with HeadlessHttpClient(f"http://127.0.0.1:{headless_port}", timeout_seconds=1.0) as client:
         headless = client.health()
         manager = client.manager_status()
-    with HeadlessHttpClient(f"http://127.0.0.1:{runner_port}", timeout_seconds=1.0) as client:
-        runner = client.request("GET", "/api/program/health")
+    runner = _program_runner_health()
     with HeadlessHttpClient(f"http://127.0.0.1:{composer_port}", timeout_seconds=1.0) as client:
         composer = client.health()
     if not all(isinstance(row, dict) for row in (manager, headless, runner, composer)):
@@ -800,7 +820,6 @@ class Workbench:
         *,
         project_path: str | None,
         headless_port: int,
-        runner_port: int,
         composer_port: int,
         frontend_port: int,
         artifact_root: Path | None = None,
@@ -820,7 +839,6 @@ class Workbench:
     ) -> None:
         self.project_path = project_path
         self.headless_port = headless_port
-        self.runner_port = runner_port
         self.composer_port = composer_port
         self.frontend_port = frontend_port
         self.artifact_root = artifact_root or WORKSPACE / "examples"
@@ -855,6 +873,8 @@ class Workbench:
                     "(MANYFORGE_DEV_SITE_SETTINGS) and unset the variable")
         # The disk limits: the site settings file's, or the defaults.
         self.disk_limits = run_session.read_site_disk_limits(site_settings)
+        # Soft core-file limit of the Manager (site `core_dumps`; 0 when off).
+        self.core_dump_limit_bytes = run_session.read_site_core_dump_limit(site_settings)
         self.runtime_root = STATE_ROOT / "current"
 
     def _paths(self) -> dict[str, Path]:
@@ -880,6 +900,8 @@ class Workbench:
     def _composer_command(self, base_url: str) -> list[str]:
         command = [
             sys.executable,
+            "-X",
+            "faulthandler",
             "-m",
             "manyforge_composer",
             "--host",
@@ -951,7 +973,6 @@ class Workbench:
                     self.scenario_id = ros_capture["scenario_id"]
         for port in (
             self.headless_port,
-            self.runner_port,
             self.composer_port,
             *((self.frontend_port,) if not built_gui else ()),
         ):
@@ -1038,8 +1059,12 @@ class Workbench:
         # Draft state; its installation settings persist under the inherited
         # MANYFORGE_STATE_DIR (composer/).
         processes = [
+            # -X faulthandler: a fatal signal writes every thread's Python
+            # traceback to the process's output, then the default termination.
             ApplicationProcess("headless", (
                 sys.executable,
+                "-X",
+                "faulthandler",
                 "-m",
                 "manyforge_headless_api",
                 "serve",
@@ -1076,8 +1101,8 @@ class Workbench:
                 "2000",
                 "--manager-timeout-s",
                 "15",
-                "--program-runner-url",
-                f"http://127.0.0.1:{self.runner_port}",
+                "--program-runner-socket-root",
+                str(paths["manager_run"]),
                 "--activation-preparer",
                 str(activation_preparer),
                 "--activation-preparer-capability-root",
@@ -1087,12 +1112,12 @@ class Workbench:
             ), {"MANYFORGE_FS_ROOTS": read_roots}),
             ApplicationProcess("program_runner", (
                 sys.executable,
+                "-X",
+                "faulthandler",
                 "-m",
                 "manyforge_program_runner",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(self.runner_port),
+                "--program-socket-root",
+                str(paths["manager_run"]),
                 "--headless-url",
                 base_url,
                 "--execution-run-root",
@@ -1203,7 +1228,6 @@ class Workbench:
         try:
             if self._built_gui:
                 if not query_operator_status(headless_port=self.headless_port,
-                                             runner_port=self.runner_port,
                                              composer_port=self.composer_port,
                                              scenario_id=self.scenario_id)["ready"]:
                     return
@@ -1249,7 +1273,7 @@ class Workbench:
         self.manager = subprocess.Popen(
             command,
             env={**os.environ, **environment},
-            preexec_fn=parent_death_preexec(),
+            preexec_fn=parent_death_preexec(self.core_dump_limit_bytes),
         )
 
     def _stop_manager(self) -> bool:
@@ -1306,7 +1330,9 @@ class Workbench:
         verified = self._stop_vite() and verified
         if self.session is not None:
             try:
-                self.session.stopped(verified=verified)
+                self.session.stopped(
+                    verified=verified,
+                    manager_returncode=None if self.manager is None else self.manager.returncode)
             finally:
                 self.session.close()
                 self.session = None
@@ -1359,7 +1385,6 @@ def _parser() -> argparse.ArgumentParser:
         projects = command.add_mutually_exclusive_group()
         projects.add_argument("--project")
         command.add_argument("--headless-port", type=int, default=9010)
-        command.add_argument("--runner-port", type=int, default=9011)
         command.add_argument("--composer-port", type=int, default=9020)
         command.add_argument("--frontend-port", type=int, default=3000)
         command.add_argument("--operator-runtime", action="store_true")
@@ -1402,7 +1427,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise WorkbenchError(str(error)) from error
             if args.operator_runtime:
                 result = query_operator_status(headless_port=args.headless_port,
-                                               runner_port=args.runner_port,
                                                composer_port=args.composer_port,
                                                scenario_id=scenario_id)
             else:
@@ -1417,7 +1441,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         Workbench(
             project_path=project,
             headless_port=args.headless_port,
-            runner_port=args.runner_port,
             composer_port=args.composer_port,
             frontend_port=args.frontend_port,
             bootstrap_project_path=args.bootstrap_project,

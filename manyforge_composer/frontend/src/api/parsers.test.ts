@@ -48,6 +48,7 @@ import {
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentExportResponse,
   parseScenarioDocumentSaveResponse,
+  parseScenarioUpgradeResponse,
   parseSceneRuntimeProjection,
   parseSceneMeshAssetMetadata,
   parseProgramDraftMeshAssetMetadata,
@@ -179,6 +180,39 @@ describe('editable Scenario document transport', () => {
     expect(saved.lastKnownStatus).toBe('unknown');
   });
 
+  it('parses a Scenario upgrade check and reply strictly (OD-391)', () => {
+    const check = {
+      api_version: 'manyforge.scenario_upgrade.v1',
+      path: '/workspace/cell.scenario',
+      status: 'available',
+      conversions: [{ conversion: 'collision_rules', changes: ['program.yaml: 1 collision rule(s)'] }],
+      backup_pattern: '/workspace/cell.scenario.before-0.4.0-YYYYMMDDTHHMMSSZ',
+      backup_path: null,
+    };
+    expect(parseScenarioUpgradeResponse(check)).toEqual({
+      status: 'available',
+      path: '/workspace/cell.scenario',
+      conversions: [{ conversion: 'collision_rules', changes: ['program.yaml: 1 collision rule(s)'] }],
+      backupPattern: '/workspace/cell.scenario.before-0.4.0-YYYYMMDDTHHMMSSZ',
+      backupPath: null,
+    });
+    const backupPath = '/workspace/cell.scenario.before-0.4.0-20261125T101500Z';
+    expect(parseScenarioUpgradeResponse({ ...check, status: 'upgraded', backup_path: backupPath })
+      .backupPath).toBe(backupPath);
+    expect(parseScenarioUpgradeResponse({ ...check, status: 'current', conversions: [] }).status)
+      .toBe('current');
+    for (const patch of [
+      { status: 'upgraded' },
+      { backup_path: backupPath },
+      { status: 'current' },
+      { conversions: [{ conversion: 'unknown', changes: [] }] },
+      { api_version: 'manyforge.scenario_upgrade.v2' },
+      { extra: true },
+    ]) {
+      expect(() => parseScenarioUpgradeResponse({ ...check, ...patch })).toThrow();
+    }
+  });
+
   it('parses an explicit portable project export', () => {
     expect(parseScenarioDocumentExportResponse({
       status: 'exported',
@@ -205,7 +239,7 @@ function programFixture(): Record<string, unknown> {
   return {
     api_version: 'manyforge.program.v4',
     program_revision: `sha256:${'a'.repeat(64)}`,
-    program_profile: 'composable-cell-v1',
+    program_profile: 'manyforge-cell-v1',
     catalog: {
       api_version: 'manyforge.node_catalog.v3',
       content_version: '4.0.0',
@@ -274,7 +308,6 @@ function workspaceFixture(): Record<string, unknown> {
       unavailableReason: {
         code: 'program_apply_unavailable',
         message: 'Apply waits for N7.',
-        restorationGates: ['N7'],
       },
     },
     hasUnsavedChanges: true,
@@ -762,7 +795,9 @@ describe('Program product projections', () => {
 
   function runStatus(state = 'running'): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_run_status.v5',
+      schema_version: 'manyforge.program_run_status.v6',
+      node_running_since_utc_ns: {},
+      node_wait_values: {},
       owner_id: 'program-runner.cell-a',
       run_revision: 3,
       state,
@@ -1243,6 +1278,35 @@ describe('Program product projections', () => {
     const status = parseProgramRunStatus(runStatus());
 
     expect(status.capture.programRunId).toBe(1);
+  });
+
+  it('reads the running nodes\' start times and wait values of a v6 status', () => {
+    const idle = parseProgramRunStatus(runStatus());
+    expect(idle.nodeRunningSinceUtcNs).toEqual({});
+    expect(idle.nodeWaitValues).toEqual({});
+    const missing = runStatus();
+    delete missing.node_wait_values;
+    expect(() => parseProgramRunStatus(missing)).toThrow();
+    expect(() => parseProgramRunStatus({ ...runStatus(), schema_version: 'manyforge.program_run_status.v5' }))
+      .toThrow(/schema_version/);
+    const v6 = parseProgramRunStatus({
+      ...runStatus(),
+      node_running_since_utc_ns: { wait: 1_795_514_400_000_000_000, move: '1795514400000000123' },
+      node_wait_values: {
+        wait: { kind: 'key', key: 'cell.count', value: 3, observed_at_utc_ns: '1795514400000000500' },
+        grip: { kind: 'gripper', component_id: 'gripper', state: 'open' },
+      },
+    });
+    expect(v6.schemaVersion).toBe('manyforge.program_run_status.v6');
+    expect(v6.nodeRunningSinceUtcNs).toEqual({ wait: '1795514400000000000', move: '1795514400000000123' });
+    expect(v6.nodeWaitValues).toEqual({
+      wait: { kind: 'key', key: 'cell.count', value: 3, observedAtUtcNs: '1795514400000000500' },
+      grip: { kind: 'gripper', componentId: 'gripper', state: 'open' },
+    });
+    expect(() => parseProgramRunStatus({ ...runStatus(), node_wait_values: { wait: { kind: 'blackboard' } } }))
+      .toThrow(/node_wait_values/);
+    expect(() => parseProgramRunStatus({ ...runStatus(), schema_version: 'manyforge.program_run_status.v7' }))
+      .toThrow(/schema_version/);
   });
 
   it('carries the Stop that froze a halted run, kinds kept as text', () => {
@@ -1947,25 +2011,32 @@ describe('Program product projections', () => {
       current_command_kind: 'program_reset', runner_commands: { in_progress: null, ended: [] }, failure: null,
       reset_phase: 'restoring_scene',
       reset_robot_position: { available: false, reason: 'unsupported' },
-      reset_options: { reload_initial_scene: true, reset_robot_position: true },
+      reset_options: { reload_initial_scene: true, reset_robot_position: true, reset_stored_values: false },
       allowed_commands: [], recovery_offer: null, run: null, runtime_controls: null,
     };
     for (const phase of ['restoring_scene', 'restoring_position', 'releasing']) {
       expect(parseProgramCycleStatus({ ...input, reset_phase: phase }).resetOptions)
-        .toEqual({ reloadInitialScene: true, resetRobotPosition: true });
+        .toEqual({ reloadInitialScene: true, resetRobotPosition: true, resetStoredValues: false });
     }
     expect(parseProgramCycleStatus({
       ...input, state: 'recovery_required', reset_phase: 'restoring_position',
       failure: { failed_phase: 'restoring_position', code: 'position_failed' },
     })).toMatchObject({ state: 'recovery_required', resetPhase: 'restoring_position',
-      resetOptions: { reloadInitialScene: true, resetRobotPosition: true } });
+      resetOptions: { reloadInitialScene: true, resetRobotPosition: true, resetStoredValues: false } });
+    expect(parseProgramCycleStatus({ ...input, reset_options: {
+      reload_initial_scene: false, reset_robot_position: true, reset_stored_values: true,
+    }, reset_phase: 'restoring_position' }).resetOptions)
+      .toEqual({ reloadInitialScene: false, resetRobotPosition: true, resetStoredValues: true });
     for (const change of [
       { reset_options: undefined }, { reset_options: null },
       { reset_options: { reload_initial_scene: true } },
-      { reset_options: { reload_initial_scene: true, reset_robot_position: 1 } },
-      { reset_options: { reload_initial_scene: true, reset_robot_position: false, extra: true } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: false } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: false, reset_stored_values: 1 } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: 1, reset_stored_values: false } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: false, reset_stored_values: false, extra: true } },
       { reset_options: { reload_initial_scene: true, reset_robot_position: false, keep_stop_fault: true } },
-      { reset_options: { reload_initial_scene: false, reset_robot_position: false } },
+      // A no-run Reset needs a Scene or position effect; stored values alone never enter one.
+      { reset_options: { reload_initial_scene: false, reset_robot_position: false, reset_stored_values: true } },
       { state: 'idle_after_reset' }, { current_command_kind: 'program_run' },
       { cycle_claim_generation: 2 }, { terminal_or_settlement_reference: digestA },
       { reset_phase: 'stopping' }, { reset_phase: null },
@@ -1974,12 +2045,12 @@ describe('Program product projections', () => {
     }
     for (const phase of ['restoring_scene', 'restoring_position']) {
       const selected = phase === 'restoring_scene'
-        ? { reload_initial_scene: true, reset_robot_position: false }
-        : { reload_initial_scene: false, reset_robot_position: true };
+        ? { reload_initial_scene: true, reset_robot_position: false, reset_stored_values: false }
+        : { reload_initial_scene: false, reset_robot_position: true, reset_stored_values: false };
       expect(parseProgramCycleStatus({ ...input, reset_phase: phase, reset_options: selected })
         .resetPhase).toBe(phase);
       const unselected = { reload_initial_scene: !selected.reload_initial_scene,
-        reset_robot_position: !selected.reset_robot_position };
+        reset_robot_position: !selected.reset_robot_position, reset_stored_values: true };
       for (const state of ['resetting', 'recovery_required']) {
         expect(() => parseProgramCycleStatus({ ...input, state, reset_phase: phase,
           reset_options: unselected, failure: { failed_phase: phase } })).toThrow(/phase selected/);
@@ -2524,7 +2595,7 @@ describe('Program workspace parsers', () => {
     });
     expect(workspace.saved.matchesDraft).toBe(false);
     expect(workspace.hasUnappliedChanges).toBeNull();
-    expect(workspace.applied.unavailableReason?.restorationGates).toEqual(['N7']);
+    expect(workspace.applied.unavailableReason?.code).toBe('program_apply_unavailable');
   });
 
   it('parses the exact Program scene and viewer authoring contracts', () => {
@@ -2745,7 +2816,6 @@ describe('Program workspace parsers', () => {
       unavailableReason: {
         code: 'composer_authoring_draft_incomplete',
         message: 'Program requires exactly one root; found 0.',
-        restorationGates: [],
       },
     };
 
@@ -2814,12 +2884,10 @@ describe('Program workspace parsers', () => {
           owner_health_available: true,
           reasons: [],
           reason_codes: ['program_binding_unselected'],
-          restoration_gates: [],
         }],
         manager_runtime_converged: true,
         portable_authoring_available: true,
         reason_codes: ['program_binding_unselected'],
-        restoration_gates: ['N'],
       },
       active: { retainedBundleId: 'bundle-1', graphRevision: 'graph-1' },
       source: {},
@@ -3948,9 +4016,8 @@ describe('headless projection parsers', () => {
       mode: 'structural_only',
       components: { runtime: 'unavailable' },
       runtimeAvailability: {
-        code: 'composable_cell_runtime_unavailable',
+        code: 'runtime_unavailable',
         message: 'Runtime is unavailable.',
-        restorationGates: ['N7', 'L0', 'P5', 'I', 'R', 'T'],
       },
       timestamp: 1,
     });
@@ -3963,9 +4030,10 @@ describe('headless projection parsers', () => {
       timestamp: 2,
     });
 
-    expect(structural.runtimeAvailability?.restorationGates).toEqual([
-      'N7', 'L0', 'P5', 'I', 'R', 'T',
-    ]);
+    expect(structural.runtimeAvailability).toEqual({
+      code: 'runtime_unavailable',
+      message: 'Runtime is unavailable.',
+    });
     expect(structural.headless).toBeNull();
     expect(headless.mode).toBe('headless_client');
     expect(headless.runtimeAvailability).toBeNull();

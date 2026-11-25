@@ -16,7 +16,7 @@
 
 const unavailable = {
   schema_version: "manyforge.operator_unavailable.v1",
-  reason_code: "composable_cell_runtime_unavailable",
+  reason_code: "runtime_unavailable",
   script: "hermes/derive-hermes-dockerfile.mjs",
   historical_source:
     "manyforge@08222188293df8e12f90dc72e204c21f22f92ea1",

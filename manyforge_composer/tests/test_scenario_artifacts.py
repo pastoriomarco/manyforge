@@ -131,6 +131,9 @@ def test_capture_refuses_a_project_with_dropped_document_fields(tmp_path: Path) 
         path = target / member
         value = json.loads(path.read_text(encoding="utf-8"))
         value[field] = "old_cell"
+        if member == "deployment.yaml":
+            # Scenario lane labels were removed (0.4.0): the same refusal.
+            value["compatibility"] = {"lane": "manyforge-only", "tags": []}
         path.write_text(json.dumps(value) + "\n", encoding="utf-8")
 
     with pytest.raises(ScenarioArtifactError) as error:
@@ -138,6 +141,27 @@ def test_capture_refuses_a_project_with_dropped_document_fields(tmp_path: Path) 
     assert error.value.code == "scenario_document_dropped_fields"
     assert "program.yaml: program_id" in str(error.value)
     assert "deployment.yaml: name" in str(error.value)
+    assert "deployment.yaml: compatibility.lane" in str(error.value)
+    assert "scripts/convert_scenarios_od369.py" in str(error.value)
+
+
+def test_capture_refuses_a_project_with_the_retired_program_profile(tmp_path: Path) -> None:
+    target = Path(
+        save_scenario_artifact(
+            _document("old_cell"),
+            str(tmp_path / "old_cell.scenario"),
+            allowed_roots=[str(tmp_path)],
+            overwrite=False,
+        )
+    )
+    path = target / "program.yaml"
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["program_profile"] = "composable-cell-v1"
+    path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+
+    with pytest.raises(ScenarioArtifactError) as error:
+        capture_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+    assert error.value.code == "scenario_program_profile_renamed"
     assert "scripts/convert_scenarios_od369.py" in str(error.value)
 
 
@@ -2110,13 +2134,14 @@ def test_load_failed_before_any_effect_restores_the_previous_drafts(
 
 
 class _FailedStopKernel:
-    """The Kernel reads one real Runner port makes at Reset: its Program-run
-    Stop left the run's node faulted (nothing contained)."""
+    """The execution gateway calls one real Runner port makes at Reset: its
+    Program-run Stop left the run's node faulted (nothing contained)."""
 
-    def identity(self) -> dict:
+    def identity(self, members: dict | None = None) -> dict:
         return {"ok": True, "identity": {"application_start_id": "3f9a00000000002a"}}
 
-    def stop_program_run(self, body: dict) -> dict:
+    def stop_program_run(self, members: dict) -> dict:
+        body = members["request"]
         assert set(body) == {"request_context", "program_run_id"}
         return {"ok": True, "command": "stop_program_run", "accepted": {
             "request_key": body["request_context"]["request_key"], "event_id": 1,
@@ -2125,7 +2150,8 @@ class _FailedStopKernel:
             "applied": "program_end", "widen_reason": "none", "covered": [],
             "stale_diagnostics": [], "stale_total": 0, "accepted_at_ns": 1}}
 
-    def read_program_execution_scope(self, program_run_id: int) -> dict:
+    def read_program_execution_scope(self, members: dict) -> dict:
+        program_run_id = members["program_run_id"]
         return {"ok": True, "scope": {
             "schema_version": "manyforge.program_execution_scope.v4",
             "claim_generation": 1, "program_run_id": program_run_id,

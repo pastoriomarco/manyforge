@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -95,6 +96,12 @@ struct Fault final {
   /// C33 the controller I/O member; an e-stop every member); empty otherwise.
   std::vector<std::string> concerns;
   std::int64_t since_ns{};
+  /// The UTC time (ns since the Unix epoch) of the same instant as
+  /// `since_ns`, set by the core coordinator when it first publishes the fault.
+  std::int64_t since_utc_ns{};
+  /// Typed facts of the fault, e.g. `output_tail` (the last lines of an
+  /// exited launch's output); empty otherwise.
+  std::map<std::string, std::string> details{};
 
   friend bool operator==(const Fault&, const Fault&) = default;
 };
@@ -108,6 +115,8 @@ struct ComponentStop final {
   std::optional<std::string> vendor_code;
   std::optional<std::string> vendor_text;
   std::int64_t since_ns{};
+  /// The UTC time of `since_ns`, as on `Fault`.
+  std::int64_t since_utc_ns{};
 
   friend bool operator==(const ComponentStop&, const ComponentStop&) = default;
 };

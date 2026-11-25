@@ -135,7 +135,7 @@ function entry(id: string, goalSchema: CatalogJsonSchema): CatalogEntry {
     ],
     requiredCapabilities: [],
     execution: { blocking: true, cancellable: true, ownerApi: 'program' },
-    runners: { py_trees: 'fixture' }, tags: [], minProgramProfile: 'composable-cell-v1',
+    runners: { py_trees: 'fixture' }, tags: [], minProgramProfile: 'manyforge-cell-v1',
     blackboard: { reads: [], writes: [] }, ownerContext: null, outcomes: {}, eventFamily: null,
   };
 }
@@ -160,7 +160,7 @@ const jointNode: ProgramTreeNode = {
 };
 const program: ProgramAuthoringDocument = {
   api_version: 'manyforge.program.v4',
-  program_profile: 'composable-cell-v1',
+  program_profile: 'manyforge-cell-v1',
   catalog: { api_version: 'manyforge.node_catalog.v3', content_version: 'fixture' },
   schema_version: 'manyforge.composer_authoring_forest.v2',
   forest: [poseNode, jointNode], positions: {},

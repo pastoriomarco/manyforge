@@ -89,13 +89,18 @@ TEST(PoseSourceLaunch, PlanWritesTheDocumentAndLaunchesTheObserver) {
 }
 
 TEST(PoseSourceLaunch, ExitStatus78IsATypedConfigErrorWithTheOutputTail) {
-  const auto exited = pose_source_exit_fault("exited with status 1", 1, "");
+  const auto exited = pose_source_exit_fault("exited with status 1", 1, false, "");
   EXPECT_EQ(exited.code, "pose_source_exited");
   EXPECT_TRUE(exited.details.empty());
+  // Every exit carries its output tail.
+  const auto crashed =
+      pose_source_exit_fault("exited with status 1", 1, false, "observer crashed");
+  EXPECT_EQ(crashed.code, "pose_source_exited");
+  EXPECT_EQ(crashed.details.at("output_tail"), "observer crashed");
 
   const auto direct = pose_source_exit_fault(
-      "exited with status 78", 78,
-      "isaac_pose_observer_failed: site config api_version is unsupported\n");
+      "exited with status 78", 78, false,
+      "isaac_pose_observer_failed: site config api_version is unsupported");
   EXPECT_EQ(direct.code, "pose_source_config_invalid");
   EXPECT_EQ(direct.message, "exited with status 78");
   EXPECT_EQ(direct.details.at("output_tail"),
@@ -103,13 +108,12 @@ TEST(PoseSourceLaunch, ExitStatus78IsATypedConfigErrorWithTheOutputTail) {
             "unsupported");
 
   // `ros2 launch` exits 0 and reports its child's status in the output.
-  const std::string long_prefix(400U, 'x');
+  EXPECT_EQ(pose_source_child_config_invalid_text(), "exit code 78");
   const auto launched = pose_source_exit_fault(
-      "exited with status 0", 0,
-      long_prefix + "\n[ERROR] [pose_source_snapshot_publisher-1]: process has "
-                    "died [pid 7, exit code 78, cmd '...'].\n");
+      "exited with status 0", 0, true,
+      "[ERROR] [pose_source_snapshot_publisher-1]: process has died [pid 7, "
+      "exit code 78, cmd '...'].");
   EXPECT_EQ(launched.code, "pose_source_config_invalid");
-  EXPECT_LE(launched.details.at("output_tail").size(), 256U);
   EXPECT_NE(launched.details.at("output_tail").find("exit code 78"),
             std::string::npos);
 }
@@ -166,14 +170,14 @@ TEST(PoseSourceLaunch, AiModelPlanWritesTheProbeDocumentAndLaunchesTheProbe) {
 }
 
 TEST(PoseSourceLaunch, AiModelExitCodesAreTyped) {
-  EXPECT_EQ(pose_source_exit_fault("exited with status 1", 1, "",
+  EXPECT_EQ(pose_source_exit_fault("exited with status 1", 1, false, "",
                                    ControllerLaunchLane::kAiModel)
                 .code,
             "ai_model_exited");
   const auto invalid = pose_source_exit_fault(
-      "exited with status 0", 0,
+      "exited with status 0", 0, true,
       "[ERROR] [ai_model_probe-1]: process has died [pid 7, exit code 78, "
-      "cmd '...'].\n",
+      "cmd '...'].",
       ControllerLaunchLane::kAiModel);
   EXPECT_EQ(invalid.code, "ai_model_config_invalid");
   EXPECT_NE(invalid.details.at("output_tail").find("exit code 78"),

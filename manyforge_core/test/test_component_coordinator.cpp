@@ -518,6 +518,50 @@ TEST(ComponentCoordinator, PublishesTheAdaptersDetailsAsReported) {
   EXPECT_EQ(f.publications.last()[0].details, observed.details);
 }
 
+TEST(ComponentCoordinator, StampsTheUtcTimeOfAFaultAndAStopOnceAndKeepsIt) {
+  Fixture f;
+  const auto utc_now = [] {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+  };
+  f.clock.set(5'000);
+  auto observed = Observed(ComponentLifecycle::kFault, ComponentActivity::kUnknown,
+                           Fault{FaultCode::kProcessExited, "exited", true,
+                                 FaultOperatorAction::kRecover, std::nullopt, std::nullopt,
+                                 {}, 4'000});
+  observed.fault->details = {{"output_tail", "last line"}};
+  observed.stop = ComponentStop{StopCode::kEstop, "E-stop", "C2", std::nullopt, 5'000};
+  f.robot->set_state(observed);
+  const auto before = utc_now();
+  f.coordinator.Refresh();
+  const auto after = utc_now();
+  const auto first = f.publications.last()[0];
+  ASSERT_TRUE(first.fault && first.stop);
+  // The fault began 1 us before the read: its UTC time is 1 us before the
+  // UTC clock read with it; the stop began at the read.
+  EXPECT_GE(first.fault->since_utc_ns, before - 1'000);
+  EXPECT_LE(first.fault->since_utc_ns, after - 1'000);
+  EXPECT_GE(first.stop->since_utc_ns, before);
+  EXPECT_LE(first.stop->since_utc_ns, after);
+  EXPECT_EQ(first.fault->details, observed.fault->details);
+
+  // The same fault and stop keep their UTC times: nothing new is published.
+  const auto published = f.publications.count();
+  f.clock.advance(1'000'000);
+  f.coordinator.Refresh();
+  EXPECT_EQ(f.publications.count(), published);
+  EXPECT_EQ(f.coordinator.States()[0].fault->since_utc_ns, first.fault->since_utc_ns);
+  EXPECT_EQ(f.coordinator.States()[0].stop->since_utc_ns, first.stop->since_utc_ns);
+
+  // A new stop instant is stamped again.
+  observed.stop->since_ns = f.clock.now();
+  f.robot->set_state(observed);
+  f.coordinator.Refresh();
+  EXPECT_GE(f.publications.last()[0].stop->since_utc_ns, after);
+  EXPECT_EQ(f.publications.last()[0].fault->since_utc_ns, first.fault->since_utc_ns);
+}
+
 TEST(ComponentCoordinator, RemovedComponentsLeaveTheCell) {
   Fixture f;
   ASSERT_TRUE(f.coordinator.Submit("gripper", ComponentAction::kDisable).ok());
@@ -1452,7 +1496,12 @@ TEST(CellLatchCauses, AMachineIsOneCauseThroughItsOwner) {
   ASSERT_EQ(causes.size(), 1U);
   EXPECT_EQ(causes[0].component_id, "lite6");
   EXPECT_EQ(causes[0].kind, CellLatchCauseKind::kFault);
-  EXPECT_EQ(causes[0].fault, MachineFault());
+  // The published fault carries the UTC time of its `since_ns`.
+  ASSERT_TRUE(causes[0].fault);
+  EXPECT_GT(causes[0].fault->since_utc_ns, 0);
+  auto expected = MachineFault();
+  expected.since_utc_ns = causes[0].fault->since_utc_ns;
+  EXPECT_EQ(causes[0].fault, expected);
 
   // Members listed before their owner still yield the owner once.
   auto states = f.coordinator.States();

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Regenerate code-owned Composer/Headless REST or optional MCP references.
 
-The composable-cell cutover still removes the former aggregate assistant,
-viewer, and lifecycle contract owners. The explicit generators are:
+The former aggregate assistant, viewer, and lifecycle contract owners are
+removed. The explicit generators are:
 
   - ``docs/reference/REST_API.md`` from
     ``create_app(ComposerState()).openapi()``.
@@ -30,7 +30,7 @@ import sys
 import tempfile
 
 
-_UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+_UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 _LEGACY_AGGREGATE_UNAVAILABLE_MESSAGE = (
     f"{_UNAVAILABLE_REASON_CODE}: aggregate public-contract generation is "
     "unavailable while later runtime contract owners are removed; use one "
@@ -669,7 +669,7 @@ def gen_rest_api() -> str:
     ]
     body.append(
         "This is the structural, authoring, and thin runtime-client Composer "
-        "surface retained during the composable-cell runtime cutover. Catalog "
+        "surface. Catalog "
         "reads, sandboxed artifact browsing, structural URDF assets, health, "
         "and the strict revision-fenced Program Draft/Saved workflow remain "
         "available. When Headless and the independent Program runner are "
@@ -766,11 +766,12 @@ def gen_headless_rest_api() -> str:
         "success reply is returned at once. This wait has no time limit.\n\n"
     )
     body.append(
-        "The Program runner latches pose observations into the scene between "
-        "nodes through `GET /api/scene/runtime-owner` and "
-        "`POST /api/scene/runtime-latch`. A latch that committed observations "
-        "is answered under the same rule as a Scene commit; one that committed "
-        "none is answered at once.\n\n"
+        "The Program runner reads and edits the scene, and latches pose "
+        "observations into it between nodes, at the Manager, not through this "
+        "API; a Program node's read after such a change shows it. Headless's "
+        "own view of the logical scene shows these changes once the Manager "
+        "publishes them, so a read through this API is not ordered with "
+        "them.\n\n"
     )
     _append_openapi_routes(body, spec)
     return "".join(body)

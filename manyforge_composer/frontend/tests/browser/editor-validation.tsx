@@ -31,13 +31,13 @@ const entry: CatalogEntry = {
   id: 'test.editor', name: 'Editor', category: 'logic', description: '', stability: 'stable',
   kind: 'leaf', childrenMin: 0, childrenMax: 0, parameters: [], requiredCapabilities: [],
   execution: { blocking: true, cancellable: false, ownerApi: 'program' },
-  runners: { py_trees: 'test' }, tags: [], minProgramProfile: 'composable-cell-v1',
+  runners: { py_trees: 'test' }, tags: [], minProgramProfile: 'manyforge-cell-v1',
   blackboard: { reads: [], writes: [] }, ownerContext: null, outcomes: {}, eventFamily: null,
 };
 const node = { node_id: entry.id, instance_id: 'edit', parameters: {}, children: [] };
 const program: ProgramAuthoringDocument = {
   api_version: 'manyforge.program.v2',
-  program_profile: 'composable-cell-v1', catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.4.0' },
+  program_profile: 'manyforge-cell-v1', catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.4.0' },
   component_roles: {}, target_roles: {}, schema_version: 'manyforge.composer_authoring_forest.v1',
   forest: [node], positions: {},
 };

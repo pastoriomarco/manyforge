@@ -55,7 +55,7 @@ from manyforge_behavior.recovery import (
 )
 from manyforge_behavior.nodes.operator import OperatorRequestChoice
 from manyforge_behavior.nodes.v2_owner import MotionTaskAdapter, OwnerTaskAdapter
-from manyforge_behavior.run_sender import RunSender
+from manyforge_behavior.run_sender import RunRequest, RunSender
 from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopPolicy,
     OperatorMotionStopSnapshot,
@@ -369,7 +369,11 @@ class _NodeAttemptHistory:
     def close_finished(self) -> None:
         for node_instance_id, attempt in tuple(self._open.items()):
             leaf = attempt.leaf
-            if leaf.status is not py_trees.common.Status.RUNNING:
+            if leaf.status is not py_trees.common.Status.RUNNING and not getattr(
+                # A stopped attempt still taking its sent request ends with
+                # that request's real result first.
+                leaf, "settling_after_stop", False
+            ):
                 del self._open[node_instance_id]
                 self._close(attempt, *_attempt_result(leaf))
             elif leaf.failure_reason_code and not getattr(leaf, "presented_held", False):
@@ -474,6 +478,9 @@ def _program_node_ids(node: ProgramTreeNode) -> tuple[str, ...]:
     for child in node.children:
         result.update(_program_node_ids(child))
     return tuple(sorted(result))
+
+
+_MAXIMUM_WAIT_OBSERVATIONS: Final = 32
 
 
 def _presented_node_status(behaviour: py_trees.behaviour.Behaviour) -> str:
@@ -648,13 +655,18 @@ class ExecutableProgramRun:
         # Owner-task leaves by node: drained after each tick, and restarted
         # (motion retry budget) when the operator releases a hold over them.
         self._task_adapters: dict[str, OwnerTaskAdapter] = {}
+        # Wait leaves that keep the value they last read (`wait_observation`).
+        self._wait_adapters: dict[str, py_trees.behaviour.Behaviour] = {}
         # Each node's nearest Hold scope (None: Continue up to
         # the root), for the held-node mask of the Run's Mock snapshot.
         self._hold_scopes: dict[str, str | None] = {}
         # The run's ordered sender (OD-213): slow node requests leave the
-        # tick. Bounded by the node count (one queued request per node).
+        # tick. Bounded by the node count (one queued request per node). Its
+        # answers wake the run's tick (S2).
         self._sender = RunSender(
             len(node_children),
+            program_run_id=capture.program_run_id,
+            wake_set=ports.run_wake,
             name=f"manyforge-program-{capture.program_run_id}-sender",
         )
         # Leaves whose sent request a Forced Program End still awaits.
@@ -673,6 +685,23 @@ class ExecutableProgramRun:
         self._stopped = False
         # Unconfirmed Mock ENDs/pause states already reported.
         self._mock_ends_reported: set[tuple[str, str]] = set()
+        # The run's Mock settlements on its sender (OD-380 D2), oldest first,
+        # each with whether it is a run-end (final) one: at most one
+        # non-final and one final outstanding. Not withdrawable: an END
+        # or Halt state is sent also after a Halt or the run's end.
+        self._mock_settlements: list[tuple[RunRequest, bool]] = []
+        self._mock_ending = False  # The tree ended or was stopped.
+        self._mock_final_settled = False
+        self._sender_open = True
+        # The tree ended while its final Mock settlement is unanswered: base
+        # sent the ENDs inside that tick, so nothing of the ended tree is
+        # shown (node statuses, history) until the settlement is answered;
+        # meanwhile the statuses last read are shown again.
+        self._end_settling = False
+        self._shown_node_statuses: Mapping[str, str] | None = None
+        self._shown_wait_observations: Mapping[str, Mapping[str, Any]] | None = None
+        # The operator Stop scope read of a pending settlement, on the sender.
+        self._stop_settlement_read: RunRequest | None = None
 
     def _build_node(
         self,
@@ -737,6 +766,8 @@ class ExecutableProgramRun:
             self._question_adapters[node.instance_id] = built
         if isinstance(built, OwnerTaskAdapter):
             self._task_adapters[node.instance_id] = built
+        if hasattr(built, "wait_observation"):
+            self._wait_adapters[node.instance_id] = built
         if callable(getattr(built, "settle_abandoned_request", None)):
             self._sender_adapters.append(built)
         self._hold_scopes[node.instance_id] = hold_scope
@@ -787,6 +818,11 @@ class ExecutableProgramRun:
     @property
     def value_store(self) -> ProgramValueStore:
         return self._value_store
+
+    @property
+    def sender(self) -> RunSender:
+        """The run's ordered sender (its value publication drains on it)."""
+        return self._sender
 
     def preview_node_inputs(
         self,
@@ -943,8 +979,11 @@ class ExecutableProgramRun:
             )
 
     def take_node_history_events(self) -> tuple[dict[str, Any], ...]:
-        """Node history events decided since the last take."""
+        """Node history events decided since the last take (those of the
+        tick that ended the tree once its Mock ENDs are answered)."""
 
+        if self._end_settling:
+            return ()
         events, self._node_history_events = self._node_history_events, []
         return tuple(events)
 
@@ -1063,49 +1102,122 @@ class ExecutableProgramRun:
         (held before admission); it would otherwise present as idle.
         """
 
-        return MappingProxyType(
+        if self._end_settling and self._shown_node_statuses is not None:
+            return self._shown_node_statuses  # The ended tree waits for its ENDs.
+        shown = MappingProxyType(
             {
                 instance_id: _presented_node_status(behaviour)
                 for instance_id, behaviour in self._authored_nodes.items()
             }
         )
+        self._shown_node_statuses = shown
+        return shown
+
+    @property
+    def wait_observations(self) -> Mapping[str, Mapping[str, Any]]:
+        """What the running wait nodes last read (display only), at most
+        32: the watched key and its value, or the gripper and its state."""
+
+        if self._end_settling and self._shown_wait_observations is not None:
+            return self._shown_wait_observations
+        observations: dict[str, Mapping[str, Any]] = {}
+        for instance_id, adapter in self._wait_adapters.items():
+            observation = adapter.wait_observation
+            if observation is not None and adapter.status is py_trees.common.Status.RUNNING:
+                observations[instance_id] = observation
+                if len(observations) == _MAXIMUM_WAIT_OBSERVATIONS:
+                    break
+        shown = MappingProxyType(observations)
+        self._shown_wait_observations = shown
+        return shown
 
     def tick_once(self) -> py_trees.common.Status:
         """Advance at most one tree tick; scheduling remains the host's job."""
 
         if self._stopped:
             raise ProgramRuntimeError("a stopped Program run cannot be ticked")
-        if self._tree.root.status in {
-            py_trees.common.Status.SUCCESS,
-            py_trees.common.Status.FAILURE,
-        }:
-            return self._tree.root.status
-        self._tree.tick()
-        for adapter in self._task_adapters.values():
-            # Abandoned (INVALID) attempts close once their Stop settled.
-            if adapter.has_pending_drain:
-                adapter.drain_invalidated()
-        if self._attempt_history is not None:
-            self._attempt_history.close_finished()
+        ended = {py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE}
+        if self._tree.root.status not in ended:
+            self._tree.tick()
+            for adapter in self._task_adapters.values():
+                # Abandoned (INVALID) attempts close once their Stop settled.
+                if adapter.has_pending_drain:
+                    adapter.drain_invalidated()
+            if (
+                self._attempt_history is not None
+                and self._tree.root.status not in ended
+            ):
+                self._attempt_history.close_finished()
         status = self._tree.root.status
-        self._settle_mock_ends(
-            final=status in {py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE}
-        )
+        if not self._settle_mock_ends(final=status in ended):
+            # The tree ended; the run ends once its Mock ENDs and Halt
+            # state were sent (off the tick) and their answers reported.
+            # Base sent them inside the ending tick: until then nothing of
+            # the ended tree is shown (`node_statuses`, history).
+            self._end_settling = True
+            return py_trees.common.Status.RUNNING
+        if status in ended:
+            self._end_settling = False
+            if self._attempt_history is not None:
+                # The ended tree's attempts close after its ENDs, as in base.
+                self._attempt_history.close_finished()
         return status
 
-    def _settle_mock_ends(self, *, final: bool) -> None:
-        """Resend this Run's unanswered node ENDs unchanged on
-        every tick; when the tree ends with an END still unanswered, its
-        cancellation is unproven and the history says so (once)."""
+    def _settle_mock_ends(self, *, final: bool) -> bool:
+        """The run's Mock ENDs and Halt state leave the tick: while one is
+        pending, unanswered or a superseded state is unreported (memory
+        only), one settlement on the run's sender resends them unchanged;
+        its answer is read on a later tick. Once the tree ended (``final``),
+        one settlement sent after that end decides: an END or the current
+        Halt state still unanswered then is unproven and the history says so
+        (once). False while that final settlement is not answered. Tick
+        worker only."""
 
         port = getattr(self._ports, "mock_simulation", None)
-        resend = getattr(port, "resend_unknown_ends", None)
-        if resend is None:
-            return
+        due = getattr(port, "settlement_due", None)
+        if due is None:
+            return True
+        self._mock_ending |= final
         run_id = self._capture.program_run_id
+        submitted = False
+        while True:
+            # Answers in submission order.
+            while self._mock_settlements and self._mock_settlements[0][0].answered:
+                request, was_final = self._mock_settlements.pop(0)
+                self._report_mock_settlement(request, final=was_final)
+                self._mock_final_settled |= was_final
+            if self._mock_final_settled:
+                return True
+            if not self._mock_ending:
+                # Running: one settlement at a time while anything is due.
+                if (
+                    submitted
+                    or self._mock_settlements
+                    or not self._sender_open
+                    or not due(run_id)
+                ):
+                    return True
+            elif any(was_final for _request, was_final in self._mock_settlements):
+                return False
+            elif not self._sender_open or (
+                not self._mock_settlements and not due(run_id)
+            ):
+                self._mock_final_settled = True  # Nothing left to send.
+                return True
+            self._submit_mock_settlement(port, run_id, final=self._mock_ending)
+            submitted = True
+
+    def _submit_mock_settlement(self, port: Any, run_id: int, *, final: bool) -> None:
+        def settle() -> tuple[Any, Any]:
+            return port.resend_unknown_ends(run_id), port.resend_run_pause(run_id)
+
+        self._mock_settlements.append(
+            (self._sender.submit(settle, withdrawable=False), final)
+        )
+
+    def _report_mock_settlement(self, request: RunRequest, *, final: bool) -> None:
         try:
-            pending = resend(run_id)
-            superseded, current = port.resend_run_pause(run_id)
+            pending, (superseded, current) = request.result()
         except Exception:
             return
         self._report_unconfirmed_pauses(
@@ -1300,17 +1412,20 @@ class ExecutableProgramRun:
         )
 
     def refresh_pending_stop_settlement(self) -> None:
-        """Use the existing tree worker only until accepted containment settles."""
+        """Until accepted containment settles, the tick asks for a Kernel
+        scope read on the run's sender (OD-380 D2), one at a time; its answer
+        is published to the run's Stop state and used from a later tick."""
         if (
             self._operator_stop_state.snapshot().stopping_nodes
             or self._operator_stop_state.observation_error() is not None
         ):
-            try:
-                self._operator_stop_state.refresh()
-            except Exception:
-                # An observation outage is not a failed tree or proof of rest.
-                # Keep the exact holds; the next settling tick retries the read.
-                pass
+            read = self._stop_settlement_read
+            if read is None or read.answered:
+                # A failed read is an observation outage, not a failed tree or
+                # proof of rest: the exact holds stay; a later tick reads again.
+                self._stop_settlement_read = self._sender.submit(
+                    self._operator_stop_state.refresh, withdrawable=False
+                )
 
     @property
     def stop_observation_error(self) -> str | None:
@@ -1353,18 +1468,11 @@ class ExecutableProgramRun:
         return self._stopped_by_rule_id
 
     def settle_mock_pause(self) -> None:
-        """Send the Run's unanswered Mock pause state (entering Halt only
-        records it); report superseded states never answered. Tick worker."""
+        """The Run's unanswered Mock pause state (entering Halt only records
+        it) leaves on the run's sender, not withdrawn by the Halt; superseded
+        states never answered are reported. Tick worker."""
 
-        port = getattr(self._ports, "mock_simulation", None)
-        resend = getattr(port, "resend_run_pause", None)
-        if resend is None:
-            return
-        try:
-            superseded, _current = resend(self._capture.program_run_id)
-        except Exception:
-            return
-        self._report_unconfirmed_pauses(superseded)
+        self._settle_mock_ends(final=False)
 
     def _report_unconfirmed_pauses(self, facts: Sequence[Mapping[str, Any]]) -> None:
         # A Halt state never answered: the Mock may not have paused/resumed.
@@ -1580,9 +1688,13 @@ class ExecutableProgramRun:
         if self._stopped:
             return
         self._stopped = True
+        self._end_settling = False  # The Stop's statuses are shown.
         self._tree.root.stop(py_trees.common.Status.INVALID)
-        self._sender.close()
+        # The final Mock settlement is queued behind the stopped nodes' ENDs
+        # and still sent after the close; ``settle_sent_requests`` reads it.
         self._settle_mock_ends(final=True)
+        self._sender_open = False
+        self._sender.close()
 
     def withdraw_unsent_requests(self) -> None:
         """A Halt froze the run: nothing queued on its sender is sent. Each
@@ -1592,10 +1704,15 @@ class ExecutableProgramRun:
 
     def settle_sent_requests(self) -> bool:
         """Forced Program End (OD-213): each stopped node whose request was
-        already sent ends with that request's real result. True once no sent
-        request is outstanding; the run's tick asks again until then."""
+        already sent ends with that request's real result, and the run's
+        final Mock settlement is answered. True once no sent request is
+        outstanding; the run's tick asks again until then."""
 
-        settled = all([adapter.settle_abandoned_request() for adapter in self._sender_adapters])
+        settled = all([
+            *(adapter.settle_abandoned_request() for adapter in self._sender_adapters),
+            # The run's final Mock settlement (its ENDs and Halt state).
+            self._settle_mock_ends(final=True),
+        ])
         if settled and self._attempt_history is not None:
             # The attempts the Stop ended close here, a sent request's
             # with its real result.
@@ -1603,8 +1720,10 @@ class ExecutableProgramRun:
         return settled
 
     def close_sender(self) -> None:
-        """Runner shutdown: nothing queued is sent any more."""
+        """Runner shutdown: nothing queued is sent any more (an END or Halt
+        state queued is still sent)."""
 
+        self._sender_open = False
         self._sender.close()
 
 

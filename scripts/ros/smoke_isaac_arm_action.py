@@ -13,7 +13,7 @@ import sys
 from typing import Sequence
 
 
-UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: live Isaac arm smoke is not available yet"
 )

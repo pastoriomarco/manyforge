@@ -5,11 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from manyforge_behavior.kernel_client import (
-    KernelClientResponseError,
-    KernelOperationObservationUnavailableError,
-    PushedOperationTable,
-)
 from manyforge_program_runner.active_tcp_mirror import ActiveTcpMirror, ActiveTcpWireError
 from manyforge_program_runner.models import (
     ProgramHaltResumeRequest,
@@ -54,15 +49,13 @@ def _binding(*, include_io=False):
 def _runtime():
     runtime = object.__new__(ProgramRuntime)
     runtime._liveness = object()  # noqa: SLF001
-    runtime._execution_transport = SimpleNamespace(  # noqa: SLF001
-        subscribe_events=lambda *_args: None,
-    )
+    runtime._gateway = SimpleNamespace()  # noqa: SLF001
+    # The thread applying the core's event subscription.
     runtime._interrupt_state_follower = SimpleNamespace(is_alive=lambda: True)  # noqa: SLF001
     runtime._active_tcp_stores_lock = Lock()  # noqa: SLF001
     runtime._active_tcp_stores = {}  # noqa: SLF001
     runtime._active_tcp_mirror = ActiveTcpMirror(on_change=runtime._write_active_tcp)  # noqa: SLF001
     runtime._kernel = SimpleNamespace(read_active_tcp=lambda **_kwargs: {"robots": []})  # noqa: SLF001
-    runtime._operation_table = PushedOperationTable()  # noqa: SLF001
     # No runner command is held (OD-214 command rows).
     runtime._command = None  # noqa: SLF001
     return runtime
@@ -220,7 +213,7 @@ def test_program_scene_reset_failure_preserves_typed_tcp_cause() -> None:
     runtime._reset_active_tcp = fail_reset  # type: ignore[method-assign]  # noqa: SLF001
     cycle = SimpleNamespace(reset_phase="restoring_scene", cycle_generation=1)
     journal = SimpleNamespace(read=lambda: cycle)
-    request = SimpleNamespace(reload_initial_scene=True)
+    request = SimpleNamespace(reload_initial_scene=True, reset_stored_values=False)
     with pytest.raises(ProgramRunnerError) as captured:
         runtime._advance_reset_options(request, None, journal)  # noqa: SLF001
     assert captured.value.code == "program_cycle_reset_scene_preparation_failed"
@@ -246,7 +239,7 @@ def test_reset_requires_every_registered_robot() -> None:
 def test_ordered_read_applies_without_running_follower_even_with_liveness(no_subscription) -> None:
     runtime = _runtime()
     if no_subscription:
-        runtime._execution_transport = SimpleNamespace()  # noqa: SLF001
+        runtime._gateway = SimpleNamespace()  # noqa: SLF001
     else:
         runtime._interrupt_state_follower = SimpleNamespace(is_alive=lambda: False)  # noqa: SLF001
     entry = _entry()
@@ -351,34 +344,3 @@ def test_idle_registration_seeds_latest_update_after_own_read() -> None:
     binding = _binding()
     runtime._register_active_tcp_store(None, store, binding)  # noqa: SLF001
     assert store.values == {("robot", "arm"): new}
-
-
-def test_stream_state_feeds_the_pushed_operations_until_the_stream_is_lost() -> None:
-    # OD-213: the follower thread keeps the nodes' copy of the operations.
-    runtime = _runtime()
-    entry = {"control_pending": False, "last_control": None, "operation_id": 3,
-             "operation": {"operation_id": 3, "state": "executing"}}
-    runtime._on_active_tcp_message({  # noqa: SLF001
-        "type": "state",
-        "state": {"active_tcp_baseline": [], "operations": _operations(5, [entry]),
-                  "planning_jobs": [{"job_id": "job-1", "kind": "pick",
-                                     "program_run_id": 1, "state": "planning"}]},
-    })
-    envelope = runtime._operation_table.envelope(3, 5)  # noqa: SLF001
-    assert envelope["operation"] == entry["operation"] and envelope["resident"] is True
-    # OD-213 (1): the same message's planning jobs, lost with it.
-    jobs = runtime._operation_table.planning_jobs  # noqa: SLF001
-    assert jobs.state("job-1") == "planning"
-    runtime._on_active_tcp_stream_lost(RuntimeError("lost"))  # noqa: SLF001
-    with pytest.raises(KernelOperationObservationUnavailableError):
-        runtime._operation_table.envelope(3, 5)  # noqa: SLF001
-    with pytest.raises(KernelOperationObservationUnavailableError):
-        jobs.state("job-1")
-    # A malformed table raises (the subscription reconnects) and stays unavailable.
-    with pytest.raises(KernelClientResponseError):
-        runtime._on_active_tcp_message({  # noqa: SLF001
-            "type": "snapshot",
-            "state": {"active_tcp_baseline": [], "operations": {"change": 6}},
-        })
-    with pytest.raises(KernelOperationObservationUnavailableError):
-        runtime._operation_table.envelope(3, 5)  # noqa: SLF001

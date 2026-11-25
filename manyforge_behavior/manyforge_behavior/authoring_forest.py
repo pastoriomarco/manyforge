@@ -83,7 +83,7 @@ def empty_authoring(catalog: NodeCatalog) -> dict[str, Any]:
     return {
         "schema_version": AUTHORING_FOREST_VERSION,
         "api_version": PROGRAM_API_VERSION,
-        "program_profile": "composable-cell-v1",
+        "program_profile": "manyforge-cell-v1",
         "catalog": {
             "api_version": catalog.api_version,
             "content_version": catalog.content_version,

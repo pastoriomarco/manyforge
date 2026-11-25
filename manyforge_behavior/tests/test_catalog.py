@@ -167,7 +167,7 @@ def test_catalog_exposes_structured_v3_semantics() -> None:
 
     assert move.kind == "leaf"
     assert move.category == "motion"
-    assert move.min_program_profile == "composable-cell-v1"
+    assert move.min_program_profile == "manyforge-cell-v1"
     assert move.execution.owner_api == "kernel.operation"
     assert move.runner_implementation_ids == {"py_trees": "motion_move_to_pose_v1"}
     assert {parameter.id for parameter in move.parameters} == {
@@ -255,8 +255,8 @@ def test_effectful_requirements_are_explicit_target_commands() -> None:
 
 
 def test_profile_comparison_has_no_legacy_profile_family() -> None:
-    assert profile_satisfied("composable-cell-v1", "composable-cell-v2")
-    assert not profile_satisfied("composable-cell-v2", "composable-cell-v1")
+    assert profile_satisfied("manyforge-cell-v1", "manyforge-cell-v2")
+    assert not profile_satisfied("manyforge-cell-v2", "manyforge-cell-v1")
     assert not profile_satisfied("v0.1", "v0.2")
 
 

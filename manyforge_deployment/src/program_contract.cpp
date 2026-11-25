@@ -2762,8 +2762,8 @@ extract_contract(const CanonicalValue &root_value,
   }
   if (require_string(require_member(root, "program_profile", "program"),
                      "program.program_profile") !=
-      core::kComposableCellProgramProfile) {
-    fail("program.program_profile: expected composable-cell-v1");
+      core::kProgramProfile) {
+    fail("program.program_profile: expected manyforge-cell-v1");
   }
   const auto &bundle = retained_bundle.value();
   const auto &catalog = require_object(

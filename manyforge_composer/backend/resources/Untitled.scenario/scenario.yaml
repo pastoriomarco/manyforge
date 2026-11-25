@@ -7,11 +7,11 @@
   "description": "",
   "members": {
     "deployment.yaml": "sha256:29374ec9547f1bd529371b912b074d564ac275d5ea9f9e9d3347ad13385929cb",
-    "program.yaml": "sha256:ed52f3240bc27578709e116d53afea39fae1a636b50471e2a7324fa5c062ebec"
+    "program.yaml": "sha256:349359173824de8057479084f4faaa8684d387c77d5cc363fc8437012d3713f2"
   },
   "name": "Untitled",
   "saved_status": {
-    "checked_content_digest": "sha256:9c9a3242708503c00b7dded14f803535646f824e2a8a9d87348e9b07c920c291",
+    "checked_content_digest": "sha256:5628b9ffef484a12588386573c5dc46ad0828b8bee9d8f363641ae8bfc3a6276",
     "last_known_status": "incomplete",
     "manyforge_version": "0.4.0"
   },

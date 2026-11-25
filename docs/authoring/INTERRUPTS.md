@@ -124,9 +124,11 @@ latch.
   each write to a key a rule reads, starts a new evaluation of the rules that
   read it.
 - A write to a key a rule reads, by the tree, the operator's runtime
-  blackboard control or the API, is evaluated before the write returns, in
-  write order, one evaluation per write. The tree's next step sees the
-  result, and a value written and reset at once still trips the rule.
+  blackboard control or the API, is evaluated in write order, one evaluation
+  per write. The write itself returns at once; the value reaches the rule
+  evaluator one exchange later. A request the run makes after the write (a
+  motion, an output) reaches the execution host after that evaluation, so it
+  sees the result, and a value written and reset at once still trips the rule.
 - Reaction time depends on the source's publishing interval and on system
   scheduling. The publishing rate alone is not a response-time guarantee.
 - Each global rule's state change is streamed to the Program runner and

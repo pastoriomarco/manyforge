@@ -214,6 +214,17 @@ def test_an_older_intent_version_names_the_converter() -> None:
         validate_deployment_intent(intent, source="test")
 
 
+def test_a_lane_label_is_refused_and_other_compatibility_passes() -> None:
+    # Scenario lane labels were removed (0.4.0): each component has its lane.
+    intent = _intent()
+    intent["compatibility"] = {"provides": [], "tags": ["cell"]}
+    assert validate_deployment_intent(intent, source="test")["compatibility"] == {
+        "provides": [], "tags": ["cell"]}
+    intent["compatibility"]["lane"] = "manyforge-only"
+    with pytest.raises(DeploymentIntentError, match="compatibility.lane"):
+        validate_deployment_intent(intent, source="test")
+
+
 def test_default_tcp_and_primary_mount_pass_through() -> None:
     # A component's `default_tcp` pair and a mount's `primary` flag are
     # authored fields; the compiler checks them against the component types.

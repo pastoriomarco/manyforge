@@ -1,7 +1,7 @@
 # ManyForge Deployment
 
 `manyforge_deployment` is the ROS-free, non-real-time artifact boundary for
-the composable-cell runtime. It depends on the passive identities and DTOs in
+the component-based runtime. It depends on the passive identities and DTOs in
 `manyforge_core`; the execution Kernel does not depend on this library.
 
 The implemented offline boundary owns:

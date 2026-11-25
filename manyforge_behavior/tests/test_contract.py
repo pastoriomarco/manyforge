@@ -3,6 +3,7 @@
 import pytest
 
 from manyforge_behavior.kernel_client import KernelClient
+from .gateway_fakes import transport_gateway
 
 
 def test_contract_requires_the_base_headless_transport_calls() -> None:
@@ -11,7 +12,7 @@ def test_contract_requires_the_base_headless_transport_calls() -> None:
             return {"ok": True}
 
     with pytest.raises(TypeError, match="submit"):
-        KernelClient(IncompleteTransport())  # type: ignore[arg-type]
+        KernelClient(transport_gateway(IncompleteTransport()))  # type: ignore[arg-type]
 
 
 def test_contract_constructor_does_not_call_the_transport() -> None:
@@ -29,6 +30,6 @@ def test_contract_constructor_does_not_call_the_transport() -> None:
         acknowledge_completed = PoisonCallable()
         stop = PoisonCallable()
 
-    client = KernelClient(Transport())
+    client = KernelClient(transport_gateway(Transport()))
     with pytest.raises(TypeError, match="plan_pick"):
         client.plan_pick({"sequence_id": "pick-1"})

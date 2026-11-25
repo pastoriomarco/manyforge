@@ -41,6 +41,7 @@ import {
   simulationRefusalAuditText,
   programOperatorAuditText,
   recoveryClassLabel,
+  RESET_STORED_VALUES_NOTE,
   resetKeptMessage,
   runKeyValueText,
   selectManualRecoveryTarget,
@@ -257,7 +258,7 @@ function controller(
         program: {
           api_version: 'manyforge.program.v4',
           program_revision: `sha256:${'b'.repeat(64)}`,
-          program_profile: 'composable-cell-v1',
+          program_profile: 'manyforge-cell-v1',
           catalog: {
             api_version: 'manyforge.node_catalog.v3',
             content_version: '4.0.0',
@@ -305,7 +306,7 @@ function controller(
         },
       },
       run: {
-        schemaVersion: 'manyforge.program_run_status.v5',
+        schemaVersion: 'manyforge.program_run_status.v6',
         ownerId: 'program-runner.cell-a',
         runRevision: 4,
         state,
@@ -2190,7 +2191,7 @@ describe('Reset confirmation and persistent keys', () => {
     } finally { await open.unmount(); }
   });
 
-  it('mentions and lists persistent keys only when the Program has them and Reload is checked', async () => {
+  it('offers Reset stored values, off by default, only when the Program has persistent keys (OD-393)', async () => {
     for (const persistence of ['run', 'persistent'] as const) {
       const program = controller('intervention_required');
       program.state.controls = ordinaryMotionStopControls();
@@ -2204,14 +2205,48 @@ describe('Reset confirmation and persistent keys', () => {
         await open.press((props) => props.children === 'Reset'
           && String(props.className).startsWith('transport-reset'));
         expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(true);
+        const stored = (props: Record<string, unknown>) => props.name === 'resetStoredValues';
+        expect(open.mounted((props) => stored(props) && props.checked === false
+          && props.disabled === (persistence !== 'persistent'))).toBe(true);
+        expect(open.mounted((props) => props.children === 'Reset stored values to their initial values')).toBe(true);
         const note = (props: Record<string, unknown>) => props.className === 'transport-reset-option-note'
-          && JSON.stringify(props.children ?? null).includes('Persistent keys return');
+          && JSON.stringify(props.children ?? null).includes(RESET_STORED_VALUES_NOTE);
         expect(open.mounted(note)).toBe(persistence === 'persistent');
-        // The stored-value list is read only once Reload initial scene is checked.
+        const reason = 'The applied Program has no persistent keys, so there are no stored values to reset.';
+        expect(open.mounted((props) => props.className === 'toggle-control' && props.title === reason))
+          .toBe(persistence !== 'persistent');
+        // Reload initial scene no longer resets stored values: no list.
+        await open.change((props) => props.name === 'reloadInitialScene', { target: { checked: true } });
         expect(program.persistentValues.read).not.toHaveBeenCalled();
-        await open.change((props) => props.name === 'reloadInitialScene',
-          { target: { checked: true } });
+        // The stored-value list is read only once Reset stored values is checked.
+        await open.change(stored, { target: { checked: true } });
         expect(vi.mocked(program.persistentValues.read).mock.calls.length > 0).toBe(persistence === 'persistent');
+      } finally {
+        await open.unmount();
+      }
+    }
+  });
+
+  it('sends Reset stored values independently of Reload initial scene', async () => {
+    for (const reload of [false, true]) {
+      const program = controller('succeeded', 'idle_after_reset');
+      program.state.applied!.program.blackboard = {
+        namespaces: [],
+        keys: [{ key: 'layer', type: 'int64', access: 'read_write', persistence: 'persistent', initial: 0 }],
+      };
+      vi.mocked(program.persistentValues.read).mockReturnValue(new Promise<never>(() => undefined));
+      const open = await mountTransport(program);
+      try {
+        await open.press((props) => props.children === 'Reset'
+          && String(props.className).startsWith('transport-reset'));
+        if (reload) {
+          await open.change((props) => props.name === 'reloadInitialScene', { target: { checked: true } });
+        }
+        await open.change((props) => props.name === 'resetStoredValues', { target: { checked: true } });
+        await open.press((props) => props.children === 'Reset Program');
+        expect(program.reset).toHaveBeenCalledWith({
+          reloadInitialScene: reload, resetRobotPosition: false, resetStoredValues: true,
+        });
       } finally {
         await open.unmount();
       }
@@ -3087,6 +3122,8 @@ describe('Active TCP Resume confirmation', () => {
     robot.controlSource = {
       getShellSnapshot: () => ({ transportStatus }),
       subscribeShell: (listener: () => void) => { onShellChange = listener; return () => {}; },
+      getCellState: () => ({ components: null, latch: null, io: null, readiness: null }),
+      subscribeCellState: () => () => {},
     } as unknown as RobotControlController['controlSource'];
     const transport = await mountTransport(program, robot);
     try {
@@ -3430,6 +3467,27 @@ describe('Operator questions (OD-342)', () => {
       title: 'Waiting',
       pinnedLines: ['cell.cycle_on == true — robot_1_wait_cycle_on, loader_wait_cycle_on'],
     });
+    // An input wait shows its input's pushed value.
+    program.state.applied!.program.tree.children.push({ node_id: 'io.wait_for_input', instance_id: 'wait_part',
+      children: [], parameters: { signal: { component_id: 'io', signal_name: 'DI1' }, expected_value: true } });
+    program.state.run!.nodeStatuses = { ...program.state.run!.nodeStatuses, wait_part: 'running' };
+    expect(deriveTransportGuidance({
+      enabled: true, program, robot: robotController(), motionActive: false, onReviewProgramRecovery: vi.fn(),
+      io: [{ signal_id: 'io/DI1', value: false, source: 'device', age_ns: 4e10, fresh: false }],
+    }).find((notice) => notice.id === 'program.waiting')?.pinnedLines).toEqual([
+      'cell.cycle_on == true — robot_1_wait_cycle_on, loader_wait_cycle_on',
+      'input io/DI1 = true · now false (stale) — wait_part',
+    ]);
+    // A v6 status: how long each wait has run and the key value the runner read.
+    program.state.run!.nodeRunningSinceUtcNs = { loader_wait_cycle_on: '1795514400000000000', wait_part: '1795514430000000000' };
+    program.state.run!.nodeWaitValues = { loader_wait_cycle_on: { kind: 'key', key: 'cell.cycle_on', value: false } };
+    expect(deriveTransportGuidance({
+      enabled: true, program, robot: robotController(), motionActive: false, onReviewProgramRecovery: vi.fn(),
+      nowMs: 1_795_514_440_500,
+    }).find((notice) => notice.id === 'program.waiting')?.pinnedLines).toEqual([
+      'cell.cycle_on == true · now false · 40 s — robot_1_wait_cycle_on, loader_wait_cycle_on',
+      'input io/DI1 = true · 10 s — wait_part',
+    ]);
     program.state.run!.nodeStatuses = { root: 'running', robot_1_wait_cycle_on: 'success', loader_wait_cycle_on: 'success' };
     expect(deriveTransportGuidance({
       enabled: true, program, robot: robotController(), motionActive: false, onReviewProgramRecovery: vi.fn(),

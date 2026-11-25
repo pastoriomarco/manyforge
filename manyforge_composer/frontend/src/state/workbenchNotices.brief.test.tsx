@@ -1,7 +1,15 @@
 import { act, useEffect } from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
 
-import { BRIEF_NOTICE_MS, useBriefNotice, type WorkbenchNotice } from './workbenchNotices';
+import {
+  BRIEF_NOTICE_MS,
+  RECENT_NOTICE_LIMIT,
+  recordRecentNotice,
+  useBriefNotice,
+  useRecentNotices,
+  type RecentNotice,
+  type WorkbenchNotice,
+} from './workbenchNotices';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -71,5 +79,36 @@ it('presents an event-triggered notice for BRIEF_NOTICE_MS, never re-presents it
 
   await render(completed(2));
   expect(shown?.id).toBe('activation.completed.2');
+  await act(() => root.unmount());
+});
+
+it('keeps each presented brief notice with its time, newest first, at most RECENT_NOTICE_LIMIT', async () => {
+  const host = stubDom();
+  let recent: readonly RecentNotice[] = [];
+  function Probe({ notice }: { notice: WorkbenchNotice | null }) {
+    useBriefNotice(notice);
+    const list = useRecentNotices();
+    useEffect(() => { recent = list; });
+    return null;
+  }
+  const { createRoot } = await import('react-dom/client');
+  const root = createRoot(host as unknown as Element);
+  const render = (notice: WorkbenchNotice | null) => act(() => {
+    root.render(<Probe notice={notice} />);
+  });
+  await render({ ...completed(7), history: { programRunId: 3 } });
+  const presented = recent.length;
+  expect(recent[0]).toMatchObject({
+    severity: 'info', title: 'Activation completed', message: 'Manager confirmed 3f9a/apply7.',
+    history: { programRunId: 3 },
+  });
+  expect(recent[0].presentedAtMs).toBeGreaterThan(0);
+  // The same event re-rendered is not a new presentation.
+  await render({ ...completed(7), history: { programRunId: 3 } });
+  expect(recent.length).toBe(presented);
+  for (let id = 100; id < 100 + RECENT_NOTICE_LIMIT + 3; id += 1) recordRecentNotice(completed(id));
+  await render(null);
+  expect(recent.length).toBe(RECENT_NOTICE_LIMIT);
+  expect(recent[0].message).toBe(`Manager confirmed 3f9a/apply${100 + RECENT_NOTICE_LIMIT + 2}.`);
   await act(() => root.unmount());
 });

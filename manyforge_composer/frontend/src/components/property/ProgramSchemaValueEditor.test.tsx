@@ -22,7 +22,7 @@ const entry: CatalogEntry = {
   execution: { blocking: true, cancellable: false, ownerApi: 'scene' },
   runners: { py_trees: 'attach_v1' },
   tags: [],
-  minProgramProfile: 'composable-cell-v1',
+  minProgramProfile: 'manyforge-cell-v1',
   blackboard: { reads: [], writes: [] },
   ownerContext: null,
   outcomes: {},
@@ -38,7 +38,7 @@ const node: ProgramTreeNode = {
 
 const program: ProgramAuthoringDocument = {
   api_version: 'manyforge.program.v4',
-  program_profile: 'composable-cell-v1',
+  program_profile: 'manyforge-cell-v1',
   catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
   schema_version: 'manyforge.composer_authoring_forest.v2',
   forest: [node],

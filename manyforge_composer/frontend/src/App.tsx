@@ -631,6 +631,7 @@ export default function App() {
     title: isRuleHoldsRefusal(programRuntime.state.errorRefusal)
       ? 'Held by a global rule' : 'Program Run, Stop, or Reset failed',
     message: programRuntime.state.error,
+    code: programRuntime.state.errorRefusal?.code,
     onDismiss: programRuntime.dismissError,
   });
   useOperationalErrorMirror({
@@ -649,6 +650,7 @@ export default function App() {
     title: isRuleHoldsRefusal(robotControl.state.errorRefusal)
       ? 'Held by a global rule' : 'Robot control request failed',
     message: robotOperationalError,
+    code: robotControl.state.errorRefusal?.code,
     onDismiss: robotControl.dismissError,
   });
   const clientErrors = operationalErrors.errors;
@@ -1164,6 +1166,7 @@ export default function App() {
     source: 'composer.warning_alarm_acknowledgement',
     title: 'Alarm acknowledgement failed',
     message: alarmAcknowledgement.error,
+    code: alarmAcknowledgement.errorCode,
     onDismiss: () => setAlarmAcknowledgementError(null),
   });
   // Unacknowledged warning alarms (yellow) with the server's exact acknowledgement.

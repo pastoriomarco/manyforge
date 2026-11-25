@@ -7,11 +7,11 @@
   "description": "Isaac Sim UR10e light scene with the assistant's scene-authoring tools enabled. Ask the assistant to change the scene; every simulator change needs your approval.",
   "members": {
     "deployment.yaml": "sha256:185e6ad8551910891384d81c57175c64e27c026ab3036b9ab6d8af39efb8eea9",
-    "program.yaml": "sha256:ae01194206aed2ed685aea15baf671c6ba02159b6dc149f8f9d8db4987a6b244"
+    "program.yaml": "sha256:271ff6d4fba7d0e29f178c8b3baad73deb18b81d012d5b5bff4256ba476eda59"
   },
   "name": "sim_ur10e_assistant_scene_authoring",
   "saved_status": {
-    "checked_content_digest": "sha256:1256bed992fba64912b3d857e550208f40a5f34a538542b637af859ff45800cb",
+    "checked_content_digest": "sha256:8a0b5a927b9b7eef1c5dc58af1c90ff3179155c89d039eb62d42b8ede2416587",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

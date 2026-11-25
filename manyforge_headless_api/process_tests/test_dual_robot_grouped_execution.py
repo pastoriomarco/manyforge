@@ -22,7 +22,7 @@ import pytest
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.component_model import enable_all_targets, owner_ids
-from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.process_tests.host_probe import HostProbe
 from manyforge_headless_api.models import OperationIntentRequest, TargetObservationQuery
 from manyforge_headless_api.process_tests.test_process_stack import (
     keep_failure_evidence,
@@ -628,7 +628,7 @@ def _start_run(
 
 
 def _native_events(stack: ProcessStack) -> list[dict[str, Any]]:
-    native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=2.0)
+    native = HostProbe(stack.execution_run_root, timeout_seconds=2.0)
     result: list[dict[str, Any]] = []
     after = 0
     while True:
@@ -1141,7 +1141,7 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
         # (node catalog default 3, 1 s apart): four attempts, each refused by
         # the planner for the moved cell.
         assert len(ur5e_operations) == 4, ur5e_operations
-        native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+        native = HostProbe(stack.execution_run_root, timeout_seconds=5.0)
         for operation_id in ur5e_operations:
             evidence = json.dumps(native.read(operation_id), sort_keys=True)
             assert "native_goal_state_collision" in evidence, evidence
@@ -1192,7 +1192,7 @@ def test_robot_is_refused_a_goal_inside_its_peers_actual_position() -> None:
         assert len(accepted(events, "ur5e_robot")) == 1, events
         lite6_operations = accepted(events, "lite6_robot")
         assert len(lite6_operations) == 4, lite6_operations
-        native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+        native = HostProbe(stack.execution_run_root, timeout_seconds=5.0)
         for operation_id in lite6_operations:
             evidence = json.dumps(native.read(operation_id), sort_keys=True)
             assert "native_goal_state_collision" in evidence, evidence
@@ -1271,7 +1271,7 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
                            if row["target"] == {"component_id": "lite6_robot", "command_target_id": "arm"})
         assert any(row["capability_id"] == "model.kinematics.fk"
                    for row in arm_binding["capability_bindings"])
-        native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+        native = HostProbe(stack.execution_run_root, timeout_seconds=5.0)
         # The robot-role `tcp` frame alias is gone (CHANGELOG 0.2.0, Program
         # changes); the arm's target role declares only `base`.
         for frame_role in ("base",):
@@ -1372,7 +1372,7 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
         reader_started = threading.Event()
 
         def read_publications() -> int:
-            native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+            native = HostProbe(stack.execution_run_root, timeout_seconds=5.0)
             count = 0
             while not stop_reader.is_set():
                 # Use the production render projection without competing for
@@ -1391,7 +1391,7 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
             return count
 
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+            native = HostProbe(stack.execution_run_root, timeout_seconds=5.0)
             initial_diagnostics = native.diagnostics()
             assert initial_diagnostics.get("ok") is True, initial_diagnostics
             initial_status = initial_diagnostics["status"]
@@ -1642,7 +1642,7 @@ def test_runner_loss_during_admitted_motion_alarms_stops_the_program_run_and_kee
             # authored motions active well past the former 1 s lease.
             _set_scale(composer, selector, 0.05, "r5.runner-loss.slow-active-motion")
             _wait_scale_applied(composer, selector, 0.05)
-            native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+            native = HostProbe(stack.execution_run_root, timeout_seconds=5.0)
             native_start = native.identity()["identity"]["application_start_id"]
             deadline = time.monotonic() + 20.0
             while True:
@@ -1773,7 +1773,7 @@ def test_runner_loss_during_admitted_motion_alarms_stops_the_program_run_and_kee
             # requires Workbench restart. Fixture teardown owns process cleanup.
 
 
-def _executing_operation_ids(native: ExecutionCommandClient, operation_ids: set[int]) -> set[int]:
+def _executing_operation_ids(native: HostProbe, operation_ids: set[int]) -> set[int]:
     deadline = time.monotonic() + 20.0
     while True:
         executing = {operation_id for operation_id in operation_ids
@@ -1786,7 +1786,7 @@ def _executing_operation_ids(native: ExecutionCommandClient, operation_ids: set[
         time.sleep(0.01)
 
 
-def _wait_operations_stopped(native: ExecutionCommandClient, operation_ids: set[int]) -> None:
+def _wait_operations_stopped(native: HostProbe, operation_ids: set[int]) -> None:
     deadline = time.monotonic() + 20.0
     while True:
         states = {operation_id: native.read(operation_id)["operation"]["state"]
@@ -1823,7 +1823,7 @@ def test_a_frozen_manager_never_gates_a_users_stop() -> None:
                          for event in _operation_acceptances(stack, program_run_id)}
             _set_scale(composer, selector, 0.05, "frozen-manager.slow-motion")
             _wait_scale_applied(composer, selector, 0.05)
-            native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+            native = HostProbe(stack.execution_run_root, timeout_seconds=5.0)
             native_start = native.identity()["identity"]["application_start_id"]
             executing = _executing_operation_ids(native, first_ids)
             # Read before the freeze: the client holds the start it built
@@ -2027,7 +2027,7 @@ def _assert_stored_authoring_apply_without_linked_children(
         assert connection.execute(
             "SELECT schema_id,schema_version,cell_id FROM apply_journal_metadata WHERE singleton=1"
         ).fetchone() == (
-            "manyforge.internal.component-manager.apply-journal.h1a.v25", 25, stack.cell_id
+            "manyforge.internal.component-manager.apply-journal.v25", 25, stack.cell_id
         )
         key = (status["apply_id"], status["apply_generation"])
         rows = connection.execute(
@@ -2243,7 +2243,7 @@ def _deployment_apply_retention_case(stack: ProcessStack, kind: str) -> None:
     from manyforge_headless_api.tests.test_models import _planning_motion
 
     _load_scenario(stack, GROUPED_SCENARIO)
-    native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+    native = HostProbe(stack.execution_run_root, timeout_seconds=5.0)
     with HeadlessHttpClient(stack.base_url, timeout_seconds=30.0) as headless, HeadlessHttpClient(
         stack.composer_url, timeout_seconds=30.0
     ) as composer:

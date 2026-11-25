@@ -20,6 +20,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <manyforge_content_identity/canonical_value.hpp>
@@ -365,6 +366,13 @@ private:
   bool queue_full_{};
   /// The episode's one log line, until the writer writes it.
   std::optional<std::string> unlogged_loss_;
+  /// The current episode's first and last loss: host CLOCK_MONOTONIC and UTC
+  /// nanoseconds. When the episode ends, the writer appends one
+  /// `historian_records_lost` row with them.
+  std::pair<std::int64_t, std::int64_t> first_loss_{};
+  std::pair<std::int64_t, std::int64_t> last_loss_{};
+  /// Losses counted when the previous episode ended.
+  std::uint64_t reported_losses_{};
   std::uint64_t health_generation_{};
   std::optional<std::string> error_code_;
   std::optional<std::string> error_message_;

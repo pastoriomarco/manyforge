@@ -118,8 +118,15 @@ def test_a_failed_attempt_carries_its_code_and_the_retry_is_a_new_attempt() -> N
     events: list[dict[str, Any]] = []
     run = _run(program, _ports(task), events)
 
-    assert run.tick_once() is py_trees.common.Status.RUNNING
-    assert run.tick_once() is py_trees.common.Status.SUCCESS
+    status = run.tick_once()
+    assert status is py_trees.common.Status.RUNNING
+    # OD-380 D2: each owner answer is read a wake later; the retry restarts
+    # its child on the tick after the failure is read.
+    for _ in range(8):
+        if status is not py_trees.common.Status.RUNNING:
+            break
+        status = _tick_answered(run)
+    assert status is py_trees.common.Status.SUCCESS
 
     assert _summary(events) == [
         ("move_to_pick", 1, "failed", {"code": "owner_failed", "message": ""}),
@@ -141,7 +148,8 @@ def test_an_automatic_retry_closes_the_failed_attempt_once() -> None:
         motion_attention=lambda _node, _key: None,
     )
 
-    status = run.tick_once()
+    # OD-380 D2: the failed start is read a wake later.
+    status = _tick_answered(run)
     assert _summary(events) == [
         ("move_to_pick", 1, "failed", {"code": "planning_failed", "message": "no feasible path"}),
     ]
@@ -192,6 +200,41 @@ def test_run_stop_closes_each_running_attempt_with_its_stop_result() -> None:
             "code": "program_node_interrupted", "message": "the running attempt was stopped",
         }),
     ]
+
+
+def test_a_start_a_program_stop_withdrew_records_base_s_cancelled_attempt() -> None:
+    # Parallel[move, cell_stop]: base admitted the move inside the tick and
+    # the Stop cancelled it before dispatch. Now the queued start is withdrawn
+    # and never sent; the History row is base's for that cancelled attempt.
+    document = _minimal_document()
+    motion = document["tree"]["children"][0]
+    document["tree"] = {
+        "node_id": "parallel",
+        "instance_id": "together",
+        "parameters": {"success_policy": "all"},
+        "children": [motion, _leaf("kernel.cell_stop", "halt_cell")],
+    }
+    program = Program.from_dict(_identified(document), _catalog())
+    events: list[dict[str, Any]] = []
+    operations = _TaskPort((OwnerTaskState.ACTIVE,))
+    ports = replace(_ports(operations), kernel_controls=_TaskPort())
+    run = _run(program, ports, events)
+    queued: list[Any] = []
+    run._sender._spawn = lambda _name, work: queued.append(work)  # noqa: SLF001
+
+    assert run.tick_once() is py_trees.common.Status.RUNNING
+    for _ in range(8):
+        while queued:
+            queued.pop(0)()
+        if run.tick_once() is not py_trees.common.Status.RUNNING:
+            break
+    assert operations.starts == []  # The move's start never reached the host.
+    assert ("move_to_pick", 1, "failed", {
+        "code": "operation_cancelled_pre_dispatch",
+        "message": "native operation was interrupted",
+    }) in _summary(events)
+    row = next(event for event in events if event["node_instance_id"] == "move_to_pick")
+    assert row["error"]["details"] is None
 
 
 class _BlockingInvocationPort(_InvocationPort):

@@ -175,15 +175,6 @@ def with_part(key: bytes, part: int) -> bytes:
     return bytes(((key[0] & 0xC0) | part,)) + key[1:]
 
 
-def http_client_key(key: bytes) -> bytes:
-    """The key Headless forms for an HTTP request carrying ``key``: byte 0
-    overwritten by class 3, part 0. An owner reached over HTTP names this key."""
-
-    if len(key) != REQUEST_KEY_BYTES:
-        raise ValueError("request key must be 16 bytes")
-    return bytes((int(KeyClass.HTTP_CLIENT) << 6,)) + key[1:]
-
-
 def key_class(key: bytes) -> KeyClass:
     return KeyClass(key[0] >> 6)
 

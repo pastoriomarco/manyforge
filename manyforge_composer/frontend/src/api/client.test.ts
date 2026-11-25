@@ -310,6 +310,11 @@ it('sends the application-start id with History queries whenever a start is name
     .toBe(`/api/execution/history?limit=32&recent_seconds=60&channel=manyforge.composer&application_start_id=${start}`);
   expect(historianListPath({ applicationStartId: start, limit: 1 }))
     .toBe(`/api/execution/history?limit=1&application_start_id=${start}`);
+  // A node attempt and a Stop filter, as the History query names them.
+  expect(historianListPath({ nodeAttemptId: 12, stopEventId: '3f9a/stop4' }))
+    .toBe('/api/execution/history?limit=32&node_attempt_id=12&stop_event_id=3f9a%2Fstop4');
+  // A rule filter, by the payload key `rule_id`.
+  expect(historianListPath({ ruleId: 'wall' })).toBe('/api/execution/history?limit=32&rule_id=wall');
   // Without a named start, no start is sent.
   expect(historianListPath({ recentSeconds: 60 })).not.toContain('application_start_id');
   expect(api.history.captureExportUrl(4)).not.toContain('application_start_id');
@@ -602,7 +607,7 @@ function workspaceFixture(): Record<string, unknown> {
   };
   const programFields = {
     api_version: 'manyforge.program.v4',
-    program_profile: 'composable-cell-v1',
+    program_profile: 'manyforge-cell-v1',
     catalog: {
       api_version: 'manyforge.node_catalog.v3',
       content_version: '4.0.0',
@@ -652,7 +657,6 @@ function workspaceFixture(): Record<string, unknown> {
       unavailableReason: {
         code: 'program_apply_unavailable',
         message: 'Apply waits for N7.',
-        restorationGates: ['N7'],
       },
     },
     hasUnsavedChanges: false,

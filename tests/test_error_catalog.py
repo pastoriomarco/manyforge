@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -91,8 +93,9 @@ def test_scanner_finds_codes_at_error_construction_sites(tmp_path: Path) -> None
 def test_listed_indirect_codes_count_while_their_producer_has_them(tmp_path: Path) -> None:
     # Every listed code is seen in this repository, so it needs its row.
     used = checker.used_codes()
-    for codes in checker._INDIRECT_CODES.values():
-        assert set(codes) <= set(used)
+    for producer, codes in checker._INDIRECT_CODES.items():
+        if (REPOSITORY_ROOT / producer).is_file():
+            assert set(codes) <= set(used), producer
     relative, codes = next(iter(checker._INDIRECT_CODES.items()))
     producer = tmp_path / relative
     producer.parent.mkdir(parents=True)
@@ -200,16 +203,143 @@ def test_python_reasons_count_only_in_listed_files_and_forms(tmp_path: Path) -> 
     }
 
 
-def test_python_constants_count_only_when_listed(tmp_path: Path) -> None:
-    relative = "manyforge_program_runner/bbkey_publication.py"
-    assert "FAULT_CODE" in checker._PY_CONSTANTS[relative]
+def test_python_constants_count_when_listed_or_named_code(tmp_path: Path) -> None:
+    relative = "manyforge_program_runner/persistent_keys.py"
+    assert "REASON_NOT_DECLARED" in checker._PY_CONSTANTS[relative]
     source = (
         'COMMAND: Final = "example_command_name"\n'
+        'REASON_NOT_DECLARED: Final = "example_not_declared"\n'
         'FAULT_CODE: Final = "example_publication_failed"\n'
+        '_MALFORMED_CODE = "example_malformed"\n'
+        'LOG_CODE: Final = "example_log_tag"\n'
     )
     _write(tmp_path, relative, source)
     _write(tmp_path, "manyforge_example/unlisted.py", source.replace("example_", "unlisted_"))
-    assert set(checker.used_codes(tmp_path)) == {"example_publication_failed"}
+    assert set(checker.used_codes(tmp_path)) == {
+        "example_not_declared",
+        "example_publication_failed",
+        "example_malformed",
+        "unlisted_publication_failed",
+        "unlisted_malformed",
+    }
+
+
+def test_cpp_code_parameters_conditionals_and_returned_codes(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "manyforge_example/src/owner.cpp",
+        'void Require(bool condition, const std::string &code, std::string message);\n'
+        'void Note(bool condition, const std::string &detail);\n'
+        'Require(ok, "example_required", "message");\n'
+        'Require(ok, busy ? "example_busy" : "example_idle", "message");\n'
+        'Require(Text(v, "field_name") == "other_value", "example_compared", "m");\n'
+        'Note(ok, "example_detail_not_a_code");\n'
+        'return TypedError(a == B::kC ? "example_then" : x ? "example_else_then"\n'
+        '                  : other_code, "message");\n'
+        'return Result<void>::Err({"example_braced", "message", {}});\n'
+        'std::optional<std::string_view> example_field_error(const T& v) noexcept {\n'
+        '  if (!v.ok) return "example_returned";\n'
+        '  return std::nullopt;\n'
+        '}\n'
+        'std::string_view describe(const T& v) { return "example_not_returned_code"; }\n',
+    )
+    _write(tmp_path, "manyforge_example/include/manyforge_example/alarm.hpp",
+           'void MarkUnavailable(std::string code, std::string message);\n')
+    _write(tmp_path, "manyforge_example/src/alarm.cpp",
+           'MarkUnavailable("example_header_helper", "message");\n')
+    assert set(checker.used_codes(tmp_path)) == {
+        "example_required",
+        "example_busy",
+        "example_idle",
+        "example_compared",
+        "example_then",
+        "example_else_then",
+        "example_braced",
+        "example_returned",
+        "example_header_helper",
+    }
+
+
+def test_python_conditional_default_and_helper_codes(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "manyforge_example/owner.py",
+        'def _refuse(entry, code, message): ...\n'
+        'class Refused(Exception):\n'
+        '    code: Final = "example_class_code"\n'
+        '_refuse(entry, "example_helper_code", "message")\n'
+        'raise HeadlessApiError("example_then" if busy else "example_else", "m")\n'
+        'record(reason_code=None if ok else "example_keyword")\n'
+        'detail = {"code": reason or "example_default"}\n'
+        'code = getattr(error, "code", None) or "example_assigned"\n'
+        'other("example_not_a_code" if busy else "example_still_not")\n',
+    )
+    assert set(checker.used_codes(tmp_path)) == {
+        "example_class_code",
+        "example_helper_code",
+        "example_then",
+        "example_else",
+        "example_keyword",
+        "example_default",
+        "example_assigned",
+    }
+
+
+def test_runtime_families_count_while_their_template_is_present(tmp_path: Path) -> None:
+    used = checker.used_codes()
+    for producer, families in checker._RUNTIME_FAMILIES.items():
+        if (REPOSITORY_ROOT / producer).is_file():
+            for template, codes in families.items():
+                assert set(codes) <= set(used), template
+    relative = "manyforge_program_runner/runtime.py"
+    template = 'f"program_cycle_state_{cycle.state}"'
+    _write(tmp_path, relative, f"reason = {template}\n")
+    assert "program_cycle_state_running" in checker.used_codes(tmp_path)
+    _write(tmp_path, relative, "reason = None\n")
+    assert "program_cycle_state_running" not in checker.used_codes(tmp_path)
+
+
+def _closed_set(relative: str, name: str) -> set[str]:
+    """String values of a module-level set/dict constant or an Enum class."""
+    tree = ast.parse((REPOSITORY_ROOT / relative).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return {
+                item.value.value
+                for item in node.body
+                if isinstance(item, ast.Assign) and isinstance(item.value, ast.Constant)
+            }
+        target = getattr(node, "target", None) or (getattr(node, "targets", None) or [None])[0]
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and getattr(target, "id", None) == name:
+            value = node.value
+            if isinstance(value, ast.Dict):
+                return {v.value for v in value.values}
+            return {
+                item.value
+                for item in ast.walk(value)
+                if isinstance(item, ast.Constant) and isinstance(item.value, str)
+            }
+    raise AssertionError(f"{name} not found in {relative}")
+
+
+def test_runtime_family_sets_match_their_sources() -> None:
+    assert set(checker._PROGRAM_CYCLE_STATES) == _closed_set(
+        "manyforge_program_runner/cycle_journal.py", "STATES")
+    assert set(checker._PROGRAM_RUN_STATES) == _closed_set(
+        "manyforge_behavior/manyforge_behavior/program_run_owner.py", "ProgramRunState")
+    assert set(checker._PREEMPTION_OUTCOMES) == _closed_set(
+        "manyforge_behavior/manyforge_behavior/nodes/v2_owner.py", "_PREEMPTION_OUTCOMES")
+    ports = (REPOSITORY_ROOT / "manyforge_behavior/manyforge_behavior/orchestration_ports.py"
+             ).read_text(encoding="utf-8")
+    execution_states = _closed_set(
+        "manyforge_behavior/manyforge_behavior/kernel_client.py", "ExecutionState")
+    for name, states in (
+        ("INTERRUPTED_EXECUTION_STATES", checker._INTERRUPTED_EXECUTION_STATES),
+        ("FAILED_EXECUTION_STATES", checker._FAILED_EXECUTION_STATES),
+    ):
+        body = ports.split(f"{name}: Final = frozenset(", 1)[1].split(")\n", 1)[0]
+        members = {m.lower() for m in re.findall(r"ExecutionState\.(\w+)\.value", body)}
+        assert set(states) == members and members <= execution_states, name
 
 
 def test_vocabulary_entries_count_only_when_referenced(tmp_path: Path) -> None:

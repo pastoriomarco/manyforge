@@ -1,31 +1,49 @@
 """One ordered BB key sender per source: a captured Run, or the cell between Runs.
 
-Every writer (tree node, operator control, REST, MCP) commits through
-the source's value store, and the store forwards each committed change of a
-subscribed key synchronously under its lock, so writes reach the Kernel in
-commit order, one frame per write (never merged), and a write returns only
-after the Kernel's reply. The Kernel evaluates its rules before it ACKs.
+Every writer (tree node, operator control, REST, MCP) commits through the
+source's value store. Under the store lock the store hands each committed
+change of a subscribed key to this publisher, which only captures it: the
+frame (values and the next sequence number) joins the source's frames in
+commit order, one frame per write (never merged). No lock is held while a
+frame is sent: one drain request at a time sends the captured frames in
+sequence order. A Run source drains on the Run's own sender, so a value
+written before a node's next request reaches the Kernel before that request;
+once the Run's sender has closed (the source lives until Reset), and for the
+cell-level source between Runs, the source's own sender drains. A drain
+request is never withdrawn: a committed value is state, and a frame left out
+would be a sequence gap (source loss). A sent frame completes with its real
+reply. The Kernel evaluates its rules before it ACKs.
+
+A write returns once committed, with the receipt of its frame
+(``PublicationReceipt``), answered once the Kernel answered that frame: the
+writing node holds RUNNING and a command thread waits for it, so each returns
+only after the host's answer, as when the write sent its frame itself (OD-213
+part 3). A frame that is never sent (source not installed yet, superseded or
+retired) is answered when it is dropped; a refused one, and every write
+behind it, once the source is declared lost and its containment handed over.
 
 The baseline (message 1) carries every key of the union (null when unset);
-an update carries only the written key. While the Kernel
-answers the baseline `bb_source_not_ready` (the matching Apply is
-still installing; or the Kernel has not yet observed the Runner's newer
-Program cycle), the source does not exist yet: writes only commit, and the
-owner's next start sends a baseline built from the store at that moment.
-An explicit `superseded` reply (the frame's occurrence was retired by an
-authoritative replacement) is no fault. A source the Runner itself retired
+an update carries only the written key. Writes committed while the baseline
+is on its way follow it as updates. While the Kernel answers the baseline
+`bb_source_not_ready` (the matching Apply is still installing; or the Kernel
+has not yet observed the Runner's newer Program cycle), the source does not
+exist yet: the updates behind that baseline are dropped, writes only commit,
+and the owner's next start sends a baseline built from the store at that
+moment. An explicit `superseded` reply (the frame's occurrence was retired by
+an authoritative replacement) is no fault. A source the Runner itself retired
 (its own Reset, a new Run or a new Applied publication) never faults: a late
 reply for one of its frames is recorded only. Any other refusal or unknown
 reply is source loss and latches a publisher fault: publishing stops for
-good, the Run's Program Stop is requested first, then the fault is reported
-to the owner's ``on_fault``. Before any of that the sender makes the Kernel's
-source unavailable (an exact-sender sequence gap), so its rules can't watch
-and hold their scope. There are no
-retries and no resends.
+good (frames not sent yet are dropped), the sender makes the Kernel's source
+unavailable (an exact-sender sequence gap, sent next on the same drain) so
+its rules can't watch and hold their scope, then the Run's Program Stop is
+requested, then the fault is reported to the owner's ``on_fault``. There are
+no retries and no resends.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import logging
@@ -36,8 +54,10 @@ import unicodedata
 
 from manyforge_behavior.orchestration_values import (
     ProgramValueStore,
+    PublicationReceipt,
     PublishedKeyChange,
 )
+from manyforge_behavior.run_sender import RunSender
 
 
 SCHEMA_VERSION: Final = "manyforge.program_bbkey_publication.v2"
@@ -115,14 +135,34 @@ def publisher_fault_error(message: str) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _Frame:
+    """One captured frame: its kind, sequence number, rows by key, and the
+    receipt its writer holds."""
+
+    kind: str
+    sequence: int
+    values: Mapping[str, dict[str, Any]]
+    receipt: PublicationReceipt
+
+
+@dataclass(frozen=True, slots=True)
+class _Loss:
+    """Queued after a latched fault: the drain sends the loss declaration
+    next, then answers the receipts of the writes the fault ended."""
+
+    receipts: list[PublicationReceipt]
+
+
 class ProgramBlackboardKeyPublisher:
-    """Forward one source's key writes synchronously, in commit order."""
+    """Capture one source's key writes in commit order; send them off the lock."""
 
     def __init__(
         self,
         scope: ProgramBlackboardPublicationScope,
         *,
         publish: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+        sender: RunSender,
         submit: Callable[[Callable[[], None]], Any],
         stop_run: Callable[[int], None],
         on_fault: Callable[[Mapping[str, Any], str], None],
@@ -132,7 +172,11 @@ class ProgramBlackboardKeyPublisher:
     ) -> None:
         self._scope = scope
         self._publish = publish
-        # Containment (Program Stop, fault report) runs off the store lock.
+        # A Run's source drains on the Run's sender (its frames stay ordered
+        # with the Run's requests; not withdrawable, so it is still sent
+        # after the Run ends); the between-Runs source on its own sender.
+        self._sender = sender
+        # Containment (Program Stop, fault report) runs on the owner's work pool.
         self._submit = submit
         self._stop_run = stop_run
         self._on_fault = on_fault
@@ -140,17 +184,24 @@ class ProgramBlackboardKeyPublisher:
         self._on_baseline_accepted = on_baseline_accepted
         # The owner's monotonic creation order of its sources.
         self._source_ordinal = source_ordinal
-        self._baseline_accepted = False
         self._fault_reference = fault_reference
-        # Never held across I/O, a store call or a callback.
+        # Memory only: never held across I/O, a store call, a submit or a callback.
         self._lock = Lock()
         # Current published row of every key of the fixed union.
         self._current: dict[str, dict[str, Any]] = {}
+        # Captured, not sent yet, in sequence order (a _Loss after a fault).
+        self._frames: deque[_Frame | _Loss] = deque()
+        # One drain request is queued or running.
+        self._draining = False
         self._next_sequence = 1
         self._subscribed = False
+        # The baseline is captured and its reply not read yet.
+        self._baseline_in_flight = False
+        self._baseline_accepted = False
         self._retired = False
         self._source_epoch: str | None = None
         self._fault: dict[str, Any] | None = None
+        self._loss_declared = False
         # The Kernel confirmed this faulted source lost.
         self._loss_confirmed = False
 
@@ -168,6 +219,19 @@ class ProgramBlackboardKeyPublisher:
             return self._baseline_accepted
 
     @property
+    def baseline_in_flight(self) -> bool:
+        """The baseline is captured and its reply is not read yet."""
+        with self._lock:
+            return self._baseline_in_flight
+
+    @property
+    def settled(self) -> bool:
+        """Nothing more to start: the baseline was ACKed, or the source
+        faulted or retired."""
+        with self._lock:
+            return self._baseline_accepted or self._fault is not None or self._retired
+
+    @property
     def fault(self) -> dict[str, Any] | None:
         with self._lock:
             return None if self._fault is None else dict(self._fault)
@@ -178,12 +242,13 @@ class ProgramBlackboardKeyPublisher:
             return self._loss_confirmed
 
     def start(self, store: ProgramValueStore, keys: tuple[str, ...]) -> bool:
-        """Send the baseline from the store's current values.
+        """Capture the baseline from the store's current values and queue it.
 
         The first call subscribes the fixed union; a later call (the Kernel
-        had not installed the source yet) resends a baseline built from the
-        store at that moment. False while the Kernel answers
-        `bb_source_not_ready`: until then a write only commits.
+        had not installed the source yet) captures a baseline from the store
+        at that moment. True once nothing more is to be started (``settled``);
+        False while the baseline is on its way or the Kernel answered
+        `bb_source_not_ready` (until then a write only commits).
         """
 
         with self._lock:
@@ -191,62 +256,99 @@ class ProgramBlackboardKeyPublisher:
             self._subscribed = True
         if first:
             store.subscribe_published_keys(
-                keys, baseline=self._send_baseline, on_change=self._on_change
+                keys, baseline=self._capture_baseline, on_change=self._capture_change
             )
         else:
-            store.read_published_baseline(self._send_baseline)
-        with self._lock:
-            return self._baseline_accepted or self._fault is not None or self._retired
+            store.read_published_baseline(self._capture_baseline)
+        return self.settled
 
-    def _send_baseline(self, changes: tuple[PublishedKeyChange, ...]) -> None:
+    def _capture_baseline(self, changes: tuple[PublishedKeyChange, ...]) -> None:
         # Store lock held: no commit falls between this baseline and the
-        # forwards that follow it.
+        # updates captured after it.
         try:
             values = {change.key: _row(change) for change in changes}
         except _Unrepresentable as error:
-            self._forward_failed(str(error))
+            self._fail_queued(str(error))
             return
         with self._lock:
-            if self._fault is not None or self._retired or self._baseline_accepted:
+            if (
+                self._fault is not None
+                or self._retired
+                or self._baseline_accepted
+                or self._baseline_in_flight
+            ):
                 return
             self._current = values
-        if self._forward("baseline", 1, values, not_ready_allowed=True):
-            with self._lock:
-                self._baseline_accepted = True
-                self._next_sequence = 2
-            if self._on_baseline_accepted is not None:
-                self._submit_or_run(self._on_baseline_accepted)
+            self._baseline_in_flight = True
+            self._next_sequence = 2
+            self._frames.append(_Frame("baseline", 1, values, PublicationReceipt()))
+            drain = self._claim_drain_locked()
+        if drain:
+            self._request_drain()
 
-    def _on_change(self, change: PublishedKeyChange) -> None:
-        # Store lock held: one write, one frame, forwarded before the write
-        # returns. Before the source exists a write only commits.
+    def _capture_change(self, change: PublishedKeyChange) -> PublicationReceipt | None:
+        # Store lock held: one write, one frame, captured in commit order.
+        # Before the source's baseline is captured a write only commits
+        # (no receipt: nothing is sent).
         try:
             row = _row(change)
         except _Unrepresentable as error:
-            self._forward_failed(str(error))
-            return
+            return self._fail_queued(str(error))
+        failure: str | None = None
+        drain = False
+        receipt: PublicationReceipt | None = None
         with self._lock:
             if self._fault is not None or self._retired:
-                return
+                return None
             self._current[change.key] = row
-            if not self._baseline_accepted:
-                return
+            if not (self._baseline_accepted or self._baseline_in_flight):
+                return None
             if self._next_sequence > MAXIMUM_SEQUENCE:
-                failure: str | None = "BB publication sequence is exhausted"
+                failure = "BB publication sequence is exhausted"
             else:
-                failure = None
-                sequence = self._next_sequence
+                receipt = PublicationReceipt()
+                self._frames.append(
+                    _Frame("update", self._next_sequence, {change.key: row}, receipt)
+                )
                 self._next_sequence += 1
+                drain = self._claim_drain_locked()
         if failure is not None:
-            self._forward_failed(failure)
-            return
-        self._forward("update", sequence, {change.key: row})
+            return self._fail_queued(failure)
+        if drain:
+            self._request_drain()
+        return receipt
 
-    def _submit_or_run(self, work: Callable[[], None]) -> None:
-        try:
-            self._submit(work)
-        except Exception:
-            work()
+    def _claim_drain_locked(self) -> bool:
+        if self._draining:
+            return False  # The queued or running drain sends this frame too.
+        self._draining = True
+        return True
+
+    def _request_drain(self) -> None:
+        """Queue the one drain request; it is never withdrawn.
+
+        Called while the store lock may be held: a submit only queues (no
+        request is sent and nothing waits for one).
+        """
+
+        self._sender.submit(self._drain, withdrawable=False)
+
+    def _drain(self) -> None:
+        """Send the captured frames one at a time, in sequence order, with
+        no lock held during a send; ends when none is left. A frame captured
+        while this drain runs is sent by it too: a request submitted after
+        that capture is queued behind this drain, so it follows the frame."""
+
+        while True:
+            with self._lock:
+                if not self._frames:
+                    self._draining = False
+                    return
+                item = self._frames.popleft()
+            if isinstance(item, _Loss):
+                self._lose_and_contain(item)
+            elif self._send(item):
+                item.receipt.answer()
 
     def _request(self, kind: str, sequence: int, values: Mapping[str, Any]) -> dict[str, Any]:
         scope = self._scope
@@ -263,18 +365,15 @@ class ProgramBlackboardKeyPublisher:
             "values": [dict(values[name]) for name in sorted(values)],
         }
 
-    def _forward(
-        self,
-        kind: str,
-        sequence: int,
-        values: Mapping[str, Any],
-        *,
-        not_ready_allowed: bool = False,
-    ) -> bool:
-        """One exchange; True when the Kernel accepted it. Never resent."""
+    def _send(self, frame: _Frame) -> bool:
+        """One exchange, its reply recorded. Never resent. False when the
+        frame's receipt waits for the loss declaration its refusal queued."""
 
+        baseline = frame.kind == "baseline"
         try:
-            response = self._publish(self._request(kind, sequence, values))
+            response = self._publish(
+                self._request(frame.kind, frame.sequence, frame.values)
+            )
             status = response.get("status")
             source_epoch = response.get("source_epoch")
             if response.get("command") != COMMAND or status not in {
@@ -286,30 +385,42 @@ class ProgramBlackboardKeyPublisher:
             ):
                 raise ValueError("BB publication reply has no source epoch")
         except Exception as error:
-            with self._lock:
-                retired = self._retired
             code = getattr(error, "code", type(error).__name__)
             details = getattr(error, "details", None)
             reason = details.get("reason") if isinstance(details, Mapping) else None
+            dropped: list[PublicationReceipt] = []
+            with self._lock:
+                retired = self._retired
+                not_ready = (
+                    not retired and baseline and code == SOURCE_NOT_READY_CODE
+                )
+                if not_ready:
+                    # The Kernel has not installed the source yet (Apply or
+                    # Reset): the updates behind this baseline have no source;
+                    # writes only commit until the owner's next start.
+                    self._baseline_in_flight = False
+                    self._next_sequence = 1
+                    dropped = self._drop_frames_locked()
+            _answer(dropped)
             if retired:
                 # This sender already retired the source itself: a stale
                 # or superseded refusal is recorded, never a fault.
                 _LOGGER.info(
                     "BB publication %s for a retired source answered %s: run=%s",
-                    sequence, code, self._scope.program_run_id,
+                    frame.sequence, code, self._scope.program_run_id,
                 )
-                return False
-            if not_ready_allowed and code == SOURCE_NOT_READY_CODE:
-                # The Kernel has not installed the source yet (Apply or Reset).
+                return True
+            if not_ready:
                 _LOGGER.info(
                     "BB baseline: source not ready yet (reason=%s); writes only commit",
                     reason,
                 )
-                return False
+                return True
             # Refused or unanswered after the source exists: source loss.
-            self._forward_failed(
-                f"BB publication {sequence} was not acknowledged: "
-                f"code={code} reason={reason}: {error}"
+            self._fail_in_drain(
+                f"BB publication {frame.sequence} was not acknowledged: "
+                f"code={code} reason={reason}: {error}",
+                frame.receipt,
             )
             return False
         if status == "superseded":
@@ -317,42 +428,76 @@ class ProgramBlackboardKeyPublisher:
             # fault, and nothing more to send for it.
             with self._lock:
                 self._retired = True
+                self._baseline_in_flight = False
+                dropped = self._drop_frames_locked()
+            _answer(dropped)
             _LOGGER.info(
                 "BB publication %s superseded: run=%s cycle=%s",
-                sequence, self._scope.program_run_id, self._scope.cycle_generation,
+                frame.sequence, self._scope.program_run_id, self._scope.cycle_generation,
             )
-            return False
+            return True
         with self._lock:
             changed = self._source_epoch not in {None, source_epoch}
             if not changed:
                 self._source_epoch = source_epoch
+                if baseline:
+                    self._baseline_in_flight = False
+                    self._baseline_accepted = True
         if changed:
-            self._forward_failed("BB publication source epoch changed within the Run")
+            self._fail_in_drain(
+                "BB publication source epoch changed within the Run", frame.receipt
+            )
             return False
+        if baseline and self._on_baseline_accepted is not None:
+            self._submit_or_run(self._on_baseline_accepted)
         return True
 
-    def _forward_failed(self, message: str) -> None:
-        # Store lock held: latch and lose the Kernel's source before the
-        # write returns (no later write or admission sees the old value),
-        # contain off the lock (Program Stop may block).
-        error = self._latch(message)
-        if error is not None:
-            self._lose()
-            self._submit_or_run(lambda: self._contain(error))
+    def _submit_or_run(self, work: Callable[[], None]) -> None:
+        try:
+            self._submit(work)
+        except Exception:
+            work()
+
+    def _drop_frames_locked(self) -> list[PublicationReceipt]:
+        """Drop the frames not sent yet (a queued loss declaration stays);
+        their receipts are answered by the caller, off the lock."""
+
+        dropped = [item.receipt for item in self._frames if isinstance(item, _Frame)]
+        self._frames = deque(item for item in self._frames if isinstance(item, _Loss))
+        return dropped
+
+    def _fail_in_drain(self, message: str, receipt: PublicationReceipt) -> None:
+        # On the drain: frames not sent yet are dropped; the loss declaration
+        # is the next frame of this source. The refused frame's writer, and
+        # the writers of the dropped ones, are answered after it.
+        self._latch(message)
+        with self._lock:
+            receipts = [receipt, *self._drop_frames_locked()]
+            for item in self._frames:
+                assert isinstance(item, _Loss)
+                receipts.extend(item.receipts)
+            self._frames = deque([_Loss(receipts)])
+
+    def _fail_queued(self, message: str) -> PublicationReceipt | None:
+        # A writer or the owner found the fault (possibly under the store
+        # lock): the frames already captured are sent first, then the loss.
+        # The receipt is answered once the loss is declared (the writer that
+        # found the fault); None when the source had already ended.
+        if self._latch(message) is None:
+            return None
+        receipt = PublicationReceipt()
+        with self._lock:
+            self._frames.append(_Loss([receipt]))
+            drain = self._claim_drain_locked()
+        if drain:
+            self._request_drain()
+        return receipt
 
     def fail(self, message: str) -> None:
         """Latch once: stop publishing, lose the Kernel's source, request
-        Program Stop, report the fault."""
+        Program Stop, report the fault (on this source's drain)."""
 
-        error = self._latch(message)
-        if error is not None:
-            self._lose()
-            self._contain(error)
-
-    def _lose(self) -> None:
-        lost = self._declare_lost()
-        with self._lock:
-            self._loss_confirmed = lost
+        self._fail_queued(message)
 
     def _latch(self, message: str) -> dict[str, Any] | None:
         error = publisher_fault_error(message)
@@ -360,7 +505,22 @@ class ProgramBlackboardKeyPublisher:
             if self._fault is not None or self._retired:
                 return None
             self._fault = error
+            self._baseline_in_flight = False
         return error
+
+    def _lose_and_contain(self, loss: _Loss) -> None:
+        with self._lock:
+            error = self._fault
+            first = error is not None and not self._loss_declared
+            if first:
+                self._loss_declared = True
+        if first:
+            assert error is not None
+            lost = self._declare_lost()
+            with self._lock:
+                self._loss_confirmed = lost
+            self._submit_or_run(lambda: self._contain(error))
+        _answer(loss.receipts)
 
     def _contain(self, error: dict[str, Any]) -> None:
         reference = self._fault_reference(error)
@@ -410,12 +570,21 @@ class ProgramBlackboardKeyPublisher:
 
     def retire(self) -> None:
         """Reset, next Run start, new Applied publication or shutdown: the
-        Runner retires this source itself; the replacement baseline carries
-        the current values (run-only keys at their declared `initial` after
-        Reset)."""
+        Runner retires this source itself; frames not sent yet are dropped
+        (a pending loss declaration still goes); the replacement baseline
+        carries the current values (run-only keys at their declared
+        `initial` after Reset)."""
 
         with self._lock:
             self._retired = True
+            self._baseline_in_flight = False
+            dropped = self._drop_frames_locked()
+        _answer(dropped)
+
+
+def _answer(receipts: list[PublicationReceipt]) -> None:
+    for receipt in receipts:
+        receipt.answer()
 
 
 __all__ = [

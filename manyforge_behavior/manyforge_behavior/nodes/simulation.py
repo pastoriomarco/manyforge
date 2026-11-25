@@ -6,7 +6,7 @@ from typing import Final
 
 
 SIMULATION_NODE_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_simulation_node_unavailable"
+    "simulation_node_unavailable"
 )
 
 

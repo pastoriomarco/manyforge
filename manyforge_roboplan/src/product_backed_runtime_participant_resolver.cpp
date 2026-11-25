@@ -837,11 +837,14 @@ ProductBackedRuntimeParticipantResolver::LoadProgram(
 core::Result<core::ProgramFrameReferenceDTO>
 ProductBackedRuntimeParticipantResolver::ResolveAttachActiveTcp(
     const core::ProgramBindingId &binding_id, const core::ProgramTargetReferenceDTO &holder_ref,
-    const std::function<std::optional<ActiveTcp>(const core::ControllableComponentId &)> &read) const {
+    const std::function<std::optional<ActiveTcp>(const core::ControllableComponentId &)> &read,
+    const core::ProgramRunResolutionContext &held_run) const {
   using Reply = core::Result<core::ProgramFrameReferenceDTO>;
-  std::shared_ptr<const deployment::ProgramBinding> binding;
+  // OD-234: the held run's Binding is the copy verified at its capture.
+  auto binding = HeldRunSourcesFor(held_run, binding_id, *retained_bundle_).binding;
   try {
-    binding = LoadProgramBinding(binding_id);
+    if (!binding)
+      binding = LoadProgramBinding(binding_id);
   } catch (const deployment::ProgramBindingError &) {
     return Reply::Err({"attach_holder_unavailable", "Applied holder binding is unavailable", {}});
   }
@@ -982,7 +985,8 @@ ProductBackedRuntimeParticipantResolver::ResolveObservationTarget(
     const core::CapabilityId &capability_id,
     const core::RuntimeParticipantBinding &physical,
     const std::span<const core::RuntimeParticipantBinding>
-        current_representatives) const {
+        current_representatives,
+    const core::ProgramRunResolutionContext &held_run) const {
   using Target = ResolvedTargetObservation;
   try {
     if (capability_id.value() != "model.kinematics.fk" &&
@@ -1000,11 +1004,17 @@ ProductBackedRuntimeParticipantResolver::ResolveObservationTarget(
                          ? selection->binding
                          : nullptr;
       if (!binding) {
-        binding = LoadProgramBinding(program_binding_id);
+        // OD-234: a read of the held run's Binding uses the copy verified
+        // at its capture; any other reads and verifies its sources.
+        auto held = HeldRunSourcesFor(held_run, program_binding_id, *retained_bundle_);
+        binding = held.binding ? std::move(held.binding)
+                               : LoadProgramBinding(program_binding_id);
         if (!binding) {
           throw std::invalid_argument("no exact retained Program Binding");
         }
-        const auto program = LoadProgram(binding->value().program_revision);
+        const auto program =
+            held.program ? std::move(held.program)
+                         : LoadProgram(binding->value().program_revision);
         if (!program || program->value().node_environment !=
                             binding->value().node_environment) {
           throw std::invalid_argument("no exact canonical Program");

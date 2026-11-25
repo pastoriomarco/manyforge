@@ -267,3 +267,167 @@ def test_required_position_close_needs_stall_window_evidence(confirmed, status):
     assert events[-1] == ("status", "gripper.check_status")
     if status is py_trees.common.Status.FAILURE:
         assert node.failure_reason_code == "grasp_not_confirmed"
+
+
+# --- With the run's sender (OD-380 D2): every owner call leaves the tick ------
+
+
+def _sent_node(*, required, check=None, dwell=0.0):
+    from manyforge_behavior.orchestration_ports import OwnerNodeInputs
+
+    from .test_owner_calls_leave_the_tick import _Sender, _TickGuard, _guarded
+
+    node, events, levels, now = _node(required=required, dwell=dwell)
+    if check is not None:
+        node = _confirming(node, events, check)
+    guard, sender = _TickGuard(), _Sender()
+    route = node._port.route
+    adapter = GripperCommandAdapter(
+        name="close", node_id="gripper.command_position", node_instance_id="close",
+        attempt_source=node._attempt_source,
+        parameters={"dwell_while_held": "pause"}, value_sources={},
+        input_resolver=node._input_resolver,
+        port=_guarded(node._port, guard), program_clock=ProgramClock(lambda: now[0]),
+        io_watches=_guarded(node._io_watches, guard),
+        io_signals=_guarded(node._io_signals, guard),
+        run_sender=sender.sender, valve_sender=sender.sender,
+    )
+    assert route["logical"] == OwnerNodeInputs({"position": {"kind": "linear_m", "value_m": 0.0}})
+    return adapter, events, levels, guard, sender, now
+
+
+def _sent_ticks_until(node, sender, predicate, limit=40):
+    for _ in range(limit):
+        node.tick_once()
+        sender.drain()  # The answers arrive between ticks.
+        if predicate():
+            return
+    pytest.fail(f"gripper did not reach the expected stage: {node.status} {node.feedback_message!r}")
+
+
+def test_with_the_run_sender_the_input_watches_and_reads_leave_the_tick():
+    node, events, _levels, guard, sender, _now = _sent_node(required=("closed", "part"))
+    _sent_ticks_until(node, sender, lambda: node.status is not py_trees.common.Status.RUNNING)
+    assert node.status is py_trees.common.Status.SUCCESS
+    # The same owner calls in the same order as inside the tick, none on it.
+    assert [event[:2] for event in events] == [
+        ("output", "valve-a"), ("output", "valve-b"),
+        ("watch", "closed"), ("watch-release", "closed"),
+        ("watch", "part"), ("watch-release", "part"),
+        ("read", "closed"), ("read", "part"), ("logical", {"position": {"kind": "linear_m", "value_m": 0.0}}),
+        ("ack", "gripper"),
+    ]
+    assert {"pneumatic_plan", "start", "acknowledge", "invoke"} <= set(guard.calls)
+    assert guard.on_tick == []
+
+
+def test_with_the_run_sender_a_watch_that_waits_is_read_off_the_tick_until_it_matches():
+    node, events, levels, guard, sender, _now = _sent_node(required=("part",))
+    levels["part"] = False
+    _sent_ticks_until(node, sender, lambda: guard.calls.count("observe") >= 2)
+    assert node.status is py_trees.common.Status.RUNNING
+    levels["part"] = True
+    _sent_ticks_until(node, sender, lambda: node.status is not py_trees.common.Status.RUNNING)
+    assert node.status is py_trees.common.Status.SUCCESS
+    assert events.count(("watch", "part")) == 1 and guard.on_tick == []
+
+
+def test_with_the_run_sender_a_queued_input_read_at_the_deadline_is_withdrawn():
+    node, events, levels, guard, sender, now = _sent_node(required=("part",), dwell=0.5)
+    levels["part"] = False
+    _sent_ticks_until(node, sender, lambda: ("watch", "part") in events)
+    node.tick_once()  # Takes the registration: the input does not match yet.
+    node.tick_once()  # Queues the watch's next read.
+    queued = node._settle_request[2]
+    assert not queued.sent
+    now[0] = 1.0  # The deadline passed.
+    node.tick_once()
+    assert queued.withdrawn
+    # Its watch is released first, off the tick, as base released it right
+    # before the node failed.
+    assert node.status is py_trees.common.Status.RUNNING
+    assert ("watch-release", "part") not in events
+    sender.drain()
+    node.tick_once()
+    assert node.status is py_trees.common.Status.FAILURE
+    assert node.failure_reason_code == "io_wait_timeout"
+    assert events.count(("watch-release", "part")) == 1 and guard.on_tick == []
+
+
+@pytest.mark.parametrize("grasped", [True, False])
+def test_with_the_run_sender_the_grasp_check_leaves_the_tick(grasped):
+    node, events, levels, guard, sender, _now = _sent_node(required=(), check=_PART_CHECK)
+    levels["part"] = grasped
+    _sent_ticks_until(node, sender, lambda: ("ack", "gripper") in events)
+    node.tick_once()  # The completed Close sends its grasp read.
+    assert node.status is py_trees.common.Status.RUNNING
+    assert ("read", "part") not in events
+    sender.drain()
+    node.tick_once()
+    assert events[-1] == ("read", "part") and events.count(("read", "part")) == 1
+    assert node.status is (
+        py_trees.common.Status.SUCCESS if grasped else py_trees.common.Status.FAILURE
+    )
+    if not grasped:
+        assert node.failure_reason_code == "grasp_not_confirmed"
+    assert guard.on_tick == []
+
+
+class _RefusedRelease:
+    """The input watch port, whose every release is refused."""
+
+    def __init__(self, inner, tries):
+        self._inner = inner
+        self._tries = tries
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def acknowledge(self, task_id, identity):
+        self._tries.append(("release", identity.node_attempt_id))
+        raise RuntimeError("release refused")
+
+    cancel = acknowledge
+
+
+@pytest.mark.parametrize("sent", [False, True])
+def test_a_refused_watch_release_is_tried_at_bases_points(sent):
+    """Base tried the release when the watch ended, again before the node
+    failed, and once more at the node's end: three tries, the same failure,
+    with or without the run's sender."""
+
+    tries = []
+    if sent:
+        node, events, _levels, _guard, sender, _now = _sent_node(required=("part",))
+        node._io_watches = _RefusedRelease(node._io_watches, tries)
+        _sent_ticks_until(node, sender, lambda: node.status is not py_trees.common.Status.RUNNING)
+    else:
+        node, events, _levels, _now = _node(required=("part",))
+        node._io_watches = _RefusedRelease(node._io_watches, tries)
+        _tick_until(node, lambda: node.status is not py_trees.common.Status.RUNNING)
+    assert node.status is py_trees.common.Status.FAILURE
+    assert node.failure_reason_code == "owner_request_failed"
+    assert "release was not confirmed" in node.failure_message
+    assert tries == [("release", 1)] * 3
+    assert not any(event[0] == "logical" for event in events)
+
+
+@pytest.mark.parametrize("grasped", [True, False])
+def test_a_stop_while_the_grasp_read_is_sent_ends_with_its_result(grasped):
+    node, events, levels, guard, sender, _now = _sent_node(required=(), check=_PART_CHECK)
+    levels["part"] = grasped
+    _sent_ticks_until(node, sender, lambda: ("ack", "gripper") in events)
+    node.tick_once()  # The completed Close's grasp read is on the sender.
+    assert node.status is py_trees.common.Status.RUNNING
+    node.stop(py_trees.common.Status.INVALID)  # The Program Stop.
+    sender.sender.close()
+    assert node.outcome is None and node.settle_abandoned_request() is False
+    sender.drain()
+    assert node.settle_abandoned_request() is True
+    # As base, whose tick read it right after the acknowledgement.
+    assert events.count(("read", "part")) == 1
+    if grasped:
+        assert node.status is py_trees.common.Status.SUCCESS and node.outcome == "success"
+    else:
+        assert node.status is py_trees.common.Status.FAILURE
+        assert node.failure_reason_code == "grasp_not_confirmed"

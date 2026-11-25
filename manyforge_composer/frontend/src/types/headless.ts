@@ -334,10 +334,9 @@ export interface HistorianCapturePage {
 }
 
 export interface HistorianRetention {
-  schemaVersion: 'manyforge.historian_retention.v3';
+  schemaVersion: 'manyforge.historian_retention.v4';
   captures: HistorianCaptureRetention;
   partitionRowLimit: string;
-  partitionRecordByteLimit: string;
   databasePageByteLimit: string;
   durationGuaranteed: false;
   priorPruningKnown: boolean;
@@ -348,11 +347,13 @@ export interface HistorianRetention {
     format: string | null;
   }>;
   partitions: Array<{
-    partition: 'routine' | 'important';
+    partition: 'routine' | 'important' | 'node_attempts';
     retainedCount: string;
     retainedBytes: string;
     prunedCount: string;
     prunedBytes: string;
+    /** This partition's record byte budget. */
+    recordByteLimit: string;
     lastPrunedSequence: string | null;
     unknownTimeCount: string;
     regressedTimeCount: string;

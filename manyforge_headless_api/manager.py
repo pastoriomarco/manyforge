@@ -1,14 +1,15 @@
-"""Bounded same-user client for the Manager daemon's private protocol."""
+"""Headless's Manager commands: a thin adapter over the gateway core.
+
+The core (``manyforge_headless_py.Gateway``) owns the Manager command socket,
+the envelope and the scene commit's cross-field rules; each method here is its
+request members, one core call and the reply interpretation that decides an
+outcome or reshapes the reply. The Manager's encoder is the authority on the
+reply's shape.
+"""
 
 from __future__ import annotations
 
-import math
-from pathlib import Path
-import socket
 from typing import Any, Protocol
-import unicodedata
-
-import rfc8785
 
 from .models import (
     ManagerApplyRequest,
@@ -17,50 +18,19 @@ from .models import (
     ManagerDeploymentCandidatePreviewRequest,
     ProjectionRevisionRequest,
     SceneResourcePoseQuery,
-    SceneRuntimeLatchRequest,
     SceneTransactionRequest,
 )
-from .native import (
-    DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
-    HeadlessApiError,
-    MAX_MANAGER_COMMAND_TIMEOUT_SECONDS,
-    strict_json_object,
-)
+from .native import HeadlessApiError
 from manyforge_behavior.reference_validation import validate_reference_refusal
-from .private_transport import (
-    PinnedRunRoot,
-    PrivateTransportCapabilityError,
-)
 
 
-MANAGER_SOCKET_FILE = "manager-command.sock"
-MANAGER_COMMAND_VERSION = "manyforge.manager_command.v2"
-MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v3"
-MAX_MANAGER_PACKET_BYTES = 128 * 1024 + 4 * 1024
-MAX_MANAGER_RESPONSE_BYTES = 64 * 1024
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
-_SCENE_REPLAY_STATUSES = {
-    "accepted_new",
-    "replayed_exact",
-    "request_result_expired",
-    "request_id_conflict",
-    "request_ledger_full",
-}
-_SCENE_PROJECTION_STATUSES = {
-    "not_attempted",
-    "committed",
-    "rejected_rollback_proven",
-    "failed_projection_uncertain",
-}
-_SCENE_UPDATE_STATUSES = {"geometry_changed", "freshness_only", "no_op"}
 
 
 class ManagerPort(Protocol):
     def scene_runtime_owner(self) -> dict[str, Any]: ...
 
-    def latch_scene_runtime_between_nodes(
-        self, request: SceneRuntimeLatchRequest
-    ) -> dict[str, Any]: ...
+    def scene_projection_revision(self) -> dict[str, Any]: ...
 
     def preview_deployment_candidate(
         self, request: ManagerDeploymentCandidatePreviewRequest
@@ -86,8 +56,6 @@ class ManagerPort(Protocol):
         trusted_principal_id: str | None,
         mesh_content_digest: str | None,
     ) -> dict[str, Any]: ...
-
-    def scene_transaction_status(self, request: SceneTransactionRequest) -> dict[str, Any]: ...
 
     def resolve_scene_resources(
         self,
@@ -161,199 +129,112 @@ def _manager_error(error: object) -> HeadlessApiError | None:
     )
 
 
-def _canonical_json(value: dict[str, Any]) -> bytes:
-    try:
-        return rfc8785.dumps(value)
-    except (rfc8785.CanonicalizationError, UnicodeError, ValueError) as exc:
-        raise HeadlessApiError(
-            "manager_command_invalid",
-            f"Manager command is not canonically encodable: {exc}",
-        ) from exc
+def _invalid(message: str) -> HeadlessApiError:
+    return HeadlessApiError("manager_command_response_invalid", message)
+
+
+def _raise_refusal(response: dict[str, Any], label: str) -> None:
+    """Raise a refused reply as its typed Manager error."""
+
+    typed = _manager_error(response.get("error"))
+    if typed is None:
+        raise _invalid(f"{label} refusal is invalid")
+    raise typed
+
+
+def _check_scene_result(response: object) -> None:
+    """The outcome a scene commit result's consumers decide on.
+
+    A success is a new commit or an exact replay and names its committed
+    projection revision (the publication wait and the History record read
+    it); a failure carries a typed error and no committed projection (its
+    projection status tells refused from unknown).
+    """
+
+    if not isinstance(response, dict) or type(response.get("ok")) is not bool:
+        raise _invalid("scene commit result has no boolean outcome")
+    if response["ok"]:
+        if (
+            response.get("error") is not None
+            or response.get("projection_status") != "committed"
+            or response.get("replay_status") not in {"accepted_new", "replayed_exact"}
+        ):
+            raise _invalid("successful scene commit response is internally inconsistent")
+        try:
+            ProjectionRevisionRequest.model_validate(
+                response.get("committed_projection_revision")
+            )
+        except ValueError as exc:
+            raise _invalid(
+                "scene commit response has an invalid projection revision"
+            ) from exc
+    elif (
+        _manager_error(response.get("error")) is None
+        or response.get("projection_status") == "committed"
+        or response.get("committed_projection_revision") is not None
+    ):
+        raise _invalid("failed scene commit response is internally inconsistent")
 
 
 class ManagerCommandClient:
-    """Forward one packet at a time; never cache or reduce Manager truth."""
+    """Forward one command at a time; never cache or reduce Manager truth.
 
-    def __init__(
-        self,
-        run_root: Path,
-        *,
-        timeout_seconds: float = DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
-    ) -> None:
-        if (
-            timeout_seconds <= 0
-            or timeout_seconds > MAX_MANAGER_COMMAND_TIMEOUT_SECONDS
-        ):
-            raise ValueError("Manager timeout must be in (0, 60] seconds")
-        try:
-            self._run_root = PinnedRunRoot(run_root)
-        except PrivateTransportCapabilityError as error:
-            raise HeadlessApiError(
-                "manager_command_unavailable",
-                f"Manager run capability is invalid: {error}",
-            ) from error
-        self._timeout_seconds = timeout_seconds
+    ``gateway`` is Headless's ``manyforge_headless_py.Gateway`` (HTTP
+    attribution); its typed failures become ``HeadlessApiError`` with the
+    same code, message, details and producer.
+    """
 
-    def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
-        encoded = _canonical_json(command)
-        if len(encoded) > MAX_MANAGER_PACKET_BYTES:
-            raise HeadlessApiError(
-                "manager_command_oversized",
-                "Manager command exceeds its byte bound",
-            )
+    def __init__(self, gateway: Any) -> None:
+        import manyforge_headless_py as core  # type: ignore[import-not-found]
+
+        self._gateway = gateway
+        self._gateway_error: type[Exception] = core.GatewayError
+
+    def _call(self, command: str, members: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
-            with self._run_root.socket_address(
-                MANAGER_SOCKET_FILE
-            ) as socket_address:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-                    # OD-298 (a): only the connection is limited, as for the
-                    # execution host (cell_admission.py). A connected command
-                    # waits for its answer, ended by the reply or by the
-                    # Manager closing the connection (its exit or stop); a
-                    # command held by a slow execution host shows as the
-                    # Manager's outstanding exchange, not as a time-out.
-                    client.settimeout(self._timeout_seconds)
-                    client.connect(socket_address)
-                    client.settimeout(None)
-                    sent = client.send(encoded)
-                    if sent != len(encoded):
-                        raise HeadlessApiError(
-                            "manager_command_transport_failure",
-                            "Manager command packet was truncated",
-                        )
-                    payload, _ancillary, flags, _address = client.recvmsg(
-                        MAX_MANAGER_RESPONSE_BYTES
-                    )
-        except HeadlessApiError:
-            raise
-        except PrivateTransportCapabilityError as exc:
-            raise HeadlessApiError(
-                "manager_command_unavailable",
-                f"Manager command socket is unavailable: {exc}",
-            ) from exc
-        except (OSError, TimeoutError) as exc:
-            raise HeadlessApiError(
-                "manager_command_unavailable",
-                f"Manager command transport failed: {exc}",
-            ) from exc
-        if not payload:
-            # The Manager closed the connection before answering (it exited
-            # or is stopping); the command's outcome is unknown.
-            raise HeadlessApiError(
-                "manager_command_unavailable",
-                "Manager closed the connection before answering",
-            )
-        if flags & socket.MSG_TRUNC:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager command response is oversized",
-            )
-        try:
-            text = payload.decode("utf-8", errors="strict")
-        except UnicodeDecodeError as exc:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager command response is not UTF-8",
-            ) from exc
-        response = strict_json_object(text, label="Manager command response")
-        if _canonical_json(response) != payload:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager command response is not canonical JSON",
-            )
-        if response.get("api_version") != MANAGER_RESPONSE_VERSION:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager command response version is unsupported",
-            )
-        if type(response.get("ok")) is not bool:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager command response has no boolean result",
-            )
-        return response
+            return getattr(self._gateway, command)(members or {})
+        except self._gateway_error as error:
+            raise self._error(error) from error
+
+    @staticmethod
+    def _error(error: Any) -> HeadlessApiError:
+        return HeadlessApiError(
+            error.code, error.message, details=error.details, producer=error.producer
+        )
 
     def scene_runtime_owner(self) -> dict[str, Any]:
         """Read the existing Scene owner identity when a viewer source starts."""
-        response = self._exchange({"api_version": MANAGER_COMMAND_VERSION,
-                                   "command": "scene_runtime_owner_read"})
-        if response.get("ok") is False:
-            typed = _manager_error(response.get("error"))
-            if typed is not None:
-                raise typed
-            raise HeadlessApiError("manager_command_response_invalid", "Scene runtime owner refusal is invalid")
-        if (response.get("ok") is not True or set(response) != {
-                "api_version", "ok", "cell_id", "initialization_generation",
-                "initialization_state", "runtime_identity"}
-                or not isinstance(response.get("cell_id"), str)
-                or not isinstance(response.get("runtime_identity"), dict)):
-            raise HeadlessApiError("manager_command_response_invalid", "Scene runtime owner response is invalid")
+        response = self._call("scene_runtime_owner_read")
+        if response["ok"] is False:
+            _raise_refusal(response, "Scene runtime owner")
         return response
 
-    def latch_scene_runtime_between_nodes(
-        self, request: SceneRuntimeLatchRequest
-    ) -> dict[str, Any]:
-        """Forward one between-nodes latch; the Runner checks the full answer.
-
-        Only the fields Headless itself reads (the committed count and the
-        projection revision it waits for) are checked here.
-        """
-
-        command: dict[str, Any] = {
-            "api_version": MANAGER_COMMAND_VERSION,
-            "command": "scene_runtime_latch_between_nodes",
-            "expected_runtime_identity": request.expected_runtime_identity.model_dump(),
-        }
-        if request.scene_resource_ids is not None:
-            command["scene_resource_ids"] = list(request.scene_resource_ids)
-        response = self._exchange(command)
-        if response.get("ok") is False:
-            typed = _manager_error(response.get("error"))
-            if typed is not None:
-                raise typed
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "between-nodes latch refusal is invalid",
-            )
-        count = response.get("committed_observation_count")
-        try:
-            ProjectionRevisionRequest.model_validate(response.get("projection_revision"))
-        except ValueError as exc:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "between-nodes latch projection revision is invalid",
-            ) from exc
-        if type(count) is not int or not 0 <= count <= _MAXIMUM_SAFE_INTEGER:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "between-nodes latch committed observation count is invalid",
-            )
-        return response
+    def scene_projection_revision(self) -> dict[str, Any]:
+        """The Scene owner's current projection revision (``scene_owner_read``)."""
+        response = self._call("scene_owner_read")
+        if response["ok"] is False:
+            _raise_refusal(response, "Scene owner read")
+        return response["projection_revision"]
 
     def preview_deployment_candidate(
         self, request: ManagerDeploymentCandidatePreviewRequest
     ) -> dict[str, Any]:
-        response = self._exchange(
+        return self._call(
+            "deployment_candidate_preview",
             {
-                "api_version": MANAGER_COMMAND_VERSION,
-                "command": "deployment_candidate_preview",
                 "deployment_revision": request.deployment_revision,
                 "candidate_retained_bundle_id": request.candidate_retained_bundle_id,
                 "candidate_graph_revision": request.candidate_graph_revision,
                 "prepared_activation_id": request.prepared_activation_id,
-                "expected_admission_generation": (
-                    request.expected_admission_generation
-                ),
+                "expected_admission_generation": request.expected_admission_generation,
                 "expected_current": request.expected_current.model_dump(),
-            }
+            },
         )
-        return response
 
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
-        response = self._exchange(
+        response = self._call(
+            "apply",
             {
-                "api_version": MANAGER_COMMAND_VERSION,
-                "command": "apply",
                 "accepted_impact_digest": request.accepted_impact_digest,
                 "candidate_receipt": request.candidate_receipt.model_dump(),
                 "deployment_revision": request.deployment_revision,
@@ -376,16 +257,12 @@ class ManagerCommandClient:
                         "claim": request.parent_authoring_claim,
                     }
                 ),
-            }
+            },
         )
         error = response.get("error")
-        if response.get("ok") is False and isinstance(error, dict) and "reference_validation" in error:
-            typed = _manager_error(error)
-            if typed is None:
-                raise HeadlessApiError(
-                    "manager_command_response_invalid", "Manager Apply rejection is malformed"
-                )
-            raise typed
+        if response["ok"] is False and isinstance(error, dict) and "reference_validation" in error:
+            # The reference diagnostics become the typed refusal's details.
+            _raise_refusal(response, "Manager Apply")
         return response
 
     def _apply_status_command(
@@ -407,44 +284,24 @@ class ManagerCommandClient:
                 "manager_apply_status_invalid",
                 f"{label} requires one bounded durable identity",
             )
-        command: dict[str, Any] = {
-            "api_version": MANAGER_COMMAND_VERSION,
+        members: dict[str, Any] = {
             "apply_generation": apply_generation,
             "apply_id": apply_id,
-            "command": command_name,
         }
         if request_context is not None:
-            command["request_context"] = request_context.model_dump(
+            members["request_context"] = request_context.model_dump(
                 mode="json", exclude_none=True
             )
-        response = self._exchange(command)
-        if response.get("ok") is False:
-            if (
-                set(response) != {"api_version", "error", "ok"}
-                or _manager_error(response.get("error")) is None
-            ):
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    f"{label} rejection is malformed",
-                )
+        response = self._call(command_name, members)
+        if response["ok"] is False:
             return response
-        members = set(ManagerApplyStatus.model_fields)
-        if set(response) != (members | {"api_version", "error", "ok"}) or (
-            response.get("error") is not None
-        ):
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                f"{label} response is malformed",
-            )
+        # The Apply lifecycle the routes return and the Apply follower reads.
         try:
             ManagerApplyStatus.model_validate(
-                {name: response[name] for name in members}
+                {name: response[name] for name in ManagerApplyStatus.model_fields}
             )
-        except (TypeError, ValueError) as error:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                f"{label} response is malformed",
-            ) from error
+        except (KeyError, TypeError, ValueError) as error:
+            raise _invalid(f"{label} response is malformed") from error
         return response
 
     def observe_apply(
@@ -476,127 +333,14 @@ class ManagerCommandClient:
         ``released`` names that Apply, or is ``None`` when none holds it.
         """
 
-        response = self._exchange(
+        return self._call(
+            "apply_release_for_new",
             {
-                "api_version": MANAGER_COMMAND_VERSION,
-                "command": "apply_release_for_new",
                 "request_context": request_context.model_dump(
                     mode="json", exclude_none=True
                 ),
-            }
+            },
         )
-        if response.get("ok") is False:
-            if (
-                set(response) != {"api_version", "error", "ok"}
-                or _manager_error(response.get("error")) is None
-            ):
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    "Manager Apply release for New rejection is malformed",
-                )
-            return response
-        released = response.get("released")
-        if (
-            set(response) != {"api_version", "error", "ok", "released"}
-            or response.get("error") is not None
-            or released is not None
-            and (
-                not isinstance(released, dict)
-                or set(released) != {"apply_id", "apply_generation"}
-                or type(released["apply_id"]) is not int
-                or type(released["apply_generation"]) is not int
-            )
-        ):
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "Manager Apply release for New response is malformed",
-            )
-        return response
-
-    @staticmethod
-    def _validate_scene_response(response: dict[str, Any]) -> None:
-        expected_fields = {
-            "api_version",
-            "committed_projection_revision",
-            "error",
-            "ok",
-            "projection_status",
-            "replay_status",
-            "request_key",
-            "transaction_sequence",
-            "update_status",
-        }
-        if (not isinstance(response, dict) or set(response) != expected_fields
-            or response.get("api_version") != MANAGER_RESPONSE_VERSION
-            or type(response.get("ok")) is not bool):
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "scene commit response has an unknown or missing field",
-            )
-        if response.get("replay_status") not in _SCENE_REPLAY_STATUSES:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "scene commit response has an invalid replay status",
-            )
-        projection_status = response.get("projection_status")
-        if projection_status not in _SCENE_PROJECTION_STATUSES:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "scene commit response has an invalid projection status",
-            )
-        error = response.get("error")
-        if error is not None:
-            if _manager_error(error) is None or "details" not in error:
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    "scene commit response has an invalid error",
-                )
-        sequence = response.get("transaction_sequence")
-        if sequence is not None and (
-            type(sequence) is not int
-            or sequence < 1
-            or sequence > _MAXIMUM_SAFE_INTEGER
-        ):
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "scene commit response has an invalid transaction sequence",
-            )
-        projection = response.get("committed_projection_revision")
-        if projection is not None:
-            try:
-                ProjectionRevisionRequest.model_validate(projection)
-            except ValueError as exc:
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    "scene commit response has an invalid projection revision",
-                ) from exc
-        update_status = response.get("update_status")
-        success = response["ok"]
-        if success:
-            if (
-                error is not None
-                or sequence is None
-                or projection is None
-                or projection_status != "committed"
-                or update_status not in _SCENE_UPDATE_STATUSES
-                or response["replay_status"]
-                not in {"accepted_new", "replayed_exact"}
-            ):
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    "successful scene commit response is internally inconsistent",
-                )
-        elif (
-            error is None
-            or sequence is not None
-            or projection is not None
-            or projection_status == "committed"
-            or update_status is not None
-        ):
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "failed scene commit response is internally inconsistent",
-            )
 
     def commit_scene_transaction(
         self,
@@ -605,172 +349,38 @@ class ManagerCommandClient:
         trusted_principal_id: str | None,
         mesh_content_digest: str | None,
     ) -> dict[str, Any]:
-        if trusted_principal_id is not None and (
-            not trusted_principal_id
-            or unicodedata.normalize("NFC", trusted_principal_id)
-            != trusted_principal_id
-            or len(trusted_principal_id.encode("utf-8")) > 256
-        ):
-            raise HeadlessApiError(
-                "scene_request_attribution_invalid",
-                "trusted scene principal must be bounded non-empty NFC text",
-            )
-        attribution = {
-            "assurance": (
-                "externally_authenticated"
-                if trusted_principal_id is not None
-                else "unverified"
-            ),
-            "principal_id": trusted_principal_id,
-            "transport": "http",
-        }
-        transaction = _transaction_body(request, mesh_content_digest)
-        transaction["attribution"] = attribution
-        response = self._exchange(
-            {
-                "api_version": MANAGER_COMMAND_VERSION,
-                "command": "scene_commit",
-                "transaction": transaction,
-            }
-        )
-        self._validate_scene_response(response)
-        return response
+        """The core's scene commit: its cross-field rules, the caller's
+        attribution and the exchange; the result's outcome is checked."""
 
-    def scene_transaction_status(self, request: SceneTransactionRequest) -> dict[str, Any]:
-        transaction = _transaction_body(request, None)
-        # Attribution is not mutation intent. Lookup performs no Scene write.
-        transaction["attribution"] = {
-            "assurance": "unverified", "principal_id": None, "transport": "http"}
-        response = self._exchange({"api_version": MANAGER_COMMAND_VERSION,
-                                   "command": "scene_transaction_status", "transaction": transaction})
-        if (set(response) != {"api_version", "ok", "result"}
-            or response.get("api_version") != MANAGER_RESPONSE_VERSION
-            or response.get("ok") is not True):
-            raise HeadlessApiError("manager_command_response_invalid", "Scene result lookup is malformed")
-        if response["result"] is not None:
-            self._validate_scene_response(response["result"])
+        try:
+            response = self._gateway.scene_commit(
+                _transaction_body(request, mesh_content_digest), trusted_principal_id
+            )
+        except self._gateway_error as error:
+            raise self._error(error) from error
+        _check_scene_result(response)
         return response
 
     def resolve_scene_resources(
         self,
         request: SceneResourcePoseQuery,
     ) -> dict[str, Any]:
-        response = self._exchange(
+        response = self._call(
+            "scene_pose_query",
             {
-                "api_version": MANAGER_COMMAND_VERSION,
-                "command": "scene_pose_query",
                 "expected_projection_revision": (
                     request.expected_projection_revision.model_dump()
                 ),
                 "scene_resource_ids": request.scene_resource_ids,
-            }
+            },
         )
-        if response.get("ok") is not True:
-            error = response.get("error")
-            code = error.get("code") if isinstance(error, dict) else None
-            message = error.get("message") if isinstance(error, dict) else None
-            details = error.get("details") if isinstance(error, dict) else None
-            if details is not None and (
-                not isinstance(details, dict)
-                or not all(
-                    isinstance(key, str) and isinstance(value, str)
-                    for key, value in details.items()
-                )
-            ):
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    "Manager scene pose error details are invalid",
-                )
-            raise HeadlessApiError(
-                code if isinstance(code, str) and code else "scene_pose_unavailable",
-                message
-                if isinstance(message, str) and message
-                else "Manager scene pose query was rejected",
-                details=details if isinstance(details, dict) else None,
-                producer=(
-                    error["producer"]
-                    if isinstance(error, dict)
-                    and isinstance(error.get("producer"), str)
-                    and error["producer"]
-                    else _MANAGER_PRODUCER
-                ),
-            )
-        if set(response) != {
-            "api_version",
-            "ok",
-            "poses",
-            "projection_revision",
-        }:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "scene pose response has an unknown or missing field",
-            )
-        try:
-            projection = ProjectionRevisionRequest.model_validate(
-                response["projection_revision"]
-            )
-        except (KeyError, ValueError) as exc:
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "scene pose response has an invalid projection revision",
-            ) from exc
+        if response["ok"] is not True:
+            _raise_refusal(response, "Manager scene pose query")
         # The owner resolves against its current projection: a newer
         # revision of the same Scene is the latest truth; it refuses a
         # lineage change itself.
-        poses = response.get("poses")
-        if not isinstance(poses, list) or len(poses) != len(
-            request.scene_resource_ids
-        ):
-            raise HeadlessApiError(
-                "manager_command_response_invalid",
-                "scene pose response is incomplete",
-            )
-        parsed: list[dict[str, Any]] = []
-        for index, row in enumerate(poses):
-            if (
-                not isinstance(row, dict)
-                or set(row) != {"pose_in_cell", "scene_resource_id"}
-            ):
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    f"scene pose response row {index} has an invalid shape",
-                )
-            pose = row.get("pose_in_cell")
-            if not isinstance(pose, dict) or set(pose) != {
-                "orientation_xyzw",
-                "position_m",
-            }:
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    f"scene pose response row {index} has an invalid pose",
-                )
-            position = pose.get("position_m")
-            orientation = pose.get("orientation_xyzw")
-            if (
-                not isinstance(position, dict)
-                or set(position) != {"x", "y", "z"}
-                or not isinstance(orientation, list)
-                or len(orientation) != 4
-                or any(
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(float(value))
-                    for value in (*position.values(), *orientation)
-                )
-            ):
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    f"scene pose response row {index} has invalid coordinates",
-                )
-            norm = math.sqrt(sum(float(value) ** 2 for value in orientation))
-            if abs(norm - 1.0) > 1.0e-6:
-                raise HeadlessApiError(
-                    "manager_command_response_invalid",
-                    f"scene pose response row {index} has a non-unit quaternion",
-                )
-            parsed.append(row)
         return {
             "api_version": "manyforge.scene_resource_pose_response.v1",
-            "poses": parsed,
-            "projection_revision": projection.model_dump(),
+            "poses": response.get("poses"),
+            "projection_revision": response.get("projection_revision"),
         }

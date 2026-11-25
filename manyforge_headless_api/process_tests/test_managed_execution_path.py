@@ -29,19 +29,16 @@ import rfc8785
 from manyforge_headless_api.app import TrustedPrincipal, create_app
 from manyforge_headless_api.cell_admission import CellAdmissionClient
 from manyforge_headless_api.client import HeadlessHttpClient
-from manyforge_headless_api.execution import (
-    EXECUTION_COMMAND_VERSION,
-    ExecutionCommandClient,
-)
+from manyforge_headless_api.execution import EXECUTION_COMMAND_VERSION
+from manyforge_headless_api.process_tests.host_probe import HostProbe
 from manyforge_headless_api.models import (
     OperationIntentRequest,
     ProgramRunStopIntentRequest,
     RuntimeScaleControlRequest,
     TargetObservationQuery,
 )
-from manyforge_headless_api.native import HeadlessApiError
 from manyforge_headless_api.private_transport import PinnedRunRoot
-from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
+from manyforge_headless_api.program_runner_client import ProgramRunnerClient
 from manyforge_headless_api.process_tests.test_process_stack import (
     ProcessStack,
     _assistant_stack,
@@ -95,7 +92,7 @@ class FixedTrustedPrincipalAdapter:
 
 
 def _component_states(run_root: Path) -> list[dict[str, Any]]:
-    return ExecutionCommandClient(run_root, timeout_seconds=2.0).component_model()[
+    return HostProbe(run_root, timeout_seconds=2.0).component_model()[
         "component_states"
     ]
 
@@ -108,7 +105,7 @@ def _run_component_action(run_root: Path, component_id: str, action: str) -> dic
         return row
 
     previous = state().get("last_action")
-    accepted = ExecutionCommandClient(run_root).component_action(component_id, action)
+    accepted = HostProbe(run_root).component_action(component_id, action)
     assert accepted["ok"] is True, accepted
     deadline = time.monotonic() + 10.0
     while True:
@@ -188,7 +185,7 @@ def _arm_binding(binding: Mapping[str, Any]) -> dict[str, Any]:
     return arm
 
 
-def _in_process_api(stack: ProcessStack, execution: ExecutionCommandClient) -> TestClient:
+def _in_process_api(stack: ProcessStack, execution: HostProbe) -> TestClient:
     """Headless in process over the managed cell's execution host and Program
     runner (ordinary commands read the runner's cycle before dispatch)."""
 
@@ -198,7 +195,7 @@ def _in_process_api(stack: ProcessStack, execution: ExecutionCommandClient) -> T
                 UnusedCore(),  # type: ignore[arg-type]
                 UnusedManager(),  # type: ignore[arg-type]
                 execution,
-                ProgramRunnerHttpClient(stack.program_runner_url, timeout_seconds=8.0),
+                ProgramRunnerClient(stack.manager_run_root, timeout_seconds=8.0),
                 application_start_id=stack.application_start_id,
             ),
             trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
@@ -237,7 +234,7 @@ def _wait_state(
     raise RuntimeError(f"operation did not reach one of {sorted(expected)}: {last}")
 
 
-def _wait_retired(client: ExecutionCommandClient, operation_id: int) -> None:
+def _wait_retired(client: HostProbe, operation_id: int) -> None:
     """Observe exact automatic settlement; never perform client-side cleanup."""
 
     deadline = time.monotonic() + 5.0
@@ -249,7 +246,7 @@ def _wait_retired(client: ExecutionCommandClient, operation_id: int) -> None:
         time.sleep(0.005)
 
 
-def _wait_events_settled(client: ExecutionCommandClient) -> dict[str, Any]:
+def _wait_events_settled(client: HostProbe) -> dict[str, Any]:
     """The event page once the Kernel has journaled its interrupt-rule states.
 
     Enabling the cell queues each global rule's first state; the Kernel's
@@ -538,7 +535,7 @@ def test_internal_program_run_stop_uses_one_exact_priority_request(
         package_environment=package_environment,
     ) as stack, HeadlessHttpClient(stack.base_url, timeout_seconds=20.0) as headless:
         run_root = stack.execution_run_root
-        client = ExecutionCommandClient(
+        client = HostProbe(
             run_root, timeout_seconds=5.0, attribution_transport="internal"
         )
         applied = headless.program_applied()
@@ -663,7 +660,7 @@ def test_events_sample_live_progress_without_durable_progress_records(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with _managed_cell(monkeypatch) as stack:
-        execution = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=3.0)
+        execution = HostProbe(stack.execution_run_root, timeout_seconds=3.0)
         status = execution.diagnostics()["status"]
         request = _direct_control_gripper_operation(status, label="progress-only",
                                                     position=0.004)
@@ -699,7 +696,7 @@ def test_manual_motion_malformed_stop_recovers_with_durable_evidence(
 ) -> None:
     with _managed_cell(monkeypatch) as stack:
         run_root = stack.execution_run_root
-        execution = ExecutionCommandClient(run_root, timeout_seconds=3.0)
+        execution = HostProbe(run_root, timeout_seconds=3.0)
         raw_api = _in_process_api(stack, execution)
         headless = HeadlessHttpClient("http://headless.test", client=raw_api)
         try:
@@ -775,7 +772,7 @@ def test_frame_transform_query_uses_cell_resolver_and_direct_frames(
                          if row["reference"]["component_id"] == arm["target"]["component_id"]),
                         key=lambda frame: frame["frame_id"])
         assert len(frames) >= 2, frames
-        client = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=10.0)
+        client = HostProbe(stack.execution_run_root, timeout_seconds=10.0)
         client.identity()  # Ready before the read-only queries.
         probe = _pose(0.05, -0.02, 0.03)
         query = {
@@ -846,11 +843,15 @@ def test_frame_transform_query_uses_cell_resolver_and_direct_frames(
 def test_program_operation_query_rejects_wrong_or_missing_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from manyforge_program_runner.execution_transport import ProgramRunnerExecutionTransport
+    import manyforge_headless_py as core
+
+    from manyforge_behavior.kernel_client import ExecutionCommandError, KernelClient
 
     with _managed_cell(monkeypatch) as stack:
         binding = _program_binding(stack)
-        client = ProgramRunnerExecutionTransport(stack.execution_run_root, timeout_seconds=2.0)
+        # The Program runner's client over its gateway.
+        gateway = core.Gateway(str(stack.execution_run_root), None, attribution="internal")
+        client = KernelClient(gateway)
         client.identity()  # Ready before the read-only queries.
         query = {
             "schema_version": "manyforge.program_operation_query.v3",
@@ -858,16 +859,17 @@ def test_program_operation_query_rejects_wrong_or_missing_context(
             "program_run_id": 1,
             "target": _arm_binding(binding)["target"],
         }
-        before = client.events(0)
+        # The operation events, not the page's time-varying samples.
+        before = client.read_interrupt_rule_state_events(0)["events"]
         for change, code in [
             ({}, "execution_operation_context_unavailable"),
             ({"target": {**query["target"], "command_target_id": "foreign"}},
              "execution_operation_target_unavailable"),
         ]:
-            with pytest.raises(HeadlessApiError) as error:
+            with pytest.raises(ExecutionCommandError) as error:
                 client.query_operation({**query, **change})
             assert error.value.code == code
-        assert client.events(0) == before
+        assert client.read_interrupt_rule_state_events(0)["events"] == before
 
 
 def test_cell_admission_crosses_real_execution_seqpacket_surface(
@@ -875,7 +877,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
 ) -> None:
     with _managed_cell(monkeypatch) as stack:
         run_root = stack.execution_run_root
-        client = ExecutionCommandClient(run_root, timeout_seconds=5.0)
+        client = HostProbe(run_root, timeout_seconds=5.0)
         get = {"api_version": "manyforge.execution_command.v4", "command": "cell_admission_get"}
         first = client._exchange(get)
         assert client._exchange(get) == first
@@ -1024,7 +1026,7 @@ def test_execution_host_scale_selector_codec_preserves_singular_scope(
     with _managed_cell(monkeypatch) as stack:
         binding = _program_binding(stack)
         target = _arm_binding(binding)["target"]
-        client = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+        client = HostProbe(stack.execution_run_root, timeout_seconds=5.0)
         singular_selector = {
             "program_binding_id": binding["program_binding_id"],
             **target,
@@ -1054,7 +1056,7 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(
 ) -> None:
     marker = tmp_path / "blocked-preview-worker"
     with _managed_cell(monkeypatch, fake_worker_marker=marker) as stack:
-        execution = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=3.0)
+        execution = HostProbe(stack.execution_run_root, timeout_seconds=3.0)
         raw_api = _in_process_api(stack, execution)
         headless = HeadlessHttpClient("http://headless.test", client=raw_api)
         preview_done = threading.Event()
@@ -1165,10 +1167,10 @@ def test_runtime_scale_is_answered_on_its_own_lane_while_a_preview_blocks_submis
     marker = tmp_path / "blocked-preview-worker"
     with _managed_cell(monkeypatch, fake_worker_marker=marker) as stack:
         run_root = stack.execution_run_root
-        execution = ExecutionCommandClient(run_root, timeout_seconds=2.0)
-        internal = ExecutionCommandClient(run_root, timeout_seconds=2.0,
+        execution = HostProbe(run_root, timeout_seconds=2.0)
+        internal = HostProbe(run_root, timeout_seconds=2.0,
                                           attribution_transport="internal")
-        planning = ExecutionCommandClient(run_root, timeout_seconds=30.0)
+        planning = HostProbe(run_root, timeout_seconds=30.0)
         preview_thread: threading.Thread | None = None
         try:
             status = execution.diagnostics()["status"]
@@ -1245,10 +1247,10 @@ def test_ordered_active_tcp_read_waits_for_queued_set_tcp(
     marker = tmp_path / "blocked-preview-worker"
     with _managed_cell(monkeypatch, fake_worker_marker=marker) as stack:
         run_root = stack.execution_run_root
-        execution = ExecutionCommandClient(run_root, timeout_seconds=2.0)
-        internal = ExecutionCommandClient(run_root, timeout_seconds=2.0,
+        execution = HostProbe(run_root, timeout_seconds=2.0)
+        internal = HostProbe(run_root, timeout_seconds=2.0,
                                           attribution_transport="internal")
-        planning = ExecutionCommandClient(run_root, timeout_seconds=30.0)
+        planning = HostProbe(run_root, timeout_seconds=30.0)
         pinned = PinnedRunRoot(run_root)
         clients: list[socket.socket] = []
         preview_thread: threading.Thread | None = None

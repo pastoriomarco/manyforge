@@ -7,7 +7,7 @@ import {
   useState,
 } from 'react';
 
-import { api, authoringRefusalMessage, connectionLost, currentScenarioText, isStaleWorkspaceError, KnownOutcomeError, savedNotAdoptedMessage } from '../api/client';
+import { api, apiErrorCode, authoringRefusalMessage, connectionLost, currentScenarioText, isStaleWorkspaceError, KnownOutcomeError, savedNotAdoptedMessage } from '../api/client';
 import { applyResultText } from '../components/ApplyImpact';
 import { errorMessage } from '../state/structuralResource';
 import { cellApplyErrorText } from './useDeploymentWorkspace';
@@ -163,6 +163,19 @@ const PROGRAM_ACTION_COMMANDS: Record<Exclude<ProgramWorkspaceActionName, 'refre
   save_scenario_document: 'save',
 };
 
+/**
+ * The typed code of a refused or failed New or Load: the API refusal, or the
+ * ended row's code, it carries as its cause; null without one.
+ */
+function replacementRefusalCode(error: unknown): string | null {
+  const cause = error instanceof Error && error.cause !== undefined ? error.cause : error;
+  const code = apiErrorCode(cause);
+  if (code !== null) return code;
+  const coded = cause as { code?: unknown } | null;
+  return typeof coded === 'object' && coded !== null && typeof coded.code === 'string'
+    ? coded.code : null;
+}
+
 export function useProgramWorkspace(
   snapshot: ComposerHeadlessState | null,
   authoring: AuthoringWorkspaceController,
@@ -266,7 +279,7 @@ export function useProgramWorkspace(
   const run = useCallback(async (
     action: ProgramWorkspaceActionName,
     request: () => Promise<ProgramWorkspaceRunResult>,
-    onAuthoringRefusal?: (message: string, failed?: boolean) => void,
+    onAuthoringRefusal?: (message: string, failed?: boolean, code?: string | null) => void,
   ): Promise<ProgramWorkspaceRunResult | null> => {
     // A Scenario Discard is a Draft edit; whether any Scenario document has
     // unapplied changes is decided by its route and by the backend, never by
@@ -324,7 +337,7 @@ export function useProgramWorkspace(
             ? error.message : null);
       if (refusal !== null) {
         if (mounted.current) dispatch({ type: 'request_refused', generation: current, message: refusal });
-        onAuthoringRefusal?.(refusal);
+        onAuthoringRefusal?.(refusal, false, replace ? replacementRefusalCode(error) : null);
         return null;
       }
       const failure = errorMessage(error, 'Program workspace request failed.');
@@ -333,7 +346,9 @@ export function useProgramWorkspace(
       }
       // New and Load show the server's typed refusal in their dialog;
       // `failed`: the reply stated a failed outcome, not a refusal.
-      if (replace) onAuthoringRefusal?.(failure, error instanceof KnownOutcomeError);
+      if (replace) {
+        onAuthoringRefusal?.(failure, error instanceof KnownOutcomeError, replacementRefusalCode(error));
+      }
       // Another client's accepted edit moved the workspace ahead of this
       // request, or a Save wrote its document without adopting it as Saved.
       // Refresh both owners' truth once and never repeat the request; the
@@ -629,7 +644,7 @@ export function useProgramWorkspace(
   const activateScenarioDocument = useCallback((
     kind: 'new' | 'load',
     path: string | null,
-    onRefusal?: (message: string, failed?: boolean) => void,
+    onRefusal?: (message: string, failed?: boolean, code?: string | null) => void,
   ) => {
     const label = kind === 'new' ? 'New Scenario' : 'Scenario Load';
     return run(`${kind}_scenario_document`, async () => {
@@ -652,7 +667,9 @@ export function useProgramWorkspace(
         return { workspace: await api.programWorkspace.get(), message: null, transitionStatus: null };
       }
       const refusal = applyRowRefusal(ended);
-      if (refusal !== null) throw new Error(`${label} refused: ${codedErrorText(refusal)}`);
+      if (refusal !== null) {
+        throw new Error(`${label} refused: ${codedErrorText(refusal)}`, { cause: refusal });
+      }
       const result = applyResultOfRow(ended);
       // The row states the failure: the outcome is known, not unconfirmed.
       if (result.outcome === 'failed') throw new KnownOutcomeError(`${label}: ${applyResultText(result)}`);
@@ -667,10 +684,11 @@ export function useProgramWorkspace(
   }, [applyRows, run]);
   /**
    * `onRefusal` receives the reason when Load is refused before any effect,
-   * or (`failed`) when the Load ran and its reply stated a failed outcome.
+   * or (`failed`) when the Load ran and its reply stated a failed outcome,
+   * with the typed code when there is one.
    */
   const loadScenarioDocument = useCallback(
-    (path: string, onRefusal?: (message: string, failed?: boolean) => void) => activateScenarioDocument('load', path, onRefusal),
+    (path: string, onRefusal?: (message: string, failed?: boolean, code?: string | null) => void) => activateScenarioDocument('load', path, onRefusal),
     [activateScenarioDocument],
   );
   /** New always works; the Scene is initialized. */

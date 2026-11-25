@@ -25,6 +25,7 @@ export {
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentSaveResponse,
   parseScenarioDocumentExportResponse,
+  parseScenarioUpgradeResponse,
   parseDeploymentWorkspaceResponse,
   parseToolReplacementResponse,
   parseCurrentScenarioResponse,

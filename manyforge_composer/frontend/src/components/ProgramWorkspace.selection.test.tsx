@@ -30,14 +30,13 @@ const environment: NodeEnvironmentResponse = {
   portableAuthoringAvailable: true,
   executionAvailable: false,
   reasonCodes: [],
-  restorationGates: [],
   active: null,
 };
 
 function workspaceWithDraft(): ProgramWorkspaceResponse {
   const authoring: ProgramAuthoringDocument = {
     api_version: 'manyforge.program.v4',
-    program_profile: 'composable-cell-v1',
+    program_profile: 'manyforge-cell-v1',
     catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '2.4.0' },
     parameters: [],
     blackboard: { namespaces: [], keys: [] },

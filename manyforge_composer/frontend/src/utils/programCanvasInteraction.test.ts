@@ -38,7 +38,7 @@ const leaf: CatalogEntry = {
   execution: { blocking: true, cancellable: true, ownerApi: 'program' },
   runners: { py_trees: 'move_v1' },
   tags: [],
-  minProgramProfile: 'composable-cell-v1',
+  minProgramProfile: 'manyforge-cell-v1',
   blackboard: { reads: [], writes: [] },
   ownerContext: null,
   outcomes: {},

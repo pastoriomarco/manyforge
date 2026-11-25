@@ -283,7 +283,7 @@ export function PersistentKeyValuesView({
   );
 }
 
-/** One stored value a Reset with Reload initial scene returns to `initial:`. */
+/** One stored value a Reset with Reset stored values returns to `initial:`. */
 export interface PersistentKeyResetRow {
   key: string;
   current: string;
@@ -291,7 +291,7 @@ export interface PersistentKeyResetRow {
 }
 
 /**
- * The stored values that Reload initial scene resets, as the Reset
+ * The stored values that Reset stored values resets, as the Reset
  * confirmation lists them; a value already equal to `initial:` is not a change.
  */
 export function persistentKeyResetRows(values: PersistentKeyValues): PersistentKeyResetRow[] {
@@ -318,7 +318,7 @@ export function PersistentKeyResetList({ rows }: { rows: readonly PersistentKeyR
   );
 }
 
-/** Reads the stored values for the Reset confirmation while Reload initial scene is chosen. */
+/** Reads the stored values for the Reset confirmation while Reset stored values is chosen. */
 export function PersistentKeyResetNotice({
   client,
 }: {

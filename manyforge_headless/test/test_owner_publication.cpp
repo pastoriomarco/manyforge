@@ -529,6 +529,59 @@ TEST(ManagerSourcePublication,
 }
 
 TEST(ManagerSourcePublication,
+     SuccessAwaitingItsClaimReleaseIsPublishedAsNotYetTerminal) {
+  // OD-387: `succeeded` is published only once the Apply's admission claim
+  // is released. Until then its journaled success is published exactly as
+  // before its terminal record; failures are published as they are.
+  const auto admission = LoadAdmission();
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", admission.cell_id());
+  static_cast<void>(journal.EnsureIntent(ApplyIntent(admission)));
+  auto inventory = journal.ReadStatusInventory();
+  ASSERT_EQ(inventory.size(), 1U);
+  const auto apply_id = inventory.front().intent.intent.apply_id;
+  const auto with_terminal =
+      [&](const component_manager::ManagerApplyTerminalOutcomeState state) {
+        auto ended = inventory;
+        ended.front().terminal_outcome = component_manager::PersistedManagerApplyTerminalOutcome{
+            component_manager::ManagerApplyTerminalOutcomeDTO{
+                apply_id, core::ApplyGeneration(1U), std::nullopt, std::nullopt,
+                std::nullopt, std::nullopt, state, std::nullopt},
+            core::ContentDigest(std::string(kDigestOne))};
+        return ended;
+      };
+  const auto publish = [&](const auto &applies, const std::optional<core::ApplyId> &settling) {
+    return content_identity::canonical_json(BuildManagerSourcePayload(
+        admission.retained_bundle(), admission, Runtime(admission), journal, applies,
+        ManagerApplyMutationAvailability::kAvailable, settling));
+  };
+  const auto succeeded =
+      with_terminal(component_manager::ManagerApplyTerminalOutcomeState::kSucceeded);
+
+  const auto settling = publish(succeeded, apply_id);
+  EXPECT_EQ(settling, publish(inventory, std::nullopt));
+  EXPECT_NE(settling.find("\"incomplete\":true"), std::string::npos);
+  EXPECT_NE(settling.find("\"terminal_state\":null"), std::string::npos);
+  EXPECT_EQ(settling.find("\"phase\":\"terminal\""), std::string::npos);
+  EXPECT_NE(settling.find("\"manager_ready\":false"), std::string::npos);
+  EXPECT_NE(settling.find("\"converged\":false"), std::string::npos);
+
+  for (const auto &released :
+       {publish(succeeded, std::nullopt),
+        publish(succeeded, core::ApplyId(apply_id.value() + 1U))}) {
+    EXPECT_NE(released.find("\"incomplete\":false"), std::string::npos);
+    EXPECT_NE(released.find("\"terminal_state\":\"succeeded\""), std::string::npos);
+    EXPECT_NE(released.find("\"phase\":\"terminal\""), std::string::npos);
+    EXPECT_NE(released.find("\"manager_ready\":true"), std::string::npos);
+  }
+  const auto failed = publish(
+      with_terminal(component_manager::ManagerApplyTerminalOutcomeState::kFailed), apply_id);
+  EXPECT_NE(failed.find("\"terminal_state\":\"failed\""), std::string::npos);
+  EXPECT_NE(failed.find("\"incomplete\":false"), std::string::npos);
+}
+
+TEST(ManagerSourcePublication,
      RefusesARuntimeThatPredatesACommittedApplyPublication) {
   // The live race: the Apply progression lane published a transition value
   // from the last runtime observed before the Apply (active publication N)

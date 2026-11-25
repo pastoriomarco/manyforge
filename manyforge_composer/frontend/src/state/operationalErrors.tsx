@@ -14,6 +14,8 @@ export interface ClientOperationalError {
   id: string;
   title: string;
   message: string;
+  /** The failure's typed code, when it carries one; shown in the notice detail. */
+  code?: string;
   active: boolean;
   acknowledgementRequired: boolean;
   severity: 'warning';
@@ -37,6 +39,7 @@ interface OperationalErrorRegistry {
     message: string,
     attentionPolicy: OperationalErrorAttentionPolicy,
     dismissSource?: () => void,
+    code?: string,
   ) => void;
   resolve: (source: string) => void;
   dismiss: (id: string) => void;
@@ -65,6 +68,7 @@ export type OperationalErrorAction =
       message: string;
       attentionPolicy: OperationalErrorAttentionPolicy;
       dismissSource?: () => void;
+      code?: string;
     }
   | { kind: 'resolve'; source: string }
   | { kind: 'dismiss'; id: string }
@@ -88,6 +92,7 @@ export function reduceOperationalErrors(
     if (
       existing?.active === true
       && existing.message === action.message
+      && existing.code === action.code
       && existing.title === action.title
       && existing.attentionPolicy === action.attentionPolicy
     ) return state;
@@ -98,6 +103,7 @@ export function reduceOperationalErrors(
       source: action.source,
       title: action.title,
       message: action.message,
+      ...(action.code === undefined ? {} : { code: action.code }),
       active: true,
       acknowledgementRequired:
         action.attentionPolicy === 'acknowledgement_required',
@@ -152,6 +158,7 @@ export function OperationalErrorProvider({ children }: { children: ReactNode }) 
     message,
     attentionPolicy,
     dismissSource,
+    code,
   ) => {
     if (!message.trim()) return;
     setState((current) => reduceOperationalErrors(current, {
@@ -161,6 +168,7 @@ export function OperationalErrorProvider({ children }: { children: ReactNode }) 
       message,
       attentionPolicy,
       dismissSource,
+      code,
     }));
   }, []);
   const resolve = useCallback<OperationalErrorRegistry['resolve']>((source) => {
@@ -201,6 +209,7 @@ export function useOperationalErrorMirror({
   source,
   title,
   message,
+  code,
   onDismiss,
   // A newer command does not clear a failure: it stays until acknowledged.
   attentionPolicy = 'acknowledgement_required',
@@ -208,6 +217,8 @@ export function useOperationalErrorMirror({
   source: string;
   title: string;
   message: string | null;
+  /** The failure's typed code, when it carries one. */
+  code?: string | null;
   onDismiss?: () => void;
   attentionPolicy?: OperationalErrorAttentionPolicy;
 }) {
@@ -221,6 +232,6 @@ export function useOperationalErrorMirror({
   const dismiss = useCallback(() => dismissRef.current?.(), []);
   useEffect(() => {
     if (message === null) resolve(source);
-    else report(source, title, message, attentionPolicy, dismiss);
-  }, [attentionPolicy, dismiss, message, report, resolve, source, title]);
+    else report(source, title, message, attentionPolicy, dismiss, code ?? undefined);
+  }, [attentionPolicy, code, dismiss, message, report, resolve, source, title]);
 }

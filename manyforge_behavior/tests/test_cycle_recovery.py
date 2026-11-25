@@ -23,7 +23,7 @@ def test_v1_recovery_coordinator_fails_before_inputs_or_callbacks() -> None:
     poison = PoisonCollaborator()
     with pytest.raises(
         CycleRecoveryOwnerUnavailableError,
-        match="composable_cell_cycle_recovery_owner_unavailable",
+        match="cycle_recovery_owner_unavailable",
     ):
         CycleRecoveryCoordinator(on_offer_published=poison, kernel=poison)
 
@@ -57,6 +57,6 @@ def test_diagnostic_sanitizer_bounds_and_json_normalizes_nested_values():
 def test_runtime_pause_registry_fails_before_allocating_live_state() -> None:
     with pytest.raises(
         RuntimePauseOwnerUnavailableError,
-        match="composable_cell_runtime_pause_owner_unavailable",
+        match="runtime_pause_owner_unavailable",
     ):
         RuntimePauseRegistry()

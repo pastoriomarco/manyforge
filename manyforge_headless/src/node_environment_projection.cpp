@@ -367,16 +367,6 @@ ManifestIdentity VerifyManifest(const CanonicalValue &manifest) {
   return {environment_digest, std::move(catalog_identity), std::move(registry)};
 }
 
-CanonicalValue
-StringArray(const std::initializer_list<std::string_view> values) {
-  CanonicalValue::Array result;
-  result.reserve(values.size());
-  for (const auto value : values) {
-    result.emplace_back(CanonicalValue(std::string(value)));
-  }
-  return CanonicalValue(std::move(result));
-}
-
 CanonicalValue StringArray(std::vector<std::string> values) {
   std::sort(values.begin(), values.end());
   values.erase(std::unique(values.begin(), values.end()), values.end());
@@ -418,8 +408,6 @@ CanonicalValue CapabilityOffers(const manyforge::core::RetainedBundleDTO &bundle
 struct DeferredAdapter final {
   std::string_view node_id;
   std::string_view reason_code;
-  std::string_view milestone;
-  std::string_view gate;
 };
 
 constexpr std::array<DeferredAdapter, 0U> kDeferredAdapters{};
@@ -449,10 +437,8 @@ CanonicalValue Availability(const std::vector<RegistryRow> &registry,
     if (!owner_health_available) {
       reason_codes.emplace_back("program_runtime_owner_unavailable");
     }
-    CanonicalValue restoration_gates(CanonicalValue::Array{});
     if (deferred != nullptr) {
       reason_codes.emplace_back(deferred->reason_code);
-      restoration_gates = StringArray({deferred->milestone, deferred->gate});
     }
     implementations.emplace_back(CanonicalValue(CanonicalValue::Object{
         {"adapter_build_qualified", CanonicalValue(deferred == nullptr)},
@@ -466,7 +452,6 @@ CanonicalValue Availability(const std::vector<RegistryRow> &registry,
         {"node_id", CanonicalValue(row.node_id)},
         {"owner_health_available", CanonicalValue(owner_health_available)},
         {"reason_codes", StringArray(std::move(reason_codes))},
-        {"restoration_gates", std::move(restoration_gates)},
     }));
   }
   CanonicalValue::Array reason_codes;
@@ -483,7 +468,6 @@ CanonicalValue Availability(const std::vector<RegistryRow> &registry,
       {"manager_runtime_converged", CanonicalValue(manager_runtime_converged)},
       {"portable_authoring_available", CanonicalValue(true)},
       {"reason_codes", CanonicalValue(std::move(reason_codes))},
-      {"restoration_gates", StringArray({"I6", "N"})},
   });
 }
 

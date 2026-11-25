@@ -54,7 +54,7 @@ const runtime = {
 
 const program: ProgramAuthoringDocument = {
   api_version: 'manyforge.program.v4',
-  program_profile: 'composable-cell-v1',
+  program_profile: 'manyforge-cell-v1',
   catalog: {
     api_version: 'manyforge.node_catalog.v3',
     content_version: '4.0.0',
@@ -107,7 +107,7 @@ it('validates the Program corner blend radius as a non-negative distance', async
     id: 'move', name: 'Move', category: 'motion', description: '', stability: 'stable',
     kind: 'leaf', childrenMin: 0, childrenMax: 0, parameters: [], requiredCapabilities: [],
     execution: { blocking: true, cancellable: true, ownerApi: 'kernel.operation' },
-    runners: { py_trees: 'move_v1' }, tags: [], minProgramProfile: 'composable-cell-v1',
+    runners: { py_trees: 'move_v1' }, tags: [], minProgramProfile: 'manyforge-cell-v1',
     blackboard: { reads: [], writes: [] }, ownerContext: null, outcomes: {},
     eventFamily: 'manyforge.program.node',
   } as CatalogEntry;
@@ -141,7 +141,7 @@ it('updates only the motion defaults the Program declares by name', async () => 
     id: 'move', name: 'Move', category: 'motion', description: '', stability: 'stable',
     kind: 'leaf', childrenMin: 0, childrenMax: 0, parameters: [], requiredCapabilities: [],
     execution: { blocking: true, cancellable: true, ownerApi: 'kernel.operation' },
-    runners: { py_trees: 'move_v1' }, tags: [], minProgramProfile: 'composable-cell-v1',
+    runners: { py_trees: 'move_v1' }, tags: [], minProgramProfile: 'manyforge-cell-v1',
     blackboard: { reads: [], writes: [] }, ownerContext: null, outcomes: {},
     eventFamily: 'manyforge.program.node',
   } as CatalogEntry;

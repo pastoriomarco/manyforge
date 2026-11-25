@@ -74,6 +74,7 @@ export function composerWarningNotices(
     domain: 'runtime',
     title: record.title,
     message: record.message,
+    ...(record.code === undefined ? {} : { details: `Code: ${record.code}` }),
     actions: [{
       id: ACKNOWLEDGE_ACTION_ID,
       label: 'Acknowledge',

@@ -417,12 +417,12 @@ CanonicalValue OptionalString(const std::optional<std::string> &value) {
 CanonicalValue Scope() {
   return CanonicalValue(CanonicalValue::Object{
       {"blind_spots", StringArray({
-                          "program_execution_pending_i6",
-                          "component_lifecycle_pending_i7",
-                          "kernel_stop_pending_i8",
-                          "isaac_pending_i9",
-                          "real_robot_pending_i10",
-                          "tools_and_grippers_pending_i11",
+                          "program_execution",
+                          "component_lifecycle",
+                          "kernel_stop",
+                          "isaac",
+                          "real_robot",
+                          "tools_and_grippers",
                       })},
       {"included_sections",
        StringArray({"manager", "logical_scene", "scene_runtime"})},

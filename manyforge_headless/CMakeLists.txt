@@ -210,6 +210,31 @@ if(NOT TARGET manyforge::private_stream)
     EXCLUDE_FROM_ALL)
 endif()
 
+# The execution-path gateway core (OD-380): the one C++ client of the Manager
+# command socket and the execution host sockets, the event follower, the run
+# wake set and the Program command/status link. ROS-free.
+add_library(manyforge_gateway
+  src/gateway_owner_link.cpp
+  src/gateway_core.cpp
+  src/gateway_events.cpp
+  src/program_link.cpp)
+add_library(manyforge::gateway ALIAS manyforge_gateway)
+target_include_directories(manyforge_gateway PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_gateway PUBLIC
+  manyforge::content_identity
+  manyforge::private_stream
+  Threads::Threads)
+set_target_properties(manyforge_gateway PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(MANYFORGE_HEADLESS_BUILD_PYTHON)
+  target_sources(manyforge_headless_py PRIVATE
+    python/gateway_bindings.cpp
+    python/gateway_event_bindings.cpp
+    python/program_link_bindings.cpp)
+  target_link_libraries(manyforge_headless_py PRIVATE manyforge_gateway)
+endif()
+
 # The Apply preview reads the candidate's meshes with the collision engine's
 # own topology check (OD-363).
 if(NOT TARGET manyforge_mesh_topology)
@@ -277,6 +302,15 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_manager_status_stream
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
+  foreach(_gateway_test test_gateway_core test_gateway_events test_program_link)
+    add_executable(${_gateway_test} test/${_gateway_test}.cpp)
+    target_link_libraries(${_gateway_test} PRIVATE
+      manyforge_gateway
+      GTest::gtest_main)
+    gtest_discover_tests(${_gateway_test}
+      PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+  endforeach()
+
   add_executable(test_runtime_snapshot test/test_runtime_snapshot.cpp)
   target_link_libraries(test_runtime_snapshot PRIVATE
     manyforge_headless GTest::gtest_main)
@@ -293,7 +327,7 @@ if(BUILD_TESTING)
   add_executable(test_scene_admission_reconciliation
     test/test_scene_admission_reconciliation.cpp)
   target_link_libraries(test_scene_admission_reconciliation PRIVATE
-    manyforge_headless GTest::gtest_main)
+    manyforge_headless manyforge::scene GTest::gtest_main)
   gtest_discover_tests(test_scene_admission_reconciliation
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
@@ -511,7 +545,7 @@ if(BUILD_TESTING)
       --package-root
       "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_PACKAGE_ROOT}"
       --cell-id
-      c1_build_authority_cell
+      canonical_empty_cell
       --bundle-ids-output
       "${MANYFORGE_HEADLESS_TEST_ALARM_REGISTRY_BUNDLE_IDS_FILE}"
     DEPENDS

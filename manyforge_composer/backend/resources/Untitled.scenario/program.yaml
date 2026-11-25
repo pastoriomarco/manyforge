@@ -49,6 +49,6 @@
     }
   ],
   "positions": {},
-  "program_profile": "composable-cell-v1",
+  "program_profile": "manyforge-cell-v1",
   "schema_version": "manyforge.composer_authoring_forest.v2"
 }

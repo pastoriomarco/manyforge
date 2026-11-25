@@ -80,6 +80,10 @@ struct ExecutionHostExitDTO final {
   /// status.
   bool signaled{};
   int value{};
+  /// The host child's PID, and whether the kernel reported a core dump
+  /// (WCOREDUMP) for its terminating signal.
+  pid_t pid{};
+  bool core_dumped{};
 };
 
 /// Manager-owned local adapter for the retained native execution product.
@@ -245,7 +249,9 @@ public:
   /// stopped. Information only: the Manager's observation tick logs an
   /// exchange still outstanding at its next tick; nothing is halted or
   /// faulted. Settles replies that arrived with non-blocking reads under the
-  /// adapter's leaf locks; never waits on the host.
+  /// adapter's leaf locks; never waits on the host. A failed observation is
+  /// logged once per episode, with no lock held. Called from one thread (the
+  /// Manager's main thread).
   [[nodiscard]] std::optional<ExecutionHostReplyOutstandingDTO>
   HostReplyOutstanding() const noexcept;
 

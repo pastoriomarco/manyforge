@@ -106,8 +106,8 @@ compatibility:
   - bin-pick
   - ur5
   - vision-pick
-program_profile: composable-cell-v1
-program_revision: sha256:064a5c3d85b0357178549d301b7d233384245239cb04ccb0ff4904573f732dae
+program_profile: manyforge-cell-v1
+program_revision: sha256:df16a7e615ce45bfbb8016cd33b5b71d47ff604a7ae6f30f4ae73f05515db86b
 scene:
 - pose:
     frame_ref:

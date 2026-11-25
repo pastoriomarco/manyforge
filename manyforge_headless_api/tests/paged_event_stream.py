@@ -5,16 +5,25 @@ subscription) and its page function ``events(after_sequence, limit=...)``,
 translated into
 ``snapshot`` / ``event`` / ``state`` / ``progress`` / ``heartbeat`` messages
 the way the host sends them. A fake's failure ends the subscription, as a lost
-stream does."""
+stream does.
+
+``FollowedEventSource`` is the test double of the core's
+``manyforge_headless_py.ExecutionEvents`` over such a fake (or any fake with a
+``subscribe_events(after_cursor)`` context manager): one follower thread,
+``subscribe()`` returning a subscription with ``next(timeout_s)`` and
+``close()``, ``{"type": "disconnected", "code", "message"}`` on a lost
+subscription, then a resubscription after the last delivered cursor."""
 
 from __future__ import annotations
 
+from collections import deque
 from contextlib import contextmanager
-from threading import Event
+from threading import Condition, Event, Thread
 from typing import Any, Iterator
 
 from manyforge_headless_api.execution import COMPONENT_MODEL_STATE_FIELDS
-from manyforge_headless_api.execution_event_stream import EVENT_STREAM_API_VERSION
+
+EVENT_STREAM_API_VERSION = "manyforge.execution_event_stream.v4"
 from manyforge_headless_api.native import HeadlessApiError
 
 # One re-read of the fake per period, like a heartbeat round.
@@ -109,3 +118,91 @@ class _PagedSubscription:
 @contextmanager
 def paged_subscription(fake: Any, after_cursor: int) -> Iterator[_PagedSubscription]:
     yield _PagedSubscription(fake, after_cursor)
+
+
+class _Subscription:
+    def __init__(self) -> None:
+        self._changed = Condition()
+        self._queue: deque[dict[str, Any]] = deque()
+        self._closed = False
+
+    def push(self, message: dict[str, Any]) -> None:
+        with self._changed:
+            self._queue.append(message)
+            self._changed.notify_all()
+
+    def next(self, timeout_s: float) -> dict[str, Any] | None:
+        with self._changed:
+            self._changed.wait_for(lambda: self._queue or self._closed, timeout=timeout_s)
+            return self._queue.popleft() if self._queue else None
+
+    def close(self) -> None:
+        with self._changed:
+            self._closed = True
+            self._changed.notify_all()
+
+
+class FollowedEventSource:
+    """Mixin: the fake is its own ``ExecutionEvents`` double (see above)."""
+
+    def subscribe(self) -> _Subscription:
+        subscription = _Subscription()
+        self.__dict__.setdefault("_followed_subscriptions", []).append(subscription)
+        return subscription
+
+    def start(self) -> None:
+        stop = self.__dict__.setdefault("_followed_stop", Event())
+        if self.__dict__.get("_followed_thread") is None:
+            thread = Thread(target=self._follow, args=(stop,), daemon=True)
+            self.__dict__["_followed_thread"] = thread
+            thread.start()
+
+    def close(self) -> None:
+        self.__dict__.setdefault("_followed_stop", Event()).set()
+        thread = self.__dict__.get("_followed_thread")
+        if thread is not None:
+            thread.join(timeout=5.0)
+        for subscription in self.__dict__.get("_followed_subscriptions", []):
+            subscription.close()
+
+    def _deliver(self, message: dict[str, Any]) -> None:
+        for subscription in self.__dict__.get("_followed_subscriptions", []):
+            subscription.push(message)
+
+    def _follow(self, stop: Event) -> None:
+        cursor = 0
+        while not stop.is_set():
+            try:
+                with self.subscribe_events(cursor) as subscription:
+                    while True:
+                        message = subscription.receive(stop)
+                        if message is None:
+                            return
+                        self._deliver(message)
+                        if message["type"] in ("snapshot", "heartbeat"):
+                            cursor = message["cursor"]
+                        elif message["type"] == "event":
+                            cursor = message["event"]["sequence"]
+            except Exception as error:  # noqa: BLE001 - the core's follower too
+                self._deliver({
+                    "type": "disconnected",
+                    "code": getattr(error, "code", "execution_owner_unavailable"),
+                    "message": str(error),
+                })
+            if stop.wait(PERIOD_SECONDS):
+                return
+
+    def subscribe_events(self, after_cursor: int):
+        return paged_subscription(self, after_cursor)
+
+
+class _FollowedPages(FollowedEventSource):
+    def __init__(self, identity: Any, events: Any) -> None:
+        self.identity = identity
+        self.events = events
+
+
+def followed_pages(identity: Any, events: Any) -> FollowedEventSource:
+    """An ``ExecutionEvents`` double over two page functions."""
+
+    return _FollowedPages(identity, events)

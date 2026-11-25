@@ -60,11 +60,10 @@ export function requestKeyAt(value: unknown, path: string): string {
 
 export function parseRuntimeAvailability(value: unknown, path: string) {
   const record = objectAt(value, path);
-  exactKeysAt(record, ['code', 'message', 'restorationGates'], path);
+  exactKeysAt(record, ['code', 'message'], path);
   return {
     code: stringAt(record.code, `${path}.code`),
     message: stringAt(record.message, `${path}.message`),
-    restorationGates: stringArrayAt(record.restorationGates, `${path}.restorationGates`),
   };
 }
 

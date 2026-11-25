@@ -105,6 +105,7 @@ from .scenario_artifacts import (
     scenario_project_path,
     scenario_project_stem,
 )
+from .scenario_upgrade import check_scenario_upgrade, upgrade_scenario
 from .state import ComposerState, canonical_project_path
 
 _LOGGER = logging.getLogger(__name__)
@@ -187,6 +188,18 @@ class ScenarioLoadRequest(BaseModel):
     path: str = Field(min_length=1, max_length=4096)
     discard_unsaved: bool = False
     # The command's identity (OD-214): the same key again returns its row.
+    request_key: RequestKeyText
+
+
+class ScenarioUpgradeRequest(BaseModel):
+    """`POST /api/scenario-documents/upgrade` body: upgrade the Scenario
+    folder at `path` in place, keeping the original as its backup."""
+
+    model_config = _DTO
+
+    path: str = Field(min_length=1, max_length=4096)
+    # The command's identity: the same key again finds the Scenario current
+    # and changes nothing.
     request_key: RequestKeyText
 
 
@@ -428,6 +441,42 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 "directory": current_directory,
                 "entries": saved,
             }
+        except Exception as error:
+            _raise(error)
+
+    @router.get("/api/scenario-documents/upgrade")
+    def check_upgrade(
+        path: str = Query(min_length=1, max_length=4096),
+    ) -> dict[str, Any]:
+        """Whether a Scenario saved in an older file format can be upgraded,
+        and which conversions apply (``manyforge.scenario_upgrade.v1``,
+        ``status`` ``available`` or ``current``). Writes nothing; a part that
+        cannot be converted is refused with
+        ``scenario_upgrade_conversion_failed``."""
+
+        try:
+            return check_scenario_upgrade(
+                path, allowed_roots=state.allowed_fs_roots, version=_version()
+            )
+        except Exception as error:
+            _raise(error)
+
+    @router.post("/api/scenario-documents/upgrade")
+    def upgrade_document(body: ScenarioUpgradeRequest) -> dict[str, Any]:
+        """Upgrade a Scenario saved in an older file format in place, for the
+        Load dialog's Upgrade and load (OD-391): the folder is converted as a
+        copy, then swapped in; the original stays next to it as the backup
+        ``backup_path`` (``status`` ``upgraded``). A current Scenario is left
+        alone (``current``). Neither the workspace nor the cell changes; the
+        Load that follows is the ordinary one."""
+
+        try:
+            return upgrade_scenario(
+                body.path,
+                allowed_roots=state.allowed_fs_roots,
+                version=_version(),
+                request_key=body.request_key,
+            )
         except Exception as error:
             _raise(error)
 

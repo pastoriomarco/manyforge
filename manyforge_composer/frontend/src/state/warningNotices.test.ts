@@ -30,8 +30,19 @@ describe('warnings: what blocks nothing stays until acknowledged', () => {
     }], dismiss);
     expect(notice).toMatchObject({ severity: 'warning', title: 'Program Run, Stop, or Reset failed' });
     expect(labels(notice)).toEqual(['Acknowledge']);
+    expect(notice?.details).toBeUndefined();
     notice?.actions?.[0]?.run();
     expect(dismiss).toHaveBeenCalledWith('composer.program_runtime:3');
+  });
+
+  it('shows the typed code of a Composer request failure in the notice detail', () => {
+    const [notice] = composerWarningNotices([{
+      id: 'composer.program_runtime:4', title: 'Program Run, Stop, or Reset failed',
+      message: 'Run failed. The Program run started and then failed.', code: 'program_run_started_then_failed',
+      active: true, acknowledgementRequired: true, severity: 'warning',
+    }], vi.fn());
+    expect(notice?.message).toBe('Run failed. The Program run started and then failed.');
+    expect(notice?.details).toBe('Code: program_run_started_then_failed');
   });
 
   it('keeps a stopped Apply until acknowledged, then stops following it', () => {

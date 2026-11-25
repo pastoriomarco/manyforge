@@ -238,9 +238,10 @@ docker exec $W docker-entrypoint.ros-jazzy-full.sh ros2 action list
 | `Development site settings file is unavailable: <path>` | The file doesn't exist at that path on the host. |
 | `project_folder_invalid: site settings file must be JSON: …` | Fix the JSON syntax. |
 | `project_folder_invalid: site settings schema must be manyforge.site.v2` | Add `"schema": "manyforge.site.v2"`. |
-| `project_folder_invalid: site settings <member> needs schema manyforge.site.v2: …` | A `manyforge.site.v1` file has a disk limit: change the first line's schema to `manyforge.site.v2`. |
+| `project_folder_invalid: site settings <member> needs schema manyforge.site.v2: …` | A `manyforge.site.v1` file has a disk limit or `core_dumps`: change the first line's schema to `manyforge.site.v2`. |
 | `project_folder_invalid: site settings <member> must be an integer from … to …` | Fix the disk limit; see [Site settings](DEVELOPMENT_WORKBENCH.md#site-settings). |
-| `project_folder_invalid: site settings has unknown fields: …` | Only `schema`, `device_addresses`, `project_folders`, `disk_max_percent`, `disk_always_free_bytes` and `disk_machine_minimum_bytes` are accepted. |
+| `project_folder_invalid: site settings has unknown fields: …` | Only `schema`, `device_addresses`, `project_folders`, `disk_max_percent`, `disk_always_free_bytes`, `disk_machine_minimum_bytes` and `core_dumps` are accepted. |
+| `project_folder_invalid: site settings core_dumps must be an object with exactly enabled (true or false) and max_bytes` / `… core_dumps.max_bytes must be an integer from 1 to …` | Write `"core_dumps": {"enabled": true, "max_bytes": 1073741824}` (or `"enabled": false`); see [Site settings](DEVELOPMENT_WORKBENCH.md#site-settings). |
 | `<variable> is no longer read: set <member> in the site settings file …` | Unset `MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT` / `MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES`; put the value in the named site settings member. |
 | `project_folder_invalid: project folder must be an existing absolute directory: …` | Create the folder, fix the path, or remove it from `project_folders`. |
 | `project_folder_invalid: project_folders repeats …` / `unsupported project folder …` | List each folder once; paths can't contain `:` and folder names can't contain `,`. |
@@ -468,7 +469,9 @@ curl -s "$API/api/debug/export?run_id=${RUN_ID}&application_start_id=${START}" >
 curl -s "$API/api/execution/history?program_run_id=${RUN_ID}&application_start_id=${START}" > history.json
 curl -s "$API/api/execution/alarms" > alarms.json
 curl -s "$API/api/cycle/status" > cycle-status.json
-docker logs --tail 2000 manyforge-development-workbench > workbench.log   # ./manyforge run: container manyforge
+docker logs --timestamps --tail 2000 manyforge-development-workbench > workbench.log   # ./manyforge run: container manyforge
+./scripts/compose-dev.sh collect --list   # ./manyforge collect --list: one line per run, with its start id
+./scripts/compose-dev.sh collect --start ${START}   # ./manyforge collect --start ${START}
 ```
 
 Attach also the start command (`./scripts/compose-dev.sh start --project …`)

@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v3
 content_version: 4.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:8ea501e0503f9dc6ebfe06ee0ad72e647d5afdb38a06608f98bfecba38480fbb
+catalog_digest: sha256:2800a9be389ec9297e69e20b4d7c83c7616c99df0696258815f946858663cf74
 schema_types:
   tcp_selector:
     type: object
@@ -1267,7 +1267,7 @@ entries:
   - control_flow
   - composite
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: composite
   children:
     min: 1
@@ -1294,7 +1294,7 @@ entries:
   - control_flow
   - composite
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: composite
   children:
     min: 1
@@ -1321,7 +1321,7 @@ entries:
   - control_flow
   - composite
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: composite
   children:
     min: 1
@@ -1359,7 +1359,7 @@ entries:
   - control_flow
   - decorator
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: decorator
   children:
     min: 1
@@ -1386,7 +1386,7 @@ entries:
   - control_flow
   - decorator
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: decorator
   children:
     min: 1
@@ -1424,7 +1424,7 @@ entries:
   - control_flow
   - decorator
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: decorator
   children:
     min: 1
@@ -1465,7 +1465,7 @@ entries:
   - control_flow
   - timing
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -1516,7 +1516,7 @@ entries:
   - planning
   - execution
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -1742,7 +1742,7 @@ entries:
   - planning
   - execution
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -2047,7 +2047,7 @@ entries:
   - planning
   - cartesian
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -2346,7 +2346,7 @@ entries:
   - motion
   - interrupt
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -2667,7 +2667,7 @@ entries:
   - interrupt
   - contact
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -2975,7 +2975,7 @@ entries:
   - motion
   - tcp
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3021,7 +3021,7 @@ entries:
   tags:
   - scene
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3078,7 +3078,7 @@ entries:
   tags:
   - scene
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3134,7 +3134,7 @@ entries:
   tags:
   - scene
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3171,7 +3171,7 @@ entries:
   tags:
   - scene
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3215,7 +3215,7 @@ entries:
   - scene
   - attachment
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3324,7 +3324,7 @@ entries:
   - scene
   - attachment
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3368,7 +3368,7 @@ entries:
   - scene
   - blackboard
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3421,7 +3421,7 @@ entries:
   - logic
   - blackboard
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3459,7 +3459,7 @@ entries:
   - logic
   - blackboard
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3523,7 +3523,7 @@ entries:
   - logic
   - blackboard
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3610,7 +3610,7 @@ entries:
   - logic
   - blackboard
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3714,7 +3714,7 @@ entries:
   tags:
   - io
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3757,7 +3757,7 @@ entries:
   tags:
   - io
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3813,7 +3813,7 @@ entries:
   tags:
   - io
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3863,7 +3863,7 @@ entries:
   tags:
   - io
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3930,7 +3930,7 @@ entries:
   tags:
   - io
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -3967,7 +3967,7 @@ entries:
   - logic
   - rules
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4009,7 +4009,7 @@ entries:
   - gripper
   - tool
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4125,7 +4125,7 @@ entries:
   - gripper
   - tool
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4199,7 +4199,7 @@ entries:
   - gripper
   - tool
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4288,7 +4288,7 @@ entries:
   - model
   - kinematics
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4348,7 +4348,7 @@ entries:
   - geometry
   - blackboard
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4414,7 +4414,7 @@ entries:
   - geometry
   - blackboard
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4469,7 +4469,7 @@ entries:
   - geometry
   - blackboard
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4529,7 +4529,7 @@ entries:
   - kernel
   - stop
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4571,7 +4571,7 @@ entries:
   - kernel
   - stop
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4601,7 +4601,7 @@ entries:
   - kernel
   - reset
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4641,7 +4641,7 @@ entries:
   tags:
   - simulation
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4672,7 +4672,7 @@ entries:
   tags:
   - simulation
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4713,7 +4713,7 @@ entries:
   tags:
   - simulation
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4753,7 +4753,7 @@ entries:
   - simulation
   - scene
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4798,7 +4798,7 @@ entries:
   - assistant
   - model
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -4970,7 +4970,7 @@ entries:
   - assistant
   - perception
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -5058,7 +5058,7 @@ entries:
   - assistant
   - perception
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -5139,7 +5139,7 @@ entries:
   - planning
   - pick
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -5345,7 +5345,7 @@ entries:
   - planning
   - place
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -5519,7 +5519,7 @@ entries:
   - operator
   - recovery
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -5598,7 +5598,7 @@ entries:
   - motion
   - stop
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -5636,7 +5636,7 @@ entries:
   tags:
   - recovery
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0
@@ -5685,7 +5685,7 @@ entries:
   - example
   - model
   profiles:
-    min_program_profile: composable-cell-v1
+    min_program_profile: manyforge-cell-v1
   kind: leaf
   children:
     min: 0

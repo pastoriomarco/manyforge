@@ -919,7 +919,7 @@ def test_g_plain_stop_exports_exact_container_logs_before_removal(tmp_path):
     assert completed.returncode == 0, completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
     assert not any(c.startswith("cp ") for c in calls)
-    assert calls.index("logs " + "d" * 64) < calls.index("rm " + "d" * 64)
+    assert calls.index("logs --timestamps " + "d" * 64) < calls.index("rm " + "d" * 64)
     assert not any(c.startswith(("stop ", "logs ", "rm ", "run "))
                    for c in calls[calls.index("rm " + "d" * 64) + 1:])
     state = tmp_path / "container/manyforge-state"
@@ -937,7 +937,7 @@ def test_g_export_failure_keeps_container_and_never_starts_replacement(tmp_path,
     assert completed.returncode == 69, completed.stderr
     assert "capture failed, container retained" in completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
-    assert "logs " + "d" * 64 in calls
+    assert "logs --timestamps " + "d" * 64 in calls
     assert not any(c.startswith(("rm ", "run ")) for c in calls)
     assert not Path(environment["FAKE_DOCKER_REMOVED"]).exists()
     assert len(list((tmp_path / "container/manyforge-state/evidence").glob("*.partial"))) == 1
@@ -1085,7 +1085,10 @@ def test_failed_developer_start_uses_same_capture_path(tmp_path):
     assert Path(environment["FAKE_DOCKER_STOPPED"]).exists()
     assert Path(environment["FAKE_DOCKER_REMOVED"]).exists()
     assert list((root / "evidence").glob("*/docker.log"))
-    assert "cp " not in Path(environment["FAKE_DOCKER_CALLS"]).read_text()
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text()
+    assert "cp " not in calls
+    # The console tail printed for the failed start carries Docker's times.
+    assert "logs --timestamps --tail 200 " + "d" * 64 + "\n" in calls
 
 
 def test_legacy_transition_refuses_nonempty_target_before_removal(tmp_path):
@@ -1122,7 +1125,7 @@ def test_failed_capture_retries_receipt_matched_older_once_then_removes(tmp_path
         FAKE_LOGS_FAIL="true", FAKE_OLDER_LOGS_FAIL=str(older_failure).lower(), **settings)
     assert completed.returncode == 69
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
-    assert calls.count("logs "+"a"*64) == 1
+    assert calls.count("logs --timestamps "+"a"*64) == 1
     assert "rm "+"a"*64 in calls
     assert not any(c.startswith("rm ") and c != "rm "+"a"*64 for c in calls)
     assert "persistent state remains" in completed.stderr if older_failure else "capture succeeded" in completed.stderr

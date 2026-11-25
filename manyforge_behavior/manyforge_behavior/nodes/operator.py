@@ -182,6 +182,9 @@ class OperatorRequestChoice(InterruptedOutcome, _ProgramStopRequest):
         return option
 
     def update(self) -> py_trees.common.Status:
+        held = self._held_write_result()
+        if held is not None:
+            return held
         inputs = self._resolved_inputs()
         if inputs is None:
             return py_trees.common.Status.FAILURE
@@ -196,15 +199,17 @@ class OperatorRequestChoice(InterruptedOutcome, _ProgramStopRequest):
                 self.feedback_message = f"blackboard_write_failed: {exc}"
                 return py_trees.common.Status.FAILURE
         if answer["result"] == "success":
-            return py_trees.common.Status.SUCCESS
-        return self._fail(
+            return self._after_write(py_trees.common.Status.SUCCESS)
+        return self._after_write(self._fail(
             OPERATOR_CHOICE_FAILED,
             f"The operator chose {answer['label']}",
             _NODE_FAILURE,
-        )
+        ))
 
     def terminate(self, new_status: py_trees.common.Status) -> None:
-        self._record_interruption(new_status)
+        # A chosen option already written ends with its result (OD-213).
+        if not self._abandon_write(new_status):
+            self._record_interruption(new_status)
         super().terminate(new_status)
 
 

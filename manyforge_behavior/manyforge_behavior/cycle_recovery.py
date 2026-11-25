@@ -14,7 +14,7 @@ from typing import Final
 
 
 CYCLE_RECOVERY_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_cycle_recovery_owner_unavailable"
+    "cycle_recovery_owner_unavailable"
 )
 
 

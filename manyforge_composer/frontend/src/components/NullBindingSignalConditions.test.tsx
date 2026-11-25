@@ -19,7 +19,7 @@ const base: Omit<CatalogEntry, 'id' | 'parameters'> = {
   kind: 'leaf', childrenMin: 0, childrenMax: 0, requiredCapabilities: [],
   execution: { blocking: true, cancellable: true, ownerApi: 'kernel.operation' },
   runners: { py_trees: 'node_v1' }, tags: ['motion'],
-  minProgramProfile: 'composable-cell-v1', blackboard: { reads: [], writes: [] },
+  minProgramProfile: 'manyforge-cell-v1', blackboard: { reads: [], writes: [] },
   ownerContext: null, outcomes: {}, eventFamily: null,
 };
 const targetRole = {

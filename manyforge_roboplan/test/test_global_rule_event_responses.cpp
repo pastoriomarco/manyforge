@@ -393,6 +393,28 @@ TEST(ComponentStateResponseTest, CarriesOwnerRoleAndFaultConcerns) {
   owner.fault->concerns.clear();
   EXPECT_EQ(ComponentStateValue(owner).find_object_member("fault")->find_object_member("concerns"),
             nullptr);
+  EXPECT_EQ(owned.find_object_member("fault")->find_object_member("details"), nullptr);
+}
+
+// A fault and a stop carry the UTC time of `since_ns` (the int64 encoding:
+// decimal text above 2^53 - 1); a launch fault carries its output tail.
+TEST(ComponentStateResponseTest, CarriesSinceUtcAndFaultDetails) {
+  core::ComponentState state;
+  state.component_id = "lite6_robot";
+  state.lifecycle = core::ComponentLifecycle::kFault;
+  state.fault = core::Fault{core::FaultCode::kProcessExited, "controller launch exited", true,
+                            core::FaultOperatorAction::kRecover, std::nullopt, std::nullopt,
+                            {}, 4};
+  state.fault->since_utc_ns = 1'795'122'990'477'663'500;
+  state.fault->details = {{"output_tail", "[ros2_control_node-2]: driver failed"}};
+  state.stop = core::ComponentStop{core::StopCode::kEstop, "E-stop", "C2", std::nullopt, 5};
+  state.stop->since_utc_ns = 7;
+  const auto value = ComponentStateValue(state);
+  const auto *fault = value.find_object_member("fault");
+  EXPECT_EQ(fault->find_object_member("since_utc_ns")->as_string(), "1795122990477663500");
+  EXPECT_EQ(fault->find_object_member("details")->find_object_member("output_tail")->as_string(),
+            "[ros2_control_node-2]: driver failed");
+  EXPECT_EQ(value.find_object_member("stop")->find_object_member("since_utc_ns")->as_number(), 7.0);
 }
 
 TEST(ComponentStateResponseTest, CarriesTypedStopOnOwnerAndLatchCause) {

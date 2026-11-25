@@ -1048,3 +1048,43 @@ def test_operator_question_offer_is_stable_and_shares_the_offer_revision() -> No
     )
     assert fenced["offer_revision"] == 6
     assert fenced["offer_id"] != retried["offer_id"]
+
+
+def test_each_audit_event_goes_to_history_stamped_and_the_ring_is_unchanged() -> None:
+    """OD-381 P3: the one append point hands each audit event, with its
+    production time, to History; the ring's entries keep their shape."""
+
+    sent: list[dict[str, object]] = []
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences(), history=sent.append)
+    before_ns = time.monotonic_ns()
+    controls.audit_value(
+        "cycle_recovery_action_applied",
+        offer_id="offer.1", action_id="retry_runtime_step",
+        node_instance_id="move.1", node_attempt_id=2, cycle_resumed=True,
+    )
+    controls.note_retry("move.1")
+    controls.audit_value("program_motion_groups_stopped", node_attempt_id=2, group_ids=["arm"])
+    controls.mark_reset(request_key=_kb("reset"), source_label="composer_ui")
+    after_ns = time.monotonic_ns()
+
+    audit = controls.snapshot()["audit"]
+    assert [entry["kind"] for entry in audit] == [
+        "cycle_recovery_action_applied", "program_node_retry",
+        "program_motion_groups_stopped", "program_runtime_controls_reset",
+    ]
+    assert audit[0] == {
+        "event_revision": 1, "kind": "cycle_recovery_action_applied", "offer_id": "offer.1",
+        "action_id": "retry_runtime_step", "node_instance_id": "move.1",
+        "node_attempt_id": 2, "cycle_resumed": True,
+    }
+    assert [(event["program_run_id"], event["event"], event["outcome"], event["error"])
+            for event in sent] == [
+        (1, entry["kind"], "recorded", None) for entry in audit]
+    assert [event["facts"] for event in sent] == [
+        {name: value for name, value in entry.items() if name != "kind"} for entry in audit]
+    for event in sent:
+        assert before_ns <= int(event["occurred_at_ns"]) <= after_ns
+        assert event["occurred_at_wall"].endswith("+00:00")
+    # The History copy never aliases the ring entry itself.
+    sent[0]["facts"]["offer_id"] = "changed"
+    assert controls.snapshot()["audit"][0]["offer_id"] == "offer.1"

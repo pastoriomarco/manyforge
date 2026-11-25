@@ -1,5 +1,7 @@
 #include "managed_projection_registry.hpp"
 
+#include <manyforge_core/process_diagnostics.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -124,12 +126,15 @@ public:
             "manyforge_managed_native_projection", stage.loader_urdf_path(),
             stage.srdf_path(), stage.package_paths(), std::string{},
             config_.scene_content_root_fd);
-    std::cerr << "native projection collision model loaded: retained_bundle="
-              << candidate.retained_bundle_id.value() << " load_ms="
-              << std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - started)
-                     .count()
-              << " (shared by every planning group)\n";
+    core::LogLine(
+        core::LogSeverity::kInfo,
+        core::LogText("native projection collision model loaded: "
+                      "retained_bundle=",
+                      candidate.retained_bundle_id.value(), " load_ms=",
+                      std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - started)
+                          .count(),
+                      " (shared by every planning group)"));
     return ManagedProjectionCandidateInputs{
         std::move(bundle),
         std::move(*model_map),
@@ -532,37 +537,40 @@ private:
     }
 
     // With `deferred_line`, the line is returned there for the caller to
-    // print after its own lock instead of being printed here.
+    // print after its own lock instead of being printed here. The line is
+    // built under this progress lock and printed after it is released.
     void Advance(std::string next_milestone,
                  std::string *deferred_line = nullptr) {
-      std::lock_guard lock(mutex);
-      const auto now = clock();
-      const auto since_start = (now - started_at_ns) / 1'000'000;
-      const auto since_last = (now - last_progress_at_ns) / 1'000'000;
-      milestone = std::move(next_milestone);
-      ++sequence;
-      last_progress_at_ns = now;
-      if (deferred_line != nullptr) {
-        *deferred_line = "native projection job progress: operation=" +
-                         operation + " provider=" +
-                         binding.provider_binding_id.value() +
-                         " milestone=" + milestone +
-                         " sequence=" + std::to_string(sequence) +
-                         " elapsed_ms=" + std::to_string(since_start) +
-                         " since_last_progress_ms=" +
-                         std::to_string(since_last) + '\n';
-      } else {
-        std::cerr << "native projection job progress: operation=" << operation
-                  << " provider=" << binding.provider_binding_id.value()
-                  << " milestone=" << milestone << " sequence=" << sequence
-                  << " elapsed_ms=" << since_start
-                  << " since_last_progress_ms=" << since_last << '\n';
-      }
+      std::string line;
 #if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
-      AppendNativeProjectionTestTrace(
-          "progress " + operation + " " +
-          binding.provider_binding_id.value() + " " +
-          std::to_string(sequence) + " " + milestone);
+      std::string trace;
+#endif
+      {
+        std::lock_guard lock(mutex);
+        const auto now = clock();
+        const auto since_start = (now - started_at_ns) / 1'000'000;
+        const auto since_last = (now - last_progress_at_ns) / 1'000'000;
+        milestone = std::move(next_milestone);
+        ++sequence;
+        last_progress_at_ns = now;
+        line = core::LogText("native projection job progress: operation=",
+                             operation, " provider=",
+                             binding.provider_binding_id.value(),
+                             " milestone=", milestone, " sequence=", sequence,
+                             " elapsed_ms=", since_start,
+                             " since_last_progress_ms=", since_last);
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+        trace = "progress " + operation + " " +
+                binding.provider_binding_id.value() + " " +
+                std::to_string(sequence) + " " + milestone;
+#endif
+      }
+      if (deferred_line != nullptr)
+        *deferred_line = std::move(line);
+      else
+        core::LogLine(core::LogSeverity::kInfo, line);
+#if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+      AppendNativeProjectionTestTrace(trace);
 #endif
     }
 
@@ -1117,10 +1125,12 @@ private:
       StartRebuildLocked(key, request, accepted.resulting_health, projection,
                          std::move(retained_lease_ids), input_ready_line);
     } catch (...) {
-      std::cerr << input_ready_line;
+      if (!input_ready_line.empty())
+        core::LogLine(core::LogSeverity::kInfo, input_ready_line);
       throw;
     }
-    std::cerr << input_ready_line;
+    if (!input_ready_line.empty())
+      core::LogLine(core::LogSeverity::kInfo, input_ready_line);
     return accepted;
   }
 

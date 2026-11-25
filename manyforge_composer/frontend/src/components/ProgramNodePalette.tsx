@@ -74,15 +74,11 @@ export function executionAvailability(
       note: `Authorable · unavailable · ${errorCatalogRow(typedReason.code)?.[0] ?? typedReason.message}${typeof typedReason.details?.capability === 'string' ? ` (${typedReason.details.capability})` : ''}`,
     };
   }
-  // Restoration gates are internal codes: the note only says whether any apply.
-  const gated = rows.some((row) => row.restorationGates.length > 0);
   const reasons = [...new Set(rows.flatMap((row) => row.reasonCodes))];
   const boundedReason = reasons[0]?.replaceAll('_', ' ') ?? 'no current execution offer';
   return {
     available: false,
-    note: gated
-      ? `Authorable · unavailable in this version · ${boundedReason}`
-      : `Authorable · unavailable · ${boundedReason}`,
+    note: `Authorable · unavailable · ${boundedReason}`,
   };
 }
 

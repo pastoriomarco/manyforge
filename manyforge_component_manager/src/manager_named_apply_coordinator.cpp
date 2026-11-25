@@ -2,6 +2,7 @@
 
 #include "native_projection_transition_internal.hpp"
 
+#include <manyforge_core/process_diagnostics.hpp>
 #include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
@@ -835,16 +836,20 @@ bool ManagerNamedApplyCoordinator::SettleSuccessfulAdmission(
     return false;
   }
   pending_settlement_.reset();
+  // The claim is released: the success is now answered `succeeded` (OD-387).
+  success_settlement_apply_id_.store(0U, std::memory_order_release);
   return true;
 }
 
 void ManagerNamedApplyCoordinator::DeferSettlement(const ManagerApplyIntentDTO &intent,
                                                    const std::exception &error) {
   const auto cause = core::CauseOf(error, "manager_command_rejected", kApplyProducer);
-  std::cerr << "Manager Apply " << intent.apply_id.value()
-            << ": its admission claim release did not settle and is retried on "
-               "the heartbeat: "
-            << cause.error.code << ": " << cause.error.message << '\n';
+  core::LogLine(core::LogSeverity::kWarning,
+                core::LogText("Manager Apply ", intent.apply_id.value(),
+                              ": its admission claim release did not settle "
+                              "and is retried on the heartbeat: ",
+                              cause.error.code, ": ", cause.error.message),
+                cause.error.code);
   last_settlement_retry_error_ = cause.error.code + ": " + cause.error.message;
   pending_settlement_ = core::NamedApplyPublicationTransactionDTO{
       intent.apply_id, intent.apply_generation};
@@ -874,8 +879,11 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::EndApplyByManager(
     const PersistedManagerApplyIntent &durable, const std::string &code,
     const core::TypedCause &cause) {
   const auto &intent = durable.intent;
-  std::cerr << "Manager Apply " << intent.apply_id.value() << " ended " << code << ": "
-            << cause.error.code << ": " << cause.error.message << '\n';
+  core::LogLine(core::LogSeverity::kError,
+                core::LogText("Manager Apply ", intent.apply_id.value(), " ended ",
+                              code, ": ", cause.error.code, ": ",
+                              cause.error.message),
+                code);
   // Before the fence attempt only reads and this Apply's own claim happened
   // (preflight, claim lookup/acquire, plan, continuity, inventory reads).
   if (!apply_journal_.ReadFenceAttempt(intent.apply_id, intent.apply_generation))
@@ -907,6 +915,18 @@ std::unique_lock<std::mutex> ManagerNamedApplyCoordinator::LockUnlessStepInProgr
   auto lock = TryLockUnlessStepInProgress();
   if (!lock.owns_lock()) ThrowApplyBusy();
   return lock;
+}
+
+bool ManagerNamedApplyCoordinator::SuccessSettlementPending(
+    const core::ApplyId &apply_id) const noexcept {
+  return success_settlement_apply_id_.load(std::memory_order_acquire) == apply_id.value();
+}
+
+std::optional<core::ApplyId>
+ManagerNamedApplyCoordinator::SuccessSettlementPendingApply() const noexcept {
+  const auto apply_id = success_settlement_apply_id_.load(std::memory_order_acquire);
+  if (apply_id == 0U) return std::nullopt;
+  return core::ApplyId(apply_id);
 }
 
 std::optional<core::NamedApplyPublicationTransactionDTO>
@@ -954,8 +974,11 @@ ManagerNamedApplyCoordinator::RetryPendingSettlementOnHeartbeat(
     const auto cause = core::CauseOf(error, "manager_command_rejected", kApplyProducer);
     auto text = cause.error.code + ": " + cause.error.message;
     if (last_settlement_retry_error_ != text) {
-      std::cerr << "Manager Apply " << reference.apply_id.value()
-                << ": admission claim release retry failed: " << text << '\n';
+      core::LogLine(core::LogSeverity::kWarning,
+                    core::LogText("Manager Apply ", reference.apply_id.value(),
+                                  ": admission claim release retry failed: ",
+                                  text),
+                    cause.error.code);
       last_settlement_retry_error_ = std::move(text);
     }
     return still_pending;
@@ -1165,9 +1188,11 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
             "manager: execution host refused the candidate before any effect", false);
       } catch (const std::exception &release_error) {
         // The failure stays retained; its fence and claim stay held.
-        std::cerr << "Manager Apply " << intent.apply_id.value()
-                  << ": host refusal could not release its fence and claim: "
-                  << release_error.what() << '\n';
+        core::LogLine(core::LogSeverity::kError,
+                      core::LogText("Manager Apply ", intent.apply_id.value(),
+                                    ": host refusal could not release its "
+                                    "fence and claim: ",
+                                    release_error.what()));
       }
     }
     return result;
@@ -1217,6 +1242,9 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalConfiguratio
       captured.original_scene_completed = completed;
     }
     Require(captured.original_scene_completed.has_value(), "configuration Scene completion outcome is uncertain");
+    // Before the success is journaled (OD-387): status and replay answer
+    // `pending` until SettleSuccessfulAdmission released the claim.
+    success_settlement_apply_id_.store(intent.apply_id.value(), std::memory_order_release);
     const auto released = fence_release_coordinator_.ReleaseOrRecover(intent.apply_id, intent.apply_generation);
     const auto terminal = apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation);
     Require(terminal.has_value(), "configuration release lacks its actual terminal evidence");
@@ -1229,10 +1257,14 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalConfiguratio
             apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation)) {
       // The success is written (it is the last step of the fence release);
       // only the claim release is left: the heartbeat retries it (OD-188 P1).
-      if (!terminal->terminal_outcome.succeeded()) throw;
-      DeferSettlement(intent, error);
-      return PendingSettlementResult(intent, request_replayed);
+      if (terminal->terminal_outcome.succeeded()) {
+        DeferSettlement(intent, error);
+        return PendingSettlementResult(intent, request_replayed);
+      }
+      success_settlement_apply_id_.store(0U, std::memory_order_release);
+      throw;
     }
+    success_settlement_apply_id_.store(0U, std::memory_order_release);
     return RetainTerminalFailure(apply_journal_, durable, "configuration_settlement_failed",
         error, ManagerApplyEffectDisposition::kUnknown, request_replayed);
   }
@@ -1243,29 +1275,22 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
     OriginalPrepareAcknowledgement original_prepare_acknowledgement) {
   Require(request.valid(), "named Apply request is invalid");
   // OD-270: never waits behind an Apply lane step. The journal guards its
-  // own reads, so a replay is answered without operation_mutex_ unless it
-  // needs the pending settlement, which only the lock shows; any other
-  // request is refused `apply_busy` with `effect: none`.
+  // own reads and the success settlement is a lock-free fact, so a replay is
+  // answered without operation_mutex_; any other request is refused
+  // `apply_busy` with `effect: none` while a step holds it.
   const auto lock = TryLockUnlessStepInProgress();
   const auto existing =
       apply_journal_.ReadRequest(request.request_context.request_key);
-  std::optional<PersistedManagerApplyTerminalOutcome> terminal;
   if (existing.has_value()) {
     Require(MatchesRequest(existing->intent, request),
             "public request identity is already bound to another Apply");
-    terminal = apply_journal_.ReadTerminalOutcome(
+    const auto terminal = apply_journal_.ReadTerminalOutcome(
         existing->intent.apply_id, existing->intent.apply_generation);
-  }
-  const bool settlement_unknown =
-      terminal.has_value() && terminal->terminal_outcome.succeeded();
-  if (!lock.owns_lock() && (!existing.has_value() || settlement_unknown))
-    ThrowApplyBusy();
-  if (existing.has_value()) {
-    // A failure whose release is pending replays as the failure it is.
-    if (lock.owns_lock() &&
-        pending_settlement_ == core::NamedApplyPublicationTransactionDTO{
-            existing->intent.apply_id, existing->intent.apply_generation} &&
-        (!terminal || terminal->terminal_outcome.succeeded()))
+    // Read after the journal (OD-387): a success whose claim release is
+    // still pending replays as pending; a failure whose release is pending
+    // replays as the failure it is.
+    if (terminal.has_value() && terminal->terminal_outcome.succeeded() &&
+        SuccessSettlementPending(existing->intent.apply_id))
       return PendingSettlementResult(existing->intent, true);
     return {existing->intent.apply_id, existing->intent.apply_generation,
             terminal.has_value()
@@ -1276,6 +1301,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
                                  : std::nullopt};
   }
 
+  if (!lock.owns_lock()) ThrowApplyBusy();
   if (pending_settlement_)
     throw ManagerNamedApplyBusyError("another Apply retains its admission claim until its release settles");
 
@@ -1649,9 +1675,11 @@ ManagerNamedApplyCoordinator::RecoverIncompleteApply() {
                         : std::nullopt);
       } catch (const std::exception &error) {
         const auto cause = core::CauseOf(error, "scene_adoption_end_failed", kApplyProducer);
-        std::cerr << "Manager Apply " << intent.apply_id.value()
-                  << ": its Scene adoption could not be ended: " << cause.error.code << ": "
-                  << cause.error.message << '\n';
+        core::LogLine(core::LogSeverity::kError,
+                      core::LogText("Manager Apply ", intent.apply_id.value(),
+                                    ": its Scene adoption could not be ended: ",
+                                    cause.error.code, ": ", cause.error.message),
+                      cause.error.code);
       }
     }
     if (result.state != ManagerNamedApplyResultState::kPending) {

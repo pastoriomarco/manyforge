@@ -5,6 +5,7 @@
 #include <sys/types.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -53,8 +54,13 @@ ParseApplicationProcessList(std::string_view document);
 /// One application process exit, as the supervisor observed it.
 struct ApplicationProcessExit final {
   manyforge::core::ApplicationRole role{};
+  /// True when `value` is the terminating signal, false when it is the exit
+  /// status.
   bool signaled{};
   int value{};
+  pid_t pid{};
+  /// The kernel reported a core dump for the terminating signal (WCOREDUMP).
+  bool core_dumped{};
 };
 
 /// Starts, watches and stops the listed processes. Used only from the
@@ -63,8 +69,12 @@ struct ApplicationProcessExit final {
 /// caveat). No lock is held anywhere in it.
 class ApplicationProcessSupervisor final {
 public:
+  /// `core_dump_limit_bytes`: the soft core-file size limit each child
+  /// starts with (0, core dumps off, unless the site settings enable them),
+  /// capped at the hard limit, which is kept.
   ApplicationProcessSupervisor(std::vector<ApplicationProcessSpec> specs,
-                               manyforge::core::ApplicationStartId application_start_id);
+                               manyforge::core::ApplicationStartId application_start_id,
+                               std::uint64_t core_dump_limit_bytes = 0U);
   ~ApplicationProcessSupervisor();
 
   ApplicationProcessSupervisor(const ApplicationProcessSupervisor &) = delete;
@@ -72,6 +82,8 @@ public:
   operator=(const ApplicationProcessSupervisor &) = delete;
 
   /// Launches every `immediate` entry, in list order, with no readiness wait.
+  /// Each child runs with the core-file size limit's soft value at
+  /// `core_dump_limit_bytes` (0 by default: core dumps off).
   void StartImmediate();
   /// Launches every `after_baseline` entry, in list order, once.
   void StartAfterBaseline();
@@ -97,6 +109,7 @@ private:
 
   std::vector<ApplicationProcessSpec> specs_;
   std::string application_start_text_;
+  std::uint64_t core_dump_limit_bytes_{};
   std::vector<Running> running_;
   bool after_baseline_started_{};
 };

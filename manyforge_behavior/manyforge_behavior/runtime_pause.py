@@ -23,7 +23,7 @@ _MAX_DETAIL_TEXT_CHARS: Final = 16_384
 _MAX_DETAIL_KEY_CHARS: Final = 128
 _DETAILS_TRUNCATED_KEY: Final = "_manyforge_details_truncated"
 RUNTIME_PAUSE_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_runtime_pause_owner_unavailable"
+    "runtime_pause_owner_unavailable"
 )
 
 

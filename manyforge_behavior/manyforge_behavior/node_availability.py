@@ -9,7 +9,7 @@ from typing import Any, Final
 
 from manyforge_behavior.executable_node_resolver import ExecutableNodeResolver
 
-NODE_EXECUTION_AVAILABILITY_API: Final = "manyforge.node_execution_availability.v1"
+NODE_EXECUTION_AVAILABILITY_API: Final = "manyforge.node_execution_availability.v2"
 
 
 class NodeAvailabilityError(ValueError):
@@ -203,7 +203,6 @@ def project_node_execution_availability(
                 "execution_available": execution_available,
                 "implementation_identity_resolved": True,
                 "reason_codes": list(reason_codes),
-                "restoration_gates": list(disposition.restoration_gates),
             }
         )
 

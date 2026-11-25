@@ -19,16 +19,13 @@ import {
   type ScenarioAction,
 } from '../state/documentStates';
 import {
-  PERSISTENT_KEYS_RESET_NOTE,
   RELOAD_INITIAL_SCENE_NOTE,
-  declaresPersistentKeys,
   initialSceneReloadOffered,
   type InitialSceneExpectation,
 } from '../state/initialSceneApplied';
 import { ApplyImpact } from './ApplyImpact';
 import { applyAdmissionBlock, useAuthoringAdmissionTooltip } from './authoringAdmission';
 import { OverlayPanel } from './OverlayPanel';
-import { PersistentKeyResetNotice } from './PersistentKeyValues';
 
 function actionTitle(action: ScenarioAction): string {
   switch (action) {
@@ -194,7 +191,6 @@ export function ScenarioActionControls({
     appliedProgram,
     savedDiffersFromApplied: programSavedDiffers,
   });
-  const reloadPersistentKeys = declaresPersistentKeys(action === 'apply' ? draftProgram : appliedProgram);
   const confirm = () => {
     if (action === null) return;
     const target = routes[action].target;
@@ -323,7 +319,6 @@ export function ScenarioActionControls({
             {reloadOffered && (
               <ReloadInitialSceneOption
                 action="revert" resetsRun={resetsRun} checked={reloadScene} onChange={setReloadScene}
-                persistentKeys={reloadPersistentKeys} persistentValues={runtime.persistentValues}
               />
             )}
             {resetsRun && <ResetsRunWarning action="revert" />}
@@ -361,7 +356,6 @@ export function ScenarioActionControls({
             {reloadOffered && (
               <ReloadInitialSceneOption
                 action="apply" resetsRun={resetsRun} checked={reloadScene} onChange={setReloadScene}
-                persistentKeys={reloadPersistentKeys} persistentValues={runtime.persistentValues}
               />
             )}
             {resetsRun && <ResetsRunWarning />}
@@ -394,8 +388,6 @@ export function ScenarioActionControls({
             {previewReloadOffered && (
               <ReloadInitialSceneOption
                 action={previewAction} resetsRun={previewResetsRun} checked={reloadScene} onChange={setReloadScene}
-                persistentKeys={declaresPersistentKeys(reverting ? appliedProgram : draftProgram)}
-                persistentValues={runtime.persistentValues}
               />
             )}
             {previewResetsRun && <ResetsRunWarning action={previewAction} />}
@@ -449,15 +441,11 @@ export function ReloadInitialSceneOption({
   resetsRun,
   checked,
   onChange,
-  persistentKeys,
-  persistentValues,
 }: {
   action: 'apply' | 'revert';
   resetsRun: boolean;
   checked: boolean;
   onChange: (checked: boolean) => void;
-  persistentKeys: boolean;
-  persistentValues: ProgramRuntimeController['persistentValues'];
 }) {
   const after = action === 'revert' ? 'Revert' : 'Apply';
   return (
@@ -477,11 +465,9 @@ export function ReloadInitialSceneOption({
             ? `After the ${after}, a second Reset reloads the initial scene. `
             : `After the ${after}, a Reset reloads the initial scene. `}
           {RELOAD_INITIAL_SCENE_NOTE}
-          {persistentKeys && PERSISTENT_KEYS_RESET_NOTE}
           {' '}Otherwise the live cell keeps its current scene until a Reset with Reload initial scene.
         </small>
       </fieldset>
-      {checked && persistentKeys && <PersistentKeyResetNotice client={persistentValues} />}
       {checked && <p>Robot positions stay as they are.</p>}
     </>
   );

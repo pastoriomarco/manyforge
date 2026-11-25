@@ -35,8 +35,8 @@ Scenario. It lives in the site settings file, a JSON document:
 
 - `schema` must be `manyforge.site.v2` (a `manyforge.site.v1` file is still
   accepted and uses the default disk limits). Besides the members below, only
-  the optional [disk limits](DEVELOPMENT_WORKBENCH.md#site-settings) are
-  accepted.
+  the optional [disk limits](DEVELOPMENT_WORKBENCH.md#site-settings) and
+  `core_dumps` are accepted.
 - `device_addresses` maps a key to a host name or IP address. Use lower-case
   keys (letters, digits, `.`, `_`, `-`, starting with a letter): the machine
   card accepts only those. Scenarios name the key, never the address.

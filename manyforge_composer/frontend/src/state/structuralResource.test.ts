@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   errorMessage,
+  withErrorCode,
   structuralResourceReducer,
   type StructuralResourceState,
 } from './structuralResource';
@@ -75,5 +76,14 @@ describe('errorMessage', () => {
     );
     expect(errorMessage(new Error('plain'), 'fallback')).toBe('plain');
     expect(errorMessage(null, 'fallback')).toBe('fallback');
+  });
+});
+
+describe('withErrorCode', () => {
+  it('adds the typed code once, and only when there is one', () => {
+    expect(withErrorCode('Robot stopped itself', 'fault_protective_stop')).toBe('Robot stopped itself (fault_protective_stop)');
+    expect(withErrorCode('fault_protective_stop', 'fault_protective_stop')).toBe('fault_protective_stop');
+    expect(withErrorCode('busy', null)).toBe('busy');
+    expect(withErrorCode('busy', undefined)).toBe('busy');
   });
 });

@@ -17,7 +17,9 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_behavior.program_clock import ProgramClock
 
 
-def _waiter(clock=None, program_clock=None, timeout_while_held="pause", **adapter_options):
+def _waiter(
+    clock=None, program_clock=None, timeout_while_held="pause", target=None, **adapter_options
+):
     clock = clock or [10.0]
     program_clock = program_clock or ProgramClock(lambda: clock[0])
     scope = (7, 2, "source", "revision", "provider.1", "route.1", 3)
@@ -42,6 +44,8 @@ def _waiter(clock=None, program_clock=None, timeout_while_held="pause", **adapte
         # The resolver supplies the catalog default `pause` when omitted.
         "timeout_while_held": timeout_while_held,
     }
+    if target is not None:
+        parameters["target"] = target
     node = GripperStatusWaitAdapter(
         name="wait",
         node_id="gripper.wait_for_status",
@@ -78,6 +82,29 @@ def test_wait_is_bounded_read_only_and_completes_without_reissuing_a_command():
     node.tick_once()
     assert node.status is py_trees.common.Status.SUCCESS
     assert len(calls) == 2
+
+
+def test_wait_keeps_the_state_it_last_read_with_the_time_first_read():
+    """OD-382 C6: display only, from the read the wait already does."""
+    node, clock, port, _, scope = _waiter(target={"component_id": "gripper_1"})
+    assert node.wait_observation is None
+    node.tick_once()
+    first = node.wait_observation
+    assert {key: first[key] for key in ("kind", "component_id", "state")} == {
+        "kind": "gripper", "component_id": "gripper_1", "state": "reached"}
+    assert type(first["observed_at_utc_ns"]) is int
+    clock[0] += 0.1
+    node.tick_once()
+    assert node.wait_observation is first  # Unchanged state: same observation.
+    port.result = OwnerInvocationResult(
+        False,
+        reason_code="gripper_status_not_matched",
+        metadata={"command_scope": scope, "command_state": "executing"},
+    )
+    clock[0] += 0.1
+    node.tick_once()
+    assert node.wait_observation["state"] == "moving"
+    assert node.wait_observation["observed_at_utc_ns"] >= first["observed_at_utc_ns"]
 
 
 @pytest.mark.parametrize("field", range(7))

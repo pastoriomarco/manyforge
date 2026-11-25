@@ -11,7 +11,7 @@ _PROBE = _REPO_ROOT / "manyforge_core" / "tools" / "realtime_qualification_probe
 
 
 def _load_probe() -> Any:
-    spec = importlib.util.spec_from_file_location("manyforge_rt6_probe_test", _PROBE)
+    spec = importlib.util.spec_from_file_location("manyforge_realtime_probe_test", _PROBE)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -19,7 +19,7 @@ def _load_probe() -> Any:
     return module
 
 
-def test_rt6_probe_reports_source_architecture_and_collision_resource_policy(
+def test_realtime_probe_reports_source_architecture_and_collision_resource_policy(
     monkeypatch,
 ) -> None:
     probe = _load_probe()
@@ -29,7 +29,7 @@ def test_rt6_probe_reports_source_architecture_and_collision_resource_policy(
 
     evidence = probe.build_evidence({})
 
-    assert evidence["schema_version"] == "manyforge.rt6_qualification.v1"
+    assert evidence["schema_version"] == "manyforge.realtime_qualification.v1"
     assert evidence["passed"] is True
     assert evidence["source_level_architecture"]["highest_runtime_role"] == (
         "controller_command"
@@ -53,7 +53,7 @@ def test_rt6_probe_reports_source_architecture_and_collision_resource_policy(
     )
 
 
-def test_rt6_probe_marks_requested_os_realtime_mismatch_as_failed(monkeypatch) -> None:
+def test_realtime_probe_marks_requested_os_realtime_mismatch_as_failed(monkeypatch) -> None:
     probe = _load_probe()
     monkeypatch.setattr(probe, "_current_scheduler_policy", lambda: (0, None))
     monkeypatch.setattr(probe, "_current_affinity", lambda: ([0, 1], None))
@@ -61,9 +61,9 @@ def test_rt6_probe_marks_requested_os_realtime_mismatch_as_failed(monkeypatch) -
 
     evidence = probe.build_evidence(
         {
-            "MANYFORGE_RT6_REQUESTED_SCHED_POLICY": "SCHED_FIFO",
-            "MANYFORGE_RT6_REQUESTED_CPU_AFFINITY": "0-2",
-            "MANYFORGE_RT6_REQUESTED_MLOCK": "1",
+            "MANYFORGE_REALTIME_REQUESTED_SCHED_POLICY": "SCHED_FIFO",
+            "MANYFORGE_REALTIME_REQUESTED_CPU_AFFINITY": "0-2",
+            "MANYFORGE_REALTIME_REQUESTED_MLOCK": "1",
         }
     )
 
@@ -78,14 +78,14 @@ def test_rt6_probe_marks_requested_os_realtime_mismatch_as_failed(monkeypatch) -
     assert evidence["os_realtime"]["memory_locking"]["accepted"] is False
 
 
-def test_rt6_probe_requires_exact_cpu_affinity_match(monkeypatch) -> None:
+def test_realtime_probe_requires_exact_cpu_affinity_match(monkeypatch) -> None:
     probe = _load_probe()
     monkeypatch.setattr(probe, "_current_scheduler_policy", lambda: (0, None))
     monkeypatch.setattr(probe, "_current_affinity", lambda: ([0, 1, 2, 3], None))
     monkeypatch.setattr(probe, "_locked_memory_bytes", lambda: (0, None))
 
-    superset = probe.build_evidence({"MANYFORGE_RT6_REQUESTED_CPU_AFFINITY": "2-3"})
-    exact = probe.build_evidence({"MANYFORGE_RT6_REQUESTED_CPU_AFFINITY": "0-3"})
+    superset = probe.build_evidence({"MANYFORGE_REALTIME_REQUESTED_CPU_AFFINITY": "2-3"})
+    exact = probe.build_evidence({"MANYFORGE_REALTIME_REQUESTED_CPU_AFFINITY": "0-3"})
 
     assert superset["passed"] is False
     assert superset["failed_checks"] == ["cpu_affinity"]
@@ -94,7 +94,7 @@ def test_rt6_probe_requires_exact_cpu_affinity_match(monkeypatch) -> None:
     assert exact["os_realtime"]["cpu_affinity"]["accepted"] is True
 
 
-def test_rt6_probe_fails_requested_os_realtime_when_unobservable(monkeypatch) -> None:
+def test_realtime_probe_fails_requested_os_realtime_when_unobservable(monkeypatch) -> None:
     probe = _load_probe()
     monkeypatch.setattr(probe, "_current_scheduler_policy", lambda: (0, None))
     monkeypatch.setattr(probe, "_current_affinity", lambda: (None, "unavailable"))
@@ -102,8 +102,8 @@ def test_rt6_probe_fails_requested_os_realtime_when_unobservable(monkeypatch) ->
 
     evidence = probe.build_evidence(
         {
-            "MANYFORGE_RT6_REQUESTED_CPU_AFFINITY": "0",
-            "MANYFORGE_RT6_REQUESTED_MLOCK": "1",
+            "MANYFORGE_REALTIME_REQUESTED_CPU_AFFINITY": "0",
+            "MANYFORGE_REALTIME_REQUESTED_MLOCK": "1",
         }
     )
 
@@ -115,13 +115,13 @@ def test_rt6_probe_fails_requested_os_realtime_when_unobservable(monkeypatch) ->
     assert evidence["os_realtime"]["memory_locking"]["error"] == "unavailable"
 
 
-def test_rt6_probe_fails_malformed_requested_cpu_affinity(monkeypatch) -> None:
+def test_realtime_probe_fails_malformed_requested_cpu_affinity(monkeypatch) -> None:
     probe = _load_probe()
     monkeypatch.setattr(probe, "_current_scheduler_policy", lambda: (0, None))
     monkeypatch.setattr(probe, "_current_affinity", lambda: ([0, 1], None))
     monkeypatch.setattr(probe, "_locked_memory_bytes", lambda: (0, None))
 
-    evidence = probe.build_evidence({"MANYFORGE_RT6_REQUESTED_CPU_AFFINITY": "3-1"})
+    evidence = probe.build_evidence({"MANYFORGE_REALTIME_REQUESTED_CPU_AFFINITY": "3-1"})
 
     assert evidence["passed"] is False
     assert evidence["failed_checks"] == ["cpu_affinity"]

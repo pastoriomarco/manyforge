@@ -20,13 +20,10 @@ from typing import Any, Callable
 
 import rfc8785
 from pydantic import ValidationError
-from websockets.asyncio.client import connect as connect_websocket
-from websockets.exceptions import ConnectionClosed
 
 from .control_protocol import (
     CONTROL_COLD_COMBINE_NS,
     CONTROL_MAXIMUM_CLIENTS,
-    CONTROL_MAXIMUM_SNAPSHOT_BYTES,
     EXECUTION_CONTROL_PROJECTION_SCHEMA,
     ExecutionControlProjectionDTO,
 )
@@ -41,7 +38,7 @@ from .component_model import (
 from .component_overview import ComponentOverviewFacts
 from .execution_control import ExecutionControlIngress
 from .held_run_authoring import held_run_draft_edit_allowed
-from .native import HeadlessApiError, strict_json_object
+from .native import HeadlessApiError
 from .identity import causal_display
 from .program_cycle import (
     PROGRAM_CONTROL_STATE_SCHEMA,
@@ -49,6 +46,7 @@ from .program_cycle import (
     program_cycle_control_key,
     program_operation_failures,
 )
+from .program_runner_client import ProgramRunnerClientError, ProgramStatusSubscriptionPort
 from .service import HeadlessService
 
 
@@ -56,6 +54,8 @@ _MAXIMUM_ACTIVE_CLIENT_INCIDENTS = CONTROL_MAXIMUM_CLIENTS * 8
 _SOURCE_RETRY_INITIAL_SECONDS = 0.05
 _SOURCE_RETRY_MAX_SECONDS = 1.0
 _SOURCE_FAILURE_LOG_INTERVAL_NS = 5_000_000_000
+# One wait of the Program status reader; closing the subscription ends it.
+_PROGRAM_STATUS_WAIT_SECONDS = 60.0
 _ERROR_CODES = frozenset(
     value for name, value in vars(error_codes).items()
     if name.isupper() and isinstance(value, str)
@@ -87,6 +87,22 @@ async def _drained_owner_read(
     except asyncio.CancelledError:
         if stop is not None:
             stop.set()
+        await asyncio.gather(read, return_exceptions=True)
+        raise
+
+
+async def _next_program_frame(
+    subscription: ProgramStatusSubscriptionPort,
+) -> dict[str, Any] | None:
+    """The next pushed Program frame (None: none yet). A cancel closes the
+    subscription, which ends the waiting read, and drains it."""
+    read = asyncio.create_task(
+        asyncio.to_thread(subscription.next, _PROGRAM_STATUS_WAIT_SECONDS)
+    )
+    try:
+        return await asyncio.shield(read)
+    except asyncio.CancelledError:
+        subscription.close()
         await asyncio.gather(read, return_exceptions=True)
         raise
 
@@ -440,14 +456,16 @@ class HeadlessControlStateSource:
         service: HeadlessService,
         ingress: ExecutionControlIngress,
         *,
-        program_runner_websocket_url: str | None,
+        program_status: Callable[[], ProgramStatusSubscriptionPort] | None,
         incident_recorder: Callable[..., dict[str, Any]] | None = None,
         program_failure_observer: Callable[[str], dict[str, Any]] | None = None,
         runner_command_observer: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._service = service
         self._ingress = ingress
-        self._runner_url = program_runner_websocket_url
+        # Opens one pushed Program control-state subscription; None: the
+        # Program state is read on demand instead.
+        self._program_status = program_status
         self._incident_recorder = incident_recorder
         self._diagnostic_origin_ns = time.monotonic_ns()
         self._diagnostics = {
@@ -926,7 +944,7 @@ class HeadlessControlStateSource:
 
         loop = self._loop
         wake = self._program_wake
-        if loop is not None and wake is not None and self._runner_url is None:
+        if loop is not None and wake is not None and self._program_status is None:
             loop.call_soon_threadsafe(wake.set)
 
     async def close(self) -> None:
@@ -1193,7 +1211,7 @@ class HeadlessControlStateSource:
         self._program_failure_observer_failed = False
         return True
 
-    def _log_program_source_failure(self, error: Exception | None) -> None:
+    def _log_program_source_failure(self, error: Exception) -> None:
         now = time.monotonic_ns()
         if (
             self._program_source_log_ns is not None
@@ -1201,15 +1219,11 @@ class HeadlessControlStateSource:
         ):
             return
         self._program_source_log_ns = now
-        if error is None:
-            kind, code = "peer_closed", None
-        elif isinstance(error, HeadlessApiError):
-            kind = "HeadlessApiError"
+        if isinstance(error, (HeadlessApiError, ProgramRunnerClientError)):
+            kind = type(error).__name__
             code = error.code if error.code in _ERROR_CODES else "unknown"
         elif isinstance(error, ValidationError):
             kind, code = "ValidationError", None
-        elif isinstance(error, ConnectionClosed):
-            kind, code = "ConnectionClosed", None
         elif isinstance(error, TimeoutError):
             kind, code = "TimeoutError", None
         elif isinstance(error, OSError):
@@ -1219,7 +1233,7 @@ class HeadlessControlStateSource:
         _LOGGER.warning("Program control source failure: type=%s code=%s", kind, code)
 
     async def _run_program_source(self) -> None:
-        if self._runner_url is None:
+        if self._program_status is None:
             assert self._program_wake is not None
             wake = self._program_wake
             retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
@@ -1235,77 +1249,70 @@ class HeadlessControlStateSource:
             return
         retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
         while self._program_demanded() and not self._closed:
+            subscription: ProgramStatusSubscriptionPort | None = None
             try:
-                async with connect_websocket(
-                    self._runner_url,
-                    max_size=CONTROL_MAXIMUM_SNAPSHOT_BYTES,
-                    open_timeout=1.0,
-                    close_timeout=0.25,
-                ) as websocket:
-                    previous_sequence = 0
-                    async for message in websocket:
-                        if not isinstance(message, str):
-                            raise ValueError("Program control frame is not text")
-                        value = strict_json_object(
-                            message,
-                            label="Program control state",
-                            maximum_bytes=CONTROL_MAXIMUM_SNAPSHOT_BYTES,
+                subscription = await _drained_owner_read(self._program_status)
+                previous_sequence = 0
+                while True:
+                    value = await _next_program_frame(subscription)
+                    if value is None:
+                        continue
+                    if (
+                        set(value)
+                        != {
+                            "program_cycle",
+                            "schema_version",
+                            "server_sequence",
+                            "event_class",
+                        }
+                        or value.get("schema_version")
+                        != PROGRAM_CONTROL_STATE_SCHEMA
+                        or value.get("event_class")
+                        not in ("critical", "node_progress")
+                    ):
+                        raise ValueError(
+                            "Program control frame has an invalid shape"
                         )
-                        if (
-                            set(value)
-                            != {
-                                "program_cycle",
-                                "schema_version",
-                                "server_sequence",
-                                "event_class",
-                            }
-                            or value.get("schema_version")
-                            != PROGRAM_CONTROL_STATE_SCHEMA
-                            or value.get("event_class")
-                            not in ("critical", "node_progress")
-                        ):
-                            raise ValueError(
-                                "Program control frame has an invalid shape"
-                            )
-                        sequence_text = value.get("server_sequence")
-                        if (
-                            not isinstance(sequence_text, str)
-                            or not sequence_text.isascii()
-                            or not sequence_text.isdigit()
-                            or sequence_text.startswith("0")
-                        ):
-                            raise ValueError("Program control sequence is invalid")
-                        sequence = int(sequence_text)
-                        if sequence <= previous_sequence:
-                            raise ValueError("Program control sequence regressed")
-                        previous_sequence = sequence
-                        cycle = value.get("program_cycle")
-                        if not isinstance(cycle, dict):
-                            raise ValueError("Program control state omitted its cycle")
-                        event_class = value["event_class"]
-                        self._accept_cycle(cycle, event_class)
-                        retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
-                # A clean peer close also invalidates the cached authority.
-                self._log_program_source_failure(None)
-                self._invalidate_source("program")
+                    sequence_text = value.get("server_sequence")
+                    if (
+                        not isinstance(sequence_text, str)
+                        or not sequence_text.isascii()
+                        or not sequence_text.isdigit()
+                        or sequence_text.startswith("0")
+                    ):
+                        raise ValueError("Program control sequence is invalid")
+                    sequence = int(sequence_text)
+                    if sequence <= previous_sequence:
+                        raise ValueError("Program control sequence regressed")
+                    previous_sequence = sequence
+                    cycle = value.get("program_cycle")
+                    if not isinstance(cycle, dict):
+                        raise ValueError("Program control state omitted its cycle")
+                    event_class = value["event_class"]
+                    self._accept_cycle(cycle, event_class)
+                    retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
             except asyncio.CancelledError:
                 raise
             except (
-                ConnectionClosed,
                 OSError,
                 TimeoutError,
                 ValueError,
                 HeadlessApiError,
+                ProgramRunnerClientError,
             ) as error:
                 # Reconnection is source recovery, never command replay. Keep
                 # the newest visual state but stop issuing new frames until a
-                # current owner snapshot arrives.
+                # current owner snapshot arrives. A runner that ends the
+                # subscription (also cleanly) invalidates the cached authority.
                 self._log_program_source_failure(error)
                 self._invalidate_source("program")
             except Exception:
                 self._invalidate_source("program")
                 _LOGGER.exception("Unexpected Program control source failure")
                 raise
+            finally:
+                if subscription is not None:
+                    subscription.close()
             await asyncio.sleep(retry_seconds)
             retry_seconds = min(retry_seconds * 2, _SOURCE_RETRY_MAX_SECONDS)
 

@@ -47,7 +47,7 @@ def _config(root: Path, application_start_id: str) -> HeadlessApiConfig:
         historian_directory=history_directory,
         manager_run_root=manager_run_root,
         execution_run_root=execution_run_root,
-        cell_id="c1_build_authority_cell",
+        cell_id="canonical_empty_cell",
         application_start_id=application_start_id,
         freshness_milliseconds=100,
         historian_queue_capacity=32,
@@ -254,7 +254,7 @@ def test_native_failure_capture_protects_context_and_reports_its_limits(tmp_path
         assert capture["coverage"] == "uncertain"
         assert "tail_interrupted_by_restart" in capture["uncertainty"]
         assert capture["trigger"]["event_type"] == "client_incident_activated"
-        assert page.json()["retention"]["schema_version"] == "manyforge.historian_retention.v3"
+        assert page.json()["retention"]["schema_version"] == "manyforge.historian_retention.v4"
         rows = client.get("/api/execution/history", params={"capture_id": 1})
         assert rows.status_code == 200, rows.text
         assert [row["sequence"] for row in rows.json()["events"]] == [5, 4, 3, 2, 1]

@@ -36,6 +36,7 @@ from .control_protocol import (
     ExecutionControlSnapshotDTO,
     is_stop_command,
 )
+from .activity_history import CommandHistory
 from .control_state import (
     ControlStateFrame,
     ControlStateSubscription,
@@ -140,8 +141,11 @@ class ExecutionControlSession:
         *,
         shell_enricher: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        command_history: CommandHistory | None = None,
     ) -> None:
         self._websocket = websocket
+        # Each command's History row, once its receipt is queued.
+        self._command_history = command_history
         self._source = source
         self._ingress = ingress
         self._enrich = shell_enricher or (lambda value: value)
@@ -569,6 +573,8 @@ class ExecutionControlSession:
         if self._runtime_scale_pending is future:
             self._runtime_scale_pending = None
         if self._closed:
+            # Nobody reads the receipt; the command still has its row.
+            self._record_done(request, future)
             return
         kind = request.command.command_envelope.command_kind
         try:
@@ -603,6 +609,7 @@ class ExecutionControlSession:
             result = {
                 "code": getattr(error, "code", "execution_control_delivery_uncertain"),
                 "message": str(error)[:2048],
+                "details": dict(getattr(error, "details", None) or {}),
             }
         message = ExecutionCommandReceiptMessageDTO(
             schema_version=CONTROL_PROTOCOL_VERSION,
@@ -620,6 +627,40 @@ class ExecutionControlSession:
             self._closed = True
             self._slots.close()
         self._source.notify_control()
+        self._record_done(request, future)
+
+    def _record_done(
+        self,
+        request: ExecutionControlCommandDTO,
+        future: asyncio.Future[ExecutionControlSubmission],
+    ) -> None:
+        if future.cancelled():
+            return
+        error = future.exception()
+        if error is not None:
+            self._record(request, None, None, error)
+        else:
+            submission = future.result()
+            self._record(request, submission.receipt, submission.result)
+
+    def _record(
+        self,
+        request: ExecutionControlCommandDTO,
+        receipt: Any,
+        result: Any,
+        error: BaseException | None = None,
+    ) -> None:
+        """The command's History row, after its receipt is queued
+        (``record_activity`` never waits)."""
+
+        if self._command_history is not None:
+            self._command_history.control_command(
+                request.command,
+                receipt=receipt,
+                result=result,
+                error=error,
+                transport="ws",
+            )
 
     def _receive_command(self, message: ExecutionControlCommandDTO) -> None:
         kind = message.command.command_envelope.command_kind
@@ -652,6 +693,7 @@ class ExecutionControlSession:
                         result=None,
                     )
                 )
+                self._record(message, receipt, None)
                 return
         try:
             future = self._ingress.start(
@@ -676,6 +718,7 @@ class ExecutionControlSession:
                     result=None,
                 )
             )
+            self._record(message, receipt, None)
             return
         if runtime_scale:
             self._runtime_scale_pending = future
@@ -859,12 +902,14 @@ async def serve_execution_control(
     ingress: ExecutionControlIngress,
     *,
     shell_enricher: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    command_history: CommandHistory | None = None,
 ) -> None:
     await ExecutionControlSession(
         websocket,
         source,
         ingress,
         shell_enricher=shell_enricher,
+        command_history=command_history,
     ).serve()
 
 

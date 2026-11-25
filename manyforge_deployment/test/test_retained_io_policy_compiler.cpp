@@ -205,7 +205,7 @@ V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
   auto root = parse(
       R"({"api_version":"manyforge.program.v4",
     "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "program_profile":"composable-cell-v1",
+    "program_profile":"manyforge-cell-v1",
     "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
     "execution_groups":{"inspect":{"execution_policy":"independent"}},
     "blackboard":{"namespaces":[],"keys":[{"key":"ready","type":"bool","access":"read_write","persistence":"run","initial":false}]},

@@ -37,6 +37,8 @@ from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     OwnerInvocationResult,
     OwnerNodeInputs,
+    OwnerTaskObservationUnavailableError,
+    OwnerTaskReadRequiredError,
     OwnerTaskSnapshot,
     OwnerTaskState,
     ProgramRunPortContext,
@@ -85,6 +87,7 @@ from manyforge_behavior import program_runtime
 from manyforge_behavior.program_runtime import ProgramRunOwnerIdentity
 from manyforge_behavior.run_sender import RunSender
 from manyforge_program_runner.runtime_controls import ProgramRuntimeControls
+from .gateway_fakes import transport_gateway
 
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -102,18 +105,30 @@ def _sender_in_place(monkeypatch: pytest.MonkeyPatch) -> None:
     answered before the next tick, which reads it. A run ends on the tick
     after the one that sent its last request, never by thread timing."""
 
-    def sender(capacity: int, *, name: str = "manyforge-program-sender") -> RunSender:
-        return RunSender(capacity, name=name, spawn=lambda _name, work: work())
+    def sender(capacity: int, **options: Any) -> RunSender:
+        return RunSender(capacity, spawn=lambda _name, work: work(), **options)
 
     monkeypatch.setattr(program_runtime, "RunSender", sender)
 
 
-def _scene_step_sent(owner: ProgramRunOwner, program_run_id: int) -> ProgramRunSnapshot:
-    """The example Program's tick that ends its motion leaf: its Scene leaf
-    (remove_table) then sends its request on the run's sender and is RUNNING
-    until the answer (OD-213 (4)), so the run is still RUNNING. The next tick
-    reads the answer and ends the tree."""
+def _motion_start_sent(owner: ProgramRunOwner, program_run_id: int) -> ProgramRunSnapshot:
+    """The example Program's first tick: its motion leaf sends its start on
+    the run's sender (OD-380 D2) and is RUNNING until the answer."""
 
+    snapshot = owner.advance_once(program_run_id)
+    assert snapshot.state is ProgramRunState.RUNNING
+    assert snapshot.node_statuses["move_to_pick"] == "running"
+    return snapshot
+
+
+def _scene_step_sent(owner: ProgramRunOwner, program_run_id: int) -> ProgramRunSnapshot:
+    """The example Program's tick that ends its motion leaf (after the tick
+    that sent its start): its Scene leaf (remove_table) then sends its
+    request on the run's sender and is RUNNING until the answer (OD-213 (4)),
+    so the run is still RUNNING. The next tick reads the answer and ends the
+    tree."""
+
+    _motion_start_sent(owner, program_run_id)
     snapshot = owner.advance_once(program_run_id)
     assert snapshot.state is ProgramRunState.RUNNING
     assert snapshot.node_statuses["move_to_pick"] == "success"
@@ -124,8 +139,9 @@ def _scene_step_sent(owner: ProgramRunOwner, program_run_id: int) -> ProgramRunS
 def _host_scene_step_sent(host: ProgramRunTickHost) -> None:
     """`_scene_step_sent` for each run a manual host tick advances."""
 
-    snapshots = host.advance_ready_once()
-    assert snapshots
+    for _ in range(2):  # The motion start's tick, then the Scene leaf's.
+        snapshots = host.advance_ready_once()
+        assert snapshots
     for snapshot in snapshots:
         assert snapshot.state is ProgramRunState.RUNNING
         assert snapshot.node_statuses["remove_table"] == "running"
@@ -138,6 +154,13 @@ def _stop(owner: ProgramRunOwner, program_run_id: int, **kwargs: Any):
     return owner.finish_stop(program_run_id, owner.send_stop(program_run_id, **kwargs))
 
 
+def _apply_posted(host: ProgramRunTickHost, intent: Any) -> None:
+    """Tick the run once: its tick applies the posted command, the owner
+    calls of a Resume, Run, Retry or Execute inside it (OD-146, as base)."""
+
+    host.advance_ready_once()
+
+
 def _on_tick(host: ProgramRunTickHost, command: Callable[[], Any]) -> Any:
     """A host command handed to the run's tick (OD-146), in manual tick mode:
     its request waits on a thread; the test ticks the host once the command
@@ -146,9 +169,11 @@ def _on_tick(host: ProgramRunTickHost, command: Callable[[], Any]) -> Any:
     owner = host._owner  # noqa: SLF001
     posted = Event()
     post = owner.post_to_tick
+    intents: list[Any] = []
 
-    def post_and_note(*args):
-        intent = post(*args)
+    def post_and_note(*args, **kwargs):
+        intent = post(*args, **kwargs)
+        intents.append(intent)
         posted.set()
         return intent
 
@@ -168,7 +193,7 @@ def _on_tick(host: ProgramRunTickHost, command: Callable[[], Any]) -> Any:
             if not thread.is_alive():
                 break
         if posted.is_set():
-            host.advance_ready_once()
+            _apply_posted(host, intents[-1])
         thread.join(5)
     finally:
         del owner.post_to_tick
@@ -1004,10 +1029,12 @@ def test_start_captures_the_exact_scenario_closure_before_the_first_tick() -> No
     assert dict(started.capture.node_policy_by_instance_id) == {}
 
     sent = _scene_step_sent(owner, started.capture.program_run_id)
-    assert sent.node_status_revision == 2
+    # One revision more: the motion start's tick (OD-380 D2) changes the
+    # node statuses too (move_to_pick running).
+    assert sent.node_status_revision == 3
     completed = owner.advance_once(started.capture.program_run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
-    assert completed.node_status_revision == 3
+    assert completed.node_status_revision == 4
     assert set(completed.node_statuses.values()) == {"success"}
     assert completed.active_operation_count == 0
 
@@ -1306,6 +1333,7 @@ def test_failed_tree_projects_the_exact_focused_owner_failure() -> None:
     )
     started = owner.start(admission)
 
+    _motion_start_sent(owner, started.capture.program_run_id)
     failed = owner.advance_once(started.capture.program_run_id)
 
     assert failed.state is ProgramRunState.FAILED
@@ -1374,6 +1402,7 @@ def test_authored_pause_requires_intervention_without_redispatch() -> None:
     )
     started = owner.start(admission)
 
+    _motion_start_sent(owner, started.capture.program_run_id)
     paused = owner.advance_once(started.capture.program_run_id)
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
     assert paused.active_operation_count is None
@@ -1520,6 +1549,7 @@ def test_terminal_reset_uncontained_stop_accepts_only_current_zero_sample(stop_s
         initial_task_state=OwnerTaskState.FAILED
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     terminal = owner.advance_once(run_id)
     assert terminal.state is ProgramRunState.FAILED
     assert terminal.active_operation_count == 0
@@ -1689,7 +1719,7 @@ def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_
     )
     operation_id = native_task.metadata["operation_id"]
     transport.operations[operation_id]["state"] = "intervention_required"
-    assert native.operations.observe(native_task.task_id).state is OwnerTaskState.FAILED
+    assert native.operations.observe(native_task.task_id, reads=True).state is OwnerTaskState.FAILED
 
     terminal = owner.advance_once(run_id)
     assert terminal.state is ProgramRunState.FAILED
@@ -1772,6 +1802,7 @@ def test_terminal_reset_partial_lost_reply_cannot_reuse_partial_proof():
         initial_task_state=OwnerTaskState.FAILED
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     scope.state = ProgramRunScopeState.UNKNOWN
     scope.unknown_reason_code = "program_run_stop_partial"
@@ -2038,6 +2069,7 @@ def test_failure_pause_stops_all_program_motion_once() -> None:
         interventions=interventions,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     paused = owner.advance_once(run_id)
 
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
@@ -2094,6 +2126,7 @@ def test_a_simulation_not_playing_refusal_is_the_operator_stop_until_run() -> No
             request_key=request_key,
         )
 
+    _motion_start_sent(owner, run_id)
     held = owner.advance_once(run_id)
     assert held.state is ProgramRunState.RUNNING
     assert held.reason_code is None
@@ -2110,6 +2143,7 @@ def test_a_simulation_not_playing_refusal_is_the_operator_stop_until_run() -> No
     assert task.refused == 1 and scope.stop_requests == 1 and task.starts == 0
 
     run_after_play(_key())
+    _motion_start_sent(owner, run_id)
     again = owner.advance_once(run_id)
     assert again.state is ProgramRunState.RUNNING
     assert task.refused == 2 and scope.stop_requests == 2
@@ -2159,6 +2193,7 @@ def _failure_paused_run():
     )
     holder["scope"] = scope
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     paused = owner.advance_once(run_id)
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
     failure = interventions.read(run_id)
@@ -2220,6 +2255,7 @@ def test_failure_pause_stays_dormant_whatever_the_owner_deadline(deadline_ns) ->
         interventions=interventions,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     assert owner.advance_once(run_id).state is ProgramRunState.INTERVENTION_REQUIRED
     failure = interventions.read(run_id)
     assert failure.owner_assessment["observed_state_valid_until_ns"] == deadline_ns
@@ -2244,6 +2280,7 @@ def test_press_time_failure_refresh_reads_the_owner_and_keeps_the_acknowledgemen
         interventions=interventions,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     assert owner.advance_once(run_id).state is ProgramRunState.INTERVENTION_REQUIRED
     failure = interventions.read(run_id)
     interventions.refresh_owner_assessment(
@@ -2337,6 +2374,7 @@ def test_unconfirmed_failure_containment_is_visible_and_blocks_retry() -> None:
     )
     scope.state = ProgramRunScopeState.UNKNOWN  # the containment Stop fails
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     paused = owner.advance_once(run_id)
 
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
@@ -2368,6 +2406,7 @@ def test_ordinary_stop_intervention_sends_no_extra_failure_pause_stop() -> None:
         interventions=interventions,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     held = owner.advance_once(run_id)
     assert held.state is ProgramRunState.INTERVENTION_REQUIRED
@@ -2389,6 +2428,7 @@ def test_tick_host_does_not_schedule_an_ordinary_held_intervention() -> None:
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     started = host.start_run(admission)
 
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     assert host.advance_ready_once()[0].state is (ProgramRunState.INTERVENTION_REQUIRED)
     assert host.advance_ready_once() == ()
     assert task.starts == 1
@@ -2410,6 +2450,7 @@ def test_tick_host_keeps_only_operator_stop_intervention_observable() -> None:
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     started = host.start_run(admission)
 
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
     held = host.advance_ready_once()[0]
     assert held.state is ProgramRunState.INTERVENTION_REQUIRED
@@ -2584,6 +2625,7 @@ def test_motion_stop_holds_the_current_node_and_resume_hands_off_its_exact_fence
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     started = host.start_run(admission)
 
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
     scope.state = ProgramRunScopeState.ACTIVE
     stopped = owner.stop_motion(
@@ -2642,6 +2684,7 @@ def test_manual_handover_reuses_cleanup_without_releasing_or_repeating_work(new_
         interventions=interventions,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     scope.state = ProgramRunScopeState.ACTIVE
     owner.stop_motion(run_id, stop_request_key=_key())
@@ -2712,6 +2755,7 @@ def test_manual_handover_rejects_inexact_scope_before_cleanup(invalid):
         interventions=interventions,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     scope.state = ProgramRunScopeState.ACTIVE
     owner.stop_motion(run_id, stop_request_key=_key())
@@ -2764,6 +2808,7 @@ def test_motion_recovery_cannot_resume_across_a_new_stop_or_failed_handoff(
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     started = host.start_run(admission)
     run_id = started.capture.program_run_id
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     host.advance_ready_once()
     scope.state = ProgramRunScopeState.ACTIVE
     owner.stop_motion(run_id, stop_request_key=_key())
@@ -2832,6 +2877,7 @@ def test_recovery_preflights_only_its_exact_program_stop(program_scope):
     )
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     run_id = host.start_run(admission).capture.program_run_id
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     host.advance_ready_once()
     scope.state = ProgramRunScopeState.ACTIVE
     if program_scope:
@@ -2890,7 +2936,7 @@ def test_explicit_stop_recaptures_a_lost_reply_through_the_native_scope():
     run_id = owner.start(admission).capture.program_run_id
     owner.advance_once(run_id)
     transport = _Transport()
-    native = NativeKernelProgramPort(KernelClient(transport))
+    native = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     native.bind(replace(_context(), program_run_id=run_id))
     owner._scope = native.scope
     # This test's own Kernel stand-in for the Forced Program End and the one
@@ -2952,6 +2998,7 @@ def test_halt_overtakes_a_held_execute_without_releasing_the_newer_halt():
     )
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     run_id = host.start_run(admission).capture.program_run_id
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     host.advance_ready_once()
     _host_halt(host, scope, run_id)
     assert host.advance_ready_once()[0].state is ProgramRunState.HALTED
@@ -2977,6 +3024,7 @@ def test_halt_never_waits_for_a_scheduling_scope_read():
         interventions=ProgramInterventionRegistry(maximum_retained_runs=8),
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     entered, finish, first_done, second_done = Event(), Event(), Event(), Event()
     read_scope = scope.execution_scope
@@ -3069,6 +3117,7 @@ def test_selection_status_never_settles_an_observed_completed_task():
         initial_task_state=OwnerTaskState.ACTIVE
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     owner.stop_motion(run_id, stop_request_key=_key())
     _tick_end(owner, run_id)
@@ -3100,7 +3149,11 @@ def test_selection_status_never_settles_an_observed_completed_task():
         expected_hold_revision=controls["hold_revision"],
         request_key=_key(),
     )
-    _scene_step_sent(owner, run_id)
+    # The motion leaf already succeeded: only the Scene leaf's tick is left
+    # (`_scene_step_sent` would first expect the motion start's tick).
+    sent = owner.advance_once(run_id)
+    assert sent.state is ProgramRunState.RUNNING
+    assert sent.node_statuses["remove_table"] == "running"
     completed = owner.advance_once(run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
     assert completed.active_operation_count == 0
@@ -3538,6 +3591,7 @@ def test_selection_projection_uses_retained_owner_assessment_without_owner_io():
         interventions=interventions,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     owner.stop_motion(run_id, stop_request_key=_key())
     owner.advance_once(run_id)
@@ -3632,7 +3686,7 @@ def test_resume_crossed_by_a_run_revision_change_is_still_admitted():
     )
     # The run revision moves after the Resume was posted, before its tick.
     owner.note_runtime_control_change(run_id)
-    host.advance_ready_once()
+    _apply_posted(host, thread.intent)
     _answer(thread, outcome)
     assert scope.release_requests == 1
     _on_tick(host, lambda: host.stop_run(run_id))
@@ -3814,6 +3868,7 @@ def test_a_halt_with_a_faulted_stop_shows_the_fault():
         task_factory=_OperatorStopTaskPort,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     _halted_with_a_faulted_node(owner, scope, run_id)
     scope.held = True  # The Kernel scope names the faulted nodes.
@@ -4071,6 +4126,7 @@ def test_parallel_stop_records_both_attempts_before_halt_recovery() -> None:
     program = Program.from_dict(document, admission.environment.catalog)
     admission = _admission_for_program(admission, program, [])
     run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)  # The motion starts' tick (OD-380 D2).
     assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
     assert task.starts == 2
     assert _halt(owner, run_id).state is ProgramRunState.HALTING
@@ -4143,6 +4199,7 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
 
     task.observe = current_assessment
     run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)  # The motion starts' tick (OD-380 D2).
     owner.advance_once(run_id)
     owner.stop_motion(run_id, stop_request_key=_key())
     first = owner.advance_once(run_id)
@@ -4193,6 +4250,249 @@ def test_selected_resume_refreshes_siblings_and_retains_partial_cleanup(policy) 
     assert scope.release_requests == 1
     owner.advance_once(run_id)
     assert task.starts == 4
+    _stop(owner, run_id)
+
+
+class _ReadRequiredStopTaskPort(_OperatorStopTaskPort):
+    """As production (OD-380 D2): the observation of a stopped (interrupted)
+    or failed task is memory only unless ``reads``; without them it raises
+    ``OwnerTaskReadRequiredError``, whose ``read`` makes the read. A node in
+    ``stopped`` was stopped by its Stop; one in ``failing`` fails into its
+    authored pause; the others keep running."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.stopped: set[str] = set()
+        self.failing: set[str] = set()
+        self.reads = 0
+        self.read_error: Exception | None = None
+
+    def start(self, _node_id, identity, _inputs) -> OwnerTaskSnapshot:
+        self.starts += 1
+        return OwnerTaskSnapshot(
+            task_id=f"{identity.node_instance_id}#{self.starts}",
+            state=OwnerTaskState.ACTIVE,
+        )
+
+    def observe(self, task_id: str, *, reads: bool = False) -> OwnerTaskSnapshot:
+        node = task_id.split("#")[0]
+        if node not in self.stopped | self.failing:
+            return OwnerTaskSnapshot(task_id=task_id, state=OwnerTaskState.ACTIVE)
+        if not reads:
+            raise OwnerTaskReadRequiredError(lambda: self.observe(task_id, reads=True))
+        self.reads += 1
+        if self.read_error is not None:
+            raise self.read_error
+        if node in self.failing:
+            return OwnerTaskSnapshot(
+                task_id=task_id,
+                state=OwnerTaskState.FAILED,
+                metadata={
+                    **_SETTLED_FAILURE_METADATA,
+                    "authored_failure_policy": "pause_for_operator",
+                    "authored_failure_policy_parameter": "no_feasible_plan_policy",
+                },
+                reason_code="no_feasible_candidate",
+                message="No pick candidate is feasible",
+                settlement_proven=True,
+            )
+        return super().observe(task_id)
+
+
+def _two_group_stop_run():
+    """arm_move (group arm) and tool_move (group tools) both move; the
+    Kernel stand-in holds only the nodes of the groups a Stop names."""
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE,
+        task_factory=_ReadRequiredStopTaskPort,
+        interventions=interventions,
+    )
+    document = admission.program.to_dict()
+    move = document["tree"]["children"][0]
+    children = []
+    for instance_id, group in (("arm_move", "arm"), ("tool_move", "tools")):
+        child = deepcopy(move)
+        child["instance_id"] = instance_id
+        child["execution_groups"] = [group]
+        child["recovery_policy"] = {"allow_intervention": True, "max_retries": 0}
+        children.append(child)
+    document["tree"] = {
+        "node_id": "parallel",
+        "instance_id": "parallel",
+        "parameters": {"success_policy": "all"},
+        "children": children,
+    }
+    document["execution_groups"] = {
+        group: {"execution_policy": "independent"} for group in ("arm", "tools")
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v4",
+    )
+    program = Program.from_dict(document, admission.environment.catalog)
+    rows = [row.to_dict() for row in program_node_policies(program)]
+    admission = _admission_for_program(admission, program, rows)
+    run_id = owner.start(admission).capture.program_run_id
+    held: set[int] = set()
+    read, stop, release = (
+        scope.execution_scope, scope.stop_selection, scope.release_selection
+    )
+
+    def members(request) -> set[int]:
+        nodes = set().union(
+            *(scope.group_members.get(group, ()) for group in request["group_ids"])
+        )
+        if request.get("node_instance_id"):
+            nodes.add(request["node_instance_id"])
+        return {scope.node_ids.index(node) for node in nodes}
+
+    def execution_scope(program_run_id):
+        return {**read(program_run_id), "held_node_indices": sorted(held)}
+
+    def stop_selection(request):
+        held.update(members(request))
+        return {**stop(request), "state": execution_scope(request["program_run_id"])}
+
+    def release_selection(request, expected_hold_revision):
+        release(request, expected_hold_revision)
+        held.difference_update(members(request))
+        scope.held = bool(held)
+        return execution_scope(request["program_run_id"])
+
+    scope.execution_scope = execution_scope
+    scope.stop_selection = stop_selection
+    scope.release_selection = release_selection
+    owner.advance_once(run_id)  # The motion starts' tick (OD-380 D2).
+    assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    return owner, task, scope, interventions, run_id
+
+
+def _operator_stop_arm(owner, task, interventions, run_id) -> None:
+    """The operator stops group arm; tool_move keeps running. The stopped
+    node reads its interrupted task on the run's sender, then records its
+    operator-Stop hold."""
+    task.stopped.add("arm_move")
+    owner.stop_motion(run_id, group_id="arm", stop_request_key=_key())
+    for _ in range(4):
+        snapshot = owner.advance_once(run_id)
+        if any(
+            row.identity.node_instance_id == "arm_move"
+            for row in interventions.read_all(run_id)
+        ):
+            break
+    assert snapshot.node_statuses["tool_move"] == "running"
+    assert [row.identity.node_instance_id for row in interventions.read_all(run_id)] == [
+        "arm_move"
+    ]
+    _tick_end(owner, run_id)
+
+
+@pytest.mark.parametrize("group_id", ["arm", "all"], ids=["resume", "replan"])
+def test_resume_after_one_groups_operator_stop_reads_the_stopped_task(group_id) -> None:
+    """Live regression: the tick's observation of a stopped task needs a read
+    (OD-380 D2). Resume of the stopped group (and the offer's
+    replan_from_stopped_state, which resumes every held group) makes that
+    read as base did, replans the stopped task and releases its group while
+    the other group keeps running."""
+    owner, task, scope, interventions, run_id = _two_group_stop_run()
+    _operator_stop_arm(owner, task, interventions, run_id)
+    reads = task.reads
+    releases = scope.release_requests
+
+    resumed = owner.resume_motion(
+        run_id,
+        expected_hold_revision=scope.hold_revision,
+        request_key=_key(),
+        group_id=group_id,
+    )
+    assert resumed.state is ProgramRunState.RUNNING
+    assert task.reads > reads  # The assessment's read, made by the command.
+    assert [recovered[0].split("#")[0] for recovered in task.recoveries] == ["arm_move"]
+    assert scope.release_requests == releases + 1
+    assert scope.last_selection_release["group_ids"] == [group_id]
+    assert interventions.read_all(run_id) == ()
+    _stop(owner, run_id)
+
+
+@pytest.mark.parametrize("operation", ["retry", "continue"])
+def test_failure_hold_release_reads_a_stopped_siblings_task(operation) -> None:
+    """A failure hold's Retry or Continue that releases an operator-stopped
+    node's group recovers that node first, reading its stopped task as base
+    did."""
+    owner, task, scope, interventions, run_id = _two_group_stop_run()
+    _operator_stop_arm(owner, task, interventions, run_id)
+    task.failing.add("tool_move")
+    for _ in range(4):
+        paused = owner.advance_once(run_id)
+        if paused.state is ProgramRunState.INTERVENTION_REQUIRED:
+            break
+    assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
+    tool = _hold(interventions, run_id, "tool_move")
+    task.close = lambda *_args, **_kwargs: True
+    reads = task.reads
+    release = (
+        owner.retry_failure_pause
+        if operation == "retry"
+        else lambda run, **kwargs: owner.continue_failure_pause(
+            run, **{key: value for key, value in kwargs.items() if key != "action"}
+        )
+    )
+    release(
+        run_id,
+        node_attempt_id=tool.identity.node_attempt_id,
+        action=None,
+        request_key=_key(),
+        reason=None,
+    )
+    assert task.reads > reads
+    assert [recovered[0].split("#")[0] for recovered in task.recoveries] == ["arm_move"]
+    assert scope.last_selection_release["group_ids"] == ["all"]
+    _stop(owner, run_id)
+
+
+def test_unreadable_stopped_task_refuses_resume_with_its_typed_code() -> None:
+    owner, task, scope, interventions, run_id = _two_group_stop_run()
+    _operator_stop_arm(owner, task, interventions, run_id)
+    task.read_error = OwnerTaskObservationUnavailableError("owner unreachable")
+    releases = scope.release_requests
+
+    with pytest.raises(ProgramRunOwnerError) as refused:
+        owner.resume_motion(
+            run_id,
+            expected_hold_revision=scope.hold_revision,
+            request_key=_key(),
+            group_id="arm",
+        )
+    # The held node whose assessment is unreadable is not recoverable now
+    # (`_recovery_candidates` names a held non-candidate so, as base).
+    assert refused.value.code == "selected_owner_recovery_unavailable"
+    assert refused.value.details == {"node_instance_id": "arm_move"}
+    assert scope.release_requests == releases and not task.recoveries
+    # A stale selection names both hold revisions.
+    with pytest.raises(ProgramRunOwnerError) as stale:
+        owner.resume_motion(
+            run_id,
+            expected_hold_revision=scope.hold_revision - 1,
+            request_key=_key(),
+            group_id="arm",
+        )
+    assert stale.value.code == "program_runtime_control_stale"
+    assert stale.value.details == {
+        "expected_hold_revision": scope.hold_revision - 1,
+        "current_hold_revision": scope.hold_revision,
+    }
+    # Nothing of group tools is held.
+    with pytest.raises(ProgramRunOwnerError) as not_held:
+        owner.resume_motion(
+            run_id,
+            expected_hold_revision=scope.hold_revision,
+            request_key=_key(),
+            group_id="tools",
+        )
+    assert not_held.value.code == "selection_not_held"
     _stop(owner, run_id)
 
 
@@ -4332,6 +4632,7 @@ def test_an_operator_stop_intervention_keeps_program_time_running() -> None:
         interventions=interventions,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     assert owner.advance_once(run_id).state is ProgramRunState.INTERVENTION_REQUIRED
     # The tree keeps ticking; each held node decides how its held time counts.
@@ -4352,6 +4653,7 @@ def test_halt_then_execute_keeps_motion_stopped_until_resume() -> None:
     started = host.start_run(admission)
     program_run_id = started.capture.program_run_id
 
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     running = host.advance_ready_once()[0]
     assert running.state is ProgramRunState.RUNNING
     assert running.tree_status == "running"
@@ -4415,6 +4717,7 @@ def test_halt_waits_for_scope_settlement_before_freezing_the_tree() -> None:
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     started = host.start_run(admission)
     program_run_id = started.capture.program_run_id
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
     scope.state = ProgramRunScopeState.ACTIVE
 
@@ -4447,6 +4750,7 @@ def test_operator_stop_without_exact_identity_fails_before_held_tree_progress() 
     )
     started = owner.start(admission)
 
+    _motion_start_sent(owner, started.capture.program_run_id)
     assert owner.advance_once(started.capture.program_run_id).state is (
         ProgramRunState.RUNNING
     )
@@ -4881,6 +5185,7 @@ def test_tick_host_rejects_recovery_before_changing_owner_when_queue_is_full() -
     )
     host = ProgramRunTickHost(owner, maximum_scheduled_runs=1)
     started = host.start_run(admission)
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     paused = host.advance_ready_once()[0]
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
     intervention = interventions.read(started.capture.program_run_id)
@@ -5057,6 +5362,7 @@ def test_failure_is_not_relabelled_as_stopped_while_kernel_work_settles() -> Non
         initial_task_state=OwnerTaskState.FAILED
     )
     started = owner.start(admission)
+    _motion_start_sent(owner, started.capture.program_run_id)
     scope.state = ProgramRunScopeState.ACTIVE
 
     stopping = owner.advance_once(started.capture.program_run_id)
@@ -5708,6 +6014,7 @@ def test_owner_refusal_reaches_status_diagnostic_and_offer_exactly() -> None:
     )
     run_id = owner.start(_pausing_move(admission)).capture.program_run_id
 
+    _motion_start_sent(owner, run_id)
     paused = owner.advance_once(run_id)
 
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
@@ -5741,6 +6048,7 @@ def test_terminal_owner_refusal_keeps_its_details_and_origin() -> None:
     )
     run_id = owner.start(admission).capture.program_run_id
 
+    _motion_start_sent(owner, run_id)
     failed = owner.advance_once(run_id)
 
     assert failed.state is ProgramRunState.FAILED
@@ -5811,6 +6119,8 @@ def test_runner_failure_names_the_program_runner_without_details(
 
     if task_state is OwnerTaskState.SUCCEEDED:
         _scene_step_sent(owner, run_id)
+    else:
+        _motion_start_sent(owner, run_id)
     scope.observe = unknown_scope
     snapshot = owner.advance_once(run_id)
 
@@ -5860,6 +6170,7 @@ def test_program_owner_halt_preserves_delivery_settled_dwell_attempt():
     owner,admission,task,scope,events = _fixture(initial_task_state=OwnerTaskState.SUCCEEDED,
         task_factory=lambda events:DwellPort(events,OwnerTaskState.SUCCEEDED),program_clock_source=lambda:now[0])
     run_id=owner.start(_program_dwell_admission(admission, "continue")).capture.program_run_id
+    owner.advance_once(run_id)  # The gripper start's tick (OD-380 D2).
     assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
     run=owner._runs[run_id].run
     wrapped=run._authored_nodes["command"]
@@ -5892,6 +6203,7 @@ def test_program_owner_retires_held_preparation_before_exact_selected_release(cl
     owner,admission,task,scope,events = _fixture(initial_task_state=OwnerTaskState.ACTIVE,
         task_factory=lambda events:UnsentPort(events,OwnerTaskState.ACTIVE))
     run_id=owner.start(_program_dwell_admission(admission)).capture.program_run_id
+    owner.advance_once(run_id)  # The gripper start's tick (OD-380 D2).
     assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
     scope.state=ProgramRunScopeState.SETTLED
     owner.stop_motion(run_id,group_id="all",stop_request_key=_key())
@@ -6212,6 +6524,7 @@ def test_run_stopped_during_an_automatic_retry_wait_leaves_nothing_resident() ->
     )
     run_id = owner.start(admission).capture.program_run_id
 
+    _motion_start_sent(owner, run_id)
     waiting = owner.advance_once(run_id)
 
     assert waiting.state is ProgramRunState.RUNNING  # The wait keeps the node running.
@@ -6309,6 +6622,7 @@ def _two_group_holds(
     rows = [row.to_dict() for row in program_node_policies(program)]
     admission = _admission_for_program(admission, program, rows)
     run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)  # The motion starts' tick (OD-380 D2).
     paused = owner.advance_once(run_id)
     return owner, task, scope, interventions, run_id, paused
 
@@ -6441,6 +6755,127 @@ def test_own_groups_scope_stops_and_releases_only_the_held_nodes_groups() -> Non
     )
     assert scope.last_selection_release["group_ids"] == ["tools"]
     _stop(owner, run_id)
+
+
+class _ArmFailsToolMovesPort(_HeldFailureTaskPort):
+    """arm_move fails into its hold; tool_move's operation runs until
+    ``done``, then has completed."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.done = False
+        self.acknowledged: list[str] = []
+
+    def start(self, node_id, identity, inputs) -> OwnerTaskSnapshot:
+        if identity.node_instance_id == "arm_move":
+            return super().start(node_id, identity, inputs)
+        self.starts += 1
+        return OwnerTaskSnapshot(task_id="tool-task", state=OwnerTaskState.ACTIVE)
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        if task_id != "tool-task":
+            return super().observe(task_id)
+        return OwnerTaskSnapshot(
+            task_id=task_id,
+            state=OwnerTaskState.SUCCEEDED if self.done else OwnerTaskState.ACTIVE,
+        )
+
+    def acknowledge(self, task_id, _identity) -> None:
+        self.acknowledged.append(task_id)
+
+
+@pytest.mark.parametrize("release", ["stop_all", "retry"])
+def test_own_groups_pause_settles_the_other_groups_node_on_its_first_tick(release) -> None:
+    """As base: a held failure pauses the whole tree, also with `own_groups`
+    (only the held node's groups stop; the other group's motion goes on).
+    The other group's node whose operation completed meanwhile stays running
+    while the run is paused and unscheduled, and ends SUCCESS on the first
+    tick once a Stop all holds it (its settlement is observed) or the
+    operator releases the hold."""
+    interventions = ProgramInterventionRegistry(maximum_retained_runs=8)
+    owner, admission, task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED,
+        task_factory=_ArmFailsToolMovesPort,
+        interventions=interventions,
+    )
+    document = admission.program.to_dict()
+    move = document["tree"]["children"][0]
+    children = []
+    for instance_id, group in (("arm_move", "arm"), ("tool_move", "tools")):
+        child = deepcopy(move)
+        child["instance_id"] = instance_id
+        child["execution_groups"] = [group]
+        child["recovery_policy"] = {
+            "allow_intervention": True,
+            "max_retries": 0,
+            "intervention_stop_scope": "own_groups",
+        }
+        children.append(child)
+    document["tree"] = {
+        "node_id": "parallel",
+        "instance_id": "parallel",
+        "parameters": {"success_policy": "all"},
+        "children": children,
+    }
+    document["execution_groups"] = {
+        group: {"execution_policy": "independent"} for group in ("arm", "tools")
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v4",
+    )
+    program = Program.from_dict(document, admission.environment.catalog)
+    rows = [row.to_dict() for row in program_node_policies(program)]
+    admission = _admission_for_program(admission, program, rows)
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    run_id = host.start_run(admission).capture.program_run_id
+    # Like the Kernel, the pause's `arm` Stop holds only arm_move (this
+    # stand-in otherwise holds every node).
+    arm_index = owner._entry(run_id).run._scope_node_ids.index("arm_move")  # noqa: SLF001
+    every_node_read, every_node_stop = scope.execution_scope, scope.stop_selection
+
+    def arm_held(program_run_id):
+        read = dict(every_node_read(program_run_id))
+        if read["held_node_indices"]:
+            read["held_node_indices"] = [arm_index]
+        return read
+
+    def arm_stop(request):
+        return {**every_node_stop(request), "state": arm_held(request["program_run_id"])}
+
+    scope.execution_scope, scope.stop_selection = arm_held, arm_stop
+    for _ in range(3):
+        host.advance_ready_once()
+    paused = owner.read(run_id)
+    assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
+    assert scope.last_selection_stop["group_ids"] == ["arm"]
+    assert run_id not in host._scheduled  # noqa: SLF001 (dormant, unscheduled)
+    task.done = True
+    assert owner.advance_once(run_id).node_statuses["tool_move"] == "running"
+    assert task.acknowledged == []
+
+    if release == "stop_all":
+        scope.execution_scope, scope.stop_selection = every_node_read, every_node_stop
+        owner.stop_motion(run_id, group_id="all", stop_request_key=_key())
+    else:
+        arm = _hold(interventions, run_id, "arm_move")
+        owner.retry_failure_pause(
+            run_id,
+            node_attempt_id=arm.identity.node_attempt_id,
+            action=None,
+            request_key=_key(),
+            reason=None,
+        )
+        owner.resolve_intervention(
+            run_id, node_attempt_id=arm.identity.node_attempt_id, action="retry"
+        )
+    host.schedule(run_id)
+    host.advance_ready_once()
+    assert owner.read(run_id).node_statuses["tool_move"] == "success"
+    assert task.acknowledged == ["tool-task"]
+    host.shutdown()
 
 
 def _release_for(held: str, others: Sequence[str], *, scope: str = "all"):
@@ -6580,6 +7015,7 @@ def test_a_failed_run_keeps_its_operation_failure_row_until_reset() -> None:
         task_factory=lambda events: _FailedFactTaskPort(events, OwnerTaskState.FAILED),
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     failed = owner.advance_once(run_id)
 
     assert failed.state is ProgramRunState.FAILED
@@ -6608,6 +7044,7 @@ def test_the_run_end_says_why_the_run_ended() -> None:
         task_factory=lambda events: _FailedFactTaskPort(events, OwnerTaskState.FAILED),
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     failed = owner.advance_once(run_id).to_dict()
     assert failed["state"] == "failed"
     assert failed["run_end"]["end_reason"] == "failed"
@@ -6674,6 +7111,7 @@ class _MockRunRecorder:
         self.sent: list[tuple[Any, ...]] = []
         self.recorded: list[tuple[Any, ...]] = []
         self.resends: list[int] = []
+        self._due = False  # A recorded state the run's sender has not sent.
 
     def set_run_paused(self, program_run_id, run_revision, paused, held=()) -> None:
         self.calls.append(("pause", program_run_id, run_revision, paused, tuple(held)))
@@ -6685,7 +7123,16 @@ class _MockRunRecorder:
         # Memory only, like the native port's record.
         self.calls.append(("pause", program_run_id, run_revision, paused, tuple(held)))
         self.recorded.append(self.calls[-1])
+        self._due = True
         return True
+
+    def _send_recorded(self) -> None:
+        # The run's sender sends the latest recorded state (resend_run_pause).
+        if not self._due or not self.recorded:
+            return
+        _pause, _run, run_revision, paused, held = self.recorded[-1]
+        if self.events is not None:
+            self.events.append(f"mock_snapshot:{run_revision}:{paused}:{','.join(held)}")
 
     def end(self, start_request) -> None:  # pragma: no cover - no Mock nodes here
         self.calls.append(("end", start_request))
@@ -6695,7 +7142,12 @@ class _MockRunRecorder:
 
     def resend_run_pause(self, program_run_id):
         self.resends.append(program_run_id)
+        self._send_recorded()
+        self._due = False
         return (), None
+
+    def settlement_due(self, program_run_id) -> bool:
+        return self._due
 
 
 def test_mock_run_pause_follows_run_start_halt_and_resume_but_not_teardown():
@@ -7017,6 +7469,7 @@ def test_halt_is_mirrored_from_kernel_hold_facts_without_an_owner_stop_call() ->
     )
     host = ProgramRunTickHost(owner, tick_interval_s=0.01)
     run_id = host.start_run(admission).capture.program_run_id
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     assert host.advance_ready_once()[0].state is ProgramRunState.RUNNING
 
     _host_halt(host, scope, run_id)
@@ -7117,6 +7570,7 @@ def test_a_halting_run_is_halted_once_its_scope_settles() -> None:
         task_factory=_OperatorStopTaskPort,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     scope.state = ProgramRunScopeState.ACTIVE
     _halt(owner, run_id)
@@ -7172,6 +7626,7 @@ def test_a_halting_run_with_a_faulted_node_is_halted_once_none_is_stopping() -> 
         task_factory=_OperatorStopTaskPort,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     halted = _halted_with_a_faulted_node(owner, scope, run_id)
     # Further Halting reads change nothing on the halted run.
@@ -7185,6 +7640,7 @@ def test_execute_after_a_halt_with_a_faulted_node_keeps_the_kernel_refusal() -> 
         task_factory=_OperatorStopTaskPort,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     halted = _halted_with_a_faulted_node(owner, scope, run_id)
     # C3: the Kernel refuses the Halt release over a faulted node.
@@ -7226,6 +7682,7 @@ def _run_in_state(start_state: ProgramRunState):
         )
     owner, admission, _task, scope, _events = fixture
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     if start_state is ProgramRunState.HALTED:
         _halted_with_a_faulted_node(owner, scope, run_id)
@@ -7328,6 +7785,7 @@ def test_a_released_freeze_returns_a_halting_or_halted_run_to_running(settled) -
     mock = _MockRunRecorder()
     owner._ports = replace(owner._ports, mock_simulation=mock)
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     if not settled:
         scope.state = ProgramRunScopeState.ACTIVE
@@ -7347,7 +7805,9 @@ def test_a_released_freeze_returns_a_halting_or_halted_run_to_running(settled) -
     assert running.state is ProgramRunState.RUNNING
     assert running.run_revision > halted.run_revision
     assert not owner._runs[run_id].run.program_clock.frozen  # noqa: SLF001
-    assert mock.sent[-1][:4] == ("pause", run_id, running.run_revision, False)
+    # Recorded by the tick and sent on the run's sender (OD-380 D2).
+    assert mock.recorded[-1][:4] == ("pause", run_id, running.run_revision, False)
+    assert not mock.settlement_due(run_id)
     assert scope.release_requests == 0
     _stop(owner, run_id)
 
@@ -7368,6 +7828,7 @@ def test_a_halting_or_halted_run_publishes_the_cause_of_its_halt(frozen, kind, l
         task_factory=_OperatorStopTaskPort,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     assert owner.read(run_id).halt is None
     assert owner.read(run_id).to_dict()["halt"] is None
@@ -7460,6 +7921,7 @@ def test_facts_older_than_an_accepted_execute_are_ignored() -> None:
         task_factory=_OperatorStopTaskPort,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     _halt(owner, run_id)
     stale = _kernel_facts(scope, run_id)
@@ -7528,6 +7990,7 @@ def test_refused_release_does_not_record_revision() -> None:
         task_factory=_OperatorStopTaskPort,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     _halt(owner, run_id)
     halt_revision = scope.hold_revision
@@ -7554,6 +8017,7 @@ def test_a_newer_freeze_of_a_halted_run_raises_its_run_revision() -> None:
         task_factory=_OperatorStopTaskPort,
     )
     run_id = owner.start(admission).capture.program_run_id
+    _motion_start_sent(owner, run_id)
     owner.advance_once(run_id)
     _halt(owner, run_id)
     halted = owner.reconcile_halting(run_id)
@@ -7583,10 +8047,12 @@ def test_changed_hold_facts_are_read_on_the_next_tick_only() -> None:
     refresh = owner.refresh_selection_scope
     refresh_reads: list[int] = []
 
-    def spy(program_run_id):
+    def spy(program_run_id, *, read=True):
+        # Every tick applies an answered read; changed facts send one.
         before = calls.count("execution_scope")
-        snapshot = refresh(program_run_id)
-        refresh_reads.append(calls.count("execution_scope") - before)
+        snapshot = refresh(program_run_id, read=read)
+        if read:
+            refresh_reads.append(calls.count("execution_scope") - before)
         return snapshot
 
     owner.refresh_selection_scope = spy
@@ -7596,7 +8062,7 @@ def test_changed_hold_facts_are_read_on_the_next_tick_only() -> None:
     assert calls == [] and refresh_reads == []
 
     owner.advance_once(run_id, hold_facts=facts)
-    # The scope read happens inside the tick.
+    # The tick sends the scope read (its sender here answers in place).
     assert len(refresh_reads) == 1 and refresh_reads[0] >= 1
     owner.advance_once(run_id, hold_facts=facts)
     assert len(refresh_reads) == 1
@@ -7743,14 +8209,16 @@ def test_a_resent_resume_reuses_its_stopped_task_replan_key() -> None:
 
 def _post(host: ProgramRunTickHost, command: Callable[[], Any]):
     """Start one queued host command on a request thread and return once it
-    is posted to the run's tick. Returns (thread, outcome)."""
+    is posted to the run's tick. Returns (thread, outcome); the posted
+    intent is ``thread.intent`` (see ``_apply_posted``)."""
 
     owner = host._owner  # noqa: SLF001
     posted = Event()
     post = owner.post_to_tick
 
-    def post_and_note(*args):
-        intent = post(*args)
+    def post_and_note(*args, **kwargs):
+        intent = post(*args, **kwargs)
+        thread.intent = intent  # type: ignore[attr-defined]
         posted.set()
         return intent
 
@@ -7801,7 +8269,6 @@ def _refusal(call: Callable[[], Any]) -> tuple[type, str, Any, Any]:
         "retry_failure_pause",
         "continue_failure_pause",
         "resume_halt",
-        "contain_reset_run",
     ],
 )
 def test_each_queued_command_is_applied_at_the_next_tick_with_its_former_answer(
@@ -7871,7 +8338,7 @@ def test_each_queued_command_is_applied_at_the_next_tick_with_its_former_answer(
     thread, outcome = _post(host, host_calls[command])
     # Posted, not applied: nothing answers it before the run's next tick.
     assert thread.is_alive() and not outcome
-    host.advance_ready_once()
+    _apply_posted(host, thread.intent)
     assert _refusal(lambda: _answer(thread, outcome)) == former
     assert owner.read(run_id).run_revision >= revision
     assert scope.release_requests == 0
@@ -7895,7 +8362,7 @@ def test_a_queued_release_is_applied_at_the_next_tick_and_answers_its_result():
         ),
     )
     assert thread.is_alive() and scope.release_requests == 0
-    host.advance_ready_once()
+    _apply_posted(host, thread.intent)
     released = _answer(thread, outcome)
     assert scope.release_requests == 1
     assert events.index("scope_stop_release") < events.index("leaf_start")
@@ -7912,6 +8379,7 @@ def test_commands_for_runs_not_being_ticked_are_still_taken_and_answered():
     )
     host = ProgramRunTickHost(owner, tick_interval_s=0.001)
     run_id = host.start_run(admission).capture.program_run_id
+    host.advance_ready_once()  # The motion start's tick (OD-380 D2).
     host.advance_ready_once()
     _host_halt(host, scope, run_id)
     assert host.advance_ready_once()[0].state is ProgramRunState.HALTED
@@ -8104,9 +8572,11 @@ def test_commands_posted_during_a_blocked_tick_follow_it_in_posting_order():
     finally:
         release_dispatch.set()
         advancing.join(2.0)
-    # The blocked tick had passed its start: the next one applies both.
+    # The blocked tick had passed its start: the next ones apply both, in
+    # posting order (the second is sent once the first is answered).
     assert applied == []
-    host.advance_ready_once()
+    _apply_posted(host, first[0].intent)
+    _apply_posted(host, second[0].intent)
     assert applied == ["resume_motion", "retry_failure_pause"]
     with pytest.raises(ProgramRunOwnerError, match="stale selection"):
         _answer(*first)
@@ -8694,3 +9164,543 @@ def test_an_ask_holding_all_motion_completes_only_after_the_operators_run() -> N
     )
     assert _until_terminal(owner, run_id).state is ProgramRunState.SUCCEEDED
     assert owner._runs[run_id].run.value_store.read("answer") == "continue"  # noqa: SLF001
+
+
+# The commands the run's tick applies that ask the Kernel (Resume, Run, the
+# manual hand-over, Retry, Continue, Execute after Halt) make their Kernel
+# calls inside the tick, ahead of the run's queued requests, as base did
+# (`RunSender.apply_in_place`). Reset's containment Stop is sent by its
+# command thread. Here the run's sender sends on a thread of its own: every
+# Kernel call is recorded with the thread it was made on.
+
+_KERNEL_SCOPE_CALLS = (
+    "execution_scope",
+    "release_selection",
+    "retire_held_preparations",
+    "release_halt",
+    "request_stop",
+    "observe",
+)
+
+
+def _threaded_sender(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(program_runtime, "RunSender", RunSender)
+
+
+def _kernel_calls(scope: _ScopePort) -> list[tuple[str, int]]:
+    """Record each Kernel scope call with its thread from now on."""
+
+    calls: list[tuple[str, int]] = []
+    for name in _KERNEL_SCOPE_CALLS:
+        inner = getattr(scope, name)
+
+        def call(*args, _inner=inner, _name=name, **kwargs):
+            calls.append((_name, threading.get_ident()))
+            return _inner(*args, **kwargs)
+
+        setattr(scope, name, call)
+    return calls
+
+
+def _tick_threads(owner: ProgramRunOwner) -> set[int]:
+    """Record the thread of every tick of ``owner`` from now on."""
+
+    threads: set[int] = set()
+    advance = owner.advance_once
+
+    def advance_once(*args, **kwargs):
+        threads.add(threading.get_ident())
+        return advance(*args, **kwargs)
+
+    owner.advance_once = advance_once  # type: ignore[method-assign]
+    return threads
+
+
+def _on_tick_thread(calls: list[tuple[str, int]]) -> list[str]:
+    tick = threading.get_ident()
+    return [name for name, thread in calls if thread == tick]
+
+
+def _halted(owner: ProgramRunOwner, run_id: int) -> ProgramRunSnapshot:
+    """Halting ticks until Halted: the first sends the scope read, the one
+    that finds it answered applies it."""
+
+    deadline = time.monotonic() + 5
+    snapshot = owner.reconcile_halting(run_id)
+    while snapshot.state is ProgramRunState.HALTING and time.monotonic() < deadline:
+        time.sleep(0.002)
+        snapshot = owner.reconcile_halting(run_id)
+    return snapshot
+
+
+def test_run_and_its_release_are_made_inside_the_tick(monkeypatch):
+    _threaded_sender(monkeypatch)
+    owner, admission, _task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    scope.ready = True
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    run_id = host.start_run(admission, defer_ticks=True).capture.program_run_id
+    calls = _kernel_calls(scope)
+    ticks = _tick_threads(owner)
+
+    released = _on_tick(
+        host,
+        lambda: host.start_motion(
+            run_id, expected_hold_revision=scope.hold_revision, request_key=_key()
+        ),
+    )
+    assert released.state is ProgramRunState.RUNNING
+    assert scope.release_requests == 1
+    released_on = [thread for name, thread in calls if name == "release_selection"]
+    assert released_on and set(released_on) <= ticks  # Base: inside the tick.
+    _on_tick(host, lambda: host.stop_run(run_id))
+    host.shutdown()
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "resume_motion",
+        "start_motion",
+        "prepare_manual_handover",
+        "retry_failure_pause",
+        "continue_failure_pause",
+    ],
+)
+def test_a_command_on_the_tick_keeps_its_refusal(monkeypatch, command):
+    _threaded_sender(monkeypatch)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    run_id = host.start_run(admission).capture.program_run_id
+    host.advance_ready_once()
+    stale = scope.hold_revision + 7
+    calls = {
+        "resume_motion": lambda target: target.resume_motion(
+            run_id, expected_hold_revision=stale, request_key=_key()
+        ),
+        "start_motion": lambda target: target.start_motion(
+            run_id, expected_hold_revision=stale, request_key=_key()
+        ),
+        "prepare_manual_handover": lambda target: target.prepare_manual_handover(
+            run_id,
+            node_indices=(0,),
+            expected_run_revision=owner.read(run_id).run_revision + 1,
+            expected_hold_revision=scope.hold_revision,
+            request_key=_key(),
+        ),
+        "retry_failure_pause": lambda target: target.retry_failure_pause(
+            run_id, node_attempt_id=1, action=None, request_key=_key(), reason=None
+        ),
+        "continue_failure_pause": lambda target: target.continue_failure_pause(
+            run_id, node_attempt_id=1, request_key=_key(), reason=None
+        ),
+    }
+    # The answer the command gives when it runs where it is called.
+    former = _refusal(lambda: calls[command](owner))
+    kernel = _kernel_calls(scope)
+    assert _refusal(lambda: _on_tick(host, lambda: calls[command](host))) == former
+    assert ("release_selection", ANY_THREAD) not in kernel
+    assert scope.release_requests == 0
+    _on_tick(host, lambda: host.stop_run(run_id))
+    host.shutdown()
+
+
+def test_the_halting_read_leaves_the_tick_and_execute_after_halt_is_inside_it(monkeypatch):
+    _threaded_sender(monkeypatch)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    scope.ready = True  # No task starts: the Halt settles at once.
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    run_id = host.start_run(admission).capture.program_run_id
+    host.advance_ready_once()
+    assert _halt(owner, run_id).state is ProgramRunState.HALTING
+    kernel = _kernel_calls(scope)
+    # The Halting tick sends its scope read; the tick that finds it answered
+    # applies it (the one that sent it, when it was answered at once).
+    assert _halted(owner, run_id).state is ProgramRunState.HALTED
+    assert _on_tick_thread(kernel) == [] and ("execution_scope", ANY_THREAD) in kernel
+
+    ticks = _tick_threads(owner)
+    resumed = _on_tick(host, lambda: host.resume_halt(run_id))
+    assert resumed.state is ProgramRunState.RUNNING
+    assert len(scope.halt_releases) == 1
+    released_on = [thread for name, thread in kernel if name == "release_halt"]
+    assert released_on and set(released_on) <= ticks  # Base: inside the tick.
+    _on_tick(host, lambda: host.stop_run(run_id))
+    host.shutdown()
+
+
+class _AnyThread:
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, int)
+
+
+ANY_THREAD = _AnyThread()
+
+
+def _gated_release(scope: _ScopePort) -> tuple[Event, Event]:
+    """The Run's release waits in the Kernel until the test opens it."""
+
+    entered, opened = Event(), Event()
+    release = scope.release_selection
+
+    def gated(request, expected_hold_revision):
+        entered.set()
+        assert opened.wait(5.0)
+        return release(request, expected_hold_revision)
+
+    scope.release_selection = gated
+    return entered, opened
+
+
+def _tick_in_background(host: ProgramRunTickHost) -> Thread:
+    """One manual tick on a thread of its own (it applies a command whose
+    Kernel call the test holds)."""
+
+    tick = Thread(target=host.advance_ready_once)
+    tick.start()
+    return tick
+
+
+def test_a_halt_during_a_run_on_the_tick_waits_for_it_and_its_release_is_refused(
+    monkeypatch,
+):
+    _threaded_sender(monkeypatch)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    scope.ready = True
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    run_id = host.start_run(admission, defer_ticks=True).capture.program_run_id
+    entered, opened = _gated_release(scope)
+    thread, outcome = _post(
+        host,
+        lambda: host.start_motion(
+            run_id, expected_hold_revision=scope.hold_revision, request_key=_key()
+        ),
+    )
+    tick = _tick_in_background(host)  # Applies the Run inside the tick.
+    try:
+        assert entered.wait(2.0)
+        # The Halt reaches the run while its tick makes the Run's release:
+        # the tree and the hold facts wait for that tick, as in base.
+        _host_halt(host, scope, run_id)
+        assert owner.read(run_id).state is ProgramRunState.RUNNING
+        assert thread.is_alive() and not outcome
+    finally:
+        opened.set()
+    tick.join(5.0)
+    assert not tick.is_alive()
+    # The Kernel refuses the release behind the newer Halt (stale revision).
+    with pytest.raises(ProgramRunOwnerError):
+        _answer(thread, outcome)
+    assert scope.release_requests == 0
+    host.advance_ready_once()
+    assert owner.read(run_id).state in {ProgramRunState.HALTING, ProgramRunState.HALTED}
+    _on_tick(host, lambda: host.stop_run(run_id))
+    host.shutdown()
+
+
+def test_a_stop_during_a_run_on_the_tick_is_sent_at_once_and_its_tree_part_follows(
+    monkeypatch,
+):
+    _threaded_sender(monkeypatch)
+    owner, admission, _task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    scope.ready = True
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    run_id = host.start_run(admission, defer_ticks=True).capture.program_run_id
+    entered, opened = _gated_release(scope)
+    run_thread, run_outcome = _post(
+        host,
+        lambda: host.start_motion(
+            run_id, expected_hold_revision=scope.hold_revision, request_key=_key()
+        ),
+    )
+    stopped: list[ProgramRunSnapshot] = []
+    stop_thread = Thread(target=lambda: stopped.append(host.stop_run(run_id)))
+    tick = _tick_in_background(host)  # Applies the Run inside the tick.
+    try:
+        assert entered.wait(2.0)
+        stop_thread.start()
+        # The Stop is sent at once by its command thread, while the tick
+        # makes the Run's release.
+        deadline = time.monotonic() + 2.0
+        while scope.stop_requests == 0 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        assert scope.stop_requests == 1 and run_thread.is_alive()
+    finally:
+        opened.set()
+    tick.join(5.0)
+    assert not tick.is_alive()
+    with pytest.raises(ProgramRunOwnerError):
+        _answer(run_thread, run_outcome)
+    # The Stop's tree part was handed to the tick after the Run: applied by
+    # the same or the next tick.
+    deadline = time.monotonic() + 2.0
+    while stop_thread.is_alive() and time.monotonic() < deadline:
+        host.advance_ready_once()
+        stop_thread.join(0.002)
+    assert not stop_thread.is_alive() and stopped
+    assert events.index("scope_stop") < len(events)
+    assert scope.release_requests == 0
+    host.shutdown()
+
+
+def test_reset_containment_stop_is_sent_by_its_command_thread():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.001)
+    run_id = host.start_run(admission).capture.program_run_id
+    _host_scene_step_sent(host)
+    terminal = host.advance_ready_once()[0]
+    assert terminal.state is ProgramRunState.SUCCEEDED
+    kernel = _kernel_calls(scope)
+    posted: list[Any] = []
+    post = owner.post_to_tick
+    owner.post_to_tick = lambda *args, **kwargs: posted.append(args) or post(  # type: ignore[method-assign]
+        *args, **kwargs
+    )
+    host.start()
+    try:
+        assert host.contain_reset_run(run_id, stop_request_key=_key()) == terminal
+    finally:
+        host.shutdown()
+        del owner.post_to_tick
+    stops = [thread for name, thread in kernel if name == "request_stop"]
+    assert stops == [threading.get_ident()]
+    assert posted == []  # Not handed to the run's tick.
+
+
+def _until(predicate: Callable[[], bool], limit_s: float = 5.0) -> None:
+    deadline = time.monotonic() + limit_s
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.002)
+    assert predicate()
+
+
+def test_changed_hold_facts_read_the_selection_scope_off_the_tick(monkeypatch):
+    """The tick sends the scope read on the run's sender and does not wait
+    for it; the tick that finds it answered applies it, as the inline read
+    was applied (OD-380 D2)."""
+
+    _threaded_sender(monkeypatch)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    kernel = _kernel_calls(scope)
+    entered, opened = Event(), Event()
+    read = scope.execution_scope
+
+    def gated(program_run_id):
+        entered.set()
+        assert opened.wait(5.0)
+        return read(program_run_id)
+
+    scope.execution_scope = gated
+    facts = _facts(run_id, hold_revision=5, all_groups_held=True)
+    try:
+        owner.advance_once(run_id, hold_facts=facts)
+        assert entered.wait(2.0)  # Sent, and the tick has returned.
+        request = owner._entry(run_id).selection_scope_read  # noqa: SLF001
+        assert request is not None and not request.answered
+        # The run stays scheduled until its tick applied the answer.
+        assert owner.tick_intents_pending(run_id)
+        waiting = owner.read(run_id).run_revision
+    finally:
+        opened.set()
+    _until(lambda: request.answered)
+    applied = owner.advance_once(run_id, hold_facts=facts)
+    assert applied.run_revision > waiting
+    assert owner._entry(run_id).selection_scope_read is None  # noqa: SLF001
+    assert not owner.tick_intents_pending(run_id)
+    assert ("execution_scope", ANY_THREAD) in kernel
+    assert _on_tick_thread(kernel) == []
+    scope.execution_scope = read
+    _stop(owner, run_id)
+
+
+def test_a_failed_selection_scope_read_fails_the_tick_that_applies_it(monkeypatch):
+    """As the inline read: its error leaves the tick that reads it."""
+
+    _threaded_sender(monkeypatch)
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+
+    opened = Event()
+
+    def unreadable(_program_run_id):
+        assert opened.wait(5.0)
+        raise RuntimeError("temporary Kernel scope read failure")
+
+    read = scope.execution_scope
+    scope.execution_scope = unreadable
+    facts = _facts(run_id, hold_revision=5, all_groups_held=True)
+    owner.advance_once(run_id, hold_facts=facts)  # Sends the read.
+    request = owner._entry(run_id).selection_scope_read  # noqa: SLF001
+    assert request is not None
+    opened.set()
+    _until(lambda: request.answered)
+    with pytest.raises(RuntimeError, match="temporary Kernel scope read failure"):
+        owner.advance_once(run_id, hold_facts=facts)
+    scope.execution_scope = read
+    _stop(owner, run_id)
+
+
+def test_mock_held_mask_and_halt_release_states_are_sent_off_the_tick(monkeypatch):
+    """A changed held mask and a released Halt are recorded by the tick and
+    sent on the run's sender, never on the tick (OD-380 D2)."""
+
+    _threaded_sender(monkeypatch)
+    owner, run_id, _run, mock, mask, _events = _mock_owner()
+    tick = threading.get_ident()
+    sent_on: list[int] = []
+    resend = mock.resend_run_pause
+
+    def recorded_resend(program_run_id):
+        sent_on.append(threading.get_ident())
+        return resend(program_run_id)
+
+    mock.resend_run_pause = recorded_resend
+    sent_at_start = len(mock.sent)
+    mask["value"] = ("move_to_pick",)
+    owner.advance_once(run_id)
+    assert mock.recorded[-1][3:] == (False, ("move_to_pick",))
+    _until(lambda: len(sent_on) == 1)
+
+    scope = owner._scope  # noqa: SLF001
+    _halt(owner, run_id)
+    assert _halted(owner, run_id).state is ProgramRunState.HALTED
+    _until(lambda: not mock.settlement_due(run_id))
+    sends = len(sent_on)
+    scope.frozen = "none"
+    scope.hold_revision += 1
+    assert owner._reconcile_hold_facts(run_id, _kernel_facts(scope, run_id))  # noqa: SLF001
+    released = owner.read(run_id)
+    assert released.state is ProgramRunState.RUNNING
+    assert mock.recorded[-1][:4] == ("pause", run_id, released.run_revision, False)
+    _until(lambda: len(sent_on) > sends)
+    assert tick not in sent_on
+    assert len(mock.sent) == sent_at_start  # Nothing sent at once.
+    _stop(owner, run_id)
+
+
+def test_a_selection_scope_read_after_the_run_sender_closed_still_leaves_the_tick():
+    """A run whose tree ended (its sender closed) still mirrors changed
+    hold facts while it is Stopping: the read is still sent on its sender
+    (here in place)."""
+
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner._entry(run_id).run.close_sender()  # noqa: SLF001
+    calls = _count_scope_reads(scope)
+    before = owner.read(run_id).run_revision
+    owner.refresh_selection_scope(run_id)
+    assert calls.count("execution_scope") == 1
+    assert owner.read(run_id).run_revision > before
+    assert not owner.tick_intents_pending(run_id)
+
+
+class _ThreadedContextPort(_ContextPort):
+    """Records the thread each unbind (run teardown) is made on."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__(events)
+        self.unbind_threads: list[int] = []
+
+    def unbind(self, program_run_id: int) -> None:
+        self.unbind_threads.append(threading.get_ident())
+        super().unbind(program_run_id)
+
+
+def _ticks_until(owner, run_id, done, limit_s: float = 5.0) -> ProgramRunSnapshot:
+    deadline = time.monotonic() + limit_s
+    snapshot = owner.advance_once(run_id)
+    while not done(snapshot) and time.monotonic() < deadline:
+        time.sleep(0.002)
+        snapshot = owner.advance_once(run_id)
+    assert done(snapshot), snapshot.state
+    return snapshot
+
+
+def _stopped_off_the_tick(monkeypatch):
+    _threaded_sender(monkeypatch)
+    context = _ThreadedContextPort([])
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE, context_port=context
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    scope.state = ProgramRunScopeState.ACTIVE  # The Stop settles later.
+    sent = owner.send_stop(run_id)  # The Stop: its command's thread.
+    kernel = _kernel_calls(scope)
+    owner.finish_stop(run_id, sent)  # Closes the run's sender.
+    assert owner.read(run_id).state is ProgramRunState.STOPPING
+    scope.state = ProgramRunScopeState.SETTLED
+    stopped = _ticks_until(
+        owner, run_id, lambda snapshot: snapshot.state is ProgramRunState.STOPPED
+    )
+    return owner, run_id, scope, context, kernel, stopped
+
+
+def test_the_stopping_reads_and_the_teardown_leave_the_tick_after_the_close(
+    monkeypatch,
+):
+    """After the Forced End closed the run's sender, its Stopping scope
+    reads and its teardown (unbind) still go on it, never on the tick."""
+
+    owner, run_id, _scope, context, kernel, _stopped = _stopped_off_the_tick(monkeypatch)
+    assert ("observe", ANY_THREAD) in kernel
+    assert _on_tick_thread(kernel) == []
+    assert context.unbound == [run_id]
+    assert threading.get_ident() not in context.unbind_threads
+    assert owner._entry(run_id).tick_reads == {}  # noqa: SLF001
+
+
+def test_reset_containment_is_observed_off_the_tick(monkeypatch):
+    owner, run_id, scope, _context, _kernel, _stopped = _stopped_off_the_tick(
+        monkeypatch
+    )
+    scope.state = ProgramRunScopeState.ACTIVE  # Its Stop is not settled yet.
+    owner.begin_reset_containment(run_id, stop_request_key=_key())
+    assert owner.reset_containment_pending(run_id)
+    kernel = _kernel_calls(scope)
+    owner.advance_once(run_id)
+    scope.state = ProgramRunScopeState.SETTLED
+    _until(
+        lambda: (
+            owner.advance_once(run_id),
+            not owner.reset_containment_pending(run_id),
+        )[1]
+    )
+    assert owner.reset_containment_settled(run_id)
+    assert ("observe", ANY_THREAD) in kernel
+    assert _on_tick_thread(kernel) == []
+
+
+def test_the_ended_trees_scope_read_leaves_the_tick(monkeypatch):
+    _threaded_sender(monkeypatch)
+    context = _ThreadedContextPort([])
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED, context_port=context
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    kernel = _kernel_calls(scope)
+    ended = _ticks_until(
+        owner, run_id, lambda snapshot: snapshot.state is ProgramRunState.SUCCEEDED
+    )
+    assert ended.state is ProgramRunState.SUCCEEDED
+    assert ("observe", ANY_THREAD) in kernel
+    assert _on_tick_thread(kernel) == []
+    assert threading.get_ident() not in context.unbind_threads

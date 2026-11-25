@@ -113,15 +113,15 @@ constexpr std::string_view kRuntimeConvergenceIntentDigestDomain =
 constexpr std::string_view kRuntimeStagedReadyDigestDomain =
     "manyforge.component-manager-runtime-staged-ready.v3";
 constexpr std::string_view kPrivateMaterializationDigestDomain =
-    "manyforge.component-manager-private-selected-bundle.ua4.v2";
+    "manyforge.component-manager-private-selected-bundle.v2";
 constexpr std::string_view kPublicationReceiptDigestDomain =
     "manyforge.component-manager-apply-publication-receipt.v1";
 constexpr std::string_view kFenceReleaseIntentDigestDomain =
-    "manyforge.component-manager-fence-release-intent.ua4.v2";
+    "manyforge.component-manager-fence-release-intent.v2";
 constexpr std::string_view kFenceReleasedDigestDomain =
     "manyforge.component-manager-fence-released.v1";
 constexpr std::string_view kTerminalOutcomeDigestDomain =
-    "manyforge.component-manager-terminal-outcome.ua4.v4";
+    "manyforge.component-manager-terminal-outcome.v4";
 constexpr int kBusyTimeoutMilliseconds = 10000;
 constexpr std::int64_t kWalCheckpointTargetBytes = 16LL * 1024LL * 1024LL;
 constexpr std::int64_t kExpectedSchemaObjectCardinality = 27;

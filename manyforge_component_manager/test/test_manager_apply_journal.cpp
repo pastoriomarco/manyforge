@@ -820,7 +820,7 @@ TEST(ManagerApplyJournalIntegrity,
 
 TEST(ManagerApplyJournalIntegrity, RejectsPreUa4JournalVersion) {
   TemporaryDirectory directory;
-  const auto path = directory.path() / "pre-ua4.sqlite3";
+  const auto path = directory.path() / "older-format.sqlite3";
   { SqliteManagerApplyJournal initialized(path, CellId("cell-1")); }
   ExecSql(path, "PRAGMA user_version=12;");
   const auto before = ReadFileBytes(path);

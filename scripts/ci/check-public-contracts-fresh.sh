@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-readonly UNAVAILABLE_REASON_CODE="composable_cell_runtime_unavailable"
+readonly UNAVAILABLE_REASON_CODE="runtime_unavailable"
 readonly LEGACY_AGGREGATE_UNAVAILABLE_MESSAGE="${UNAVAILABLE_REASON_CODE}: aggregate public-contract freshness is unavailable while later runtime owners are removed; use one explicit structural-rest or headless-rest selector."
 
 if (( $# == 0 )); then

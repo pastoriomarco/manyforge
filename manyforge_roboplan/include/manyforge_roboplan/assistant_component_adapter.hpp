@@ -71,15 +71,16 @@ class IAssistantHostLink {
 };
 
 /// The component's state: no process → `not_prepared`; an exited process →
-/// `fault_process_exited` (Recover restarts it); else `enabled` while the last
+/// `fault_process_exited` (Recover restarts it) with detail `output_tail`
+/// (absent when empty); else `enabled` while the last
 /// completed Enable stands and the host reports an endpoint, `prepared`
 /// otherwise. Activity is `busy` while enabled and a turn runs, else idle.
 /// The `bridge` stream is freshness only, never a fault: `none` unless
 /// enabled, `fresh` while the last `/health` answer is within the budget,
 /// `stale` otherwise. `endpoints` carries the bridge's URL only while enabled.
 [[nodiscard]] core::ComponentState AssistantComponentState(
-    bool process_started, const std::optional<std::string> &exit_reason, bool serving,
-    const AssistantHostObservation &observed, std::int64_t stream_budget_ns,
+    bool process_started, const std::optional<std::string> &exit_reason,
+    std::string output_tail, bool serving, const AssistantHostObservation &observed, std::int64_t stream_budget_ns,
     std::int64_t now_ns);
 
 /// The adapter: `prepare`/`recover` (re)start the host with serving off;

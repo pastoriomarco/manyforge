@@ -234,7 +234,7 @@ TEST(KernelCellAdmissionSqlite, V12ClaimsAreRefusedNotConvertedAfterTheStopTimin
   const auto downgraded =
       sqlite3_exec(legacy,
                    "PRAGMA user_version=12; UPDATE journal_metadata SET schema_version=12,"
-                   "schema_id='manyforge.internal.execution.operation-journal.o1.5.v12';",
+                   "schema_id='manyforge.internal.execution.operation-journal.v12';",
                    nullptr, nullptr, nullptr);
   sqlite3_close(legacy);
   ASSERT_EQ(downgraded, SQLITE_OK);

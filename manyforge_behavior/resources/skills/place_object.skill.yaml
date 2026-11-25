@@ -5,7 +5,7 @@
   "name": "Place object — logical-gripper template",
   "description": "Preserves the historical logical-gripper skill: approach, descend, set a Program flag, request the Scene-owned attachment change, and retreat. It does not actuate or confirm a physical gripper. Add an explicit qualified gripper command/confirmation when needed. Scene revisions invalidate affected cache entries automatically; there is no manual cache-reset node.",
   "compatible_profiles": [
-    "composable-cell-v1"
+    "manyforge-cell-v1"
   ],
   "parameters": [
     {

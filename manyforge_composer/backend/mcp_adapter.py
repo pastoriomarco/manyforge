@@ -8,10 +8,13 @@ capacity. No MCP session, command receipt, retry loop or worker is retained.
 from __future__ import annotations
 
 import base64
+from contextvars import ContextVar
 from copy import deepcopy
 import json
+import logging
 import math
 import re
+import time
 from typing import Any
 
 import httpx
@@ -23,9 +26,46 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
+from manyforge_headless_api.client import REQUEST_ID_HEADER, TRANSPORT_HEADER
 from manyforge_headless_api.control_protocol import is_stop_command
 
+from .app import _LOGGED_ERROR_CODE
 from .security import SecurityConfig
+
+logger = logging.getLogger(__name__)
+# The id of the outer MCP request whose tool call is being carried out; its
+# inner requests carry it (Composer forwards it to Headless).
+_OUTER_REQUEST_ID: ContextVar[str | None] = ContextVar(
+    "manyforge_mcp_outer_request_id", default=None
+)
+# A tool answer larger than this is not read for its refusal code.
+_MAXIMUM_LOGGED_ANSWER_BYTES = 64 * 1024
+
+
+def _tool_error_code(response: httpx.Response) -> str | None:
+    """The typed code of a refused tool call: its error body's, a rejected
+    command receipt's or an ``ok: false`` result's."""
+
+    if len(response.content) > _MAXIMUM_LOGGED_ANSWER_BYTES or not response.headers.get(
+        "content-type", ""
+    ).startswith("application/json"):
+        return None
+    try:
+        value = json.loads(response.content)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    detail, receipt, error = value.get("detail"), value.get("receipt"), value.get("error")
+    if isinstance(detail, dict):
+        code = detail.get("code")
+    elif isinstance(receipt, dict) and receipt.get("disposition") == "rejected":
+        code = receipt.get("code")
+    elif value.get("ok") is False and isinstance(error, dict):
+        code = error.get("code")
+    else:
+        return None
+    return code if isinstance(code, str) and _LOGGED_ERROR_CODE.fullmatch(code) else None
 
 # One routing inventory, also used to generate the public tool contract.
 # Each action names an existing route; callers never supply a URL or method.
@@ -454,7 +494,12 @@ class ComposerMcpAdapter:
         # it unchanged. Do not preempt that rule with SDK JSON-schema checks.
         @server.call_tool(validate_input=False)
         async def call_tool(name: str, arguments: dict[str, Any]):
-            response = await self.invoke(name, arguments)
+            outer = getattr(server.request_context.request, "state", None)
+            token = _OUTER_REQUEST_ID.set(getattr(outer, "request_id", None))
+            try:
+                response = await self._logged_invoke(name, arguments)
+            finally:
+                _OUTER_REQUEST_ID.reset(token)
             if response.is_success and response.headers.get("content-type", "").startswith(
                 "image/"
             ):
@@ -527,6 +572,43 @@ class ComposerMcpAdapter:
         async with manager.run():
             await manager.handle_request(scope, receive, send)
 
+    async def _logged_invoke(
+        self, name: str, arguments: dict[str, Any]
+    ) -> httpx.Response:
+        """Carry out one tool call and write its one log line."""
+
+        action = arguments.get("action") if isinstance(arguments, dict) else None
+        route = TOOL_ROUTES.get(name, {}).get(action) if isinstance(action, str) else None
+        fields: dict[str, Any] = {
+            "tool": name,
+            "action": action,
+            "route": None if route is None else f"{route[0]} {route[1]}",
+            "status_code": None,
+            "error_code": None,
+            "request_id": _OUTER_REQUEST_ID.get(),
+        }
+        started_at = time.monotonic()
+        try:
+            response = await self.invoke(name, arguments)
+        except Exception as error:
+            fields["error_type"] = type(error).__name__
+            raise
+        else:
+            fields["status_code"] = response.status_code
+            if response.status_code >= 400 or (route is not None and route[0] != "GET"):
+                fields["error_code"] = _tool_error_code(response)
+            return response
+        finally:
+            fields["duration_ms"] = round((time.monotonic() - started_at) * 1000.0, 1)
+            logger.info(
+                "mcp tool %s %s %s %.1fms",
+                name,
+                action,
+                fields["status_code"],
+                fields["duration_ms"],
+                extra=fields,
+            )
+
     async def invoke(self, name: str, arguments: dict[str, Any]) -> httpx.Response:
         args = ToolArguments.model_validate(arguments)
         route = TOOL_ROUTES.get(name, {}).get(args.action)
@@ -570,10 +652,14 @@ class ComposerMcpAdapter:
                         body = b"null"  # the Stop route forwards it as `{}`
                 else:
                     body = await run_in_threadpool(encode_body)
+            # Marked as the MCP adapter's, under the outer request's id.
+            headers = {"Content-Type": "application/json", TRANSPORT_HEADER: "mcp"}
+            if (outer_request_id := _OUTER_REQUEST_ID.get()) is not None:
+                headers[REQUEST_ID_HEADER] = outer_request_id
             return await client.request(
                 method,
                 path,
                 params=args.query,
                 content=body,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
             )

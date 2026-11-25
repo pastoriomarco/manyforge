@@ -234,7 +234,7 @@ make_program_root(const RetainedBundle &bundle,
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.program.v2")},
       {"program_revision", CanonicalValue(std::string(kZeroDigest))},
-      {"program_profile", CanonicalValue("composable-cell-v1")},
+      {"program_profile", CanonicalValue("manyforge-cell-v1")},
       {"catalog",
        CanonicalValue(CanonicalValue::Object{
            {"api_version", CanonicalValue("manyforge.node_catalog.v3")},
@@ -2102,7 +2102,7 @@ TEST(ProgramBindingCompilerTest,
 }
 
 TEST(ProgramBindingCompilerTest,
-     RejectsMissingRuntimeEpochAndNonDesiredI6Route) {
+     RejectsMissingRuntimeEpochAndNonDesiredRoute) {
   ScopedTrustedRoot root;
   const BindingCompilerContext context = make_ros_motion_context(root.path());
   FilesystemCatalogArtifactStore catalog_store(root.path());

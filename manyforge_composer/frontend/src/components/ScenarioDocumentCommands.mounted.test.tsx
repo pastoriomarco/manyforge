@@ -3,9 +3,11 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import { authoringOperation, type BusyOperation } from '../state/busyOperation';
 import { SAVE_UNAPPLIED_NOTE, ScenarioDocumentCommands } from './ScenarioDocumentCommands';
+import { errorCatalogRow } from '../state/commandRefusal';
+import { SCENARIO_UPGRADE_CONVERSION_TEXT, SCENARIO_UPGRADE_OFFER } from '../state/scenarioUpgrade';
 
 const apiMock = vi.hoisted(() => ({
-  scenarioDocuments: { list: vi.fn() }, files: { browse: vi.fn() },
+  scenarioDocuments: { list: vi.fn(), upgradeCheck: vi.fn(), upgrade: vi.fn() }, files: { browse: vi.fn() },
 }));
 vi.mock('../api/client', () => ({ api: apiMock }));
 
@@ -624,4 +626,147 @@ it('a running Save shows its busy label and names itself on every other Scenario
     expect(other.disabled).toBe(true);
     expect(other['data-tooltip']).toBe(`${label}: Save is in progress.`);
   }
+});
+
+// Upgrade and load (OD-391): a Load refused for an older file format.
+const OLD_FORMAT = 'Scenario Load refused: Scenario saved in an older format';
+const UPGRADE_CHECK = {
+  status: 'available', path: '/projects/other',
+  conversions: [
+    { conversion: 'collision_rules', changes: ['deployment.yaml: first collision rule: clearance 0.001 m'] },
+    { conversion: 'scenario_identity', changes: ['removed program.yaml: program_id'] },
+    { conversion: 'lane_labels', changes: ['program.yaml: compatibility.lanes removed'] },
+  ],
+  backupPattern: '/projects/other.before-0.4.0-YYYYMMDDTHHMMSSZ', backupPath: null,
+};
+function refusedForOldFormat(test: Awaited<ReturnType<typeof mount>>, code = 'scenario_document_dropped_fields') {
+  vi.mocked(test.controller.loadScenarioDocument).mockImplementationOnce(async (_path, onRefusal) => {
+    onRefusal?.(OLD_FORMAT, false, code);
+    return null;
+  });
+}
+const text = (test: Awaited<ReturnType<typeof mount>>, value: string) => test.find((p) => p.children === value);
+
+it('a Load refused for an older format offers Upgrade and load, confirms it, upgrades, then loads', async () => {
+  const test = await mount();
+  refusedForOldFormat(test);
+  apiMock.scenarioDocuments.upgradeCheck.mockResolvedValue(UPGRADE_CHECK);
+  apiMock.scenarioDocuments.upgrade.mockResolvedValue({
+    ...UPGRADE_CHECK, status: 'upgraded', backupPath: '/projects/other.before-0.4.0-20261125T101500Z',
+  });
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+
+  expect(apiMock.scenarioDocuments.upgradeCheck).toHaveBeenCalledExactlyOnceWith('/projects/other');
+  expect(text(test, OLD_FORMAT)).toBeDefined();
+  expect(text(test, SCENARIO_UPGRADE_OFFER)).toBeDefined();
+  // The offer replaces the converter-script guidance and the Load button.
+  expect(() => text(test, errorCatalogRow('scenario_document_dropped_fields')![1])).toThrow();
+  expect(() => test.primary('Load Scenario')).toThrow();
+
+  // The confirmation, inside the app: what changes and where the backup goes.
+  await test.click(test.primary('Upgrade and load'));
+  expect(test.find((p) => p.role === 'dialog')).toBeDefined();
+  expect(text(test, SCENARIO_UPGRADE_CONVERSION_TEXT.collision_rules)).toBeDefined();
+  expect(text(test, SCENARIO_UPGRADE_CONVERSION_TEXT.scenario_identity)).toBeDefined();
+  expect(text(test, SCENARIO_UPGRADE_CONVERSION_TEXT.lane_labels)).toBeDefined();
+  expect(() => text(test, SCENARIO_UPGRADE_CONVERSION_TEXT.program_profile)).toThrow();
+  expect(text(test, '/projects/other.before-0.4.0-YYYYMMDDTHHMMSSZ')).toBeDefined();
+  expect(text(test, 'removed program.yaml: program_id')).toBeDefined();
+  expect(apiMock.scenarioDocuments.upgrade).not.toHaveBeenCalled();
+
+  await test.click(test.primary('Upgrade and load'));
+  expect(apiMock.scenarioDocuments.upgrade).toHaveBeenCalledExactlyOnceWith('/projects/other');
+  // The ordinary Load follows; its replacement was already confirmed.
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledTimes(2);
+  expect(vi.mocked(test.controller.loadScenarioDocument).mock.calls[1]![0]).toBe('/projects/other');
+  expect(() => test.find((p) => p.role === 'dialog')).toThrow();
+});
+
+it('Cancel in the upgrade confirmation returns to the offer without upgrading', async () => {
+  const test = await mount();
+  refusedForOldFormat(test, 'scenario_program_profile_renamed');
+  apiMock.scenarioDocuments.upgradeCheck.mockResolvedValue({
+    ...UPGRADE_CHECK, conversions: [{ conversion: 'program_profile', changes: ['program.yaml: program_profile'] }],
+  });
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  await test.click(test.primary('Upgrade and load'));
+  expect(text(test, SCENARIO_UPGRADE_CONVERSION_TEXT.program_profile)).toBeDefined();
+
+  await test.click(test.find((p) => p.type === 'button' && p.children === 'Cancel'));
+  expect(text(test, SCENARIO_UPGRADE_OFFER)).toBeDefined();
+  expect(apiMock.scenarioDocuments.upgrade).not.toHaveBeenCalled();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledOnce();
+});
+
+it('a refused upgrade is shown with its reason and nothing is loaded', async () => {
+  const test = await mount();
+  refusedForOldFormat(test);
+  apiMock.scenarioDocuments.upgradeCheck.mockResolvedValue(UPGRADE_CHECK);
+  const reason = "/projects/other/program.yaml: node 'probe' names contact policy 'missing'";
+  apiMock.scenarioDocuments.upgrade.mockRejectedValue(Object.assign(new Error(reason), {
+    structuredError: { code: 'scenario_upgrade_conversion_failed', message: reason, details: null, origin: null },
+  }));
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  await test.click(test.primary('Upgrade and load'));
+  await test.click(test.primary('Upgrade and load'));
+
+  expect(text(test, `Scenario could not be upgraded: ${reason}`)).toBeDefined();
+  expect(text(test, errorCatalogRow('scenario_upgrade_conversion_failed')![1])).toBeDefined();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledOnce();
+  // No second offer: Load stays the primary action.
+  expect(test.primary('Load Scenario')).toBeDefined();
+});
+
+it('a Scenario already in the current format is never offered an upgrade', async () => {
+  const test = await mount();
+  refusedForOldFormat(test, 'scenario_deployment_intent_invalid');
+  apiMock.scenarioDocuments.upgradeCheck.mockResolvedValue({
+    ...UPGRADE_CHECK, status: 'current', conversions: [],
+  });
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+
+  expect(apiMock.scenarioDocuments.upgradeCheck).toHaveBeenCalledOnce();
+  expect(() => test.primary('Upgrade and load')).toThrow();
+  expect(() => text(test, SCENARIO_UPGRADE_OFFER)).toThrow();
+  expect(text(test, errorCatalogRow('scenario_deployment_intent_invalid')![1])).toBeDefined();
+});
+
+it('another refused Load shows its catalog guidance and asks for no upgrade', async () => {
+  const test = await mount();
+  vi.mocked(test.controller.loadScenarioDocument).mockImplementationOnce(async (_path, onRefusal) => {
+    onRefusal?.('Scenario Load refused: Scenario save was interrupted', false, 'scenario_project_save_interrupted');
+    return null;
+  });
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+
+  expect(text(test, 'Scenario Load refused: Scenario save was interrupted')).toBeDefined();
+  expect(text(test, errorCatalogRow('scenario_project_save_interrupted')![1])).toBeDefined();
+  expect(apiMock.scenarioDocuments.upgradeCheck).not.toHaveBeenCalled();
+});
+
+it('a lanes-only Scenario refused as older offers Upgrade and load with the lane bullet only', async () => {
+  const test = await mount();
+  refusedForOldFormat(test);
+  apiMock.scenarioDocuments.upgradeCheck.mockResolvedValue({
+    ...UPGRADE_CHECK, conversions: [{ conversion: 'lane_labels', changes: ['program.yaml: compatibility.lanes removed'] }],
+  });
+  apiMock.scenarioDocuments.upgrade.mockResolvedValue({
+    ...UPGRADE_CHECK, status: 'upgraded', backupPath: '/projects/other.before-0.4.0-20261125T101500Z',
+    conversions: [{ conversion: 'lane_labels', changes: ['program.yaml: compatibility.lanes removed'] }],
+  });
+  vi.mocked(test.controller.loadScenarioDocument).mockResolvedValue({} as never);
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  await test.click(test.primary('Upgrade and load'));
+  expect(text(test, SCENARIO_UPGRADE_CONVERSION_TEXT.lane_labels)).toBeDefined();
+  expect(() => text(test, SCENARIO_UPGRADE_CONVERSION_TEXT.collision_rules)).toThrow();
+
+  await test.click(test.primary('Upgrade and load'));
+  expect(apiMock.scenarioDocuments.upgrade).toHaveBeenCalledExactlyOnceWith('/projects/other');
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledTimes(2);
 });

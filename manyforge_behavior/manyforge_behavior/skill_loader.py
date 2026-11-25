@@ -145,7 +145,7 @@ class SkillCatalog:
                     f"skill {field} must be non-empty text",
                 )
             _require(
-                artifact["compatible_profiles"] == ["composable-cell-v1"],
+                artifact["compatible_profiles"] == ["manyforge-cell-v1"],
                 "unsupported skill profile",
             )
             for field in ("requires", "provides", "modifies", "requires_tools", "tags"):
@@ -216,7 +216,7 @@ class SkillCatalog:
             host = {
                 "api_version": "manyforge.program.v4",
                 "program_revision": "sha256:" + "0" * 64,
-                "program_profile": "composable-cell-v1",
+                "program_profile": "manyforge-cell-v1",
                 "catalog": {
                     "api_version": catalog.api_version,
                     "content_version": catalog.content_version,
@@ -345,7 +345,7 @@ class SkillCatalog:
                 "schema_version",
             }
             & set(program_context)
-            and program_context.get("program_profile") == "composable-cell-v1",
+            and program_context.get("program_profile") == "manyforge-cell-v1",
             "skill expansion requires portable Program declarations, not a tree or binding",
         )
         host = deepcopy(program_context)

@@ -844,8 +844,8 @@ class PersistentKeyRegister:
     ) -> dict[str, Any]:
         """Forget every stored value of the Scenario's persistent keys.
 
-        The Program Reset that reloads the initial scene: each key, whatever
-        its access, starts again from `initial:` (or empty). One change, with
+        The Program Reset with Reset stored values to their initial values:
+        each key, whatever its access, starts again from `initial:` (or empty). One change, with
         one `reset` audit per key naming the value it had. Returns the
         forgotten values by key.
         """
@@ -877,7 +877,7 @@ class PersistentKeyRegister:
                             "reset",
                             project_path,
                             key,
-                            detail=f"Reset reloaded the initial scene; was {_canonical(value)}",
+                            detail=f"Reset to the initial value; was {_canonical(value)}",
                         )
                         for key, value in forgotten.items()
                     ],

@@ -12,6 +12,7 @@ from manyforge_behavior.kernel_client import (
 )
 from manyforge_behavior.request_keys import KeyClass, request_key
 from manyforge_behavior.runner import OrchestratorRunner
+from .gateway_fakes import transport_gateway
 
 _KEY = request_key(KeyClass.HTTP_CLIENT, 1, 1)
 _GRIPPER_KEY = request_key(KeyClass.HTTP_CLIENT, 1, 2)
@@ -124,7 +125,7 @@ def _applied_binding() -> dict[str, Any]:
 
 def test_runner_submits_source_joint_names_against_exact_owner_selection() -> None:
     transport = RecordingTransport()
-    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+    runner = OrchestratorRunner(KernelClient(transport_gateway(transport)), _applied_binding())
 
     accepted = runner.submit_joint_goal(
         base_frame={"component_id": "lite6_arm", "frame_id": "base"},
@@ -169,7 +170,7 @@ def test_runner_refuses_joint_goal_without_end_effector_tcp() -> None:
     transport = RecordingTransport()
     binding = _applied_binding()
     binding["target_bindings"][0]["robot_tcps"] = []
-    runner = OrchestratorRunner(KernelClient(transport), binding)
+    runner = OrchestratorRunner(KernelClient(transport_gateway(transport)), binding)
     with pytest.raises(ValueError, match="no unique end-effector TCP"):
         runner.submit_joint_goal(
         base_frame={"component_id": "lite6_arm", "frame_id": "base"},
@@ -180,7 +181,7 @@ def test_runner_refuses_joint_goal_without_end_effector_tcp() -> None:
 
 
 def test_runner_reads_owner_projection_without_reducing_it() -> None:
-    runner = OrchestratorRunner(KernelClient(RecordingTransport()), _applied_binding())
+    runner = OrchestratorRunner(KernelClient(transport_gateway(RecordingTransport())), _applied_binding())
     assert runner.operation(1)["operation"] == {
         "operation_id": 1,
         "state": "completed",
@@ -189,7 +190,7 @@ def test_runner_reads_owner_projection_without_reducing_it() -> None:
 
 def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None:
     transport = RecordingTransport()
-    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+    runner = OrchestratorRunner(KernelClient(transport_gateway(transport)), _applied_binding())
 
     accepted = runner.submit_gripper_position(
         request_key=_GRIPPER_KEY,
@@ -232,7 +233,7 @@ def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None
 
 def test_runner_passes_wait_for_duration_as_a_bool_caller_option() -> None:
     transport = RecordingTransport()
-    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+    runner = OrchestratorRunner(KernelClient(transport_gateway(transport)), _applied_binding())
 
     runner.submit_gripper_position(
         request_key=_GRIPPER_KEY,
@@ -256,7 +257,7 @@ def test_runner_passes_wait_for_duration_as_a_bool_caller_option() -> None:
 
 def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
     transport = RecordingTransport()
-    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+    runner = OrchestratorRunner(KernelClient(transport_gateway(transport)), _applied_binding())
 
     first = runner.stop_operation(
         request_key=_STOP_KEY,
@@ -298,7 +299,7 @@ def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> No
             return {"ok": True, "identity": {"application_start_id": "3f9a00000000abcd"}}
 
     transport = IncompleteIdentityTransport()
-    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+    runner = OrchestratorRunner(KernelClient(transport_gateway(transport)), _applied_binding())
 
     with pytest.raises(KernelClientResponseError, match="incomplete"):
         runner.submit_joint_goal(
@@ -318,7 +319,7 @@ def test_runner_rejects_an_incomplete_owner_projection_before_submission() -> No
 
 def test_runner_takes_program_identity_from_the_applied_binding_only() -> None:
     transport = RecordingTransport()
-    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+    runner = OrchestratorRunner(KernelClient(transport_gateway(transport)), _applied_binding())
     arguments = {
         "request_key": _KEY,
         "program_run_id": 1,
@@ -345,7 +346,7 @@ def test_runner_takes_program_identity_from_the_applied_binding_only() -> None:
     # The binding runs only against the publication it was compiled for.
     stale = _applied_binding()
     stale["retained_bundle_id"] = "sha256:" + "9" * 64
-    stale_runner = OrchestratorRunner(KernelClient(transport), stale)
+    stale_runner = OrchestratorRunner(KernelClient(transport_gateway(transport)), stale)
     with pytest.raises(KernelClientResponseError, match="differs"):
         stale_runner.submit_joint_goal(
         base_frame={"component_id": "lite6_arm", "frame_id": "base"},

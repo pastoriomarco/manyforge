@@ -27,6 +27,14 @@
 
 namespace py = pybind11;
 
+namespace manyforge::headless::gateway {
+// Defined in gateway_bindings.cpp, gateway_event_bindings.cpp and
+// program_link_bindings.cpp.
+void RegisterGateway(py::module_ &module);
+void RegisterGatewayEvents(py::module_ &module);
+void RegisterProgramLink(py::module_ &module);
+}  // namespace manyforge::headless::gateway
+
 namespace manyforge::headless {
 namespace {
 
@@ -1057,6 +1065,9 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
   module.doc() =
       "Thin binding over the C++ ManyForge headless runtime API core";
   manyforge::headless::RegisterExpressionModule(module);
+  manyforge::headless::gateway::RegisterGateway(module);
+  manyforge::headless::gateway::RegisterGatewayEvents(module);
+  manyforge::headless::gateway::RegisterProgramLink(module);
   module.def(
       "compile_deployment_draft",
       [](const std::string &source) {

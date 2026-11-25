@@ -49,7 +49,8 @@ Option 1, after authorization to install/start, in an empty folder:
 ```bash
 mkdir -p ~/manyforge && cd ~/manyforge
 docker run --rm --entrypoint tar ghcr.io/pastoriomarco/manyforge:<VERSION> \
-  -c -C /workspace VERSION manyforge scripts/compose-dev.sh scripts/lib manyforge_operator/run_session.py \
+  -c -C /workspace VERSION manyforge scripts/compose-dev.sh scripts/lib \
+  manyforge_operator/run_session.py manyforge_headless_api/history_export.py \
   | tar -x
 ./manyforge run --project examples/mock_lite6_pick_and_place.scenario
 ./manyforge status
@@ -132,7 +133,8 @@ and the runbook's troubleshooting table before changing anything.
   `{"schema":"manyforge.site.v2","device_addresses":{"lite6_main":"192.168.1.31"}}`,
   optionally with `project_folders` (absolute host paths) and the disk limits
   (`disk_max_percent`, `disk_always_free_bytes`, `disk_machine_minimum_bytes`;
-  built-in defaults apply when absent). Export its absolute
+  built-in defaults apply when absent) and `core_dumps`
+  (`{"enabled": true, "max_bytes": …}`; off when absent). Export its absolute
   path as `MANYFORGE_SITE_SETTINGS` before `./manyforge run` (option 1) or as
   `MANYFORGE_DEV_SITE_SETTINGS` before `./scripts/compose-dev.sh start`; it is
   read only at start. A Real machine's card names the `device_addresses` key

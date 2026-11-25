@@ -19,7 +19,6 @@ from manyforge_behavior.request_keys import (
     Part,
     Phase,
     format_request_key,
-    http_client_key,
     parse_request_key,
     program_key,
     request_key,
@@ -31,11 +30,10 @@ from manyforge_behavior.assistant_program_port import (
     ProgramAssistantPort,
 )
 from manyforge_behavior.kernel_client import (
+    ExecutionCommandError,
     KernelOperationObservationUnavailableError,
     KernelClient,
-    KernelClientResponseError,
     KernelOperationAdmissionRejectedError,
-    PushedOperationTable,
 )
 from manyforge_behavior.orchestration_ports import (
     OwnerTaskSettlementPendingError,
@@ -56,6 +54,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
+    OwnerTaskReadRequiredError,
     OwnerTaskSettlementPendingError,
     OwnerTaskSnapshot,
     OwnerTaskState,
@@ -73,6 +72,7 @@ from manyforge_behavior.production_ports import (
     _owner_failure_message,
     program_motion_participant,
 )
+from .gateway_fakes import transport_gateway
 
 
 _APPLICATION_START_ID = "3f9a00000000002a"
@@ -374,7 +374,7 @@ class _ControlTransport(_Transport):
 
 def _control_port():
     transport = _ControlTransport()
-    owner = NativeKernelProgramPort(KernelClient(transport))
+    owner = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     context = _context()
     binding = {
         **context.program_binding,
@@ -540,7 +540,7 @@ def test_control_node_submits_once_then_observes_owner_outcome(node, state):
         "source_label": "manyforge_behavior",
     }
     transport.operations[_CONTROLLED]["state"] = state
-    result = owner.controls.observe(task.task_id)
+    result = owner.controls.observe(task.task_id, reads=True)
     assert result.state is OwnerTaskState.SUCCEEDED
     owner.controls.acknowledge(task.task_id, identity)
     assert len(transport.controls) == 1  # consumption does not Reset/ACK the robot
@@ -568,7 +568,7 @@ def test_stop_control_node_waits_for_its_stop_event(cell, terminal, state, reaso
     )
     # Pending: read_stop until the event is complete.
     for _ in range(3):
-        assert owner.controls.observe(task.task_id).state is OwnerTaskState.ACTIVE
+        assert owner.controls.observe(task.task_id, reads=True).state is OwnerTaskState.ACTIVE
     assert transport.stop_reads == 3
     assert len(transport.controls) == 1
     if cell:
@@ -580,7 +580,7 @@ def test_stop_control_node_waits_for_its_stop_event(cell, terminal, state, reaso
             {"operation_id": _CONTROLLED, "expected_operation_revision": 7}
         ]
     transport.stop_states[_CONTROL_STOP] = terminal
-    result = owner.controls.observe(task.task_id)
+    result = owner.controls.observe(task.task_id, reads=True)
     assert result.state is state
     assert result.reason_code == reason
     assert owner.controls._pending == {}
@@ -605,13 +605,13 @@ def test_control_node_waits_for_provider_completion_not_just_observed_state(
     transport.control_pending = True
     transport.resident[_CONTROLLED] = True
     transport.operations[_CONTROLLED]["state"] = observed
-    assert owner.controls.observe(task.task_id).state is OwnerTaskState.ACTIVE
+    assert owner.controls.observe(task.task_id, reads=True).state is OwnerTaskState.ACTIVE
     transport.control_pending = False
     if succeeds and node == "kernel.reset_operation":
         transport.resident[_CONTROLLED] = False
     elif not succeeds:
         transport.operations[_CONTROLLED]["state"] = "intervention_required"
-    assert owner.controls.observe(task.task_id).state is (
+    assert owner.controls.observe(task.task_id, reads=True).state is (
         OwnerTaskState.SUCCEEDED if succeeds else OwnerTaskState.FAILED
     )
     assert len(transport.controls) == 1
@@ -626,7 +626,7 @@ def test_control_node_cannot_claim_a_later_controls_completion():
         OwnerNodeInputs({"target": target("robot.1", "arm.command")}),
     )
     transport.last_control["request_key"] = format_request_key(_key("another-reset"))
-    assert owner.controls.observe(task.task_id).reason_code == "operation_control_superseded"
+    assert owner.controls.observe(task.task_id, reads=True).reason_code == "operation_control_superseded"
 
 
 def test_cell_stop_never_needs_ordinary_read_or_fresh_owner(monkeypatch):
@@ -684,7 +684,7 @@ def test_control_task_retention_is_pending_only_and_cancel_never_reissues_effect
         task = owner.controls.start(
             "kernel.reset_operation", identity, OwnerNodeInputs({"target": target("robot.1", "arm.command")})
         )
-        assert owner.controls.observe(task.task_id).state is OwnerTaskState.SUCCEEDED
+        assert owner.controls.observe(task.task_id, reads=True).state is OwnerTaskState.SUCCEEDED
         owner.controls.acknowledge(task.task_id, identity)
     identity = NodeAttemptIdentity(1, "control", 1001)
     task = owner.controls.start(
@@ -811,7 +811,7 @@ def _motion_inputs() -> OwnerNodeInputs:
 
 def test_deferred_execution_policy_is_rejected_before_binding_effects() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
 
     with pytest.raises(ProductionPortError, match="unavailable until F2"):
         port.bind(_deferred_policy_context())
@@ -869,7 +869,7 @@ def test_native_queries_use_one_captured_read_without_effects(
             }
 
     transport = QueryTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = (
         {"target": target("robot.1", "arm.command"), "frame": frame("robot.1", "tcp"), "output_key": "pose"}
@@ -905,7 +905,7 @@ def test_native_queries_use_one_captured_read_without_effects(
 
 def test_relative_pose_submission_uses_capture_and_preserves_direct_references() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
 
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
@@ -998,7 +998,7 @@ def test_absolute_goal_frame_is_forwarded_as_one_goal_frame_reference(
     node_id, frame, expected
 ) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     frames = [frame] if node_id == "motion.move_to_pose" else [frame, frame]
 
@@ -1037,7 +1037,7 @@ def test_goal_frames_the_owner_cannot_take_fail_before_submission(
     node_id, frames, target_mode, message
 ) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     inputs = _absolute_inputs(node_id, frames)
     if target_mode == "relative":
@@ -1057,7 +1057,7 @@ def test_goal_frames_the_owner_cannot_take_fail_before_submission(
 
 def test_cartesian_blend_radii_take_the_waypoint_override_else_the_node_default() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     inputs = _absolute_inputs("motion.follow_cartesian_path", [None, None, None])
     path = [dict(waypoint) for waypoint in inputs.parameters["path"]]
@@ -1078,7 +1078,7 @@ def test_cartesian_speed_mode_is_sent_only_when_the_node_sets_cartesian_timing(
 ) -> None:
     # CT-1: absent cartesian_timing keeps the Deployment's timing.
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     inputs = _absolute_inputs("motion.follow_cartesian_path", [None, None])
     if timing is not None:
@@ -1132,7 +1132,7 @@ def test_joint_pose_move_keeps_its_two_field_pose_goal() -> None:
 
 def test_linear_pose_move_payload_reaches_the_owner() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = {**_motion_inputs().parameters, "motion_type": "linear", **_LINE}
 
@@ -1194,7 +1194,7 @@ def test_motion_sends_its_collision_rules(authored, sent) -> None:
     # The node's rules reach the owner with every release spelled out; a node
     # without rules sends an empty list and keeps the Deployment's rules.
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
     if authored is not None:
@@ -1213,7 +1213,7 @@ def test_motion_sends_its_collision_rules(authored, sent) -> None:
 
 def test_motion_refuses_malformed_collision_rules_before_submission() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
     parameters["collision_rules"] = [
@@ -1239,7 +1239,7 @@ def test_motion_spells_out_a_spring_slider_rule_from_the_binding() -> None:
         }],
     })
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(context)
     parameters = dict(_motion_inputs().parameters)
     parameters["collision_rules"] = [{
@@ -1271,7 +1271,7 @@ def test_motion_spells_out_a_spring_slider_rule_from_the_binding() -> None:
 
 def test_motion_refuses_a_spring_slider_the_binding_does_not_hold() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
     parameters["collision_rules"] = [{
@@ -1289,7 +1289,7 @@ def test_motion_refuses_a_spring_slider_the_binding_does_not_hold() -> None:
 
 def test_reference_names_another_robot_frame_or_the_cell_by_binding_identity() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     inputs = OwnerNodeInputs(
         parameters={
@@ -1341,7 +1341,7 @@ def test_frame_transform_query_forwards_both_frames_and_names_owner_refusals() -
             }
 
     transport = TransformTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     pose = {
         "frame_ref": {"kind": "target_frame", "frame": frame("tool.1", "tcp")},
@@ -1379,7 +1379,7 @@ def test_frame_transform_query_forwards_both_frames_and_names_owner_refusals() -
 
 def test_independent_lost_acceptance_reply_is_reconciled_by_reset() -> None:
     transport = _LostAcceptanceReplyTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("independent")
 
@@ -1413,7 +1413,7 @@ def test_independent_lost_acceptance_reply_is_reconciled_by_reset() -> None:
 
 def test_partial_stop_reset_requires_resident_operations_to_be_reset_first() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start(
         "motion.move_to_pose", _identity("partial-reset"), _motion_inputs()
@@ -1438,7 +1438,7 @@ def test_uncontained_stop_reset_completes_after_intervention_is_retired(
     # The cell latch blocks execution after a Stop that left a node faulted,
     # so Reset completes.
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start(
         "motion.move_to_pose", _identity("partial-reset"), _motion_inputs()
@@ -1464,7 +1464,7 @@ def test_uncontained_stop_reset_completes_after_intervention_is_retired(
 def test_partial_stop_reset_keeps_intervention_task_and_fence_on_nonquiescent_refusal() -> None:
     transport = _Transport()
     refusal: dict[str, Any] = {}
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start(
         "motion.move_to_pose", _identity("partial-not-quiescent"), _motion_inputs()
@@ -1488,10 +1488,9 @@ def test_partial_stop_reset_keeps_intervention_task_and_fence_on_nonquiescent_re
         return refusal
 
     transport.reset = refuse_nonquiescent
-    with pytest.raises(
-        KernelClientResponseError, match="did not return a successful envelope"
-    ):
+    with pytest.raises(ExecutionCommandError) as refused:
         port.scope.reset(1)
+    assert refused.value.code == "execution_rejected"
 
     assert refusal["error"]["details"]["reason"] == "prepared_execution_not_quiescent"
     assert transport.resident[started.task_id] is True
@@ -1503,7 +1502,7 @@ def test_partial_stop_reset_keeps_intervention_task_and_fence_on_nonquiescent_re
 
 def test_partial_stop_does_not_reconcile_unknown_admission() -> None:
     transport = _LostAcceptanceReplyTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     port.operations.start(
         "motion.move_to_pose", _identity("partial-unknown"), _motion_inputs()
@@ -1523,7 +1522,7 @@ def test_partial_stop_does_not_reconcile_unknown_admission() -> None:
 
 def test_reset_refuses_while_the_forced_end_is_still_stopping() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     port.scope.request_stop(1, _key("stop.stopping"), "Reset containment")
     assert port.scope.observe(1).state is ProgramRunScopeState.ACTIVE
@@ -1557,7 +1556,7 @@ def test_reset_does_not_turn_a_pre_acceptance_lost_reply_into_motion() -> None:
             }
 
     transport = LostBeforeAcceptance()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start(
         "motion.move_to_pose", _identity("not-accepted"), _motion_inputs()
@@ -1584,7 +1583,7 @@ def test_completed_operation_is_acknowledged_with_exact_revision() -> None:
     started = port.operations.start("motion.move_to_pose", identity, _motion_inputs())
     transport.operations[started.task_id].update({"state": "completed", "operation_revision": 7})
 
-    observed = port.operations.observe(started.task_id)
+    observed = port.operations.observe(started.task_id, reads=True)
     assert isinstance(observed, OwnerTaskSnapshot)
     assert observed.state is OwnerTaskState.SUCCEEDED
     reads_after_terminal_observation = transport.operation_reads
@@ -1614,25 +1613,25 @@ def test_accepted_operation_owner_unavailability_has_exact_task_port_type() -> N
             raise OwnerUnavailableError("HTTP 503")
 
     transport = _UnavailableTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
 
     with pytest.raises(OwnerTaskObservationUnavailableError):
-        port.operations.observe(started.task_id)
+        port.operations.observe(started.task_id, reads=True)
 
     assert len(transport.submissions) == 1
 
 
 def test_operation_identity_change_remains_a_terminal_observation_error() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     transport.operations[started.task_id]["operation_id"] = 999
 
     with pytest.raises(ProductionPortError, match="changed identity"):
-        port.operations.observe(started.task_id)
+        port.operations.observe(started.task_id, reads=True)
 
 
 @pytest.mark.parametrize("state", ["failed", "intervention_required"])
@@ -1648,7 +1647,7 @@ def test_failed_native_operation_is_observed_as_a_failure_with_its_owner_reason(
             "code": "planning_failed", "message": "goal is unreachable",
         }
 
-    snapshot = port.operations.observe(started.task_id)
+    snapshot = port.operations.observe(started.task_id, reads=True)
 
     assert snapshot.state is OwnerTaskState.FAILED
     assert snapshot.reason_code == (
@@ -1679,7 +1678,7 @@ def test_owner_failures_name_the_reference_that_failed() -> None:
         }
     ]
 
-    snapshot = port.operations.observe(started.task_id)
+    snapshot = port.operations.observe(started.task_id, reads=True)
 
     assert snapshot.state is OwnerTaskState.FAILED
     assert snapshot.reason_code == "missing_reference"
@@ -1705,7 +1704,7 @@ def test_owner_failures_name_the_reference_that_failed() -> None:
 
 def test_native_context_cleanup_consumes_settled_tasks_but_refuses_active_work() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     active = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
 
@@ -1722,7 +1721,7 @@ def test_native_context_cleanup_consumes_settled_tasks_but_refuses_active_work()
 
 def test_program_scope_stop_is_one_exact_batch_without_operation_reads() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     transport.operations[started.task_id].update({"state": "executing", "operation_revision": 3})
@@ -1785,7 +1784,7 @@ def test_program_scope_stop_joins_inflight_admission_and_fences_fresh_work() -> 
             return super().stop_program_run(body)
 
     transport = _BlockingAdmissionTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     first = port.operations.start(
         "motion.move_to_pose",
@@ -1858,7 +1857,7 @@ def test_program_scope_stop_owns_operation_accepted_before_local_retention() -> 
             return response
 
     transport = _AcceptedBeforeReplyTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started: list[OwnerTaskSnapshot] = []
 
@@ -1893,7 +1892,7 @@ def test_program_scope_stop_owns_operation_accepted_before_local_retention() -> 
 
 def test_program_scope_stop_reaches_kernel_before_first_task_is_retained() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
 
     stopped = port.scope.request_stop(
@@ -1916,7 +1915,7 @@ def test_program_scope_stop_reaches_kernel_before_first_task_is_retained() -> No
 
 def test_unbound_program_scope_stop_needs_no_identity_read() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
 
     stopped = port.scope.request_stop(
         2,
@@ -1948,7 +1947,7 @@ def test_program_scope_stop_never_waits_on_the_ordinary_identity_lane() -> None:
             return super().identity()
 
     transport = _BlockedOrdinaryTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     assert transport.identity_reads == 1
     transport.block_identity = True
@@ -1984,7 +1983,7 @@ def test_program_scope_stop_never_waits_on_the_ordinary_identity_lane() -> None:
 
 def test_distinct_program_stops_refresh_the_native_fence_without_local_replay() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     transport.operations[started.task_id].update({"state": "executing", "operation_revision": 3})
@@ -2005,7 +2004,7 @@ def test_distinct_program_stops_refresh_the_native_fence_without_local_replay() 
 
 def test_reordered_stop_responses_cannot_replace_the_newest_hold_revision():
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     original = transport.stop_program_run
 
@@ -2027,7 +2026,7 @@ def test_reordered_stop_responses_cannot_replace_the_newest_hold_revision():
 
 def test_stop_reply_watermark_is_retired_after_each_reset():
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     for index in range(128):
         port.scope.request_stop(1, _key(f"stop-{index}"), "Stop")
@@ -2039,7 +2038,7 @@ def test_stop_reply_watermark_is_retired_after_each_reset():
 
 def test_old_replayed_stop_cannot_reconcile_a_different_lost_stop():
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     original, receipts = transport.stop_program_run, {}
     lose = [False]
@@ -2073,7 +2072,7 @@ def test_old_replayed_stop_cannot_reconcile_a_different_lost_stop():
 
 def test_lost_stop_reply_with_no_local_tasks_remains_unknown_until_recaptured():
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     original = transport.stop_program_run
 
@@ -2100,7 +2099,7 @@ def test_lost_stop_reply_with_no_local_tasks_remains_unknown_until_recaptured():
 
 def test_pending_first_stop_with_no_local_tasks_cannot_report_settlement():
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     entered, finish = Event(), Event()
     original = transport.stop_program_run
@@ -2131,7 +2130,7 @@ def test_pending_first_stop_with_no_local_tasks_cannot_report_settlement():
 
 def test_old_settled_read_cannot_hide_a_new_unknown_stop():
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     port.scope.request_stop(1, _key("first"), "Stop")
     transport.stop_states[1] = "succeeded"
@@ -2154,7 +2153,7 @@ def test_old_settled_read_cannot_hide_a_new_unknown_stop():
 
 def test_first_stop_during_task_read_cannot_publish_false_settlement():
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     task = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     transport.operations[task.task_id].update(state="completed", operation_revision=3)
@@ -2177,7 +2176,7 @@ def test_first_stop_during_task_read_cannot_publish_false_settlement():
 
 def test_operation_only_stop_does_not_acquire_a_program_scope_handoff():
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     port.operations.start("motion.move_to_pose", _identity("unrelated"), _motion_inputs())
     assert port.scope.observe(1).state is ProgramRunScopeState.ACTIVE
@@ -2189,7 +2188,7 @@ def test_terminal_reset_stop_reuses_identical_native_payload():
     from manyforge_behavior.program_run_owner import PROGRAM_RESET_STOP_REASON
 
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     port.scope.request_stop(1, _key("reset.1"), PROGRAM_RESET_STOP_REASON)
     transport.stop_states[1] = "succeeded"
@@ -2201,7 +2200,7 @@ def test_terminal_reset_stop_reuses_identical_native_payload():
 @pytest.mark.parametrize("program_stop", [False, True])
 def test_program_scope_reset_releases_terminal_residency_once(program_stop) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     transport.operations[started.task_id].update({"state": "stopped", "operation_revision": 4})
@@ -2242,7 +2241,7 @@ def test_program_scope_reset_releases_terminal_residency_once(program_stop) -> N
 )
 def test_program_scope_reset_retains_an_unproven_stop(scope_change):
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     port.scope.request_stop(1, _key("first"), "Reset containment")
     transport.stop_states[1] = "succeeded"
@@ -2264,7 +2263,7 @@ def test_program_scope_reset_retains_an_unproven_stop(scope_change):
 
 def test_program_scope_reset_retains_a_crossing_new_stop():
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     port.scope.request_stop(1, _key("first"), "Reset containment")
     transport.stop_states[1] = "succeeded"
@@ -2299,7 +2298,7 @@ def test_failed_stop_submission_can_be_retried() -> None:
             return super().stop_program_run(body)
 
     transport = _OneStopFailureTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     started = port.operations.start("motion.move_to_pose", _identity(), _motion_inputs())
     transport.operations[started.task_id].update({"state": "executing", "operation_revision": 3})
@@ -2313,7 +2312,7 @@ def test_failed_stop_submission_can_be_retried() -> None:
 
 def test_gripper_schema_comes_from_captured_program_binding() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     inputs = OwnerNodeInputs(
         parameters={
@@ -2420,7 +2419,7 @@ def test_named_gripper_alias_consumes_exact_v5_mode_policy_matrix(
         "actuation_kind": actuation, "output_mode": mode,
         "completion_policy": completion, "grasp_confirmation_policy": confirmation,
     })
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_gripper_inputs().parameters)
     parameters["position"] = {"kind": "named_preset", "name": alias}
@@ -2474,7 +2473,7 @@ def test_named_gripper_alias_refuses_old_or_incomplete_v5_descriptor(case):
                       "open_state_ref", "closed_state_ref", "mount_frame", "attach_frame", "tcp_frame"):
             descriptor[field] = None
         descriptor["grip_body_links"] = []
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_gripper_inputs().parameters)
     parameters["position"] = {"kind": "named_preset", "name": "open"}
@@ -2489,7 +2488,7 @@ def test_named_gripper_alias_refuses_old_or_incomplete_v5_descriptor(case):
 @pytest.mark.parametrize("alias,value", [("open", 0.8), ("closed", 0.1)])
 def test_named_gripper_alias_resolves_configured_reference_once_per_attempt(kind, alias, value):
     transport = _preset_transport(kind=kind)
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_gripper_inputs().parameters)
     parameters["position"] = {"kind": "named_preset", "name": alias}
@@ -2506,7 +2505,7 @@ def test_named_gripper_alias_resolves_configured_reference_once_per_attempt(kind
     assert parameters["position"] == {"kind": "named_preset", "name": alias}
     assert transport.target_reads == 1
     transport.operations[task.task_id].update({"state": "completed", "operation_revision": 3})
-    port.operations.observe(task.task_id)
+    port.operations.observe(task.task_id, reads=True)
     port.operations.acknowledge(task.task_id, identity)
     selected = next(row for row in transport.preset_descriptor["named_presets"] if
                     row["name"] == transport.preset_descriptor[f"{alias}_state_ref"])
@@ -2523,7 +2522,7 @@ def test_named_gripper_alias_hands_effort_to_kernel_with_the_grippers_own_kind()
     # OD-90: a linear gripper's preset resolves to linear_m; an angular effort
     # then reaches the kernel's typed gripper_command_effort_unit_mismatch check.
     transport = _preset_transport(kind="linear_m")
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_gripper_inputs().parameters)
     parameters["position"] = {"kind": "named_preset", "name": "closed"}
@@ -2566,7 +2565,7 @@ def test_named_gripper_alias_refuses_unverified_metadata_before_command(case):
         transport.preset_envelope["targets"]["components"].append(deepcopy(component))
     else:
         component["targets"].append(deepcopy(component["targets"][0]))
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_gripper_inputs().parameters)
     parameters["position"] = {"kind": "named_preset", "name": "open"}
@@ -2582,7 +2581,7 @@ def test_numeric_gripper_command_reads_descriptor_without_resolving_named_preset
     # Numeric payloads do not consult aliases, even if presets are unavailable.
     transport.preset_descriptor["named_presets"] = None
     transport.preset_descriptor["open_state_ref"] = None
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
     assert transport.target_reads == 1
@@ -2594,7 +2593,7 @@ def test_numeric_gripper_command_reads_descriptor_without_resolving_named_preset
 def test_numeric_gripper_descriptor_unavailability_refuses_before_effect():
     transport = _preset_transport()
     transport.preset_envelope = None
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     with pytest.raises(Exception):
         port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
@@ -2610,7 +2609,7 @@ def test_pneumatic_held_result_drains_without_successor_retry_or_resend(
     duration_s, succeeded, composite,
 ) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     state = OperatorMotionStopState({
         "command": (), "next": (), "root": ("command", "next"),
@@ -2684,7 +2683,7 @@ def test_pneumatic_held_result_drains_without_successor_retry_or_resend(
 ])
 def test_final_pneumatic_failure_keeps_result_and_exact_ack_revision(reason) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("pneumatic")
     started = port.operations.start("gripper.command_position", identity, _gripper_inputs())
@@ -2693,7 +2692,7 @@ def test_final_pneumatic_failure_keeps_result_and_exact_ack_revision(reason) -> 
         "state": "failed", "operation_revision": 7,
         "participants": [_final_pneumatic_failure(reason), {"state": "completed"}],
     })
-    observed = port.operations.observe(started.task_id)
+    observed = port.operations.observe(started.task_id, reads=True)
     assert observed.state is OwnerTaskState.FAILED
     assert observed.settlement_proven is True
     assert observed.reason_code == "command_failed"
@@ -2701,7 +2700,7 @@ def test_final_pneumatic_failure_keeps_result_and_exact_ack_revision(reason) -> 
     assert observed.metadata["operation_revision"] == 7
     reads = transport.operation_reads
     operation.update({"state": "completed", "operation_revision": 8})
-    assert port.operations.observe(started.task_id) == observed
+    assert port.operations.observe(started.task_id, reads=True) == observed
     assert transport.operation_reads == reads
     with pytest.raises(ProductionPortError, match="changed node attempt"):
         port.operations.acknowledge(started.task_id, _identity("foreign"))
@@ -2731,7 +2730,7 @@ def test_cached_pneumatic_failure_survives_lost_operation_read() -> None:
             return super().read(operation_id)
 
     transport = LostAfterSettlement()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("settled-pneumatic")
     started = port.operations.start("gripper.command_position", identity, _gripper_inputs())
@@ -2739,11 +2738,11 @@ def test_cached_pneumatic_failure_survives_lost_operation_read() -> None:
         "state": "failed", "operation_revision": 7,
         "participants": [_final_pneumatic_failure()],
     })
-    settled = port.operations.observe(started.task_id)
+    settled = port.operations.observe(started.task_id, reads=True)
     assert settled.state is OwnerTaskState.FAILED and settled.settlement_proven
     reads = transport.operation_reads
     transport.unavailable = True
-    assert port.operations.observe(started.task_id) == settled
+    assert port.operations.observe(started.task_id, reads=True) == settled
     assert transport.operation_reads == reads
     port.operations.acknowledge(started.task_id, identity)
     assert transport.controls[-1][2]["expected_operation_revision"] == 7
@@ -2755,7 +2754,7 @@ def test_cached_pneumatic_failure_survives_lost_operation_read() -> None:
 ])
 def test_pneumatic_settlement_marker_does_not_settle_other_failures(case) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("gripper")
     started = port.operations.start("gripper.command_position", identity, _gripper_inputs())
@@ -2779,7 +2778,7 @@ def test_pneumatic_settlement_marker_does_not_settle_other_failures(case) -> Non
         "state": "intervention_required" if case == "intervention_required" else "failed",
         "operation_revision": 3, "participants": participants,
     })
-    observed = port.operations.observe(started.task_id)
+    observed = port.operations.observe(started.task_id, reads=True)
     assert observed.state is OwnerTaskState.FAILED
     assert observed.settlement_proven is False
     with pytest.raises(ProductionPortError, match="only a completed operation"):
@@ -2789,7 +2788,7 @@ def test_pneumatic_settlement_marker_does_not_settle_other_failures(case) -> Non
 
 def test_final_pneumatic_failure_unbind_consumes_exact_owner_result_without_reset() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     task = port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
     transport.operations[task.task_id].update({
@@ -2815,7 +2814,7 @@ def test_final_pneumatic_failure_waits_for_owner_acknowledgement_without_resendi
             return super().acknowledge_completed(operation_id, body)
 
     transport = Pending()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("pneumatic")
     task = port.operations.start("gripper.command_position", identity, _gripper_inputs())
@@ -2824,10 +2823,10 @@ def test_final_pneumatic_failure_waits_for_owner_acknowledgement_without_resendi
         "state": "failed", "operation_revision": 7,
         "participants": [_final_pneumatic_failure()],
     })
-    failed = port.operations.observe(task.task_id)
+    failed = port.operations.observe(task.task_id, reads=True)
     with pytest.raises(OwnerTaskSettlementPendingError):
         port.operations.acknowledge(task.task_id, identity)
-    assert port.operations.observe(task.task_id) == failed
+    assert port.operations.observe(task.task_id, reads=True) == failed
     assert transport.controls == []
     assert len(transport.submissions) == 1
     transport.dispatch_returned = True
@@ -2839,13 +2838,13 @@ def test_final_pneumatic_failure_waits_for_owner_acknowledgement_without_resendi
 
 def test_pneumatic_unknown_kernel_admission_reply_keeps_existing_exclusion() -> None:
     transport = _LostAcceptanceReplyTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     task = port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
     assert task.state is OwnerTaskState.FAILED
     assert task.reason_code == "operation_admission_outcome_unknown"
     assert task.settlement_proven is False
-    assert port.operations.observe(task.task_id) == task
+    assert port.operations.observe(task.task_id, reads=True) == task
     assert port.scope.observe(1).state is ProgramRunScopeState.UNKNOWN
     assert len(transport.submit_attempts) == 1
     assert len(transport.submissions) == 1
@@ -2854,7 +2853,7 @@ def test_pneumatic_unknown_kernel_admission_reply_keeps_existing_exclusion() -> 
 
 def test_unadmitted_pneumatic_command_remains_held_without_a_send() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     state = OperatorMotionStopState({"command": ()})
     state.publish(OperatorMotionStopSnapshot(1, frozenset({"command"})))
@@ -2883,7 +2882,7 @@ def test_stale_native_deployment_fails_before_dispatch() -> None:
             return result
 
     transport = _StaleTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     with pytest.raises(ProductionPortError, match="captured Program"):
         port.bind(_context())
 
@@ -3066,7 +3065,7 @@ def _pick_inputs(*, policy: str = "pause_for_operator") -> OwnerNodeInputs:
 
 def test_pick_offset_object_key_is_bound_to_the_selected_object_on_descend() -> None:
     transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_pick_inputs().parameters)
     synthesis = dict(parameters["synthesis"])
@@ -3103,7 +3102,7 @@ def test_pick_offset_object_key_is_bound_to_the_selected_object_on_descend() -> 
 
 def test_pick_offsets_accept_cell_and_other_robot_frames_like_motion_references() -> None:
     transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     inputs = _pick_inputs()
     parameters = dict(inputs.parameters)
@@ -3149,7 +3148,7 @@ def test_pick_planning_is_a_job_read_once_and_released() -> None:
     """OD-213 (1): the send is answered at once; the read releases the job."""
 
     transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("plan-pick-job")
     job = port.operations.send_planning("planning.plan_pick_sequence", identity, _pick_inputs())
@@ -3165,7 +3164,7 @@ def test_pick_planning_is_a_job_read_once_and_released() -> None:
 
 def test_a_lost_planning_reply_is_the_same_job() -> None:
     transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("plan-pick-lost")
     first = port.operations.send_planning("planning.plan_pick_sequence", identity, _pick_inputs())
@@ -3177,7 +3176,7 @@ def test_a_lost_planning_reply_is_the_same_job() -> None:
 
 def test_a_cancelled_or_failed_planning_job_ends_as_the_host_says() -> None:
     transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("plan-pick-cancel")
     job = port.operations.send_planning("planning.plan_pick_sequence", identity, _pick_inputs())
@@ -3203,7 +3202,7 @@ def test_a_cancelled_or_failed_planning_job_ends_as_the_host_says() -> None:
 
 def test_planning_is_never_a_start() -> None:
     transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     with pytest.raises(ProductionPortError, match="planning job"):
         port.operations.start("planning.plan_pick_sequence", _identity("start"), _pick_inputs())
@@ -3212,7 +3211,7 @@ def test_planning_is_never_a_start() -> None:
 
 def test_pick_planning_assembles_portable_intent_without_prepared_authority() -> None:
     transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("plan-pick")
 
@@ -3336,7 +3335,7 @@ def test_pick_planning_assembles_portable_intent_without_prepared_authority() ->
 def test_pick_no_feasible_candidate_preserves_authored_policy_and_diagnostics() -> None:
     transport = _PickPlaceTransport()
     transport.no_feasible = True
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
 
     result = _plan(
@@ -3398,7 +3397,7 @@ def test_native_motion_stop_projects_exact_operator_recovery_policy() -> None:
         },
         "stop_event_id": 11,
     }
-    observed = port.operations.observe(started.task_id)
+    observed = port.operations.observe(started.task_id, reads=True)
     assert observed.state is OwnerTaskState.INTERRUPTED
     assert observed.metadata["stop_event_id"] == 11
     assert "active_stop_id" not in observed.metadata
@@ -3459,7 +3458,7 @@ def test_native_motion_program_stop_fails_with_its_cause_and_never_holds(
         "recovery_assessment": {"recovery_class": "ordinary_program_stop"},
         "stop_event_id": 11,
     }
-    observed = port.operations.observe(started.task_id)
+    observed = port.operations.observe(started.task_id, reads=True)
     assert observed.state is OwnerTaskState.INTERRUPTED
     assert "authored_failure_policy" not in observed.metadata
     assert "authored_failure_policy_parameter" not in observed.metadata
@@ -3500,7 +3499,7 @@ def test_native_motion_clean_collision_stop_fails_with_its_collision_cause() -> 
         "recovery_assessment": {"recovery_class": "runtime_collision"},
         "stop_event_id": 11,
     }
-    observed = port.operations.observe(started.task_id)
+    observed = port.operations.observe(started.task_id, reads=True)
     assert observed.state is OwnerTaskState.INTERRUPTED
     assert "authored_failure_policy" not in observed.metadata
     assert observed.reason_code == "execution_aborted"
@@ -3511,7 +3510,7 @@ def test_native_motion_clean_collision_stop_fails_with_its_collision_cause() -> 
 
 def test_accepted_native_motion_recovery_releases_the_obsolete_task() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("motion-recovery")
     started = port.operations.start(
@@ -3565,12 +3564,12 @@ def test_accepted_native_motion_recovery_releases_the_obsolete_task() -> None:
         0,
     )
     with pytest.raises(ProductionPortError, match="not retained"):
-        port.operations.observe(started.task_id)
+        port.operations.observe(started.task_id, reads=True)
 
 
 def test_place_intent_preserves_authored_pose_and_has_no_grasp_exception() -> None:
     transport = _PickPlaceTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_pick_inputs().parameters)
     parameters.pop("synthesis")
@@ -3622,7 +3621,7 @@ def test_named_planning_output_reuses_resolved_numeric_tool_position(phase, alia
         transport.plan_pick = change_presets_after_planning
     else:
         transport.plan_place = change_presets_after_planning
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_pick_inputs().parameters)
     parameters["tool_position"] = {"kind": "named_preset", "name": alias}
@@ -3747,6 +3746,8 @@ class _SceneTransport:
                 }
             ]
         self.submissions: list[dict[str, Any]] = []
+        # The members of each owner read (None: the whole Scene).
+        self.owner_reads: list[dict[str, Any] | None] = []
         self.admission_generation = 1
 
     def authoring_admission(self) -> dict[str, Any]:
@@ -3754,6 +3755,52 @@ class _SceneTransport:
             "authoring_allowed": True,
             "admission_generation": self.admission_generation,
         }
+
+    # The gateway core calls of the scene port (a fake Manager and host).
+    def cell_admission_get(self) -> dict[str, Any]:
+        return {
+            "api_version": "manyforge.execution_command_response.v6",
+            "command": "cell_admission_get",
+            "ok": True,
+            "authoring_admission": self.authoring_admission(),
+        }
+
+    def scene_owner_read(self, members: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """The Manager's narrow owner read, from the same state as ``scene``,
+        in the owner's snapshot form (the logical-scene codec). With
+        ``scene_resource_ids``: those objects only, with their attachments."""
+
+        self.owner_reads.append(None if members is None else deepcopy(dict(members)))
+        payload = self.scene()["logical_scene"]["payload"]
+        snapshot = deepcopy(payload["snapshot"])
+        if members is not None:
+            assert set(members) == {"scene_resource_ids"}
+            selected = set(members["scene_resource_ids"])
+            snapshot["objects"] = [
+                row for row in snapshot["objects"] if row["scene_resource_id"] in selected
+            ]
+            snapshot["carried_object_attachments"] = [
+                row for row in snapshot["carried_object_attachments"]
+                if row["scene_resource_id"] in selected
+            ]
+        snapshot["objects"] = [_owner_object_form(row) for row in snapshot["objects"]]
+        for attachment in snapshot["carried_object_attachments"]:
+            if attachment["pose_in_carrier_frame"]:
+                attachment["pose_in_carrier_frame"] = _owner_pose_form(
+                    attachment["pose_in_carrier_frame"])
+        return {
+            "api_version": "manyforge.manager_command_response.v3",
+            "logical_scene": snapshot,
+            "ok": True,
+            "projection_revision": payload["access"]["active_projection"],
+        }
+
+    def scene_commit(self, transaction: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            return self.commit_scene_transaction(transaction)
+        except _Rejection as rejection:
+            # An owner refusal is a reply of the core, not an exception.
+            return rejection.response
 
     def scene(self) -> dict[str, Any]:
         return {
@@ -3894,20 +3941,58 @@ class _SceneTransport:
             "ok": True,
             "projection_status": "committed",
             "replay_status": "accepted_new",
-            # As Headless: the owner names the class 3 key it formed.
-            "request_key": _headless_key(context["request_key"]),
+            # The owner names the key it was sent.
+            "request_key": context["request_key"],
             "transaction_sequence": len(self.submissions),
             "update_status": "geometry_changed",
         }
 
-    def scene_transaction_status(self, body):
+    def scene_transaction_status(self, members):
         return {"api_version": "manyforge.manager_command_response.v3", "ok": True, "result": None}
 
 
-def _headless_key(sent: str) -> str:
-    """The key Headless forms for an HTTP request (class 3)."""
+def _owner_pose_form(pose: Mapping[str, Any]) -> dict[str, Any]:
+    """A published pose in the owner's snapshot form."""
 
-    return format_request_key(http_client_key(parse_request_key(sent)))
+    return {
+        "position_m": {f"{axis}_m": pose["position_m"][axis] for axis in "xyz"},
+        "orientation": dict(zip("xyzw", pose["orientation_xyzw"])),
+    }
+
+
+def _owner_object_form(row: Mapping[str, Any]) -> dict[str, Any]:
+    """A published scene object in the owner's snapshot form: shapes and
+    poses spelled as transactions name them, a mesh with its content digest,
+    provider evidence only when present."""
+
+    def shape(published: Mapping[str, Any]) -> dict[str, Any]:
+        kind = published["type"]
+        if kind == "box":
+            return {"type": kind, "box_dimensions_m": {
+                f"{axis}_m": published["dimensions_m"][axis] for axis in "xyz"}}
+        if kind == "sphere":
+            return {"type": kind, "sphere_radius_m": published["radius_m"]}
+        if kind == "cylinder":
+            return {"type": kind, "cylinder_radius_m": published["radius_m"],
+                    "cylinder_height_m": published["height_m"]}
+        return {"type": kind, "mesh_resource_uri": published["resource_uri"],
+                "mesh_scale": {f"{axis}_m": published["scale"][axis] for axis in "xyz"},
+                "mesh_content_digest": _DIGEST_E}
+
+    result = {name: deepcopy(value) for name, value in row.items()
+              if name != "provider_evidence" or value is not None}
+    result["collision_shapes"] = [shape(item) for item in row["collision_shapes"]]
+    if row["placement"]["kind"] == "cell_fixed":
+        result["placement"] = {**row["placement"],
+                               "pose_in_cell": _owner_pose_form(row["placement"]["pose_in_cell"])}
+    return result
+
+
+def _lookup_of(transaction: Mapping[str, Any]) -> dict[str, Any]:
+    """The status lookup members of one sent transaction."""
+
+    return {"transaction": {**transaction, "attribution": {
+        "assurance": "unverified", "principal_id": None, "transport": "http"}}}
 
 
 def _scene_port(transport):
@@ -3963,30 +4048,32 @@ def _pose_latch_success_response(request: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class _LatchTransport(_SceneTransport):
-    """The Headless client's latch routes (OD-294) over one fake Manager answer."""
+    """The Manager's latch commands (D1) over one fake Manager answer."""
 
     def __init__(self, latch=None) -> None:
         super().__init__()
         self.latch_bodies: list[dict[str, Any]] = []
         self._latch = latch or _pose_latch_success_response
 
-    def scene_runtime_owner(self) -> dict[str, Any]:
+    def scene_runtime_owner_read(self) -> dict[str, Any]:
         return _pose_latch_owner_response()
 
-    def latch_scene_runtime_between_nodes(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        self.latch_bodies.append(deepcopy(dict(body)))
-        return self._latch(body)
+    def scene_runtime_latch_between_nodes(self, members: Mapping[str, Any]) -> dict[str, Any]:
+        self.latch_bodies.append(deepcopy(dict(members)))
+        return self._latch(members)
 
 
-class _HeadlessRefusal(RuntimeError):
-    """A typed Headless HTTP refusal, as the Headless client raises it."""
+def _manager_refusal(code: str) -> dict[str, Any]:
+    """A typed Manager refusal reply, as the core returns it."""
 
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
+    return {
+        "api_version": "manyforge.manager_command_response.v3",
+        "ok": False,
+        "error": {"code": code, "message": code, "details": {}, "producer": "component_manager"},
+    }
 
 
-def test_between_nodes_latch_goes_through_headless_with_sorted_scope() -> None:
+def test_between_nodes_latch_goes_to_the_manager_with_sorted_scope() -> None:
     transport = _LatchTransport()
     scene = HeadlessSceneProgramPort(transport)
     scene.bind(_scene_context())
@@ -4003,7 +4090,7 @@ def test_between_nodes_latch_goes_through_headless_with_sorted_scope() -> None:
 
 def test_between_nodes_capture_uses_manager_scene_without_a_stale_pre_read() -> None:
     class NoScenePreRead(_LatchTransport):
-        def scene(self):
+        def scene_owner_read(self, members=None):
             raise AssertionError("between-nodes capture must not pre-read Scene")
 
     def latch(request):
@@ -4041,15 +4128,13 @@ def test_between_nodes_capture_retains_deployment_and_scene_fences(crossed) -> N
     [
         ({"api_version": "manyforge.manager_command_response.v3", "ok": True},
          "scene_runtime_latch_failed"),
-        (_HeadlessRefusal("stale_scene_projection"), "stale_scene_projection"),
+        (_manager_refusal("stale_scene_projection"), "stale_scene_projection"),
     ],
 )
 def test_between_nodes_latch_malformed_or_refused_response_fails_before_motion_dispatch(
-    latch_response: Mapping[str, Any] | Exception, expected_reason: str
+    latch_response: Mapping[str, Any], expected_reason: str
 ) -> None:
     def latch(_request: Mapping[str, Any]) -> dict[str, Any]:
-        if isinstance(latch_response, Exception):
-            raise latch_response
         return deepcopy(dict(latch_response))
 
     scene_transport = _LatchTransport(latch)
@@ -4057,7 +4142,7 @@ def test_between_nodes_latch_malformed_or_refused_response_fails_before_motion_d
     scene.bind(_scene_context())
     kernel_transport = _Transport()
     native = NativeKernelProgramPort(
-        KernelClient(kernel_transport),
+        KernelClient(transport_gateway(kernel_transport)),
         scene_pose_source_latch=scene.latch_between_nodes,
     )
     native.bind(_context())
@@ -4273,11 +4358,17 @@ def test_cancelled_simulation_reset_does_not_call_tcp_hook() -> None:
     assert calls == []
 
 
-def _scene_rejection(body, code, message):
-    from manyforge_behavior.scene_client import SceneTransactionRejectedError
+class _Rejection(Exception):
+    """A fake Manager's no-effect refusal; the fake gateway replies with it."""
 
+    def __init__(self, response: dict[str, Any]) -> None:
+        super().__init__(response["error"]["message"])
+        self.response = response
+
+
+def _scene_rejection(body, code, message):
     context = body["request_context"]
-    return SceneTransactionRejectedError(
+    return _Rejection(
         {
             "api_version": "manyforge.manager_command_response.v3",
             "ok": False,
@@ -4453,7 +4544,7 @@ def test_empty_apply_refused_detach_keeps_the_part() -> None:
                 self.submissions.append(dict(body))
                 return {
                     "api_version": "manyforge.manager_command_response.v3",
-                    "request_key": _headless_key(body["request_context"]["request_key"]),
+                    "request_key": body["request_context"]["request_key"],
                     "ok": False, "projection_status": "not_attempted",
                     "error": {"code": "missing_reference", "message": "carrier unavailable"},
                 }
@@ -4559,7 +4650,7 @@ def test_scene_initialization_retries_no_effect_admission_race_with_new_identity
      "error": {"code": "authoring_not_ready", "details": {"reason": "delivery_unknown"}}},
 ])
 def test_scene_initialization_does_not_retry_unknown_authoring_error(response) -> None:
-    from manyforge_behavior.scene_client import SceneOutcomeUnknownError
+    from manyforge_behavior.production_ports import SceneOutcomeUnknownError
 
     class UnknownAuthoring(RuntimeError):
         code = "authoring_not_ready"
@@ -4712,8 +4803,9 @@ def test_lost_scene_reply_is_observed_while_held_without_replaying_the_action() 
                 raise TimeoutError("accepted transaction reply was lost")
             return result
 
-        def scene_transaction_status(self, body):
-            assert body == self.submissions[-1]
+        def scene_transaction_status(self, members):
+            # The lookup names the one sent transaction; it never resends it.
+            assert members == _lookup_of(self.submissions[-1])
             return {
                 "api_version": "manyforge.manager_command_response.v3",
                 "ok": True,
@@ -4792,8 +4884,8 @@ def test_scene_rejected_by_stop_stays_unstarted_until_a_newer_release(lose_reply
                 raise TimeoutError("rejection reply lost")
             raise error
 
-        def scene_transaction_status(self, body):
-            assert body == self.rejections[-1]
+        def scene_transaction_status(self, members):
+            assert members == _lookup_of(self.rejections[-1])
             return {
                 "api_version": "manyforge.manager_command_response.v3",
                 "ok": True,
@@ -4889,7 +4981,7 @@ def test_three_production_context_ports_rollback_as_one_before_dispatch() -> Non
     )
     kernel_transport = _Transport()
     scene_transport = _SceneTransport()
-    native = NativeKernelProgramPort(KernelClient(kernel_transport))
+    native = NativeKernelProgramPort(KernelClient(transport_gateway(kernel_transport)))
     scene = _scene_port(scene_transport)
     assistant = ProgramAssistantPort(
         _NoModelTransport(),  # type: ignore[arg-type]
@@ -5213,20 +5305,15 @@ def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> Non
             self.queries: list[dict[str, Any]] = []
             self.response_revision: dict[str, Any] | None = None
 
-        def scene(self) -> dict[str, Any]:
-            projection = super().scene()
-            # A read does not need Scene writes to be open.
-            projection["logical_scene"]["payload"]["access"]["scene_writes_open"] = False
-            return projection
-
-        def resolve_scene_resources(self, body: Mapping[str, Any]) -> dict[str, Any]:
-            self.queries.append(deepcopy(dict(body)))
+        def scene_pose_query(self, members: Mapping[str, Any]) -> dict[str, Any]:
+            self.queries.append(deepcopy(dict(members)))
             return {
-                "api_version": "manyforge.scene_resource_pose_response.v1",
+                "api_version": "manyforge.manager_command_response.v3",
+                "ok": True,
                 "projection_revision": deepcopy(self.response_revision or self.revision),
                 "poses": [
                     {
-                        "scene_resource_id": body["scene_resource_ids"][0],
+                        "scene_resource_id": members["scene_resource_ids"][0],
                         "pose_in_cell": {
                             "position_m": {"x": 0.5, "y": 0.0, "z": 0.25},
                             "orientation_xyzw": [0.0, 0.0, 0.0, 2.0],
@@ -5262,7 +5349,6 @@ def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> Non
     assert carried.output["orientation"] == {"xyzw": [0.0, 0.0, 0.0, 1.0]}
     assert transport.queries == [
         {
-            "api_version": "manyforge.scene_resource_pose_query.v1",
             "expected_projection_revision": transport.revision,
             "scene_resource_ids": ["old-part"],
         }
@@ -5296,7 +5382,21 @@ def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> Non
     assert "absent from the logical scene" in absent.message
     assert transport.submissions == []
 
-    plain = _SceneTransport(populated=True)
+    class _RefusingOwner(_SceneTransport):
+        fenced = False
+
+        def scene_owner_read(self, members=None) -> dict[str, Any]:
+            # The owner answers a read only while its writes are open.
+            if self.fenced:
+                return _manager_refusal("active_native_projection_initialization_pending")
+            return super().scene_owner_read(members)
+
+        def scene_pose_query(self, members: Mapping[str, Any]) -> dict[str, Any]:
+            refusal = _manager_refusal("scene_pose_unavailable")
+            refusal["error"]["details"] = {"reason": "carrier_frame_unresolved"}
+            return refusal
+
+    plain = _RefusingOwner(populated=True)
     plain_port = _scene_port(plain)
     plain_port.bind(_scene_context())
     unresolved = plain_port.invoke(
@@ -5305,7 +5405,410 @@ def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> Non
         OwnerNodeInputs(parameters={"scene_resource_id": "old-part", "output_key": "pose"}),
     )
     assert unresolved.succeeded is False
-    assert "carried-object pose projection is unavailable" in unresolved.message
+    assert unresolved.reason_code == "scene_pose_unavailable"
+    assert unresolved.details == {"reason": "carrier_frame_unresolved"}
+    plain.fenced = True
+    fenced = plain_port.invoke(
+        "scene.get_object_pose",
+        _identity("read-fenced"),
+        OwnerNodeInputs(parameters={"scene_resource_id": "old-support", "output_key": "pose"}),
+    )
+    assert fenced.succeeded is False
+    # The node's reason stays generic; the owner's typed code is its cause.
+    assert fenced.reason_code == "scene_program_request_failed"
+    assert fenced.details == {"reason": "active_native_projection_initialization_pending"}
+    assert "writes are fenced" in fenced.message
+
+
+class _CheckingOwner(_SceneTransport):
+    """A fake Manager answering the whole and the selected owner read from one
+    Scene; ``narrow`` False answers a selection with the whole Scene (the read
+    before OD-380). It refuses as the owner does: an existing id on add, a
+    missing one on update or remove."""
+
+    def __init__(self, *, narrow: bool) -> None:
+        super().__init__(populated=True)
+        self.narrow = narrow
+        self.asked: list[Mapping[str, Any] | None] = []
+        # A carried object of another holder, and Scene rows no node names.
+        self.objects["held-elsewhere"] = _fixed_scene_object("held-elsewhere")
+        self.objects["held-elsewhere"]["placement"] = {
+            "kind": "carried", "carried_object_attachment_id": "attachment.other",
+            "carried_object_attachment_revision": _DIGEST_F,
+        }
+        self.attachments.append({
+            **deepcopy(self.attachments[0]),
+            "carried_object_attachment_id": "attachment.other",
+            "scene_resource_id": "held-elsewhere",
+            "controllable_component_id": "robot.2",
+        })
+        for index in range(20):
+            self.objects[f"filler-{index:02d}"] = _fixed_scene_object(f"filler-{index:02d}")
+
+    def scene_owner_read(self, members=None) -> dict[str, Any]:
+        self.asked.append(members)
+        return super().scene_owner_read(members if self.narrow else None)
+
+    def scene_pose_query(self, members: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "api_version": "manyforge.manager_command_response.v3", "ok": True,
+            "projection_revision": deepcopy(self.revision),
+            "poses": [{
+                "scene_resource_id": members["scene_resource_ids"][0],
+                "pose_in_cell": {"position_m": {"x": 0.5, "y": 0.0, "z": 0.25},
+                                 "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]},
+            }],
+        }
+
+    def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        operation = body["operation"]
+        resource_id = operation.get("scene_resource_id")
+        if operation["kind"] == "add_object" and resource_id in self.objects:
+            raise _scene_rejection(body, "scene_resource_exists", "scene resource exists")
+        if operation["kind"] in {"update_object_pose", "remove_object"} and (
+            resource_id not in self.objects
+        ):
+            raise _scene_rejection(body, "object_not_found", "scene resource is absent")
+        return super().commit_scene_transaction(body)
+
+
+_BOX_POSE = {
+    "frame_ref": {"kind": "cell_frame"},
+    "position_m": [0.3, 0.0, 0.2],
+    "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+}
+_BOX_SHAPE = {"type": "box", "box_dimensions_m": [0.1, 0.1, 0.1]}
+_HOLDER = target("robot.1", "arm.command")
+
+
+@pytest.mark.parametrize("node_id,parameters", [
+    ("scene.add_object", {"scene_resource_id": "new-box", "shape": _BOX_SHAPE, "pose": _BOX_POSE}),
+    # Name collision: the owner refuses.
+    ("scene.add_object", {"scene_resource_id": "old-support", "shape": _BOX_SHAPE, "pose": _BOX_POSE}),
+    ("scene.upsert_object", {"scene_resource_id": "old-support", "shape": _BOX_SHAPE, "pose": _BOX_POSE}),
+    ("scene.update_object_pose", {"scene_resource_id": "old-support", "pose": _BOX_POSE}),
+    ("scene.update_object_pose", {"scene_resource_id": "old-support", "pose": {
+        **_BOX_POSE, "frame_ref": {"kind": "scene_resource", "scene_resource_id": "filler-03"}}}),
+    ("scene.update_object_pose", {"scene_resource_id": "missing", "pose": _BOX_POSE}),
+    ("scene.remove_object", {"scene_resource_id": "old-support"}),
+    ("scene.remove_object", {"scene_resource_id": "missing"}),
+    ("scene.attach_carried_object", {
+        "scene_resource_id": "old-support", "target": _HOLDER,
+        "carrier_frame_ref": frame("robot.1", "tcp"),
+        "touch_bodies": [{"component_id": "robot.1", "collision_body_id": "tool_collision"}]}),
+    ("scene.detach_carried_object", {"scene_resource_id": "old-part", "target": _HOLDER}),
+    # Wrong holder, not carried, missing.
+    ("scene.detach_carried_object", {"scene_resource_id": "held-elsewhere", "target": _HOLDER}),
+    ("scene.detach_carried_object", {"scene_resource_id": "old-support", "target": _HOLDER}),
+    ("scene.detach_carried_object", {"scene_resource_id": "missing", "target": _HOLDER}),
+    ("scene.get_object_pose", {"scene_resource_id": "old-support", "output_key": "pose"}),
+    ("scene.get_object_pose", {"scene_resource_id": "old-part", "output_key": "pose"}),
+    ("scene.get_object_pose", {"scene_resource_id": "missing", "output_key": "pose"}),
+    # No Scene object can have this id: the whole Scene is read.
+    ("scene.get_object_pose", {"scene_resource_id": "not an id", "output_key": "pose"}),
+])
+def test_each_scene_node_reads_its_object_only_with_the_same_outcome(node_id, parameters) -> None:
+    """OD-380: a Scene node reads its own object (and its attachment) at the
+    owner, not the whole Scene; its result, refusal and commit are those of
+    the whole read."""
+
+    outcomes = []
+    for narrow in (False, True):
+        owner = _CheckingOwner(narrow=narrow)
+        port = _scene_port(owner)
+        port.bind(_scene_context())
+        result = port.invoke(node_id, _identity("narrow-read"), OwnerNodeInputs(parameters=parameters))
+        sent = [{**body, "request_context": None} for body in owner.submissions]
+        outcomes.append((result.succeeded, result.reason_code, result.message,
+                         result.details, result.output, result.metadata, sent))
+        resource_id = parameters["scene_resource_id"]
+        assert owner.asked == [
+            None if resource_id == "not an id" else {"scene_resource_ids": [resource_id]}
+        ]
+    assert outcomes[0] == outcomes[1]
+    succeeded = outcomes[1][0]
+    assert succeeded is (parameters["scene_resource_id"] not in {"missing", "not an id", "held-elsewhere"}
+                         and not (node_id == "scene.add_object" and parameters["scene_resource_id"] == "old-support")
+                         and not (node_id == "scene.detach_carried_object"
+                                  and parameters["scene_resource_id"] == "old-support"))
+
+
+class _LedgerManager(_SceneTransport):
+    """A fake Manager with a request ledger: a resend of a key with the same
+    transaction replays its result exactly; nothing is committed twice."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.sent: list[dict[str, Any]] = []
+        self.ledger: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+
+    def scene_commit(self, transaction: Mapping[str, Any]) -> dict[str, Any]:
+        self.sent.append(deepcopy(dict(transaction)))
+        key = transaction["request_context"]["request_key"]
+        if key in self.ledger:
+            recorded, result = self.ledger[key]
+            assert recorded == dict(transaction)
+            return {**deepcopy(result), "replay_status": "replayed_exact"}
+        result = super().scene_commit(transaction)
+        self.ledger[key] = (deepcopy(dict(transaction)), deepcopy(result))
+        return result
+
+    def scene_transaction_status(self, members: Mapping[str, Any]) -> dict[str, Any]:
+        transaction = dict(members["transaction"])
+        # The commit's form (http, no principal): not mutation intent.
+        assert transaction.pop("attribution") == {
+            "assurance": "unverified", "principal_id": None, "transport": "http"}
+        recorded = self.ledger.get(transaction["request_context"]["request_key"])
+        assert recorded is None or recorded[0] == transaction
+        return {"api_version": "manyforge.manager_command_response.v3", "ok": True,
+                "result": None if recorded is None else deepcopy(recorded[1])}
+
+
+def _remove_graspable(port, identity):
+    return port.invoke(
+        "scene.remove_object", identity,
+        OwnerNodeInputs(parameters={"scene_resource_id": "graspable"}),
+    )
+
+
+def test_scene_node_key_reaches_the_manager_unchanged_and_a_resend_replays() -> None:
+    from manyforge_behavior.request_keys import Minter, key_class, key_origin
+
+    manager = _LedgerManager()
+    manager.objects["graspable"] = _fixed_scene_object("graspable")
+    port = _scene_port(manager)
+    port.bind(_scene_context())
+    identity = _identity("ledger-remove")
+    # The owner read is the same before the resend: one admission generation.
+    view = manager.scene_owner_read()
+    manager.scene_owner_read = lambda members=None: deepcopy(view)
+
+    first = _remove_graspable(port, identity)
+    manager.admission_generation = 1  # The fake advanced it on commit.
+    resent = _remove_graspable(port, identity)
+
+    assert first.succeeded is True and resent.succeeded is True
+    assert first.output == resent.output
+    assert len(manager.sent) == 2 and manager.sent[0] == manager.sent[1]
+    key = parse_request_key(manager.sent[0]["request_context"]["request_key"])
+    # The runner's own class 1 key, never re-formed as an HTTP key (D1).
+    assert key_class(key) is KeyClass.INTERNAL
+    assert key_origin(key) == Minter.RUNNER
+    assert len(manager.submissions) == 1
+
+
+def test_unknown_scene_outcome_is_looked_up_by_its_key_never_resubmitted() -> None:
+    import manyforge_headless_py as core
+
+    from manyforge_behavior.orchestration_ports import OwnerInvocationPendingError
+
+    class LostReply(_LedgerManager):
+        lose = True
+
+        def scene_commit(self, transaction):
+            result = super().scene_commit(transaction)
+            if self.lose:
+                raise core.GatewayError(
+                    "manager_command_response_invalid", "reply lost", {"reason": "peer_closed"}
+                )
+            return result
+
+    manager = LostReply()
+    manager.objects["graspable"] = _fixed_scene_object("graspable")
+    port = _scene_port(manager)
+    port.bind(_scene_context())
+
+    with pytest.raises(OwnerInvocationPendingError) as pending:
+        _remove_graspable(port, _identity("lost-remove"))
+    observed = pending.value.observe()
+
+    assert observed.succeeded is True
+    assert observed.output["committed_projection_revision"] == manager.revision
+    assert len(manager.sent) == 1
+    assert len(manager.submissions) == 1
+
+
+def test_scene_commit_transport_failure_keeps_its_typed_cause_as_unknown() -> None:
+    import manyforge_headless_py as core
+
+    from manyforge_behavior.production_ports import SceneOutcomeUnknownError
+
+    class Unreachable(_SceneTransport):
+        def scene_commit(self, transaction):
+            self.submissions.append(deepcopy(dict(transaction)))
+            raise core.GatewayError(
+                "manager_command_unavailable", "Manager socket is unavailable",
+                {"reason": "connect_refused"},
+            )
+
+    manager = Unreachable()
+    with pytest.raises(SceneOutcomeUnknownError) as caught:
+        _scene_port(manager).prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
+    assert not hasattr(caught.value, "code")
+    assert caught.value.cause_code == "manager_command_unavailable"
+    assert caught.value.cause_details == {"reason": "connect_refused"}
+    assert len(manager.submissions) == 1
+
+
+def _recording_port(manager):
+    records: list[dict[str, Any]] = []
+    port = HeadlessSceneProgramPort(
+        manager,
+        program_node_evidence=_scene_port(manager)._program_node_evidence,
+        record_scene_change=records.append,
+    )
+    return port, records
+
+
+def test_runner_scene_changes_outside_nodes_are_recorded_once_each() -> None:
+    manager = _SceneTransport(populated=True)
+    port, records = _recording_port(manager)
+
+    port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
+    port.bind(_scene_context())
+    node = _remove_graspable(port, _identity("recorded-remove"))
+
+    assert node.succeeded is True
+    # The node's change is in its node attempt event, not here.
+    assert [(row["operation_kind"], row["outcome"]) for row in records] == [
+        ("detach_carried_object_at_current_pose", "succeeded"),
+        ("add_object", "succeeded"),
+        ("remove_object", "succeeded"),
+        ("remove_object", "succeeded"),
+    ]
+    revisions = [row["scene_change"].pop("scene_revision_id") for row in records]
+    assert revisions == [2, 3, 4, 5]
+    assert all(row["scene_change"].pop("duration_ms") >= 0 for row in records)
+    assert [row["scene_change"] for row in records] == [
+        {"scene_resource_id": resource, "source_label": "manyforge.behavior.program_scene"}
+        for resource in ("old-part", "graspable", "old-part", "old-support")
+    ]
+    assert all(row["error"] is None for row in records)
+
+
+def test_runner_scene_change_records_refusal_unknown_and_failure_and_skip_replays() -> None:
+    import manyforge_headless_py as core
+
+    class Outcomes(_SceneTransport):
+        def __init__(self, reply):
+            super().__init__(populated=True)
+            self.reply = reply
+
+        def scene_commit(self, transaction):
+            if isinstance(self.reply, Exception):
+                raise self.reply
+            return deepcopy(self.reply)
+
+    refused = {
+        "api_version": "manyforge.manager_command_response.v3", "ok": False,
+        "projection_status": "not_attempted", "committed_projection_revision": None,
+        "replay_status": "accepted_new", "transaction_sequence": None, "update_status": None,
+        "request_key": None,
+        "error": {"code": "missing_reference", "message": "carrier unavailable",
+                  "details": {"reason": "carrier"}, "producer": "component_manager"},
+    }
+    cases = [
+        (refused, "refused", {"code": "missing_reference", "message": "carrier unavailable",
+                              "details": {"reason": "carrier"}}),
+        ({**refused, "projection_status": "failed_projection_uncertain"}, "unknown",
+         {"code": "missing_reference", "message": "carrier unavailable",
+          "details": {"reason": "carrier"}}),
+        (core.GatewayError("manager_command_unavailable", "no Manager", {"reason": "x"}),
+         "failed", {"code": "manager_command_unavailable", "message": "no Manager",
+                    "details": {"reason": "x"}}),
+        ({**refused, "replay_status": "replayed_exact"}, None, None),
+    ]
+    for reply, outcome, error in cases:
+        port, records = _recording_port(Outcomes(reply))
+        result = port.clear_applied_scene(
+            retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C, is_current=lambda: True,
+        )
+        assert result["state"] in {"failed", "unknown", "partial"}
+        if outcome is None:
+            assert records == []
+            continue
+        assert records[0]["operation_kind"] == "detach_carried_object"
+        assert records[0]["outcome"] == outcome
+        assert records[0]["error"] == error
+        assert records[0]["scene_change"]["scene_resource_id"] is None
+        assert records[0]["scene_change"]["scene_revision_id"] is None
+
+
+def test_runner_scene_transactions_are_the_wire_form_headless_sent() -> None:
+    """Every transaction the port hands the core is exactly what Headless's
+    scene route sent the Manager for it (its model and wire body)."""
+
+    from manyforge_headless_api.manager import _transaction_body
+    from manyforge_headless_api.models import SceneTransactionRequest
+
+    class Recording(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__(populated=True)
+            self.sent: list[dict[str, Any]] = []
+
+        def scene_commit(self, transaction):
+            self.sent.append(deepcopy(dict(transaction)))
+            return super().scene_commit(transaction)
+
+        def commit_scene_transaction(self, body):
+            # The fixture models ordinary authoring for every object mutation.
+            if body["program_reset_scene_authorization"] is not None:
+                body = {**body, "expected_admission_generation": self.admission_generation}
+            return super().commit_scene_transaction(body)
+
+    manager = Recording()
+    manager.objects["graspable"] = _fixed_scene_object("graspable")
+    port = _scene_port(manager)
+    context = _scene_context()
+    port.prepare_initial_scene(context, _authored_scene())
+    port.bind(context)
+    for node_id, parameters in (
+        ("scene.upsert_object", {
+            "scene_resource_id": "part", "shape": _authored_scene()[0]["shape"],
+            "pose": _authored_scene()[0]["pose"]}),
+        ("scene.update_object_pose", {
+            "scene_resource_id": "part",
+            "pose": {**_authored_scene()[0]["pose"], "position_m": [0.4, 0.1, 0.2]}}),
+        ("scene.attach_carried_object", {
+            "scene_resource_id": "part", "target": target("robot.1", "arm.command"),
+            "carrier_frame_ref": frame("robot.1", "tcp"),
+            "touch_bodies": [{"component_id": "robot.1", "collision_body_id": "tool_collision"}],
+            "grasp_lost_translation_m": 0.01, "grasp_lost_rotation_rad": 0.1}),
+        ("scene.detach_carried_object", {
+            "scene_resource_id": "part", "target": target("robot.1", "arm.command")}),
+        ("scene.remove_object", {"scene_resource_id": "part"}),
+    ):
+        result = port.invoke(node_id, _identity(f"wire-{node_id}"), OwnerNodeInputs(parameters=parameters))
+        assert result.succeeded is True, result.message
+    port.prepare_initial_scene(
+        context, _authored_scene(), program_reset_scene_authorization=_RUN_RESET_AUTHORIZATION)
+    manager.objects["stray"] = _fixed_scene_object("stray")
+    port.prepare_initial_scene(context, _authored_scene(), program_reset_scene_authorization={
+        "cycle_generation": 3, "reset_claim": _IDLE_RESET_CLAIM,
+        "program_cycle_status": _RESET_CYCLE_STATUS})
+    assert port.invoke("scene.attach_carried_object", _identity("wire-attach-again"),
+                       OwnerNodeInputs(parameters={
+                           "scene_resource_id": "graspable",
+                           "target": target("robot.1", "arm.command"),
+                           "carrier_frame_ref": frame("robot.1", "tcp"),
+                           "touch_bodies": [{"component_id": "robot.1",
+                                             "collision_body_id": "tool_collision"}]})).succeeded
+    port.clear_applied_scene(
+        retained_bundle_id=_DIGEST_B, graph_revision=_DIGEST_C, is_current=lambda: True)
+
+    kinds = {body["operation"]["kind"] for body in manager.sent}
+    assert kinds == {
+        "detach_carried_object_at_current_pose", "add_object", "upsert_object",
+        "remove_object", "update_object_pose", "attach_carried_object", "detach_carried_object",
+    }
+    assert {
+        "reset_claim" in (body["program_reset_scene_authorization"] or {"none": 1})
+        for body in manager.sent if body["program_reset_scene_authorization"] is not None
+    } == {True, False}
+    assert any("program_node_evidence" in body for body in manager.sent)
+    for body in manager.sent:
+        headless = _transaction_body(SceneTransactionRequest.model_validate(body), None)
+        assert headless == body
 
 
 def _joint_inputs() -> OwnerNodeInputs:
@@ -5379,7 +5882,7 @@ _PREVIEW_VARIANTS = {
 def test_node_preview_uses_the_execution_motion_builder_exactly(variant) -> None:
     node_id, inputs_factory, unavailable = _PREVIEW_VARIANTS[variant]
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     inputs = inputs_factory()
     identity = _identity("move-preview")
@@ -5395,9 +5898,19 @@ def test_node_preview_uses_the_execution_motion_builder_exactly(variant) -> None
         binding=bound.capture.program_binding,
         move_id=executed_payload["move_id"],
     )
+    def wire(payload: Mapping[str, Any]) -> dict[str, Any]:
+        # On the wire each joint limit row carries its three caps (the host's form).
+        payload = deepcopy(dict(payload))
+        payload["per_joint_dynamics_limits"] = {
+            joint: {"max_velocity_rad_s": None, "max_acceleration_rad_s2": None,
+                    "max_jerk_rad_s3": None, **row}
+            for joint, row in payload["per_joint_dynamics_limits"].items()
+        }
+        return payload
+
     # One builder: relative targets, goal frames, contact inputs and limits
     # are the execution payload itself, not a second translation.
-    assert dict(shared.payload) == executed_payload
+    assert wire(shared.payload) == executed_payload
     submissions_before = deepcopy(transport.submissions)
     controls_before = deepcopy(transport.controls)
 
@@ -5411,7 +5924,7 @@ def test_node_preview_uses_the_execution_motion_builder_exactly(variant) -> None
         )
         previewed = intent["participants"][0]
         assert previewed["payload"]["move_id"] != executed_payload["move_id"]
-        assert {**previewed["payload"], "move_id": None} == {
+        assert {**wire(previewed["payload"]), "move_id": None} == {
             **executed_payload,
             "move_id": None,
         }
@@ -5439,7 +5952,7 @@ def test_node_preview_uses_the_execution_motion_builder_exactly(variant) -> None
 
 def test_node_preview_refuses_unbound_runs_and_non_motion_nodes() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     identity = _identity("move-preview")
 
     with pytest.raises(ProgramMotionPreviewUnavailableError) as unbound:
@@ -5495,7 +6008,7 @@ def _interrupt_inputs(node_id: str) -> OwnerNodeInputs:
 @pytest.mark.parametrize("node_id", ["motion.move_until_signal", "motion.probe_search"])
 def test_interrupt_move_submits_the_ordinary_motion_with_its_node_context(node_id) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("search")
 
@@ -5526,7 +6039,7 @@ def test_interrupt_move_submits_the_ordinary_motion_with_its_node_context(node_i
 
 def test_probe_search_needs_no_collision_rule() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_interrupt_inputs("motion.probe_search").parameters)
     parameters.pop("collision_rules")
@@ -5541,7 +6054,7 @@ def test_probe_search_needs_no_collision_rule() -> None:
 @pytest.mark.parametrize("node_id", ["motion.move_until_signal", "motion.probe_search"])
 def test_interrupt_move_preview_keeps_the_original_node_context(node_id) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     identity = _identity("search")
     inputs = _interrupt_inputs(node_id)
@@ -5591,7 +6104,7 @@ def test_idle_scene_restoration_reuses_the_exact_applied_program_convergence() -
 @pytest.mark.parametrize("wait", [None, False, True])
 def test_gripper_command_passes_wait_for_duration_as_bool_option(wait):
     transport = _preset_transport(kind="linear_m")
-    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport))); port.bind(_context())
     parameters = dict(_gripper_inputs().parameters)
     parameters["command_duration_s"] = 0.4
     if wait is not None:
@@ -5611,7 +6124,7 @@ def test_gripper_attempt_captures_typed_default_and_override_once(kind, authored
     if kind == "pneumatic":
         transport.preset_descriptor.update(actuation_kind=kind, completion_policy="output_delivery",
                                            grasp_confirmation_policy="not_required", command_duration_s=1.25)
-    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport))); port.bind(_context())
     parameters = dict(_gripper_inputs().parameters)
     if authored is None:
         parameters.pop("command_duration_s")
@@ -5627,7 +6140,7 @@ def test_gripper_attempt_captures_typed_default_and_override_once(kind, authored
     transport.preset_descriptor["command_duration_s"] = 99.0
     transport.preset_descriptor["actuation_kind"] = "foreign"
     transport.operations[started.task_id].update(state="completed", operation_revision=3)
-    completed = port.operations.observe(started.task_id)
+    completed = port.operations.observe(started.task_id, reads=True)
     assert completed.metadata["gripper_dwell_s"] == timing["gripper_dwell_s"]
     port.operations.acknowledge(started.task_id, _identity())
     assert transport.target_reads == 1
@@ -5654,7 +6167,7 @@ def test_numeric_gripper_reuses_verified_descriptor_and_refuses_before_effect(fa
     elif fault == "schema": descriptor["contracts"]["command_schema"] = {}
     elif fault == "limits": descriptor["min_position"] = 2.0
     else: descriptor["unit"] = "rad"
-    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport))); port.bind(_context())
     with pytest.raises(ProductionPortError):
         port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
     assert transport.submissions == transport.controls == []
@@ -5666,7 +6179,7 @@ def test_numeric_gripper_accepts_explicit_unconfigured_legacy_descriptor_without
     for key in ("actuation_kind", "output_mode", "completion_policy", "grasp_confirmation_policy", "command_duration_s"):
         transport.preset_descriptor[key] = None
     transport.preset_descriptor["named_presets"] = None
-    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport))); port.bind(_context())
     started = port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
     assert started.metadata["gripper_actuation_kind"] is None
     assert started.metadata["gripper_dwell_s"] is None
@@ -5686,7 +6199,7 @@ def test_numeric_gripper_keeps_descriptor_owner_for_effect_submit_cas(field):
         assert body["expected_retained_bundle_id"] == _DIGEST_B
         return {"ok": False, "error": {"code": "invalid_state_transition", "message": "owner CAS refused", "details": {"reason":"stale_capture"}}}
     transport.targets, transport.submit = replace_after_read, refuse_stale
-    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport))); port.bind(_context())
     with pytest.raises(KernelOperationAdmissionRejectedError):
         port.operations.start("gripper.command_position", _identity(), _gripper_inputs())
     assert transport.submissions == transport.controls == []
@@ -5777,7 +6290,7 @@ def _prepared_held_behavior():
     transport = _HeldPreparationTransport()
     context = replace(_context(), program={"program_revision":_DIGEST_A,
         "tree":{"instance_id":"command","node_id":"gripper.command_position","parameters":{},"children":[]}})
-    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(context)
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport))); port.bind(context)
     now = [100.0]; clock = ProgramClock(lambda: now[0])
     def scope_snapshot():
         return OperatorMotionStopSnapshot(transport.hold_revision,
@@ -5906,7 +6419,7 @@ def test_idle_reset_scene_preparation_forwards_exact_claim_without_authoring_adm
     port.prepare_initial_scene(_scene_context(), _authored_scene(), program_reset_scene_authorization=authorization)
     assert transport.forwarded
     assert all(row["program_reset_scene_authorization"] == authorization for row in transport.forwarded)
-    assert all("expected_admission_generation" not in row for row in transport.forwarded)
+    assert all(row["expected_admission_generation"] is None for row in transport.forwarded)
 
 
 _IDLE_RESET_CLAIM = {"request_key": format_request_key(_key("reset.1")),
@@ -6175,7 +6688,8 @@ def test_manual_result_press_reads_the_owner_fresh_not_the_cached_terminal(
     )
     # The ordinary observation answers from the cached terminal.
     assert (
-        fixture.port.operations.observe(task_id).metadata["recovery_assessment"] == cached
+        fixture.port.operations.observe(task_id, reads=True).metadata["recovery_assessment"]
+        == cached
     )
     previous = fixture.transport.operation_recovery
     reads: list[str] = []
@@ -6211,13 +6725,13 @@ def test_a_transient_assessment_absence_is_not_a_failure_and_a_malformed_read_is
         raise KernelOperationObservationUnavailableError("the owner is unreachable")
 
     fixture.transport.operation_recovery = unreachable
-    transient = fixture.port.operations.observe(fixture.started.task_id)
+    transient = fixture.port.operations.observe(fixture.started.task_id, reads=True)
     assert transient.state is OwnerTaskState.INTERRUPTED
     assert "recovery_assessment" not in transient.metadata
     assert "recovery_assessment_failure" not in transient.metadata
 
     fixture.transport.operation_recovery = lambda _operation_id: {"ok": True}
-    malformed = fixture.port.operations.observe(fixture.started.task_id)
+    malformed = fixture.port.operations.observe(fixture.started.task_id, reads=True)
     assert malformed.state is OwnerTaskState.INTERRUPTED
     assert "recovery_assessment" not in malformed.metadata
     failure = malformed.metadata["recovery_assessment_failure"]
@@ -6227,7 +6741,7 @@ def test_a_transient_assessment_absence_is_not_a_failure_and_a_malformed_read_is
 
 def test_motion_participants_carry_no_automatic_retry_context() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
 
     port.operations.start("motion.move_to_pose", _identity("motion-no-context"), _motion_inputs())
@@ -6244,7 +6758,7 @@ def test_a_logical_preemption_is_read_from_the_operation_state_exactly() -> None
         {"state": "executing", "preemption": {"kind": "preempted", "by": successor}}
     )
 
-    observed = fixture.port.operations.observe(fixture.started.task_id)
+    observed = fixture.port.operations.observe(fixture.started.task_id, reads=True)
     assert observed.state is OwnerTaskState.ACTIVE  # Physically it still moves.
     assert observed.metadata["preemption"] == {"kind": "preempted", "by": successor}
 
@@ -6256,7 +6770,7 @@ def test_a_logical_preemption_is_read_from_the_operation_state_exactly() -> None
         "kind": "won", "by": successor,
     }
     with pytest.raises(ProductionPortError, match="preemption fact is invalid"):
-        fixture.port.operations.observe(fixture.started.task_id)
+        fixture.port.operations.observe(fixture.started.task_id, reads=True)
 
 
 def _takeover(**overrides: Any) -> dict[str, Any]:
@@ -6278,7 +6792,7 @@ def test_a_motion_takeover_is_read_from_the_newcomer_operation_state_exactly() -
     fixture = _stopped_motion_for_recovery()
     operation = fixture.transport.operations[fixture.started.task_id]
     operation["state"] = "executing"
-    observed = fixture.port.operations.observe(fixture.started.task_id)
+    observed = fixture.port.operations.observe(fixture.started.task_id, reads=True)
     assert "motion_takeover" not in observed.metadata  # Omitted when absent.
 
     for fact in (
@@ -6291,7 +6805,7 @@ def test_a_motion_takeover_is_read_from_the_newcomer_operation_state_exactly() -
         }),
     ):
         operation["motion_takeover"] = fact
-        observed = fixture.port.operations.observe(fixture.started.task_id)
+        observed = fixture.port.operations.observe(fixture.started.task_id, reads=True)
         assert observed.state is OwnerTaskState.ACTIVE
         assert observed.metadata["motion_takeover"] == fact
 
@@ -6327,14 +6841,14 @@ def test_a_malformed_motion_takeover_is_ignored_and_never_fails_the_node(fact) -
     fixture = _stopped_motion_for_recovery()
     operation = fixture.transport.operations[fixture.started.task_id]
     operation.update({"state": "executing", "motion_takeover": fact})
-    observed = fixture.port.operations.observe(fixture.started.task_id)
+    observed = fixture.port.operations.observe(fixture.started.task_id, reads=True)
     assert observed.state is OwnerTaskState.ACTIVE
     assert "motion_takeover" not in observed.metadata
 
 
 def test_a_newcomer_refused_by_priority_names_the_winner() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
 
     def refuse(body):
@@ -6367,7 +6881,7 @@ def test_a_rule_holds_refusal_is_the_kernels_own_admission_refusal() -> None:
     """No "Motion waits"; the node fails at once with it."""
 
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
 
     def refuse(body):
@@ -6391,7 +6905,7 @@ def test_a_rule_holds_refusal_is_the_kernels_own_admission_refusal() -> None:
 
 def test_rules_set_active_is_one_immediate_kernel_call() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     result = port.queries.invoke("rules.set_active", _identity("rule"), OwnerNodeInputs(
         parameters={"rule_id": "curtain", "active": True}))
@@ -6413,7 +6927,7 @@ def test_rules_set_active_is_one_immediate_kernel_call() -> None:
 
 def test_clear_outside_change_names_the_bound_output_and_writes_nothing() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_pneumatic_context())
     result = port.queries.invoke("io.clear_outside_change", _identity("clear"), OwnerNodeInputs(
         parameters={"signal": signal("io.2", "valve.a")}))
@@ -6488,7 +7002,7 @@ def test_changed_outside_is_read_like_any_fresh_input_signal() -> None:
                           "source_id": "core.changed_outside.io.2.valve.a",
                           "source_epoch": "core", "source_sequence": 2}}}
 
-    port = NativeKernelProgramPort(KernelClient(QueryTransport()))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(QueryTransport())))
     port.bind(_pneumatic_context())
     result = port.queries.invoke("io.check_input", _identity("outside"), OwnerNodeInputs(
         parameters={"signal": signal("io.2", "valve.a.changed_outside"),
@@ -6519,7 +7033,7 @@ def test_a_failed_operation_carries_its_own_failure_facts() -> None:
             ],
         }
     )
-    observed = fixture.port.operations.observe(fixture.started.task_id)
+    observed = fixture.port.operations.observe(fixture.started.task_id, reads=True)
 
     assert observed.metadata["operation_failure"] == {
         "operation": {
@@ -6534,14 +7048,14 @@ def test_a_failed_operation_carries_its_own_failure_facts() -> None:
 
 def test_an_observed_operation_carries_its_exact_state_and_residency() -> None:
     fixture = _stopped_motion_for_recovery()
-    observed = fixture.port.operations.observe(fixture.started.task_id)
+    observed = fixture.port.operations.observe(fixture.started.task_id, reads=True)
     assert observed.metadata["operation_state"] == "stopped"
     assert observed.metadata["resident"] is True
 
     # An exact successful read showing the operation no longer resident:
     # its retirement already completed.
     fixture.transport.resident[observed.metadata["operation_id"]] = False
-    retired = fixture.port.operations.observe(fixture.started.task_id)
+    retired = fixture.port.operations.observe(fixture.started.task_id, reads=True)
     assert retired.metadata["resident"] is False
 
 
@@ -6558,7 +7072,7 @@ def test_an_observed_operation_carries_its_exact_state_and_residency() -> None:
 )
 def test_motion_start_accepts_frozen_tcp_selectors(selector, expected) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
     parameters["tcp_endpoint"] = selector
@@ -6588,7 +7102,7 @@ def test_motion_start_accepts_frozen_tcp_selectors(selector, expected) -> None:
 )
 def test_motion_start_rejects_invalid_frozen_tcp_selectors(selector, message) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
     parameters["tcp_endpoint"] = selector
@@ -6601,7 +7115,7 @@ def test_motion_start_rejects_invalid_frozen_tcp_selectors(selector, message) ->
 
 def test_motion_start_rejects_legacy_tcp_frame_role_before_submission() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
     parameters["tcp_frame_role"] = "tcp"
@@ -6615,7 +7129,7 @@ def test_motion_start_rejects_legacy_tcp_frame_role_before_submission() -> None:
 @pytest.mark.parametrize('node_id', ['motion.move_to_pose', 'motion.probe_search'])
 def test_qualified_tcp_endpoint_is_identical_for_execution_and_preview(node_id) -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     inputs = _contact_pose_inputs() if node_id == 'motion.move_to_pose' else _interrupt_inputs(node_id)
     parameters = dict(inputs.parameters)
@@ -6681,7 +7195,7 @@ def test_joint_goal_sends_a_release_rule_for_the_selected_tcp() -> None:
         collision_rules=[rule],
     )
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     port.operations.start('motion.move_to_joint_target', _identity('withdraw'), OwnerNodeInputs(parameters))
     payload = transport.submissions[0]['participants'][0]['payload']
@@ -6750,7 +7264,7 @@ def test_pneumatic_plan_uses_endpoint_and_false_before_true(position_request, ex
         completion_policy="no_output", grasp_confirmation_policy="not_required")
     transport.preset_descriptor["named_presets"][0]["master_position"] = 0.5
     transport.preset_descriptor["named_presets"][1]["master_position"] = 0.0
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_pneumatic_context())
     parameters = dict(_gripper_inputs().parameters)
     parameters.update(position=position_request, required_inputs=[{"input": "workpiece_grasped", "value": True}])
@@ -6763,7 +7277,7 @@ def test_pneumatic_plan_uses_endpoint_and_false_before_true(position_request, ex
 
 def test_pneumatic_valve_rows_write_their_signal_ids_without_kernel_operations():
     transport = _preset_transport(kind="linear_m")
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_pneumatic_context())
     for component, resource in (("io.2", "valve.a"), ("io.1", "valve.b")):
         result = port.queries.invoke("io.set_output", _identity(), OwnerNodeInputs({
@@ -6792,7 +7306,7 @@ def test_position_grasp_confirmation_rides_the_existing_descriptor_read(
     transport = _preset_transport(kind="linear_m")
     if required:
         transport.preset_descriptor["grasp_confirmation"] = "required"
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     parameters = dict(_gripper_inputs().parameters)
     parameters.update(position=position_request)
@@ -6816,7 +7330,7 @@ def test_pneumatic_grasp_confirmation_reads_the_mapped_workpiece_input(name, exp
         grasp_confirmation="required")
     transport.preset_descriptor["named_presets"][0]["master_position"] = 0.5
     transport.preset_descriptor["named_presets"][1]["master_position"] = 0.0
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_pneumatic_context())
     parameters = dict(_gripper_inputs().parameters)
     parameters.update(position={"kind": "named_preset", "name": name})
@@ -6837,7 +7351,7 @@ def test_gripper_status_read_carries_typed_grasp_evidence(confirmed):
                           "source_epoch": "provider.1", "active_control_configuration_id": "route.1",
                           "active_control_configuration_generation": 3}}}
 
-    port = NativeKernelProgramPort(KernelClient(QueryTransport()))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(QueryTransport())))
     port.bind(_context())
     result = port.queries.invoke("gripper.check_status", _identity("grasp"), OwnerNodeInputs(
         parameters={"target": target("tool.1", "gripper.command"), "expected_state": "reached"}))
@@ -6855,7 +7369,7 @@ def test_set_tcp_current_lowers_blackboard_entry_before_submission() -> None:
             }}
 
     transport = RefusingTransport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     entry = {"target": target("tool.1", "gripper.command"), "frame": frame("tool.1", "tip")}
     with pytest.raises(KernelOperationAdmissionRejectedError) as refused:
@@ -6890,7 +7404,7 @@ def test_set_tcp_result_is_applied_before_success() -> None:
 
     applied = []
     transport = ImmediateTransport()
-    port = NativeKernelProgramPort(KernelClient(transport),
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)),
         active_tcp_result=lambda run, robot, value: applied.append((run, robot, deepcopy(value))))
     port.bind(_context())
     result = port.operations.start("motion.set_tcp", _identity("tcp-success"), OwnerNodeInputs({
@@ -6944,7 +7458,7 @@ def _motion_test_port(transport):
         return {**read(operation_id), "active_tcp": deepcopy(rows)}
 
     transport.read = read_with_tcp
-    return NativeKernelProgramPort(KernelClient(transport),
+    return NativeKernelProgramPort(KernelClient(transport_gateway(transport)),
                                    active_tcp_result=runtime._apply_active_tcp_result)
 
 
@@ -6968,7 +7482,7 @@ def test_same_owner_tcp_result_conflict_does_not_settle_as_success() -> None:
             }, "active_tcp": rows}
 
     transport = ConflictingReceipt()
-    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=runtime._apply_active_tcp_result)
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)), active_tcp_result=runtime._apply_active_tcp_result)
     port.bind(_context())
     result = port.operations.start("motion.set_tcp", _identity("conflicting-tcp-result"), OwnerNodeInputs({
         "target": target("robot.1", "arm.command"), "tcp": {"kind": "entry", "target": target("robot.1", "arm.command"), "frame": frame("robot.1", "flange")},
@@ -6998,14 +7512,14 @@ def test_non_node_observations_ignore_unavailable_active_tcp_result(action) -> N
         return runtime._apply_active_tcp_result(*args)
 
     transport = OldResultTransport()
-    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=apply_result)
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)), active_tcp_result=apply_result)
     port.bind(_context())
     identity = _identity("unavailable-tcp")
     started = port.operations.start("motion.move_to_pose", identity, _motion_inputs())
     transport.operations[started.task_id]["state"] = "completed"
 
     with pytest.raises(OwnerTaskObservationUnavailableError):
-        port.operations.observe(started.task_id)
+        port.operations.observe(started.task_id, reads=True)
     assert len(calls) == 1
     calls.clear()
     if action == "scope":
@@ -7056,7 +7570,7 @@ def test_unknown_set_tcp_reset_reads_status_without_replay_and_retries_failed_re
         applied.append((run, robot, deepcopy(value)))
         return True
 
-    port = NativeKernelProgramPort(KernelClient(transport),
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)),
         active_tcp_result=apply_result)
     port.bind(_context())
     result = port.operations.start("motion.set_tcp", _identity("tcp-unknown"), OwnerNodeInputs({
@@ -7101,7 +7615,7 @@ def test_admitted_set_tcp_failure_applies_confirmed_value_before_failure() -> No
 
     applied = []
     transport = FailedStep()
-    port = NativeKernelProgramPort(KernelClient(transport),
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)),
         active_tcp_result=lambda run, robot, value: applied.append((run, robot, deepcopy(value))))
     port.bind(_context())
     result = port.operations.start("motion.set_tcp", _identity("tcp-failure"), OwnerNodeInputs({
@@ -7125,7 +7639,7 @@ def test_failed_move_applies_confirmed_tcp_before_terminal_failure() -> None:
 
     applied = []
     transport = TcpReadTransport()
-    port = NativeKernelProgramPort(KernelClient(transport),
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)),
         active_tcp_result=lambda run, robot, value: applied.append((run, robot, deepcopy(value))))
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
@@ -7133,7 +7647,7 @@ def test_failed_move_applies_confirmed_tcp_before_terminal_failure() -> None:
     started = port.operations.start("motion.move_to_pose", _identity("tcp-failed-move"),
                                     OwnerNodeInputs(parameters))
     transport.operations[started.task_id]["state"] = "failed"
-    result = port.operations.observe(started.task_id)
+    result = port.operations.observe(started.task_id, reads=True)
     assert result.state is OwnerTaskState.FAILED
     assert applied == [(1, "robot.1", rows)]
 
@@ -7160,7 +7674,7 @@ def test_motion_terminal_waits_when_confirmed_tcp_cannot_be_applied(
         applied.append((run, robot, deepcopy(value)))
 
     transport = TcpReadTransport()
-    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=update)
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)), active_tcp_result=update)
     port.bind(_context())
     parameters = dict(_motion_inputs().parameters)
     parameters["tcp_endpoint"] = {"kind": "default_of_target", "target": target("tool.1", "gripper.command")}
@@ -7168,9 +7682,9 @@ def test_motion_terminal_waits_when_confirmed_tcp_cannot_be_applied(
                                     OwnerNodeInputs(parameters))
     transport.operations[started.task_id]["state"] = native_state
     with pytest.raises(OwnerTaskObservationUnavailableError):
-        port.operations.observe(started.task_id)
+        port.operations.observe(started.task_id, reads=True)
     fail[0] = False
-    assert port.operations.observe(started.task_id).state is expected_state
+    assert port.operations.observe(started.task_id, reads=True).state is expected_state
     assert applied == [(1, "robot.1", rows)]
     assert len(transport.submissions) == 1
 
@@ -7189,7 +7703,7 @@ def test_a_stop_for_a_run_the_port_never_bound_leaves_no_stop_entry() -> None:
     bound run keeps its Stop until Reset."""
 
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(_context())
     for index in range(3):
         snapshot = port.scope.request_stop(
@@ -7207,7 +7721,7 @@ def test_a_stop_for_a_run_the_port_never_bound_leaves_no_stop_entry() -> None:
 
 def test_release_halt_passes_through_for_a_bound_run_only() -> None:
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     with pytest.raises(ProductionPortError, match="not bound"):
         port.scope.release_halt(7, expected_hold_revision=3)
     assert transport.released_halts == []
@@ -7222,7 +7736,7 @@ def test_an_unbound_run_observes_no_kernel_scope() -> None:
     transport = _Transport()
     transport.run_fences[7] = (1, 1)
     transport.stop_states[1] = "stopping"
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     assert port.scope.observe(7).state is ProgramRunScopeState.SETTLED
     assert transport.scope_reads == 0
 
@@ -7287,6 +7801,50 @@ def test_scene_node_commit_key_follows_the_admission_generation() -> None:
 # operations table, not with a `read` per tick.
 
 
+class _CoreError(RuntimeError):
+    """The core's GatewayError as the client sees it: a typed ``code``."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class _PushedEvents:
+    """The core follower's pushed copy (``ExecutionEvents``) as the nodes
+    read it: replaced whole by ``apply_state``, unavailable after
+    ``stream_lost``. Its full semantics are the core's gtest."""
+
+    def __init__(self) -> None:
+        self._state: dict[str, Any] | None = None
+
+    def apply_state(self, state: Mapping[str, Any]) -> None:
+        self._state = deepcopy(dict(state))
+
+    def stream_lost(self) -> None:
+        self._state = None
+
+    def operation_envelope(self, operation_id: int, after_change: int) -> dict[str, Any] | None:
+        if self._state is None:
+            raise _CoreError("execution_event_mirror_unavailable")
+        table = self._state["operations"]
+        if table["change"] < after_change:
+            raise _CoreError("execution_event_mirror_behind")
+        entry = next((row for row in table["resident"] if row["operation_id"] == operation_id), None)
+        if entry is None or entry["operation"] is None:
+            return None
+        return deepcopy({
+            "ok": True, "command": "read", "operation": entry["operation"], "resident": True,
+            "last_control": entry["last_control"], "control_pending": entry["control_pending"],
+            "active_tcp": self._state.get("active_tcp_baseline"),
+        })
+
+    def planning_job_state(self, job_id: str) -> str | None:
+        if self._state is None:
+            raise _CoreError("execution_event_mirror_unavailable")
+        return next((row["state"] for row in self._state["planning_jobs"]
+                     if row["job_id"] == job_id), None)
+
+
 class _PushedTransport(_Transport):
     """Acceptances carry the Kernel's operations counter; ``push`` sends the
     stream's table built from this fake Kernel's resident operations."""
@@ -7294,7 +7852,7 @@ class _PushedTransport(_Transport):
     def __init__(self) -> None:
         super().__init__()
         self.change = 0
-        self.table = PushedOperationTable()
+        self.table = _PushedEvents()
         self.last_controls: dict[int, dict[str, Any]] = {}
 
     def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -7333,7 +7891,7 @@ class _PushedTransport(_Transport):
 
 def _pushed_port(transport: _PushedTransport, tcp_results: list[Any]) -> NativeKernelProgramPort:
     port = NativeKernelProgramPort(
-        KernelClient(transport, transport.table),
+        KernelClient(transport_gateway(transport), transport.table),
         active_tcp_result=lambda *args: tcp_results.append(args),
     )
     port.bind(_context())
@@ -7381,7 +7939,12 @@ def test_a_retired_or_unlisted_operation_is_read_once_per_observation() -> None:
     transport.change += 1
     transport.push()
 
-    observed = port.operations.observe(started.task_id)
+    # The tick's observation reads nothing (OD-380 D2): its read is handed
+    # to the node, which sends it on its run's sender.
+    with pytest.raises(OwnerTaskReadRequiredError) as needed:
+        port.operations.observe(started.task_id)
+    assert transport.operation_reads == 0
+    observed = needed.value.read()
 
     assert observed.state is OwnerTaskState.SUCCEEDED
     assert observed.metadata["resident"] is False
@@ -7447,7 +8010,7 @@ def test_reset_control_node_observes_the_pushed_table() -> None:
             return response
 
     transport = Transport()
-    owner = NativeKernelProgramPort(KernelClient(transport, transport.table))
+    owner = NativeKernelProgramPort(KernelClient(transport_gateway(transport), transport.table))
     context = _context()
     owner.bind(replace(context, program_binding={
         **context.program_binding,
@@ -7471,7 +8034,11 @@ def test_reset_control_node_observes_the_pushed_table() -> None:
     with pytest.raises(OwnerTaskObservationUnavailableError):
         owner.controls.observe(task.task_id)
     # The Reset retired the operation: the current table no longer lists it,
-    # one read confirms it is no longer resident.
+    # and the tick reads nothing (OD-380 D2): the node sends the one read
+    # that confirms it is no longer resident on its run's sender.
     transport.push()
-    assert owner.controls.observe(task.task_id).state is OwnerTaskState.SUCCEEDED
+    with pytest.raises(OwnerTaskReadRequiredError) as needed:
+        owner.controls.observe(task.task_id)
+    assert transport.operation_reads == 0
+    assert needed.value.read().state is OwnerTaskState.SUCCEEDED
     assert transport.operation_reads == 1

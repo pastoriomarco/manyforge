@@ -31,6 +31,7 @@ from manyforge_behavior.orchestration_ports import (
     PROGRAM_MOTION_STOP_RECOVERY_CLASS,
     recovery_outcome,
     NodeAdapterPorts,
+    OwnerTaskReadRequiredError,
     OwnerTaskSettlementPendingError,
     OwnerTaskState,
     ProgramRunPortContext,
@@ -55,6 +56,7 @@ from manyforge_behavior.program_runtime import (
     ProgramRuntimeError,
 )
 from manyforge_behavior.orchestration_values import ProgramValueError, ProgramValueStore
+from manyforge_behavior.run_sender import RunRequest, RunSender
 
 
 PROGRAM_RUN_STATUS_API: Final = "manyforge.program_run_status.v5"
@@ -75,7 +77,23 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class ProgramRunOwnerError(RuntimeError):
-    """A Program-run owner request is invalid, stale, or unavailable."""
+    """A Program-run owner request is invalid, stale, or unavailable.
+
+    ``code`` and ``details``, when given, are the refusal's catalog code and
+    its typed details (the runner passes them on)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.code = code
+        if details is not None:
+            self.details = dict(details)
 
 
 class ProgramRunOwnerStaleRevisionError(ProgramRunOwnerError):
@@ -93,11 +111,17 @@ class ProgramRunOwnerStaleRevisionError(ProgramRunOwnerError):
 
 def _release_refused(error: ProgramSelectionReleaseRejectedError) -> ProgramRunOwnerError:
     """Keep the Kernel's stable refusal code and details for the caller."""
-    refused = ProgramRunOwnerError(str(error))
-    if error.code is not None:
-        refused.code = error.code  # type: ignore[attr-defined]
-        refused.details = dict(error.details)  # type: ignore[attr-defined]
-    return refused
+    if error.code is None:
+        return ProgramRunOwnerError(str(error))
+    return ProgramRunOwnerError(str(error), code=error.code, details=error.details)
+
+
+def _blocked_refusal(blocked: Mapping[str, str]) -> ProgramRunOwnerError:
+    """A selected recovery's first blocked node: its reason is the code."""
+    node_instance_id, reason = next(iter(blocked.items()))
+    return ProgramRunOwnerError(
+        reason, code=reason, details={"node_instance_id": node_instance_id}
+    )
 
 
 class ProgramRunOwnerOutcomeUnknownError(ProgramRunOwnerError):
@@ -735,12 +759,18 @@ class RunIntent:
     The tick takes the run's intents at its start, in posting order, applies
     each one and hands back its result or its error. The request that posted
     it waits for that (``ProgramRunTickHost``).
+
+    A command that asks other processes (``in_place``: Resume, Run, Retry,
+    Continue, the manual hand-over, Execute after Halt) makes the owner calls
+    it submits to the run's sender in place, inside the tick, ahead of what
+    is queued there, as base made them (``RunSender.apply_in_place``).
     """
 
-    __slots__ = ("_apply", "done", "result", "error")
+    __slots__ = ("_apply", "in_place", "done", "result", "error")
 
-    def __init__(self, apply: Callable[[], Any]) -> None:
+    def __init__(self, apply: Callable[[], Any], *, in_place: bool = False) -> None:
         self._apply = apply
+        self.in_place = in_place
         self.done = Event()
         self.result: Any = None
         self.error: Exception | None = None
@@ -781,6 +811,9 @@ class _RunEntry:
     tree_status: str = "invalid"
     node_status_revision: int = 1
     node_statuses: Mapping[str, str] = field(default_factory=dict)
+    # What the running wait nodes last read, as the tick last left it
+    # (``ExecutableProgramRun.wait_observations``): display only, no revision.
+    wait_observations: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     # Audit facts of automatic motion retries decided since the runner's last take.
     pending_node_history_events: list[dict[str, Any]] = field(default_factory=list)
     active_operation_count: int | None = 0
@@ -839,6 +872,18 @@ class _RunEntry:
     reset_containment_pre_stop_active_operation_count: int | None = None
     # Commands handed to the run's tick, in posting order (OD-146).
     inbox: deque[RunIntent] = field(default_factory=deque, repr=False)
+    # The Halting tick's Kernel scope read on the run's sender and the run
+    # revision it was sent at; a later tick applies its answer.
+    halting_scope_read: tuple[RunRequest, int] | None = field(default=None, repr=False)
+    # The tick's selection scope read (``refresh_selection_scope``) on the
+    # run's sender, and whether another one is due after its answer.
+    selection_scope_read: RunRequest | None = field(default=None, repr=False)
+    selection_scope_read_due: bool = False
+    # The tick's other owner reads on the run's sender, by name, with the
+    # basis each was sent with (``_sent_tick_read``).
+    tick_reads: dict[str, tuple[RunRequest, Any]] = field(
+        default_factory=dict, repr=False
+    )
     tick_facts: _TickFacts | None = None
     # The (eligible, tick facts) the motion group state keys were last
     # written from.
@@ -850,11 +895,14 @@ class ProgramRunOwner:
 
     Each run's tree belongs to its tick (OD-146). The commands that change
     the tree are handed to the tick (``post_to_tick``); the tick-side
-    methods (``advance_once``, ``resume_motion``, ``start_motion``,
+    methods (``advance_once``, ``answer_operator_question``,
+    ``finish_stop``, ``stop_motion``) run only on it. The commands that ask
+    other processes (``resume_motion``, ``start_motion``,
     ``prepare_manual_handover``, ``retry_failure_pause``,
-    ``continue_failure_pause``, ``resume_halt``, ``finish_stop``,
-    ``begin_reset_containment``, ``stop_motion``) run only on it. The owner
-    lock guards memory only.
+    ``continue_failure_pause``, ``resume_halt``) leave the tick (OD-380 D2):
+    the tick sends each on the run's sender and the tree waits for its
+    answer (``RunIntent``). ``send_stop`` and ``begin_reset_containment``
+    (Stops) run on the command's thread. The owner lock guards memory only.
     """
 
     def __init__(
@@ -897,12 +945,17 @@ class ProgramRunOwner:
             raise ProgramRunOwnerError("Program run does not exist") from exc
 
     def post_to_tick(
-        self, program_run_id: int, apply: Callable[[], Any]
+        self,
+        program_run_id: int,
+        apply: Callable[[], Any],
+        *,
+        in_place: bool = False,
     ) -> RunIntent:
         """Hand one command to the run's tick (OD-146); memory only. The
-        caller wakes the run."""
+        caller wakes the run. ``in_place``: the command's owner calls are
+        made inside the tick (``RunIntent``)."""
 
-        intent = RunIntent(apply)
+        intent = RunIntent(apply, in_place=in_place)
         with self._lock:
             self._entry(program_run_id).inbox.append(intent)
         return intent
@@ -918,6 +971,19 @@ class ProgramRunOwner:
             inbox.remove(intent)
             return True
 
+    def tick_intents_pending(self, program_run_id: int) -> bool:
+        """Scheduling only, memory: commands are handed to the run's tick
+        and not answered yet, or the tick's selection scope read waits to be
+        applied."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            return bool(
+                entry.inbox
+                or entry.selection_scope_read is not None
+                or entry.selection_scope_read_due
+            )
+
     def _apply_tick_intents(self, program_run_id: int) -> None:
         """On the run's tick, at its start: apply the intents posted since
         the last tick, in posting order. Each answer is handed back after
@@ -928,10 +994,15 @@ class ProgramRunOwner:
             if not entry.inbox:
                 return
             intents, entry.inbox = entry.inbox, deque()
+            sender = entry.run.sender
         while intents:
             intent = intents[0]
             try:
-                intent.result = intent._apply()
+                intent.result = (
+                    sender.apply_in_place(intent._apply)
+                    if intent.in_place
+                    else intent._apply()
+                )
             except Exception as error:
                 intent.error = error
             try:
@@ -1096,6 +1167,24 @@ class ProgramRunOwner:
         except Exception:
             pass
 
+    def _send_mock_run_paused_from_tick(
+        self,
+        run: ExecutableProgramRun,
+        program_run_id: int,
+        run_revision: int,
+        paused: bool,
+        held: tuple[str, ...],
+    ) -> None:
+        """On the run's tick: the Run's new Halt state leaves the tick
+        (OD-380 D2). Recorded (memory), then sent on the run's sender
+        (``settle_mock_pause``) behind what the run sent before and ahead of
+        any later Mock START, which also sends it first."""
+
+        self._notify_mock_run_paused(
+            program_run_id, run_revision, paused, held, record_only=True
+        )
+        run.settle_mock_pause()
+
     def _snapshot(self, entry: _RunEntry) -> ProgramRunSnapshot:
         return ProgramRunSnapshot(
             owner_id=self._owner_id,
@@ -1245,6 +1334,45 @@ class ProgramRunOwner:
             raise ProgramRunOwnerError("Kernel Program-run scope is invalid")
         return not stopping
 
+    def _sent_tick_read(
+        self,
+        program_run_id: int,
+        run: ExecutableProgramRun,
+        name: str,
+        call: Callable[[], Any],
+        basis: Any = None,
+    ) -> tuple[RunRequest, Any] | None:
+        """One owner call of the run's tick on the run's sender (OD-380 D2),
+        not withdrawable, so also sent once the run's tree has ended (its
+        Stop, cleanup and Reset containment settle off the tick): None
+        while it is not answered (sent now when none is out), then once the
+        answered request with the ``basis`` it was sent with. One per name
+        and run at a time."""
+
+        with self._lock:
+            reads = self._entry(program_run_id).tick_reads
+            pending = reads.get(name)
+            if pending is not None:
+                if not pending[0].answered:
+                    return None
+                del reads[name]
+                return pending
+        request = run.sender.submit(call, withdrawable=False)
+        if request.answered:  # A sender that makes its requests in place.
+            return request, basis
+        with self._lock:
+            self._entry(program_run_id).tick_reads[name] = (request, basis)
+        return None
+
+    def _stop_scope_read(self, program_run_id: int) -> tuple[Any, bool]:
+        """The Stopping tick's Kernel scope read (sent on the run's sender):
+        its fields, and whether an uncontained Stop has ended."""
+
+        scope_fields = self._scope_fields(
+            self._scope.observe(program_run_id), program_run_id
+        )
+        return scope_fields, self._uncontained_end(program_run_id, scope_fields[2])
+
     def _release_resources(self, program_run_id: int) -> tuple[Exception, ...]:
         errors: list[Exception] = []
         context = self._ports.program_run_context
@@ -1270,7 +1398,18 @@ class ProgramRunOwner:
             if entry.state is not ProgramRunState.FINALIZING or entry.cleanup_failed:
                 return self._snapshot(entry)
             already_released = entry.resources_released
-        errors = () if already_released else self._release_resources(program_run_id)
+            run = entry.run
+        errors: tuple[Exception, ...] = ()
+        if not already_released:
+            # The release leaves the tick (OD-380 D2): the run stays
+            # finalizing until its answer.
+            answered = self._sent_tick_read(
+                program_run_id, run, "release",
+                lambda: self._release_resources(program_run_id),
+            )
+            if answered is None:
+                return self.read(program_run_id)
+            errors = answered[0].result()
         with self._lock:
             entry = self._entry(program_run_id)
             if errors:
@@ -1415,11 +1554,24 @@ class ProgramRunOwner:
         with self._lock:
             return self._snapshot(self._entry(program_run_id))
 
+    def wait_observations(self, program_run_id: int) -> Mapping[str, Mapping[str, Any]]:
+        """What the run's running wait nodes last read, as its tick last left
+        it (display only): no tick wait, no read of the run's values."""
+
+        with self._lock:
+            return self._entry(program_run_id).wait_observations
+
     def value_store(self, program_run_id: int) -> ProgramValueStore:
         """The run's value store, for its BB publication subscription."""
 
         with self._lock:
             return self._entry(program_run_id).run.value_store
+
+    def run_sender(self, program_run_id: int) -> RunSender:
+        """The run's ordered sender, for its BB publication drain."""
+
+        with self._lock:
+            return self._entry(program_run_id).run.sender
 
     def take_node_history_events(self, program_run_id: int) -> tuple[dict[str, Any], ...]:
         """Node history events (automatic retries, preemptions) since the last take."""
@@ -1572,7 +1724,12 @@ class ProgramRunOwner:
         observe = getattr(owner_port, "observe", None)
         if not callable(observe):
             raise ProgramRunOwnerError("stopped task cannot be observed")
-        task = observe(intervention.owner_task_id)
+        # The command's read, made here as base made it (an in-place command
+        # on the run's tick); the tick's observation is memory only.
+        try:
+            task = observe(intervention.owner_task_id)
+        except OwnerTaskReadRequiredError as needed:
+            task = needed.read()
         assessment = task.metadata.get("recovery_assessment")
         if (
             task.task_id != intervention.owner_task_id
@@ -1622,26 +1779,61 @@ class ProgramRunOwner:
         for run in runs:
             run.close_sender()
 
-    def refresh_selection_scope(self, program_run_id: int) -> ProgramRunSnapshot:
+    def refresh_selection_scope(
+        self, program_run_id: int, *, read: bool = True
+    ) -> ProgramRunSnapshot:
         """Refresh the operator Stop scope and the Mock held mask from the
         Kernel scope read (tick worker). Never issues or releases
-        containment."""
+        containment.
 
-        with self._lock:
-            run = self._entry(program_run_id).run
-        run.refresh_operator_stop_scope()
+        The read leaves the tick (OD-380 D2): it goes on the run's sender,
+        one at a time (asked for while one is outstanding, it is sent after
+        that answer), and the tick that finds it answered applies it as the
+        inline read was applied; a failed read raises its error there.
+        ``read``: False only applies an answered read (every tick)."""
+
+        while True:
+            with self._lock:
+                entry = self._entry(program_run_id)
+                run = entry.run
+                entry.selection_scope_read_due |= read
+                read = False
+                pending = entry.selection_scope_read
+                if pending is not None and not pending.answered:
+                    return self._snapshot(entry)
+                entry.selection_scope_read = None
+                if pending is None:
+                    if not entry.selection_scope_read_due:
+                        return self._snapshot(entry)
+                    entry.selection_scope_read_due = False
+            if pending is None:
+                # Also once the run's tree has ended (its sender closed).
+                request = run.sender.submit(
+                    run.refresh_operator_stop_scope, withdrawable=False
+                )
+                with self._lock:
+                    entry = self._entry(program_run_id)
+                    if entry.run is run:
+                        entry.selection_scope_read = request
+                continue
+            pending.result()
+            self._apply_selection_scope_read(program_run_id, run)
+
+    def _apply_selection_scope_read(
+        self, program_run_id: int, run: ExecutableProgramRun
+    ) -> None:
         with self._lock:
             entry = self._entry(program_run_id)
             if entry.run is not run:
-                return self._snapshot(entry)
+                return
             entry.active_operation_count = None
             entry.revision += 1
             held = self._note_mock_held(entry)
             held_revision, held_paused = entry.revision, self._mock_paused(entry)
-            snapshot = self._snapshot(entry)
         if held is not None:
-            self._notify_mock_run_paused(program_run_id, held_revision, held_paused, held)
-        return snapshot
+            self._send_mock_run_paused_from_tick(
+                run, program_run_id, held_revision, held_paused, held
+            )
 
     def operator_stop_scope(self, program_run_id: int):
         """Return the current scheduling view, not a new owner read."""
@@ -1676,7 +1868,7 @@ class ProgramRunOwner:
                 )
             store = entry.run.value_store
         try:
-            store.write(
+            receipt = store.write(
                 key,
                 value,
                 metadata={
@@ -1687,6 +1879,10 @@ class ProgramRunOwner:
             )
         except (KeyError, ProgramValueError) as error:
             raise ProgramRunOwnerError(str(error)) from error
+        if receipt is not None:
+            # The reply follows the host's answer to the published value
+            # (OD-213 part 3); this command thread waits, never the tick.
+            receipt.wait()
         with self._lock:
             entry = self._entry(program_run_id)
             entry.revision += 1
@@ -1724,7 +1920,7 @@ class ProgramRunOwner:
                 )
             store = entry.run.value_store
         try:
-            store.reset_to_initial(
+            receipt = store.reset_to_initial(
                 key,
                 metadata={
                     "program_run_id": program_run_id,
@@ -1734,6 +1930,8 @@ class ProgramRunOwner:
             )
         except ProgramValueError as error:
             raise ProgramRunOwnerError(str(error)) from error
+        if receipt is not None:
+            receipt.wait()  # After the host's answer, as the write above.
         with self._lock:
             entry = self._entry(program_run_id)
             entry.revision += 1
@@ -1981,17 +2179,35 @@ class ProgramRunOwner:
             stopped_node_statuses = run.node_statuses
         scope_fields: tuple[int | None, bool, str | None] | None = None
         uncontained_end = False
+        uncontained_pending = False
         if sent.scope_snapshot is not None and not scope_errors:
             try:
                 scope_fields = self._scope_fields(
                     sent.scope_snapshot,
                     program_run_id,
                 )
-                uncontained_end = self._uncontained_end(
-                    program_run_id, scope_fields[2]
-                )
             except Exception as exc:
                 scope_errors.append(exc)
+        if (
+            scope_fields is not None
+            and scope_fields[2] in PROGRAM_RUN_STOP_UNCONTAINED_REASON_CODES
+        ):
+            # An uncontained reply's scope read leaves the tick (OD-380 D2):
+            # unanswered, the Stopping tick that finds it answered applies it
+            # with this reply (``reconcile_stop``).
+            fields = scope_fields
+            answered = self._sent_tick_read(
+                program_run_id, run, "stop",
+                lambda: (fields, self._uncontained_end(program_run_id, fields[2])),
+                basis=sent_settled,
+            )
+            if answered is None:
+                uncontained_pending = True
+            else:
+                try:
+                    uncontained_end = answered[0].result()[1]
+                except Exception as exc:
+                    scope_errors.append(exc)
 
         finalize = False
         with self._lock:
@@ -2028,7 +2244,7 @@ class ProgramRunOwner:
                     )
                 else:
                     self._restore_after_stop(entry)
-                if settled and sent_settled:
+                if settled and sent_settled and not uncontained_pending:
                     entry.terminal_settlement_active_operation_count = (
                         active_count
                         if active_count == 0
@@ -2175,8 +2391,8 @@ class ProgramRunOwner:
             snapshot = self._snapshot(entry)
         if held is not None:
             # The new mask under this command's revision.
-            self._notify_mock_run_paused(
-                program_run_id, held_revision, held_paused, held
+            self._send_mock_run_paused_from_tick(
+                run, program_run_id, held_revision, held_paused, held
             )
         # A Kernel selection error means it contained more than the
         # selection (Stop all); the state stream shows it.
@@ -2758,7 +2974,7 @@ class ProgramRunOwner:
         for hold in holds:
             blocked.pop(hold.identity.node_instance_id, None)
         if blocked:
-            raise ProgramRunOwnerError(next(iter(blocked.values())))
+            raise _blocked_refusal(blocked)
         cleanup_accepted = False
         try:
             for item in batch:
@@ -2899,14 +3115,16 @@ class ProgramRunOwner:
                 ProgramRunState.INTERVENTION_REQUIRED,
             }:
                 raise ProgramRunOwnerError(
-                    "motion Resume requires a current running Program"
+                    "motion Resume requires a current running Program",
+                    code=f"program_run_state_{entry.state.value}",
                 )
             run, run_revision = entry.run, entry.revision
         selected = run.execution_selection(group_id)
         if held_nodes is not None:
             if not held_nodes <= selected:
                 raise ProgramRunOwnerError(
-                    "manual handover names unknown Program nodes"
+                    "manual handover names unknown Program nodes",
+                    code="manual_handover_scope_stale",
                 )
             selected = held_nodes
         scope = run.read_operator_stop_scope()
@@ -2914,14 +3132,32 @@ class ProgramRunOwner:
             type(expected_hold_revision) is not int
             or scope["hold_revision"] != expected_hold_revision
         ):
-            raise ProgramRunOwnerError("motion Resume identifies a stale selection")
-        if selected & run.scope_node_ids(
-            (*scope["stopping_node_indices"], *scope["faulted_node_indices"])
-        ):
-            raise ProgramRunOwnerError("selected work is still stopping or faulted")
+            raise ProgramRunOwnerError(
+                "motion Resume identifies a stale selection",
+                code="program_runtime_control_stale",
+                details={
+                    "expected_hold_revision": expected_hold_revision,
+                    "current_hold_revision": scope["hold_revision"],
+                },
+            )
+        faulted = selected & run.scope_node_ids(scope["faulted_node_indices"])
+        if faulted or selected & run.scope_node_ids(scope["stopping_node_indices"]):
+            raise ProgramRunOwnerError(
+                "selected work is still stopping or faulted",
+                code=(
+                    "manual_handover_producer_not_held"
+                    if held_nodes is not None
+                    else "selected_stop_fault_requires_recovery"
+                    if faulted
+                    else "selected_motion_stop_settling"
+                ),
+            )
         held = run.scope_node_ids(scope["held_node_indices"])
         if held_nodes is not None and not selected <= held:
-            raise ProgramRunOwnerError("manual handover producers are not all held")
+            raise ProgramRunOwnerError(
+                "manual handover producers are not all held",
+                code="manual_handover_producer_not_held",
+            )
         if held_nodes is None:
             # Run and Resume are one release: never-started (Ready) work
             # is released with stopped work; only stopped work needs the
@@ -2929,11 +3165,13 @@ class ProgramRunOwner:
             held = held | run.scope_node_ids(scope["ready_node_indices"])
         selected &= held
         if not selected:
-            raise ProgramRunOwnerError("selected scope is not held")
+            raise ProgramRunOwnerError(
+                "selected scope is not held", code="selection_not_held"
+            )
         interventions = self._ports.program_interventions
         batch, blocked = self._selection_recovery_candidates(run, selected)
         if blocked:
-            raise ProgramRunOwnerError(next(iter(blocked.values())))
+            raise _blocked_refusal(blocked)
         cleanup_accepted = False
         try:
             for item in batch:
@@ -2949,7 +3187,8 @@ class ProgramRunOwner:
                     and entry.revision != run_revision
                 ):
                     raise ProgramRunOwnerError(
-                        "Program changed during selected recovery; holds remain"
+                        "Program changed during selected recovery; holds remain",
+                        code="program_runtime_control_stale",
                     )
             if held_nodes is not None:
                 current_scope = run.read_operator_stop_scope()
@@ -2967,7 +3206,8 @@ class ProgramRunOwner:
                     )
                 ):
                     raise ProgramRunOwnerError(
-                        "Program hold changed during manual handover"
+                        "Program hold changed during manual handover",
+                        code="manual_handover_scope_stale",
                     )
             else:
                 try:
@@ -3084,10 +3324,12 @@ class ProgramRunOwner:
         if facts.program_run_id != program_run_id:
             raise ProgramRunOwnerError("hold facts name another Program run")
         notify: tuple[int, bool, tuple[str, ...]] | None = None
+        released_at: object = None
         with self._lock:
             entry = self._entry(program_run_id)
             if facts.hold_revision < entry.own_release_revision:
                 return False
+            run = entry.run
             key = facts.reconciliation_key()
             previous = entry.applied_hold_facts
             changed = key != previous
@@ -3136,12 +3378,7 @@ class ProgramRunOwner:
                 entry.mock_held = entry.run.mock_held_nodes()
                 notify = (entry.revision, False, entry.mock_held)
                 record_only = False
-                _LOGGER.info(
-                    "Program run %s follows the Kernel: Halt released at hold "
-                    "revision %s",
-                    program_run_id,
-                    facts.hold_revision,
-                )
+                released_at = facts.hold_revision
             if (
                 cause_changed
                 and entry.revision == revision_before
@@ -3154,10 +3391,22 @@ class ProgramRunOwner:
                 ProgramRunState.SUCCEEDED,
                 ProgramRunState.FAILED,
             }
-        if notify is not None:
-            self._notify_mock_run_paused(
-                program_run_id, *notify, record_only=record_only
+        # Printed after the owner lock is released.
+        if released_at is not None:
+            _LOGGER.info(
+                "Program run %s follows the Kernel: Halt released at hold "
+                "revision %s",
+                program_run_id,
+                released_at,
             )
+        if notify is not None:
+            if record_only:
+                self._notify_mock_run_paused(
+                    program_run_id, *notify, record_only=True
+                )
+            else:
+                # The Halt released: the state leaves the tick (OD-380 D2).
+                self._send_mock_run_paused_from_tick(run, program_run_id, *notify)
         return changed and not ended
 
     def _complete_halting(
@@ -3230,21 +3479,40 @@ class ProgramRunOwner:
         """Halting tick: send the recorded Mock pause, read the Kernel scope
         (stopping and faulted nodes) and, once no Program node is stopping,
         move to Halted, also with faulted nodes (their failed Stop stays the
-        run's reason). The scope read is applied only if the run did not
-        change meanwhile."""
+        run's reason). The scope read leaves the tick (OD-380 D2): it is sent
+        on the run's sender and the tick that finds it answered applies it,
+        only if the run did not change since it was sent; the tick after that
+        sends the next read."""
 
         with self._lock:
             entry = self._entry(program_run_id)
             if entry.state is not ProgramRunState.HALTING:
                 return self._snapshot(entry)
-            captured_revision = entry.revision
             run = entry.run
-        # The Halt's Mock pause, recorded on entering Halting, is sent here.
-        run.settle_mock_pause()
+            pending = entry.halting_scope_read
+            if pending is not None:
+                if not pending[0].answered:
+                    return self._snapshot(entry)
+                entry.halting_scope_read = None
+            captured_revision = entry.revision
+        if pending is None:
+            # The Halt's Mock pause, recorded on entering Halting, is sent here.
+            run.settle_mock_pause()
+            request = run.sender.submit(
+                lambda: self._scope.execution_scope(program_run_id),
+                withdrawable=False,
+            )
+            if not request.answered:
+                with self._lock:
+                    entry = self._entry(program_run_id)
+                    entry.halting_scope_read = (request, captured_revision)
+                    return self._snapshot(entry)
+        else:
+            request, captured_revision = pending
         try:
             # One Kernel scope read: halted once no Program node is stopping;
             # a faulted node means the Halt's Stop did not contain it.
-            scope = self._scope.execution_scope(program_run_id)
+            scope = request.result()
             stopping = scope.get("stopping_node_indices")
             faulted = scope.get("faulted_node_indices")
             if (
@@ -3257,17 +3525,7 @@ class ProgramRunOwner:
             active_count = 0 if settled else None
             scope_reason = "program_run_stop_failed" if faulted else None
         except Exception as error:
-            with self._lock:
-                entry = self._entry(program_run_id)
-                if entry.revision != captured_revision:
-                    return self._snapshot(entry)
-                entry.active_operation_count = None
-                self._set_runner_failure(
-                    entry,
-                    "program_run_scope_unknown",
-                    str(error) or type(error).__name__,
-                )
-                return self._snapshot(entry)
+            return self._halting_scope_unknown(program_run_id, captured_revision, error)
         with self._lock:
             entry = self._entry(program_run_id)
             if entry.revision != captured_revision:
@@ -3286,6 +3544,21 @@ class ProgramRunOwner:
             if settled
             else self.read(program_run_id)
         )
+
+    def _halting_scope_unknown(
+        self, program_run_id: int, captured_revision: int, error: Exception
+    ) -> ProgramRunSnapshot:
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.revision != captured_revision:
+                return self._snapshot(entry)
+            entry.active_operation_count = None
+            self._set_runner_failure(
+                entry,
+                "program_run_scope_unknown",
+                str(error) or type(error).__name__,
+            )
+            return self._snapshot(entry)
 
     def resume_halt(
         self,
@@ -3388,7 +3661,9 @@ class ProgramRunOwner:
         self, program_run_id: int, *, stop_request_key: bytes
     ) -> ProgramRunSnapshot:
         """Close a terminal Run's Kernel scope without changing its history.
-        Applied by the run's tick (OD-146)."""
+        A Stop, made by the command's thread like ``send_stop`` (OD-119):
+        checked and marked under the owner lock, then sent at once with no
+        lock held, never behind the run's tick."""
         with self._lock:
             entry = self._entry(program_run_id)
             if entry.state not in {
@@ -3451,6 +3726,28 @@ class ProgramRunOwner:
         return scope.state is ProgramRunScopeState.SETTLED
 
     def _observe_reset_containment(self, program_run_id: int) -> ProgramRunSnapshot:
+        """The Reset containment's scope read leaves the tick (OD-380 D2);
+        its answer applies only to the containment it was sent for."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            run, basis = entry.run, entry.reset_containment
+        answered = self._sent_tick_read(
+            program_run_id, run, "reset_containment",
+            lambda: self._reset_containment_read(program_run_id),
+            basis=basis,
+        )
+        if answered is None:
+            return self.read(program_run_id)
+        request, basis = answered
+        scope = request.result()
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.reset_containment is basis:
+                entry.reset_containment = scope
+            return self._snapshot(entry)
+
+    def _reset_containment_read(self, program_run_id: int) -> ProgramRunScopeSnapshot:
         try:
             scope = self._scope.observe(program_run_id)
             self._scope_fields(scope, program_run_id)
@@ -3461,10 +3758,7 @@ class ProgramRunOwner:
                 None,
                 (str(error) or type(error).__name__)[:256],
             )
-        with self._lock:
-            entry = self._entry(program_run_id)
-            entry.reset_containment = scope
-            return self._snapshot(entry)
+        return scope
 
     def _reset_scope_effects(self, program_run_id: int) -> None:
         snapshot = self._scope.reset(program_run_id)
@@ -3534,10 +3828,19 @@ class ProgramRunOwner:
         # real result before the run ends (OD-213).
         sent_settled = run.settle_sent_requests()
         node_statuses = run.node_statuses
+        # The scope read leaves the tick (OD-380 D2). It ends the run only
+        # when sent after every request sent before the Stop completed, as
+        # the read inside the tick followed their settlement.
+        answered = self._sent_tick_read(
+            program_run_id, run, "stop",
+            lambda: self._stop_scope_read(program_run_id),
+            basis=sent_settled,
+        )
+        if answered is None:
+            return self.read(program_run_id)
+        request, read_after_settled = answered
         try:
-            scope_snapshot = self._scope.observe(program_run_id)
-            scope_fields = self._scope_fields(scope_snapshot, program_run_id)
-            uncontained_end = self._uncontained_end(program_run_id, scope_fields[2])
+            scope_fields, uncontained_end = request.result()
         except Exception as exc:
             with self._lock:
                 entry = self._entry(program_run_id)
@@ -3567,7 +3870,12 @@ class ProgramRunOwner:
             ):
                 entry.node_statuses = node_statuses
                 entry.node_status_revision += 1
-            if entry.state is ProgramRunState.STOPPING and settled and sent_settled:
+            if (
+                entry.state is ProgramRunState.STOPPING
+                and settled
+                and sent_settled
+                and read_after_settled
+            ):
                 entry.terminal_settlement_active_operation_count = (
                     active_count
                     if active_count == 0
@@ -3605,8 +3913,11 @@ class ProgramRunOwner:
     def _advance_run(
         self, program_run_id: int, hold_facts: ProgramRunHoldFacts | None
     ) -> ProgramRunSnapshot:
-        if self._reconcile_hold_facts(program_run_id, hold_facts):
-            self.refresh_selection_scope(program_run_id)
+        # Changed hold facts send a scope read; an answered one is applied.
+        self.refresh_selection_scope(
+            program_run_id,
+            read=self._reconcile_hold_facts(program_run_id, hold_facts),
+        )
         with self._lock:
             halting = self._entry(program_run_id).state is ProgramRunState.HALTING
         if halting:
@@ -3846,7 +4157,7 @@ class ProgramRunOwner:
         try:
             run.refresh_pending_stop_settlement()
             # A changed held-node mask takes its own run
-            # revision and reaches the Mock port before this tick can
+            # revision and goes on the run's sender before this tick can
             # START anything (the port settles it before a START).
             with self._lock:
                 entry = self._entry(program_run_id)
@@ -3857,8 +4168,8 @@ class ProgramRunOwner:
                     held_revision = entry.revision
                     held_paused = self._mock_paused(entry)
             if held is not None:
-                self._notify_mock_run_paused(
-                    program_run_id, held_revision, held_paused, held
+                self._send_mock_run_paused_from_tick(
+                    run, program_run_id, held_revision, held_paused, held
                 )
             if observe_only:
                 held = run.operator_stop_scope().held_nodes
@@ -3867,6 +4178,7 @@ class ProgramRunOwner:
             else:
                 tree_status = run.tick_once()
             node_statuses = run.node_statuses
+            wait_observations = run.wait_observations
             node_history_events = run.take_node_history_events()
             stop_observation_changed = run.take_stop_observation_change()
         except Exception as exc:
@@ -3915,6 +4227,7 @@ class ProgramRunOwner:
             if entry.node_statuses != node_statuses:
                 entry.node_statuses = node_statuses
                 entry.node_status_revision += 1
+            entry.wait_observations = wait_observations
             new_holds = [
                 hold
                 for hold in holds
@@ -4013,12 +4326,16 @@ class ProgramRunOwner:
             if terminal_state is ProgramRunState.FAILED
             else None
         )
+        # The ended tree's scope read leaves the tick (OD-380 D2); the run
+        # stays running until its answer.
+        answered = self._sent_tick_read(
+            program_run_id, run, "terminal",
+            lambda: self._scope_fields(self._scope.observe(program_run_id), program_run_id),
+        )
+        if answered is None:
+            return self.read(program_run_id)
         try:
-            scope_snapshot = self._scope.observe(program_run_id)
-            active_count, scope_settled, scope_reason = self._scope_fields(
-                scope_snapshot,
-                program_run_id,
-            )
+            active_count, scope_settled, scope_reason = answered[0].result()
         except Exception as exc:
             return self._begin_stop(
                 program_run_id,

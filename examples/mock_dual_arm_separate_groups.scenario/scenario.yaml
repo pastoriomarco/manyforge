@@ -7,11 +7,11 @@
   "description": "Mock UR5e and Lite6 on a wall-separated bench: two independent joint trajectories in separate control groups.",
   "members": {
     "deployment.yaml": "sha256:c1d6c8da77814c58080f8f4c1d46067149f2aba859e338b5f63fb2040fee31f3",
-    "program.yaml": "sha256:587e77e3f937d5a0231845dbc97edc44c620324f5e85022a4f546e077b42a0c4"
+    "program.yaml": "sha256:c982a5c8a6c5a9df4c854cbc663784665fc31357310aaaea830106dce7213ba0"
   },
   "name": "mock_dual_arm_separate_groups",
   "saved_status": {
-    "checked_content_digest": "sha256:77048bd7e024816efb103fd3036469ce08d2b7799c075a073c8d552497f1a964",
+    "checked_content_digest": "sha256:4f2f3f1f74f23aa04d6ef3ea3487b5a236ff657be9e6317d917b1bbd6f6b5b11",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

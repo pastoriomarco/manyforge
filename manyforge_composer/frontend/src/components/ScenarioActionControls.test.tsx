@@ -1,18 +1,12 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import { ReloadInitialSceneOption, ResetsRunWarning } from './ScenarioActionControls';
-
-const persistentValues = {
-  read: vi.fn(() => new Promise(() => undefined)),
-} as unknown as ProgramRuntimeController['persistentValues'];
 
 function option(patch: Partial<Parameters<typeof ReloadInitialSceneOption>[0]> = {}) {
   return renderToStaticMarkup(
     <ReloadInitialSceneOption
-      action="apply" resetsRun={false} checked={false} onChange={vi.fn()}
-      persistentKeys={false} persistentValues={persistentValues} {...patch}
+      action="apply" resetsRun={false} checked={false} onChange={vi.fn()} {...patch}
     />,
   );
 }
@@ -29,10 +23,11 @@ describe('Reload initial scene in the Apply and Revert confirmation', () => {
     expect(markup).not.toContain('Robot positions stay as they are.');
   });
 
-  it('names the persistent-key reset and what stays when checked', () => {
-    const markup = option({ checked: true, persistentKeys: true });
+  it('names what stays when checked; stored values are not reset (OD-393)', () => {
+    const markup = option({ checked: true });
     expect(markup).toContain('checked=""');
-    expect(markup).toContain('Persistent keys return to their initial values.');
+    expect(markup).not.toContain('Persistent keys');
+    expect(markup).not.toContain('Stored values reset');
     expect(markup).toContain('Robot positions stay as they are.');
   });
 

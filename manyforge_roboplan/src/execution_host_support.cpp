@@ -1,5 +1,7 @@
 #include <manyforge_roboplan/execution_host_support.hpp>
 
+#include <manyforge_core/process_diagnostics.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -258,11 +260,13 @@ std::string_view safety_path_fault_reason(core::SchedulerPriority priority) {
 void log_scheduler_callback_exception(core::SchedulerPriority priority,
                                       const char* exception_text,
                                       bool contained) {
-  std::cerr << "manyforge_scheduler_callback_exception"
-            << " priority=" << core::scheduler_priority_name(priority)
-            << " contained=" << (contained ? "true" : "false")
-            << " exception=" << exception_text
-            << " later_throws=not_logged" << std::endl;
+  core::LogLine(core::LogSeverity::kError,
+                core::LogText("manyforge_scheduler_callback_exception",
+                              " priority=",
+                              core::scheduler_priority_name(priority),
+                              " contained=", contained ? "true" : "false",
+                              " exception=", exception_text,
+                              " later_throws=not_logged"));
 }
 
 }  // namespace
@@ -410,10 +414,14 @@ SimpleScheduler::SimpleScheduler(SimpleSchedulerConfig config) {
   // `schedule()` never creates a thread or waits for one.
   if (config.lock_memory) {
     const auto error = lock_process_memory();
-    std::cerr << "manyforge_scheduler_memory_lock accepted="
-              << (error.empty() ? "true" : "false");
-    if (!error.empty()) std::cerr << " error=\"" << error << '"';
-    std::cerr << std::endl;
+    core::LogLine(error.empty() ? core::LogSeverity::kInfo
+                                : core::LogSeverity::kError,
+                  error.empty()
+                      ? std::string("manyforge_scheduler_memory_lock "
+                                    "accepted=true")
+                      : core::LogText("manyforge_scheduler_memory_lock "
+                                      "accepted=false error=\"",
+                                      error, '"'));
     if (!error.empty())
       throw std::runtime_error("native scheduler strict profile rejected its memory lock: " +
                                error);
@@ -628,20 +636,22 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
   if (!startup_failed && os_config.prefault_stack) prefault_worker_stack();
 #endif
   if (os_config.requested()) {
-    std::cerr << "manyforge_scheduler_os_profile"
-              << " role=" << core::scheduler_priority_name(priority)
-              << " policy="
-              << (os_config.policy
-                      ? os_scheduler_policy_name(*os_config.policy)
-                      : "INHERIT")
-              << " priority=" << os_config.priority
-              << " affinity=" << format_cpu_affinity(os_config.cpu_affinity)
-              << " required=" << (os_config.required ? "true" : "false")
-              << " accepted=" << (os_error.empty() ? "true" : "false");
+    std::string line = core::LogText(
+        "manyforge_scheduler_os_profile",
+        " role=", core::scheduler_priority_name(priority), " policy=",
+        os_config.policy ? os_scheduler_policy_name(*os_config.policy)
+                         : "INHERIT",
+        " priority=", os_config.priority,
+        " affinity=", format_cpu_affinity(os_config.cpu_affinity),
+        " required=", os_config.required ? "true" : "false",
+        " accepted=", os_error.empty() ? "true" : "false");
     if (!os_error.empty()) {
-      std::cerr << " error=\"" << os_error << '"';
+      line += " error=\"" + os_error + '"';
     }
-    std::cerr << std::endl;
+    core::LogLine(os_error.empty()       ? core::LogSeverity::kInfo
+                  : os_config.required ? core::LogSeverity::kError
+                                       : core::LogSeverity::kWarning,
+                  line);
   }
   {
     std::lock_guard<std::mutex> startup_lock(startup_mutex);

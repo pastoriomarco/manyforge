@@ -77,7 +77,7 @@ in regular GitHub issues:
 If you're deploying ManyForge against real hardware:
 
 - ✅ Run the workbench on an isolated network — do not expose its ports
-  (3000, 9010, 9011, 9020) or your model server to the public internet.
+  (3000, 9010, 9020) or your model server to the public internet.
   The AI assistant's bridge listens on loopback only, on a port its host
   process picks (no fixed port).
 - ✅ Review AI assistant edits in the Draft before Applying them.

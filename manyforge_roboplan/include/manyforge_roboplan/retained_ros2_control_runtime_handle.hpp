@@ -584,11 +584,13 @@ public:
   /// it here. Only before `StartBackend` (it may precede `Bind`); at most
   /// once. The optional health source reads the same exact owner cache without
   /// advancement; when absent, health is unavailable rather than calling the
-  /// lifecycle advancement source.
+  /// lifecycle advancement source. The optional output tail is the exited
+  /// launch's `output_tail` fault detail (memory only).
   void InstallControllerProcessFaultSource(
       std::function<std::optional<std::string>()> source,
       std::function<core::Result<std::optional<std::string>>()> health_source =
-          {});
+          {},
+      std::function<std::string()> output_tail = {});
   /// Exact local Kernel callbacks for a fault-owner rebuild. The host binds
   /// these once to the Kernel paired with this handle. The assessment must
   /// match both the participant execution and its observation boundary.
@@ -678,7 +680,8 @@ public:
   /// restarted; its exit is now read from the new process's sources.
   void ReplaceControllerProcessFaultSource(
       std::function<std::optional<std::string>()> source,
-      std::function<core::Result<std::optional<std::string>>()> health_source);
+      std::function<core::Result<std::optional<std::string>>()> health_source,
+      std::function<std::string()> output_tail = {});
 
   /// Verify the live factory-bound participant and its current sealed physical
   /// bindings.
@@ -1031,6 +1034,7 @@ private:
   std::function<std::optional<std::string>()> process_fault_source_;
   std::function<core::Result<std::optional<std::string>>()>
       process_health_source_;
+  std::function<std::string()> process_output_tail_;
   std::function<bool()> launch_settled_;
   std::chrono::steady_clock::time_point launch_settle_bound_{};
   std::chrono::steady_clock::duration launch_settle_span_{};

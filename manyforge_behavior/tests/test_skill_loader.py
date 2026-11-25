@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def _context(catalog):
     return {
         "api_version": "manyforge.program.v4",
-        "program_profile": "composable-cell-v1",
+        "program_profile": "manyforge-cell-v1",
         "catalog": {"api_version": catalog.api_version, "content_version": catalog.content_version},
     }
 
@@ -190,7 +190,7 @@ def test_first_subtree_needs_declarations_not_a_dummy_program(catalog, artifact)
     skills = SkillCatalog([artifact], catalog=catalog)
     context = {
         "api_version": "manyforge.program.v4",
-        "program_profile": "composable-cell-v1",
+        "program_profile": "manyforge-cell-v1",
         "catalog": {
             "api_version": catalog.api_version,
             "content_version": catalog.content_version,

@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -158,10 +159,11 @@ public:
   /// Validate and durably accept one exact request without advancing any
   /// runtime effect. Exact replay returns terminal evidence when it already
   /// exists; otherwise the sole progression owner resumes it through
-  /// RecoverIncompleteApply(). Never waits behind an Apply step (OD-270):
-  /// while one runs, a replay is answered from the journal when the pending
-  /// settlement cannot change it, and anything else is refused `apply_busy`
-  /// with `effect: none`.
+  /// RecoverIncompleteApply(). Never waits behind an Apply step (OD-270): a
+  /// replay is answered from the journal and SuccessSettlementPending(), a
+  /// success whose claim release is still pending replaying as pending
+  /// (OD-387); a new request is refused `apply_busy` with `effect: none`
+  /// while a step runs.
   [[nodiscard]] ManagerNamedApplyResult
   AcceptOrReplay(const ManagerNamedApplyRequestDTO &request,
                  OriginalPrepareAcknowledgement original_prepare_acknowledgement = {});
@@ -197,6 +199,17 @@ public:
   [[nodiscard]] std::optional<manyforge::core::NamedApplyPublicationTransactionDTO>
   ReleaseFailedApplyForNew(const manyforge::core::RequestKey &request_key,
                            const std::string &source_label);
+
+  /// Lock-free (OD-387): true from before this Apply's success is journaled
+  /// until its admission claim release completed, so `succeeded` is answered
+  /// only once the cell is usable. A reader reads the journal first, then
+  /// this. Apply ids are never reused (MintApplyId), so the id alone names
+  /// the Apply. Memory-only, like the pending settlement it covers.
+  [[nodiscard]] bool SuccessSettlementPending(
+      const manyforge::core::ApplyId &apply_id) const noexcept;
+  /// The same fact for a publication of the whole Apply inventory.
+  [[nodiscard]] std::optional<manyforge::core::ApplyId>
+  SuccessSettlementPendingApply() const noexcept;
 
   /// Nonblocking metadata read by the ordinary heartbeat. An earlier beat
   /// cannot schedule a later Apply's settlement; this is only a scheduling tag.
@@ -316,6 +329,10 @@ private:
   // by the existing journal/capture; no duplicate settlement result is cached.
   std::optional<manyforge::core::NamedApplyPublicationTransactionDTO>
       pending_settlement_;
+  /// The Apply id (0: none) whose success is, or is about to be, journaled
+  /// while its admission claim release has not completed (OD-387). Written
+  /// only by the Apply lane under operation_mutex_; read lock-free.
+  std::atomic<std::uint64_t> success_settlement_apply_id_{0U};
   std::mutex operation_mutex_;
   /// Memory-only: true while the Apply lane runs a step or a settlement
   /// retry, from before it takes operation_mutex_ until after it releases it.

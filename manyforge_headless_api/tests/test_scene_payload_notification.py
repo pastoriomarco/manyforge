@@ -1,4 +1,4 @@
-"""Scene commits and status return owner receipts without an execution bridge."""
+"""Scene commits return owner receipts without an execution bridge."""
 from types import SimpleNamespace
 
 import pytest
@@ -33,13 +33,6 @@ class Manager:
         finally:
             self.inside = False
 
-    def scene_transaction_status(self, request):
-        self.inside = True
-        try:
-            return {"ok": True, "result": self.result}
-        finally:
-            self.inside = False
-
 
 class Execution:
     def __init__(self, manager):
@@ -64,7 +57,7 @@ def request(kind):
 
 @pytest.mark.parametrize("kind", ["attach_carried_object", "detach_carried_object", "detach_carried_object_at_current_pose"])
 @pytest.mark.parametrize("program_node", [False, True])
-def test_committed_scene_and_exact_receipt_do_not_call_execution_bridge(kind, program_node):
+def test_committed_scene_does_not_call_execution_bridge(kind, program_node):
     manager = Manager()
     execution = Execution(manager)
     service = HeadlessService(Core(), manager, execution, application_start_id="3f9a0000000000a1")
@@ -73,7 +66,6 @@ def test_committed_scene_and_exact_receipt_do_not_call_execution_bridge(kind, pr
         item.program_node_evidence = object()
         item.expected_admission_generation = 1
     assert service.scene_commit(item, TrustedAttribution()) is COMMITTED
-    assert service.scene_transaction_status(item)["result"] is COMMITTED
     assert execution.calls == []
 
 
@@ -92,15 +84,4 @@ def test_uncommitted_result_does_not_notify():
     execution = Execution(manager)
     service = HeadlessService(Core(), manager, execution, application_start_id="3f9a0000000000a1")
     service.scene_commit(request("attach_carried_object"), TrustedAttribution())
-    assert execution.calls == []
-
-
-@pytest.mark.parametrize("result", [None, {"ok": False, "projection_status": "not_attempted"}])
-def test_unresolved_or_failed_receipt_does_not_notify(result):
-    manager = Manager()
-    manager.result = result
-    execution = Execution(manager)
-    service = HeadlessService(Core(), manager, execution, application_start_id="3f9a0000000000a1")
-    response = service.scene_transaction_status(request("detach_carried_object"))
-    assert response["result"] == result
     assert execution.calls == []

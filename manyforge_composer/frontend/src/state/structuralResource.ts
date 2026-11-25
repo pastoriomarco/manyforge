@@ -45,6 +45,11 @@ const WAITING_FOR_DETAILS = [
   ['busy_resource_ids', 'resources'],
 ] as const;
 
+/** A failure's text with its typed code, so the operator can quote it: `text (code)`. */
+export function withErrorCode(text: string, code: string | null | undefined): string {
+  return code == null || code === '' || text.includes(code) ? text : `${text} (${code})`;
+}
+
 export function errorMessage(error: unknown, fallback: string): string {
   const message = error instanceof Error && error.message.trim()
     ? error.message

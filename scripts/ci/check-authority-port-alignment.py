@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject deleted authority surfaces during the composable-cell relocation."""
+"""Reject deleted authority surfaces."""
 
 from __future__ import annotations
 
@@ -143,7 +143,7 @@ def main() -> int:
         return 1
 
     print(
-        "Composable-cell authority relocation check passed "
+        "Authority relocation check passed "
         f"({len(authored_sources())} production files scanned)."
     )
     return 0

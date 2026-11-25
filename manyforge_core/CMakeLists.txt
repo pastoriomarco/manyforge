@@ -93,6 +93,7 @@ add_library(manyforge_core
   src/trajectory_progress_projection.cpp
   src/observed_robot_state_provider.cpp
   src/pose_math.cpp
+  src/process_diagnostics.cpp
   src/resource_addressed_execution_kernel.cpp
   src/resource_addressed_kernel_admission.cpp
   src/resource_addressed_kernel_runtime.cpp
@@ -222,6 +223,12 @@ if(BUILD_TESTING)
   add_executable(test_version test/test_version.cpp)
   target_link_libraries(test_version PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_version
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_process_diagnostics test/test_process_diagnostics.cpp)
+  target_link_libraries(test_process_diagnostics PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_process_diagnostics
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_kinematic_state_view_provider

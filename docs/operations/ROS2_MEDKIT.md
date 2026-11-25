@@ -4,7 +4,7 @@
 > [ros2_medkit](https://github.com/selfpatch/ros2_medkit) today. Both
 > effectful entrypoints, `python3 -m manyforge_medkit_adapter.adapter` and
 > `python3 -m manyforge_ros.diagnostics_bridge`, exit 78
-> (`composable_cell_runtime_unavailable`) before they parse arguments or touch
+> (`runtime_unavailable`) before they parse arguments or touch
 > the network or ROS. No ManyForge image includes ros2_medkit.
 
 ManyForge core stays medkit-free. Only `manyforge_medkit_adapter` may depend

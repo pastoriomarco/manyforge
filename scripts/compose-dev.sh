@@ -4,7 +4,7 @@
 # tests, sanitizers, release packaging, or Stop-proof generation.
 # `run` starts the prebuilt manyforge image instead (Dockerfile.manyforge): the
 # same serve path, with nothing built and Composer serving the GUI on 9000.
-# Users reach `run`, `status`, `stop` and `logs` through ../manyforge, which
+# Users reach `run`, `status`, `stop`, `logs` and `collect` through ../manyforge, which
 # maps its product variable names onto the MANYFORGE_DEV_* names read here.
 
 set -euo pipefail
@@ -182,7 +182,7 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 usage() {
-  echo "Usage: $0 build | pull [<image reference>] | build-native | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | run [--project <scenario-project-folder>] [<manyforge image reference> | sha256:<digest>] | status | stop [--keep-evidence] | logs [<docker logs option>...]" >&2
+  echo "Usage: $0 build | pull [<image reference>] | build-native | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | run [--project <scenario-project-folder>] [<manyforge image reference> | sha256:<digest>] | status | stop [--keep-evidence] | logs [<docker logs option>...] | collect [--start <application start id> | --last] [--out <file.tar.gz>] [--max-bytes <bytes>] | collect --list" >&2
 }
 
 # The native build container's image, image-keyed cache, identity, build and
@@ -360,7 +360,8 @@ print(json.dumps(row,separators=(",",":")))
     return 69
   fi
   tail_path="$partial_path/.docker.log.next"
-  if ! docker logs "$container_ref" 2>&1 | python3 "$retention_helper" tail "$tail_path"; then
+  # Docker's receive time on every line, to match the tail to History times.
+  if ! docker logs --timestamps "$container_ref" 2>&1 | python3 "$retention_helper" tail "$tail_path"; then
     echo "Could not copy container logs. Partial evidence: $partial_path" >&2
     echo "Container is stopped, capture failed, container retained: $container_ref; manually export or explicitly remove after investigation" >&2
     return 69
@@ -733,7 +734,7 @@ case "$command" in
     deadline=$((SECONDS + ${MANYFORGE_DEV_START_TIMEOUT_SECONDS:-900}))
     while ((SECONDS < deadline)); do
       if [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") != true ]]; then
-        docker logs --tail 200 "$container_ref" >&2
+        docker logs --timestamps --tail 200 "$container_ref" >&2
         exit 69
       fi
       if [[ "$operator_mode" == true || "$product" == true ]]; then
@@ -759,7 +760,7 @@ case "$command" in
       fi
       sleep 1
     done
-    docker logs --tail 200 "$container_ref" >&2
+    docker logs --timestamps --tail 200 "$container_ref" >&2
     echo "Development workbench did not become ready before its bounded startup timeout." >&2
     exit 69
     ;;
@@ -817,6 +818,12 @@ print(any(ref in line.split() for line in sys.stdin), end="")
     ;;
   logs)
     docker logs "$@" "$container_ref"
+    ;;
+  collect)
+    # One bounded bug-report bundle of one run (--list: one line per run),
+    # read from the state root on the host; the application need not run and
+    # nothing in it changes.
+    python3 "$repo_root/scripts/lib/collect_bundle.py" "$runtime_root" "$@"
     ;;
   *) usage; exit 64 ;;
 esac

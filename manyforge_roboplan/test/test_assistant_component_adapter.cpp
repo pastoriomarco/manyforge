@@ -8,11 +8,15 @@
 
 #include <chrono>
 #include <functional>
+#include <future>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
@@ -34,15 +38,28 @@ class FakeLink final : public IAssistantHostLink {
 struct ProcessLog final {
   std::vector<ComponentProcessCommand> started;
   int stopped{};
+  std::vector<std::thread::id> stop_threads;
+  int released{};
   std::optional<std::string> exit;
+  /// Runs in exited() (e.g. to hold a State() reader there).
+  std::function<void()> on_exited;
+  std::string output_tail;
   bool refuse{};
 };
 
 class FakeProcess final : public IComponentProcess {
  public:
   explicit FakeProcess(std::shared_ptr<ProcessLog> log) : log_(std::move(log)) {}
-  ~FakeProcess() override { ++log_->stopped; }
-  std::optional<std::string> exited() override { return log_->exit; }
+  ~FakeProcess() override { ++log_->released; }
+  void stop() override {
+    ++log_->stopped;
+    log_->stop_threads.push_back(std::this_thread::get_id());
+  }
+  std::optional<std::string> exited() override {
+    if (log_->on_exited) log_->on_exited();
+    return log_->exit;
+  }
+  std::string output_tail() const override { return log_->output_tail; }
 
  private:
   std::shared_ptr<ProcessLog> log_;
@@ -256,6 +273,11 @@ TEST(AssistantComponentAdapter, HostExitIsAFaultThatRecoverClears) {
   EXPECT_EQ(state.fault->operator_action, core::FaultOperatorAction::kRecover);
   EXPECT_TRUE(state.fault->clearable);
   EXPECT_TRUE(state.endpoints.empty());
+  EXPECT_TRUE(state.fault->details.empty());
+  // The host's last output lines, when it left any.
+  f.log->output_tail = "assistant host crashed";
+  EXPECT_EQ(f.adapter.State(f.clock->now()).fault->details,
+            (std::map<std::string, std::string>{{"output_tail", "assistant host crashed"}}));
   EXPECT_EQ(f.adapter.Run(core::ComponentAction::kEnable, {}).error->code,
             "component_not_prepared");
   f.log->exit.reset();
@@ -268,6 +290,40 @@ TEST(AssistantComponentAdapter, HostExitIsAFaultThatRecoverClears) {
   state = f.adapter.State(f.clock->now());
   EXPECT_EQ(state.lifecycle, core::ComponentLifecycle::kPrepared);
   EXPECT_TRUE(state.endpoints.empty());
+}
+
+TEST(AssistantComponentAdapter, RecoverStopsTheOldHostOnItsThreadAStateReaderOnlyReleasesIt) {
+  Fixture f;
+  f.Prepare();
+  // A State() reader holds the old host's handle (in exited()) while Recover
+  // replaces it.
+  std::promise<void> entered;
+  std::promise<void> release;
+  std::shared_future<void> gate{release.get_future().share()};
+  std::once_flag hold;
+  f.log->on_exited = [&] {
+    std::call_once(hold, [&] {
+      entered.set_value();
+      gate.wait();
+    });
+  };
+  auto reader = std::async(std::launch::async, [&] {
+    static_cast<void>(f.adapter.State(0));
+    return std::this_thread::get_id();
+  });
+  entered.get_future().wait();
+  EXPECT_EQ(f.adapter.Run(core::ComponentAction::kRecover, {}).outcome,
+            core::ActionOutcome::kSucceeded);
+  // Stopped once, on the Recover caller's thread; the reader still holds it.
+  EXPECT_EQ(f.log->stopped, 1);
+  EXPECT_EQ(f.log->stop_threads, std::vector<std::thread::id>{std::this_thread::get_id()});
+  EXPECT_EQ(f.log->released, 0);
+  EXPECT_EQ(f.log->started.size(), 2U);
+  release.set_value();
+  EXPECT_NE(reader.get(), std::this_thread::get_id());
+  // The reader's drop released it without stopping it again.
+  EXPECT_EQ(f.log->released, 1);
+  EXPECT_EQ(f.log->stopped, 1);
 }
 
 TEST(AssistantComponentAdapter, PrepareStartFailureIsTyped) {
@@ -284,20 +340,21 @@ TEST(AssistantComponentState, BridgeStreamIsFreshStaleOrNone) {
   const AssistantHostObservation none{kUrl, false, std::nullopt};
   const AssistantHostObservation answered{kUrl, false, 9 * kSecond};
   const auto budget = 5 * kSecond;
-  auto state = AssistantComponentState(true, std::nullopt, false, answered, budget, 10 * kSecond);
+  auto state =
+      AssistantComponentState(true, std::nullopt, "", false, answered, budget, 10 * kSecond);
   EXPECT_EQ(state.lifecycle, core::ComponentLifecycle::kPrepared);
   EXPECT_EQ(state.streams.front().freshness, core::StreamFreshness::kNone);
-  state = AssistantComponentState(true, std::nullopt, true, none, budget, 10 * kSecond);
+  state = AssistantComponentState(true, std::nullopt, "", true, none, budget, 10 * kSecond);
   EXPECT_EQ(state.streams.front().freshness, core::StreamFreshness::kStale);
-  state = AssistantComponentState(true, std::nullopt, true, answered, budget, 10 * kSecond);
+  state = AssistantComponentState(true, std::nullopt, "", true, answered, budget, 10 * kSecond);
   EXPECT_EQ(state.streams.front().freshness, core::StreamFreshness::kFresh);
   EXPECT_EQ(state.streams.front().age_ns, kSecond);
-  state = AssistantComponentState(true, std::nullopt, true, answered, budget, 20 * kSecond);
+  state = AssistantComponentState(true, std::nullopt, "", true, answered, budget, 20 * kSecond);
   EXPECT_EQ(state.streams.front().freshness, core::StreamFreshness::kStale);
   EXPECT_EQ(state.lifecycle, core::ComponentLifecycle::kEnabled);
   EXPECT_FALSE(state.fault.has_value());
   // Serving without an endpoint (the host stopped the bridge) is prepared.
-  state = AssistantComponentState(true, std::nullopt, true, {"", false, 9 * kSecond}, budget,
+  state = AssistantComponentState(true, std::nullopt, "", true, {"", false, 9 * kSecond}, budget,
                                   10 * kSecond);
   EXPECT_EQ(state.lifecycle, core::ComponentLifecycle::kPrepared);
   EXPECT_EQ(state.streams.front().freshness, core::StreamFreshness::kNone);

@@ -82,7 +82,7 @@ def _base_program_document() -> dict[str, Any]:
     return {
         "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "0" * 64,
-        "program_profile": "composable-cell-v1",
+        "program_profile": "manyforge-cell-v1",
         "catalog": {"api_version": "manyforge.node_catalog.v3", "content_version": _catalog().content_version},
         "parameters": [],
     }

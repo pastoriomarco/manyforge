@@ -30,7 +30,7 @@ def _store() -> ProgramValueStore:
     document = {
         "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "0" * 64,  # TCP migration: placeholder digest shape, recomputed below
-        "program_profile": "composable-cell-v1",
+        "program_profile": "manyforge-cell-v1",
         "catalog": {"api_version": catalog.api_version, "content_version": catalog.content_version},
         "tree": {"node_id": "timer", "instance_id": "timer", "parameters": {"duration_s": 1.0}, "children": []},
     }

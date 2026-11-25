@@ -20,16 +20,10 @@ import { canonical } from '../utils/referenceValidation';
 /** The confirmation's text for the Reload initial scene option; the Reset
  * confirmation uses the same. */
 export const RELOAD_INITIAL_SCENE_NOTE = 'Scene objects, including carried ones, are replaced by the Program\'s initial Scene.';
-export const PERSISTENT_KEYS_RESET_NOTE = ' Persistent keys return to their initial values.';
 
 /** The initial scene of a Program document, comparable by value. */
 export function initialSceneKey(program: ProgramDocument | null | undefined): string {
   return canonical(program?.scene ?? []);
-}
-
-/** The Program declares a persistent key (Reload also resets those). */
-export function declaresPersistentKeys(program: ProgramDocument | null | undefined): boolean {
-  return (program?.blackboard?.keys ?? []).some((key) => key.persistence === 'persistent');
 }
 
 /**

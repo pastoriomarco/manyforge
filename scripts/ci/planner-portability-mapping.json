@@ -2,7 +2,7 @@
   "schema_version": "manyforge.planner_portability.v1",
   "contract_revision": "2026-08-06",
   "runtime_availability": {
-    "status": "temporarily_unavailable_composable_cell_rebuild",
+    "status": "temporarily_unavailable_runtime_rebuild",
     "available_surface": "retained_planning_product_consumer_qualification_only",
     "restoration_gate": "qualify a non-empty retained planner product and its target-scene adapter before restoring runtime launch or conformance claims"
   },
@@ -35,7 +35,7 @@
       "capability_disposition": "supported_and_explicit_rejection_variants"
     },
     "roboplan_0_8_0": {
-      "status": "temporarily_unavailable_composable_cell_rebuild",
+      "status": "temporarily_unavailable_runtime_rebuild",
       "package": "manyforge_roboplan",
       "available_surface": "retained_planning_product_consumer_qualification_only",
       "restoration_gate": "non-empty retained planning product plus target-scene adapter qualification",
@@ -154,7 +154,7 @@
     "curobo": {
       "status": "explicitly_unsupported_deferred",
       "admission_behavior": "A deployment selecting a cuRobo planning adapter is rejected because no implemented adapter capability manifest exists",
-      "implementation_changes_in_rp5_6": "none"
+      "implementation_changes": "none"
     }
   },
   "test_references": [

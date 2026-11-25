@@ -6,7 +6,7 @@ from typing import Final
 
 
 MOTION_SCOPED_NODE_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_motion_scoped_node_unavailable"
+    "motion_scoped_node_unavailable"
 )
 
 

@@ -19,14 +19,28 @@ component's bridge also writes a JSONL audit file.
 
 - **Where**: the workbench container's console. Child-process output
   (Composer, Headless API, Program runner, ROS host) is inherited by it:
-  `docker logs --tail 200 manyforge-development-workbench` (or the
-  `MANYFORGE_DEV_CONTAINER_NAME` you set). Docker rotates it at 50 MB × 3
-  files. `./scripts/compose-dev.sh stop` keeps the last 10 MB under the runtime
-  root's `evidence/` (see [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)).
-- **Composer backend format**: single-line JSON per request (path, status,
-  duration_ms, client) plus service-level INFO/WARNING/ERROR, from
-  `manyforge_composer/backend/logging_config.py`. `uvicorn.access` is quieted
-  to WARNING. The level is INFO by default (Composer's `--log-level` option).
+  `docker logs --timestamps --tail 200 manyforge-development-workbench` (or
+  the `MANYFORGE_DEV_CONTAINER_NAME` you set); `--timestamps` prefixes each
+  line with the UTC time Docker received it, which matches History's UTC
+  times. Docker rotates it at 50 MB × 3 files. `./scripts/compose-dev.sh stop`
+  keeps the last 10 MB, with those times, under the runtime root's `evidence/`
+  (see [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)).
+- **Python process format** (Composer, Headless API, Program runner): one
+  JSON object per line on stderr, from
+  `manyforge_headless_api/logging_setup.py`, with `timestamp` (UTC, ISO-8601
+  with microseconds and a trailing `Z`), `mono_ns` (CLOCK_MONOTONIC),
+  `level`, `process` (`composer`, `headless_api` or `program_runner`), `pid`,
+  `logger` and `event` (the message), plus `exception` (the traceback) and
+  any call-site fields; a call-site field that collides with one of these
+  appears as `extra_<name>`. `uvicorn.access`, `httpx` and `httpcore` are
+  quieted to WARNING. Each process takes `--log-level` (`DEBUG`, `INFO`,
+  `WARNING`, `ERROR`; for the Headless API on `serve`): Composer defaults to
+  INFO and adds one line per request (path, status, duration_ms, client);
+  the Headless API and the Program runner default to INFO. Uvicorn's own
+  start and error lines keep uvicorn's text format.
+- **Fatal signals**: on SIGSEGV, SIGFPE, SIGABRT, SIGBUS or SIGILL,
+  Composer, the Headless API and the Program runner write every thread's
+  Python traceback to stderr (`Fatal Python error: …`), then end as before.
 - **Component actions**: Prepare, Enable, Disable, Recover and the other
   component actions end `succeeded`, `failed` with a typed error (and the
   vendor's code and text when the controller gave one), or `unknown` when
@@ -98,6 +112,53 @@ operator launcher's `standard` profile):
   channel).
 - `manyforge_fault code=<code> …`: an internal fault or stall, named by its
   code. Keep the log and report it.
+
+#### How the application ended
+
+When the application ends because a process exited, a stop signal came,
+`shutdown_runtime` was requested or the Manager failed (an internal error, or
+a failed start of the processes that start after the first baseline), the
+Manager keeps that first event in memory and, once its stop has ended, writes
+it once to `current/manager-run/application-end.json`
+(`manyforge.application_end.v1`): `ended_by` (`process_exit`, `stop_signal`,
+`shutdown_runtime` or `manager_failure`), `process` (for `process_exit`: its
+`role`, `pid`, `exit_status` or `signal`, and `core_dumped`; otherwise null)
+and `ended_at_wall` (UTC). A Manager that fails while it starts up, or is
+killed, writes no file; a failed write is logged as
+`application end record not written: …`. After the Manager exits, the
+launcher copies the file into the run's `session.json`
+(`manyforge.workbench_session.v3`, field `application_end`) together with the
+Manager's own exit (`manager_exit`: `exit_status` or `signal`). The next
+start's previous-run report (`manyforge.workbench_previous_session.v4`)
+carries it as `application_end`, null when the run has none, together with
+`started_at_wall` (the previous run's start in UTC, null when its
+`session.json` could not be read) and `reported_at_wall` (when the launcher
+wrote the report, UTC). History files the report under the previous run's
+start; with `started_at_wall` null its time is shown as unknown. A session of
+an older build, archived at an upgrade, has an unknown shutdown; its report
+names the older marker format in `archived_older_marker` (null otherwise), and
+the unclean-session alarm says it came from an older build and names its
+archive (`previous-runs/<id>`).
+
+#### Crash output
+
+Core dumps are off by default: every process the launchers and the Manager
+start (the Manager, the execution host and its component processes, Headless,
+the Program runner, Composer) runs with the soft core-file size limit at 0.
+The site settings member `core_dumps` (`{"enabled": true, "max_bytes": …}`,
+see [Site settings](DEVELOPMENT_WORKBENCH.md#site-settings)) turns them on:
+the soft limit is then `max_bytes`, at most the hard limit, which ManyForge
+never raises. Where a core goes and how long it is kept are decided by the
+host's `kernel.core_pattern` and its crash handler, not by ManyForge, which
+changes neither: with a file name or path the kernel writes the core there
+(a relative path is relative to the crashed process's working directory,
+inside the container for the workbench); with a pipe to a crash handler
+(`|…`, such as systemd-coredump or apport) the kernel passes the dump to that
+program, and what it keeps follows that program's own configuration.
+`max_bytes` bounds each core; ManyForge does not bound how many are kept.
+Headless, the Program runner and Composer start with `-X faulthandler`: on a
+fatal signal they print the Python traceback of every thread to their output
+(the console or journald), then end as before.
 
 ### Assistant bridge audit
 
@@ -171,14 +232,19 @@ these points, the point writes one `program_runner_heap_settled` line with
 clean up) and, except at `run_start`, `frozen_objects`.
 
 The History file is named by its event format, `history.v<N>.sqlite3`
-(currently `history.v9.sqlite3`), in the History directory (`history/` under
+(currently `history.v10.sqlite3`), in the History directory (`history/` under
 the development state root and in an operator instance). Only the file of the
 current format is opened. An earlier History file
 (`history.sqlite3`, or a `history.v<N>.sqlite3` with a lower number) stays on
 disk unopened and unconverted, and the History panel's retention notes say
 which file holds that earlier history. Older History files count toward the
 2 GiB kept for previous runs and are deleted oldest first; the current file
-never is.
+never is. Within the file, routine events, important events (errors, Stops,
+acknowledgements) and Program node attempts (`program_node_attempt_finished`)
+are pruned separately, oldest first, each class above 100000 events or its
+event bytes (16 MiB routine, 16 MiB important, 32 MiB node attempts), so a
+long run's node attempts never prune the Applies, Enables and moves before
+them.
 
 History keeps the events of earlier application starts, and every event
 belongs to one start: `application_start_id` (16 hex characters) is a filter,
@@ -229,11 +295,12 @@ terminal, with the typed error code and message:
   records again at that confirmation's end. The payload has `outcome`
   (`succeeded`, `refused` before it was accepted, `failed`, `unknown` when its
   effect needs reconciliation), `error`, and `reset`: the options
-  `reload_initial_scene` and `reset_robot_position`, the `program_run_id` it
-  reset (null without a run), `cause_code` of a failure, and, when this Reset
-  reloaded the scene, the Applied Program it used (`program_revision`,
-  `applied_record_digest`) and the logical-scene revision its verified
-  readback left (`scene_revision_id`, `scene_content_hash`). The line reads
+  `reload_initial_scene`, `reset_robot_position` and `reset_stored_values`,
+  the `program_run_id` it reset (null without a run), `cause_code` of a
+  failure, and, when this Reset reloaded the scene, the Applied Program it
+  used (`program_revision`, `applied_record_digest`) and the logical-scene
+  revision its verified readback left (`scene_revision_id`,
+  `scene_content_hash`). The line reads
   like `Program reset succeeded · reloaded initial scene (scene revision 10)`.
 - `program_node_attempt_finished` — one per finished Program node attempt,
   sent by the Program runner (component `manyforge.program_runner`). The
@@ -258,7 +325,9 @@ terminal, with the typed error code and message:
   Composer, the assistant, MCP, any HTTP caller, and the Program runner's own
   changes (initial-scene preparation, a Program Reset's scene reload, the
   scene clear of an empty Apply; `source_label`
-  `manyforge.behavior.program_scene` for the runner's). A Program node's
+  `manyforge.behavior.program_scene` for the runner's, which commits them at
+  the Manager and records them through
+  `POST /api/execution/history/scene-changes`). A Program node's
   scene change is in its `program_node_attempt_finished` event, and a request
   sent again that is answered with its first result records nothing again. The payload has `subject` (the operation:
   `add_object`, `upsert_object`, `remove_object`, `update_object_pose`,
@@ -275,6 +344,71 @@ terminal, with the typed error code and message:
   unless succeeded). Severity: INFO on success, WARN when refused, ERROR when
   failed or unknown. The line reads like
   `Scene add object box_1 succeeded · composer_ui · 12 ms`.
+
+- `command_finished` — one per operator command at its answer (component
+  `manyforge.headless`): Execute, motion start and stop, resume, resume or
+  discard a halt, blackboard write, manual result and handover, operation
+  start, reset and acknowledge, recovery action and persistent values, each
+  accepted or refused, and runtime scale changes; for Stop, Stop all, Halt
+  and alarm acknowledgement only refusals (an accepted Stop has its
+  `stop_event_*` events). The payload has `subject` (the command), `outcome` (`accepted`,
+  `succeeded`, `refused`, `failed`, `unknown`), `error` (with its `details`
+  when they fit) and `command` (the command kind, run or operation number,
+  `scale` for runtime scale, and `repeat_count`). An identical refusal within
+  10 s of the last row written for it is only counted, and so is an accepted
+  runtime scale change from the same source and transport (a slider sends one
+  per step); the next row written for it carries the count and, for runtime
+  scale, the latest scale.
+  Severity: INFO, WARN when not accepted.
+- `io_output_written` — one per manual output write (component
+  `manyforge.io`): `subject` is the output, `io_output` has the `value`, its
+  `origin` and `duration_ms`. Program writes are in the node attempt.
+- `motion_trace_captured` — one per automatic motion-trace capture (component
+  `manyforge.motion`), when a trace store is set (`MANYFORGE_MOTION_TRACE_DIR`):
+  after an operation with a robot motion ends `failed`, `interrupted` or
+  `intervention_required`, or after a robot's Stop escalated, Headless has the
+  execution host write the commanded-vs-measured trace it holds in memory
+  (the last 16 goals and controller samples) to the store, once per operation,
+  one capture at a time; requests for a robot that already has one waiting
+  are counted into it. `subject` is the robot, `outcome` `succeeded` or
+  `failed` (with the `error`, for example `motion_trace_store_full`), and
+  `motion_trace` has `cause` (`operation_failed`, `stop_escalated`),
+  `operation_id`, `operation_revision`, `operation_state`, `stop_event_id`,
+  `program_run_id`, the
+  `file` name in the store, its `bytes`, `status` (`complete`, or `partial`
+  when the window had already dropped data) and `request_count`. The capture
+  never delays motion, Stop or other commands: the file is written by its
+  own host thread and nothing is retried. Severity: INFO, WARN when failed.
+  The line reads like `Motion trace of robot_1 saved: trace-<sha256>.json · operation 12 failed`.
+- `program_run_started`, `program_run_finished` and the runner's audit
+  events (`cycle_recovery_action_applied`, `program_operator_choice_answered`,
+  `program_node_automatic_retry`, `program_node_preempted`,
+  `persistent_value_written` and the others the run's audit list shows), sent
+  by the Program runner like node attempts and stamped when they happened on
+  the runner's clocks. The payload has `subject`, `outcome` (`started`; the
+  end state `succeeded`, `failed`, `stopped`; `recorded` for an audit event),
+  `error` when failed, and `run_event`: `program_run_id`, `occurred_at_ns`,
+  `occurred_at_wall` and the event's facts. Severity: INFO, WARN when the run
+  failed or stopped.
+- `historian_records_lost` — one WARN row when a run of records that History
+  could not take ends, with `lost_count`, `reason_code` and the first and last
+  lost time.
+- `clock_anchor` — one row per start: Headless's event clock
+  (`owner_monotonic_ns`, `clock_owner` `headless:<start>`) next to the host's
+  `raw_monotonic_ns` and `utc_wall`, read back to back, so Headless times can
+  be ordered against the runner's and the Kernel's raw monotonic times.
+
+A record made while serving a request may carry `caller`: `request_id` (the
+`X-Request-ID` Composer forwards), `request_key`, `transport` (`http`, `ws`,
+or `mcp` for a request made through Composer's MCP adapter), `source_label`
+and `principal_id`. A runtime-collision event's line names the bodies, like
+`... (lite6_link5 <-> fixture_box)`.
+
+In Composer's History panel row times show the UTC date and milliseconds; a
+selected row shows the recorded event as JSON with Copy, and its ids as
+"Set filter" buttons; Follow reads the newest page every 2 s while the panel
+is visible; a page filtered to one Program run also shows the run's timeline,
+oldest first.
 
 The list line reads like `Enable lite6_robot failed: <code>: <message>`; select
 the row for the full payload. Filter with `event_types=component_action_finished`
@@ -353,7 +487,7 @@ pose source's acquisition rate.
 | Env var | What it controls |
 | --- | --- |
 | `MANYFORGE_DEV_CONTAINER_NAME` | Workbench container name (default `manyforge-development-workbench`). |
-| `MANYFORGE_MOTION_TRACE_DIR` | Optional motion-trace snapshots for debug export (see [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md#reference)). |
+| `MANYFORGE_MOTION_TRACE_DIR` | Motion-trace snapshots for debug export, in a capped store; empty keeps traces inline. Default: `/tmp/manyforge-state/motion-traces` in the workbench (see [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md#reference)), the run's `current/motion-traces/` with the operator launcher. |
 
 ## Container names
 
@@ -373,12 +507,48 @@ For a reproducible failure, capture the following before stopping
 1. `GET $API/api/debug/export?run_id=<program_run_id>&application_start_id=<A>`
    — the single-call debug bundle. `<A>` is the 16-character
    `application_start_id` of the start the run belongs to.
-1. `GET $API/api/execution/history?program_run_id=<program_run_id>&application_start_id=<A>`
-   for the run's latest events.
 1. `GET $API/api/execution/alarms` and `GET $API/api/cycle/status` so the
    alarm lifecycle and exact recovery offer are preserved.
-1. `docker logs --tail 2000 manyforge-development-workbench > workbench.log`
+1. `docker logs --timestamps --tail 2000 manyforge-development-workbench > workbench.log`
    and the `./scripts/compose-dev.sh status` output.
-1. If the assistant was used: copy its audit JSONL (see
-   [§Assistant bridge audit](#assistant-bridge-audit)).
 1. Note the start command (`./scripts/compose-dev.sh start --project …`).
+
+Then, running or stopped, one bundle of the run's files:
+
+```bash
+./scripts/compose-dev.sh collect [--start <A> | --last] [--out bundle.tar.gz] [--max-bytes <bytes>]
+# ./manyforge run: ./manyforge collect …
+./scripts/compose-dev.sh collect --list   # one line per run, with its start id
+```
+
+It runs on the host, only reads the runtime state root and writes one
+`.tar.gz` (default `manyforge-collect-<UTC>.tar.gz` in the current
+folder) of one run: the newest (`--last`, the default) or the one of start
+`<A>`. In this order, while the files' total stays within `--max-bytes`
+(default 512 MiB, before compression): the run's `session.json` and
+previous-run report, the console captures of its container under
+`evidence/`, its History rows (`history.ndjson`), copies of its SQLite
+journals, its assistant audit files, the rest of its run folder and the
+motion traces written during it. A file that does not fit is left out;
+`manifest.json` in the bundle lists what is in it and what was left out. The
+History rows and the copies of a running run's journals need
+`manyforge_headless_api/history_export.py` beside the launcher, which a
+checkout has.
+
+All History rows of one start or one Program run, oldest first, one JSON
+object per line, from the running application:
+
+```bash
+docker exec manyforge-development-workbench python3 -m manyforge_headless_api history export \
+  --application-start-id <A> [--program-run-id <n>] [--since 2026-11-24T14:00:00Z] [--until …] \
+  --out /tmp/history.ndjson
+docker cp manyforge-development-workbench:/tmp/history.ndjson .
+```
+
+Without `--application-start-id`, `--program-run-id` means a run of the
+current start. `--history-file <state root>/history/history.v<N>.sqlite3`
+reads a History file instead, without the application (from a checkout on
+the host: `python3 -I manyforge_headless_api/history_export.py export
+--history-file … --application-start-id <A> --out history.ndjson`); it never
+writes beside the file. `--max-rows` (default 1,000,000) bounds the export;
+when it is reached, the newest rows are kept and the command says so.

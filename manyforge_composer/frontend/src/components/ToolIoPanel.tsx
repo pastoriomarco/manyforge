@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react';
 
 import { api } from '../api/client';
+import { errorMessage } from '../state/structuralResource';
 import {
   ioSignalBindingsFromProgramBinding,
   type IoSignalBinding,
@@ -139,7 +140,7 @@ export function toolIoSignalKey(
 }
 
 function message(error: unknown): string {
-  return error instanceof Error ? error.message : 'The request failed.';
+  return errorMessage(error, 'The request failed.');
 }
 
 function declaredSourceText(declared: DeclaredIoSource): string {

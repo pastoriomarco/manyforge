@@ -665,7 +665,7 @@ describe('Program runtime authority requests', () => {
       expected_claim_generation: 12,
       terminal_reference: terminalReference,
       settlement_evidence_digest: terminalReference,
-      reload_initial_scene: false, reset_robot_position: false,
+      reload_initial_scene: false, reset_robot_position: false, reset_stored_values: false,
     });
     expect(buildProgramResetRequest(
       {
@@ -683,7 +683,7 @@ describe('Program runtime authority requests', () => {
       expected_claim_generation: 12,
       terminal_reference: null,
       settlement_evidence_digest: null,
-      reload_initial_scene: false, reset_robot_position: false,
+      reload_initial_scene: false, reset_robot_position: false, reset_stored_values: false,
     });
     expect(buildProgramResetRequest(
       {

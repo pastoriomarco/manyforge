@@ -48,13 +48,22 @@ def _test_module(relative: str, name: str) -> ModuleType:
     """Load an owner test module by path (its ``tests`` package name is
     ambiguous across the repository's per-package import roots)."""
 
-    loaded = sys.modules.get(name)
+    # The module lives in a package of its own name (its directory), so its
+    # relative imports (``from .gateway_fakes import ...``) resolve there.
+    path = _ROOT / relative
+    package = f"{name}_package"
+    qualified = f"{package}.{path.stem}"
+    loaded = sys.modules.get(qualified)
     if loaded is not None:
         return loaded
-    spec = importlib.util.spec_from_file_location(name, _ROOT / relative)
+    if package not in sys.modules:
+        parent = ModuleType(package)
+        parent.__path__ = [str(path.parent)]
+        sys.modules[package] = parent
+    spec = importlib.util.spec_from_file_location(qualified, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
+    sys.modules[qualified] = module
     spec.loader.exec_module(module)
     return module
 
@@ -150,6 +159,7 @@ def _held_owner(behavior: ModuleType):
     rows = [row.to_dict() for row in behavior.program_node_policies(program)]
     admission = behavior._admission_for_program(admission, program, rows)
     run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)  # The motion starts' tick (their answers are read on the next).
     paused = owner.advance_once(run_id)
     assert paused.state is behavior.ProgramRunState.INTERVENTION_REQUIRED
     return owner

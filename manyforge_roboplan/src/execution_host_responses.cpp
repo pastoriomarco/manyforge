@@ -1945,13 +1945,19 @@ CanonicalValue FaultValue(const core::Fault &fault) {
       {"code", Text(core::to_string(fault.code))},
       {"message", CanonicalValue(fault.message)},
       {"operator_action", Text(core::to_string(fault.operator_action))},
-      {"since_ns", Nanoseconds(fault.since_ns)}};
+      {"since_ns", Nanoseconds(fault.since_ns)},
+      {"since_utc_ns", Nanoseconds(fault.since_utc_ns)}};
   OptionalText(object, "vendor_code", fault.vendor_code);
   OptionalText(object, "vendor_text", fault.vendor_text);
   if (!fault.concerns.empty()) {
     CanonicalValue::Array concerns;
     for (const auto &component_id : fault.concerns) concerns.emplace_back(component_id);
     object.emplace_back("concerns", CanonicalValue(std::move(concerns)));
+  }
+  if (!fault.details.empty()) {
+    CanonicalValue::Object details;
+    for (const auto &[name, value] : fault.details) details.emplace_back(name, CanonicalValue(value));
+    object.emplace_back("details", CanonicalValue(std::move(details)));
   }
   return CanonicalValue(std::move(object));
 }
@@ -1992,7 +1998,8 @@ CanonicalValue ActionResultValue(const core::ActionResult &result) {
 CanonicalValue ComponentStopValue(const core::ComponentStop &stop) {
   CanonicalValue::Object object{{"code", Text(core::to_string(stop.code))},
                                 {"message", CanonicalValue(stop.message)},
-                                {"since_ns", Nanoseconds(stop.since_ns)}};
+                                {"since_ns", Nanoseconds(stop.since_ns)},
+                                {"since_utc_ns", Nanoseconds(stop.since_utc_ns)}};
   OptionalText(object, "vendor_code", stop.vendor_code);
   OptionalText(object, "vendor_text", stop.vendor_text);
   return CanonicalValue(std::move(object));

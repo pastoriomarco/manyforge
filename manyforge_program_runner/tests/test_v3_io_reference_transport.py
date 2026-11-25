@@ -1,44 +1,11 @@
-"""I/O transport carries the exact component/signal pair."""
+"""The runner keeps the exact component/signal pair of I/O references."""
 
-import pytest
-from pydantic import ValidationError
 from pathlib import Path
 from types import SimpleNamespace
 
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_program_runner.execution_transport import (
-    _IoWatchRequest,
-    _MockSimulationRow,
-    _selectors,
-)
 from manyforge_program_runner.runtime import ProgramRuntime
 from manyforge_program_runner.active_tcp_mirror import decode_active_tcp_rows
-
-
-def test_watch_uses_direct_signal_and_rejects_role_fields():
-    request = {
-        "schema_version": "manyforge.io_watch_request.v3",
-        "program_binding_id": "sha256:" + "0" * 64,
-        "claim_generation": 1,
-        "program_run_id": 1,
-        "node_instance_id": "node",
-        "node_attempt_id": 1,
-        "signal": {"component_id": "robot_io", "signal_name": "CI0"},
-        "condition": {"kind": "level", "expected_value": True},
-    }
-    parsed = _IoWatchRequest.model_validate(request)
-    assert parsed.signal.signal_name == "CI0"
-    with pytest.raises(ValidationError):
-        _IoWatchRequest.model_validate({**request, "target_role_id": "arm"})
-
-
-def test_mock_receipt_selector_preserves_component_and_signal_name():
-    rows = [_MockSimulationRow.model_validate({
-        "signal": {"component_id": "robot_io", "signal_name": "CI0"},
-        "start_value": False,
-        "change": None,
-    })]
-    assert _selectors(rows) == [("robot_io", "CI0")]
 
 
 def test_simulator_dependency_keeps_direct_signal_identity_until_binding_join():

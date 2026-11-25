@@ -20,7 +20,7 @@ def test_create_kernel_fails_before_deployment_or_factory_access() -> None:
 
     with pytest.raises(
         RuntimeError,
-        match="composable_cell_kernel_client_binding_unavailable",
+        match="kernel_client_binding_unavailable",
     ):
         create_kernel(PoisonDeployment())
 

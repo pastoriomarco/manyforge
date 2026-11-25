@@ -18,7 +18,7 @@ from typing import Any
 
 
 EVIDENCE_PREFIX = "MANYFORGE_QUALIFICATION_EVIDENCE "
-SCHEMA_VERSION = "manyforge.rt6_qualification.v1"
+SCHEMA_VERSION = "manyforge.realtime_qualification.v1"
 
 
 def _scheduler_name(policy: int | None) -> str:
@@ -82,18 +82,18 @@ def _locked_memory_bytes() -> tuple[int | None, str | None]:
 
 
 def _requested_policy(env: dict[str, str]) -> str | None:
-    value = env.get("MANYFORGE_RT6_REQUESTED_SCHED_POLICY")
+    value = env.get("MANYFORGE_REALTIME_REQUESTED_SCHED_POLICY")
     if value:
         return value.strip().upper()
     return None
 
 
 def _requested_affinity(env: dict[str, str]) -> list[int] | None:
-    return _parse_cpu_set(env.get("MANYFORGE_RT6_REQUESTED_CPU_AFFINITY"))
+    return _parse_cpu_set(env.get("MANYFORGE_REALTIME_REQUESTED_CPU_AFFINITY"))
 
 
 def _requested_mlock(env: dict[str, str]) -> bool:
-    return env.get("MANYFORGE_RT6_REQUESTED_MLOCK", "").strip().lower() in {
+    return env.get("MANYFORGE_REALTIME_REQUESTED_MLOCK", "").strip().lower() in {
         "1",
         "true",
         "yes",

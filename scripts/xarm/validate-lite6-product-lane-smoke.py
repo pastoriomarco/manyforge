@@ -26,7 +26,7 @@ import urllib.error
 
 
 LITE6_PRODUCT_SMOKE_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_lite6_product_smoke_unavailable"
+    "lite6_product_smoke_unavailable"
 )
 HISTORICAL_SOURCE_COMMIT: Final = (
     "08222188293df8e12f90dc72e204c21f22f92ea1"

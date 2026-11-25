@@ -55,7 +55,7 @@ const entry: CatalogEntry = {
   execution: { blocking: true, cancellable: true, ownerApi: 'kernel.operation' },
   runners: { py_trees: 'move_v1' },
   tags: [],
-  minProgramProfile: 'composable-cell-v1',
+  minProgramProfile: 'manyforge-cell-v1',
   blackboard: { reads: [], writes: [] },
   ownerContext: null,
   outcomes: {},
@@ -237,7 +237,7 @@ describe('Program parameter binding continuity', () => {
     const selected = tree({ parameters: { target: { component_id: 'robot', command_target_id: 'arm' } } });
     const program: ProgramAuthoringDocument = {
       api_version: 'manyforge.program.v4',
-      program_profile: 'composable-cell-v1',
+      program_profile: 'manyforge-cell-v1',
       catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
       blackboard: { namespaces: [], keys: [
         { key: 'selection', type: 'scene_selection_result', access: 'write', persistence: 'run' },
@@ -263,7 +263,7 @@ describe('Program parameter binding continuity', () => {
     });
     const program: ProgramAuthoringDocument = {
       api_version: 'manyforge.program.v4',
-      program_profile: 'composable-cell-v1',
+      program_profile: 'manyforge-cell-v1',
       catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
       blackboard: {
         namespaces: [],
@@ -302,7 +302,7 @@ describe('Program parameter binding continuity', () => {
     };
     const program = {
       api_version: 'manyforge.program.v4',
-      program_profile: 'composable-cell-v1',
+      program_profile: 'manyforge-cell-v1',
       catalog: {
         api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',
@@ -363,7 +363,7 @@ describe('Program parameter binding continuity', () => {
     };
     const program = {
       api_version: 'manyforge.program.v4',
-      program_profile: 'composable-cell-v1',
+      program_profile: 'manyforge-cell-v1',
       catalog: {
         api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',
@@ -404,7 +404,7 @@ describe('Program parameter binding continuity', () => {
     };
     const program = {
       api_version: 'manyforge.program.v4',
-      program_profile: 'composable-cell-v1',
+      program_profile: 'manyforge-cell-v1',
       catalog: {
         api_version: 'manyforge.node_catalog.v3',
         content_version: '2.4.0',

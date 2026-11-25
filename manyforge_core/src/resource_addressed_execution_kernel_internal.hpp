@@ -757,7 +757,7 @@ struct StopStaticFacts final {
   const auto& participant_policy = *registration.participant_policy;
   if (binding.model_groups.size() != 1U) {
     return reject<ExecuteRequestDTO>("motion requires exactly one retained model group",
-                                     "i6_motion_model_group_cardinality_invalid");
+                                     "motion_model_group_cardinality_invalid");
   }
   const auto* base = find_frame(binding, motion.base_frame);
   const auto* tcp =
@@ -1054,7 +1054,7 @@ struct StopStaticFacts final {
   if (binding.model_groups.size() > 1U || binding.resources.size() != 1U) {
     return reject<GripperCommandRequestDTO>(
         "the retained gripper mechanism requires one exact command resource",
-        "i6_gripper_command_scope_unsupported");
+        "gripper_command_scope_unsupported");
   }
   const auto& resource = binding.resources.front();
   const bool model_backed = resource.source_joint_name.has_value();
@@ -1067,12 +1067,12 @@ struct StopStaticFacts final {
   if (!exact_model_scope && !exact_component_local_scope) {
     return reject<GripperCommandRequestDTO>(
         "the retained gripper resource has no exact model-backed or component-local scope",
-        "i6_gripper_command_scope_unsupported");
+        "gripper_command_scope_unsupported");
   }
   if (command.command_schema_id.value() != kGripperPositionCommandSchemaId ||
       command.command_schema_revision.value() != kGripperPositionCommandSchemaRevision) {
     return reject<GripperCommandRequestDTO>("the command is not the qualified gripper schema",
-                                            "i6_command_schema_unsupported",
+                                            "gripper_command_schema_unsupported",
                                             ErrorCode::kUnsupportedCapability);
   }
 
@@ -3141,7 +3141,7 @@ struct ResourceAddressedExecutionKernel::PreviewSession final : IAddressedMotion
     if (intent.participants.size() != 1U ||
         intent.coordination_policy != OperationCoordinationPolicy::kIndependent) {
       return reject<RuntimeParticipantExecutionRegistration>(
-          "preview admits one independent participant", "i6_preview_single_participant_only");
+          "preview admits one independent participant", "preview_single_participant_only");
     }
     auto resolved = owner_.resolve_registration(intent, 0U);
     if (!resolved.ok()) {

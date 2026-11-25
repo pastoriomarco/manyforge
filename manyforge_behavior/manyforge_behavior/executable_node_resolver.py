@@ -77,13 +77,11 @@ class ExecutableNodeResolverError(ValueError):
 
 
 class ExecutableNodeUnavailableError(RuntimeError):
-    """An exact row is known but its responsible restoration gate is open."""
+    """An exact row is known but has no build-qualified adapter."""
 
-    def __init__(self, reason_code: str, restoration_gates: tuple[str, ...]) -> None:
+    def __init__(self, reason_code: str) -> None:
         self.reason_code = reason_code
-        self.restoration_gates = restoration_gates
-        gates = ",".join(restoration_gates)
-        super().__init__(f"{reason_code}: restoration_gates={gates}")
+        super().__init__(reason_code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,9 +107,8 @@ class NodeAdapterBuildContext:
     motion_attention: Callable[[str, str], None] | None = None
     # Receives each automatic retry's audit fact (the run's own audit list).
     audit_sink: Callable[[dict[str, Any]], None] | None = None
-    # The run's ordered sender (OD-213): the nodes whose slow request
-    # leaves the tick (Scene nodes, the output writes, Set TCP, pick/place
-    # planning) use it.
+    # The run's ordered sender (OD-213, OD-380 D2): the nodes whose owner
+    # requests leave the tick use it.
     run_sender: RunSender | None = None
     # The captured Program's execution selections (group id -> node ids),
     # read by the Program's own motion-group Stop.
@@ -185,7 +182,6 @@ class ExecutableNodeDisposition:
     adapter_build_qualified: bool
     owner_port_name: str | None
     unavailable_reason_code: str | None
-    restoration_gates: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -193,7 +189,6 @@ class ExecutableNodeDisposition:
             "adapter_build_qualified": self.adapter_build_qualified,
             "owner_port_name": self.owner_port_name,
             "unavailable_reason_code": self.unavailable_reason_code,
-            "restoration_gates": list(self.restoration_gates),
         }
 
 
@@ -203,7 +198,6 @@ class _AdapterDefinition:
     builder: NodeAdapterBuilder | None
     owner_port_name: str | None
     unavailable_reason_code: str | None
-    restoration_gates: tuple[str, ...]
 
 
 def _sequence(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
@@ -317,6 +311,21 @@ def _derived_active_tcp_key(node_id: str, parameters: Mapping[str, Any]) -> str 
     return active_tcp_key(target.get("component_id"), target.get("command_target_id"))
 
 
+# The Program's control nodes whose start leaves the tick on the run's sender
+# (OD-380 D2). The Program's own Stop nodes (`kernel.stop_operation`,
+# `kernel.cell_stop`) are not among them: like every Stop they never wait
+# behind another request (OD-119); the tick sends them on the host's Stop
+# control socket and reads their status there. Each first withdraws the run's
+# queued motion and gripper starts it covers and waits only for such a start
+# already sent to answer (`RunSender.stop_starts`).
+_SENT_CONTROL_NODE_IDS: Final = frozenset(
+    {
+        "kernel.reset_operation",
+        "recovery.apply_offered_action",
+    }
+)
+
+
 def _owner_task_builder(
     node_id: str,
     port_name: str,
@@ -351,9 +360,18 @@ def _owner_task_builder(
             timing["io_watches"] = getattr(context.ports, "io_watches", None)
             timing["io_signals"] = getattr(context.ports, "io_signals", None)
             timing["valve_sender"] = context.run_sender
-        if node_id == "motion.set_tcp" or planning:
-            # Set TCP and the pick/place planning jobs (OD-213) leave the tick.
+        if motion or gripper_command or node_id == "motion.set_tcp" or planning:
+            # The motion and gripper starts (OD-380 D2), Set TCP and the
+            # pick/place planning jobs (OD-213) leave the tick.
             timing["run_sender"] = context.run_sender
+        if node_id in _SENT_CONTROL_NODE_IDS:
+            # The Program's operation Reset and recovery nodes leave the
+            # tick (OD-380 D2): start, status reads and settling.
+            timing["run_sender"] = context.run_sender
+        if node_id in {"kernel.stop_operation", "kernel.cell_stop"}:
+            # Not sent on it: the Program Stop withdraws the run's queued
+            # motion and gripper starts it covers and follows one in flight.
+            timing["program_stop_starts"] = context.run_sender
         if interrupt_motion:
             timing["mock_simulation"] = getattr(context.ports, "mock_simulation", None)
         return adapter(
@@ -456,6 +474,9 @@ def _owner_invocation_builder(
             blackboard_read_parameters=blackboard_read_parameters,
             cancellable=cancellable,
             owner_api=owner_api,
+            # Every owner request leaves the tick on the run's sender (OD-380
+            # D2): the node is RUNNING until its answer.
+            run_sender=context.run_sender,
         )
         if node_id in {"io.get_input", "io.check_input"}:
             common.update(
@@ -465,12 +486,6 @@ def _owner_invocation_builder(
         if node_id != "gripper.wait_for_status":
             return OwnerInvocationAdapter(
                 operator_stop_state=context.operator_stop_state,
-                # The Scene nodes and the output write leave the tick (OD-213).
-                run_sender=(
-                    context.run_sender
-                    if port_name == "scene_transactions" or node_id == "io.set_output"
-                    else None
-                ),
                 **common,  # type: ignore[arg-type]
             )
         # Only a waiter some hold policy can stop ticking sees the Stop
@@ -514,6 +529,7 @@ def _io_wait_builder(
             operator_stop_hold_scope=context.operator_stop_hold_scope if held else None,
             audit_sink=context.audit_sink,
             mock_simulation=getattr(context.ports, "mock_simulation", None),
+            run_sender=context.run_sender,
             cancellable=cancellable,
             owner_api=owner_api,
         )
@@ -534,6 +550,8 @@ def _pure_leaf(
             input_resolver=_required_input_resolver(context),
             attempt_source=_required_attempt_source(context),
             frame_transforms=context.ports.model_queries,
+            # A frame transform leaves the tick on the run's sender (OD-380 D2).
+            run_sender=context.run_sender,
             # A timed node reads the run's Program clock. Only one some hold
             # policy can stop ticking sees the Stop state, with the subtree
             # whose hold actually stops it.
@@ -676,13 +694,12 @@ def _definition_for(
             ),
             "model_queries",
             None,
-            (),
         )
     run_owner_builder = _RUN_OWNER_BUILDERS.get(
         (row.implementation_id, entry.execution.owner_api)
     )
     if run_owner_builder is not None:
-        return _AdapterDefinition(row, run_owner_builder, None, None, ())
+        return _AdapterDefinition(row, run_owner_builder, None, None)
     pure_builder = _PURE_BUILDERS.get(row.implementation_id)
     if pure_builder is not None:
         if entry.execution.owner_api not in _OWNER_NEUTRAL_APIS:
@@ -690,7 +707,7 @@ def _definition_for(
                 f"pure implementation {row.implementation_id!r} is bound to "
                 f"effectful owner API {entry.execution.owner_api!r}"
             )
-        return _AdapterDefinition(row, pure_builder, None, None, ())
+        return _AdapterDefinition(row, pure_builder, None, None)
     if entry.execution.owner_api in _OWNER_NEUTRAL_APIS:
         raise ExecutableNodeResolverError(
             f"owner-neutral implementation {row.implementation_id!r} has no "
@@ -720,7 +737,6 @@ def _definition_for(
                 ),
                 "io_watches",
                 None,
-                (),
             )
     if task_port is not None and invocation_port is not None:
         raise ExecutableNodeResolverError(f"node {row.node_id!r} has ambiguous owner-port binding")
@@ -738,7 +754,6 @@ def _definition_for(
             ),
             task_port,
             None,
-            (),
         )
     if invocation_port is not None:
         return _AdapterDefinition(
@@ -756,7 +771,6 @@ def _definition_for(
             ),
             invocation_port,
             None,
-            (),
         )
     raise ExecutableNodeResolverError(
         f"node {row.node_id!r} has no build-qualified adapter binding"
@@ -790,7 +804,6 @@ class ExecutableNodeResolver:
                 adapter_build_qualified=definition.builder is not None,
                 owner_port_name=definition.owner_port_name,
                 unavailable_reason_code=definition.unavailable_reason_code,
-                restoration_gates=definition.restoration_gates,
             )
             for definition in sorted(self._definitions.values(), key=lambda item: item.row)
         )
@@ -807,7 +820,6 @@ class ExecutableNodeResolver:
             adapter_build_qualified=definition.builder is not None,
             owner_port_name=definition.owner_port_name,
             unavailable_reason_code=definition.unavailable_reason_code,
-            restoration_gates=definition.restoration_gates,
         )
 
     def instantiate(
@@ -823,10 +835,7 @@ class ExecutableNodeResolver:
             ) from exc
         if definition.builder is None:
             assert definition.unavailable_reason_code is not None
-            raise ExecutableNodeUnavailableError(
-                definition.unavailable_reason_code,
-                definition.restoration_gates,
-            )
+            raise ExecutableNodeUnavailableError(definition.unavailable_reason_code)
         try:
             behavior = definition.builder(context)
         except (ExecutableNodeResolverError, ExecutableNodeUnavailableError):

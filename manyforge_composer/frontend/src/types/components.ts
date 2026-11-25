@@ -42,6 +42,10 @@ export interface Fault {
   /** On an owner's fault, the members it concerns. */
   concerns?: string[];
   since_ns: number;
+  /** The UTC time of the same instant, nanoseconds as decimal text; absent from older owners. */
+  since_utc_ns?: string;
+  /** A launch fault's last lines of the launched process's output (details `output_tail`). */
+  output_tail?: string;
 }
 
 /** An emergency stop the component reports (a stop, not a fault). */
@@ -49,6 +53,8 @@ export interface ComponentStop {
   code: 'estop';
   message: string;
   since_ns: number;
+  /** The UTC time of the same instant, nanoseconds as decimal text; absent from older owners. */
+  since_utc_ns?: string;
   vendor_code?: string;
   vendor_text?: string;
 }

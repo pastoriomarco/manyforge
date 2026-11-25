@@ -64,7 +64,6 @@ function workspace(draftId: string, revision: number): ProgramWorkspaceResponse 
       unavailableReason: {
         code: 'program_apply_unavailable',
         message: 'Apply waits for N7.',
-        restorationGates: ['N7'],
       },
     },
     hasUnsavedChanges: false,

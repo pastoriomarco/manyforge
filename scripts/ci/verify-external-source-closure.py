@@ -15,7 +15,7 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 
-_LEDGER_SCHEMA = "manyforge.composable_cell.e1.external_delta_ledger.v1"
+_LEDGER_SCHEMA = "manyforge.external_delta_ledger.v1"
 _CONTENT_DOMAIN = b"manyforge.external-source-content.v1\0"
 
 

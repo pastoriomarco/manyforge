@@ -26,6 +26,7 @@ from manyforge_operator import (
     ResourceKind,
     ResourceObservation,
     ResourcePresence,
+    RESULT_SCHEMA,
     RosTopology,
     RuntimeArtifactIdentity,
     ServiceEndpoint,
@@ -288,14 +289,14 @@ def test_status_requires_identity_order_coverage_and_truthful_ready_state(
 def test_command_result_success_error_and_round_trip(configuration_factory, status_factory):
     status = status_factory(configuration_factory(), with_resources=True)
     result = OperatorCommandResult(
-        schema_version="manyforge.operator_command_result.v2",
+        schema_version=RESULT_SCHEMA,
         operation=LaunchOperation.START,
         outcome=CommandOutcome.STARTED,
         status=status,
     )
     assert OperatorCommandResult.model_validate_json(result.model_dump_json()) == result
     conflict = OperatorCommandResult(
-        schema_version="manyforge.operator_command_result.v2",
+        schema_version=RESULT_SCHEMA,
         operation=LaunchOperation.START,
         outcome=CommandOutcome.CONFLICT,
         error=OperatorCommandError(code="port_occupied", message="port is occupied"),
@@ -303,13 +304,13 @@ def test_command_result_success_error_and_round_trip(configuration_factory, stat
     assert conflict.error is not None
     with pytest.raises(ValidationError):
         OperatorCommandResult(
-            schema_version="manyforge.operator_command_result.v2",
+            schema_version=RESULT_SCHEMA,
             operation=LaunchOperation.START,
             outcome=CommandOutcome.STARTED,
         )
     with pytest.raises(ValidationError):
         OperatorCommandResult(
-            schema_version="manyforge.operator_command_result.v2",
+            schema_version=RESULT_SCHEMA,
             operation=LaunchOperation.START,
             outcome=CommandOutcome.CONFLICT,
         )
@@ -512,7 +513,7 @@ def test_contract_schema_is_closed_discriminated_and_stable():
     second = operator_launch_contract_schema()
     assert first == second
     assert first["$schema"] == "https://json-schema.org/draft/2020-12/schema"
-    assert first["$id"] == "manyforge.operator_launch_contract.v2"
+    assert first["$id"] == "manyforge.operator_launch_contract.v3"
     assert first["discriminator"]["propertyName"] == "schema_version"
     assert {"LaunchConfiguration", "LaunchInstanceStatus", "OperatorCommandResult"} <= set(
         first["$defs"]
@@ -541,7 +542,7 @@ def test_contract_schema_is_closed_discriminated_and_stable():
     }
     assert rfc8785.dumps(first) == rfc8785.dumps(second)
     assert hashlib.sha256(rfc8785.dumps(first)).hexdigest() == (
-        "82596849b1144a4d5a9ae99e993e778d4d3b71051a17dff7e02bcaf38a1c459d"
+        "7982ac8be19e17128e304e843691c80d322703a14a0b058dffddcc84824f57e4"
     )
 
 

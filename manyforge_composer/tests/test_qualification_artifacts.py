@@ -598,6 +598,6 @@ def test_git_commit_metadata_can_come_from_environment(
 def test_runtime_runner_name_is_only_a_typed_gate() -> None:
     with pytest.raises(
         ScenarioExecutionUnavailableError,
-        match="composable_cell_runtime_unavailable",
+        match="runtime_unavailable",
     ):
         ScenarioRunner(object())

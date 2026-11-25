@@ -101,7 +101,7 @@ namespace {
 
 using collision::ManyForgeCollisionEngine;
 constexpr std::string_view kCanonicalCellFrame =
-    "mf1_cell_e228ede37638a8d03080644d418a75c681930a4b5b3f6b0bbde2603974dab681";
+    "mf1_cell_7e6d927cd7a7eabf33d74af788ccc2b0f441014dcb310cd81814df016ce9213c";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -1458,7 +1458,7 @@ TEST(RetainedProductCrossConsumer,
   // Five milliseconds is a deliberately broad regression tripwire, not an
   // attempt to compare unlike FNV and retained-product workloads.
   EXPECT_LT(p99_us, 5000.0);
-  std::cout << "{\"schema\":\"manyforge.i6.retained_model_lookup_perf.v1\","
+  std::cout << "{\"schema\":\"manyforge.retained_model_lookup_perf.v1\","
             << "\"runtime_map_rebuilds\":0,"
             << "\"symbol_lookups_per_iteration\":" << kSymbolLookupsPerIteration
             << ","
@@ -7496,7 +7496,7 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
     auto root = deployment::normalize_program_authoring(CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue("manyforge.program.v4")},
         {"program_revision", CanonicalValue(std::string(kZeroDigest))},
-        {"program_profile", CanonicalValue("composable-cell-v1")},
+        {"program_profile", CanonicalValue("manyforge-cell-v1")},
         {"catalog",
          CanonicalValue(CanonicalValue::Object{
              {"api_version", CanonicalValue("manyforge.node_catalog.v3")},
@@ -7730,6 +7730,54 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
   std::jthread second(concurrent_reads, 1U);
   first.join();
   second.join();
+
+  // OD-234: a read of the held run's Binding resolves from that run's
+  // capture; any other Binding (or no held run) reads and verifies its
+  // sources as before. Fresh resolvers: no warm selection.
+  const auto &held_run = capture.value().resolution_context;
+  ASSERT_TRUE(held_run);
+  const auto timed_pair = [&](const char *label,
+                              const core::ProgramRunResolutionContext &context) {
+    ProductBackedRuntimeParticipantResolver fresh(
+        package_root, materialized.bundle, model_map, representatives, {});
+    double ms[2];
+    for (auto &sample : ms) {
+      const auto begun = std::chrono::steady_clock::now();
+      const auto result = fresh.ResolveObservationTarget(
+          binding_id, target_id, capability_id, physical, representatives, context);
+      sample = std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - begun).count();
+      ASSERT_TRUE(result.ok()) << result.error().message;
+      EXPECT_EQ(result.value().observation_binding.value(), physical.value());
+    }
+    std::cout << "{\"query_target\":\"" << label << "\",\"first_ms\":" << ms[0]
+              << ",\"second_ms\":" << ms[1] << "}" << std::endl;
+  };
+  timed_pair("sources", {});
+  timed_pair("held_run", held_run);
+  ProductBackedRuntimeParticipantResolver unread(
+      package_root, materialized.bundle, model_map, representatives, {});
+  const auto hide = [&](bool hidden) {
+    for (const auto *name : {"programs", "program-bindings"})
+      std::filesystem::rename(package_root / (hidden ? name : std::string(name) + ".hidden"),
+                              package_root / (hidden ? std::string(name) + ".hidden" : name));
+  };
+  hide(true);
+  const auto absent = unread.ResolveObservationTarget(
+      binding_id, target_id, capability_id, physical, representatives);
+  ASSERT_FALSE(absent.ok());
+  EXPECT_EQ(absent.error().code, "execution_target_binding_unavailable");
+  const auto other = unread.ResolveObservationTarget(
+      selected.back()->program_binding_id(), target_id, capability_id, physical,
+      representatives, held_run);
+  ASSERT_FALSE(other.ok());
+  EXPECT_EQ(other.error().code, "execution_target_binding_unavailable");
+  const auto held = unread.ResolveObservationTarget(
+      binding_id, target_id, capability_id, physical, representatives, held_run);
+  hide(false);
+  ASSERT_TRUE(held.ok()) << held.error().message;
+  EXPECT_EQ(held.value().observation_binding.value(), physical.value());
+  EXPECT_EQ(held.value().target.program_binding_id(), binding_id);
 }
 
 TEST(RetainedProductCrossConsumer,
@@ -8636,7 +8684,7 @@ public:
     auto root = deployment::parse_strict_json_model_yaml(R"({
       "api_version":"manyforge.program.v4",
       "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "program_profile":"composable-cell-v1",
+      "program_profile":"manyforge-cell-v1",
       "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
       "blackboard":{"namespaces":[],"keys":[]},
       "tree":{"node_id":"io.check_input","instance_id":"check","parameters":{"signal":{"component_id":"device.io","signal_name":"ready"},"expected_value":true},"children":[]}
@@ -8817,7 +8865,7 @@ TEST(RetainedProductConsumerTest, TargetResolutionUsesOnlyExactActivationCatalog
   auto authored = deployment::parse_strict_json_model_yaml(R"({
     "api_version":"manyforge.program.v4",
     "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "program_profile":"composable-cell-v1",
+    "program_profile":"manyforge-cell-v1",
     "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
     "tree":{"node_id":"gripper.check_status","instance_id":"check",
       "parameters":{"target":{"component_id":"lite_gripper","command_target_id":"gripper"},
@@ -8953,7 +9001,7 @@ TEST(RetainedProductConsumerTest, ToolTcpMoveIsOwnerStampedThroughTheRealPlanner
   auto authored = deployment::parse_strict_json_model_yaml(R"({
     "api_version":"manyforge.program.v4",
     "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "program_profile":"composable-cell-v1",
+    "program_profile":"manyforge-cell-v1",
     "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
     "tree":{"node_id":"sequence","instance_id":"root","parameters":{},"children":[
       {"node_id":"motion.move_to_joint_target","instance_id":"move",
@@ -9036,6 +9084,47 @@ TEST(RetainedProductConsumerTest, ToolTcpMoveIsOwnerStampedThroughTheRealPlanner
   ASSERT_TRUE(arm_holder.ok()) << arm_holder.error().message;
   EXPECT_EQ(arm_holder.value(), motion_endpoint.frame.reference);
   EXPECT_EQ(arm_holder.value().component_id, tool_id);
+  // OD-234: a holder of the held run's Binding resolves from that run's
+  // capture; without a held run (or for another Binding) the Binding is
+  // read and verified on every call, as before.
+  const auto capture = resolver.ResolveProgramCapture(
+      {core::CellAdmissionClaimGeneration(1U), core::ProgramRunNumber(1U),
+       compiled->value().program_revision, compiled->program_binding_id(),
+       compiled->value().retained_bundle_id, compiled->value().graph_revision, {}});
+  ASSERT_TRUE(capture.ok()) << capture.error().message;
+  const auto &held_run = capture.value().resolution_context;
+  ASSERT_TRUE(held_run);
+  const auto attach = [&](const core::ProgramRunResolutionContext &context) {
+    return resolver.ResolveAttachActiveTcp(
+        compiled->program_binding_id(), {arm_id, core::CommandTargetId("arm")},
+        [&](const auto &robot) -> std::optional<ActiveTcp> {
+          return robot == arm_id ? std::optional(active) : std::nullopt;
+        },
+        context);
+  };
+  for (const auto *label : {"sources", "held_run"}) {
+    double ms[3];
+    for (auto &sample : ms) {
+      const auto begun = std::chrono::steady_clock::now();
+      const auto result = attach(std::string_view(label) == "held_run"
+                                     ? held_run : core::ProgramRunResolutionContext{});
+      sample = std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - begun).count();
+      ASSERT_TRUE(result.ok()) << result.error().message;
+      EXPECT_EQ(result.value(), motion_endpoint.frame.reference);
+    }
+    std::cout << "{\"resolve_attach_active_tcp\":\"" << label << "\",\"ms\":[" << ms[0]
+              << "," << ms[1] << "," << ms[2] << "]}" << std::endl;
+  }
+  const auto bindings_dir = artifacts.path() / "program-bindings";
+  std::filesystem::rename(bindings_dir, artifacts.path() / "program-bindings.hidden");
+  const auto absent = attach({});
+  const auto held = attach(held_run);
+  std::filesystem::rename(artifacts.path() / "program-bindings.hidden", bindings_dir);
+  ASSERT_FALSE(absent.ok());
+  EXPECT_EQ(absent.error().code, "attach_holder_unavailable");
+  ASSERT_TRUE(held.ok()) << held.error().message;
+  EXPECT_EQ(held.value(), motion_endpoint.frame.reference);
   const auto &endpoint = selected.motion_endpoint->frame;
   // The Kernel's TCP stamp: the endpoint frame under its owner.
   const core::ResolvedFrameDTO tool_tcp = core::ResolvedComponentModelFrameDTO{
@@ -9145,7 +9234,7 @@ TEST(RetainedProductConsumerTest, HeldRunResolvesFromTheProgramVerifiedAtCapture
   auto authored = deployment::parse_strict_json_model_yaml(R"({
     "api_version":"manyforge.program.v4",
     "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-    "program_profile":"composable-cell-v1",
+    "program_profile":"manyforge-cell-v1",
     "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
     "tree":{"node_id":"sequence","instance_id":"root","parameters":{},"children":[
       {"node_id":"motion.move_to_joint_target","instance_id":"move",

@@ -12,6 +12,7 @@ import type {
   ExpressionDiagnostic,
   ExpressionValueType,
   ProgramCycleStatus,
+  ProgramNodeWaitValue,
   ProgramRunStateName,
   ProgramRunStatus,
   FailureDetails,
@@ -45,6 +46,7 @@ import {
   digestAt,
   exactKeysAt,
   fail,
+  int64NumberOrTextAt,
   integerAt,
   jsonRecordAt,
   jsonValueAt,
@@ -148,10 +150,11 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
       : (() => {
         const path = 'programCycleStatus.reset_options';
         const options = objectAt(record.reset_options, path);
-        exactKeysAt(options, ['reload_initial_scene', 'reset_robot_position'], path);
+        exactKeysAt(options, ['reload_initial_scene', 'reset_robot_position', 'reset_stored_values'], path);
         return {
           reloadInitialScene: booleanAt(options.reload_initial_scene, `${path}.reload_initial_scene`),
           resetRobotPosition: booleanAt(options.reset_robot_position, `${path}.reset_robot_position`),
+          resetStoredValues: booleanAt(options.reset_stored_values, `${path}.reset_stored_values`),
         };
       })(),
     resetRobotPosition: (() => {
@@ -559,7 +562,9 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       'halt',
       'message',
       'node_status_revision',
+      'node_running_since_utc_ns',
       'node_statuses',
+      'node_wait_values',
       'origin',
       'owner_id',
       'reason_code',
@@ -573,8 +578,8 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_run_status.v5') {
-    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v5');
+  if (schemaVersion !== 'manyforge.program_run_status.v6') {
+    return fail(`${path}.schema_version`, 'manyforge.program_run_status.v6');
   }
   const state = stringAt(record.state, `${path}.state`) as ProgramRunStateName;
   if (!PROGRAM_RUN_STATES.has(state)) {
@@ -745,7 +750,48 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
     runEnd: record.run_end === undefined || record.run_end === null
       ? null : parseProgramRunEnd(record.run_end, `${path}.run_end`),
     halt,
+    nodeRunningSinceUtcNs: nodeRunningSinceAt(record.node_running_since_utc_ns, `${path}.node_running_since_utc_ns`),
+    nodeWaitValues: nodeWaitValuesAt(record.node_wait_values, `${path}.node_wait_values`),
   };
+}
+
+/** When each running node started (UTC nanoseconds), at most 64 nodes. */
+function nodeRunningSinceAt(value: unknown, path: string): Record<string, string> {
+  const entries = Object.entries(objectAt(value, path));
+  if (entries.length > 64) return fail(path, 'at most 64 running nodes');
+  return Object.fromEntries(entries.map(([id, since]) => [id, int64NumberOrTextAt(since, `${path}.${id}`)]));
+}
+
+/** The waited value of running wait nodes, at most 32 nodes. */
+function nodeWaitValuesAt(value: unknown, path: string): Record<string, ProgramNodeWaitValue> {
+  const entries = Object.entries(objectAt(value, path));
+  if (entries.length > 32) return fail(path, 'at most 32 wait nodes');
+  return Object.fromEntries(entries.map(([id, item]) => {
+    const rowPath = `${path}.${id}`;
+    const row = objectAt(item, rowPath);
+    const kind = stringAt(row.kind, `${rowPath}.kind`);
+    if (kind !== 'key' && kind !== 'gripper') return fail(`${rowPath}.kind`, 'key or gripper');
+    const text = (key: string) => (row[key] === undefined ? undefined : stringAt(row[key], `${rowPath}.${key}`));
+    const scalar = row.value;
+    if (!(scalar === undefined || scalar === null || typeof scalar === 'string' || typeof scalar === 'boolean'
+      || (typeof scalar === 'number' && Number.isFinite(scalar)))) {
+      return fail(`${rowPath}.value`, 'a JSON scalar');
+    }
+    const key = text('key');
+    const componentId = text('component_id');
+    const state = text('state');
+    const parsed: ProgramNodeWaitValue = {
+      kind,
+      ...(key === undefined ? {} : { key }),
+      ...(scalar === undefined ? {} : { value: scalar }),
+      ...(componentId === undefined ? {} : { componentId }),
+      ...(state === undefined ? {} : { state }),
+      ...(row.observed_at_utc_ns === undefined ? {} : {
+        observedAtUtcNs: int64NumberOrTextAt(row.observed_at_utc_ns, `${rowPath}.observed_at_utc_ns`),
+      }),
+    };
+    return [id, parsed];
+  }));
 }
 
 const RECOVERY_ACTION_IDS = new Set<CycleRecoveryActionId>([
@@ -1605,7 +1651,6 @@ function parseImplementationAvailability(
       'owner_health_available',
       'reasons',
       'reason_codes',
-      'restoration_gates',
     ],
     path,
   );
@@ -1631,7 +1676,6 @@ function parseImplementationAvailability(
       parseNodeAvailabilityErrorDTO(reason, `${path}.reasons[${index}]`)
     )),
     reasonCodes: stringArrayAt(record.reason_codes, `${path}.reason_codes`),
-    restorationGates: stringArrayAt(record.restoration_gates, `${path}.restoration_gates`),
   };
 }
 
@@ -1719,7 +1763,6 @@ export function parseNodeEnvironmentResponse(value: unknown): NodeEnvironmentRes
       executionAvailable: false,
       reasons: [],
       reasonCodes: ['active_node_environment_unavailable'],
-      restorationGates: [],
     };
   });
   if (record.availability === undefined) {
@@ -1729,7 +1772,6 @@ export function parseNodeEnvironmentResponse(value: unknown): NodeEnvironmentRes
       portableAuthoringAvailable: true,
       executionAvailable: false,
       reasonCodes: ['active_node_environment_unavailable'],
-      restorationGates: [],
       active: null,
     };
   }
@@ -1743,7 +1785,6 @@ export function parseNodeEnvironmentResponse(value: unknown): NodeEnvironmentRes
       'manager_runtime_converged',
       'portable_authoring_available',
       'reason_codes',
-      'restoration_gates',
     ],
     'nodeEnvironment.availability',
   );
@@ -1769,10 +1810,6 @@ export function parseNodeEnvironmentResponse(value: unknown): NodeEnvironmentRes
     reasonCodes: stringArrayAt(
       availability.reason_codes,
       'nodeEnvironment.availability.reason_codes',
-    ),
-    restorationGates: stringArrayAt(
-      availability.restoration_gates,
-      'nodeEnvironment.availability.restoration_gates',
     ),
     active: {
       retainedBundleId: stringAt(

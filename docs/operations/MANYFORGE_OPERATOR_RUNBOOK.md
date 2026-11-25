@@ -69,10 +69,10 @@ starts each component's processes, including the AI assistant's bridge.
 |---|---|---|
 | Composer (built frontend, no Vite) | 9000 | all interfaces |
 | Headless API | 9010 | loopback |
-| Program runner | 9011 | loopback |
+| Program runner | none (local sockets) | |
 | Manager | none (local sockets) | |
 
-All three ports must be free; ports are fixed. The workbench uses 3000 and 9020
+Both ports must be free; ports are fixed. The workbench uses 3000 and 9020
 for its frontend and Composer instead of 9000. Composer has no login: expose
 port 9000 only on a trusted network.
 
@@ -158,7 +158,7 @@ manyforge-operator [--state-root DIR] [--instance-id ID] [--json] {start,status,
   `.manyforge-var/operator` under the current directory).
 - `--instance-id`: one launch instance (default `workbench`). Use the same
   value for `status` and `stop`.
-- `--json`: print `manyforge.operator_command_result.v2` JSON objects, one per
+- `--json`: print `manyforge.operator_command_result.v3` JSON objects, one per
   line. `start` prints one object, except the standard profile, which prints
   two: `started` once the owners are ready, then `stopped` when the
   application ends.
@@ -295,7 +295,7 @@ The launcher keeps all files of an instance under `$STATE_ROOT/$INSTANCE_ID/`
 | `data/` | Saved data, kept across starts: persistent Program values (`data/program-runner/persistent-keys.v<N>.json`, named by its format version; an earlier-format file there is left in place and not read), Composer settings (`data/composer/`) and the Program workspace (`data/program-workspace/`). |
 | `history/` | History (`history.v<N>.sqlite3`); see [Observability](OBSERVABILITY.md#runtime-events). |
 | `operator/` | The launch record (`operator/launch_instance.json`) and the instance lock. |
-| `current/` | Everything one start writes while it runs: journals, sockets, published files. |
+| `current/` | Everything one start writes while it runs: journals, sockets, published files, motion-trace snapshots for debug exports (`current/motion-traces/`, at most 64 MiB, oldest first; start with `MANYFORGE_MOTION_TRACE_DIR=` empty to keep traces inline) and, once it has ended, how the application ended (`current/manager-run/application-end.json`, see [Observability](OBSERVABILITY.md#how-the-application-ended)). |
 | `previous-runs/`, `session-reports/` | Earlier runs and their reports. |
 
 At each start the previous `current/` moves to `previous-runs/<id>` before any
@@ -418,7 +418,7 @@ owns. Repeating `stop` on a stopped instance reports `already_stopped`.
 | `operator_configuration_invalid` | A flag is missing or invalid; the message names it. |
 | `source_dirty`, `source_identity_mismatch` | Use a clean checkout; for `isaac`, the same commit on both hosts. |
 | `package_aggregate_mismatch`, `package_aggregate_unavailable` | Recompute the digest of the exact package root; do not edit the root. |
-| `port_occupied` | Free 9000, 9010 or 9011. Ports cannot be remapped. |
+| `port_occupied` | Free 9000 or 9010. Ports cannot be remapped. |
 | `journald_unavailable` | `standard` needs `systemd-cat` and the journald socket. |
 | `application_exited` | A process of the application exited and the Manager ended the application (`start` exits with status 73). Its log names the process; read it, then start again. |
 | `application_stop_incomplete` | A step of the application's stop was forced or did not complete (`start` exits with status 73). The Manager's log names the step. The next start treats this run as ended uncleanly. Check that the robot has stopped before starting again. |
@@ -430,7 +430,7 @@ owns. Repeating `stop` on a stopped instance reports `already_stopped`.
 | `runtime_host_unavailable`, `remote_protocol_invalid` | SSH or the runtime host failed. Absence cannot be proved; restore the host, then run `status`. |
 | `container_identity_mismatch` | Another container has that name. It is not adopted. |
 | `incompatible_owner`, `stale_launch_record` | The instance has a different configuration or still owns resources. `stop` it, or use another `--instance-id`. |
-| `status_record_invalid` | The record is unreadable, or it is an `isaac` record from an older launcher that started Isaac Sim itself. Stop the old runtime, then use a new instance. |
+| `status_record_invalid` | The record is unreadable, is in the format of an earlier ManyForge version (it is not read or converted), or is an `isaac` record from an older launcher that started Isaac Sim itself. Stop the old runtime with the version that started it, then use a new instance. |
 | `cleanup_deadline_exceeded` | `stop` could not prove everything stopped. Investigate, then run `stop` again. |
 | `instance_unavailable` | No record exists for this state root and instance ID. |
 

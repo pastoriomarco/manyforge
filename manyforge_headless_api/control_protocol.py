@@ -587,10 +587,24 @@ class ExecutionIngressResult:
     command: Mapping[str, Any] | None = None
 
 
+def _json_integer(value: int) -> int | str:
+    """A JSON integer within the exactly representable range, else text."""
+
+    return value if abs(value) <= MAXIMUM_SAFE_INTEGER else str(value)
+
+
 class ControlProtocolError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    """A typed refusal; ``details`` are its typed facts (JSON-ready)."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: Mapping[str, int | str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.details: dict[str, int | str] = dict(details or {})
 
 
 class ControlFreshnessAuthority:
@@ -714,12 +728,24 @@ class ControlFreshnessAuthority:
             raise ControlProtocolError(
                 "control_projection_stale",
                 "control revision changed",
+                {
+                    "expected_execution_control_revision": _json_integer(
+                        context.execution_control_revision
+                    ),
+                    "current_execution_control_revision": _json_integer(
+                        current_control_revision
+                    ),
+                },
             )
         elapsed = received_at_ns - issued_at_ns
         if elapsed < 0 or elapsed > context.valid_for_ns:
             raise ControlProtocolError(
                 "control_freshness_expired",
                 "freshness context had expired when the command was received",
+                {
+                    "elapsed_ns": _json_integer(elapsed),
+                    "valid_for_ns": _json_integer(context.valid_for_ns),
+                },
             )
         return issued_at_ns + context.valid_for_ns
 

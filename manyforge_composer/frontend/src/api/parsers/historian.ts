@@ -96,16 +96,18 @@ function parseHistorianEventSummary(
   };
 }
 
+const RETENTION_PARTITIONS = ['routine', 'important', 'node_attempts'] as const;
+
 function parseHistorianRetention(value: unknown): HistorianRetention | null {
   if (value === null) return null;
   const path = 'history.retention';
   const record = objectAt(value, path);
-  exactKeysAt(record, ['schema_version', 'partitions', 'captures', 'partition_row_limit', 'partition_record_byte_limit', 'database_page_byte_limit', 'duration_guaranteed', 'prior_pruning_known', 'older_history_files'], path);
-  if (record.schema_version !== 'manyforge.historian_retention.v3' || record.duration_guaranteed !== false) {
-    return fail(path, 'the bounded local retention v3 profile');
+  exactKeysAt(record, ['schema_version', 'partitions', 'captures', 'partition_row_limit', 'database_page_byte_limit', 'duration_guaranteed', 'prior_pruning_known', 'older_history_files'], path);
+  if (record.schema_version !== 'manyforge.historian_retention.v4' || record.duration_guaranteed !== false) {
+    return fail(path, 'the bounded local retention v4 profile');
   }
   const partitions = arrayAt(record.partitions, `${path}.partitions`);
-  if (partitions.length !== 2) return fail(path, 'routine and important retention partitions');
+  if (partitions.length !== RETENTION_PARTITIONS.length) return fail(path, 'routine, important and node attempt retention partitions');
   const captures = objectAt(record.captures, `${path}.captures`);
   exactKeysAt(captures, ['live_count', 'open_count', 'protected_count', 'protected_bytes', 'live_capture_limit', 'protected_byte_limit', 'retired_count', 'released_rows', 'released_bytes', 'last_retired_capture_id'], `${path}.captures`);
   const captureScalar = (key: string) => nonnegativeInt64TextAt(captures[key], `${path}.captures.${key}`);
@@ -125,7 +127,6 @@ function parseHistorianRetention(value: unknown): HistorianRetention | null {
         ? null : captureScalar('last_retired_capture_id'),
     },
     partitionRowLimit: nonnegativeInt64TextAt(record.partition_row_limit, `${path}.partition_row_limit`),
-    partitionRecordByteLimit: nonnegativeInt64TextAt(record.partition_record_byte_limit, `${path}.partition_record_byte_limit`),
     databasePageByteLimit: nonnegativeInt64TextAt(record.database_page_byte_limit, `${path}.database_page_byte_limit`),
     durationGuaranteed: false,
     priorPruningKnown: booleanAt(record.prior_pruning_known, `${path}.prior_pruning_known`),
@@ -141,14 +142,15 @@ function parseHistorianRetention(value: unknown): HistorianRetention | null {
     partitions: partitions.map((value, index) => {
       const partPath = `${path}.partitions[${index}]`;
       const part = objectAt(value, partPath);
-      exactKeysAt(part, ['partition', 'retained_count', 'retained_bytes', 'pruned_count', 'pruned_bytes', 'last_pruned_sequence', 'unknown_time_count', 'regressed_time_count', 'loss_counter_saturated', 'first_recorded_utc_ns', 'last_recorded_utc_ns'], partPath);
-      const partition = index === 0 ? 'routine' : 'important';
+      exactKeysAt(part, ['partition', 'retained_count', 'retained_bytes', 'pruned_count', 'pruned_bytes', 'record_byte_limit', 'last_pruned_sequence', 'unknown_time_count', 'regressed_time_count', 'loss_counter_saturated', 'first_recorded_utc_ns', 'last_recorded_utc_ns'], partPath);
+      const partition = RETENTION_PARTITIONS[index];
       if (part.partition !== partition) return fail(partPath, partition);
       const scalar = (key: string) => nonnegativeInt64TextAt(part[key], `${partPath}.${key}`);
       const nullable = (key: string) => part[key] === null ? null : scalar(key);
       return {
         partition, retainedCount: scalar('retained_count'), retainedBytes: scalar('retained_bytes'),
         prunedCount: scalar('pruned_count'), prunedBytes: scalar('pruned_bytes'),
+        recordByteLimit: scalar('record_byte_limit'),
         lastPrunedSequence: nullable('last_pruned_sequence'), unknownTimeCount: scalar('unknown_time_count'),
         regressedTimeCount: scalar('regressed_time_count'),
         lossCounterSaturated: booleanAt(part.loss_counter_saturated, `${partPath}.loss_counter_saturated`),

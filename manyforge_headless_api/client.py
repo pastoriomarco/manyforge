@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from copy import deepcopy
 import hashlib
 import json
@@ -40,6 +41,17 @@ from .models import (
 
 
 MAX_HTTP_RESPONSE_BYTES = 64 * 1024 * 1024
+# The caller's request id, carried to Headless so one command can be
+# followed across processes; and the transport an in-process caller (the
+# Composer MCP adapter) marks its requests with.
+REQUEST_ID_HEADER = "X-Request-ID"
+TRANSPORT_HEADER = "X-ManyForge-Transport"
+# Headers every request of this context carries (Composer sets them for the
+# request it serves). Starlette copies the context into a sync route's
+# worker thread; background threads and executor lanes start without it.
+outbound_headers: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "manyforge_headless_outbound_headers", default=None
+)
 _CONDITION_ID_PATTERN = re.compile(r"^condition-[0-9a-f]{24}$")
 _ASSISTANT_MODE_PATTERN = re.compile(r"^[a-z][a-z0-9.-]*$")
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -47,10 +59,10 @@ _OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v2"
 _MAXIMUM_OBSERVATION_FRAME_BYTES = 4 * 1024 * 1024
 # Command calls (OD-214): runner commands, stored-value edits, control
 # commands, activation preparation and the Apply's Manager submissions answer
-# at acceptance and are followed through their published status. The
-# Runner's between-nodes Scene latch is answered once Headless's mirror shows
-# what it committed (OD-294), a wait with no time limit. Only the connection
-# is bounded; the wait for the reply is not.
+# at acceptance and are followed through their published status. A scene
+# commit is answered once Headless's mirror shows what it committed (OD-293),
+# a wait with no time limit. Only the connection is bounded; the wait for the
+# reply is not.
 _COMMAND_PATH = re.compile(
     r"^/api/(?:"
     r"program/runs(?:/[1-9][0-9]*/(?:motion-start|resume-motion|resume-halt"
@@ -59,9 +71,18 @@ _COMMAND_PATH = re.compile(
     r"|program/persistent-values(?:/reset|/clear)?"
     r"|control/commands|activation-preparations"
     r"|manager/apply(?:/release-for-new)?"
-    r"|scene/runtime-latch|scene/transactions"
+    r"|scene/transactions"
     r")$"
 )
+
+
+def _with_outbound_headers(
+    headers: Mapping[str, str] | None,
+) -> Mapping[str, str] | None:
+    """The context's outbound headers under the call's own."""
+
+    outbound = outbound_headers.get()
+    return headers if not outbound else {**outbound, **(headers or {})}
 
 
 class HeadlessClientError(RuntimeError):
@@ -319,7 +340,7 @@ class HeadlessHttpClient:
                 path,
                 params=params,
                 json=dict(body) if body is not None else None,
-                headers=headers,
+                headers=_with_outbound_headers(headers),
                 **timeout_override,
             ) as response:
                 chunks: list[bytes] = []
@@ -512,7 +533,9 @@ class HeadlessHttpClient:
         maximum_bytes: int,
     ) -> ViewerModelAsset:
         try:
-            with self._client.stream("GET", path, params=params) as response:
+            with self._client.stream(
+                "GET", path, params=params, headers=_with_outbound_headers(None)
+            ) as response:
                 chunks: list[bytes] = []
                 size = 0
                 for chunk in response.iter_bytes():
@@ -1350,15 +1373,6 @@ class HeadlessHttpClient:
     def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/scene/transactions", body=body)
 
-    def scene_runtime_owner(self) -> dict[str, Any]:
-        return self.request("GET", "/api/scene/runtime-owner")
-
-    def latch_scene_runtime_between_nodes(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/scene/runtime-latch", body=body)
-
-    def scene_transaction_status(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/scene/transactions/status", body=body)
-
     def alarms(
         self,
         *,
@@ -1438,6 +1452,12 @@ class HeadlessHttpClient:
         """One Program Reset terminal into History (OD-305)."""
         return self.request(
             "POST", "/api/execution/history/program-reset-outcomes", body=body
+        )
+
+    def record_scene_change(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """One Program Runner scene change outside a Program node into History."""
+        return self.request(
+            "POST", "/api/execution/history/scene-changes", body=body
         )
 
     def close(self) -> None:

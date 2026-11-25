@@ -72,7 +72,7 @@ if TYPE_CHECKING:
     from manyforge_headless_api.client import HeadlessHttpClient
 
 
-RUNTIME_UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+RUNTIME_UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 RUNTIME_UNAVAILABLE_MESSAGE = (
     "Composer is not a runtime owner; configure the headless API for owner-issued "
     "status, scene, alarm/history, preview, operation, Program Apply/Run, and "

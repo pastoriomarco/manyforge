@@ -39,6 +39,8 @@ def server_keep_alive(monkeypatch: pytest.MonkeyPatch, module: Any, start) -> in
 
 
 def headless_server_keep_alive(monkeypatch: pytest.MonkeyPatch, root: Path) -> int:
+    # The serve path configures the root logger; keep the test process's own.
+    monkeypatch.setattr(cli, "setup_logging", lambda level, *, process: None)
     monkeypatch.setattr(cli, "create_app", lambda _config: object())
     args = ["serve", "--cell-id", "cell_a", "--application-start-id", "3f9a0000000000a1"]
     for flag in (

@@ -197,7 +197,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then \
          python /tmp/verify-external-source-closure.py \
            --ledger /tmp/external-delta-ledger.v1.json \
-           --source-id roboplan_0_7_0_ua1_foundation --root /tmp/roboplan \
+           --source-id roboplan_0_7_0_foundation --root /tmp/roboplan \
            --content-kind source --allow-stripped-git; \
        elif [ "$ROBOPLAN_SOURCE_MODE" = development_override ]; then \
          echo "RoboPlan development override: exact-source qualification disabled" >&2; \
@@ -218,7 +218,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then DEVELOPMENT_SOURCE=0; else DEVELOPMENT_SOURCE=1; fi \
     && ROBOPLAN_SOURCE_LEDGER=/tmp/external-delta-ledger.v1.json \
        ROBOPLAN_SOURCE_VERIFIER=/tmp/verify-external-source-closure.py \
-       ROBOPLAN_SOURCE_ID=roboplan_0_7_0_ua1_foundation \
+       ROBOPLAN_SOURCE_ID=roboplan_0_7_0_foundation \
        ROBOPLAN_ALLOW_STRIPPED_GIT=1 \
        ROBOPLAN_ALLOW_DEVELOPMENT_SOURCE="$DEVELOPMENT_SOURCE" \
        bash /tmp/build-roboplan-source-closure.sh \

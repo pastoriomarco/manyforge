@@ -20,7 +20,6 @@ export type FileBrowseKind = ArtifactKind | 'tool_mesh' | 'scenario';
 export interface RuntimeAvailability {
   code: string;
   message: string;
-  restorationGates: string[];
 }
 
 export interface HealthResponse {
@@ -324,7 +323,7 @@ export interface BlackboardKeyDeclaration {
 export interface ProgramDocument {
   api_version: 'manyforge.program.v4';
   program_revision: string;
-  program_profile: 'composable-cell-v1';
+  program_profile: 'manyforge-cell-v1';
   catalog: {
     api_version: 'manyforge.node_catalog.v3';
     content_version: string;
@@ -527,6 +526,33 @@ export interface ScenarioSourceDiagnostic {
 export interface ScenarioDocumentExportResponse {
   status: 'exported';
   path: string;
+}
+
+/** One conversion of an older Scenario file format (OD-391). */
+export type ScenarioUpgradeConversionKind =
+  | 'collision_rules'
+  | 'scenario_identity'
+  | 'program_profile'
+  | 'lane_labels';
+
+export interface ScenarioUpgradeConversion {
+  conversion: ScenarioUpgradeConversionKind;
+  /** The converter's own lines, one per change. */
+  changes: string[];
+}
+
+/**
+ * `manyforge.scenario_upgrade.v1`: the check (`available` or `current`) or
+ * the upgrade (`upgraded` or `current`) of one Scenario folder.
+ */
+export interface ScenarioUpgradeResponse {
+  status: 'available' | 'current' | 'upgraded';
+  path: string;
+  conversions: ScenarioUpgradeConversion[];
+  /** Where an upgrade keeps the original: the folder name, version and UTC time. */
+  backupPattern: string;
+  /** The backup the upgrade kept; null for a check or a current Scenario. */
+  backupPath: string | null;
 }
 
 export interface DeploymentScenarioCandidate {
@@ -780,8 +806,21 @@ export interface ProgramRunOperationFailure {
   terminalFacts: Array<{ kind: string; effect: string }>;
 }
 
+/** The value a running wait node waits on, as the runner last read it. */
+export interface ProgramNodeWaitValue {
+  kind: 'key' | 'gripper';
+  key?: string;
+  /** A JSON scalar, or text of at most 256 bytes. */
+  value?: string | number | boolean | null;
+  componentId?: string;
+  state?: string;
+  /** UTC nanoseconds as decimal text. */
+  observedAtUtcNs?: string;
+}
+
 export interface ProgramRunStatus {
-  schemaVersion: 'manyforge.program_run_status.v5';
+  /** v6 adds the running nodes' start times and wait values. */
+  schemaVersion: 'manyforge.program_run_status.v6';
   ownerId: string;
   runRevision: number;
   state: ProgramRunStateName;
@@ -807,12 +846,17 @@ export interface ProgramRunStatus {
    * halting or halted; null otherwise. Kinds are kept as text.
    */
   halt: { kind: string; sourceLabel: string | null } | null;
+  /** When each running node started, UTC nanoseconds as decimal text; absent from older owners. */
+  nodeRunningSinceUtcNs?: Record<string, string>;
+  /** The waited value of running wait nodes the runner holds; absent from older owners. */
+  nodeWaitValues?: Record<string, ProgramNodeWaitValue>;
 }
 
 /** The immutable selectors accepted with one Program Reset intent. */
 export interface ProgramResetSelection {
   reloadInitialScene: boolean;
   resetRobotPosition: boolean;
+  resetStoredValues: boolean;
 }
 
 export interface ProgramResetRobotPositionAvailability {
@@ -1243,7 +1287,6 @@ export interface NodeImplementationAvailability {
   executionAvailable: boolean;
   reasons: ErrorDTO[];
   reasonCodes: string[];
-  restorationGates: string[];
 }
 
 export interface NodeEnvironmentResponse {
@@ -1252,7 +1295,6 @@ export interface NodeEnvironmentResponse {
   portableAuthoringAvailable: boolean;
   executionAvailable: boolean;
   reasonCodes: string[];
-  restorationGates: string[];
   active: {
     retainedBundleId: string;
     graphRevision: string;

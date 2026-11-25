@@ -20,7 +20,17 @@ SPEC = importlib.util.spec_from_file_location(
 )
 assert SPEC is not None and SPEC.loader is not None
 dev_workbench = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(dev_workbench)
+# Loading the script adds its source roots to sys.path and PYTHONPATH; keep
+# both as they were for the rest of the session.
+_SAVED_PATH, _SAVED_PYTHONPATH = list(sys.path), os.environ.get("PYTHONPATH")
+try:
+    SPEC.loader.exec_module(dev_workbench)
+finally:
+    sys.path[:] = _SAVED_PATH
+    if _SAVED_PYTHONPATH is None:
+        os.environ.pop("PYTHONPATH", None)
+    else:
+        os.environ["PYTHONPATH"] = _SAVED_PYTHONPATH
 
 
 def _built_native_fixture(
@@ -81,7 +91,7 @@ def test_ros_home_is_owned_shared_and_inherited_before_service_spawn(
     monkeypatch.setenv("ROS_HOME", str(tmp_path / "inherited-home"))
     workbench = dev_workbench.Workbench(
         project_path=None, ros2_control=True,
-        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        headless_port=1, composer_port=3, frontend_port=4,
     )
     paths = workbench._paths()
     home = paths["execution_run"] / "ros-home"
@@ -131,7 +141,7 @@ def test_repository_bootstrap_uses_the_exact_source_owned_generator(
         observed.append(command)
         selected_root = Path(command[2])
         selected_root.mkdir(parents=True, exist_ok=True)
-        (selected_root / "canonical-empty-admission.c1_build_authority_cell.json").write_text("{}")
+        (selected_root / "canonical-empty-admission.canonical_empty_cell.json").write_text("{}")
 
     monkeypatch.setattr(dev_workbench, "CANONICAL_EMPTY_GENERATOR", generator)
     monkeypatch.setattr(dev_workbench, "WORKSPACE", workspace)
@@ -143,12 +153,12 @@ def test_repository_bootstrap_uses_the_exact_source_owned_generator(
 
     root = ensure()
     assert root.parent == bootstrap
-    digest = hashlib.sha256(f"{runtime}-workbench:c1_build_authority_cell\0".encode())
+    digest = hashlib.sha256(f"{runtime}-workbench:canonical_empty_cell\0".encode())
     digest.update(generator.read_bytes() + b"\0" + profile.read_bytes() + b"\0")
     assert root.name == digest.hexdigest()
     assert observed == [
         (str(generator), "--output-root", str(root),
-         "--cell-id", "c1_build_authority_cell",
+         "--cell-id", "canonical_empty_cell",
          "--ros-runtime-profile",
          str(profile)),
     ]
@@ -158,7 +168,7 @@ def test_repository_bootstrap_uses_the_exact_source_owned_generator(
     assert profile_root != root
     generator.write_text("updated generator", encoding="utf-8")
     assert ensure() != profile_root
-    assert (root / "canonical-empty-admission.c1_build_authority_cell.json").exists()
+    assert (root / "canonical-empty-admission.canonical_empty_cell.json").exists()
 
 
 def test_status_reads_the_backend_derived_scenario_without_reducing_it_again(
@@ -328,7 +338,7 @@ def test_ros_bootstrap_selection_leaves_the_composer_startup_empty() -> None:
         ])
     workbench = dev_workbench.Workbench(
         project_path=None, bootstrap_project_path=selected.bootstrap_project,
-        ros2_control=True, headless_port=1, runner_port=2,
+        ros2_control=True, headless_port=1,
         composer_port=3, frontend_port=4,
     )
     assert "--startup-scenario-document" not in workbench._composer_command("http://headless")
@@ -372,7 +382,7 @@ def _no_project_ros_workbench(
     monkeypatch.setattr(dev_workbench, "_run", generate)
     workbench = dev_workbench.Workbench(
         project_path=None,
-        headless_port=1, runner_port=2, composer_port=3, frontend_port=4, **options,
+        headless_port=1, composer_port=3, frontend_port=4, **options,
     )
     return workbench, generator_commands
 
@@ -386,7 +396,7 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
     assert len(generator_commands) == 1
     generated = generator_commands[0]
     assert generated[3:] == (
-        "--cell-id", "c1_build_authority_cell", "--ros-runtime-profile",
+        "--cell-id", "canonical_empty_cell", "--ros-runtime-profile",
         str(REPOSITORY_ROOT / "manyforge_deployment/resources/maintained/catalog/"
             "runtime_profile/manyforge.ros2_control_execution_runtime.json"),
     )
@@ -394,10 +404,10 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
         command = commands[name]
         assert command[command.index("--install-root") + 1] == generated[2]
         assert command[command.index("--canonical-empty-admission-filename") + 1] == (
-            "canonical-empty-admission.c1_build_authority_cell.json")
+            "canonical-empty-admission.canonical_empty_cell.json")
     for name in ("Program runner", "Headless API"):
         command = commands[name]
-        assert command[command.index("--cell-id") + 1] == "c1_build_authority_cell"
+        assert command[command.index("--cell-id") + 1] == "canonical_empty_cell"
     installed = tmp_path / "state/current/installed-targets"
     assert {path.name for path in installed.iterdir()} == {
         "manyforge_manager_daemon", "manyforge_roboplan_candidate_worker",
@@ -420,6 +430,11 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
     assert headless[headless.index("--manager-run-root") + 1] == str(tmp_path / "state/current/manager-run")
     assert "--projection-root" not in headless
     assert "--projection-root" not in commands["Manager"]
+    # Every Python application process starts with the fault handler on.
+    for label, module in (("Headless API", "manyforge_headless_api"),
+                          ("Program runner", "manyforge_program_runner"),
+                          ("Composer backend", "manyforge_composer")):
+        assert commands[label][1:5] == ("-X", "faulthandler", "-m", module)
     assert not (tmp_path / "state/current/publications").exists()
     manager_command = commands["Manager"]
     assert manager_command[manager_command.index("--execution-state-root") + 1] == str(tmp_path / "state/current/execution-state")
@@ -475,7 +490,7 @@ def test_named_built_frontend_is_served_by_composer_without_vite(
     commands, _ = _prepared_start(workbench, monkeypatch)
 
     assert workbench._vite_command is None
-    assert checked_ports == [1, 2, 3]
+    assert checked_ports == [1, 3]
     composer = commands["Composer backend"]
     assert composer[composer.index("--static-dir") + 1] == str(static)
     assert composer[composer.index("--host") + 1] == "0.0.0.0"
@@ -544,7 +559,7 @@ def test_invalid_ros_selection_is_refused_before_builds_or_runtime_start(
     workbench = dev_workbench.Workbench(
         project_path=project, bootstrap_project_path=bootstrap,
         artifact_root=REPOSITORY_ROOT / "examples", ros2_control=ros,
-        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        headless_port=1, composer_port=3, frontend_port=4,
     )
     with pytest.raises(dev_workbench.WorkbenchError, match=error):
         workbench.start()
@@ -683,7 +698,7 @@ def test_ros_source_change_during_frontend_preparation_never_starts_runtime(
     monkeypatch.setattr(dev_workbench, "_ensure_ros_bootstrap_package", lambda *_a, **_k: tmp_path)
     workbench = dev_workbench.Workbench(
         project_path=None, bootstrap_project_path="/project", ros2_control=True,
-        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        headless_port=1, composer_port=3, frontend_port=4,
     )
     with pytest.raises(dev_workbench.WorkbenchError, match="changed during startup preparation"):
         workbench.start()
@@ -702,7 +717,7 @@ def test_runtime_capability_selection_keeps_one_build_closure(
     monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend",
                         lambda: pytest.fail("serve checks the ROS product; it never builds it"))
     workbench = dev_workbench.Workbench(
-        project_path=None, headless_port=1, runner_port=2,
+        project_path=None, headless_port=1,
         composer_port=3, frontend_port=4,
     )
 
@@ -801,7 +816,7 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
         lambda _command, **kwargs: spawned.append(kwargs["env"]) or SimpleNamespace(),
     )
     workbench = dev_workbench.Workbench(
-        project_path=None, headless_port=1, runner_port=2,
+        project_path=None, headless_port=1,
         composer_port=3, frontend_port=4, ros2_control=True,
     )
     workbench._spawn_manager(("manager",), environment={})
@@ -913,14 +928,12 @@ def test_workbench_selects_a_project_only_through_the_composer_loader() -> None:
     empty = dev_workbench.Workbench(
         project_path=None,
         headless_port=1,
-        runner_port=2,
         composer_port=3,
         frontend_port=4,
     )
     selected = dev_workbench.Workbench(
         project_path="/workspace/examples/mock_lite6_pick_and_place.scenario",
         headless_port=1,
-        runner_port=2,
         composer_port=3,
         frontend_port=4,
     )
@@ -971,7 +984,7 @@ class _FakeManager:
 
 def test_close_asks_the_manager_to_end_the_application_then_waits(monkeypatch: Any) -> None:
     workbench = dev_workbench.Workbench(
-        project_path=None, headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        project_path=None, headless_port=1, composer_port=3, frontend_port=4,
     )
     observed: list[str] = []
     workbench.manager = _FakeManager(observed)
@@ -993,9 +1006,10 @@ def test_close_asks_the_manager_to_end_the_application_then_waits(monkeypatch: A
         return {"ok": True}
 
     monkeypatch.setattr(dev_workbench, "request_manager_shutdown", shutdown)
-    stopped: list[bool] = []
-    workbench.session = SimpleNamespace(stopped=lambda *, verified: stopped.append(verified),
-                                        close=lambda: None)
+    stopped: list[tuple[bool, int | None]] = []
+    workbench.session = SimpleNamespace(
+        stopped=lambda *, verified, manager_returncode: stopped.append((verified, manager_returncode)),
+        close=lambda: None)
 
     workbench.close()
 
@@ -1007,7 +1021,8 @@ def test_close_asks_the_manager_to_end_the_application_then_waits(monkeypatch: A
         f"wait {dev_workbench.MANAGER_STOP_POLL_SECONDS}",
         "vite terminate",
     ]
-    assert stopped == [True]
+    # The marker records the Manager's exit status.
+    assert stopped == [(True, 0)]
 
 
 def test_close_waits_without_limit_and_passes_a_second_stop_request_on(monkeypatch: Any) -> None:
@@ -1015,7 +1030,7 @@ def test_close_waits_without_limit_and_passes_a_second_stop_request_on(monkeypat
     # workbench is passed on to the Manager, which forces its stop and ends
     # with its "stop incomplete" status: not a clean stop.
     workbench = dev_workbench.Workbench(
-        project_path=None, headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        project_path=None, headless_port=1, composer_port=3, frontend_port=4,
     )
     workbench.stop_requested = True
     workbench.stop_requests = 1
@@ -1047,7 +1062,7 @@ def test_vite_starts_after_composer_answers_and_its_exit_ends_the_session(
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
     monkeypatch.delenv("MANYFORGE_DEV_COLD_SESSION_ID", raising=False)
     workbench = dev_workbench.Workbench(
-        project_path=None, headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        project_path=None, headless_port=1, composer_port=3, frontend_port=4,
     )
     observed: list[str] = []
     composer_ready = iter([False, True])
@@ -1078,7 +1093,8 @@ def test_vite_starts_after_composer_answers_and_its_exit_ends_the_session(
                         lambda path, *, timeout_seconds: observed.append("shutdown_runtime"))
     monkeypatch.setattr(dev_workbench, "Session", SimpleNamespace(
         direct=lambda _root, _disk_limits: SimpleNamespace(
-            stopped=lambda *, verified: observed.append(f"stopped {verified}"),
+            stopped=lambda *, verified, manager_returncode: observed.append(
+                f"stopped {verified} {manager_returncode}"),
             close=lambda: None)))
 
     def start() -> None:
@@ -1100,7 +1116,7 @@ def test_vite_starts_after_composer_answers_and_its_exit_ends_the_session(
         "wait 0.5", "report",                      # Composer not ready: no Vite yet
         "wait 0.5", "vite start True", "report",   # Composer ready: Vite started once
         "wait 0.5", "shutdown_runtime",            # Vite exited: the Manager is stopped
-        f"wait {dev_workbench.MANAGER_STOP_POLL_SECONDS}", "stopped False",
+        f"wait {dev_workbench.MANAGER_STOP_POLL_SECONDS}", "stopped False 0",
     ]
 
 
@@ -1108,12 +1124,13 @@ def test_serve_waits_on_the_manager_and_reports_its_exit(tmp_path: Path, monkeyp
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
     monkeypatch.delenv("MANYFORGE_DEV_COLD_SESSION_ID", raising=False)
     workbench = dev_workbench.Workbench(
-        project_path=None, headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        project_path=None, headless_port=1, composer_port=3, frontend_port=4,
     )
     observed: list[str] = []
     monkeypatch.setattr(dev_workbench, "Session", SimpleNamespace(
         direct=lambda _root, _disk_limits: SimpleNamespace(
-            stopped=lambda *, verified: observed.append(f"stopped {verified}"),
+            stopped=lambda *, verified, manager_returncode: observed.append(
+                f"stopped {verified} {manager_returncode}"),
             close=lambda: None)))
 
     def start() -> None:
@@ -1127,7 +1144,7 @@ def test_serve_waits_on_the_manager_and_reports_its_exit(tmp_path: Path, monkeyp
 
     # Reporting only between waits; the exit is the Manager's (it printed
     # which process exited), and the session closes unverified.
-    assert observed == ["wait 0.5", "report", "wait 0.5", "stopped False"]
+    assert observed == ["wait 0.5", "report", "wait 0.5", "stopped False 72"]
 
 
 def test_g_static_composer_preserves_endpoint(tmp_path):
@@ -1135,7 +1152,7 @@ def test_g_static_composer_preserves_endpoint(tmp_path):
     static.mkdir()
     (static / "index.html").write_text("built fixture frontend")
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
-        headless_port=9010, runner_port=9011, composer_port=9000, frontend_port=3000,
+        headless_port=9010, composer_port=9000, frontend_port=3000,
         composer_static_dir=static, composer_bind_host="0.0.0.0")
     command = workbench._composer_command("http://127.0.0.1:9010")
     assert command[command.index("--host") + 1] == "0.0.0.0"
@@ -1147,7 +1164,7 @@ def test_site_settings_forward_only_when_configured(tmp_path):
     site = tmp_path / "manyforge.site.json"
     site.write_text('{"schema":"manyforge.site.v2","device_addresses":{}}')
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
-        headless_port=9010, runner_port=9011, composer_port=9020, frontend_port=3000,
+        headless_port=9010, composer_port=9020, frontend_port=3000,
         site_settings=site)
     assert workbench._site_manager_arguments() == ("--site-settings", str(site))
     site.unlink()
@@ -1175,14 +1192,15 @@ def test_g_status_uses_fresh_manager_health_without_cccl_apply_permission(tmp_pa
             return manager
         def health(self):
             return {"status": "ready", "headless_projection_ready": True}
-        def request(self, method, path):
-            assert (method, path) == ("GET", "/api/program/health")
-            return {"started": True, "closed": False}
     monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", Client)
+    # The runner answers its health over its command socket.
+    monkeypatch.setattr(
+        dev_workbench, "_program_runner_health", lambda: {"started": True, "closed": False}
+    )
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path)
     (tmp_path / "current").mkdir()
     (tmp_path / "current/workbench-startup-timing.json").write_text('{"build_elapsed_seconds":999,"readiness_elapsed_seconds":null}')
-    status = dev_workbench.query_operator_status(headless_port=9010, runner_port=9011, composer_port=9000)
+    status = dev_workbench.query_operator_status(headless_port=9010, composer_port=9000)
     assert status["ready"] is expected
     assert status["manager"] == manager
     assert status["timing"]["build_elapsed_seconds"] == 999
@@ -1208,18 +1226,20 @@ def test_operator_status_with_a_scenario_requires_it_current_and_ready(
         def health(self):
             return {"status": "ready", "headless_projection_ready": True}
         def request(self, method, path):
-            if path == "/api/scenarios/current":
-                return {"ready": scenario_ready, "current_scenario": {"scenario_id": current}}
-            return {"started": True, "closed": False}
+            assert path == "/api/scenarios/current"
+            return {"ready": scenario_ready, "current_scenario": {"scenario_id": current}}
     monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", Client)
+    monkeypatch.setattr(
+        dev_workbench, "_program_runner_health", lambda: {"started": True, "closed": False}
+    )
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path)
     status = dev_workbench.query_operator_status(
-        headless_port=9010, runner_port=9011, composer_port=9000, scenario_id="cell")
+        headless_port=9010, composer_port=9000, scenario_id="cell")
     assert status["ready"] is expected
     assert status["scenario"]["current_scenario"] == (
         {"scenario_id": current} if current == "cell" else None)
     assert dev_workbench.query_operator_status(
-        headless_port=9010, runner_port=9011, composer_port=9000)["ready"] is True
+        headless_port=9010, composer_port=9000)["ready"] is True
 
 
 def test_g_package_mismatch_refuses_before_artifact_checks_or_process_start(tmp_path, monkeypatch):
@@ -1230,7 +1250,7 @@ def test_g_package_mismatch_refuses_before_artifact_checks_or_process_start(tmp_
     digest = package_aggregate_sha256(install)
     (install / "empty.json").write_text('{"changed":true}')
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
-        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        headless_port=1, composer_port=3, frontend_port=4,
         operator_install_root=install, operator_cell_id="fixture_cell",
         canonical_empty_admission_filename="empty.json", package_aggregate_digest=digest)
     monkeypatch.setattr(dev_workbench, "_current_backend", lambda: pytest.fail("must refuse changed package first"))
@@ -1246,7 +1266,7 @@ def test_g_refuses_a_missing_built_frontend_before_process_start(tmp_path, monke
     (install / "empty.json").write_text("{}")
     monkeypatch.setattr(dev_workbench, "FRONTEND_DIST", tmp_path / "dist")
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
-        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        headless_port=1, composer_port=3, frontend_port=4,
         operator_install_root=install, operator_cell_id="fixture_cell",
         canonical_empty_admission_filename="empty.json",
         package_aggregate_digest=package_aggregate_sha256(install))
@@ -1288,7 +1308,7 @@ def test_g_owner_start(tmp_path, monkeypatch):
     monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", lambda: pytest.fail("G must not npm ci"))
     monkeypatch.setattr(dev_workbench, "_ensure_repository_bootstrap_package", lambda: pytest.fail("G must use its qualified package"))
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
-        headless_port=9010, runner_port=9011, composer_port=9000, frontend_port=3000,
+        headless_port=9010, composer_port=9000, frontend_port=3000,
         operator_install_root=install, operator_cell_id="fixture_cell",
         operator_instance_id="fixture-instance", canonical_empty_admission_filename="empty.json",
         package_aggregate_digest=package_aggregate_sha256(install),
@@ -1326,6 +1346,9 @@ def test_g_owner_start(tmp_path, monkeypatch):
         def health(self):
             return {"status": "ready", "headless_projection_ready": True}
     monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", Client)
+    monkeypatch.setattr(
+        dev_workbench, "_program_runner_health", lambda: {"started": True, "closed": False}
+    )
 
     workbench.start()
 
@@ -1355,6 +1378,14 @@ def test_g_owner_start(tmp_path, monkeypatch):
         command = commands[name]
         assert command[command.index("--cell-id") + 1] == "fixture_cell"
         assert "--owner-id" not in command
+    # The runner serves its command and status sockets in the Manager run
+    # root; Headless reaches them there. No runner port.
+    manager_run = str(tmp_path / "state/current/manager-run")
+    runner = commands["program_runner"]
+    assert runner[runner.index("--program-socket-root") + 1] == manager_run
+    assert "--port" not in runner
+    headless = commands["headless"]
+    assert headless[headless.index("--program-runner-socket-root") + 1] == manager_run
     assert manager_command[manager_command.index("--install-root") + 1] == str(install)
     assert manager_command[manager_command.index("--canonical-empty-admission-filename") + 1] == "empty.json"
 
@@ -1371,7 +1402,7 @@ def test_direct_serve_selects_one_session_before_starting_any_owner(tmp_path, mo
     monkeypatch.delenv("MANYFORGE_DEV_COLD_SESSION_ID", raising=False)
     monkeypatch.setattr(dev_workbench.signal, "signal", lambda *_args: None)
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=False,
-        headless_port=1, runner_port=2, composer_port=3, frontend_port=4)
+        headless_port=1, composer_port=3, frontend_port=4)
     started = []
 
     def start():
@@ -1397,7 +1428,7 @@ def test_preselected_session_report_is_passed_to_headless(tmp_path, monkeypatch)
     root = tmp_path / "state"
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", root)
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=False,
-        headless_port=1, runner_port=2, composer_port=3, frontend_port=4)
+        headless_port=1, composer_port=3, frontend_port=4)
     assert workbench._previous_session_arguments() == ()
     previous = "a" * 32
     workbench.session = SimpleNamespace(marker={"previous_session": {"session_id": previous}})
@@ -1607,7 +1638,7 @@ def test_serve_refuses_missing_native_artifacts_with_the_build_step(
     monkeypatch.setattr(dev_workbench, "_port_available", lambda _port: True)
     monkeypatch.setattr(dev_workbench, "_run", lambda *_a, **_k: pytest.fail("serve must not build"))
     workbench = dev_workbench.Workbench(
-        project_path=None, headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        project_path=None, headless_port=1, composer_port=3, frontend_port=4,
     )
     with pytest.raises(dev_workbench.NativeBuildMissingError,
                        match="run the native build step first: python3 scripts/dev-workbench.py build"):
@@ -1627,7 +1658,7 @@ def test_serve_refuses_the_removed_disk_variables(
     with pytest.raises(dev_workbench.WorkbenchError, match=(
             f"{variable} is no longer read: set {member} in the site settings file")):
         dev_workbench.Workbench(
-            project_path=None, headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+            project_path=None, headless_port=1, composer_port=3, frontend_port=4,
         )
 
 
@@ -1638,10 +1669,33 @@ def test_serve_takes_the_disk_limits_from_the_site_file(tmp_path: Path, monkeypa
     site = tmp_path / "manyforge.site.json"
     site.write_text('{"schema":"manyforge.site.v2","disk_machine_minimum_bytes":2000000000}')
     workbench = dev_workbench.Workbench(
-        project_path=None, headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        project_path=None, headless_port=1, composer_port=3, frontend_port=4,
         site_settings=site,
     )
     assert workbench.disk_limits.floor_bytes == 12_000_000_000
     assert dev_workbench.Workbench(
-        project_path=None, headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        project_path=None, headless_port=1, composer_port=3, frontend_port=4,
     ).disk_limits == dev_workbench.run_session.DiskLimits()
+
+
+def test_the_program_runner_probe_ends_within_its_second(tmp_path, monkeypatch) -> None:
+    """As the former HTTP probe (1 s): a runner that never answers is a
+    typed unavailable, not a status read that waits on."""
+
+    import time
+
+    import manyforge_headless_py as core
+
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path)
+    root = tmp_path / "current/manager-run"
+    root.mkdir(parents=True, mode=0o700)
+    server = core.ProgramCommandServer(str(root))
+    server.start()
+    try:
+        started = time.monotonic()
+        with pytest.raises(dev_workbench.WorkbenchError, match="program_runner_unavailable"):
+            dev_workbench._program_runner_health()
+        assert 1.0 <= time.monotonic() - started < 10.0
+        assert server.next(10.0) is not None
+    finally:
+        server.close()

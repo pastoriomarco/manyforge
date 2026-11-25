@@ -9,14 +9,14 @@
 set -euo pipefail
 
 if [[ "${1:-}" != "--in-container" ]]; then
-  echo "composable_cell_collision_lookup_probe_requires_docker: rerun with --in-container and MANYFORGE_BUILD_DIR set to an already qualified RoboPlan build" >&2
+  echo "collision_lookup_probe_requires_docker: rerun with --in-container and MANYFORGE_BUILD_DIR set to an already qualified RoboPlan build" >&2
   exit 64
 fi
 
 build_dir="${MANYFORGE_BUILD_DIR:-}"
 binary="${build_dir}/test_retained_product_consumer"
 if [[ -z "${build_dir}" || ! -x "${binary}" ]]; then
-  echo "composable_cell_collision_lookup_probe_missing_build: test_retained_product_consumer is absent from MANYFORGE_BUILD_DIR" >&2
+  echo "collision_lookup_probe_missing_build: test_retained_product_consumer is absent from MANYFORGE_BUILD_DIR" >&2
   exit 66
 fi
 

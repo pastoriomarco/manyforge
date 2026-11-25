@@ -122,7 +122,10 @@ struct IoProviderDriverRecord::Driver final {
     fault.reset();
     fault_owner.reset();
   }
-  std::function<std::optional<core::ErrorDTO>()> process_fault_source;
+  /// Shared, so a reader copies it under the delivery lock and calls it
+  /// without (ProcessFault).
+  std::shared_ptr<const std::function<std::optional<core::ErrorDTO>()>>
+      process_fault_source;
   ProcessRestartHook process_restart;
   std::vector<std::unique_ptr<core::StreamRecorder>> observer_streams;
   std::optional<std::vector<IoProviderInputSourceInstallation>> last_rebind;
@@ -169,20 +172,30 @@ struct IoProviderDriverRecord::Driver final {
 
   // The supervised process's exit, never latched into `fault`: the
   // restarted process's source replaces it (Prepare, Recover or an Apply).
-  std::optional<core::ErrorDTO> ProcessFault() const {
+  // The source takes its process's and its output's own locks, so it runs
+  // without the delivery lock: `delivery` (held) is released around the call
+  // and held again on return; an exit read from a source that was replaced
+  // or retired meanwhile isn't current and is dropped.
+  std::optional<core::ErrorDTO>
+  ProcessFault(std::unique_lock<std::mutex> &delivery) {
     if (retired || !process_fault_source)
       return std::nullopt;
-    auto fault = process_fault_source();
-    if (!fault)
-      return std::nullopt;
-    auto &reason = fault->message;
-    if (reason.size() > core::kMaxLifecycleErrorMessageBytes) {
-      auto end = core::kMaxLifecycleErrorMessageBytes;
-      while (end > 0U &&
-             (static_cast<unsigned char>(reason[end]) & 0xC0U) == 0x80U)
-        --end;
-      reason.resize(end);
+    const auto source = process_fault_source;
+    delivery.unlock();
+    auto fault = (*source)();
+    if (fault) {
+      auto &reason = fault->message;
+      if (reason.size() > core::kMaxLifecycleErrorMessageBytes) {
+        auto end = core::kMaxLifecycleErrorMessageBytes;
+        while (end > 0U &&
+               (static_cast<unsigned char>(reason[end]) & 0xC0U) == 0x80U)
+          --end;
+        reason.resize(end);
+      }
     }
+    delivery.lock();
+    if (retired || process_fault_source != source)
+      return std::nullopt;
     return fault;
   }
 
@@ -988,11 +1001,22 @@ core::ComponentState IoProviderDriverRecord::State(const std::int64_t now_ns) co
     state.lifecycle = core::ComponentLifecycle::kNotPrepared;
     return state;
   }
+  auto exited = state_->ProcessFault(lock);
+  // The delivery lock was released while the exit source ran.
+  if (state_->retired || !state_->installed) {
+    state.lifecycle = core::ComponentLifecycle::kNotPrepared;
+    return state;
+  }
   // Recover starts an exited process again where the host gave the restart.
-  if (const auto exited = state_->ProcessFault())
-    return fault(core::FaultCode::kProcessExited, *exited,
-                 state_->process_restart ? core::FaultOperatorAction::kRecover
-                                         : core::FaultOperatorAction::kNone);
+  if (exited) {
+    auto faulted = fault(core::FaultCode::kProcessExited, *exited,
+                         state_->process_restart ? core::FaultOperatorAction::kRecover
+                                                 : core::FaultOperatorAction::kNone);
+    // An exited observer's last output lines, moved from its typed error.
+    if (auto tail = exited->details.extract("output_tail"))
+      faulted.fault->details.insert(std::move(tail));
+    return faulted;
+  }
   if (state_->fault)
     return fault(core::FaultCode::kCommunication, *state_->fault,
                  core::FaultOperatorAction::kRecover);
@@ -1131,9 +1155,15 @@ core::ActionResult IoProviderDriverRecord::Run(const core::ComponentAction actio
     return refused("driver_fault_present");
   // As an xArm's driver: Prepare and Recover start an exited supervised
   // process again through the host's driver-restart entry, which waits for
-  // it and installs its exit source here; then the action runs on it.
+  // it and installs its exit source here; then the action runs on it. The
+  // exit source runs without the delivery lock (ProcessFault), so the
+  // resources are checked again after it, as after the restart.
   bool restarted = false;
-  if ((prepare || recover) && state_->process_restart && state_->ProcessFault()) {
+  const bool restart_exited = (prepare || recover) && state_->process_restart &&
+                              state_->ProcessFault(lock).has_value();
+  if (state_->retired || !state_->installed)
+    return refused("driver_resources_absent");
+  if (restart_exited && state_->process_restart) {
     const auto restart = state_->process_restart;
     lock.unlock();
     auto started = restart(stop);
@@ -1144,8 +1174,13 @@ core::ActionResult IoProviderDriverRecord::Run(const core::ComponentAction actio
       return refused("driver_resources_absent");
     restarted = true;
   }
-  if (!disable && state_->ProcessFault())
-    return refused("driver_process_exited");
+  if (!disable) {
+    const bool exited = state_->ProcessFault(lock).has_value();
+    if (state_->retired || !state_->installed)
+      return refused("driver_resources_absent");
+    if (exited)
+      return refused("driver_process_exited");
+  }
   if (!disable && !state_->TransportReady())
     return refused("driver_transport_unavailable");
   if (!disable && state_->SendersGone())
@@ -1312,8 +1347,12 @@ core::ActionResult IoProviderDriverRecord::Run(const core::ComponentAction actio
 
 void IoProviderDriverRecord::SetSupervisedProcessFaultSource(
     std::function<std::optional<core::ErrorDTO>()> source) {
+  auto shared =
+      source ? std::make_shared<const std::function<std::optional<core::ErrorDTO>()>>(
+                   std::move(source))
+             : nullptr;
   auto lock = AcquireDelivery();
-  state_->process_fault_source = std::move(source);
+  state_->process_fault_source = std::move(shared);
 }
 
 void IoProviderDriverRecord::SetSupervisedProcessRestart(ProcessRestartHook restart) {

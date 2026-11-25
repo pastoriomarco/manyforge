@@ -28,7 +28,7 @@ const check: ProgramTreeNode = {
 function program(keys: BlackboardKeyDeclaration[]): ProgramAuthoringDocument {
   return {
     api_version: 'manyforge.program.v4',
-    program_profile: 'composable-cell-v1',
+    program_profile: 'manyforge-cell-v1',
     catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
     blackboard: { namespaces: [{ namespace_id: 'cell', owner: 'program' }], keys },
     schema_version: 'manyforge.composer_authoring_forest.v2',
@@ -182,9 +182,37 @@ describe('blackboard key namespaces', () => {
     expect(markup).toContain('<summary>Node outcomes (1)</summary>');
     expect(markup).toContain('<summary>cell (1)</summary>');
     expect(markup).not.toMatch(/<details[^>]*open/);
-    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*title="System-owned[^"]*"[^>]*><span><strong>node_outcome\.approach/);
+    // Inside a namespace group a row shows the key without its namespace; the tooltip keeps the full key.
+    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*title="node_outcome\.approach\nSystem-owned[^"]*"[^>]*><span><strong>approach</);
     expect(markup).toContain('<summary>Motion group states (1)</summary>');
-    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*title="System-owned[^"]*"[^>]*><span><strong>motion_group_state\.all/);
+    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*title="motion_group_state\.all\nSystem-owned[^"]*"[^>]*><span><strong>all</);
+    expect(markup).toContain('<strong>part</strong><small>type: string - value: empty until written</small>');
+    expect(markup).toContain('aria-label="Search blackboard keys"');
+  });
+
+  it('shows each key with its type and starting value, shortened for long values', () => {
+    const markup = renderToStaticMarkup(
+      <ProgramDeclarationsNavigator
+        roots={program([]).forest}
+        parameters={[]}
+        namespaces={[]}
+        keys={[
+          { ...key('speed'), type: 'float64', initial: 0.25 },
+          { ...key('flag'), type: 'bool', initial: true },
+          { ...key('label'), type: 'string', initial: 'tube' },
+          { ...key('empty'), type: 'float64', initial: undefined },
+          { ...key('pose'), type: 'stored_pose', initial: { frame: 'world', position: [0.123456, 0.234567, 0.345678], orientation: [0, 0, 0, 1] } },
+        ]}
+        formulaReferences={{ computedKeys: {}, nodes: {} }}
+        selected={null}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(markup).toContain('<small>type: float64 - value: 0.25</small>');
+    expect(markup).toContain('<small>type: bool - value: true</small>');
+    expect(markup).toContain('<small>type: string - value: &quot;tube&quot;</small>');
+    expect(markup).toContain('<small>type: float64 - value: empty until written</small>');
+    expect(markup).toMatch(/<small>type: stored_pose - value: \{&quot;frame&quot;:&quot;world&quot;[^<]*…<\/small>/);
   });
 });
 

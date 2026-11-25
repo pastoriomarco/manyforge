@@ -278,9 +278,12 @@ CanonicalValue FenceScope(const core::ConfigurationFenceScopeDTO &scope) {
   });
 }
 
+// `settling`: a journaled success whose admission claim release is still
+// pending; it is published as not yet terminal (OD-387).
 std::string_view ApplyPhase(
-    const component_manager::PersistedManagerApplyStatus &value) noexcept {
-  if (value.terminal_outcome.has_value()) {
+    const component_manager::PersistedManagerApplyStatus &value,
+    const bool settling) noexcept {
+  if (value.terminal_outcome.has_value() && !settling) {
     return "terminal";
   }
   if (value.fence_released.has_value()) {
@@ -365,7 +368,7 @@ ApplyFence(const component_manager::PersistedManagerApplyStatus &value) {
 // every other record carries null. The journal keeps every receipt.
 CanonicalValue
 ApplyStatus(const component_manager::PersistedManagerApplyStatus &value,
-            const bool installed_active) {
+            const bool installed_active, const bool settling) {
   const auto &intent = value.intent.intent;
   CanonicalValue prepared_activation(nullptr);
   if (installed_active) {
@@ -380,7 +383,7 @@ ApplyStatus(const component_manager::PersistedManagerApplyStatus &value,
     }
   }
   const auto terminal_state =
-      value.terminal_outcome.has_value()
+      value.terminal_outcome.has_value() && !settling
           ? CanonicalValue(std::string(component_manager::ToString(
                 value.terminal_outcome->terminal_outcome.state)))
           : CanonicalValue(nullptr);
@@ -396,9 +399,9 @@ ApplyStatus(const component_manager::PersistedManagerApplyStatus &value,
       {"expected_active_projection_revision",
        ProjectionRevision(intent.expected_active_projection_revision)},
       {"fence", ApplyFence(value)},
-      {"incomplete", CanonicalValue(!value.terminal_outcome.has_value())},
+      {"incomplete", CanonicalValue(!value.terminal_outcome.has_value() || settling)},
       {"intent_digest", CanonicalValue(value.intent.intent_digest.value())},
-      {"phase", CanonicalValue(std::string(ApplyPhase(value)))},
+      {"phase", CanonicalValue(std::string(ApplyPhase(value, settling)))},
       {"prepared_activation", std::move(prepared_activation)},
       {"scene_initialization",
        CanonicalValue(std::string(
@@ -680,6 +683,17 @@ CanonicalValue BuildManagerSourcePayload(
                                    apply_availability);
 }
 
+namespace {
+// The Apply's journaled success awaits its admission claim release: it is
+// published exactly as before its terminal record (OD-387).
+bool Settling(const component_manager::PersistedManagerApplyStatus &apply,
+              const std::optional<core::ApplyId> &success_settlement_pending) noexcept {
+  return success_settlement_pending.has_value() && apply.terminal_outcome.has_value() &&
+         apply.terminal_outcome->terminal_outcome.succeeded() &&
+         apply.intent.intent.apply_id == *success_settlement_pending;
+}
+} // namespace
+
 CanonicalValue BuildManagerSourcePayload(
     const manyforge::deployment::RetainedBundle &active_bundle,
     const manyforge::deployment::CanonicalEmptyRetainedBundleAdmission
@@ -688,7 +702,8 @@ CanonicalValue BuildManagerSourcePayload(
     const component_manager::SqliteManagerApplyJournal &apply_journal,
     const std::vector<component_manager::PersistedManagerApplyStatus>
         &apply_inventory,
-    const ManagerApplyMutationAvailability apply_availability) {
+    const ManagerApplyMutationAvailability apply_availability,
+    const std::optional<core::ApplyId> &success_settlement_pending) {
   Require(manyforge::deployment::verify_retained_bundle_identity(active_bundle),
           "active retained bundle failed identity verification");
   Require(runtime.plan.valid(), "active runtime plan is invalid");
@@ -740,8 +755,12 @@ CanonicalValue BuildManagerSourcePayload(
           &publication.request.transaction_ref);
   const component_manager::PersistedManagerApplyStatus *newest_terminal =
       nullptr;
+  const auto terminal = [&](const auto &apply) {
+    return apply.terminal_outcome.has_value() &&
+           !Settling(apply, success_settlement_pending);
+  };
   for (const auto &apply : apply_inventory) {
-    if (apply.terminal_outcome.has_value()) {
+    if (terminal(apply)) {
       newest_terminal = &apply;
     }
   }
@@ -751,17 +770,17 @@ CanonicalValue BuildManagerSourcePayload(
     const bool installed_active =
         installer != nullptr && installer->apply_id == intent.apply_id &&
         installer->apply_generation == intent.apply_generation;
-    if (apply.terminal_outcome.has_value() && !installed_active &&
-        &apply != newest_terminal) {
+    if (terminal(apply) && !installed_active && &apply != newest_terminal) {
       continue;
     }
     Require(intent.cell_id == apply_journal.cell_id(),
             "Apply status belongs to a different cell");
-    applies.emplace_back(ApplyStatus(apply, installed_active));
+    applies.emplace_back(ApplyStatus(apply, installed_active,
+                                     Settling(apply, success_settlement_pending)));
   }
   const bool apply_in_progress = std::any_of(
       apply_inventory.begin(), apply_inventory.end(),
-      [](const auto &status) { return !status.terminal_outcome.has_value(); });
+      [&](const auto &status) { return !terminal(status); });
 
   const bool apply_available =
       apply_availability == ManagerApplyMutationAvailability::kAvailable;

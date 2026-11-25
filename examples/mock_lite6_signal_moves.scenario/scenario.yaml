@@ -7,11 +7,11 @@
   "description": "Mock Lite6 signal moves: search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip descends slowly (TCP up to 10 mm/s, endpoint gripper/tcp) to a requested goal 1 mm past the probe_block top, so the fingertips touch the block; the collision rule probe_contact_policy lets the TCP's contact bodies touch probe_block only in the last 20% of the move (up to 2 mm deep); it scripts edge_sensor false with no change and completes without a trip (on_no_signal success) -> no_signal_trip. end_rest withdraws from the probe_block contact under the release rule withdrawal_contact_policy (same pair: at most 2 mm deep at the start, getting shallower, apart by the end, no new contact). The node_outcome keys are checked.",
   "members": {
     "deployment.yaml": "sha256:2b370dc41138d20efb3cddbf97848df8df5d5f6a4f1a63b15c76967a5c3febe7",
-    "program.yaml": "sha256:3d4c7b9eb2b4b94a5ed226ad4686bfb2044ae8f6a00a61de57e33c7f4050afc3"
+    "program.yaml": "sha256:f7059c79585ffd078df372f5a235e6947e3ff660a3fb86a03c65aa7a19f0d016"
   },
   "name": "mock_lite6_signal_moves",
   "saved_status": {
-    "checked_content_digest": "sha256:38b231b2bceed522f1baa73235b91f09b2ffa09465e7cc6272b4b6ee2a04b8bd",
+    "checked_content_digest": "sha256:323ea472f7d91c8d1873516dadfd85a589b9beca1e99d82f8146525026bfe67e",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

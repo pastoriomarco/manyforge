@@ -54,7 +54,7 @@ struct ActiveOperationParticipant;
 /// span-based `stop_fence_batch` API in `resource_slot_table.hpp` (slice K2).
 struct ResourceSlotStopFenceScratch;
 
-inline constexpr std::size_t kMaxI6OperationReplayEntries = 4096U;
+inline constexpr std::size_t kMaxOperationReplayEntries = 4096U;
 
 /// An immediate component step. A short direct Kernel call: admitted
 /// like an operation of its component, then the adapter's atomic step runs
@@ -842,6 +842,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// state lock; no I/O.
   [[nodiscard]] ProgramRunResolutionContext program_run_resolution_context(
       const std::optional<ProgramRunNumber>& program_run_id) const;
+  /// The resolution context of the capture the Kernel holds now, whatever its
+  /// run, else null (OD-234): for a read that names only a Binding, which uses
+  /// it only when it is exactly that Binding. A pointer copy under the state
+  /// lock; no I/O.
+  [[nodiscard]] ProgramRunResolutionContext held_program_run_resolution_context() const;
 
   /// One coherent current manual result per requested target: every resident
   /// manual operation on that target, or else the latest retained operation

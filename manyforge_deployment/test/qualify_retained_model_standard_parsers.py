@@ -26,7 +26,7 @@ import xml.etree.ElementTree as ET
 from yourdfpy import URDF
 
 
-_MANIFEST_API_VERSION = "manyforge.i3.retained-consumer-fixture.v3"
+_MANIFEST_API_VERSION = "manyforge.retained-consumer-fixture.v3"
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 
 

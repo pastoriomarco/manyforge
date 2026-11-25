@@ -35,7 +35,7 @@ DEFAULT_REQUIRED_JOINTS = [
     "wrist_3_joint",
 ]
 UNAVAILABLE_MESSAGE = (
-    "composable_cell_runtime_unavailable: live Isaac controller feedback "
+    "runtime_unavailable: live Isaac controller feedback "
     "measurement requires the focused ROS/Isaac adapter, not available yet"
 )
 MAX_TOPIC_SAMPLES = 1_000_000

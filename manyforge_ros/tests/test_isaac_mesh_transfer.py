@@ -10,8 +10,7 @@ def test_isaac_mesh_transfer_refuses_before_any_effect(capsys) -> None:
     assert capsys.readouterr().err.strip() == isaac_mesh_transfer.UNAVAILABLE_MESSAGE
     payload = isaac_mesh_transfer.unavailable_payload()
 
-    assert payload["reason_code"] == "composable_cell_runtime_unavailable"
-    assert payload["restoration_gate"] == "I9/I"
+    assert payload["reason_code"] == "runtime_unavailable"
     assert payload["historical_source_blob"] == (
         "ed0b7fa46046f9e257baae9f6f07c97049b11718"
     )

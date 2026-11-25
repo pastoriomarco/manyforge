@@ -6,6 +6,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ReactNode,
 } from 'react';
 
@@ -15,7 +16,8 @@ import {
  * Severity is always stated by the producer; nothing here infers it from
  * message text. Warning and information notices describe *current* state: a
  * producer republishes its complete list whenever that state changes and the
- * notice disappears with its cause. Nothing is retained after resolution; the
+ * notice disappears with its cause. Nothing is retained after resolution but
+ * the Recent list of presented brief notices (memory only, bounded); the
  * durable record of what happened is the backend Historian.
  */
 export type NoticeSeverity = 'error' | 'warning' | 'info';
@@ -89,6 +91,13 @@ export interface WorkbenchNotice {
    * lasted past the hold time and is presented (and reported) as an error.
    */
   firstObservedMs?: number;
+  /** The History ids the notice is about, when known: Recent's "see History" filters by them. */
+  history?: NoticeHistoryRef;
+}
+
+export interface NoticeHistoryRef {
+  programRunId?: number;
+  operationId?: number;
 }
 
 /**
@@ -385,16 +394,67 @@ export function usePublishWorkbenchNotices(
 /** How long a brief, event-triggered notice stays presented. */
 export const BRIEF_NOTICE_MS = 8_000;
 
+/** One brief notice as it was presented, for the Recent list. */
+export interface RecentNotice {
+  /** Increases with every presented notice; the list key. */
+  sequence: number;
+  /** Date.now() when it was presented. */
+  presentedAtMs: number;
+  severity: NoticeSeverity;
+  title: string;
+  message: string;
+  history?: NoticeHistoryRef;
+}
+
+/** How many presented brief notices Recent keeps (this browser tab, memory only). */
+export const RECENT_NOTICE_LIMIT = 32;
+
+let recentNotices: readonly RecentNotice[] = [];
+let recentSequence = 0;
+const recentListeners = new Set<() => void>();
+
+/** Keeps one presented notice, newest first, dropping the oldest beyond the limit. */
+export function recordRecentNotice(notice: WorkbenchNotice, presentedAtMs = Date.now()): void {
+  recentSequence += 1;
+  recentNotices = [{
+    sequence: recentSequence,
+    presentedAtMs,
+    severity: notice.severity,
+    title: notice.title,
+    message: notice.message,
+    ...(notice.history === undefined ? {} : { history: notice.history }),
+  }, ...recentNotices].slice(0, RECENT_NOTICE_LIMIT);
+  recentListeners.forEach((listener) => listener());
+}
+
+function subscribeRecentNotices(listener: () => void): () => void {
+  recentListeners.add(listener);
+  return () => recentListeners.delete(listener);
+}
+
+const currentRecentNotices = () => recentNotices;
+
+/** The presented brief notices, newest first. */
+export function useRecentNotices(): readonly RecentNotice[] {
+  return useSyncExternalStore(subscribeRecentNotices, currentRecentNotices, currentRecentNotices);
+}
+
 /**
  * Presents one completed-operation message briefly, then removes it from
- * presentation. The backend keeps the durable record; nothing is stored here.
+ * presentation; Recent keeps it in memory. The backend keeps the durable record.
  */
 export function useBriefNotice(notice: WorkbenchNotice | null): WorkbenchNotice | null {
   const [visible, setVisible] = useState<string | null>(null);
   const key = notice === null ? null : `${notice.id}\n${notice.message}`;
+  const latest = useRef(notice);
+  useEffect(() => {
+    latest.current = notice;
+  });
   useEffect(() => {
     setVisible(key);
     if (key === null) return undefined;
+    // Recent keeps it after it is no longer presented.
+    if (latest.current !== null) recordRecentNotice(latest.current);
     const timer = window.setTimeout(() => setVisible(null), BRIEF_NOTICE_MS);
     return () => window.clearTimeout(timer);
   }, [key]);

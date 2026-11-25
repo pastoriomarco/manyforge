@@ -21,7 +21,7 @@ const entry = (id: string, parameters: CatalogParameter[]): CatalogEntry => ({
   id, name: id, category: 'logic', description: id, stability: 'stable', kind: 'leaf',
   childrenMin: 0, childrenMax: 0, parameters, requiredCapabilities: [],
   execution: { blocking: true, cancellable: true, ownerApi: 'program' },
-  runners: { py_trees: id }, tags: [], minProgramProfile: 'composable-cell-v1',
+  runners: { py_trees: id }, tags: [], minProgramProfile: 'manyforge-cell-v1',
   blackboard: { reads: [], writes: [] }, ownerContext: null, outcomes: {}, eventFamily: null,
 });
 

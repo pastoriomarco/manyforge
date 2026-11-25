@@ -1,5 +1,4 @@
-"""A scene commit (OD-293) or a committing between-nodes latch (OD-294)
-answers once the Manager status mirror shows it."""
+"""A scene commit (OD-293) answers once the Manager status mirror shows it."""
 
 from __future__ import annotations
 
@@ -208,58 +207,6 @@ def test_shutdown_ends_the_wait() -> None:
     assert replies[0]["ok"] is True
 
 
-class LatchManager:
-    """The Manager's between-nodes latch answer (OD-294)."""
-
-    def __init__(self, committed_observation_count: int) -> None:
-        self.count = committed_observation_count
-        self.latched = Event()
-
-    def latch_scene_runtime_between_nodes(self, request):
-        self.latched.set()
-        return {
-            "ok": True,
-            "committed_observation_count": self.count,
-            "projection_revision": _projection(2),
-        }
-
-
-def test_latch_that_committed_waits_until_the_mirror_shows_it() -> None:
-    mirror, manager = Mirror(), LatchManager(1)
-    service = HeadlessService(mirror, manager, application_start_id="3f9a0000000000a1")
-    replies: list[dict[str, Any]] = []
-    thread = Thread(
-        target=lambda: replies.append(service.scene_runtime_latch_between_nodes(object())),
-        daemon=True,
-    )
-    thread.start()
-    assert manager.latched.wait(5.0)
-    thread.join(0.1)
-    assert thread.is_alive()
-
-    mirror.shown = _projection(2)
-    service.manager_status_changed()
-    thread.join(5.0)
-    assert not thread.is_alive()
-    assert replies[0]["projection_revision"] == _projection(2)
-
-
-def test_latch_that_committed_nothing_answers_at_once() -> None:
-    # The mirror still shows revision 1 and no change would wake a wait.
-    service = HeadlessService(
-        Mirror(), LatchManager(0), application_start_id="3f9a0000000000a1"
-    )
-    replies: list[dict[str, Any]] = []
-    thread = Thread(
-        target=lambda: replies.append(service.scene_runtime_latch_between_nodes(object())),
-        daemon=True,
-    )
-    thread.start()
-    thread.join(5.0)
-    assert not thread.is_alive()
-    assert replies[0]["ok"] is True
-
-
 @pytest.mark.parametrize("shown", [None, _projection(4)])
 def test_native_accessor_parses_the_mirror_text(shown: dict[str, Any] | None) -> None:
     core = object.__new__(NativeHeadlessCore)
@@ -269,3 +216,160 @@ def test_native_accessor_parses_the_mirror_text(shown: dict[str, Any] | None) ->
         )
     )
     assert core.logical_scene_active_projection() == shown
+
+
+_DIGEST = "sha256:" + "a" * 64
+
+
+class OwnerManager:
+    """The Manager's current scene revision after the runner's commit."""
+
+    def __init__(self, revision: dict[str, Any] | Exception) -> None:
+        self.revision = revision
+        self.reads = 0
+
+    def scene_projection_revision(self) -> dict[str, Any]:
+        self.reads += 1
+        if isinstance(self.revision, Exception):
+            raise self.revision
+        return copy.deepcopy(self.revision)
+
+
+class SceneRunner:
+    """The Program Runner commits its scene at the Manager; its reply names
+    no revision."""
+
+    def __init__(self, reply: dict[str, Any]) -> None:
+        self.reply = reply
+        self.prepared = Event()
+
+    def prepare_applied_scene(self, body: dict[str, Any]) -> dict[str, Any]:
+        self.prepared.set()
+        return copy.deepcopy(self.reply)
+
+
+_PREPARED = {
+    "schema_version": "manyforge.program_scene_preparation.v1",
+    "status": "prepared",
+    "applied_record_digest": _DIGEST,
+    "program_revision": "sha256:" + "4" * 64,
+    "admission_generation": 1,
+    "prepared_scene": {"schema_version": "manyforge.prepared_program_scene.v1"},
+}
+_CLEARED = {
+    "schema_version": "manyforge.program_scene_preparation.v1",
+    "status": "prepared",
+    "applied_record_digest": None,
+    "program_revision": None,
+    "admission_generation": 1,
+    "prepared_scene": {
+        "schema_version": "manyforge.empty_scene_clear.v1",
+        "state": "succeeded",
+        "last_observed_remaining": [],
+        "refused": [],
+    },
+}
+
+
+def _runner_service(manager: OwnerManager, reply: dict[str, Any]) -> tuple[
+    HeadlessService, Mirror, SceneRunner
+]:
+    mirror, runner = Mirror(), SceneRunner(reply)
+    service = HeadlessService(
+        mirror, manager, application_start_id="3f9a0000000000a1", program_runner=runner
+    )
+    service.program_applied = lambda: {  # type: ignore[method-assign]
+        "source": {"record_digest": _DIGEST},
+        "program_revision": "sha256:" + "4" * 64,
+    }
+    service._current_apply_identity = lambda: (1, 1, "sha256:" + "f" * 64)  # type: ignore[method-assign]
+    service.manager_status = lambda: {  # type: ignore[method-assign]
+        "source": {"available": True, "freshness": "fresh"},
+        "status": {
+            "manager_ready": True,
+            "runtime": {"converged": True},
+            "active": {"canonical_empty": True, "publication": {"publication_generation": 1}},
+        },
+    }
+    return service, mirror, runner
+
+
+def _preparation(clear: bool) -> SimpleNamespace:
+    body = {"request_key": "c1" * 16}
+    return SimpleNamespace(
+        request_key="c1" * 16,
+        clear_empty_scene=clear,
+        expected_applied_record_digest=None if clear else _DIGEST,
+        expected_publication_generation=1 if clear else None,
+        model_dump=lambda mode: dict(body),
+    )
+
+
+@pytest.mark.parametrize("clear", [False, True])
+def test_runner_scene_change_answers_once_the_mirror_shows_the_owner_revision(
+    clear: bool,
+) -> None:
+    """The runner commits its scene preparation or empty-scene clear at the
+    Manager; Headless answers once its mirror shows the Manager's revision
+    read after the runner's reply (OD-293)."""
+
+    manager = OwnerManager(_projection(2))
+    service, mirror, runner = _runner_service(manager, _CLEARED if clear else _PREPARED)
+    replies: list[dict[str, Any]] = []
+    thread = Thread(
+        target=lambda: replies.append(service.program_scene_prepare(_preparation(clear))),
+        daemon=True,
+    )
+    thread.start()
+    assert runner.prepared.wait(5.0)
+    thread.join(0.1)
+    assert thread.is_alive()
+    # A change that does not yet show the revision keeps the answer waiting.
+    service.manager_status_changed()
+    thread.join(0.1)
+    assert thread.is_alive()
+
+    mirror.shown = _projection(2)
+    service.manager_status_changed()
+    thread.join(5.0)
+    assert not thread.is_alive()
+    assert manager.reads == 1
+    if clear:
+        assert replies[0]["scene_clear"]["state"] == "succeeded"
+    else:
+        assert replies[0]["status"] == "prepared"
+
+
+@pytest.mark.parametrize("clear", [False, True])
+def test_runner_scene_change_wait_ends_when_the_manager_is_gone(clear: bool) -> None:
+    service, _mirror, runner = _runner_service(
+        OwnerManager(_projection(2)), _CLEARED if clear else _PREPARED
+    )
+    thread = Thread(
+        target=lambda: service.program_scene_prepare(_preparation(clear)), daemon=True
+    )
+    thread.start()
+    assert runner.prepared.wait(5.0)
+    thread.join(0.1)
+    assert thread.is_alive()
+    service.manager_status_disconnected()
+    thread.join(5.0)
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("clear", [False, True])
+def test_mirror_already_showing_the_owner_revision_answers_at_once(clear: bool) -> None:
+    manager = OwnerManager(_projection(1))
+    service, _mirror, _runner = _runner_service(manager, _CLEARED if clear else _PREPARED)
+    service.program_scene_prepare(_preparation(clear))
+    assert manager.reads == 1
+
+
+@pytest.mark.parametrize("clear", [False, True])
+def test_refused_owner_read_leaves_nothing_to_wait_for(clear: bool) -> None:
+    # The owner answers no revision (unavailable or fenced): no wait, and no
+    # change would wake one.
+    manager = OwnerManager(HeadlessApiError("scene_owner_unavailable", "fenced"))
+    service, _mirror, _runner = _runner_service(manager, _CLEARED if clear else _PREPARED)
+    service.program_scene_prepare(_preparation(clear))
+    assert manager.reads == 1

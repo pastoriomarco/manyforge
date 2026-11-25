@@ -99,8 +99,9 @@ void RequireCaptureInvariants(const CanonicalValue& retention, std::size_t writt
 bool BothPartitionsPruned(const CanonicalValue& page) {
   const auto& partitions =
       page.find_object_member("retention")->find_object_member("partitions")->as_array();
-  return partitions.size() == 2 &&
-         std::all_of(partitions.begin(), partitions.end(), [](const auto& partition) {
+  // Routine and important; the probe writes no node attempts.
+  return partitions.size() == 3 &&
+         std::all_of(partitions.begin(), partitions.begin() + 2, [](const auto& partition) {
            return manyforge::content_identity::parse_nonnegative_int64(
                       *partition.find_object_member("pruned_count")) >= 32;
          });

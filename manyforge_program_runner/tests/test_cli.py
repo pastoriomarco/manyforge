@@ -3,22 +3,42 @@ from pathlib import Path
 import pytest
 
 from manyforge_program_runner.cli import _parser
+from manyforge_program_runner.runtime import ProgramRunnerError
+
+
+@pytest.fixture(autouse=True)
+def _keep_test_logging(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """``main`` configures the root logger; keep the test process's own."""
+
+    from manyforge_program_runner import cli
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        cli, "setup_logging", lambda level, *, process: calls.append((level, process))
+    )
+    return calls
 
 
 def test_cli_requires_the_execution_root_and_cycle_journal_pair() -> None:
     parser = _parser()
-    parsed = parser.parse_args(
-        [
-            "--execution-run-root",
-            "/run/execution",
-            "--cycle-journal-path",
-            "/state/program-cycle.sqlite3",
-            "--application-start-id",
-            "3f9a00000000002a",
-        ]
-    )
+    arguments = [
+        "--program-socket-root",
+        "/run/manager",
+        "--execution-run-root",
+        "/run/execution",
+        "--cycle-journal-path",
+        "/state/program-cycle.sqlite3",
+        "--application-start-id",
+        "3f9a00000000002a",
+    ]
+    parsed = parser.parse_args(arguments)
+    assert parsed.program_socket_root == Path("/run/manager")
     assert parsed.execution_run_root == Path("/run/execution")
     assert parsed.cycle_journal_path == Path("/state/program-cycle.sqlite3")
+    # The runner serves no TCP port: an otherwise complete command line
+    # with a port is refused.
+    with pytest.raises(SystemExit):
+        parser.parse_args([*arguments, "--port", "9011"])
 
     with pytest.raises(SystemExit):
         parser.parse_args(["--execution-run-root", "/run/execution"])
@@ -26,40 +46,6 @@ def test_cli_requires_the_execution_root_and_cycle_journal_pair() -> None:
         parser.parse_args(
             ["--cycle-journal-path", "/state/program-cycle.sqlite3"]
         )
-
-
-def test_headless_client_of_the_runner_expires_idle_connections_first(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
-    from manyforge_headless_api.tests.test_internal_http_keepalive import (
-        client_keep_alive_expiry,
-        server_keep_alive,
-    )
-    from manyforge_program_runner import cli
-
-    class _Closable:
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(cli, "OpenAICompatibleProgramModelTransport", _Closable)
-    monkeypatch.setattr(cli, "ProgramRuntime", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(cli, "create_app", lambda _runtime: object())
-    server = server_keep_alive(
-        monkeypatch,
-        cli,
-        lambda: cli.main([
-            "--execution-run-root", "/run/execution",
-            "--cycle-journal-path", "/state/program-cycle.sqlite3",
-            "--application-start-id", "3f9a00000000002a",
-        ]),
-    )
-    client = ProgramRunnerHttpClient("http://127.0.0.1:9011")
-    try:
-        expiry = client_keep_alive_expiry(client._client)
-    finally:
-        client.close()
-    assert expiry < server
 
 
 def test_a_cycle_journal_that_cannot_be_opened_refuses_the_start_by_code(
@@ -75,17 +61,14 @@ def test_a_cycle_journal_that_cannot_be_opened_refuses_the_start_by_code(
         raise sqlite3.OperationalError("database or disk is full")
 
     monkeypatch.setattr(cycle_journal.sqlite3, "connect", full_disk)
-    monkeypatch.setattr(
-        cli,
-        "uvicorn",
-        type("Uvicorn", (), {"run": staticmethod(lambda *_a, **_k: pytest.fail("served"))}),
-    )
+    monkeypatch.setattr(cli, "_serve", lambda *_a, **_k: pytest.fail("served"))
     execution_run_root = tmp_path.resolve() / "execution-run"
     execution_run_root.mkdir(mode=0o700)
     state = tmp_path.resolve() / "state"
     state.mkdir(mode=0o700)
 
     status = cli.main([
+        "--program-socket-root", str(state),
         "--execution-run-root", str(execution_run_root),
         "--cycle-journal-path", str(state / "program-cycle.sqlite3"),
         "--application-start-id", "3f9a00000000002a",
@@ -97,6 +80,45 @@ def test_a_cycle_journal_that_cannot_be_opened_refuses_the_start_by_code(
     assert capsys.readouterr().err == (
         "program_cycle_journal_unavailable: Program-cycle journal cannot be "
         "opened: database or disk is full\n"
+    )
+
+
+def test_a_socket_another_runner_serves_refuses_the_start_by_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One typed line, no traceback, and the exit status of the former port
+    bind (1); the application's own refusal is tested in test_app."""
+
+    from manyforge_program_runner import cli
+
+    class _Closable:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "OpenAICompatibleProgramModelTransport", _Closable)
+    monkeypatch.setattr(cli, "ProgramRuntime", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        cli, "ProgramRunnerApplication", lambda _runtime, _root: object()
+    )
+
+    def refused(*_args, **_kwargs):
+        raise ProgramRunnerError(
+            "program_runner_socket_unavailable",
+            "another Program runner already serves program-command.sock in this root",
+        )
+
+    monkeypatch.setattr(cli, "_serve", refused)
+    status = cli.main([
+        "--program-socket-root", "/run/manager",
+        "--execution-run-root", "/run/execution",
+        "--cycle-journal-path", "/state/program-cycle.sqlite3",
+        "--application-start-id", "3f9a00000000002a",
+    ])
+    assert status == 1
+    assert capsys.readouterr().err == (
+        "program_runner_socket_unavailable: another Program runner already "
+        "serves program-command.sock in this root\n"
     )
 
 
@@ -125,23 +147,26 @@ def test_a_failed_start_still_closes_the_simulation_port(
     monkeypatch.setitem(sys.modules, "manyforge_ros.program_simulation_port", module)
     monkeypatch.setattr(cli, "OpenAICompatibleProgramModelTransport", _Closable)
     monkeypatch.setattr(cli, "ProgramRuntime", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(cli, "create_app", lambda _runtime: object())
+    monkeypatch.setattr(
+        cli, "ProgramRunnerApplication", lambda _runtime, _root: object()
+    )
 
     def failed_start(*_args, **_kwargs):
-        # uvicorn's exit after the lifespan's startup (runtime.start()) raised.
-        raise SystemExit(3)
+        # runtime.start() raised inside the application's start.
+        raise ProgramRunnerError("program_runner_simulation_owner_unavailable", "down")
 
-    monkeypatch.setattr(cli, "uvicorn", type("Uvicorn", (), {"run": staticmethod(failed_start)}))
+    monkeypatch.setattr(cli, "_serve", failed_start)
 
-    with pytest.raises(SystemExit) as exited:
+    assert (
         cli.main([
+            "--program-socket-root", "/run/manager",
             "--execution-run-root", "/run/execution",
             "--cycle-journal-path", "/state/program-cycle.sqlite3",
             "--application-start-id", "3f9a00000000002a",
             "--simulation-control-config", "/site/simulation.yaml",
         ])
-
-    assert exited.value.code == 3
+        == 69
+    )
     assert _Port.closed == 1
 
 
@@ -178,12 +203,15 @@ def _simulation_runner(monkeypatch: pytest.MonkeyPatch, create_port, run) -> obj
     monkeypatch.setitem(sys.modules, "manyforge_ros.program_simulation_port", module)
     monkeypatch.setattr(cli, "OpenAICompatibleProgramModelTransport", _Closable)
     monkeypatch.setattr(cli, "ProgramRuntime", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(cli, "create_app", lambda _runtime: object())
-    monkeypatch.setattr(cli, "uvicorn", type("Uvicorn", (), {"run": staticmethod(run)}))
+    monkeypatch.setattr(
+        cli, "ProgramRunnerApplication", lambda _runtime, _root: object()
+    )
+    monkeypatch.setattr(cli, "_serve", run)
     return cli
 
 
 _SIMULATION_ARGS = [
+    "--program-socket-root", "/run/manager",
     "--execution-run-root", "/run/execution",
     "--cycle-journal-path", "/state/program-cycle.sqlite3",
     "--application-start-id", "3f9a00000000002a",
@@ -210,8 +238,8 @@ def test_a_simulation_thread_left_running_at_shutdown_ends_the_runner_at_once(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # The lifespan's runtime.shutdown() closed the port and its thread did not
-    # stop; uvicorn logs that failure and returns normally.
+    # The application's runtime.shutdown() closed the port and its thread did
+    # not stop; serving returns normally.
     port = _StuckPort(closed_by_runtime=True)
     cli = _simulation_runner(
         monkeypatch, lambda *_args, **_kwargs: port, lambda *_args, **_kwargs: None
@@ -233,7 +261,7 @@ def test_a_simulation_thread_left_running_after_a_failed_start_ends_at_once(
     port = _StuckPort(closed_by_runtime=False)
 
     def failed_start(*_args, **_kwargs):
-        raise SystemExit(3)
+        raise ProgramRunnerError("program_runner_simulation_owner_unavailable", "down")
 
     cli = _simulation_runner(
         monkeypatch, lambda *_args, **_kwargs: port, failed_start
@@ -245,6 +273,7 @@ def test_a_simulation_thread_left_running_after_a_failed_start_ends_at_once(
     assert ended.value.status == 65
     assert port.closed == 1
     assert capsys.readouterr().err == (
+        "program_runner_simulation_owner_unavailable: down\n"
         "program_runner_shutdown_failed: simulation rclpy executor did not stop\n"
     )
 
@@ -291,3 +320,30 @@ def test_a_simulation_port_that_stopped_leaves_the_normal_exit(
     )
 
     assert cli.main(_SIMULATION_ARGS) == 0
+
+
+@pytest.mark.parametrize("extra,level", [([], "INFO"), (["--log-level", "DEBUG"], "DEBUG")])
+def test_main_configures_logging_first(
+    monkeypatch: pytest.MonkeyPatch,
+    _keep_test_logging: list[tuple[str, str]],
+    extra: list[str],
+    level: str,
+) -> None:
+    from manyforge_program_runner import cli
+
+    class Configured(Exception):
+        pass
+
+    def config(**_kwargs: object) -> None:
+        assert _keep_test_logging == [(level, "program_runner")]
+        raise Configured
+
+    monkeypatch.setattr(cli, "ProgramRunnerConfig", config)
+    with pytest.raises(Configured):
+        cli.main([
+            "--program-socket-root", "/run/manager",
+            "--execution-run-root", "/run/execution",
+            "--cycle-journal-path", "/state/program-cycle.sqlite3",
+            "--application-start-id", "3f9a00000000002a",
+            *extra,
+        ])

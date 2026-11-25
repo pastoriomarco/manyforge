@@ -10,10 +10,10 @@
 # guard or function definition.  Re-sourcing is harmless; always overwrite the
 # fixed values and function before a gated caller can invoke it.
 
-MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE="composable_cell_runtime_unavailable"
-MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: this legacy aggregate entrypoint has no single qualified current replacement; use the Component Manager, Headless, Program runner, and Composer entrypoints for maintained ManyForge-only runtime functions."
+MANYFORGE_RUNTIME_UNAVAILABLE_REASON_CODE="runtime_unavailable"
+MANYFORGE_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_RUNTIME_UNAVAILABLE_REASON_CODE}: this legacy aggregate entrypoint has no single qualified current replacement; use the Component Manager, Headless, Program runner, and Composer entrypoints for maintained ManyForge-only runtime functions."
 
-manyforge_fail_composable_cell_runtime_unavailable() {
-    builtin printf '%s\n' "${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE}" >&2
+manyforge_fail_runtime_unavailable() {
+    builtin printf '%s\n' "${MANYFORGE_RUNTIME_UNAVAILABLE_MESSAGE}" >&2
     return 78
 }

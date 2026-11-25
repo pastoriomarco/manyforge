@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from manyforge_headless_api.app import create_app
 from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.tests.fake_gateway import FakeGateway
 from manyforge_headless_api.models import (
     IoSignalObservation,
     IoSignalReadRequest,
@@ -103,14 +104,13 @@ def _unavailable() -> dict[str, Any]:
 
 
 def _client(response: dict[str, Any]):
-    client = object.__new__(ExecutionCommandClient)
     sent: list[dict[str, Any]] = []
 
     def exchange(request):
         sent.append(deepcopy(request))
         return deepcopy(response)
 
-    client._exchange = exchange
+    client = ExecutionCommandClient(FakeGateway(exchange))
     return client, sent
 
 
@@ -158,7 +158,7 @@ def test_mock_input_request_has_exact_fields() -> None:
     assert set(MockIoInputRequest.model_validate(_mock(False)).model_dump()) == set(_mock())
 
 
-def test_mock_input_wire_uses_internal_attribution_and_checks_the_echo() -> None:
+def test_mock_input_wire_is_the_request_and_returns_the_receipt() -> None:
     client, sent = _client(_receipt(model_value=False))
     response = client.set_mock_io_input(MockIoInputRequest.model_validate(_mock(False)))
 
@@ -168,34 +168,9 @@ def test_mock_input_wire_uses_internal_attribution_and_checks_the_echo() -> None
         {
             "api_version": "manyforge.execution_command.v4",
             "command": "set_mock_io_input",
-            "attribution": {
-                "transport": "internal",
-                "assurance": "unverified",
-                "principal_id": None,
-            },
             "request": _mock(False),
         }
     ]
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda reply: reply.update(command="query_target"),
-        lambda reply: reply["target_observation"].update(source_epoch="3"),
-        lambda reply: reply["target_observation"].pop("evaluated_at_ns"),
-        lambda reply: reply["target_observation"].update(evaluated_at_ns=-1),
-        lambda reply: reply["target_observation"]["value"].update(quality="ok"),
-        lambda reply: reply["target_observation"]["value"].update(value=None),
-    ],
-)
-def test_mock_input_mismatched_reply_is_never_shown_as_fresh(mutate) -> None:
-    reply = _receipt()
-    mutate(reply)
-    client, _sent = _client(reply)
-    with pytest.raises(HeadlessApiError) as error:
-        client.set_mock_io_input(MockIoInputRequest.model_validate(_mock()))
-    assert error.value.code == "execution_target_observation_invalid"
 
 
 def test_disabled_mock_toggle_is_an_accepted_model_without_delivery() -> None:
@@ -219,33 +194,6 @@ _CURSOR = {
     "source_id": "station_mock",
     "record_sequence": "10",
 }
-
-
-@pytest.mark.parametrize(
-    "reply",
-    [
-        _receipt(model_value=False),
-        _receipt(model_value=1),
-        {k: v for k, v in _receipt().items() if k != "published_cursor"},
-        {k: v for k, v in _receipt().items() if k != "model_value"},
-        _receipt(cursor={**_CURSOR, "record_sequence": "0"}),
-        _receipt(cursor={**_CURSOR, "record_sequence": "010"}),
-        _receipt(cursor={**_CURSOR, "catalog_generation": 1}),
-        # The cursor is closed: no owner epoch any more.
-        _receipt(cursor={**_CURSOR, "owner_epoch": "owner.1"}),
-        _receipt(cursor={**_CURSOR, "source_id": "other"}),
-        _receipt(cursor={**_CURSOR, "source_epoch": "3"}),
-        _receipt(publication_error={"code": "x", "message": "y"}),
-        _receipt(_unavailable(), cursor=None, publication_error=None),
-        _receipt(_unavailable(), cursor=None, publication_error={"code": "", "message": "y"}),
-        _receipt(delivered=True),
-    ],
-)
-def test_mock_receipt_is_exact(reply) -> None:
-    client, _sent = _client(reply)
-    with pytest.raises(HeadlessApiError) as error:
-        client.set_mock_io_input(MockIoInputRequest.model_validate(_mock()))
-    assert error.value.code == "execution_target_observation_invalid"
 
 
 def test_mock_input_refusal_keeps_the_host_error_code() -> None:
@@ -358,6 +306,3 @@ def test_real_host_source_epoch_is_opaque_and_the_sequence_stays_a_counter() -> 
     ):
         with pytest.raises(ValidationError):
             IoSignalObservation.model_validate({**value, **change})
-        client, _ = _client(_observation("query_target", {**value, **change}))
-        with pytest.raises(HeadlessApiError):
-            client.query_target(TargetObservationQuery.model_validate(_read()))

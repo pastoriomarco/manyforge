@@ -16,7 +16,7 @@ namespace manyforge::core {
 struct ProgramBindingDTO;
 
 inline constexpr std::string_view kProgramApiVersion = "manyforge.program.v4";
-inline constexpr std::string_view kComposableCellProgramProfile = "composable-cell-v1";
+inline constexpr std::string_view kProgramProfile = "manyforge-cell-v1";
 inline constexpr std::size_t kMaxProgramContractRoles = 4096U;
 inline constexpr std::size_t kMaxProgramRoleRequirements = 4096U;
 inline constexpr std::size_t kMaxProgramTreeNodes = 100000U;

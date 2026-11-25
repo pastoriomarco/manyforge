@@ -21,7 +21,7 @@ const probeEntry: CatalogEntry = {
   requiredCapabilities: [],
   execution: { blocking: true, cancellable: true, ownerApi: 'kernel.operation' },
   runners: { py_trees: 'motion_probe_search_v1' }, tags: ['motion'],
-  minProgramProfile: 'composable-cell-v1', blackboard: { reads: [], writes: [] },
+  minProgramProfile: 'manyforge-cell-v1', blackboard: { reads: [], writes: [] },
   ownerContext: null, outcomes: {}, eventFamily: null,
 };
 
@@ -32,7 +32,7 @@ describe('probe Stop warning', () => {
       parameters: { target: { component_id: 'robot', command_target_id: 'arm' }, stop_mode: 'soft_on_path' },
     };
     const program: ProgramAuthoringDocument = {
-      api_version: 'manyforge.program.v4', program_profile: 'composable-cell-v1',
+      api_version: 'manyforge.program.v4', program_profile: 'manyforge-cell-v1',
       catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
       parameters: [],
       blackboard: { namespaces: [], keys: [] },

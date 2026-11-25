@@ -82,7 +82,7 @@ _PROGRAM_API_VERSION: Final = "manyforge.program.v4"
 _MAX_EXECUTION_GROUPS: Final = 4096
 _MAX_RESOLVED_GROUP_MEMBERSHIPS: Final = _MAX_TREE_NODES
 _MAX_RESOLVED_TARGET_EFFECTS: Final = _MAX_TREE_NODES
-_PROGRAM_PROFILE: Final = "composable-cell-v1"
+_PROGRAM_PROFILE: Final = "manyforge-cell-v1"
 _CATALOG_API_VERSION: Final = "manyforge.node_catalog.v3"
 _GRASP_LOST_RESPONSE_DEFAULTS: Final = MappingProxyType(
     {

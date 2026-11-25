@@ -8,6 +8,7 @@
 #include "host_component_runtime.hpp"
 #include "host_io_signal_runtime.hpp"
 #include <manyforge_core/execution_event_change_signal.hpp>
+#include <manyforge_core/process_diagnostics.hpp>
 #include <manyforge_roboplan/component_adapter_registry.hpp>
 #include <manyforge_roboplan/passive_component_adapter.hpp>
 #include <manyforge_roboplan/ros2_control_lane_family.hpp>
@@ -239,8 +240,8 @@ void LogSlowRpc(const std::string_view kind, const RpcTiming &timing,
          << " finalize_parent_journal_ns=" << timing.journal_read.count()
          << " finalize_body_ns=" << timing.finalize_body.count()
          << " finalize_candidate_load_ns=" << timing.candidate_load.count()
-         << " finalize_projection_select_ns=" << timing.projection_select.count() << '\n';
-    std::cerr << line.str();
+         << " finalize_projection_select_ns=" << timing.projection_select.count();
+    core::LogLine(core::LogSeverity::kWarning, line.str());
   } catch (...) {}
 }
 
@@ -287,8 +288,7 @@ void LogAdmissionTiming(std::string_view command, std::string_view request_id,
            << event.rows << ",direct_changes=" << event.changes;
       if (event.outcome) line << ",outcome=" << event.outcome;
     }
-    line << '\n';
-    std::cerr << line.str();
+    core::LogLine(core::LogSeverity::kWarning, line.str());
   } catch (...) {}
 }
 
@@ -510,7 +510,7 @@ RoboPlanJointLimitsFromRetainedModel(
 [[nodiscard]] RoboPlanWorkerModelDTO NativeWorkerBaseModel(
     const RetainedPlanningModelStage &stage,
     std::vector<RoboPlanJointLimitInput> joint_limits) {
-  return RoboPlanWorkerModelDTO{"manyforge_i6_execution_host_worker",
+  return RoboPlanWorkerModelDTO{"manyforge_execution_host_worker",
                                 stage.loader_urdf_path(),
                                 stage.srdf_path(),
                                 stage.package_paths(),
@@ -573,12 +573,17 @@ SelectManagedComponentProjections(const ManagedRuntimeChildConfig &config,
   const auto unavailable = [](const std::string &detail) {
     static std::mutex mutex;
     static std::string last_detail;
-    std::lock_guard lock(mutex);
-    if (last_detail != detail) {
-      last_detail = detail;
-      std::cerr << "managed component projection selection: " << detail
-                << '\n';
+    bool changed = false;
+    {
+      std::lock_guard lock(mutex);
+      if (last_detail != detail) {
+        last_detail = detail;
+        changed = true;
+      }
     }
+    // Printed after the lock is released.
+    if (changed)
+      core::LogLine(core::LogSeverity::kWarning, "managed component projection selection: " + detail);
     return std::optional<ManagedComponentProjectionSet>{};
   };
   ManagedComponentProjectionSet selected;
@@ -2157,7 +2162,7 @@ template <typename PhysicalBindingInput>
                 std::span<const deployment::RuntimeProgramTargetBinding>(
                     motion_support),
                 input.runtime_epoch,
-                core::ActiveControlConfigurationId("active.i6.native.arm")),
+                core::ActiveControlConfigurationId("active.native.arm")),
             std::span<const deployment::RuntimeProgramTargetBinding>(
                 motion_support)));
     if (!verified_motion.ok()) {
@@ -2177,7 +2182,7 @@ template <typename PhysicalBindingInput>
                 std::span<const deployment::RuntimeProgramTargetBinding>{},
                 input.runtime_epoch,
                 core::ActiveControlConfigurationId(
-                    "active.i6.native.gripper"))));
+                    "active.native.gripper"))));
     if (!verified_gripper.ok()) {
       Fail("direct-control gripper participant binding failed verification: " +
            verified_gripper.error().message);
@@ -2189,7 +2194,7 @@ template <typename PhysicalBindingInput>
     auto motion_representatives = BuildControlBindingRepresentatives(
         *motion_program, *motion, *input.bundle, input.model_map,
         input.runtime_epoch,
-        core::ActiveControlConfigurationId("active.i6.native.arm"));
+        core::ActiveControlConfigurationId("active.native.arm"));
     representatives.insert(
         representatives.end(),
         std::make_move_iterator(motion_representatives.begin()),
@@ -2199,7 +2204,7 @@ template <typename PhysicalBindingInput>
     auto gripper_representatives = BuildControlBindingRepresentatives(
         *gripper_program, *gripper, *input.bundle, input.model_map,
         input.runtime_epoch,
-        core::ActiveControlConfigurationId("active.i6.native.gripper"));
+        core::ActiveControlConfigurationId("active.native.gripper"));
     representatives.insert(
         representatives.end(),
         std::make_move_iterator(gripper_representatives.begin()),
@@ -2583,7 +2588,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
           RetainedPlanningModelStage::create_verified(
               *retained_model, input.execution_run_root));
       auto candidate_scene = BuildCandidateRetainedModelScene(
-          "manyforge_i6_native_gripper_host", *candidate_stage,
+          "manyforge_native_gripper_host", *candidate_stage,
           *retained_model, *input.bundle, input.model_map,
           {*physical.gripper}, {old_channel->query_context().freshness_budget_ns});
       const auto limits =
@@ -2733,7 +2738,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
         predecessor->second.runtime->motion_state_channel->query_context()
             .freshness_budget_ns};
     auto candidate_scene = BuildCandidateRetainedModelScene(
-        "manyforge_i6_execution_host", *candidate_stage,
+        "manyforge_execution_host", *candidate_stage,
         *retained_model, *input.bundle, input.model_map,
         std::move(projected_bindings), std::move(projected_budgets));
     auto mounted_frame_names = retained_motion_planner_frame_names(
@@ -3765,11 +3770,13 @@ struct MachineOwnerProcess final {
   MachineOwnerProcess result;
   result.controller_process = ensured.process;
   result.prepared_controller_launch = ensured;
-  std::cerr << "manyforge controller launch: component=" << id << " (arm deactivated) decision="
-            << (ensured.decision == ControllerLaunchDecision::kKeep    ? "kept"
-                : ensured.decision == ControllerLaunchDecision::kStart ? "started"
-                                                                       : "restarted")
-            << " pid=" << ensured.process->pid() << std::endl;
+  core::LogLine(core::LogSeverity::kInfo,
+                core::LogText("manyforge controller launch: component=", id,
+                              " (arm deactivated) decision=",
+                              ensured.decision == ControllerLaunchDecision::kKeep    ? "kept"
+                              : ensured.decision == ControllerLaunchDecision::kStart ? "started"
+                                                                                     : "restarted",
+                              " pid=", ensured.process->pid()));
 
   auto handle = RetainedRos2ControlRuntimeHandle::Create();
   const auto owner_timeout = handle->SetOwnerShutdownTimeout(spec.lifecycle_command_timeout_ns);
@@ -3790,7 +3797,8 @@ struct MachineOwnerProcess final {
       [process = ensured.process] {
         return core::Result<std::optional<std::string>>::Ok(
             ProjectControllerLaunchFault(process->ReadCachedFaultState()));
-      });
+      },
+      [process = ensured.process] { return process->output_tail_detail(); });
   const std::chrono::nanoseconds timeout(spec.lifecycle_command_timeout_ns);
   // Its launch starts within the owner's lifecycle command time (the
   // bring-up bound for one component): until then its Prepare awaits the
@@ -3852,24 +3860,40 @@ void AdoptMachineOwnerProcess(Composition &view, MachineOwnerProcess process,
 
 /// Component process: a component's own `ros2 launch` under the
 /// host's supervisor (lane kComponent), started by its adapter family.
-/// Destroying it stops the process.
+/// `stop()` retires it on the caller's thread, once; destroying it only
+/// releases it then. Destroying one never stopped retires it (fallback for
+/// shutdown and other drops).
 class HostComponentProcess final : public IComponentProcess {
  public:
   explicit HostComponentProcess(std::shared_ptr<ControllerLaunchProcess> process)
       : process_(std::move(process)) {}
   ~HostComponentProcess() override {
+    if (!stopped_.load()) Retire();
+  }
+  void stop() override {
+    if (!stopped_.exchange(true)) Retire();
+  }
+  [[nodiscard]] std::optional<std::string> exited() override { return process_->exited(); }
+  [[nodiscard]] std::string output_tail() const override {
+    return process_->output_tail_detail();
+  }
+
+ private:
+  /// Retires exactly this occurrence: returns at once when the supervisor no
+  /// longer holds it, and without waiting when its group has already gone.
+  void Retire() noexcept {
     try {
       static_cast<void>(host_controller_launch_supervisor().retire_exact(process_));
     } catch (const std::exception &error) {
-      std::cerr << "manyforge component process stop failed: component="
-                << process_->command().controllable_component_id << " error=" << error.what()
-                << std::endl;
+      core::LogLine(core::LogSeverity::kError,
+                    core::LogText("manyforge component process stop failed: component=",
+                                  process_->command().controllable_component_id,
+                                  " error=", error.what()));
     }
   }
-  [[nodiscard]] std::optional<std::string> exited() override { return process_->exited(); }
 
- private:
   std::shared_ptr<ControllerLaunchProcess> process_;
+  std::atomic<bool> stopped_{false};
 };
 
 /// The host's component process launcher of one component: its process
@@ -3891,8 +3915,9 @@ class HostComponentProcess final : public IComponentProcess {
     std::filesystem::create_directories(artifacts_root);
     auto ensured = host_controller_launch_supervisor().ensure(command, artifacts_root,
                                                               "Prepare component=" + component_id);
-    std::cerr << "manyforge component process launch: component=" << component_id
-              << " pid=" << ensured.process->pid() << std::endl;
+    core::LogLine(core::LogSeverity::kInfo,
+                  core::LogText("manyforge component process launch: component=",
+                                component_id, " pid=", ensured.process->pid()));
     return std::make_unique<HostComponentProcess>(std::move(ensured.process));
   };
 }
@@ -4019,7 +4044,8 @@ class HostComponentProcess final : public IComponentProcess {
       [next = restarted.process] {
         return core::Result<std::optional<std::string>>::Ok(
             ProjectControllerLaunchFault(next->ReadCachedFaultState()));
-      });
+      },
+      [next = restarted.process] { return next->output_tail_detail(); });
   // A Prepare waits for the restarted launch's spawners, not the stopped one's.
   handle->ReplaceControllerLaunchSettle(
       [next = restarted.process] { return next->spawners_settled(); },
@@ -4140,7 +4166,7 @@ struct ArmLaunchSelection final {
     record << evidence << '\n';
     Require(static_cast<bool>(record), "ROS controller launch evidence could not be written");
   }
-  std::cerr << "manyforge controller launch artifacts: " << evidence << std::endl;
+  core::LogLine(core::LogSeverity::kInfo, core::LogText("manyforge controller launch artifacts: ", evidence));
   return written;
 }
 
@@ -4156,12 +4182,13 @@ struct ArmLaunchSelection final {
                 " epoch=" + host.runtime_epoch.value()
           : host.controller_request_context);
   PendingLaunch launch(new ControllerLaunchSupervisor::Ensured(ensured));
-  std::cerr << "manyforge controller launch: component=" << written.controllable_component_id
-            << " decision="
-            << (ensured.decision == ControllerLaunchDecision::kKeep    ? "kept"
-                : ensured.decision == ControllerLaunchDecision::kStart ? "started"
-                                                                       : "restarted")
-            << " pid=" << ensured.process->pid() << std::endl;
+  core::LogLine(core::LogSeverity::kInfo,
+                core::LogText("manyforge controller launch: component=",
+                              written.controllable_component_id, " decision=",
+                              ensured.decision == ControllerLaunchDecision::kKeep    ? "kept"
+                              : ensured.decision == ControllerLaunchDecision::kStart ? "started"
+                                                                                     : "restarted",
+                              " pid=", ensured.process->pid()));
   return launch;
 }
 
@@ -4297,7 +4324,8 @@ struct ToolLaunch final {
   if (launch) handle->InstallControllerProcessFaultSource(
       ControllerLaunchSupervisor::fault_source(launch->process, CachedControllerLaunchReadinessSource(handle)),
       [process = launch->process] { return core::Result<std::optional<std::string>>::Ok(
-          ProjectControllerLaunchFault(process->ReadCachedFaultState())); });
+          ProjectControllerLaunchFault(process->ReadCachedFaultState())); },
+      [process = launch->process] { return process->output_tail_detail(); });
   // An Isaac tool's launch is its bridge: no controllers to spawn.
   if (launch && launch->process->command().lane == ControllerLaunchLane::kRos2Control)
     InstallControllerLaunchSettle(*handle, launch->process, host.launch_settle_bound);
@@ -4639,7 +4667,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   auto stage = RetainedPlanningModelStage::create_verified(
       *retained_model, input.execution_run_root);
   auto scene = make_roboplan_scene(RoboPlanSceneInput{
-      "manyforge_i6_execution_host",
+      "manyforge_execution_host",
       std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
       stage.package_paths(), roboplan_joint_limits});
   auto scene_mutex = std::make_shared<std::mutex>();
@@ -4666,7 +4694,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     // The retained package root is not a scene-mesh root: scene meshes are
     // read only from the separate scene content root by digest.
     collision_model = collision::ManyForgeCollisionEngine::load_shared_model(
-        "manyforge_i6_execution_host", stage.loader_urdf_path(),
+        "manyforge_execution_host", stage.loader_urdf_path(),
         stage.srdf_path(), stage.package_paths(), group.compiled_group_name,
         input.scene_content_root_fd);
     auto collision_projector = RetainedCollisionWorldProjector::create_verified(
@@ -4675,7 +4703,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
         EmptyScene(input.bundle->value().cell_graph.cell_id,
                    input.projection_revision.scene_revision);
     auto publisher_result = RetainedCollisionWorldPublisher::create(
-        std::move(collision_projector), "i6-execution-host",
+        std::move(collision_projector), "execution-host",
         logical_scene, WallClock{}.now(), [] { return WallClock{}.now(); });
     if (!publisher_result.ok()) {
       Fail("retained collision publication failed: " +
@@ -4875,7 +4903,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
         return core::Result<std::optional<std::string>>::Ok(
             ProjectControllerLaunchFault(
                 controller_process->ReadCachedFaultState()));
-      });
+      },
+      [controller_process] { return controller_process->output_tail_detail(); });
   InstallControllerLaunchSettle(*ros2_control_runtime_handle, controller_process,
                                 component.host.launch_settle_bound);
   auto ros2_control_backend_config =
@@ -5316,15 +5345,16 @@ void EnsureSimulatedPlc(
   if (!borrowed_drivers)
     InstallIoDeviceRestart(*view.io_provider_drivers, build.host,
                            spec.controllable_component_id.value());
-  std::cerr << "manyforge simulated PLC launch: component=" << plan->device_id
-            << " decision="
-            << (ensured.decision == ControllerLaunchDecision::kKeep
-                    ? "kept"
-                    : ensured.decision == ControllerLaunchDecision::kStart
-                          ? "started"
-                          : "restarted")
-            << " pid=" << ensured.process->pid()
-            << " config_dir=" << plan->config_dir.string() << std::endl;
+  core::LogLine(core::LogSeverity::kInfo,
+                core::LogText("manyforge simulated PLC launch: component=",
+                              plan->device_id, " decision=",
+                              ensured.decision == ControllerLaunchDecision::kKeep
+                                  ? "kept"
+                                  : ensured.decision == ControllerLaunchDecision::kStart
+                                        ? "started"
+                                        : "restarted",
+                              " pid=", ensured.process->pid(),
+                              " config_dir=", plan->config_dir.string()));
 }
 
 // The observer plan of a `pose_source` or `ai_model` component, from its
@@ -5463,15 +5493,16 @@ void EnsurePoseSource(
   if (!borrowed_drivers)
     InstallIoDeviceRestart(*view.io_provider_drivers, build.host,
                            spec.controllable_component_id.value());
-  std::cerr << "manyforge pose source launch: component=" << plan.component_id
-            << " decision="
-            << (ensured.decision == ControllerLaunchDecision::kKeep
-                    ? "kept"
-                    : ensured.decision == ControllerLaunchDecision::kStart
-                          ? "started"
-                          : "restarted")
-            << " pid=" << ensured.process->pid()
-            << " site_config=" << plan.site_config_path.string() << std::endl;
+  core::LogLine(core::LogSeverity::kInfo,
+                core::LogText("manyforge pose source launch: component=",
+                              plan.component_id, " decision=",
+                              ensured.decision == ControllerLaunchDecision::kKeep
+                                  ? "kept"
+                                  : ensured.decision == ControllerLaunchDecision::kStart
+                                        ? "started"
+                                        : "restarted",
+                              " pid=", ensured.process->pid(),
+                              " site_config=", plan.site_config_path.string()));
 }
 
 // The generic I/O drivers of a component, from its build input only:
@@ -6821,8 +6852,12 @@ void ConfigureProgramResetPositionAccess(ExecutionCompositionAccess& access,
 void PrepareGripperMeasuredSource(const core::ControllableComponentId &component,
                                   const Composition &view) {
   const auto prepared = view.gripper_runtime->PrepareCurrentMeasuredSources();
-  if (!prepared.ok()) std::cerr << "manyforge measured gripper source unavailable: component="
-      << component.value() << " code=" << prepared.error().code << " message=" << prepared.error().message << '\n';
+  if (!prepared.ok())
+    core::LogLine(core::LogSeverity::kWarning,
+                  core::LogText("manyforge measured gripper source unavailable: component=",
+                                component.value(), " code=", prepared.error().code,
+                                " message=", prepared.error().message),
+                  prepared.error().code);
 }
 
 /// Enable publishes a gripper-only component's route, and that route re-seal
@@ -6837,10 +6872,15 @@ void PrepareGripperMeasuredSourceAfterRouteOpen(
       if (found->second && !found->second->runtime && found->second->gripper_runtime)
         PrepareGripperMeasuredSource(component, *found->second);
   } catch (const std::exception &error) {
-    try { std::cerr << "manyforge measured gripper source preparation failed: " << error.what() << '\n'; }
+    try {
+      core::LogLine(core::LogSeverity::kWarning, core::LogText("manyforge measured gripper source preparation failed: ",
+                                      error.what()));
+    }
     catch (...) {}
   } catch (...) {
-    try { std::cerr << "manyforge measured gripper source preparation failed: unknown exception\n"; }
+    try {
+      core::LogLine(core::LogSeverity::kWarning, "manyforge measured gripper source preparation failed: unknown exception");
+    }
     catch (...) {}
   }
 }
@@ -6865,19 +6905,26 @@ void PrepareInstalledMeasuredSourcesAfterContext(const Composition &composition)
         // Missing measurement does not add Apply/lifecycle admission rules.
         const auto prepared = view->runtime->PrepareCurrentMeasuredSources();
         if (!prepared.ok()) {
-          std::cerr << "manyforge measured source preparation: component=" << component.value()
-                    << " code=" << prepared.error().code
-                    << " message=" << prepared.error().message << '\n';
+          core::LogLine(core::LogSeverity::kWarning,
+                        core::LogText("manyforge measured source preparation: component=",
+                                      component.value(), " code=", prepared.error().code,
+                                      " message=", prepared.error().message),
+                        prepared.error().code);
         }
       }
     }
   } catch (const std::exception &error) {
     // This new optional measurement preparation must not convert an already
     // qualified context into an Apply failure. Existing capture stays absent.
-    try { std::cerr << "manyforge measured source preparation failed: " << error.what() << '\n'; }
+    try {
+      core::LogLine(core::LogSeverity::kWarning, core::LogText("manyforge measured source preparation failed: ",
+                                      error.what()));
+    }
     catch (...) {}
   } catch (...) {
-    try { std::cerr << "manyforge measured source preparation failed: unknown exception\n"; }
+    try {
+      core::LogLine(core::LogSeverity::kWarning, "manyforge measured source preparation failed: unknown exception");
+    }
     catch (...) {}
   }
 }
@@ -7246,8 +7293,8 @@ void RefreshRetainedPublicationView(
 RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   // Start-up steps are logged (OD-214): the Manager waits for this host's
   // readiness with no time limit (OD-290 (a)).
-  std::cerr << "execution host start-up: pid=" << ::getpid()
-            << " runtime_unit=" << config.runtime_unit_id << '\n';
+  core::LogLine(core::LogSeverity::kInfo, core::LogText("execution host start-up: pid=", ::getpid(),
+                                 " runtime_unit=", config.runtime_unit_id));
   // This host's site facts (its site settings snapshot, fixed for the
   // process): every component spec it derives uses them, as the Manager does.
   const auto site_facts = component_manager::SiteFactsOf(config.site_settings);
@@ -8355,7 +8402,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     Require(execution_surface_control.ready,
             "managed execution command surface did not become ready");
   }
-  std::cerr << "execution host start-up: command surface ready\n";
+  core::LogLine(core::LogSeverity::kInfo, "execution host start-up: command surface ready");
   // The last Apply this host installed (the Manager then
   // publishes it); the liveness rebind to its successor checks it.
   std::optional<HostApplySelection> installed_apply;
@@ -8597,8 +8644,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         request.removed_domains,
         request.program};
     const auto fence_query = selection.fence_query();
-    std::cerr << "native composition install: start apply=" << selection.apply_id.value()
-              << " received_unix_ms=" << composition_request_received_unix_ms << '\n';
+    core::LogLine(core::LogSeverity::kInfo,
+                  core::LogText("native composition install: start apply=",
+                                selection.apply_id.value(), " received_unix_ms=",
+                                composition_request_received_unix_ms));
     const auto install_started = std::chrono::steady_clock::now();
     const auto install_ms = [&install_started] {
       return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -8865,8 +8914,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       // The installed cell stays: its components (a stopped one shows its
       // own state) are coordinated again.
       coordinate_installed_without({});
-      std::cerr << "ERROR native composition refused: apply=" << selection.apply_id.value()
-                << " cause=" << error.what() << '\n';
+      core::LogLine(core::LogSeverity::kError,
+                    core::LogText("ERROR native composition refused: apply=",
+                                  selection.apply_id.value(), " cause=", error.what()));
       return failed(host_detail::ScenarioCompositionRefusal(error).error());
     }
 
@@ -9128,18 +9178,20 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         installed_elapsed_ms = install_ms();
       });
       if (reconfigured_elapsed_ms)
-        std::cerr << "native composition install: Kernel reconfigured elapsed_ms="
-                  << *reconfigured_elapsed_ms << '\n';
-      std::cerr << "native composition install: installed elapsed_ms=" << *installed_elapsed_ms
-                << '\n';
+        core::LogLine(core::LogSeverity::kInfo, core::LogText("native composition install: Kernel "
+                                        "reconfigured elapsed_ms=",
+                                        *reconfigured_elapsed_ms));
+      core::LogLine(core::LogSeverity::kInfo, core::LogText("native composition install: installed elapsed_ms=",
+                                      *installed_elapsed_ms));
     } catch (...) {
       // A failure after a sample (inside or after the effect) still prints it.
       if (reconfigured_elapsed_ms)
-        std::cerr << "native composition install: Kernel reconfigured elapsed_ms="
-                  << *reconfigured_elapsed_ms << '\n';
+        core::LogLine(core::LogSeverity::kInfo, core::LogText("native composition install: Kernel "
+                                        "reconfigured elapsed_ms=",
+                                        *reconfigured_elapsed_ms));
       if (installed_elapsed_ms)
-        std::cerr << "native composition install: installed elapsed_ms=" << *installed_elapsed_ms
-                  << '\n';
+        core::LogLine(core::LogSeverity::kInfo, core::LogText("native composition install: installed elapsed_ms=",
+                                        *installed_elapsed_ms));
       if (prepared_managed_composition) {
         discard_root(failed_prepared_composition);
         prepared_managed_composition->discard_unadopted_controller_launches();
@@ -9149,7 +9201,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       // No effect: the predecessor stays installed and coordinated.
       coordinate_installed_without({});
       auto error = host_detail::HostApplyFailureBeforeEffect(std::current_exception());
-      std::cerr << "native selected composition failed before effect: " << error.message << '\n';
+      core::LogLine(core::LogSeverity::kError, "native selected composition failed before effect: " + error.message,
+                    error.code);
       return failed(std::move(error));
     }
     if (active_managed_composition) PrepareInstalledMeasuredSourcesAfterContext(*active_managed_composition);
@@ -9498,8 +9551,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             }
           }
           if (refusal_cause.has_value()) {
-            std::cerr << "Manager liveness packet refused: " << *refusal_cause
-                      << '\n';
+            core::LogLine(core::LogSeverity::kError, "Manager liveness packet refused: " + *refusal_cause,
+                          "manager_liveness_packet_refused");
             stable_kernel_owner->ContainInternalFault(
                 "manager_liveness_packet_refused");
             continue;
@@ -9950,7 +10003,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   // facade/publication/product source. No additional recovery owner or poller.
   restore_current_logical_product = restore_empty_startup_globals;
   bool process_inventory_owner_changing_logged = false;
-  std::cerr << "execution host start-up: serving the Manager channel\n";
+  core::LogLine(core::LogSeverity::kInfo, "execution host start-up: serving the Manager channel");
   while (g_stop_requested == 0) {
     rethrow_manager_liveness_failure();
     rethrow_composition_failure(true);
@@ -10344,10 +10397,13 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       {{"runtime_unit_id", value.runtime_unit_id.value()},
                        {"runtime_epoch", value.runtime_epoch.value()}}};
                   if (!process_inventory_owner_changing_logged) {
-                    std::cerr << "installed component process inventory unknown: "
-                                 "reason=process_inventory_owner_changing"
-                              << " runtime=" << value.runtime_unit_id.value()
-                              << " epoch=" << value.runtime_epoch.value() << '\n';
+                    core::LogLine(
+                        core::LogSeverity::kWarning,
+                        core::LogText("installed component process inventory unknown: "
+                                      "reason=process_inventory_owner_changing",
+                                      " runtime=", value.runtime_unit_id.value(),
+                                      " epoch=", value.runtime_epoch.value()),
+                        "process_inventory_owner_changing");
                     process_inventory_owner_changing_logged = true;
                   }
                 }
@@ -10369,7 +10425,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             if (const auto reason = typed->details().find("reason"); reason != typed->details().end())
               cause = typed->code() + " reason=" + reason->second + ": ";
           }
-          std::cerr << "native selected composition failed: " << cause << error.what() << '\n';
+          core::LogLine(core::LogSeverity::kError,
+                        core::LogText("native selected composition failed: ", cause,
+                                      error.what()),
+                        typed ? std::string_view(typed->code()) : std::string_view{});
         }
         response =
             component_manager::detail::SelectedRuntimeCompositionRpcFailure{
@@ -10841,10 +10900,11 @@ int RunExecutionHostMain(int argc, char **argv) {
     return manyforge::roboplan_backend::RunManagedRuntimeChild(
         manyforge::roboplan_backend::ParseManagedRuntimeArguments(argc, argv));
   } catch (const std::exception &error) {
-    std::cerr << error.what() << '\n';
+    core::LogLine(core::LogSeverity::kError, error.what());
     return 70;
   } catch (...) {
-    std::cerr << "Execution host failed with an unknown error\n";
+    core::LogLine(core::LogSeverity::kError,
+                  "Execution host failed with an unknown error");
     return 71;
   }
 }

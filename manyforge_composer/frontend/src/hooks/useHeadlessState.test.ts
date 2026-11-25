@@ -3610,7 +3610,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     (resetting.program_cycle as Record<string, unknown>).state = 'resetting';
     Object.assign(resetting.program_cycle as Record<string, unknown>, {
       current_command_kind: 'program_reset', reset_phase: 'restoring_scene',
-      reset_options: { reload_initial_scene: true, reset_robot_position: false },
+      reset_options: { reload_initial_scene: true, reset_robot_position: false, reset_stored_values: false },
     });
     receiveControlSnapshot(socket, resetting, CONTROL_SESSION_NUMBER, command.client_sequence);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);

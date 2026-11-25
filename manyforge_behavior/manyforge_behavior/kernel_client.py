@@ -2,110 +2,15 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-from threading import Lock
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping
+import unicodedata
 
 
-class ExecutionTransport(Protocol):
-    """Bounded operation-addressed calls to the execution owner."""
-
-    def identity(self) -> dict[str, Any]: ...
-
-    def targets(self) -> dict[str, Any]: ...
-
-    def control_state(self) -> dict[str, Any]: ...
-
-    def observation(self) -> dict[str, Any]: ...
-
-    def query_target(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def query_operation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def register_io_watch(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def read_io_watch(self, registration: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def release_io_watch(self, registration: Mapping[str, Any]) -> None: ...
-
-    def release_io_watch_scope(self, scope_request: Mapping[str, Any]) -> None: ...
-
-    def start_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def end_mock_io_node_simulation(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def set_mock_io_run_paused(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def cell_stop(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def register_program_run_capture(
-        self, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
-
-    def read_program_execution_scope(self, program_run_id: int) -> dict[str, Any]: ...
-
-    def read_manual_handover(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def stop_program_selection(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def release_program_selection(
-        self, body: Mapping[str, Any], expected_hold_revision: int
-    ) -> dict[str, Any]: ...
-
-    def start_program_selection(
-        self, body: Mapping[str, Any], expected_hold_revision: int
-    ) -> dict[str, Any]: ...
-
-    def check_program_node_motion_attention(
-        self, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
-
-    def read(self, operation_id: int) -> dict[str, Any]: ...
-
-    def operation_recovery(self, operation_id: int) -> dict[str, Any]: ...
-
-    def apply_operation_recovery(
-        self,
-        operation_id: int,
-        expected_operation_revision: int,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]: ...
-
-    def reset(self, operation_id: int, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def acknowledge_completed(
-        self, operation_id: int, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
-
-    def stop(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def stop_program_run(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
-
-    def release_halt(
-        self, program_run_id: int, expected_hold_revision: int
-    ) -> dict[str, Any]: ...
-
-    def read_stop(self, event_id: int) -> dict[str, Any]: ...
-
-    def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]: ...
-
-    def reset_rule_activation(self) -> dict[str, Any]: ...
-
-    def clear_outside_change(
-        self, controllable_component_id: str, signal_name: str
-    ) -> dict[str, Any]: ...
-
-    def set_io_output(
-        self, signal_id: str, value: bool | float, *, origin: str
-    ) -> dict[str, Any]: ...
-
-
-# Transport loss and malformed replies: they cannot prove what
-# the owner did, so they are never an owner refusal (or a teardown).
+# Transport loss and malformed replies (the core's GatewayError codes): they
+# cannot prove what the owner did, so they are never an owner refusal (or a
+# teardown).
 EXECUTION_TRANSPORT_FAILURE_CODES = frozenset(
     {
         "execution_owner_unavailable",
@@ -113,6 +18,230 @@ EXECUTION_TRANSPORT_FAILURE_CODES = frozenset(
         "execution_command_response_invalid",
     }
 )
+
+
+class ExecutionCommandError(RuntimeError):
+    """The execution owner's typed refusal of one command (an ``ok: false``
+    reply), or a refusal reply that names no code. Transport and envelope
+    failures are the core's ``GatewayError`` (codes in
+    ``EXECUTION_TRANSPORT_FAILURE_CODES``)."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        details: Mapping[str, Any] | None = None,
+        producer: str = "kernel",
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = dict(details or {})
+        self.producer = producer
+
+
+def _refusal(reply: Mapping[str, Any]) -> ExecutionCommandError:
+    error = reply.get("error")
+    if (
+        isinstance(error, Mapping)
+        and isinstance(error.get("code"), str)
+        and error["code"]
+        and isinstance(error.get("message"), str)
+        and error["message"]
+        and isinstance(error.get("details", {}), Mapping)
+    ):
+        producer = error.get("producer")
+        return ExecutionCommandError(
+            error["code"], error["message"], error.get("details"),
+            producer if isinstance(producer, str) and producer else "kernel",
+        )
+    return ExecutionCommandError(
+        "execution_command_response_invalid",
+        "native execution owner returned an invalid error response",
+        producer="headless_api",
+    )
+
+
+# Refusals of a Program selection release, Halt release or node motion
+# attention check that precede any release (a lost or malformed reply stays
+# outcome-unknown).
+_SELECTION_RELEASE_REFUSALS = frozenset(
+    {
+        "program_halt_release_stale",
+        "program_selection_manual_operation_active",
+        "program_selection_stale",
+        "program_selection_unknown",
+        "program_node_unknown",
+        "program_selection_revision_stale",
+        "program_selection_not_ready",
+        "program_selection_not_releasable",
+        "program_selection_recovery_required",
+        "program_children_unsettled",
+        "program_run_admission_in_flight",
+        "operator_alarm_interlock_active",
+        "operator_alarm_state_unavailable",
+    }
+)
+
+
+# The wire form of an operation as the host decodes it: optional members
+# carried as null when unset, and those omitted when null. A motion's
+# `planner` (and each of its members) and `runtime_object_bindings` are sent
+# as built: the host reads an absent one as null or empty.
+_POSE_GOAL_OMITTED = (
+    "motion_type",
+    "max_translation_step_m",
+    "max_rotation_step_rad",
+    "max_angular_speed_rad_s",
+    "max_linear_acceleration_mps2",
+    "max_angular_acceleration_rad_s2",
+    "speed_mode",
+)
+_COLLISION_RULE_OMITTED = ("a", "b", "clearance_m", "contact", "release")
+_CONTACT_OMITTED = (
+    "max_penetration_m", "end_from_fraction", "max_compression_step_m", "spring_group",
+)
+_ACTION_SPAN_NULLABLE = (
+    "program_run_id", "node_instance_id", "node_attempt_id", "parent_node_attempt_id",
+)
+_JOINT_LIMIT_NULLABLE = ("max_velocity_rad_s", "max_acceleration_rad_s2", "max_jerk_rad_s3")
+
+
+def _without_null(value: Mapping[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if not (key in names and item is None)}
+
+
+def _with_null(value: Mapping[str, Any], names: tuple[str, ...]) -> dict[str, Any]:
+    return {**{name: None for name in names}, **value}
+
+
+def _context_wire(context: Any) -> Any:
+    if not isinstance(context, Mapping):
+        return context
+    return {"request_key": None, **context}
+
+
+def _selection_wire(selection: Any) -> Any:
+    if isinstance(selection, Mapping) and selection.get("kind") == "attached_object":
+        return _without_null(selection, ("collision_body_role_id",))
+    return selection
+
+
+def _collision_rule_wire(rule: Any) -> Any:
+    if not isinstance(rule, Mapping):
+        return rule
+    rule = _without_null(rule, _COLLISION_RULE_OMITTED)
+    for side in ("a", "b"):
+        if isinstance(rule.get(side), list):
+            rule[side] = [_selection_wire(selection) for selection in rule[side]]
+    if isinstance(rule.get("contact"), Mapping):
+        rule["contact"] = _without_null(rule["contact"], _CONTACT_OMITTED)
+    return rule
+
+
+def _motion_payload_wire(payload: Mapping[str, Any]) -> dict[str, Any]:
+    payload = {"target_reference": None, "offset_reference": None, **payload}
+    if "goal_frame_reference" in payload and payload["goal_frame_reference"] is None:
+        del payload["goal_frame_reference"]
+    if isinstance(payload.get("speed_profile"), Mapping):
+        payload["speed_profile"] = _with_null(
+            payload["speed_profile"], ("max_tcp_linear_speed_mps",)
+        )
+    limits = payload.get("per_joint_dynamics_limits")
+    if isinstance(limits, Mapping):
+        payload["per_joint_dynamics_limits"] = {
+            joint: _with_null(limit, _JOINT_LIMIT_NULLABLE) if isinstance(limit, Mapping) else limit
+            for joint, limit in limits.items()
+        }
+    if isinstance(payload.get("collision_rules"), list):
+        payload["collision_rules"] = [
+            _collision_rule_wire(rule) for rule in payload["collision_rules"]
+        ]
+    motion = payload.get("motion")
+    if isinstance(motion, Mapping):
+        if motion.get("kind") == "pose_goal":
+            payload["motion"] = _without_null(motion, _POSE_GOAL_OMITTED)
+        elif motion.get("kind") == "cartesian_path":
+            payload["motion"] = _without_null(motion, ("speed_mode",))
+    return payload
+
+
+def _participant_wire(participant: Any) -> Any:
+    if not isinstance(participant, Mapping):
+        return participant
+    participant = dict(participant)
+    if isinstance(participant.get("action_span"), Mapping):
+        participant["action_span"] = _with_null(
+            participant["action_span"], _ACTION_SPAN_NULLABLE
+        )
+    payload = participant.get("payload")
+    if isinstance(payload, Mapping) and payload.get("kind") == "motion":
+        participant["payload"] = _motion_payload_wire(payload)
+    return participant
+
+
+def _operation_wire(operation: Mapping[str, Any]) -> dict[str, Any]:
+    """One operation intent in its wire form: its unset optional members as
+    the host decodes them (a joint limit row always carries its three caps;
+    a pose goal omits its unset limits). Everything else is sent as given."""
+
+    operation = {"program_run_id": None, **operation}
+    operation.pop("application_start_id", None)
+    if "manual_handover" in operation and operation["manual_handover"] is None:
+        del operation["manual_handover"]
+    if "request_context" in operation:
+        operation["request_context"] = _context_wire(operation["request_context"])
+    if isinstance(operation.get("participants"), list):
+        operation["participants"] = [
+            _participant_wire(participant) for participant in operation["participants"]
+        ]
+    return operation
+
+
+def _planning_intent_wire(intent: Mapping[str, Any]) -> dict[str, Any]:
+    intent = dict(intent)
+    for phase in ("approach_operation", "descend_operation", "tool_operation", "retreat_operation"):
+        if isinstance(intent.get(phase), Mapping):
+            intent[phase] = _operation_wire(intent[phase])
+    return intent
+
+
+def _control_wire(request: Mapping[str, Any]) -> dict[str, Any]:
+    request = {"reason": None, **request}
+    request.pop("application_start_id", None)
+    if "request_context" in request:
+        request["request_context"] = _context_wire(request["request_context"])
+    return request
+
+
+_MAX_STOP_REASON_BYTES = 1024
+
+
+def _sparse_stop_wire(request: Mapping[str, Any]) -> dict[str, Any]:
+    """A Stop selector: unused selector kinds and an absent reason omitted;
+    the request context is ``{request_key, source_label}``."""
+
+    request = {
+        key: value
+        for key, value in request.items()
+        if value is not None and key != "application_start_id"
+    }
+    reason = request.get("reason")
+    if "reason" in request and not (
+        isinstance(reason, str)
+        and reason
+        and unicodedata.normalize("NFC", reason) == reason
+        and len(reason.encode("utf-8")) <= _MAX_STOP_REASON_BYTES
+    ):
+        # An unusable Stop reason is dropped, never a refusal.
+        del request["reason"]
+    context = request.get("request_context")
+    if isinstance(context, Mapping):
+        request["request_context"] = {
+            "request_key": context.get("request_key"),
+            "source_label": context.get("source_label"),
+        }
+    return request
 
 
 class KernelClientResponseError(RuntimeError):
@@ -186,191 +315,36 @@ PLANNING_JOB_FINAL_STATES = frozenset({"done", "failed", "cancelled"})
 _PLANNING_JOB_STATES = frozenset({"accepted", "planning"}) | PLANNING_JOB_FINAL_STATES
 
 
-class PushedPlanningJobs:
-    """The runner's copy of the event stream's ``state.planning_jobs``
-    (OD-213 (1)): each held planning job's state, never its result. Replaced
-    whole by every ``snapshot`` and ``state``; unavailable from a lost stream
-    until the next snapshot. Memory only: a RUNNING planning node reads its
-    job here on every tick instead of asking the host."""
-
-    def __init__(self) -> None:
-        self._lock = Lock()
-        # None: unavailable (no snapshot yet, or the stream was lost).
-        self._states: dict[str, str] | None = None
-
-    def apply_state(self, state: Mapping[str, Any]) -> None:
-        """One stream ``snapshot`` or ``state``; a malformed member makes the
-        copy unavailable and raises."""
-
-        try:
-            rows = state["planning_jobs"]
-            if not isinstance(rows, list) or len(rows) > 8:
-                raise TypeError("planning jobs are not a bounded list")
-            states: dict[str, str] = {}
-            for row in rows:
-                job_id = row["job_id"]
-                if (
-                    not isinstance(job_id, str)
-                    or not job_id
-                    or job_id in states
-                    or row["kind"] not in {"pick", "place"}
-                    or row["state"] not in _PLANNING_JOB_STATES
-                    or not (row["program_run_id"] is None or _counter(row["program_run_id"]))
-                ):
-                    raise TypeError("planning job row is invalid")
-                states[job_id] = row["state"]
-        except (KeyError, TypeError) as error:
-            self.stream_lost()
-            raise KernelClientResponseError(
-                f"pushed planning jobs are invalid: {error}"
-            ) from error
-        with self._lock:
-            self._states = states
-
-    def stream_lost(self) -> None:
-        with self._lock:
-            self._states = None
-
-    def state(self, job_id: str) -> str | None:
-        """The job's state; None while the copy does not list it (not pushed
-        yet: a job leaves the host's table only when released or at its run's
-        Program Reset). Raises ``KernelOperationObservationUnavailableError``
-        while the copy is unavailable."""
-
-        with self._lock:
-            states = self._states
-        if states is None:
-            raise KernelOperationObservationUnavailableError(
-                "pushed planning jobs are unavailable"
-            )
-        return states.get(job_id)
-
-
 class KernelOperationNotYetPushedError(KernelOperationObservationUnavailableError):
     """The pushed operations table is older than the operation's acceptance."""
 
 
 _MAX_SAFE = 9_007_199_254_740_991
 
+# The core's pushed copy (``manyforge_headless_py.ExecutionEvents``) raises
+# its typed GatewayError with these codes.
+_PUSHED_UNAVAILABLE = "execution_event_mirror_unavailable"
+_PUSHED_BEHIND = "execution_event_mirror_behind"
+
 
 def _counter(value: object) -> int | None:
     return value if type(value) is int and 0 <= value <= _MAX_SAFE else None
 
 
-class PushedOperationTable:
-    """The runner's copy of the event stream's ``state.operations`` (OD-213).
+def _pushed_read(read: Callable[[], Any]) -> Any:
+    """One read of the core's pushed copy, its typed refusals mapped to the
+    observation errors the nodes handle."""
 
-    The host sends the Kernel's resident operations from memory, each with
-    the members of a ``read`` reply (``operation`` without the participants'
-    ``progress`` and ``updated_at_ns``, ``control_pending``,
-    ``last_control``), and the counter ``change``, all read in one Kernel
-    section. Every ``snapshot`` and ``state`` replaces the copy whole; a lost
-    stream makes it unavailable until the next snapshot, like every other
-    stream-fed fact. ``active_tcp`` comes from the same message's
-    ``active_tcp_baseline``, which the host reads after the table (as a
-    ``read`` reply reads its operation before its Active TCP).
-    """
-
-    def __init__(self) -> None:
-        self._lock = Lock()
-        # None: unavailable (no snapshot yet, or the stream was lost).
-        self._change: int | None = None
-        self._entries: dict[int, Mapping[str, Any]] = {}
-        self._active_tcp: Any = None
-        # The same message's planning jobs (OD-213 (1)), fed and lost with it.
-        self.planning_jobs = PushedPlanningJobs()
-
-    def apply_state(self, state: Mapping[str, Any]) -> None:
-        """One stream ``snapshot`` or ``state``. A malformed table makes the
-        copy unavailable and raises (the subscription reconnects)."""
-
-        try:
-            table = state["operations"]
-            change = _counter(table["change"])
-            resident = table["resident"]
-            total = _counter(table["resident_total"])
-            if change is None or not isinstance(resident, list) or total is None:
-                raise TypeError("operations table counters are invalid")
-            if len(resident) > total:
-                raise TypeError("operations table lists more operations than it counts")
-            entries: dict[int, Mapping[str, Any]] = {}
-            for entry in resident:
-                operation_id = _counter(entry["operation_id"])
-                operation = entry["operation"]
-                if (
-                    operation_id is None
-                    or operation_id < 1
-                    or operation_id in entries
-                    or type(entry["control_pending"]) is not bool
-                    or not (entry["last_control"] is None or isinstance(entry["last_control"], dict))
-                    or not (
-                        operation is None
-                        or isinstance(operation, dict)
-                        and operation.get("operation_id") == operation_id
-                    )
-                ):
-                    raise TypeError("operations table entry is invalid")
-                entries[operation_id] = entry
-        except (KeyError, TypeError) as error:
-            self.stream_lost()
-            raise KernelClientResponseError(
-                f"pushed operations table is invalid: {error}"
-            ) from error
-        with self._lock:
-            self._change = change
-            self._entries = entries
-            self._active_tcp = state.get("active_tcp_baseline")
-        try:
-            self.planning_jobs.apply_state(state)
-        except KernelClientResponseError:
-            self.stream_lost()
-            raise
-
-    def stream_lost(self) -> None:
-        """Unavailable, never stale, until the next snapshot."""
-
-        with self._lock:
-            self._change = None
-            self._entries = {}
-            self._active_tcp = None
-        self.planning_jobs.stream_lost()
-
-    def envelope(self, operation_id: int, after_change: int) -> dict[str, Any] | None:
-        """The operation as a ``read`` reply shows it, from the copy.
-
-        Raises ``KernelOperationObservationUnavailableError`` while the copy
-        is unavailable and ``KernelOperationNotYetPushedError`` while its
-        ``change`` is below ``after_change`` (the acceptance reply's
-        ``operations_change``: the copy may predate the acceptance). Returns
-        None when the copy is current but cannot show the operation: it is no
-        longer resident (retired), it is beyond the list's bound, or its state
-        was too large to list; the caller then reads it once.
-        """
-
-        with self._lock:
-            change, entry, active_tcp = (
-                self._change, self._entries.get(operation_id), self._active_tcp
-            )
-        if change is None:
-            raise KernelOperationObservationUnavailableError(
-                "pushed operations table is unavailable"
-            )
-        if change < after_change:
-            raise KernelOperationNotYetPushedError(
-                "pushed operations table predates the operation's acceptance"
-            )
-        if entry is None or entry["operation"] is None:
-            return None
-        # A private copy, like a fresh reply: callers may keep or change it.
-        return {
-            "ok": True,
-            "command": "read",
-            "operation": deepcopy(entry["operation"]),
-            "resident": True,
-            "last_control": deepcopy(entry["last_control"]),
-            "control_pending": entry["control_pending"],
-            "active_tcp": deepcopy(active_tcp),
-        }
+    try:
+        return read()
+    except Exception as error:
+        code = getattr(error, "code", None)
+        message = str(getattr(error, "message", error))
+        if code == _PUSHED_BEHIND:
+            raise KernelOperationNotYetPushedError(message) from error
+        if code == _PUSHED_UNAVAILABLE:
+            raise KernelOperationObservationUnavailableError(message) from error
+        raise
 
 
 class KernelOperationSettlementPendingError(RuntimeError):
@@ -452,33 +426,67 @@ class ActionSpan:
 
 
 class KernelClient:
-    """Stateless adapter; the C++ host remains the only execution owner."""
+    """Stateless adapter over the core's gateway; the C++ host remains the
+    only execution owner.
+
+    ``gateway`` is the process's one ``manyforge_headless_py.Gateway``: one
+    method per host command, named as the wire command, taking the request
+    members and returning the host's reply (``ok`` true or false). Its
+    ``GatewayError`` (transport and envelope failures) propagates unchanged.
+    """
 
     def __init__(
         self,
-        transport: ExecutionTransport,
-        operation_table: PushedOperationTable | None = None,
+        gateway: Any,
+        events: Any = None,
     ) -> None:
-        for method in (
-            "identity",
-            "submit",
-            "read",
-            "reset",
-            "acknowledge_completed",
-            "stop",
-        ):
-            if not callable(getattr(transport, method, None)):
-                raise TypeError(f"execution transport has no callable {method}")
-        self._transport = transport
-        # The event stream's pushed operations (OD-213); None in a process
-        # without the event subscription, which reads instead.
-        self._operation_table = operation_table
+        for command in ("identity", "submit", "read", "reset", "acknowledge_completed", "stop"):
+            if not callable(getattr(gateway, command, None)):
+                raise TypeError(f"execution gateway has no callable {command}")
+        self._gateway = gateway
+        # The core's event follower (``manyforge_headless_py.ExecutionEvents``)
+        # and its pushed operations and planning jobs (OD-213); None in a
+        # process without the event subscription, which reads instead.
+        self._events = events
 
     @property
     def pushes_operations(self) -> bool:
         """True when ``observed_operation`` reads the pushed table."""
 
-        return self._operation_table is not None
+        return self._events is not None
+
+    def _send(self, command: str, members: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """The host's reply to one command, whatever its ``ok``."""
+
+        method = getattr(self._gateway, command, None)
+        if not callable(method):
+            raise TypeError(f"execution gateway has no callable {command}")
+        return method(dict(members or {}))
+
+    def _owner(self, command: str, members: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """The host's success reply; a refusal raises ``ExecutionCommandError``."""
+
+        reply = self._send(command, members)
+        if not isinstance(reply, dict) or reply.get("ok") is not True:
+            raise _refusal(reply if isinstance(reply, dict) else {})
+        return reply
+
+    def _selection_owner(self, command: str, members: Mapping[str, Any]) -> dict[str, Any]:
+        """A selection or Halt release: a refusal that precedes the release is
+        ``ProgramSelectionReleaseRejectedError``."""
+
+        try:
+            return self._owner(command, members)
+        except ExecutionCommandError as error:
+            if error.details.get("reason") in _SELECTION_RELEASE_REFUSALS:
+                from manyforge_behavior.orchestration_ports import (
+                    ProgramSelectionReleaseRejectedError,
+                )
+
+                raise ProgramSelectionReleaseRejectedError(
+                    str(error), code=error.code, details=error.details
+                ) from error
+            raise
 
     @staticmethod
     def _successful(value: object, *, label: str) -> dict[str, Any]:
@@ -489,57 +497,62 @@ class KernelClient:
         return value
 
     def identity(self) -> dict[str, Any]:
-        return self._successful(self._transport.identity(), label="identity")
+        return self._owner("identity")
 
     def register_program_run_capture(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """Install a claim-bound capture through the private Program transport."""
+        """Install a claim-bound capture: only identities are sent; the
+        native product boundary supplies the table."""
 
-        return self._successful(
-            self._transport.register_program_run_capture(body),
-            label="Program execution capture",
-        )
+        return self._owner("register_program_run_capture", {"capture": dict(body)})
 
     def targets(self) -> dict[str, Any]:
-        return self._projection("targets")
+        return self._owner("targets")
 
     def read_active_tcp(self, *, ordered: bool = False) -> dict[str, Any]:
         if type(ordered) is not bool:
             raise TypeError("ordered must be boolean")
-        method = getattr(self._transport, "read_active_tcp", None)
-        if not callable(method):
-            raise TypeError("execution transport has no callable read_active_tcp")
-        return self._successful(
-            method(ordered=True) if ordered else method(), label="read active tcp"
-        )
+        return self._owner("read_active_tcp", {"ordered": True} if ordered else {})
 
     def reset_active_tcp(self) -> dict[str, Any]:
-        return self._projection("reset_active_tcp")
+        return self._owner("reset_active_tcp")
+
+    def resolve_attach_active_tcp(
+        self, binding_id: str, target: Mapping[str, str]
+    ) -> dict[str, str]:
+        """The Active TCP holder frame of one attach target."""
+
+        frame = self._owner(
+            "resolve_attach_active_tcp",
+            {"program_binding_id": binding_id, "target": dict(target)},
+        ).get("frame")
+        if not isinstance(frame, Mapping):
+            raise ExecutionCommandError(
+                "execution_command_response_invalid",
+                "Invalid Active TCP holder response",
+                producer="headless_api",
+            )
+        return dict(frame)
 
     def control_state(self) -> dict[str, Any]:
-        return self._projection("control_state")
+        return self._owner("control_state")
 
     def observation(self) -> dict[str, Any]:
-        return self._projection("observation")
+        return self._owner("observation")
 
     def query_target(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(
-            self._transport.query_target(body), label="target observation"
+        # The query names only the members its kind uses.
+        return self._owner(
+            "query_target",
+            {"query": {key: value for key, value in body.items() if value is not None}},
         )
-
-    def _io_watch_method(self, name: str):
-        method = getattr(self._transport, name, None)
-        if not callable(method):
-            raise TypeError(f"execution transport has no callable {name}")
-        return method
 
     def register_io_watch(self, request: Mapping[str, Any]) -> dict[str, Any]:
         """Register one zero-claim level watch: ``{registration, result}``."""
 
-        response = self._io_watch_method("register_io_watch")(request)
-        if (
-            not isinstance(response, dict)
-            or not isinstance(response.get("registration"), dict)
-            or not isinstance(response.get("result"), dict)
+        reply = self._owner("register_io_watch", {"request": dict(request)})
+        response = {"registration": reply.get("registration"), "result": reply.get("result")}
+        if not isinstance(response["registration"], dict) or not isinstance(
+            response["result"], dict
         ):
             raise KernelClientResponseError("I/O watch registration is malformed")
         return response
@@ -547,7 +560,7 @@ class KernelClient:
     def read_io_watch(self, registration: Mapping[str, Any]) -> dict[str, Any]:
         """The watch's current ``{state, observation, matched_sample}``."""
 
-        result = self._io_watch_method("read_io_watch")(registration)
+        result = self._owner("read_io_watch", {"registration": dict(registration)}).get("result")
         if not isinstance(result, dict) or result.get("state") not in {
             "pending", "matched", "released"
         }:
@@ -555,46 +568,67 @@ class KernelClient:
         return result
 
     def release_io_watch(self, registration: Mapping[str, Any]) -> None:
-        self._io_watch_method("release_io_watch")(registration)
+        """Exact-token idempotent release; a released token stays released."""
+
+        self._owner("release_io_watch", {"registration": dict(registration)})
 
     def release_io_watch_scope(self, scope_request: Mapping[str, Any]) -> None:
-        """Release one exact node attempt's watch without its token."""
+        """Release one exact node attempt's watch without its token: the host
+        answers after fencing the attempt and releasing any watch it holds."""
 
-        self._io_watch_method("release_io_watch_scope")(scope_request)
+        self._owner("release_io_watch", {"scope_request": dict(scope_request)})
 
     def start_mock_io_node_simulation(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        """The host's exact accepted acknowledgement."""
+        """The host's exact accepted acknowledgement (a resent request is
+        answered with the retained original result)."""
 
-        ack = self._io_watch_method("start_mock_io_node_simulation")(request)
-        if (
-            not isinstance(ack, dict)
-            or ack.get("status") != "accepted"
-            or not isinstance(ack.get("signals"), list)
-        ):
+        ack = self._owner("start_mock_io_node_simulation", {"request": dict(request)})
+        if ack.get("status") != "accepted" or not isinstance(ack.get("signals"), list):
             raise KernelClientResponseError("Mock simulation acknowledgement is malformed")
         return ack
 
     def end_mock_io_node_simulation(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        """The host's reply to one node attempt's end."""
+        """The host's reply to one node attempt's end (idempotent)."""
 
-        reply = self._io_watch_method("end_mock_io_node_simulation")(request)
-        if not isinstance(reply, dict):
-            raise KernelClientResponseError("Mock simulation end reply is malformed")
-        return reply
+        return self._owner("end_mock_io_node_simulation", {"request": dict(request)})
 
     def set_mock_io_run_paused(self, request: Mapping[str, Any]) -> dict[str, Any]:
         """The host's reply to the Run's Halt state."""
 
-        reply = self._io_watch_method("set_mock_io_run_paused")(request)
-        if not isinstance(reply, dict):
-            raise KernelClientResponseError("Mock Run pause reply is malformed")
-        return reply
+        return self._owner("set_mock_io_run_paused", {"request": dict(request)})
 
-    def _projection(self, method_name: str) -> dict[str, Any]:
-        method = getattr(self._transport, method_name, None)
-        if not callable(method):
-            raise TypeError(f"execution transport has no callable {method_name}")
-        return self._successful(method(), label=method_name.replace("_", " "))
+    def publish_program_bbkeys(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        """One ordered BB key frame; only a success reply ACKs it.
+
+        ``accepted`` names this frame's sequence; ``superseded`` (its
+        occurrence was retired by a Reset, a new Run or an Apply) names none.
+        A refusal keeps the owner's code (for example ``bb_source_not_ready``).
+        """
+
+        ack = self._owner("publish_program_bbkeys", {"request": dict(request)})
+        status = ack.get("status")
+        if status not in {"accepted", "superseded"} or (status == "accepted") != (
+            ack.get("accepted_sequence") is not None
+        ):
+            raise ExecutionCommandError(
+                "execution_command_response_invalid",
+                "BB key publication reply is invalid",
+                producer="headless_api",
+            )
+        return ack
+
+    def read_interrupt_rule_state_events(self, after_sequence: int) -> dict[str, Any]:
+        """One page of the ``events`` command, returned whole for the global
+        rule state mirror (it reads ``interrupt_rule_catalog`` and
+        ``interrupt_rule_state_baseline``)."""
+
+        return self._owner("events", {"after_sequence": after_sequence, "limit": 16})
+
+    def reset_robot_position_capability(self) -> dict[str, Any]:
+        return self._owner("reset_robot_position_capability")
+
+    def reset_robot_position(self, request: Mapping[str, Any]) -> None:
+        self._owner("reset_robot_position", dict(request))
 
     def execute(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         def refusal(code: str, message: str, details: object, active_tcp: object) -> None:
@@ -618,33 +652,26 @@ class KernelClient:
             raise KernelOperationAdmissionRejectedError(code, message, detail)
 
         try:
-            response = self._transport.submit(intent)
+            response = self._send("submit", {"operation": _operation_wire(intent)})
         except Exception as exc:
+            # A refused local precondition of the core keeps its typed code
+            # as an admission refusal; transport loss cannot prove one.
             code = getattr(exc, "code", None)
             if isinstance(code, str) and code not in EXECUTION_TRANSPORT_FAILURE_CODES:
                 refusal(code, str(exc) or "execution owner rejected the operation",
-                        getattr(exc, "details", None), getattr(exc, "active_tcp", None))
+                        getattr(exc, "details", None), None)
             raise
         if isinstance(response, dict) and response.get("ok") is False:
-            error = response.get("error")
-            if (
-                isinstance(error, Mapping)
-                and isinstance(error.get("code"), str)
-                and error["code"]
-                and isinstance(error.get("message"), str)
-                and isinstance(error.get("details", {}), Mapping)
-            ):
-                refusal(error["code"], error["message"], error.get("details"),
-                        response.get("active_tcp"))
+            error = _refusal(response)
+            if error.code in EXECUTION_TRANSPORT_FAILURE_CODES:
+                raise error
+            refusal(error.code, error.message, error.details, response.get("active_tcp"))
         return self._successful(response, label="submission")
 
-    def _planning_job_call(self, name: str, argument: Any) -> dict[str, Any]:
+    def _planning_job_call(self, command: str, members: Mapping[str, Any]) -> dict[str, Any]:
         """One planning-job exchange; a refusal raises with its typed code."""
 
-        method = getattr(self._transport, name, None)
-        if not callable(method):
-            raise TypeError(f"execution transport has no callable {name}")
-        response = method(argument)
+        response = self._send(command, members)
         if isinstance(response, Mapping) and response.get("ok") is False:
             error = response.get("error")
             if isinstance(error, Mapping) and isinstance(error.get("code"), str) and error["code"]:
@@ -653,31 +680,31 @@ class KernelClient:
                     str(error.get("message") or error["code"]),
                     error.get("details") if isinstance(error.get("details"), Mapping) else None,
                 )
-        response = self._successful(response, label=name.replace("_", " "))
-        if name != "release_planning_job" and not isinstance(response.get("planning_job"), Mapping):
-            raise KernelClientResponseError(f"execution owner {name} carries no planning job")
+        response = self._successful(response, label=command.replace("_", " "))
+        if command != "release_planning_job" and not isinstance(response.get("planning_job"), Mapping):
+            raise KernelClientResponseError(f"execution owner {command} carries no planning job")
         return response
 
     def plan_pick(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         """Accepted at once with the planning job (OD-213 (1))."""
 
-        return self._planning_job_call("plan_pick", intent)
+        return self._planning_job_call("plan_pick", {"intent": _planning_intent_wire(intent)})
 
     def plan_place(self, intent: Mapping[str, Any]) -> dict[str, Any]:
         """Accepted at once with the planning job (OD-213 (1))."""
 
-        return self._planning_job_call("plan_place", intent)
+        return self._planning_job_call("plan_place", {"intent": _planning_intent_wire(intent)})
 
     def read_planning_job(self, job_id: str) -> dict[str, Any]:
-        return self._planning_job_call("read_planning_job", job_id)
+        return self._planning_job_call("read_planning_job", {"job_id": job_id})
 
     def cancel_planning_job(self, job_id: str) -> dict[str, Any]:
         """This job only; the host's control socket (never queued)."""
 
-        return self._planning_job_call("cancel_planning_job", job_id)
+        return self._planning_job_call("cancel_planning_job", {"job_id": job_id})
 
     def release_planning_job(self, job_id: str) -> dict[str, Any]:
-        return self._planning_job_call("release_planning_job", job_id)
+        return self._planning_job_call("release_planning_job", {"job_id": job_id})
 
     def planning_job_state(self, job_id: str) -> str | None:
         """The job's state from the pushed copy (memory only); None while the
@@ -685,30 +712,33 @@ class KernelClient:
         ``KernelOperationObservationUnavailableError`` while the copy is
         unavailable. A process without the event subscription reads it."""
 
-        table = self._operation_table
-        if table is None:
+        events = self._events
+        if events is None:
             job = self.read_planning_job(job_id)["planning_job"]
             state = job.get("state")
             return state if state in _PLANNING_JOB_STATES else None
-        return table.planning_jobs.state(job_id)
+        return _pushed_read(lambda: events.planning_job_state(job_id))
 
     def operation(self, operation_id: int) -> dict[str, Any]:
         try:
-            response = self._transport.read(operation_id)
+            return self._owner("read", {"operation_id": operation_id})
         except Exception as exc:
-            # Headless transports expose stable machine-readable error codes.
-            # Map only owner availability on this exact read; every other
-            # transport, protocol, and owner error retains its original type.
+            # Only owner availability on this exact read is mapped; every
+            # other transport, protocol and owner error keeps its type.
             if getattr(exc, "code", None) == "execution_owner_unavailable":
                 raise KernelOperationObservationUnavailableError(
                     "native operation observation is temporarily unavailable"
                 ) from exc
             raise
-        return self._successful(response, label="observation")
 
     def observed_operation(
-        self, operation_id: int, after_change: object, *, wait: bool = True
-    ) -> dict[str, Any]:
+        self,
+        operation_id: int,
+        after_change: object,
+        *,
+        wait: bool = True,
+        read: bool = True,
+    ) -> dict[str, Any] | None:
         """A ``read``-shaped envelope of an operation this process started,
         from the pushed table (OD-213) instead of a per-tick ``read``.
 
@@ -718,30 +748,30 @@ class KernelClient:
         one-shot caller passes ``wait=False`` and reads instead. An operation
         the current copy cannot show (retired, beyond the list's bound, or
         listed without its state) is read once. Without a pushed table this
-        is ``operation``.
+        is ``operation``. ``read`` False (a Program tick, OD-380 D2): memory
+        only, None where a ``read`` would be made.
         """
 
-        table = self._operation_table
-        if table is None:
-            return self.operation(operation_id)
+        events = self._events
+        if events is None:
+            return self.operation(operation_id) if read else None
         change = _counter(after_change)
         if change is None:
             raise KernelClientResponseError(
                 "operation acceptance carries no operations change counter"
             )
         try:
-            envelope = table.envelope(operation_id, change)
+            envelope = _pushed_read(lambda: events.operation_envelope(operation_id, change))
         except KernelOperationNotYetPushedError:
             if wait:
                 raise
-            return self.operation(operation_id)
-        return self.operation(operation_id) if envelope is None else envelope
+            return self.operation(operation_id) if read else None
+        if envelope is None:
+            return self.operation(operation_id) if read else None
+        return envelope
 
     def recovery_assessment(self, operation_id: int) -> dict[str, Any]:
-        method = getattr(self._transport, "operation_recovery", None)
-        if not callable(method):
-            raise TypeError("execution transport has no callable operation_recovery")
-        response = self._successful(method(operation_id), label="recovery assessment")
+        response = self._owner("get_operation_recovery", {"operation_id": operation_id})
         assessment = response.get("recovery_assessment")
         if not isinstance(assessment, dict):
             raise KernelClientResponseError(
@@ -771,14 +801,13 @@ class KernelClient:
         expected_operation_revision: int,
         request: Mapping[str, Any],
     ) -> dict[str, Any]:
-        method = getattr(self._transport, "apply_operation_recovery", None)
-        if not callable(method):
-            raise TypeError(
-                "execution transport has no callable apply_operation_recovery"
-            )
-        response = self._successful(
-            method(operation_id, expected_operation_revision, request),
-            label="recovery action",
+        response = self._owner(
+            "apply_operation_recovery",
+            {
+                "expected_operation_revision": expected_operation_revision,
+                "operation_id": operation_id,
+                "request": {"principal_id": "", "reason": "", **request},
+            },
         )
         result = response.get("result")
         if (
@@ -792,75 +821,61 @@ class KernelClient:
         return result
 
     def query_operation(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(
-            self._transport.query_operation(request), label="Program operation context"
-        )
+        return self._owner("query_operation", {"query": dict(request)})
 
     def cell_stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
         """The Program node's cell Stop (host ``cell_stop``): every operation
         in the cell, no hold change."""
 
-        return self._successful(self._transport.cell_stop(request), label="cell Stop")
+        request = dict(request)
+        if "request_context" in request:
+            request["request_context"] = _context_wire(request["request_context"])
+        return self._owner("cell_stop", {"request": request})
 
     def reset(self, operation_id: int, request: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(
-            self._transport.reset(operation_id, request),
-            label="Reset",
-        )
+        """``operation_id`` is the request's own ``operation_id``."""
+
+        del operation_id
+        return self._owner("reset", {"request": _control_wire(request)})
 
     def acknowledge_completed(
         self, operation_id: int, request: Mapping[str, Any]
     ) -> dict[str, Any]:
+        del operation_id
         try:
-            response = self._transport.acknowledge_completed(operation_id, request)
-        except Exception as error:
-            details = getattr(error, "details", None)
-            if getattr(error, "code", None) == "operation_effect_in_flight" or (
-                isinstance(details, Mapping)
-                and details.get("reason") == "operation_effect_in_flight"
+            return self._owner("acknowledge_completed", {"request": _control_wire(request)})
+        except ExecutionCommandError as error:
+            if error.code == "operation_effect_in_flight" or (
+                error.details.get("reason") == "operation_effect_in_flight"
             ):
                 raise KernelOperationSettlementPendingError(
                     "operation completion is waiting for a subordinate effect"
                 ) from error
             raise
-        return self._successful(response, label="completion acknowledgement")
 
     def stop(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(
-            self._transport.stop(request),
-            label="Stop",
-        )
+        return self._owner("stop", {"request": _sparse_stop_wire(request)})
 
     def stop_program_run(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        return self._successful(
-            self._transport.stop_program_run(request),
-            label="Program-run Stop",
-        )
+        return self._owner("stop_program_run", {"request": _sparse_stop_wire(request)})
 
     def read_program_execution_scope(self, program_run_id: int) -> dict[str, Any]:
-        response = self._successful(
-            self._transport.read_program_execution_scope(program_run_id),
-            label="Program execution scope",
-        )
-        scope = response.get("scope")
+        scope = self._owner(
+            "read_program_execution_scope", {"program_run_id": program_run_id}
+        ).get("scope")
         if not isinstance(scope, dict):
             raise KernelClientResponseError("execution scope has an invalid shape")
         return scope
 
     def read_manual_handover(self, request: Mapping[str, Any]) -> dict[str, Any] | None:
-        response = self._successful(
-            self._transport.read_manual_handover(request), label="manual handover"
-        )
+        response = self._owner("read_manual_handover", {"operation": _operation_wire(request)})
         handover = response.get("handover")
         if handover is not None and not isinstance(handover, dict):
             raise KernelClientResponseError("manual handover has an invalid shape")
         return handover
 
     def stop_program_selection(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
-        response = self._successful(
-            self._transport.stop_program_selection(request),
-            label="Program selection Stop",
-        )
+        response = self._owner("stop_program_selection", {"request": dict(request)})
         accepted = response.get("accepted")
         if (
             response.get("command") != "stop_program_selection"
@@ -876,11 +891,9 @@ class KernelClient:
     def release_program_selection(
         self, request: Mapping[str, Any], expected_hold_revision: int
     ) -> Mapping[str, Any]:
-        response = self._successful(
-            self._transport.release_program_selection(
-                request, expected_hold_revision
-            ),
-            label="Program selection Resume",
+        response = self._selection_owner(
+            "release_program_selection",
+            {"request": dict(request), "expected_hold_revision": expected_hold_revision},
         )
         scope = response.get("scope")
         if (
@@ -896,11 +909,9 @@ class KernelClient:
     def start_program_selection(
         self, request: Mapping[str, Any], expected_hold_revision: int
     ) -> Mapping[str, Any]:
-        response = self._successful(
-            self._transport.start_program_selection(
-                request, expected_hold_revision
-            ),
-            label="Program selection initial Run",
+        response = self._selection_owner(
+            "start_program_selection",
+            {"request": dict(request), "expected_hold_revision": expected_hold_revision},
         )
         scope = response.get("scope")
         if (
@@ -916,9 +927,8 @@ class KernelClient:
     def check_program_node_motion_attention(
         self, request: Mapping[str, Any]
     ) -> None:
-        response = self._successful(
-            self._transport.check_program_node_motion_attention(request),
-            label="Program node motion attention",
+        response = self._selection_owner(
+            "check_program_node_motion_attention", {"request": dict(request)}
         )
         if response.get("command") != "check_program_node_motion_attention":
             raise KernelClientResponseError(
@@ -933,9 +943,9 @@ class KernelClient:
         ``hold_revision`` is the revision after the release); None when the
         run is not the Kernel's current run (no effect)."""
 
-        response = self._successful(
-            self._transport.release_halt(program_run_id, expected_hold_revision),
-            label="Halt release",
+        response = self._selection_owner(
+            "release_halt",
+            {"expected_hold_revision": expected_hold_revision, "program_run_id": program_run_id},
         )
         scope = response.get("scope")
         # The reply always carries `scope`; null means the run is not the
@@ -952,28 +962,21 @@ class KernelClient:
 
     def read_stop(self, event_id: int) -> dict[str, Any]:
         """The Stop event record (``manyforge.execution_stop_status.v2``) of
-        exactly ``event_id``; an overwritten record is the transport's
+        exactly ``event_id``; an overwritten record is the host's
         ``stop_status_not_resident`` refusal."""
 
-        try:
-            response = self._required("read_stop")(event_id)
-        except Exception as error:
-            details = getattr(error, "details", None)
-            if getattr(error, "code", None) == "stop_status_not_resident" or (
-                isinstance(details, Mapping)
+        reply = self._send("read_stop", {"event_id": event_id})
+        if isinstance(reply, dict) and reply.get("ok") is False:
+            error = reply.get("error")
+            details = error.get("details") if isinstance(error, Mapping) else None
+            if isinstance(error, Mapping) and (
+                error.get("code") == "stop_status_not_resident"
+                or isinstance(details, Mapping)
                 and details.get("reason") == "stop_status_not_resident"
             ):
-                raise KernelStopNotResidentError(event_id) from error
-            raise
-        error = response.get("error") if isinstance(response, dict) else None
-        if (
-            isinstance(response, dict)
-            and response.get("ok") is False
-            and isinstance(error, Mapping)
-            and error.get("code") == "stop_status_not_resident"
-        ):
-            raise KernelStopNotResidentError(event_id)
-        status = self._successful(response, label="Stop status").get("stop_status")
+                raise KernelStopNotResidentError(event_id)
+            raise _refusal(reply)
+        status = self._successful(reply, label="Stop status").get("stop_status")
         if (
             not isinstance(status, dict)
             or status.get("schema_version") != "manyforge.execution_stop_status.v2"
@@ -985,51 +988,40 @@ class KernelClient:
             )
         return status
 
-    def _required(self, name: str) -> Callable[..., Any]:
-        method = getattr(self._transport, name, None)
-        if not callable(method):
-            raise TypeError(f"execution transport has no callable {name}")
-        return method
-
     def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]:
         """Kernel `set_rule_active`; `rule_unknown` is refused."""
 
         if not isinstance(rule_id, str) or not rule_id or type(active) is not bool:
             raise ValueError("set_rule_active requires a rule id and a boolean")
-        return self._successful(
-            self._required("set_rule_active")(rule_id, active), label="rule activation"
-        )
+        return self._owner("set_rule_active", {"rule_id": rule_id, "active": active})
 
     def reset_rule_activation(self) -> dict[str, Any]:
         """Every global rule returns to its `active_at_start` (run end, Reset)."""
 
-        return self._successful(
-            self._required("reset_rule_activation")(), label="rule activation reset"
-        )
+        return self._owner("reset_rule_activation")
 
     def clear_outside_change(
         self, controllable_component_id: str, signal_name: str
     ) -> dict[str, Any]:
         """Kernel `clear_outside_change`; writes nothing."""
 
-        return self._successful(
-            self._required("clear_outside_change")(controllable_component_id, signal_name),
-            label="outside change clear",
+        return self._owner(
+            "clear_outside_change",
+            {"controllable_component_id": controllable_component_id, "signal_name": signal_name},
         )
 
     def set_io_output(
         self, component_id: str, signal_name: str, value: bool | float
     ) -> dict[str, Any]:
         """One output write by signal id through the one write path, sent
-        once. A refusal (`cell_latched`, `rule_holds`) raises the
-        transport's typed error; a `failed` or `unknown` result raises
+        once. A refusal (`cell_latched`, `rule_holds`) raises the host's
+        typed error; a `failed` or `unknown` result raises
         `IoOutputWriteFailedError` with the host's code."""
 
-        response = self._successful(
-            self._required("set_io_output")(
-                f"{component_id}/{signal_name}", value, origin="program"
-            ),
-            label="output write",
+        response = self._owner(
+            "set_io_output",
+            {"request": {"signal_id": f"{component_id}/{signal_name}", "value": value,
+                         "origin": "program"}},
         )
         result = response["result"]
         if result["outcome"] == "succeeded":
@@ -1042,6 +1034,7 @@ class KernelClient:
         raise IoOutputWriteFailedError(
             error["code"], str(error.get("message") or error["code"]), result["outcome"]
         )
+
 
 class MockKernelClient:
     """Removed stateful semantic mock; tests fake the thin HTTP transport."""
@@ -1057,7 +1050,7 @@ __all__ = [
     "ActionSpan",
     "EXECUTION_TRANSPORT_FAILURE_CODES",
     "ExecutionState",
-    "ExecutionTransport",
+    "ExecutionCommandError",
     "IoOutputWriteFailedError",
     "KernelClient",
     "KernelOperationAdmissionRejectedError",
@@ -1071,6 +1064,4 @@ __all__ = [
     "KernelClientResponseError",
     "LegacyKernelMockUnavailableError",
     "MockKernelClient",
-    "PushedOperationTable",
-    "PushedPlanningJobs",
 ]

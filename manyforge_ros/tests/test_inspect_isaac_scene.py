@@ -10,8 +10,7 @@ def test_inspect_isaac_scene_refuses_before_any_effect(capsys) -> None:
     assert capsys.readouterr().err.strip() == inspect_isaac_scene.UNAVAILABLE_MESSAGE
     payload = inspect_isaac_scene.unavailable_payload()
 
-    assert payload["reason_code"] == "composable_cell_runtime_unavailable"
-    assert payload["restoration_gate"] == "I9/I"
+    assert payload["reason_code"] == "runtime_unavailable"
     assert payload["historical_source_blob"] == (
         "1d074cc77f3a25ccb1af9f0616bdff2bf1298ccc"
     )

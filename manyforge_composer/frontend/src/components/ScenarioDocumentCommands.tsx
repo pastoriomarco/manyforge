@@ -13,6 +13,7 @@ import type {
   SaveScenarioDocumentInput,
   ScenarioDocumentEntry,
   ScenarioDocumentIndexResponse,
+  ScenarioUpgradeResponse,
 } from '../types/api';
 import { FolderPicker } from './FolderPicker';
 import { OverlayPanel } from './OverlayPanel';
@@ -29,6 +30,13 @@ import { busyLabel, busyReason, type BusyOperation } from '../state/busyOperatio
 import { errorMessage } from '../state/structuralResource';
 import { COMPONENT_ACTION_REASON, DOCUMENT_MOTION_REASON } from '../state/heldRunAuthoring';
 import { useAuthoringAdmissionTooltip } from './authoringAdmission';
+import {
+  refusalGuidance,
+  SCENARIO_UPGRADE_CONVERSION_TEXT,
+  SCENARIO_UPGRADE_OFFER,
+  SCENARIO_UPGRADE_REFUSAL_CODES,
+  upgradeRefusal,
+} from '../state/scenarioUpgrade';
 
 type ScenarioAction = 'new' | 'save_as' | 'load';
 type SaveAsMode = 'project' | 'portable';
@@ -37,6 +45,22 @@ interface ReplacementConfirmation {
   kind: 'new' | 'load';
   path: string | null;
 }
+
+/**
+ * Upgrade and load of a Scenario whose Load was refused for an older file
+ * format (OD-391): checked, offered, confirmed, running, refused or done.
+ */
+type ScenarioUpgradeState =
+  | { step: 'checking'; path: string }
+  | {
+    step: 'offer' | 'confirm' | 'running';
+    path: string;
+    check: ScenarioUpgradeResponse;
+    /** The operator already confirmed replacing the current Scenario. */
+    acknowledged: boolean;
+  }
+  | { step: 'refused'; path: string; text: string; guidance: string | null }
+  | { step: 'upgraded'; path: string; backupPath: string };
 
 interface ScenarioDocumentCommandsProps {
   controller: ProgramWorkspaceController;
@@ -171,6 +195,11 @@ export function ScenarioDocumentCommands({
   const [failedLoadPath, setFailedLoadPath] = useState<string | null>(null);
   const [replacementPending, setReplacementPending] = useState(false);
   const replacementInFlight = useRef(false);
+  // The typed code of the shown New or Load refusal: its catalog guidance
+  // shows with it.
+  const [refusalCode, setRefusalCode] = useState<string | null>(null);
+  const [upgrade, setUpgrade] = useState<ScenarioUpgradeState | null>(null);
+  const upgradeInFlight = useRef(false);
   const [confirmation, setConfirmation] = useState<ReplacementConfirmation | null>(null);
   // The Save waiting for the operator to confirm it leaves unapplied edits out.
   const [saveConfirmation, setSaveConfirmation] = useState<SaveScenarioDocumentInput | null>(null);
@@ -322,10 +351,12 @@ export function ScenarioDocumentCommands({
   }, [locationDirectory]);
 
   const closeAction = useCallback(() => {
-    if (replacementInFlight.current) return;
+    if (replacementInFlight.current || upgradeInFlight.current) return;
     setConfirmation(null);
     setSaveConfirmation(null);
     setNewError(null);
+    setRefusalCode(null);
+    setUpgrade(null);
     setFailedLoadPath(null);
     setAction(null);
     setConfirmOverwrite(false);
@@ -336,6 +367,8 @@ export function ScenarioDocumentCommands({
   ) => {
     returnFocus.current = event.currentTarget;
     setNewError(null);
+    setRefusalCode(null);
+    setUpgrade(null);
     setFailedLoadPath(null);
     setConfirmOverwrite(false);
     setLoadPickerOpen(false);
@@ -397,10 +430,16 @@ export function ScenarioDocumentCommands({
     replacementInFlight.current = true;
     setReplacementPending(true);
     setNewError(null);
+    setRefusalCode(null);
+    // An upgrade just done stays shown while its Load runs.
+    setUpgrade((current) => (current?.step === 'upgraded' && current.path === path ? current : null));
     setFailedLoadPath(null);
     let refusal: string | null = null;
     let failedOutcome = false as boolean;
-    const onRefusal = (message: string, failed = false) => { refusal = message; failedOutcome = failed; };
+    let code: string | null = null;
+    const onRefusal = (message: string, failed = false, refusalCodeValue: string | null = null) => {
+      refusal = message; failedOutcome = failed; code = refusalCodeValue;
+    };
     try {
       const result = kind === 'new' ? await newScenarioDocument(onRefusal)
         : await loadScenarioDocument(path as string, onRefusal);
@@ -409,13 +448,58 @@ export function ScenarioDocumentCommands({
       else {
         setNewError(refusal ?? latestError.current
           ?? `${kind === 'new' ? 'New' : 'Load'} was refused; nothing was retried.`);
+        setRefusalCode(code);
         if (kind === 'load' && failedOutcome) setFailedLoadPath(path);
+        // An older file format: ask the server whether an upgrade converts it.
+        if (kind === 'load' && !failedOutcome && code !== null
+          && SCENARIO_UPGRADE_REFUSAL_CODES.has(code)) void offerUpgrade(path as string, acknowledged);
       }
     } finally {
       replacementInFlight.current = false;
       if (replacementMounted.current) setReplacementPending(false);
     }
   };
+  const offerUpgrade = async (path: string, acknowledged: boolean) => {
+    setUpgrade({ step: 'checking', path });
+    try {
+      const check = await api.scenarioDocuments.upgradeCheck(path);
+      if (replacementMounted.current) {
+        setUpgrade(check.status === 'available' ? { step: 'offer', path, check, acknowledged } : null);
+      }
+    } catch (error: unknown) {
+      if (replacementMounted.current) setUpgrade({ step: 'refused', path, ...upgradeRefusal(error) });
+    }
+  };
+  // The confirmed upgrade, then the ordinary Load of the upgraded folder.
+  const runUpgrade = async () => {
+    if (upgrade?.step !== 'confirm' || upgradeInFlight.current || replacementInFlight.current) return;
+    const { path, acknowledged } = upgrade;
+    upgradeInFlight.current = true;
+    setUpgrade({ ...upgrade, step: 'running' });
+    let backupPath: string | null;
+    try {
+      backupPath = (await api.scenarioDocuments.upgrade(path)).backupPath;
+    } catch (error: unknown) {
+      if (replacementMounted.current) setUpgrade({ step: 'refused', path, ...upgradeRefusal(error) });
+      return;
+    } finally {
+      upgradeInFlight.current = false;
+    }
+    if (!replacementMounted.current) return;
+    setUpgrade(backupPath === null ? null : { step: 'upgraded', path, backupPath });
+    setNewError(null);
+    setRefusalCode(null);
+    void refreshScenarioIndex(scenarioDirectoryRef.current || undefined);
+    await completeReplacement('load', acknowledged);
+  };
+  const shownUpgrade = upgrade !== null && upgrade.path === selectedScenarioPath ? upgrade : null;
+  const upgradeConfirmation = shownUpgrade?.step === 'confirm' || shownUpgrade?.step === 'running'
+    ? shownUpgrade : null;
+  const upgradeOffered = shownUpgrade?.step === 'offer';
+  // The catalog's guidance for a refused Load; an upgrade offer replaces it.
+  const loadGuidance = action === 'load' && (shownUpgrade === null || shownUpgrade.step === 'upgraded')
+    ? refusalGuidance(refusalCode, newError) : null;
+
   // New has no form: it asks only when Draft changes would be discarded.
   useEffect(() => {
     if (action === 'new' && confirmation === null && !replacementPending && newError === null
@@ -515,7 +599,8 @@ export function ScenarioDocumentCommands({
       </div>
 
       <OverlayPanel
-        open={action !== null && confirmation === null && saveConfirmation === null}
+        open={action !== null && confirmation === null && saveConfirmation === null
+          && upgradeConfirmation === null}
         title={action === 'new' ? 'New Scenario' : action === 'save_as' ? 'Save Scenario as' : 'Load Scenario'}
         titleId="scenario-action-dialog-title"
         compact={false}
@@ -743,6 +828,22 @@ export function ScenarioDocumentCommands({
               )}
             </section>
             {replacementReason && <p className="inline-message severity-error" role="status">{replacementReason}</p>}
+            {loadGuidance && <p className="hint">{loadGuidance}</p>}
+            {upgradeOffered && (
+              <div className="notice severity-warning" role="status">
+                <strong>Saved in an older file format</strong>
+                <span>{SCENARIO_UPGRADE_OFFER}</span>
+              </div>
+            )}
+            {shownUpgrade?.step === 'refused' && <>
+              <p className="inline-message severity-error" role="status">{shownUpgrade.text}</p>
+              {shownUpgrade.guidance && <p className="hint">{shownUpgrade.guidance}</p>}
+            </>}
+            {shownUpgrade?.step === 'upgraded' && (
+              <p className="inline-message severity-info" role="status">
+                Scenario upgraded. The original folder is kept at <code>{shownUpgrade.backupPath}</code>.
+              </p>
+            )}
             <div className="dialog-actions new-scenario-actions">
               <button type="button" onClick={closeAction} disabled={replacementPending}>Cancel</button>
               {loadFailed && (
@@ -755,18 +856,31 @@ export function ScenarioDocumentCommands({
                   Load empty scenario
                 </button>
               )}
-              <button
-                type="button"
-                className="primary-action"
-                disabled={busy || (replacementReason !== null && newError === null) || selectedScenarioPath === null}
-                title={replacementReason ?? undefined}
-                onClick={() => {
-                  if (selectedScenarioPath === null) return;
-                  void completeReplacement('load');
-                }}
-              >
-                {loadFailed ? 'Retry Load' : busyLabel(operation, 'load', 'Load Scenario')}
-              </button>
+              {upgradeOffered ? (
+                <button
+                  type="button"
+                  className="primary-action"
+                  disabled={busy || replacementEntryReason !== null}
+                  title={replacementEntryReason ?? undefined}
+                  onClick={() => setUpgrade((current) => (
+                    current?.step === 'offer' ? { ...current, step: 'confirm' } : current))}
+                >
+                  Upgrade and load
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="primary-action"
+                  disabled={busy || (replacementReason !== null && newError === null) || selectedScenarioPath === null}
+                  title={replacementReason ?? undefined}
+                  onClick={() => {
+                    if (selectedScenarioPath === null) return;
+                    void completeReplacement('load');
+                  }}
+                >
+                  {loadFailed ? 'Retry Load' : busyLabel(operation, 'load', 'Load Scenario')}
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -789,6 +903,46 @@ export function ScenarioDocumentCommands({
             }}>{confirmation?.kind === 'new' ? 'Empty the cell and continue' : 'Load Scenario'}</button>
           </div>
         </div>
+      </OverlayPanel>
+      <OverlayPanel open={upgradeConfirmation !== null}
+        title="Upgrade and load?"
+        titleId="scenario-upgrade-confirmation-title" kind="dialog" compact
+        onClose={() => setUpgrade((current) => (
+          current?.step === 'confirm' ? { ...current, step: 'offer' } : current))}>
+        {upgradeConfirmation !== null && <div className="dialog-copy transport-confirmation">
+          <p>The Scenario folder <code>{upgradeConfirmation.check.path}</code> is converted to the current file formats:</p>
+          <ul>
+            {upgradeConfirmation.check.conversions.map((row) => (
+              <li key={row.conversion}>{SCENARIO_UPGRADE_CONVERSION_TEXT[row.conversion]}</li>
+            ))}
+          </ul>
+          <p>
+            A backup copy of the folder is kept next to it,
+            as <code>{upgradeConfirmation.check.backupPattern}</code> with the date and time of the upgrade (UTC).
+            If a part cannot be converted, nothing is changed.
+          </p>
+          <details className="hint">
+            <summary>Changes in the files</summary>
+            <ul>
+              {upgradeConfirmation.check.conversions.flatMap((row) => row.changes.map((change, index) => (
+                <li key={`${row.conversion}:${index}`}>{change}</li>
+              )))}
+            </ul>
+          </details>
+          <p>The upgraded Scenario is then loaded.</p>
+          {upgradeConfirmation.step === 'running'
+            && <p className="scenario-replacement-status" role="status">Upgrading the Scenario…</p>}
+          <div className="dialog-actions">
+            <button type="button" disabled={upgradeConfirmation.step === 'running'}
+              onClick={() => setUpgrade({ ...upgradeConfirmation, step: 'offer' })}>Cancel</button>
+            <button type="button" className="primary-action"
+              disabled={upgradeConfirmation.step === 'running' || replacementAdmissionBlock !== null}
+              title={replacementAdmissionBlock ?? undefined}
+              onClick={() => void runUpgrade()}>
+              Upgrade and load
+            </button>
+          </div>
+        </div>}
       </OverlayPanel>
       <OverlayPanel open={saveConfirmation !== null}
         title="Save the applied Scenario?"

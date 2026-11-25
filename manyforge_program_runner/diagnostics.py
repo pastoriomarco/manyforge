@@ -7,8 +7,11 @@ No I/O, wait, retry or executor submission occurs on the producer path.
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime, timezone
 import logging
 from threading import Condition, Thread
+from time import monotonic_ns, time_ns
+from typing import Any, Mapping
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -133,11 +136,41 @@ class ProgramDiagnosticPublisher:
             thread.join()
 
 
-class ProgramNodeAttemptPublisher:
-    """Deliver finished node-attempt facts to the Historian in batches (OD-375).
+def _wall(utc_ns: int) -> str:
+    return datetime.fromtimestamp(utc_ns / 1e9, timezone.utc).isoformat()
 
-    ``submit`` runs on a run's tick: it never waits. A full or closed queue
-    drops the newest facts and counts them; so does a failed delivery.
+
+def program_run_event(
+    program_run_id: int,
+    event: str,
+    outcome: str,
+    facts: Mapping[str, Any],
+    error: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One Program run event (start, end or audit event) for History, stamped
+    here, at production, on the Runner's clocks (raw CLOCK_MONOTONIC and UTC),
+    like a node attempt's end. Delivery to History is later."""
+
+    return {
+        "program_run_id": program_run_id,
+        "event": event,
+        "outcome": outcome,
+        "occurred_at_ns": str(monotonic_ns()),
+        "occurred_at_wall": datetime.now(timezone.utc).isoformat(),
+        "error": None if error is None else dict(error),
+        "facts": dict(facts),
+    }
+
+
+class ProgramNodeAttemptPublisher:
+    """Deliver finished node-attempt facts and Program run events to the
+    Historian in batches (OD-375).
+
+    ``submit`` and ``submit_run_event`` run on a run's tick or a command: they
+    never wait. Both share one queue, bound and loss count. A full or closed
+    queue drops the newest entry and counts it; so does a failed delivery.
+    The next batch carries the losses since the last delivered batch
+    (``lost_since_last_batch``), so History records them.
     """
 
     def __init__(self, send, application_start_id: str, *, capacity: int = 512, batch: int = 64) -> None:
@@ -153,13 +186,22 @@ class ProgramNodeAttemptPublisher:
         self._sent = 0
         self._failed = False
         self._notice_pending = False
+        # Losses not yet carried by a delivered batch: (count, first UTC ns,
+        # last UTC ns), or None.
+        self._unreported = None
 
     def submit(self, facts) -> None:
+        self._submit(("attempts", facts))
+
+    def submit_run_event(self, event) -> None:
+        self._submit(("run_events", event))
+
+    def _submit(self, entry) -> None:
         with self._condition:
             if self._closed or len(self._pending) >= self._capacity:
                 self._loss_locked(1)
                 return
-            self._pending.append(facts)
+            self._pending.append(entry)
             if self._thread is None:
                 thread = Thread(target=self._run, name="program-node-attempts", daemon=True)
                 try:
@@ -176,6 +218,17 @@ class ProgramNodeAttemptPublisher:
         if not self._failed:
             self._notice_pending = True
         self._failed = True
+        now = time_ns()
+        self._unreport_locked((count, now, now))
+
+    def _unreport_locked(self, loss) -> None:
+        if self._unreported is None:
+            self._unreported = loss
+        else:
+            count, first, last = self._unreported
+            self._unreported = (
+                min(_MAX_COUNT, count + loss[0]), min(first, loss[1]), max(last, loss[2])
+            )
 
     def _run(self) -> None:
         while True:
@@ -183,23 +236,39 @@ class ProgramNodeAttemptPublisher:
                 self._condition.wait_for(lambda: self._pending or self._closed)
                 if not self._pending:
                     return
-                attempts = [
+                entries = [
                     self._pending.popleft()
                     for _ in range(min(self._batch, len(self._pending)))
                 ]
                 lost = self._lost
+                unreported, self._unreported = self._unreported, None
+            batch = {"attempts": [], "run_events": []}
+            for kind, entry in entries:
+                batch[kind].append(entry)
             try:
                 result = self._send({
-                    "schema_version": "manyforge.program_node_attempt_batch.v1",
+                    "schema_version": "manyforge.program_node_attempt_batch.v2",
                     "application_start_id": self._application_start_id,
-                    "attempts": attempts,
+                    **batch,
+                    "lost_since_last_batch": (
+                        None
+                        if unreported is None
+                        else {
+                            "count": unreported[0],
+                            "first_lost_wall": _wall(unreported[1]),
+                            "last_lost_wall": _wall(unreported[2]),
+                        }
+                    ),
                 })
                 recorded = result.get("recorded")
-                if type(recorded) is not int or not 0 <= recorded <= len(attempts):
+                if type(recorded) is not int or not 0 <= recorded <= len(entries):
                     raise RuntimeError("Historian rejected Program node attempts")
             except Exception:
                 with self._condition:
-                    self._loss_locked(len(attempts))
+                    # The losses it carried go with the next batch.
+                    if unreported is not None:
+                        self._unreport_locked(unreported)
+                    self._loss_locked(len(entries))
                     notice, self._notice_pending = self._notice_pending, False
                 if notice:
                     _LOGGER.exception(
@@ -208,8 +277,8 @@ class ProgramNodeAttemptPublisher:
             else:
                 with self._condition:
                     self._sent = min(_MAX_COUNT, self._sent + recorded)
-                    if recorded < len(attempts):
-                        self._loss_locked(len(attempts) - recorded)
+                    if recorded < len(entries):
+                        self._loss_locked(len(entries) - recorded)
                     notice, self._notice_pending = self._notice_pending, False
                     recovered = self._failed and lost == self._lost
                     if recovered:

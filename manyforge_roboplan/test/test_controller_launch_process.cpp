@@ -1037,6 +1037,31 @@ TEST(ControllerLaunchSupervisor, AnExitedLaunchIsAFaultAndIsNeverRestartedByItse
   EXPECT_TRUE(supervisor.observe("dual_lite6")->running);
 }
 
+TEST(ControllerLaunchOutputTail, KeepsTheLastLinesWithinTheByteBoundOnACharacterBoundary) {
+  EXPECT_EQ(LaunchOutputTailDetail(""), "");
+  EXPECT_EQ(LaunchOutputTailDetail("\n \r\n"), "");
+  EXPECT_EQ(LaunchOutputTailDetail("first\nlast line\n\n"), "first\nlast line");
+
+  std::string lines;
+  for (int index = 0; index < 50; ++index) lines += "line " + std::to_string(index) + "\n";
+  const auto last_lines = LaunchOutputTailDetail(lines);
+  EXPECT_EQ(std::count(last_lines.begin(), last_lines.end(), '\n'),
+            static_cast<std::ptrdiff_t>(kLaunchOutputTailLines - 1U));
+  EXPECT_TRUE(last_lines.starts_with("line 10\n"));
+  EXPECT_TRUE(last_lines.ends_with("line 49"));
+
+  // 5000 bytes of two-byte characters: the cut never splits one.
+  std::string wide;
+  for (int index = 0; index < 2500; ++index) wide += "\xc3\xa9";
+  const auto bounded = LaunchOutputTailDetail(wide);
+  EXPECT_LE(bounded.size(), kLaunchOutputTailBytes);
+  EXPECT_GE(bounded.size(), kLaunchOutputTailBytes - 1U);
+  EXPECT_EQ(static_cast<unsigned char>(bounded.front()), 0xc3U);
+
+  // Text that is not NFC (a decomposed accent) is left out.
+  EXPECT_EQ(LaunchOutputTailDetail("Cafe\xcc\x81"), "");
+}
+
 TEST(ControllerLaunchSupervisor, StartHeaderBoundsDisplayButRetainsFullLaunchIdentity) {
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
@@ -1289,6 +1314,15 @@ TEST(ControllerLaunchSupervisor, MemoryOutputCapsRecentLinesAndRawBytes) {
   EXPECT_TRUE(lines.truncated);
   EXPECT_NE(lines.tail.find("existing.cclc.2099"), std::string::npos);
   EXPECT_EQ(lines.tail.find("existing.cclc.0\""), std::string::npos);
+  // A launch fault's detail is the end of the same retained output.
+  const auto detail = started.process->output_tail_detail();
+  EXPECT_EQ(detail, LaunchOutputTailDetail(lines.tail));
+  EXPECT_LE(detail.size(), kLaunchOutputTailBytes);
+  EXPECT_NE(detail.find("existing.cclc.2099"), std::string::npos);
+  // A fault's search covers the whole retained output, beyond the detail.
+  EXPECT_TRUE(started.process->output_contains(lines.tail.substr(0U, 64U)));
+  EXPECT_TRUE(started.process->output_contains("existing.cclc.2099"));
+  EXPECT_FALSE(started.process->output_contains("existing.cclc.0\""));
   EXPECT_TRUE(started.process->append_incident_correlation(
       "existing.cclc.large", "",
       std::string(200U * 1024U, 'x') + "final detail"));

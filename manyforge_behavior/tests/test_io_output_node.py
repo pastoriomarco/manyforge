@@ -31,6 +31,7 @@ from manyforge_behavior.production_ports import (
 )
 
 from .v3_fixtures import signal, target, target_binding
+from .gateway_fakes import transport_gateway
 
 _A = "sha256:" + "a" * 64
 _B = "sha256:" + "b" * 64
@@ -127,7 +128,7 @@ def _inputs(value: Any = True, signal_name: str = "do_0") -> OwnerNodeInputs:
 
 def _port(transport: _Transport | None = None, context: ProgramRunPortContext | None = None):
     transport = transport or _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(context or _context())
     return port, transport
 

@@ -31,7 +31,7 @@ class SqliteRecordWriter;
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.h1a.v25";
+    "manyforge.internal.component-manager.apply-journal.v25";
 /// v25: no Deployment artifact id (OD-369).
 /// v24: metadata `records_lost`, set by the record writer when records of this
 /// start were not written.

@@ -6,18 +6,16 @@ import argparse
 from collections.abc import Sequence
 import os
 from pathlib import Path
+import signal
 import sys
+import threading
 
-import uvicorn
-
-from manyforge_headless_api.internal_http import (
-    INTERNAL_HTTP_SERVER_KEEP_ALIVE_SECONDS,
-)
+from manyforge_headless_api.logging_setup import LOG_LEVELS, setup_logging, stop_logging
 from manyforge_headless_api.program_model_transport import (
     OpenAICompatibleProgramModelTransport,
 )
 
-from .app import create_app
+from .app import ProgramRunnerApplication
 from .runtime import (
     ProgramRunnerConfig,
     ProgramRunnerError,
@@ -38,9 +36,30 @@ def _end_now(status: int) -> None:
     can crash inside rclpy and hide the real failure.
     """
 
+    # _exit skips atexit: write the queued log lines first.
+    stop_logging()
     sys.stdout.flush()
     sys.stderr.flush()
     _exit_now(status)
+
+
+def _serve(application: ProgramRunnerApplication) -> None:
+    """Serve until SIGTERM or SIGINT, then stop serving and shut down."""
+
+    stop = threading.Event()
+    previous = {
+        number: signal.signal(number, lambda _number, _frame: stop.set())
+        for number in (signal.SIGTERM, signal.SIGINT)
+    }
+    try:
+        application.start()
+        stop.wait()
+    finally:
+        try:
+            application.close()
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
 
 
 def _application_start_id(text: str) -> int:
@@ -52,8 +71,9 @@ def _application_start_id(text: str) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="manyforge-program-runner")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=9011)
+    # The private directory of program-command.sock and program-status.sock
+    # (the Manager run root).
+    parser.add_argument("--program-socket-root", type=Path, required=True)
     parser.add_argument("--headless-url", default="http://127.0.0.1:9010")
     parser.add_argument("--execution-run-root", type=Path, required=True)
     parser.add_argument("--cycle-journal-path", type=Path, required=True)
@@ -71,11 +91,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tick-workers", type=int, default=4)
     parser.add_argument("--snapshot-url")
     parser.add_argument("--simulation-control-config")
+    # Structured JSON lines on stderr.
+    parser.add_argument("--log-level", default="INFO", choices=LOG_LEVELS)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    setup_logging(args.log_level, process="program_runner")
     runtime: ProgramRuntime | None = None
     model_transport = None
     snapshot_source = None
@@ -95,6 +118,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             manager_liveness_socket=args.manager_liveness_socket,
             cell_id=args.cell_id,
             persistent_key_register_directory=args.persistent_key_register_directory,
+            manager_run_root=args.program_socket_root,
         )
         # Program model calls go to the active Deployment's AI model component.
         model_transport = OpenAICompatibleProgramModelTransport()
@@ -126,18 +150,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             snapshot_source=snapshot_source,
             simulation_control=simulation_control,
         )
-        uvicorn.run(
-            create_app(runtime),
-            host=args.host,
-            port=args.port,
-            access_log=False,
-            timeout_keep_alive=INTERNAL_HTTP_SERVER_KEEP_ALIVE_SECONDS,
-        )
+        _serve(ProgramRunnerApplication(runtime, args.program_socket_root))
         return 0
     except (ProgramRunnerError, ValueError) as error:
         code = getattr(error, "code", "program_runner_configuration_invalid")
         print(f"{code}: {error}", file=sys.stderr)
-        status = 69 if "unavailable" in code else 65
+        if code == "program_runner_socket_unavailable":
+            # A socket another runner serves (or one that cannot be bound)
+            # ends the start with the exit status of the former port bind.
+            status = 1
+        else:
+            status = 69 if "unavailable" in code else 65
         return status
     finally:
         try:

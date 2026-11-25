@@ -834,7 +834,7 @@ compiler_contract_candidate(std::string_view own_digest) {
                 "other-policy-tables-empty")},
            {"compatibility",
             CanonicalValue("closed-provides-tags-metadata")},
-           {"i3_retention_subset",
+           {"retention_subset",
             CanonicalValue(
                 "passive-or-one-bounded-controllable-component-or-exact-"
                 "ros2-control-execution-host")},
@@ -1590,11 +1590,11 @@ void require_compiler_contract_nested_shapes(
   require_exact_fields(accepted,
                        {"deployment_api_version", "qualified_catalog_kinds",
                         "unqualified_catalog_kinds", "assistant", "policies",
-                        "compatibility", "i3_retention_subset"},
+                        "compatibility", "retention_subset"},
                        "compiler_contract_manifest.accepted_deployment_subset");
   for (const std::string_view name :
        {"deployment_api_version", "assistant", "policies", "compatibility",
-        "i3_retention_subset"}) {
+        "retention_subset"}) {
     (void)require_text(
         require_member(accepted, name,
                        "compiler_contract_manifest."

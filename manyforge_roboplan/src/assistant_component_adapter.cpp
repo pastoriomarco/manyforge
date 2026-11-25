@@ -59,6 +59,7 @@ ComponentProcessCommand assistant_host_command(const AssistantSettings &settings
 
 core::ComponentState AssistantComponentState(const bool process_started,
                                              const std::optional<std::string> &exit_reason,
+                                             std::string output_tail,
                                              const bool serving,
                                              const AssistantHostObservation &observed,
                                              const std::int64_t stream_budget_ns,
@@ -80,6 +81,8 @@ core::ComponentState AssistantComponentState(const bool process_started,
                               std::nullopt,
                               {},
                               now_ns};
+    if (!output_tail.empty())
+      state.fault->details.emplace("output_tail", std::move(output_tail));
   } else if (serving && !observed.endpoint.empty()) {
     state.lifecycle = core::ComponentLifecycle::kEnabled;
     if (observed.busy) state.activity = core::ComponentActivity::kBusy;
@@ -120,8 +123,20 @@ core::ComponentState AssistantComponentAdapter::State(const std::int64_t now_ns)
     process = process_;
     serving = serving_;
   }
-  return AssistantComponentState(process != nullptr,
-                                 process ? process->exited() : std::nullopt, serving, observed,
+  auto exit_reason = process ? process->exited() : std::nullopt;
+  if (exit_reason) {
+    // An exit is reported only for the current process: one that Prepare or
+    // Recover replaced (and stopped) meanwhile reads as the current slot.
+    const std::lock_guard lock(mutex_);
+    if (process_ != process) {
+      process = process_;
+      serving = serving_;
+      exit_reason.reset();
+    }
+  }
+  return AssistantComponentState(process != nullptr, exit_reason,
+                                 exit_reason ? process->output_tail() : std::string(), serving,
+                                 observed,
                                  static_cast<std::int64_t>(settings_.stream_budget_s * 1e9),
                                  now_ns);
 }
@@ -147,7 +162,10 @@ core::ActionResult AssistantComponentAdapter::Run(const core::ComponentAction ac
         serving_ = false;
       }
       link_->SetServing(false);
-      previous.reset();  // stops the old host and its bridge
+      // Stops the old host and its bridge on this (the action's) thread,
+      // outside the adapter lock: a State() reader's copy then only releases it.
+      if (previous) previous->stop();
+      previous.reset();
       try {
         auto started = start_process_(assistant_host_command(settings_, ros_namespace_));
         const std::lock_guard lock(mutex_);

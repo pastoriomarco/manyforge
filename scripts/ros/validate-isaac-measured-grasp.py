@@ -17,7 +17,7 @@ from numbers import Real
 from typing import Any, Iterable, Sequence
 
 
-UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: live measured-grasp qualification is not "
     "available yet"

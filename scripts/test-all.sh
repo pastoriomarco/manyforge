@@ -18,22 +18,22 @@ SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
 if [[ "$SCRIPT_DIR" == "${BASH_SOURCE[0]}" ]]; then
     SCRIPT_DIR="."
 fi
-# shellcheck source=lib/composable-cell-runtime-availability.sh
-source "$SCRIPT_DIR/lib/composable-cell-runtime-availability.sh"
+# shellcheck source=lib/runtime-availability.sh
+source "$SCRIPT_DIR/lib/runtime-availability.sh"
 
 # No argument and literal `all` selected the historical product-wide matrix,
 # including bindings, integration, runtime qualification, and native lanes.
 # Reusing either spelling for today's smaller retained subset would report a
 # false green.  Reject both before build defaults, imports, or suite runners.
 if (( $# == 0 )); then
-    manyforge_fail_composable_cell_runtime_unavailable
+    manyforge_fail_runtime_unavailable
 fi
 if (( $# > 1 )); then
     echo "test-all.sh accepts exactly one suite name" >&2
     exit 2
 fi
 if [[ "$1" == "all" ]]; then
-    manyforge_fail_composable_cell_runtime_unavailable
+    manyforge_fail_runtime_unavailable
 fi
 FILTER="$1"
 
@@ -691,7 +691,7 @@ run_observability_client_tests() {
 
 run_integration_tests() {
     section "Integration tests"
-    manyforge_fail_composable_cell_runtime_unavailable
+    manyforge_fail_runtime_unavailable
 }
 
 run_bridge_tests() {

@@ -49,6 +49,9 @@ _safe_inventory_path = run_session._safe_inventory_path
 
 
 CONSOLE_TAIL_BYTES = 10_000_000
+# Completed console captures kept in a state root's evidence/, whatever the
+# disk use; the oldest beyond are deleted by the same bounded pass.
+MAXIMUM_CONSOLE_CAPTURES = 10
 _MAX_DELETIONS = 8
 _MAX_SCAN_ENTRIES = 100_000
 _RECEIPT_PARTIAL = re.compile(r"\.mounted-[0-9a-f]{64}\.partial\Z")
@@ -436,10 +439,28 @@ def _units(root: Path, *, sibling: bool = False, ownership_root: Path | None = N
     return [(folder, "sibling root (not this quiescent owner)" if sibling else reason, order) for folder, reason, order in units]
 
 
+def _capture_beyond_count(root: Path, units: list) -> Path | None:
+    """The oldest deletable completed, owned capture of ``root`` beyond the count.
+
+    Every completed, owned capture counts; the newest, partial, unknown and
+    otherwise protected ones are never chosen.
+    """
+    captures = [(order, str(folder), reason) for folder, _, reason, order in units
+                if folder.parent == root / "evidence" and order is not None]
+    if len(captures) <= MAXIMUM_CONSOLE_CAPTURES:
+        return None
+    eligible = sorted((order, name) for order, name, reason in captures if reason is None)
+    return Path(eligible[0][1]) if eligible else None
+
+
 def rotate_retained_logs(root: Path, policy: SiteRetentionPolicy, *,
                          disk_facts: Callable[[int], DiskFacts] = _disk_facts,
                          default_roots: Path | None = None) -> RetentionResult:
-    """One pass, only before start/after confirmed stop and a no-users check."""
+    """One pass, only before start/after confirmed stop and a no-users check.
+
+    Console captures beyond MAXIMUM_CONSOLE_CAPTURES go first, then units
+    under disk pressure; at most _MAX_DELETIONS attempts in all.
+    """
     deleted: list[str] = []
     root_fd = -1
     resources = ExitStack()
@@ -512,22 +533,24 @@ def rotate_retained_logs(root: Path, policy: SiteRetentionPolicy, *,
                             owned_bytes += size
                             reason = failures.get(folder) or reason or (None if safe else "symlink or special file in retained unit")
                             units.append((folder, row, reason, order))
-            facts = disk_facts(root_fd)
-            _check_root_identity(root, root_fd)
-            if facts.total_bytes <= 0 or facts.free_bytes < 0:
-                raise ValueError("invalid filesystem capacity facts")
-            if owned_bytes * 100 <= facts.total_bytes * policy.max_disk_percent and facts.free_bytes >= policy.min_free_bytes:
-                warning = "; ".join([*observations, *(f"{folder}: {reason}" for folder, reason in failures.items())])[:4096] or None
-                return RetentionResult(tuple(deleted), warning)
-            eligible = sorted((folder for folder, _, reason, order in units if reason is None and order is not None),
-                              key=lambda folder: (next(order for path, _, _, order in units if path == folder), str(folder)))
-            if not eligible or len(deleted) + len(failures) >= _MAX_DELETIONS:
-                detail = "; ".join([*(f"{folder}: {reason}" for folder, reason in failures.items()), *observations,
-                                    *(f"{folder}: {reason}" for folder, _, reason, _ in units if reason is not None and folder not in failures)])
-                scope = "default-root aggregate" if default_roots is not None else "configured-root"
-                return RetentionResult(tuple(deleted), f"{scope} log/evidence pressure remains (measured owned={owned_bytes} bytes{', lower bound' if observations else ''}, filesystem free={facts.free_bytes} bytes); "
-                    f"{'bounded deletion pass complete' if eligible else 'only protected material remains'}; protected: {detail[:4096]}")
-            victim = eligible[0]
+            victim = _capture_beyond_count(root, units) if len(deleted) + len(failures) < _MAX_DELETIONS else None
+            if victim is None:
+                facts = disk_facts(root_fd)
+                _check_root_identity(root, root_fd)
+                if facts.total_bytes <= 0 or facts.free_bytes < 0:
+                    raise ValueError("invalid filesystem capacity facts")
+                if owned_bytes * 100 <= facts.total_bytes * policy.max_disk_percent and facts.free_bytes >= policy.min_free_bytes:
+                    warning = "; ".join([*observations, *(f"{folder}: {reason}" for folder, reason in failures.items())])[:4096] or None
+                    return RetentionResult(tuple(deleted), warning)
+                eligible = sorted((folder for folder, _, reason, order in units if reason is None and order is not None),
+                                  key=lambda folder: (next(order for path, _, _, order in units if path == folder), str(folder)))
+                if not eligible or len(deleted) + len(failures) >= _MAX_DELETIONS:
+                    detail = "; ".join([*(f"{folder}: {reason}" for folder, reason in failures.items()), *observations,
+                                        *(f"{folder}: {reason}" for folder, _, reason, _ in units if reason is not None and folder not in failures)])
+                    scope = "default-root aggregate" if default_roots is not None else "configured-root"
+                    return RetentionResult(tuple(deleted), f"{scope} log/evidence pressure remains (measured owned={owned_bytes} bytes{', lower bound' if observations else ''}, filesystem free={facts.free_bytes} bytes); "
+                        f"{'bounded deletion pass complete' if eligible else 'only protected material remains'}; protected: {detail[:4096]}")
+                victim = eligible[0]
             before = next(row for folder, row, _, _ in units if folder == victim)
             try:
                 parent_fd = _open_relative_directory(root_fd, victim.relative_to(root).parent)

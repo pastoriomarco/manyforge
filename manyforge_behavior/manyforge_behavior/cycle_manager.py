@@ -26,7 +26,7 @@ from manyforge_behavior.fault_taxonomy import (
 
 
 CYCLE_MANAGER_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_cycle_manager_unavailable"
+    "cycle_manager_unavailable"
 )
 
 

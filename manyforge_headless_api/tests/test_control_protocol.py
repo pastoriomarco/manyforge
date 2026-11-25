@@ -69,6 +69,10 @@ def test_freshness_is_stateless_signed_and_expires_at_exact_backend_boundary() -
             received_at_ns=issued_at + CONTROL_FRESHNESS_VALID_FOR_NS + 1,
         )
     assert expired.value.code == "control_freshness_expired"
+    assert expired.value.details == {
+        "elapsed_ns": CONTROL_FRESHNESS_VALID_FOR_NS + 1,
+        "valid_for_ns": CONTROL_FRESHNESS_VALID_FOR_NS,
+    }
 
 
 def test_freshness_age_is_measured_at_receipt_not_at_validation() -> None:
@@ -93,6 +97,18 @@ def test_freshness_age_is_measured_at_receipt_not_at_validation() -> None:
             context, current_control_revision=4, received_at_ns=received_late
         )
     assert expired.value.code == "control_freshness_expired"
+
+
+def test_a_refusal_detail_beyond_the_json_safe_range_is_decimal_text() -> None:
+    clock = ManualClock()
+    authority = ControlFreshnessAuthority(clock_ns=clock, secret=b"x" * 32)
+    context = _envelope(authority).freshness
+    with pytest.raises(ControlProtocolError) as expired:
+        authority.validate(
+            context, current_control_revision=4, received_at_ns=clock.now_ns + 2**53
+        )
+    assert expired.value.details["elapsed_ns"] == str(2**53)
+    assert expired.value.details["valid_for_ns"] == CONTROL_FRESHNESS_VALID_FOR_NS
 
 
 def test_freshness_profile_and_delta_shape_are_one_closed_contract() -> None:
@@ -128,6 +144,10 @@ def test_freshness_rejects_tamper_and_revision() -> None:
             context, current_control_revision=5, received_at_ns=clock.now_ns
         )
     assert rejected.value.code == "control_projection_stale"
+    assert rejected.value.details == {
+        "expected_execution_control_revision": 4,
+        "current_execution_control_revision": 5,
+    }
 
     # A middle character carries six signature bits (the last one carries
     # only two, and may already be "A"): any change alters the token.

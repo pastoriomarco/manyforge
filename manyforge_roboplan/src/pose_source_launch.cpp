@@ -1,7 +1,6 @@
 #include <manyforge_roboplan/pose_source_launch.hpp>
 
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_core/types/component_lifecycle.hpp>
 
 #include <fstream>
 #include <sstream>
@@ -14,21 +13,6 @@ using content_identity::CanonicalValue;
 
 [[noreturn]] void fail(const std::string &message) {
   throw ControllerLaunchProcessError("pose source launch: " + message);
-}
-
-// The last bytes of `text` that fit one diagnostic detail value, starting on
-// a UTF-8 boundary; empty when they are not valid NFC text.
-std::string tail_detail(std::string_view text) {
-  while (!text.empty() &&
-         (text.back() == '\n' || text.back() == '\r' || text.back() == ' '))
-    text.remove_suffix(1U);
-  if (text.size() > core::kMaxLifecycleErrorDetailValueBytes)
-    text.remove_prefix(text.size() - core::kMaxLifecycleErrorDetailValueBytes);
-  while (!text.empty() &&
-         (static_cast<unsigned char>(text.front()) & 0xC0U) == 0x80U)
-    text.remove_prefix(1U);
-  return content_identity::is_utf8_nfc(text) ? std::string(text)
-                                             : std::string();
 }
 
 } // namespace
@@ -185,28 +169,26 @@ bool pose_source_launch_survives(
              pose_source_launch_command(*candidate, "survival").identity;
 }
 
+std::string pose_source_child_config_invalid_text() {
+  return "exit code " + std::to_string(kPoseSourceConfigInvalidExitStatus);
+}
+
 core::ErrorDTO pose_source_exit_fault(std::string reason,
                                       const std::optional<int> exit_status,
-                                      const std::string_view output_tail,
+                                      const bool child_config_invalid,
+                                      std::string output_tail,
                                       const ControllerLaunchLane lane) {
   const bool ai_model = lane == ControllerLaunchLane::kAiModel;
-  // `ros2 launch` itself ends normally; it reports its child's status as
-  // "process has died [pid N, exit code 78, ...]".
   const bool config_invalid =
-      exit_status == kPoseSourceConfigInvalidExitStatus ||
-      output_tail.find("exit code " +
-                       std::to_string(kPoseSourceConfigInvalidExitStatus)) !=
-          std::string_view::npos;
-  if (!config_invalid)
-    return {std::string(ai_model ? kAiModelExitedCode : kPoseSourceExitedCode),
-            std::move(reason),
-            {}};
-  core::ErrorDTO fault{std::string(ai_model ? kAiModelConfigInvalidCode
-                                            : kPoseSourceConfigInvalidCode),
-                       std::move(reason),
-                       {}};
-  if (auto detail = tail_detail(output_tail); !detail.empty())
-    fault.details.emplace("output_tail", std::move(detail));
+      exit_status == kPoseSourceConfigInvalidExitStatus || child_config_invalid;
+  core::ErrorDTO fault{
+      std::string(config_invalid
+                      ? (ai_model ? kAiModelConfigInvalidCode : kPoseSourceConfigInvalidCode)
+                      : (ai_model ? kAiModelExitedCode : kPoseSourceExitedCode)),
+      std::move(reason),
+      {}};
+  if (!output_tail.empty())
+    fault.details.emplace("output_tail", std::move(output_tail));
   return fault;
 }
 
@@ -219,9 +201,12 @@ pose_source_fault_source(std::shared_ptr<ControllerLaunchProcess> process) {
     if (!reason)
       return std::nullopt;
     const auto evidence = process->exit_evidence();
+    // The retained output is searched and bounded under its own lock, never
+    // copied whole.
     return pose_source_exit_fault(
         std::move(*reason), evidence ? evidence->exit_status : std::nullopt,
-        process->output_snapshot().tail, process->command().lane);
+        process->output_contains(pose_source_child_config_invalid_text()),
+        process->output_tail_detail(), process->command().lane);
   };
 }
 

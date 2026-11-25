@@ -19,7 +19,7 @@ class SqliteRecordWriter;
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerBootstrapJournalSchemaId =
-    "manyforge.internal.component-manager.bootstrap-journal.i4.v2";
+    "manyforge.internal.component-manager.bootstrap-journal.v2";
 /// v2: metadata `records_lost`, set by the record writer when records of this
 /// start were not written.
 inline constexpr std::int64_t kManagerBootstrapJournalSchemaVersion = 2;

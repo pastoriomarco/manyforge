@@ -39,7 +39,7 @@ namespace manyforge::core {
 /// is an index of journal_records sequences; each Stop payload is stored once,
 /// in journal_records.
 inline constexpr std::string_view kOperationJournalSchemaId =
-    "manyforge.internal.execution.operation-journal.o1.5.v23";
+    "manyforge.internal.execution.operation-journal.v23";
 inline constexpr std::int64_t kOperationJournalSchemaVersion = 23;
 inline constexpr std::int64_t kOperationJournalSqliteApplicationId = 0x4D46454A;
 inline constexpr std::string_view kOperationJournalFilename = "operation-journal.sqlite3";

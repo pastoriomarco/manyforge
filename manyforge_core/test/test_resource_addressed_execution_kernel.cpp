@@ -9123,11 +9123,13 @@ TEST(ResourceAddressedExecutionKernelTest,
           }});
   auto& kernel = *kernel_heap_test_owner;
   const ProgramRunResolutionContext context = std::make_shared<const int>(234);
+  EXPECT_FALSE(kernel.held_program_run_resolution_context());
   establish_program_as(kernel, intent.program_revision,
                        intent.program_binding_id, std::nullopt, std::nullopt, context);
   EXPECT_EQ(kernel.program_run_resolution_context(ProgramRunNumber(1U)), context);
   EXPECT_FALSE(kernel.program_run_resolution_context(ProgramRunNumber(2U)));
   EXPECT_FALSE(kernel.program_run_resolution_context(std::nullopt));
+  EXPECT_EQ(kernel.held_program_run_resolution_context(), context);
 
   const auto result = kernel.execute(intent);
   ASSERT_TRUE(result.ok()) << result.error().message;

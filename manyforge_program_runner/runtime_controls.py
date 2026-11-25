@@ -11,7 +11,7 @@ from copy import deepcopy
 import hashlib
 from threading import RLock
 import time
-from typing import Any, Final, Mapping
+from typing import Any, Callable, Final, Mapping
 import unicodedata
 
 import rfc8785
@@ -23,6 +23,8 @@ from manyforge_behavior.recovery import (
     is_non_moving_recovery,
     recovery_retry_permitted,
 )
+
+from .diagnostics import program_run_event
 
 
 RUNTIME_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v4"
@@ -99,7 +101,10 @@ class ProgramRuntimeControls:
         capture: Mapping[str, Any],
         *,
         recovery_fences: Mapping[str, Any] | None = None,
+        history: Callable[[Mapping[str, Any]], None] | None = None,
     ) -> None:
+        """``history`` takes each audit event, stamped as it is appended, for
+        History (a non-waiting submit); the audit ring is unchanged."""
         required = {
             "program_run_id",
             "program_revision",
@@ -123,6 +128,7 @@ class ProgramRuntimeControls:
         ):
             raise ValueError("runtime controls require exact recovery fences")
         self._recovery_fences = deepcopy(fences)
+        self._history = history
         self._revision = 1
         self._audit: list[dict[str, Any]] = []
         self._retry_counts: dict[str, int] = {}
@@ -145,15 +151,22 @@ class ProgramRuntimeControls:
 
     def _event(self, kind: str, *, reserved_after: int = 1, **facts: Any) -> None:
         self.require_event_revisions(reserved_after=reserved_after)
-        self._audit.append(
-            {
-                "event_revision": self._revision,
-                "kind": kind,
-                **deepcopy(facts),
-            }
-        )
+        entry = {
+            "event_revision": self._revision,
+            "kind": kind,
+            **deepcopy(facts),
+        }
+        self._audit.append(entry)
         del self._audit[:-_MAX_AUDIT]
         self._revision += 1
+        if self._history is not None:
+            # The same facts, never changed after this append.
+            self._history(program_run_event(
+                self.program_run_id,
+                kind,
+                "recorded",
+                {name: value for name, value in entry.items() if name != "kind"},
+            ))
 
     def require_event_revisions(
         self, *, events: int = 1, reserved_after: int = 1

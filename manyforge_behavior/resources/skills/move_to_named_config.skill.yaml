@@ -5,7 +5,7 @@
   "name": "Move to named configuration",
   "description": "Expand a caller-selected source-model joint configuration into one ordinary motion node. The name is authoring context, not a deployed lookup or authority.",
   "compatible_profiles": [
-    "composable-cell-v1"
+    "manyforge-cell-v1"
   ],
   "parameters": [
     {

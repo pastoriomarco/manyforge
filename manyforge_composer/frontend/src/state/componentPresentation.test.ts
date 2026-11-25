@@ -51,6 +51,35 @@ describe('component model v2 wire parsing', () => {
     expect(() => parseComponentState({ ...robot, lifecycle: 'active' }, 'state')).toThrow();
   });
 
+  it('parses a fault\'s UTC start and a launch fault\'s output tail, both optional', () => {
+    const plain = parseComponentState(robot, 'state').fault!;
+    expect(plain).not.toHaveProperty('since_utc_ns');
+    expect(plain).not.toHaveProperty('output_tail');
+    expect(faultPresentation(plain)).toMatchObject({ since: null, outputTail: null });
+    const launched = parseComponentState({ ...robot, fault: {
+      ...robot.fault, since_utc_ns: '1795514400123000000',
+      details: { output_tail: 'Traceback\nValueError: bad config' },
+    }, stop: { code: 'estop', message: 'E-stop', since_ns: 5, since_utc_ns: 1_795_514_400_000_000_000 } }, 'state');
+    expect(launched.fault).toMatchObject({ since_utc_ns: '1795514400123000000', output_tail: 'Traceback\nValueError: bad config' });
+    expect(launched.stop?.since_utc_ns).toBe('1795514400000000000');
+    expect(faultPresentation(launched.fault!, 1_795_514_400_123 + 125_000)).toMatchObject({
+      since: 'since 2026-11-24 10:00:00.123 UTC (2 min ago)',
+      outputTail: 'Traceback\nValueError: bad config',
+    });
+    // An empty tail is no tail.
+    expect(parseComponentState({ ...robot, fault: { ...robot.fault, details: { output_tail: '' } } }, 'state').fault)
+      .not.toHaveProperty('output_tail');
+    expect(() => parseComponentState({ ...robot, fault: { ...robot.fault, since_utc_ns: -1 } }, 'state')).toThrow();
+  });
+
+  it('accepts a steady-clock since_ns above 2^53 as decimal text', () => {
+    const late = parseComponentState({ ...robot, fault: { ...robot.fault, since_ns: '9007199254740993' },
+      stop: { code: 'estop', message: 'E-stop', since_ns: '9007199254740993' } }, 'state');
+    expect(late.fault?.since_ns).toBe(Number('9007199254740993'));
+    expect(late.stop?.since_ns).toBe(Number('9007199254740993'));
+    expect(() => parseComponentState({ ...robot, fault: { ...robot.fault, since_ns: '01' } }, 'state')).toThrow();
+  });
+
   it('parses the optional read-only details', () => {
     expect(parseComponentState(robot, 'state')).not.toHaveProperty('details');
     const details = [{ name: 'Mode', value: '1' }, { name: 'Error code', value: 'C2' }];

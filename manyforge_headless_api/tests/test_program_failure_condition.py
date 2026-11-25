@@ -106,7 +106,7 @@ def _cycle(
     )
     failed = run_state != "running"
     run = {
-        "schema_version": "manyforge.program_run_status.v5",
+        "schema_version": "manyforge.program_run_status.v6",
         "owner_id": "runner",
         "run_revision": run_revision,
         "capture": capture,
@@ -115,6 +115,8 @@ def _cycle(
         "halt": None,
         "node_status_revision": run_revision,
         "node_statuses": {"move": "held" if failed else "running"},
+        "node_running_since_utc_ns": {},
+        "node_wait_values": {},
         "active_operation_count": 0,
         "reason_code": "planning_failed" if failed else None,
         "message": "original failure" if failed else "",
@@ -199,7 +201,7 @@ def source_and_observer():
     source = HeadlessControlStateSource(
         SimpleNamespace(),  # type: ignore[arg-type]
         ingress,
-        program_runner_websocket_url=None,
+        program_status=None,
         program_failure_observer=observer,
     )
     try:
@@ -239,7 +241,7 @@ def test_zero_client_demand_keeps_the_one_program_reader_running() -> None:
                 ),
             ),
             ingress,
-            program_runner_websocket_url=None,
+            program_status=None,
             program_failure_observer=observer,
         )
         try:

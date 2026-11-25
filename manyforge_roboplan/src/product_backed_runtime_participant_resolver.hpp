@@ -131,13 +131,16 @@ public:
 
   /// Resolve a read against the same immutable product as admission. This
   /// neither creates an OperationIntent nor grants execution authority.
+  /// `held_run` is the context of the capture the Kernel holds: a read of
+  /// that run's Binding resolves from it (OD-234), others read their sources.
   [[nodiscard]] core::Result<ResolvedTargetObservation>
   ResolveObservationTarget(const core::ProgramBindingId &program_binding_id,
                            const core::ProgramTargetReferenceDTO &target,
                            const core::CapabilityId &capability_id,
                            const core::RuntimeParticipantBinding &physical,
                            std::span<const core::RuntimeParticipantBinding>
-                               current_representatives) const;
+                               current_representatives,
+                           const core::ProgramRunResolutionContext &held_run = {}) const;
 
   /// Apply the exact collision-body projection already derived from this
   /// retained model map. Independent observation adapters use this instead of
@@ -161,10 +164,12 @@ public:
 
   /// Resolve the current TCP for a verified bound Scene holder: a frame of
   /// the holder, or (OD-372) of a component mounted on the holder's robot
-  /// that the robot's kinematics places.
+  /// that the robot's kinematics places. A holder of the held run's Binding
+  /// resolves from `held_run` (OD-234), as ResolveObservationTarget.
   [[nodiscard]] core::Result<core::ProgramFrameReferenceDTO> ResolveAttachActiveTcp(
       const core::ProgramBindingId &binding_id, const core::ProgramTargetReferenceDTO &holder,
-      const std::function<std::optional<ActiveTcp>(const core::ControllableComponentId &)> &read) const;
+      const std::function<std::optional<ActiveTcp>(const core::ControllableComponentId &)> &read,
+      const core::ProgramRunResolutionContext &held_run = {}) const;
 
   [[nodiscard]] core::Result<core::ProgramFrameBindingDTO> ResolveObservationFrame(
       const core::ProgramFrameReferenceDTO &reference) const;

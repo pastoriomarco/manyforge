@@ -7,11 +7,11 @@
   "description": "Mock UFACTORY UF850 with the xArm gripper as a mounted tool component: a joint move, gripper open and close, and the move back. Load and Execute the Program to watch it.",
   "members": {
     "deployment.yaml": "sha256:676d4290afa8e278e38771c2ca6486e7fa1e4fc54ae755d723f5495951d74f62",
-    "program.yaml": "sha256:c1b2d22b18b13f2270d70863753c14e32bc4ed726969a330527795276292edd0"
+    "program.yaml": "sha256:930c1699efd25a375dcae0f91912a57d1bd4e806cc233d9ad21de8d1cd50164d"
   },
   "name": "mock_uf850_xarm_gripper",
   "saved_status": {
-    "checked_content_digest": "sha256:c389ff737c87b2dd56a88baa5eeed195c9385c82dd9e0e2c268089bb98595223",
+    "checked_content_digest": "sha256:79685d244a7ffb0520263cc18a5c5598bc83facea1a45aec2126eb498adc7ad1",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

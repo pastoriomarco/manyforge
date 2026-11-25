@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 
 SNAPSHOT_CLIENT_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_snapshot_client_unavailable"
+    "snapshot_client_unavailable"
 )
 _MAXIMUM_SNAPSHOT_BYTES: Final = 4 * 1024 * 1024
 _MAXIMUM_SNAPSHOT_OBSERVERS: Final = 16

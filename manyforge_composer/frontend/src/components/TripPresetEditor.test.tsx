@@ -46,13 +46,13 @@ const entry = (id: string, name: string): CatalogEntry => ({
   requiredCapabilities: [],
   execution: { blocking: true, cancellable: true, ownerApi: 'kernel.operation' },
   runners: { py_trees: `${id}_v1` }, tags: [],
-  minProgramProfile: 'composable-cell-v1', blackboard: { reads: [], writes: [] },
+  minProgramProfile: 'manyforge-cell-v1', blackboard: { reads: [], writes: [] },
   ownerContext: null, outcomes: {}, eventFamily: null,
 });
 
 const program = {
   api_version: 'manyforge.program.v2',
-  program_profile: 'composable-cell-v1',
+  program_profile: 'manyforge-cell-v1',
   catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.7.0' },
   component_roles: {},
   target_roles: {},

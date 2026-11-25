@@ -50,7 +50,7 @@ namespace {
 using content_identity::CanonicalValue;
 using namespace std::chrono_literals;
 
-constexpr std::string_view kCellId = "c1_build_authority_cell";
+constexpr std::string_view kCellId = "canonical_empty_cell";
 
 TEST(HeadlessTypedErrors, ExistingRuntimeErrorsKeepTheirCodesAndMessages) {
   const EventHistorianError historian("historian_error", "history unavailable");
@@ -2294,10 +2294,11 @@ TEST(
   const auto &retention = Member(page, "retention");
   EXPECT_EQ(Text(retention, "partition_row_limit"), "4");
   const auto &partitions = Array(retention, "partitions");
-  ASSERT_EQ(partitions.size(), 2U);
-  for (const auto &partition : partitions) {
-    EXPECT_LE(std::stoull(Text(partition, "retained_count")), 4U);
-    EXPECT_GT(std::stoull(Text(partition, "pruned_count")), 0U);
+  ASSERT_EQ(partitions.size(), 3U);
+  // Routine and important; this test writes no node attempt.
+  for (std::size_t index = 0U; index < 2U; ++index) {
+    EXPECT_LE(std::stoull(Text(partitions[index], "retained_count")), 4U);
+    EXPECT_GT(std::stoull(Text(partitions[index], "pruned_count")), 0U);
   }
   EXPECT_LE(Array(page, "events").size(), 8U);
 }
@@ -2667,6 +2668,7 @@ TEST(HeadlessApiCore, ProgramResetOutcomesAreRecordedWithTheirFacts) {
     return CanonicalValue(CanonicalValue::Object{
         {"reload_initial_scene", CanonicalValue(true)},
         {"reset_robot_position", CanonicalValue(false)},
+        {"reset_stored_values", CanonicalValue(true)},
         {"program_run_id", CanonicalValue(7.0)},
         {"program_revision", CanonicalValue(Digest('1'))},
         {"applied_record_digest", CanonicalValue(Digest('2'))},
@@ -2702,14 +2704,24 @@ TEST(HeadlessApiCore, ProgramResetOutcomesAreRecordedWithTheirFacts) {
                        facts(CanonicalValue(nullptr), CanonicalValue(nullptr)))),
              "recorded")
           .storage()));
-  // A reset record needs its facts, complete scene revisions, its typed
-  // error on a failure, and only the Reset outcomes.
+  // A reset record needs its facts, all three options as booleans, complete
+  // scene revisions, its typed error on a failure, and only the Reset
+  // outcomes.
   auto missing = reset("succeeded", CanonicalValue(nullptr),
                        facts(CanonicalValue(nullptr), CanonicalValue(nullptr)))
                      .as_object();
   std::erase_if(missing, [](const auto &member) { return member.first == "reset"; });
+  const auto stored_values = [&](std::optional<CanonicalValue> value) {
+    auto changed = facts(CanonicalValue(nullptr), CanonicalValue(nullptr)).as_object();
+    std::erase_if(changed, [](const auto &member) {
+      return member.first == "reset_stored_values";
+    });
+    if (value) changed.emplace_back("reset_stored_values", std::move(*value));
+    return reset("succeeded", CanonicalValue(nullptr), CanonicalValue(std::move(changed)));
+  };
   for (auto invalid :
-       {CanonicalValue(std::move(missing)),
+       {CanonicalValue(std::move(missing)), stored_values(std::nullopt),
+        stored_values(CanonicalValue("true")),
         reset("succeeded", CanonicalValue(nullptr),
               facts(CanonicalValue(10.0), CanonicalValue(nullptr))),
         reset("succeeded", CanonicalValue(nullptr),
@@ -2747,6 +2759,9 @@ TEST(HeadlessApiCore, ProgramResetOutcomesAreRecordedWithTheirFacts) {
                 "program_runner:api.epoch.1");
     }
     EXPECT_EQ(Text(event, "component"), "manyforge.program_runner");
+    EXPECT_TRUE(std::get<bool>(
+        Member(Member(Member(event, "payload"), "reset"), "reset_stored_values")
+            .storage()));
     severities[Text(Member(event, "payload"), "outcome")] =
         Text(event, "severity");
   }
@@ -2885,6 +2900,287 @@ TEST(HeadlessApiCore, NodeAttemptsAndSceneChangesAreRecordedWithTheirFacts) {
                  "INFO"},
                 {"manyforge.scene/scene_change_finished/refused", "WARN"},
                 {"manyforge.scene/scene_change_finished/succeeded", "INFO"}}));
+}
+
+TEST(HeadlessApiCore, CommandsOutputWritesAndRunEventsAreRecordedWithCallers) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  using Object = CanonicalValue::Object;
+  const auto error = CanonicalValue(Object{
+      {"code", CanonicalValue("control_freshness_expired")},
+      {"message", CanonicalValue("Control is not fresh")}});
+  const auto caller = [](const std::string &transport) {
+    return CanonicalValue(Object{{"request_key", CanonicalValue("key.1")},
+                                 {"source_label", CanonicalValue("composer_ui")},
+                                 {"transport", CanonicalValue(transport)}});
+  };
+  const auto record = [](const std::string &kind, const std::string &subject,
+                         const std::string &outcome, CanonicalValue failure,
+                         const std::string &facts_name, Object facts,
+                         std::optional<CanonicalValue> who = std::nullopt) {
+    Object fields{
+        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"kind", CanonicalValue(kind)},
+        {"subject", CanonicalValue(subject)},
+        {"action", CanonicalValue(nullptr)},
+        {"outcome", CanonicalValue(outcome)},
+        {"error", std::move(failure)},
+        {"components", CanonicalValue(CanonicalValue::Array{})},
+        {"message", CanonicalValue(subject + " " + outcome)},
+        {facts_name, CanonicalValue(std::move(facts))}};
+    if (who) fields.emplace_back("caller", std::move(*who));
+    return CanonicalValue(std::move(fields));
+  };
+  const auto command = [&](const std::string &outcome, CanonicalValue failure,
+                           Object facts, std::optional<CanonicalValue> who) {
+    return record("command_finished", "execute", outcome, std::move(failure),
+                  "command", std::move(facts), std::move(who));
+  };
+  const auto output = [&](const std::string &outcome, CanonicalValue failure) {
+    return record("io_output_written", "gripper/DO3", outcome, std::move(failure),
+                  "io_output",
+                  Object{{"value", CanonicalValue(true)},
+                         {"duration_ms", CanonicalValue(2.5)},
+                         {"origin", CanonicalValue(nullptr)}},
+                  caller("http"));
+  };
+  const auto run_facts = [](CanonicalValue run, double revision) {
+    return Object{{"program_run_id", std::move(run)},
+                  {"occurred_at_ns", CanonicalValue("5000000000")},
+                  {"occurred_at_wall", CanonicalValue("2026-11-24T10:00:01.365+00:00")},
+                  {"program_revision", CanonicalValue(revision)}};
+  };
+  const auto run = [&](const std::string &subject, const std::string &outcome,
+                       CanonicalValue failure, double revision) {
+    return record("program_run_event", subject, outcome, std::move(failure),
+                  "run_event", run_facts(CanonicalValue(3.0), revision));
+  };
+  // Any kind may name its caller.
+  auto component = CanonicalValue(Object{
+      {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+      {"kind", CanonicalValue("component_action")},
+      {"subject", CanonicalValue("lite6_arm")},
+      {"action", CanonicalValue("enable")},
+      {"outcome", CanonicalValue("succeeded")},
+      {"error", CanonicalValue(nullptr)},
+      {"components", CanonicalValue(CanonicalValue::Array{})},
+      {"message", CanonicalValue("Enable lite6_arm succeeded")},
+      {"caller", caller("mcp")}});
+  for (auto valid :
+       {command("refused", error,
+                Object{{"repeat_count", CanonicalValue(3.0)},
+                       {"code", CanonicalValue("control_freshness_expired")}},
+                caller("ws")),
+        command("accepted", CanonicalValue(nullptr),
+                Object{{"repeat_count", CanonicalValue(1.0)}}, std::nullopt),
+        output("succeeded", CanonicalValue(nullptr)), output("failed", error),
+        run("program_run_started", "started", CanonicalValue(nullptr), 1.0),
+        run("program_run_finished", "failed", error, 2.0),
+        run("program_run_finished", "halted", CanonicalValue(nullptr), 3.0),
+        std::move(component)}) {
+    EXPECT_TRUE(std::get<bool>(
+        Member(core.RecordActivity(std::move(valid)), "recorded").storage()));
+  }
+  // A known transport, scalar facts, the required facts, a closed caller,
+  // the error only on a failed run event, and only the kind's outcomes.
+  auto no_run_id = run_facts(CanonicalValue(3.0), 1.0);
+  no_run_id.front() = {"node_instance_id", CanonicalValue("move")};
+  for (auto invalid :
+       {command("refused", error, Object{{"repeat_count", CanonicalValue(1.0)}},
+                caller("grpc")),
+        command("refused", error, Object{{"repeat_count", CanonicalValue(1.0)}},
+                CanonicalValue(Object{})),
+        command("refused", error, Object{{"repeat_count", CanonicalValue(1.0)}},
+                CanonicalValue(Object{{"user", CanonicalValue("x")}})),
+        command("refused", error,
+                Object{{"repeat_count", CanonicalValue(1.0)},
+                       {"details", CanonicalValue(Object{
+                                       {"reason", CanonicalValue("x")}})}},
+                std::nullopt),
+        command("refused", error, Object{{"code", CanonicalValue("x")}},
+                std::nullopt),
+        command("refused", error, Object{{"repeat_count", CanonicalValue(0.0)}},
+                std::nullopt),
+        record("command_finished", "Execute", "accepted", CanonicalValue(nullptr),
+               "command", Object{{"repeat_count", CanonicalValue(1.0)}}),
+        output("accepted", CanonicalValue(nullptr)),
+        record("program_run_event", "program_run_started", "started",
+               CanonicalValue(nullptr), "run_event", std::move(no_run_id)),
+        run("program_run_finished", "failed", CanonicalValue(nullptr), 1.0),
+        run("program_run_finished", "halted", error, 1.0),
+        run("program_run_finished", "Halted", CanonicalValue(nullptr), 1.0)}) {
+    try {
+      static_cast<void>(core.RecordActivity(std::move(invalid)));
+      FAIL() << "an invalid activity record was accepted";
+    } catch (const OperatorAlarmError &failure) {
+      EXPECT_EQ(failure.code(), "activity_record_invalid");
+    }
+  }
+
+  HistorianQuery query;
+  query.event_types = {"command_finished", "io_output_written",
+                       "program_run_started", "program_run_finished",
+                       "component_action_finished"};
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == 8U) break;
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 8U);
+  std::map<std::string, std::string> severities;
+  for (const auto &stored : Array(page, "events")) {
+    const auto &event = Member(stored, "event");
+    const auto &payload = Member(event, "payload");
+    if (Text(event, "component") == "manyforge.program_runner") {
+      // Stamped at production on the Runner's clocks.
+      EXPECT_EQ(Text(event, "occurred_at_ns"), "5000000000");
+      EXPECT_EQ(Text(event, "occurred_at_wall"), "2026-11-24T10:00:01.365+00:00");
+      EXPECT_EQ(Text(payload, "clock_owner"), "program_runner:api.epoch.1");
+    } else {
+      EXPECT_EQ(Text(payload, "clock_owner"), "headless:api.epoch.1");
+    }
+    if (Text(event, "event_type") == "io_output_written") {
+      EXPECT_EQ(Text(Member(payload, "caller"), "transport"), "http");
+    }
+    severities[Text(event, "component") + "/" + Text(event, "event_type") +
+               "/" + Text(payload, "outcome")] = Text(event, "severity");
+  }
+  // None of the three kinds is ERROR: no failure capture starts.
+  EXPECT_EQ(severities,
+            (std::map<std::string, std::string>{
+                {"lite6_arm/component_action_finished/succeeded", "INFO"},
+                {"manyforge.headless/command_finished/accepted", "INFO"},
+                {"manyforge.headless/command_finished/refused", "WARN"},
+                {"manyforge.io/io_output_written/failed", "WARN"},
+                {"manyforge.io/io_output_written/succeeded", "INFO"},
+                {"manyforge.program_runner/program_run_finished/failed", "WARN"},
+                {"manyforge.program_runner/program_run_finished/halted", "WARN"},
+                {"manyforge.program_runner/program_run_started/started", "INFO"}}));
+}
+
+TEST(HeadlessApiCore, LostRecordsAndCapturedMotionTracesAreRecordedAsWarnOrInfo) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  using Object = CanonicalValue::Object;
+  const auto error = CanonicalValue(Object{
+      {"code", CanonicalValue("motion_trace_write_failed")},
+      {"message", CanonicalValue("The trace could not be written")}});
+  const auto record = [](const std::string &kind, const std::string &subject,
+                         const std::string &outcome, CanonicalValue failure,
+                         const std::string &facts_name, Object facts) {
+    return CanonicalValue(Object{
+        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"kind", CanonicalValue(kind)},
+        {"subject", CanonicalValue(subject)},
+        {"action", CanonicalValue(nullptr)},
+        {"outcome", CanonicalValue(outcome)},
+        {"error", std::move(failure)},
+        {"components", CanonicalValue(CanonicalValue::Array{})},
+        {"message", CanonicalValue(subject + " " + outcome)},
+        {facts_name, CanonicalValue(std::move(facts))}});
+  };
+  const auto lost = [&](const std::string &subject, Object facts,
+                        const std::string &outcome = "lost",
+                        CanonicalValue failure = CanonicalValue(nullptr)) {
+    return record("records_lost", subject, outcome, std::move(failure),
+                  "records_lost", std::move(facts));
+  };
+  const auto trace = [&](const std::string &outcome, CanonicalValue failure) {
+    return record("motion_trace_captured", "lite6_arm", outcome, std::move(failure),
+                  "motion_trace",
+                  Object{{"file", CanonicalValue("trace-7.json")},
+                         {"cause", CanonicalValue("operation_failed")},
+                         {"operation_id", CanonicalValue(7.0)},
+                         {"bytes", CanonicalValue(4096.0)}});
+  };
+  const Object count{{"lost_count", CanonicalValue(3.0)},
+                     {"cause", CanonicalValue("queue_full")},
+                     {"first_lost_wall", CanonicalValue("2026-11-24T10:00:01Z")},
+                     {"last_lost_wall", CanonicalValue("2026-11-24T10:00:02Z")}};
+  for (auto valid : {lost("program_runner.node_attempts", count),
+                     lost("headless.activity", Object{{"lost_count", CanonicalValue(1.0)}}),
+                     trace("succeeded", CanonicalValue(nullptr)), trace("failed", error)}) {
+    EXPECT_TRUE(std::get<bool>(
+        Member(core.RecordActivity(std::move(valid)), "recorded").storage()));
+  }
+  Object nine = count;
+  for (const auto *name : {"a", "b", "c", "d", "e"}) nine.emplace_back(name, CanonicalValue(1.0));
+  for (auto invalid :
+       {lost("Program_Runner", count), lost(std::string(65U, 'a'), count),
+        lost("headless", Object{{"cause", CanonicalValue("queue_full")}}),
+        lost("headless", Object{{"lost_count", CanonicalValue(0.0)}}),
+        lost("headless", std::move(nine)), lost("headless", count, "failed", error),
+        lost("headless", count, "lost", error),
+        lost("headless", Object{{"lost_count", CanonicalValue(1.0)},
+                                {"details", CanonicalValue(Object{})}}),
+        trace("failed", CanonicalValue(nullptr)), trace("succeeded", error),
+        trace("lost", CanonicalValue(nullptr)),
+        record("motion_trace_captured", std::string(257U, 'a'), "succeeded",
+               CanonicalValue(nullptr), "motion_trace",
+               Object{{"file", CanonicalValue("trace.json")}})}) {
+    try {
+      static_cast<void>(core.RecordActivity(std::move(invalid)));
+      FAIL() << "an invalid activity record was accepted";
+    } catch (const OperatorAlarmError &failure) {
+      EXPECT_EQ(failure.code(), "activity_record_invalid");
+    }
+  }
+  HistorianQuery query;
+  query.event_types = {"historian_records_lost", "motion_trace_captured"};
+  query.components = {"manyforge.program_runner", "manyforge.headless", "manyforge.motion"};
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == 4U) break;
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 4U);
+  std::map<std::string, std::string> severities;
+  for (const auto &stored : Array(page, "events")) {
+    const auto &event = Member(stored, "event");
+    EXPECT_EQ(Text(Member(event, "payload"), "clock_owner"), "headless:api.epoch.1");
+    severities[Text(event, "component") + "/" + Text(event, "event_type") + "/" +
+               Text(Member(event, "payload"), "outcome")] = Text(event, "severity");
+  }
+  // Never ERROR: no failure capture starts.
+  EXPECT_EQ(severities,
+            (std::map<std::string, std::string>{
+                {"manyforge.headless/historian_records_lost/lost", "WARN"},
+                {"manyforge.motion/motion_trace_captured/failed", "WARN"},
+                {"manyforge.motion/motion_trace_captured/succeeded", "INFO"},
+                {"manyforge.program_runner/historian_records_lost/lost", "WARN"}}));
+}
+
+TEST(HeadlessApiCore, EachStartRecordsOneClockAnchor) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  HistorianQuery query;
+  query.event_types = {"clock_anchor"};
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (!Array(page, "events").empty()) break;
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 1U);
+  const auto &event = Member(Array(page, "events").front(), "event");
+  const auto &payload = Member(event, "payload");
+  EXPECT_EQ(Text(event, "component"), "manyforge.headless");
+  EXPECT_EQ(Text(event, "severity"), "INFO");
+  EXPECT_EQ(Text(payload, "clock_owner"), "headless:api.epoch.1");
+  // Headless's own event clock (the test clock) stamps the anchor.
+  const auto owner_ns = content_identity::parse_nonnegative_int64(
+      Member(payload, "owner_monotonic_ns"));
+  EXPECT_GT(owner_ns, 1000);
+  EXPECT_EQ(Text(event, "occurred_at_ns"), std::to_string(owner_ns));
+  EXPECT_GT(content_identity::parse_nonnegative_int64(
+                Member(payload, "raw_monotonic_ns")),
+            0);
+  EXPECT_EQ(Text(payload, "utc_wall"), "2026-08-05T00:00:00Z");
 }
 
 TEST(HeadlessApiCore,
@@ -3269,12 +3565,13 @@ TEST(HeadlessApiCore,
       std::get<bool>(Member(*recovered_motion, "reconciled").storage()));
   EXPECT_EQ(Unsigned(*recovered_motion, "unknown_source_count"), 0U);
 
+  // Two rows, plus the start's clock anchor.
   const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (HistoryCount(core) < 2U &&
+  while (HistoryCount(core) < 3U &&
          std::chrono::steady_clock::now() < deadline) {
     std::this_thread::yield();
   }
-  EXPECT_EQ(HistoryCount(core), 2U);
+  EXPECT_EQ(HistoryCount(core), 3U);
   // One execution host serves the whole start, so no later host epoch
   // retires these faults; the start's end does.
 }
@@ -4476,6 +4773,194 @@ TEST(HeadlessApiCore, PreviousSessionReportCommitsBeforeReceiptAndDeduplicatesAc
   }
 }
 
+// A current (v4) report: v3, how the previous run ended, the marker format of
+// an older build's session archived at an upgrade, its start and when the
+// launcher wrote the report.
+CanonicalValue Version4PreviousSessionReport(
+    CanonicalValue application_end, CanonicalValue started_at_wall = CanonicalValue(nullptr),
+    CanonicalValue reported_at_wall = CanonicalValue("2026-11-24T10:00:03.500000+00:00"),
+    CanonicalValue archived_older_marker = CanonicalValue(nullptr)) {
+  auto fields = PreviousSessionReport().as_object();
+  for (auto &[name, value] : fields) {
+    if (name == "schema_version") value = CanonicalValue("manyforge.workbench_previous_session.v4");
+  }
+  fields.emplace_back("application_end", std::move(application_end));
+  fields.emplace_back("archived_older_marker", std::move(archived_older_marker));
+  fields.emplace_back("started_at_wall", std::move(started_at_wall));
+  fields.emplace_back("reported_at_wall", std::move(reported_at_wall));
+  return CanonicalValue(std::move(fields));
+}
+
+CanonicalValue EndedProcess(CanonicalValue exit_status, CanonicalValue signal,
+                            const bool core_dumped = false) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"role", CanonicalValue("execution_host")},
+      {"pid", CanonicalValue(4242.0)},
+      {"exit_status", std::move(exit_status)},
+      {"signal", std::move(signal)},
+      {"core_dumped", CanonicalValue(core_dumped)}});
+}
+
+CanonicalValue ApplicationEnd(CanonicalValue process,
+                              const std::string &ended_by = "process_exit",
+                              const std::string &ended_at = "2026-11-24T09:59:58.250Z") {
+  return CanonicalValue(CanonicalValue::Object{
+      {"schema_version", CanonicalValue("manyforge.application_end.v1")},
+      {"ended_by", CanonicalValue(ended_by)},
+      {"process", std::move(process)},
+      {"ended_at_wall", CanonicalValue(ended_at)}});
+}
+
+TEST(HeadlessApiCore, PreviousSessionReportVersion4IsFiledAndItsApplicationEndValidated) {
+  TemporaryDirectory directory;
+  HistorianQuery query;
+  query.components.insert("manyforge.workbench");
+  query.event_types.insert("previous_session_report");
+  for (auto end : {CanonicalValue(nullptr), ApplicationEnd(CanonicalValue(nullptr), "stop_signal"),
+                   ApplicationEnd(CanonicalValue(nullptr), "manager_failure"),
+                   ApplicationEnd(EndedProcess(CanonicalValue(nullptr), CanonicalValue(9.0), true)),
+                   ApplicationEnd(EndedProcess(CanonicalValue(1.0), CanonicalValue(nullptr))),
+                   ApplicationEnd(CanonicalValue(nullptr), "shutdown_runtime")}) {
+    TemporaryDirectory store;
+    HeadlessApiCore core(Config(store, "api.epoch.1"), Clocks());
+    const auto report = Version4PreviousSessionReport(end);
+    EXPECT_EQ(Text(core.AppendWorkbenchPreviousSessionReport(report), "status"), "stored");
+    const auto page = core.HistoryPage(query);
+    ASSERT_EQ(Array(page, "events").size(), 1U);
+    EXPECT_EQ(content_identity::canonical_json(
+                  Member(Member(Array(page, "events").front(), "event"), "payload")),
+              content_identity::canonical_json(report));
+  }
+  {
+    // An older build's session archived at an upgrade names its marker format.
+    TemporaryDirectory store;
+    HeadlessApiCore core(Config(store, "api.epoch.1"), Clocks());
+    EXPECT_EQ(Text(core.AppendWorkbenchPreviousSessionReport(Version4PreviousSessionReport(
+                       CanonicalValue(nullptr), CanonicalValue(nullptr),
+                       CanonicalValue("2026-11-24T10:00:03.500000+00:00"),
+                       CanonicalValue("manyforge.workbench_session.v2"))),
+                   "status"),
+              "stored");
+  }
+  const auto older = [](CanonicalValue marker) {
+    return Version4PreviousSessionReport(CanonicalValue(nullptr), CanonicalValue(nullptr),
+                                         CanonicalValue("2026-11-24T10:00:03.500000+00:00"),
+                                         std::move(marker));
+  };
+  const auto with = [](CanonicalValue value, const std::string &field, CanonicalValue replacement) {
+    auto fields = value.as_object();
+    bool found = false;
+    for (auto &[name, member] : fields) {
+      if (name == field) { member = replacement; found = true; }
+    }
+    if (!found) fields.emplace_back(field, std::move(replacement));
+    return CanonicalValue(std::move(fields));
+  };
+  const auto process = EndedProcess(CanonicalValue(nullptr), CanonicalValue(9.0));
+  const auto end = ApplicationEnd(process);
+  auto version3_with_end = PreviousSessionReport().as_object();
+  version3_with_end.emplace_back("application_end", CanonicalValue(nullptr));
+  const auto version4_without = [](const std::string &field) {
+    auto fields = Version4PreviousSessionReport(CanonicalValue(nullptr)).as_object();
+    std::erase_if(fields, [&](const auto &member) { return member.first == field; });
+    return CanonicalValue(std::move(fields));
+  };
+  const std::vector<CanonicalValue> refused{
+      CanonicalValue(std::move(version3_with_end)),
+      version4_without("application_end"),
+      version4_without("archived_older_marker"),
+      older(CanonicalValue("manyforge.workbench_session.v")),
+      older(CanonicalValue("manyforge.workbench_session.v2x")),
+      older(CanonicalValue("manyforge.workbench_session.v" + std::string(40U, '9'))),
+      older(CanonicalValue("manyforge.other.v2")),
+      older(CanonicalValue(2.0)),
+      version4_without("started_at_wall"),
+      version4_without("reported_at_wall"),
+      Version4PreviousSessionReport(CanonicalValue("process_exit")),
+      Version4PreviousSessionReport(with(end, "schema_version", CanonicalValue("manyforge.application_end.v2"))),
+      Version4PreviousSessionReport(with(end, "ended_by", CanonicalValue("crashed"))),
+      // A process exit names its process; every other ending names none.
+      Version4PreviousSessionReport(ApplicationEnd(CanonicalValue(nullptr))),
+      Version4PreviousSessionReport(with(end, "ended_by", CanonicalValue("stop_signal"))),
+      Version4PreviousSessionReport(with(end, "ended_at_wall", CanonicalValue("2026-11-24T09:59:58+00:00"))),
+      Version4PreviousSessionReport(with(end, "ended_at_wall", CanonicalValue("yesterday"))),
+      Version4PreviousSessionReport(with(end, "extra", CanonicalValue(true))),
+      Version4PreviousSessionReport(with(end, "process", with(process, "pid", CanonicalValue(0.0)))),
+      Version4PreviousSessionReport(with(end, "process", with(process, "pid", CanonicalValue("4242")))),
+      Version4PreviousSessionReport(with(end, "process", with(process, "signal", CanonicalValue(9.5)))),
+      Version4PreviousSessionReport(with(end, "process", with(process, "exit_status", CanonicalValue("1")))),
+      Version4PreviousSessionReport(with(end, "process", with(process, "core_dumped", CanonicalValue(nullptr)))),
+      Version4PreviousSessionReport(with(end, "process", with(process, "role", CanonicalValue("")))),
+      Version4PreviousSessionReport(with(end, "process", with(process, "cgroup", CanonicalValue("x"))))};
+  for (const auto &report : refused) {
+    HeadlessApiCore core(Config(directory, "api.epoch.invalid"), Clocks());
+    try {
+      static_cast<void>(core.AppendWorkbenchPreviousSessionReport(report));
+      FAIL() << content_identity::canonical_json(report);
+    } catch (const OperatorAlarmError &) {
+    }
+  }
+}
+
+TEST(HeadlessApiCore, PreviousSessionReportIsFiledAtThePreviousStartWithItsReportTime) {
+  TemporaryDirectory directory;
+  auto config = Config(directory, "api.epoch.1");
+  HistorianQuery query;
+  query.components.insert("manyforge.workbench");
+  query.event_types.insert("previous_session_report");
+  const auto started = CanonicalValue("2026-11-24T08:00:00.125000+00:00");
+  const auto report = Version4PreviousSessionReport(CanonicalValue(nullptr), started);
+  {
+    HeadlessApiCore core(config, Clocks());
+    EXPECT_EQ(Text(core.AppendWorkbenchPreviousSessionReport(report), "status"), "stored");
+    const auto page = core.HistoryPage(query);
+    ASSERT_EQ(Array(page, "events").size(), 1U);
+    const auto &event = Member(Array(page, "events").front(), "event");
+    EXPECT_EQ(Text(event, "occurred_at_wall"), "2026-11-24T08:00:00.125000+00:00");
+    EXPECT_EQ(Text(event, "occurred_at_ns"), "0");
+    // The payload is the report as written, its report time included.
+    EXPECT_EQ(content_identity::canonical_json(Member(event, "payload")),
+              content_identity::canonical_json(report));
+    EXPECT_EQ(Text(Member(event, "payload"), "reported_at_wall"),
+              "2026-11-24T10:00:03.500000+00:00");
+    // A time filter around the previous start finds it.
+    HistorianQuery around = query;
+    around.start_utc_ns = 1795507200125000000LL - 1000000000LL;
+    around.end_utc_ns = 1795507200125000000LL + 1000000000LL;
+    EXPECT_EQ(Array(core.HistoryPage(around), "events").size(), 1U);
+    around.start_utc_ns = 1795507200125000000LL + 1000000000LL;
+    around.end_utc_ns = 1795507200125000000LL + 2000000000LL;
+    EXPECT_TRUE(Array(core.HistoryPage(around), "events").empty());
+    // The registration of the same report is the same record.
+    EXPECT_EQ(Text(core.ObserveWorkbenchPreviousSessionReport(report), "status"), "quiet");
+    ASSERT_EQ(Array(core.HistoryPage(query), "events").size(), 1U);
+  }
+  config.application_start_id = "api.epoch.2";
+  {
+    HeadlessApiCore replacement(config, Clocks());
+    EXPECT_EQ(Text(replacement.AppendWorkbenchPreviousSessionReport(report), "status"),
+              "duplicate");
+  }
+  // Without the previous start the time stays unknown; the report time is kept.
+  TemporaryDirectory other;
+  HeadlessApiCore unknown(Config(other, "api.epoch.1"), Clocks());
+  static_cast<void>(unknown.AppendWorkbenchPreviousSessionReport(
+      Version4PreviousSessionReport(CanonicalValue(nullptr))));
+  const auto unknown_page = unknown.HistoryPage(query);
+  const auto &event = Member(Array(unknown_page, "events").front(), "event");
+  EXPECT_EQ(Text(event, "occurred_at_wall"), "unknown");
+  EXPECT_EQ(Text(Member(event, "payload"), "reported_at_wall"), "2026-11-24T10:00:03.500000+00:00");
+  for (auto invalid : {Version4PreviousSessionReport(CanonicalValue(nullptr), CanonicalValue("yesterday")),
+                       Version4PreviousSessionReport(CanonicalValue(nullptr), CanonicalValue(1.0)),
+                       Version4PreviousSessionReport(CanonicalValue(nullptr), started,
+                                                     CanonicalValue(nullptr)),
+                       Version4PreviousSessionReport(CanonicalValue(nullptr), started,
+                                                     CanonicalValue("2026-11-24"))}) {
+    EXPECT_THROW(static_cast<void>(unknown.AppendWorkbenchPreviousSessionReport(
+                     std::move(invalid))), OperatorAlarmError);
+  }
+}
+
 // A report of the previous version (v2) names the scene's journal family too.
 CanonicalValue Version2PreviousSessionReport(const CanonicalValue::Array &families) {
   auto fields = PreviousSessionReport().as_object();
@@ -4625,6 +5110,70 @@ TEST(HeadlessApiCore, PreviousSessionNoticeUsesExistingNonMotionAcknowledgementA
   EXPECT_EQ(Text(next.ObserveWorkbenchPreviousSessionReport(
       ClassifiedPreviousSessionReport("unknown", "unknown", std::string(32U, 'b'))), "status"), "registered");
   EXPECT_EQ(PreviousSessionAlarms(next).size(), 1U);
+}
+
+TEST(HeadlessApiCore, PreviousSessionAlarmNamesTheEndedProcessWhenKnown) {
+  const auto unclean = [](CanonicalValue end) {
+    auto fields = Version4PreviousSessionReport(std::move(end)).as_object();
+    for (auto &[name, value] : fields) {
+      if (name == "shutdown") value = CanonicalValue("unknown");
+    }
+    return CanonicalValue(std::move(fields));
+  };
+  const auto headline = [](HeadlessApiCore &core) -> std::optional<std::string> {
+    const auto alarms = PreviousSessionAlarms(core);
+    EXPECT_EQ(alarms.size(), 1U);
+    // The catalog message stays the alarm's fixed text.
+    EXPECT_EQ(Text(alarms.front(), "message"), "ManyForge did not close correctly last time. The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History.");
+    const auto *failure = Member(alarms.front(), "details").find_object_member("failure");
+    if (failure == nullptr) return std::nullopt;
+    return Text(*failure, "message");
+  };
+  const std::vector<std::pair<CanonicalValue, std::optional<std::string>>> cases{
+      {CanonicalValue(nullptr), std::nullopt},
+      {ApplicationEnd(CanonicalValue(nullptr), "stop_signal"), std::nullopt},
+      {ApplicationEnd(CanonicalValue(nullptr), "manager_failure"),
+       "ManyForge did not close correctly last time: the Manager failed at "
+       "2026-11-24T09:59:58.250Z. The cell started empty; nothing from the previous session "
+       "was resumed. Its records are kept; details in History."},
+      {ApplicationEnd(EndedProcess(CanonicalValue(nullptr), CanonicalValue(9.0), true)),
+       "ManyForge did not close correctly last time: execution_host (pid 4242) was ended by "
+       "signal 9 (core dumped) at 2026-11-24T09:59:58.250Z. The cell started empty; nothing "
+       "from the previous session was resumed. Its records are kept; details in History."},
+      {ApplicationEnd(EndedProcess(CanonicalValue(3.0), CanonicalValue(nullptr))),
+       "ManyForge did not close correctly last time: execution_host (pid 4242) exited with "
+       "status 3 at 2026-11-24T09:59:58.250Z. The cell started empty; nothing from the "
+       "previous session was resumed. Its records are kept; details in History."},
+      {ApplicationEnd(EndedProcess(CanonicalValue(nullptr), CanonicalValue(nullptr))),
+       "ManyForge did not close correctly last time: execution_host (pid 4242) ended at "
+       "2026-11-24T09:59:58.250Z. The cell started empty; nothing from the previous session "
+       "was resumed. Its records are kept; details in History."}};
+  for (const auto &[end, expected] : cases) {
+    TemporaryDirectory directory;
+    HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+    EXPECT_EQ(Text(core.ObserveWorkbenchPreviousSessionReport(unclean(end)), "status"), "registered");
+    EXPECT_EQ(headline(core), expected);
+  }
+  // An older build's session archived at an upgrade: its shutdown is unknown.
+  auto upgraded = Version4PreviousSessionReport(
+      CanonicalValue(nullptr), CanonicalValue(nullptr),
+      CanonicalValue("2026-11-24T10:00:03.500000+00:00"),
+      CanonicalValue("manyforge.workbench_session.v2")).as_object();
+  for (auto &[name, value] : upgraded) {
+    if (name == "shutdown" || name == "effects") value = CanonicalValue("unknown");
+  }
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  EXPECT_EQ(Text(core.ObserveWorkbenchPreviousSessionReport(CanonicalValue(std::move(upgraded))),
+                 "status"),
+            "registered");
+  EXPECT_EQ(headline(core),
+            "ManyForge was upgraded: the previous session ran an older build (marker "
+            "manyforge.workbench_session.v2) and was archived to previous-runs/" +
+                std::string(32U, 'a') +
+                "; whether it closed correctly is unknown. The cell started empty; nothing "
+                "from the previous session was resumed. Its records are kept; details in "
+                "History.");
 }
 
 TEST(HeadlessApiCore, PreviousSessionReportAndUncleanAlarmAreFiledUnderTheStartTheyDescribe) {
@@ -6257,7 +6806,7 @@ TEST(HeadlessApiCore,
 // Exact durable native40 state_observed row17, including its real I/O-rule
 // evidence. This is recorded producer data, not a fabricated successful trip.
 CanonicalValue Native40IoRuleRecord() {
-  return content_identity::parse_canonical_json(R"native40({"api_version":"manyforge.operation_journal_record.v7","effect_pending":false,"intent":{"transition_reason":"runtime_scale_status_observed"},"operation_state":{"active_stop_generation":null,"active_stop_id":null,"coordination_policy":"independent","journal_capture_order":"8","operation_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participants":[{"capability_id":"execution.trajectory.execute","capability_provider_binding_id":null,"capability_provider_binding_revision":null,"command_target_id":"arm","control_binding_id":"lite6_robot.arm.execution-trajectory-execute","control_binding_revision":"sha256:8e3f32bc78e641e62fc0b9902b615e6a3ebe7626d83eb39e81efd9ca3c2425e6","control_domain_id":"lite6_robot.arm.control","control_domain_revision":"sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","execution_scope":{"node_attempt_id":"attempt:aa48a448ad3b425681b41b013bcae166","node_instance_id":"search_trip"},"io_rule_outcomes":[{"error":null,"evidence":{"evaluation_error":null,"source_losses":[],"state":"retired","trip":null},"registration":{"catalog_generation":"2","owner_epoch":"kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41","policy_id":"node.9d4549f11850b1b2fc25f067c5c1a46e727105f792656507e8739f08ac7b859a","registration_id":"1","scope":{"command_target_id":"arm","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","kind":"operation","motion_interrupt_scope_id":"node.9d4549f11850b1b2fc25f067c5c1a46e727105f792656507e8739f08ac7b859a","operation_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participant_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.participant.1","preparation_id":"2","prepared_contract_digest":"sha256:3b41addb986ce1e6507c476d16d0f5598d6ce8c86f4f482b35e35fedcaa82d04"}},"stop_certificate_id":null,"stop_certificate_revision":null,"stop_generation":null,"stop_id":null,"stop_result":null,"terminal_cause":"no_signal_trip"}],"participant_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.participant.1","payload_kind":"motion","progress":1,"resources":["lite6_robot.arm.coordinate.000000","lite6_robot.arm.coordinate.000001","lite6_robot.arm.coordinate.000002","lite6_robot.arm.coordinate.000003","lite6_robot.arm.coordinate.000004","lite6_robot.arm.coordinate.000005"],"state":"completed","terminal_error":null,"terminal_fact":{"effect":"effect_settled","error":null,"kind":"computed_completion"}}],"program_binding_id":"sha256:5ef2d8159a7dc41022f543ece89a058120b49cd679656ec6181ddeaac093858e","program_run_id":"program-cycle.1","runtime_scale_generation":0,"state":"completed","updated_at_ns":595434142274283},"owner_epoch":"kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41","record_kind":"state_observed","result":null,"runtime_scale_status":{"effective_scale":1,"operation_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participants":[{"accepted_generation":0,"acknowledgement_sequence":1888,"acknowledgement_source_epoch":"execution-host-ab1ab108c01811d071cbf157d05eef41","acknowledgement_timestamp_ns":595434139380760,"active_control_configuration_generation":1,"active_control_configuration_id":"active.i6.native.arm","applied_scale":1,"capability_id":"execution.trajectory.execute","command_target_id":"arm","commanded_scale":1,"control_binding_id":"lite6_robot.arm.execution-trajectory-execute","control_binding_revision":"sha256:8e3f32bc78e641e62fc0b9902b615e6a3ebe7626d83eb39e81efd9ca3c2425e6","control_domain_id":"lite6_robot.arm.control","control_domain_revision":"sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c","control_route_id":"arm_position","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","controller_topology_id":"manyforge.ros2_control_arm_direct","coordinated_barrier_id":null,"error":null,"participant_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.participant.1","resources":["lite6_robot.arm.coordinate.000000","lite6_robot.arm.coordinate.000001","lite6_robot.arm.coordinate.000002","lite6_robot.arm.coordinate.000003","lite6_robot.arm.coordinate.000004","lite6_robot.arm.coordinate.000005"],"scaling_domain_id":"lite6_robot.arm.runtime_scale","state":"pending","supported":true,"topology_revision":"sha256:299f321da75dc2279ca2cebf66887ae13fb365a8a9db07d5c93d8aae6303352a","virtual_trajectory_time_s":2.533308666}],"requested_scale":1,"runtime_scale_generation":0,"state":"pending","updated_at_ns":595434145763632}})native40");
+  return content_identity::parse_canonical_json(R"native40({"api_version":"manyforge.operation_journal_record.v7","effect_pending":false,"intent":{"transition_reason":"runtime_scale_status_observed"},"operation_state":{"active_stop_generation":null,"active_stop_id":null,"coordination_policy":"independent","journal_capture_order":"8","operation_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participants":[{"capability_id":"execution.trajectory.execute","capability_provider_binding_id":null,"capability_provider_binding_revision":null,"command_target_id":"arm","control_binding_id":"lite6_robot.arm.execution-trajectory-execute","control_binding_revision":"sha256:8e3f32bc78e641e62fc0b9902b615e6a3ebe7626d83eb39e81efd9ca3c2425e6","control_domain_id":"lite6_robot.arm.control","control_domain_revision":"sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","execution_scope":{"node_attempt_id":"attempt:aa48a448ad3b425681b41b013bcae166","node_instance_id":"search_trip"},"io_rule_outcomes":[{"error":null,"evidence":{"evaluation_error":null,"source_losses":[],"state":"retired","trip":null},"registration":{"catalog_generation":"2","owner_epoch":"kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41","policy_id":"node.9d4549f11850b1b2fc25f067c5c1a46e727105f792656507e8739f08ac7b859a","registration_id":"1","scope":{"command_target_id":"arm","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","kind":"operation","motion_interrupt_scope_id":"node.9d4549f11850b1b2fc25f067c5c1a46e727105f792656507e8739f08ac7b859a","operation_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participant_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.participant.1","preparation_id":"2","prepared_contract_digest":"sha256:3b41addb986ce1e6507c476d16d0f5598d6ce8c86f4f482b35e35fedcaa82d04"}},"stop_certificate_id":null,"stop_certificate_revision":null,"stop_generation":null,"stop_id":null,"stop_result":null,"terminal_cause":"no_signal_trip"}],"participant_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.participant.1","payload_kind":"motion","progress":1,"resources":["lite6_robot.arm.coordinate.000000","lite6_robot.arm.coordinate.000001","lite6_robot.arm.coordinate.000002","lite6_robot.arm.coordinate.000003","lite6_robot.arm.coordinate.000004","lite6_robot.arm.coordinate.000005"],"state":"completed","terminal_error":null,"terminal_fact":{"effect":"effect_settled","error":null,"kind":"computed_completion"}}],"program_binding_id":"sha256:5ef2d8159a7dc41022f543ece89a058120b49cd679656ec6181ddeaac093858e","program_run_id":"program-cycle.1","runtime_scale_generation":0,"state":"completed","updated_at_ns":595434142274283},"owner_epoch":"kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41","record_kind":"state_observed","result":null,"runtime_scale_status":{"effective_scale":1,"operation_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participants":[{"accepted_generation":0,"acknowledgement_sequence":1888,"acknowledgement_source_epoch":"execution-host-ab1ab108c01811d071cbf157d05eef41","acknowledgement_timestamp_ns":595434139380760,"active_control_configuration_generation":1,"active_control_configuration_id":"active.native.arm","applied_scale":1,"capability_id":"execution.trajectory.execute","command_target_id":"arm","commanded_scale":1,"control_binding_id":"lite6_robot.arm.execution-trajectory-execute","control_binding_revision":"sha256:8e3f32bc78e641e62fc0b9902b615e6a3ebe7626d83eb39e81efd9ca3c2425e6","control_domain_id":"lite6_robot.arm.control","control_domain_revision":"sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c","control_route_id":"arm_position","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","controller_topology_id":"manyforge.ros2_control_arm_direct","coordinated_barrier_id":null,"error":null,"participant_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.participant.1","resources":["lite6_robot.arm.coordinate.000000","lite6_robot.arm.coordinate.000001","lite6_robot.arm.coordinate.000002","lite6_robot.arm.coordinate.000003","lite6_robot.arm.coordinate.000004","lite6_robot.arm.coordinate.000005"],"scaling_domain_id":"lite6_robot.arm.runtime_scale","state":"pending","supported":true,"topology_revision":"sha256:299f321da75dc2279ca2cebf66887ae13fb365a8a9db07d5c93d8aae6303352a","virtual_trajectory_time_s":2.533308666}],"requested_scale":1,"runtime_scale_generation":0,"state":"pending","updated_at_ns":595434145763632}})native40");
 }
 
 // Re-pin the captured factual participant through the CURRENT typed journal

@@ -25,7 +25,7 @@ from typing import Any, get_origin
 
 
 _MODULE_NAME = "manyforge_core_py"
-_API_SCHEMA = "manyforge.composable_cell_i2.binding_api_inventory.v1"
+_API_SCHEMA = "manyforge.binding_api_inventory.v1"
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TRUSTED_PROJECTIONS = frozenset(
     {

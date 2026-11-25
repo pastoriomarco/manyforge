@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { api, HISTORIAN_PAGE_LIMIT } from '../api/client';
+import { api, apiErrorCode, HISTORIAN_PAGE_LIMIT } from '../api/client';
 import type { HistorianListQuery } from '../api/client';
 import { useShellHeadlessState } from '../hooks/useHeadlessState';
 import type {
@@ -34,7 +34,14 @@ import {
   alarmActionErrorMessage as actionErrorMessage,
   useExactAlarmAcknowledgement,
 } from '../hooks/useExactAlarmAcknowledgement';
-import type { WorkbenchNotice } from '../state/workbenchNotices';
+import {
+  RECENT_NOTICE_LIMIT,
+  useRecentNotices,
+  type NoticeHistoryRef,
+  type RecentNotice,
+  type WorkbenchNotice,
+} from '../state/workbenchNotices';
+import { utcText } from '../state/componentPresentation';
 import { OverlayPanel } from './OverlayPanel';
 import { NoticeActions, NoticeItem, NotificationRail } from './WorkbenchNotifications';
 
@@ -260,14 +267,20 @@ export function HeadlessRuntimeSurfacesView({
   const {
     busyActivation,
     error: actionError,
+    errorCode: actionErrorCode,
     setError: setActionError,
     acknowledge: acknowledgeExact,
   } = useExactAlarmAcknowledgement();
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkFence, setBulkFence] = useState<RuntimeAttentionFence | null>(null);
-  const [mode, setMode] = useState<'attention' | 'active' | 'history' | 'captures'>('attention');
+  const [mode, setMode] = useState<'attention' | 'active' | 'recent' | 'history' | 'captures'>('attention');
+  const recent = useRecentNotices();
+  // A Recent notice's "see History": the History panel restarts with its filter.
+  const [historyPreset, setHistoryPreset] = useState<{ key: number; filter?: NoticeHistoryRef }>({ key: 0 });
   const [historyLoading, setHistoryLoading] = useState(false);
-  const [historyError, setHistoryError] = useState<string | null>(null);
+  // A failed read's text and typed code.
+  const [historyFailure, setHistoryFailure] = useState<{ text: string; code: string | null } | null>(null);
+  const historyError = historyFailure?.text ?? null;
   const [historyEvents, setHistoryEvents] = useState<ExecutionHistoryEventView[]>([]);
   const [historyRetention, setHistoryRetention] = useState<HistorianRetention | null>(null);
   const [historyQuery, setHistoryQuery] = useState<HistorianListQuery>({
@@ -281,7 +294,8 @@ export function HeadlessRuntimeSurfacesView({
   const [historyHasOlder, setHistoryHasOlder] = useState(false);
   const [historyDetail, setHistoryDetail] = useState<HistorianDetail | null>(null);
   const [historyDetailLoading, setHistoryDetailLoading] = useState(false);
-  const [historyDetailError, setHistoryDetailError] = useState<string | null>(null);
+  const [historyDetailFailure, setHistoryDetailFailure] = useState<{ text: string; code: string | null } | null>(null);
+  const historyDetailError = historyDetailFailure?.text ?? null;
   const historyRequest = useRef<AbortController | null>(null);
   const historyDetailRequest = useRef<AbortController | null>(null);
   useEffect(() => () => {
@@ -304,7 +318,8 @@ export function HeadlessRuntimeSurfacesView({
     source: 'composer.runtime_history',
     title: 'Runtime history request failed',
     message: historyError,
-    onDismiss: () => setHistoryError(null),
+    code: historyFailure?.code,
+    onDismiss: () => setHistoryFailure(null),
   });
   useEffect(() => {
     reportClientIncident?.(
@@ -324,12 +339,14 @@ export function HeadlessRuntimeSurfacesView({
     source: 'composer.runtime_history_detail',
     title: 'Runtime history detail request failed',
     message: historyDetailError,
-    onDismiss: () => setHistoryDetailError(null),
+    code: historyDetailFailure?.code,
+    onDismiss: () => setHistoryDetailFailure(null),
   });
   useOperationalErrorMirror({
     source: 'composer.alarm_acknowledgement',
     title: 'Alarm acknowledgement failed',
     message: actionError,
+    code: actionErrorCode,
     onDismiss: () => setActionError(null),
   });
   const standing = snapshot?.alarms.alarms.filter((alarm) =>
@@ -353,18 +370,23 @@ export function HeadlessRuntimeSurfacesView({
     if (attentionCount < 2) setBulkFence(null);
   }, [attentionCount]);
 
+  // `follow`: Follow's read of the newest page. It keeps the open detail and
+  // the shown error until it succeeds, and shows no loading state.
   const loadHistory = async (
     query: HistorianListQuery = historyQuery,
     beforeSequence: number | null = null,
     newerCursors: Array<number | null> = [],
+    follow = false,
   ) => {
     historyRequest.current?.abort();
-    historyDetailRequest.current?.abort();
     const request = new AbortController();
     historyRequest.current = request;
-    setHistoryDetailLoading(false);
-    setHistoryLoading(true);
-    setHistoryError(null);
+    if (!follow) {
+      historyDetailRequest.current?.abort();
+      setHistoryDetailLoading(false);
+      setHistoryLoading(true);
+      setHistoryFailure(null);
+    }
     try {
       const effectiveQuery = {
         ...query,
@@ -374,8 +396,10 @@ export function HeadlessRuntimeSurfacesView({
       };
       const page = await api.history.list(effectiveQuery, request.signal);
       if (request.signal.aborted) return;
-      historyDetailRequest.current?.abort();
-      setHistoryDetailLoading(false);
+      if (!follow) {
+        historyDetailRequest.current?.abort();
+        setHistoryDetailLoading(false);
+      }
       setHistoryEvents(page.events.map(historianEventView));
       setHistoryRetention(page.retention);
       // Freeze the server's UTC window for navigation; Refresh requests a new
@@ -387,12 +411,15 @@ export function HeadlessRuntimeSurfacesView({
       setHistoryNewerCursors(newerCursors.slice(-32));
       setHistoryNextBefore(page.nextBeforeSequence);
       setHistoryHasOlder(page.truncated && page.nextBeforeSequence !== null);
-      setHistoryDetail(null);
-      setHistoryDetailError(null);
+      if (follow) setHistoryFailure(null);
+      else {
+        setHistoryDetail(null);
+        setHistoryDetailFailure(null);
+      }
     } catch (reason) {
-      if (!request.signal.aborted) setHistoryError(actionErrorMessage(reason));
+      if (!request.signal.aborted) setHistoryFailure({ text: actionErrorMessage(reason), code: apiErrorCode(reason) });
     } finally {
-      if (!request.signal.aborted) setHistoryLoading(false);
+      if (!request.signal.aborted && !follow) setHistoryLoading(false);
     }
   };
 
@@ -401,20 +428,20 @@ export function HeadlessRuntimeSurfacesView({
     historyDetailRequest.current?.abort();
     if (event.sequence === undefined) {
       setHistoryDetail(null);
-      setHistoryDetailError(null);
+      setHistoryDetailFailure(null);
       return;
     }
     const request = new AbortController();
     historyDetailRequest.current = request;
     setHistoryDetailLoading(true);
-    setHistoryDetailError(null);
+    setHistoryDetailFailure(null);
     try {
       const detail = await api.history.detail(event.sequence, request.signal);
       if (!request.signal.aborted) setHistoryDetail(detail);
     } catch (reason) {
       if (!request.signal.aborted) {
         setHistoryDetail(null);
-        setHistoryDetailError(actionErrorMessage(reason));
+        setHistoryDetailFailure({ text: actionErrorMessage(reason), code: apiErrorCode(reason) });
       }
     } finally {
       if (!request.signal.aborted) setHistoryDetailLoading(false);
@@ -473,6 +500,12 @@ export function HeadlessRuntimeSurfacesView({
     } finally {
       setBulkBusy(false);
     }
+  };
+
+  const seeHistory = (notice: RecentNotice) => {
+    setMode('history');
+    if (notice.history !== undefined) setHistoryPreset({ key: notice.sequence, filter: notice.history });
+    else if (historyEvents.length === 0 && !historyLoading) void loadHistory();
   };
 
   if (!enabled) return null;
@@ -540,6 +573,12 @@ export function HeadlessRuntimeSurfacesView({
         >
           Active{standing.length > 0 ? ` ${standing.length}` : ''}
         </button>
+        <button
+          type="button"
+          className={mode === 'recent' ? 'active' : ''}
+          aria-pressed={mode === 'recent'}
+          onClick={() => setMode('recent')}
+        >Recent{recent.length > 0 ? ` ${recent.length}` : ''}</button>
         <button
           type="button"
           className={mode === 'history' ? 'active' : ''}
@@ -622,11 +661,41 @@ export function HeadlessRuntimeSurfacesView({
         </div>
       )}
 
+      {mode === 'recent' && (
+        <div className="runtime-observability-section" aria-label="Recent notices">
+          <header className="runtime-observability-section-header">
+            <div>
+              <strong>Recent notices</strong>
+              <small>The last {RECENT_NOTICE_LIMIT} brief notices shown in this browser tab, newest first. Not kept after a reload; History holds the record.</small>
+            </div>
+          </header>
+          {recent.length === 0 && <p className="muted">No brief notice shown yet.</p>}
+          {recent.length > 0 && (
+            <ol className="recent-notices">
+              {recent.map((notice) => (
+                <li key={notice.sequence} className={`severity-${notice.severity}`}>
+                  <time>{utcText(String(BigInt(notice.presentedAtMs) * 1_000_000n))}</time>
+                  <span><strong>{notice.title}</strong>{notice.message !== '' && ` · ${notice.message}`}</span>
+                  <button type="button" className="text-button"
+                    title={notice.history === undefined ? 'Open History.' : 'Open History filtered to this notice\'s run or operation.'}
+                    onClick={() => seeHistory(notice)}
+                  >see History</button>
+                </li>
+              ))}
+            </ol>
+          )}
+        </div>
+      )}
+
       <ExecutionHistoryPanel
+        key={historyPreset.key}
+        preset={historyPreset.filter}
         open={mode === 'history'}
         embedded
         onClose={() => setMode('attention')}
         onReload={(query) => { void loadHistory(query); }}
+        onFollow={(query) => loadHistory(query, null, [], true)}
+        timelineRunId={historyQuery.programRunId ?? null}
         onLoadOlder={() => {
           if (historyNextBefore !== null) {
             void loadHistory(

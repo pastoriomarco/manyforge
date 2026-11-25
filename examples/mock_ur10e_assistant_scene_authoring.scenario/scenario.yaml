@@ -7,11 +7,11 @@
   "description": "Mock UR10e with a Robotiq 2F-140 gripper in a Mock pick-and-place workcell, with the assistant scene-authoring tools enabled. The Mock cell_io device provides the cell signals (part sensor, drop-fixture clamp valve and pressure switch, touch probe, start button, area scanner, alarm and ready lights) and the zone_intrusion rule stops motion while the area scanner reports the zone occupied. Ask the assistant to inspect or change the scene and the Program to see which tools each assistant mode offers.",
   "members": {
     "deployment.yaml": "sha256:ed6a1bd709d79022e6e2d81dd7cdb1b9d88382d86b629c15ce9f410b3c4a1cfd",
-    "program.yaml": "sha256:4e463910baee738d010e288ba4755807050bd13b1d520b90a404519558ea66ee"
+    "program.yaml": "sha256:b0072273bfa8477ccbbc96f78e54a9cc26fae8635ef20978ae4eea5216ac07e3"
   },
   "name": "mock_ur10e_assistant_scene_authoring",
   "saved_status": {
-    "checked_content_digest": "sha256:0b728d9aed0b7e3a8af36cbe2b04e3f5f71ad8900b15ac9a0268f667aa01c116",
+    "checked_content_digest": "sha256:d9c01828115987f1649d9a5bb856d6d40c9ace0a4a8f035df3223787ae8ef60f",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

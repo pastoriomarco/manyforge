@@ -100,7 +100,7 @@ Required before qualification:
 2. the existing Scene, SceneContext, path-utils and RRT suites pass unchanged
    (all margins stay zero unless set);
 3. both production Dockerfiles check the manifest and apply 0010 through 0015,
-   and the recorded build-content digest of `roboplan_0_7_0_ua1_foundation`
+   and the recorded build-content digest of `roboplan_0_7_0_foundation`
    matches the patched tree;
 4. the ManyForge worker-protocol, candidate-client and kernel clearance tests
    pass against the patched closure.

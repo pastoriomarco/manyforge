@@ -50,7 +50,7 @@ from manyforge_behavior.canonical_artifact import (
 )
 
 
-UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
+UNAVAILABLE_REASON_CODE: Final = "runtime_unavailable"
 # Scenario/evidence values use the repository's bounded JSON-model pattern,
 # with a tighter 1 MiB authored-YAML envelope and a 64 MiB run-directory cap.
 MAX_YAML_DOCUMENT_BYTES: Final = 1024 * 1024

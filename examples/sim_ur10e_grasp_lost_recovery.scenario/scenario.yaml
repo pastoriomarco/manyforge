@@ -7,11 +7,11 @@
   "description": "Isaac Sim UR10e example of a lost grasp: the cheese-box pose source reports the loss and a node-level Fallback recovers. Run the Program, then drop the part in Isaac to see the recovery.",
   "members": {
     "deployment.yaml": "sha256:894bfbfad838d4fd3c5d8f5d882fea76fdf99ebd0223dd95fe4407b2fcb4b00a",
-    "program.yaml": "sha256:2fc8da60cdb33c16722938213472d9c6396f3625ec0e745965faf7a521c32122"
+    "program.yaml": "sha256:0af21efcb7bc12413d4703812af031e5ed67958f2bf26a8c560443f7f9d76453"
   },
   "name": "sim_ur10e_grasp_lost_recovery",
   "saved_status": {
-    "checked_content_digest": "sha256:bac2adbe8b7f85aea2edc8f8c906ab954eb0ca42c97ecac3ea1c568d01465eab",
+    "checked_content_digest": "sha256:a99c42bb66dea9a3eac56d72043ab2c6db4019d602bba6556f38ab4312780af2",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

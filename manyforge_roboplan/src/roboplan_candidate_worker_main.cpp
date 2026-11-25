@@ -35,6 +35,7 @@
 
 #include "manyforge_roboplan/roboplan_scene_factory.hpp"
 #include <manyforge_collision/scene_asset_root.hpp>
+#include <manyforge_core/process_diagnostics.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -662,6 +663,8 @@ int run_worker(int descriptor) {
 
 int main(int argc, char** argv) {
   using namespace manyforge::roboplan_backend;
+  manyforge::core::SetProcessRole("candidate_worker");
+  manyforge::core::InstallCrashEvidence();
   const int descriptor = worker_protocol::kProtocolDescriptor;
   try {
     const auto parent = parse_parent_pid(argc, argv);
@@ -673,7 +676,8 @@ int main(int argc, char** argv) {
                  worker_protocol::encode_protocol_error(error.what()));
     } catch (...) {
     }
-    std::cerr << error.what() << '\n';
+    manyforge::core::LogLine(manyforge::core::LogSeverity::kError,
+                             error.what());
     return 2;
   }
 }

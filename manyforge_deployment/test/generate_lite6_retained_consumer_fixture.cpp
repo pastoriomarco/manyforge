@@ -412,7 +412,7 @@ int main(int argc, char** argv) {
 
     const CanonicalValue manifest(CanonicalValue::Object{
         {"api_version",
-         CanonicalValue("manyforge.i3.retained-consumer-fixture.v3")},
+         CanonicalValue("manyforge.retained-consumer-fixture.v3")},
         {"model_instance_id", CanonicalValue("lite6_fixture_instance")},
         {"retained_bundle_id",
          CanonicalValue(materialized.bundle->retained_bundle_id().value())},

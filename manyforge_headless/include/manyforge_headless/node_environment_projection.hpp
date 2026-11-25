@@ -11,7 +11,7 @@
 namespace manyforge::headless {
 
 inline constexpr std::string_view kNodeEnvironmentProjectionApiVersion =
-    "manyforge.node_environment_projection.v3";
+    "manyforge.node_environment_projection.v4";
 
 class NodeEnvironmentProjectionError final : public std::runtime_error {
 public:

@@ -1203,7 +1203,7 @@ ResourceAddressedExecutionKernel::begin_motion_preview_session(
           primary_motion.participants.front().payload)) {
     return reject<std::unique_ptr<IAddressedMotionPreviewSession>>(
         "preview requires one independent motion participant",
-        "i6_preview_primary_motion_invalid", ErrorCode::kInvalidRequest);
+        "preview_primary_motion_invalid", ErrorCode::kInvalidRequest);
   }
   {
     std::lock_guard state_lock(state_mutex_);
@@ -1250,7 +1250,7 @@ ResourceAddressedExecutionKernel::preview_capability_command(const OperationInte
       !std::holds_alternative<CapabilityCommandIntentDTO>(intent.participants.front().payload)) {
     return reject<CapabilityCommandPreviewResultDTO>(
         "command preview requires one independent capability command",
-        "i6_preview_capability_command_invalid", ErrorCode::kInvalidRequest);
+        "preview_capability_command_invalid", ErrorCode::kInvalidRequest);
   }
   auto resolved = resolve_registration(intent, 0U);
   if (!resolved.ok()) {
@@ -1301,6 +1301,13 @@ ProgramRunResolutionContext ResourceAddressedExecutionKernel::program_run_resolu
       program_cycle_claim_run_->program_run_id != *program_run_id ||
       !program_cycle_claim_run_->capture)
     return {};
+  return program_cycle_claim_run_->capture->resolution_context;
+}
+
+ProgramRunResolutionContext
+ResourceAddressedExecutionKernel::held_program_run_resolution_context() const {
+  std::lock_guard state_lock(state_mutex_);
+  if (!program_cycle_claim_run_ || !program_cycle_claim_run_->capture) return {};
   return program_cycle_claim_run_->capture->resolution_context;
 }
 

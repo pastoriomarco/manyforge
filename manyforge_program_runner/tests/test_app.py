@@ -1,28 +1,28 @@
-"""Private Program-runner HTTP boundary and lifecycle tests."""
+"""The Program runner's command and status sockets: dispatch and lifecycle."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import hashlib
-
-import asyncio
-import json
+from pathlib import Path
+import queue
 import threading
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
+
+import manyforge_headless_py as core
 
 from manyforge_headless_api.models import (
     ProgramHaltResumeRequest,
     ProgramRunStartRequest,
     ProgramScenePreparationRequest,
 )
-from manyforge_headless_api.component_model import RUN_REFUSAL_CODES
 from manyforge_program_runner.app import (
-    ProgramControlStateSource,
-    _serve_program_control_state,
-    _status,
-    create_app,
+    PROGRAM_RUNNER_COMMANDS,
+    ProgramRunnerApplication,
+    _ProgramStatusPump,
 )
 from manyforge_program_runner.models import (
     ProgramCycleResetRequest,
@@ -50,7 +50,7 @@ _DIGEST_C = "sha256:" + "c" * 64
 
 def _snapshot(*, state: str = "running") -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.program_run_status.v5",
+        "schema_version": "manyforge.program_run_status.v6",
         "owner_id": "program-runner.cell-a",
         "run_revision": 1,
         "state": state,
@@ -77,6 +77,8 @@ def _snapshot(*, state: str = "running") -> dict[str, Any]:
         "tree_status": "running",
         "node_status_revision": 1,
         "node_statuses": {"root": "running"},
+        "node_running_since_utc_ns": {"root": 1_795_000_000_000_000_000},
+        "node_wait_values": {},
         "active_operation_count": 1,
         "reason_code": None,
         "message": "",
@@ -312,25 +314,75 @@ def _caller() -> dict[str, Any]:
     }
 
 
-def test_node_availability_is_a_read_only_runner_projection() -> None:
+# Headless's code for a request the runner refuses as malformed.
+_MALFORMED = {
+    "code": "program_runner_http_error",
+    "details": {},
+    "message": "Program runner returned HTTP 422",
+    "producer": "program_runner",
+}
+
+
+class _Client:
+    """Headless's side of the sockets, through the core's link."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.link = core.ProgramRunnerLink(str(root), 5.0)
+
+    def call(self, command: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.link.call(command, {} if request is None else request)
+
+    def value(self, command: str, request: dict[str, Any] | None = None) -> Any:
+        reply = self.call(command, request)
+        assert reply["ok"] is True, reply
+        return reply["value"]
+
+    def error(self, command: str, request: dict[str, Any] | None = None) -> dict[str, Any]:
+        reply = self.call(command, request)
+        assert reply["ok"] is False, reply
+        return reply["error"]
+
+
+@contextmanager
+def _served(runtime: Any, tmp_path: Path) -> Iterator[_Client]:
+    root = tmp_path / "sockets"
+    root.mkdir(mode=0o700)
+    application = ProgramRunnerApplication(runtime, root)
+    application.start()
+    try:
+        yield _Client(root)
+    finally:
+        application.close()
+
+
+def _run(program_run_id: int, body: dict[str, Any]) -> dict[str, Any]:
+    return {"program_run_id": program_run_id, "body": body}
+
+
+_START_BODY = {
+    "scenario_id": "cell-pick",
+    "source_document_digest": _DIGEST_A,
+    "expected_applied_record_digest": _DIGEST_B,
+    "draft_program_revision": _DIGEST_B,
+}
+
+
+def test_node_availability_is_a_read_only_runner_projection(tmp_path) -> None:
     runtime = FakeRuntime()
     body = {
         "applied": {"program_revision": "sha256:" + "a" * 64},
     }
-    with TestClient(create_app(runtime)) as client:
-        response = client.post("/api/program/node-availability", json=body)
+    with _served(runtime, tmp_path) as client:
+        value = client.value("node_availability", body)
 
-    assert response.status_code == 200
-    assert response.json()["schema_version"] == (
-        "manyforge.program_node_availability.v2"
-    )
+    assert value["schema_version"] == "manyforge.program_node_availability.v2"
     assert runtime.calls[0][0] == "node_availability"
     assert runtime.calls[0][1].model_dump() == body
 
 
-def test_reset_is_an_explicit_strict_cycle_transition() -> None:
+def test_reset_is_an_explicit_strict_cycle_transition(tmp_path) -> None:
     runtime = FakeRuntime()
-    client = TestClient(create_app(runtime))
     body = {
         **_caller(),
         "program_run_id": 1,
@@ -339,27 +391,21 @@ def test_reset_is_an_explicit_strict_cycle_transition() -> None:
         "terminal_reference": _DIGEST_A,
         "settlement_evidence_digest": _DIGEST_B,
     }
-    with client:
-        response = client.post("/api/program/cycle/reset", json=body)
-    assert response.status_code == 200
-    # Answered at acceptance (OD-214): the reply is the command's row.
-    assert response.json() == _reply("reset")
+    with _served(runtime, tmp_path) as client:
+        # Answered at acceptance (OD-214): the reply is the command's row.
+        assert client.value("reset_cycle", body) == _reply("reset")
+        assert client.error("reset_cycle", {**body, "unexpected": True}) == _MALFORMED
     assert runtime.calls[0][0] == "reset"
-    assert (
-        client.post(
-            "/api/program/cycle/reset", json={**body, "unexpected": True}
-        ).status_code
-        == 422
-    )
+    assert len(runtime.calls) == 1
 
 
-def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
+def test_cycle_status_exposes_only_program_runner_owned_facts(tmp_path) -> None:
     runtime = FakeRuntime()
-    client = TestClient(create_app(runtime))
-    with client:
-        response = client.get("/api/cycle/status")
-    assert response.status_code == 200
-    assert set(response.json()) == {
+    with _served(runtime, tmp_path) as client:
+        value = client.value("cycle_status")
+        unknown = client.error("program_cycle_status")
+        members = client.error("cycle_status", {"extra": 1})
+    assert set(value) == {
         "cycle_generation",
         "state",
         "program_run_id",
@@ -381,11 +427,12 @@ def test_cycle_status_exposes_only_program_runner_owned_facts() -> None:
         "run",
         "runtime_controls",
     }
-    assert client.get("/api/program/cycle/status").status_code == 404
+    assert unknown == members == _MALFORMED
+    # The status publisher's observer ends with the application.
     assert runtime.control_state_observers == set()
 
 
-def test_control_state_websocket_is_change_driven_and_demand_scoped() -> None:
+def test_control_state_stream_is_change_driven(tmp_path) -> None:
     class GroupRuntime(FakeRuntime):
         group_state = "running"
 
@@ -399,199 +446,209 @@ def test_control_state_websocket_is_change_driven_and_demand_scoped() -> None:
             return cycle
 
     runtime = GroupRuntime()
-    client = TestClient(create_app(runtime))
+    with _served(runtime, tmp_path) as client:
+        subscription = client.link.subscribe_status()
+        first = subscription.next(5.0)
+        assert first["schema_version"] == "manyforge.program_control_state.v4"
+        assert first["event_class"] == "critical"
+        assert first["server_sequence"] == "1"
+        assert first["program_cycle"]["execution_control_revision"] == 1
+        assert len(runtime.control_state_observers) == 1
 
-    with client:
-        assert runtime.control_state_observers == set()
-        with client.websocket_connect("/ws/program/control-state") as websocket:
-            first = websocket.receive_json()
-            assert first["schema_version"] == "manyforge.program_control_state.v4"
-            assert first["event_class"] == "critical"
-            assert first["server_sequence"] == "1"
-            assert first["program_cycle"]["execution_control_revision"] == 1
-            assert len(runtime.control_state_observers) == 1
-
-            runtime.publish_control_state()
-            second = websocket.receive_json()
-            assert second["server_sequence"] == "2"
-            assert second["program_cycle"]["execution_control_revision"] == 2
-            assert second["program_cycle"]["node_status_revision"] == 2
-            assert second["event_class"] == "critical"
+        runtime.publish_control_state()
+        second = subscription.next(5.0)
+        assert second["server_sequence"] == "2"
+        assert second["program_cycle"]["execution_control_revision"] == 2
+        assert second["program_cycle"]["node_status_revision"] == 2
+        assert second["event_class"] == "critical"
+        runtime.publish_control_state(node_only=True)
+        progress = subscription.next(5.0)
+        assert progress["event_class"] == "node_progress"
+        for state in ("stopping", "held", "running"):
+            runtime.group_state = state
             runtime.publish_control_state(node_only=True)
-            progress = websocket.receive_json()
-            assert progress["event_class"] == "node_progress"
-            for state in ("stopping", "held", "running"):
-                runtime.group_state = state
-                runtime.publish_control_state(node_only=True)
-                change = websocket.receive_json()
-                assert change["event_class"] == "critical"
-                assert change["program_cycle"]["execution_control_revision"] == 2
-
-        assert runtime.control_state_observers == set()
+            change = subscription.next(5.0)
+            assert change["event_class"] == "critical"
+            assert change["program_cycle"]["execution_control_revision"] == 2
+        subscription.close()
+    assert runtime.control_state_observers == set()
 
 
-def test_control_state_frame_reads_reset_position_once_at_send() -> None:
-    """Classification snapshots skip the host Reset-position read; each sent
-    frame reads it once and equals the complete cycle status."""
+class _Publisher:
+    """The core publisher's Python surface: values out, read requests in."""
 
-    class FakeWebSocket:
-        def __init__(self) -> None:
-            self.inbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-            self.outbound: asyncio.Queue[str] = asyncio.Queue()
+    def __init__(self) -> None:
+        self.published: queue.Queue[tuple[dict[str, Any], bool]] = queue.Queue()
+        self.withdrawn: queue.Queue[tuple[str, str]] = queue.Queue()
+        self._requested = threading.Event()
 
-        async def accept(self) -> None:
-            return None
+    def publish(self, cycle: dict[str, Any], critical: bool) -> None:
+        self.published.put((cycle, critical))
 
-        async def receive(self) -> dict[str, Any]:
-            return await self.inbound.get()
+    def withdraw(self, code: str, message: str) -> None:
+        self.withdrawn.put((code, message))
 
-        async def send_text(self, payload: str) -> None:
-            await self.outbound.put(payload)
+    def request_read(self) -> None:
+        self._requested.set()
 
-        async def close(self, *, code: int, reason: str) -> None:
-            del code, reason
+    def wait_read_request(self, timeout_s: float | None = None) -> bool:
+        if not self._requested.wait(timeout_s):
+            return False
+        self._requested.clear()
+        return True
 
-    async def exercise() -> None:
-        runtime = FakeRuntime()
-        # A still clock keeps the node-progress window open, so the publisher
-        # always coalesces the node-only wake.
-        source = ProgramControlStateSource(runtime, clock_ns=lambda: 1)
-        websocket = FakeWebSocket()
-        serving = asyncio.create_task(
-            _serve_program_control_state(websocket, source)  # type: ignore[arg-type]
-        )
-        first = json.loads(await asyncio.wait_for(websocket.outbound.get(), timeout=1.0))
+
+def test_control_state_frame_reads_reset_position_once_at_publication() -> None:
+    """Classification snapshots skip the host Reset-position read; each
+    published cycle reads it once and equals the complete cycle status."""
+
+    runtime = FakeRuntime()
+    publisher = _Publisher()
+    # A still clock keeps the node-progress window open, so the publisher
+    # always holds the node-only wake for its whole period.
+    pump = _ProgramStatusPump(runtime, publisher, clock_ns=lambda: 1)
+    pump.start()
+    try:
+        first, critical = publisher.published.get(timeout=5.0)
+        assert critical is True
         assert (runtime.projections, runtime.reset_reads) == (1, 1)
         runtime.publish_control_state(node_only=True)
-        progress = json.loads(await asyncio.wait_for(websocket.outbound.get(), timeout=1.0))
-        assert progress["event_class"] == "node_progress"
+        progress, critical = publisher.published.get(timeout=5.0)
+        assert critical is False
         # Before: one full status per snapshot (here 2 Reset reads per frame).
         assert (runtime.projections, runtime.reset_reads) == (3, 2)
-        for frame in (first, progress):
-            assert frame["program_cycle"]["reset_robot_position"] == {
+        for cycle in (first, progress):
+            assert cycle["reset_robot_position"] == {
                 "available": False, "reason": "unsupported"}
-        assert progress["program_cycle"] == runtime.cycle_status()
-        await websocket.inbound.put({"type": "websocket.disconnect"})
-        await asyncio.wait_for(serving, timeout=1.0)
-        source.close()
-
-    asyncio.run(exercise())
+        assert progress == runtime.cycle_status()
+    finally:
+        pump.close()
+    assert runtime.control_state_observers == set()
 
 
-def test_control_state_websocket_releases_disconnected_clients_without_owner_wake() -> (
-    None
-):
-    class FakeWebSocket:
-        def __init__(self) -> None:
-            self.inbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-            self.outbound: asyncio.Queue[str] = asyncio.Queue()
+def test_unreadable_control_state_withdraws_the_frame_until_readable() -> None:
+    class FailingRuntime(FakeRuntime):
+        fail = True
 
-        async def accept(self) -> None:
-            return None
+        def cycle_projection(self) -> dict[str, Any]:
+            if self.fail:
+                raise ProgramRunnerError("program_cycle_journal_invalid", "unreadable")
+            return super().cycle_projection()
 
-        async def receive(self) -> dict[str, Any]:
-            return await self.inbound.get()
-
-        async def send_text(self, payload: str) -> None:
-            await self.outbound.put(payload)
-
-        async def close(self, *, code: int, reason: str) -> None:
-            del code, reason
-
-    async def exercise() -> None:
-        runtime = FakeRuntime()
-        source = ProgramControlStateSource(runtime)
-        # More sequential clients than the concurrent capacity proves that a
-        # quiet owner cannot retain dead subscriptions indefinitely.
-        for _ in range(6):
-            websocket = FakeWebSocket()
-            serving = asyncio.create_task(
-                _serve_program_control_state(websocket, source)  # type: ignore[arg-type]
-            )
-            first = json.loads(
-                await asyncio.wait_for(websocket.outbound.get(), timeout=1.0)
-            )
-            assert first["server_sequence"] == "1"
-            assert len(runtime.control_state_observers) == 1
-            await websocket.inbound.put({"type": "websocket.disconnect"})
-            await asyncio.wait_for(serving, timeout=1.0)
-            assert runtime.control_state_observers == set()
-        source.close()
-
-    asyncio.run(exercise())
+    runtime = FailingRuntime()
+    publisher = _Publisher()
+    pump = _ProgramStatusPump(runtime, publisher)
+    pump.start()
+    try:
+        assert publisher.withdrawn.get(timeout=5.0) == (
+            "program_cycle_journal_invalid", "unreadable")
+        runtime.fail = False
+        runtime.publish_control_state()
+        _cycle, critical = publisher.published.get(timeout=5.0)
+        assert critical is True
+    finally:
+        pump.close()
 
 
-def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
+def test_a_reconnecting_subscriber_reads_a_withdrawn_state_again(tmp_path) -> None:
+    """A withdrawn state is not kept for later subscribers: each new one
+    makes the runner read the state again (as each new connection did)."""
+
+    class RecoveringRuntime(FakeRuntime):
+        fail = True
+
+        def cycle_projection(self) -> dict[str, Any]:
+            if self.fail:
+                raise ProgramRunnerError("program_cycle_journal_invalid", "unreadable")
+            return super().cycle_projection()
+
+    runtime = RecoveringRuntime()
+    with _served(runtime, tmp_path) as client:
+        first = client.link.subscribe_status()
+        with pytest.raises(core.GatewayError) as withdrawn:
+            first.next(10.0)
+        assert withdrawn.value.code == "program_cycle_journal_invalid"
+        first.close()
+        # Readable again without any runtime wake: only the reconnect reads it.
+        runtime.fail = False
+        second = client.link.subscribe_status()
+        frame = second.next(10.0)
+        assert frame["event_class"] == "critical"
+        assert frame["server_sequence"] == "1"
+        assert frame["program_cycle"] == runtime.cycle_status()
+        second.close()
+
+
+def test_a_second_runner_on_the_same_sockets_is_refused_by_code(tmp_path) -> None:
+    """Each socket has one server; a second runner's start is refused with a
+    typed error, and the first keeps serving."""
+
     runtime = FakeRuntime()
-    client = TestClient(create_app(runtime))
-    with client:
-        health = client.get("/api/program/health")
-        index = client.get(
-            "/api/program/runs",
-            params={"active_only": "true", "limit": 7},
-        )
-        started = client.post(
-            "/api/program/runs",
-            json={
-                **_caller(),
-                "scenario_id": "cell-pick",
-                "source_document_digest": _DIGEST_A,
-                "expected_applied_record_digest": _DIGEST_B,
-                "draft_program_revision": _DIGEST_B,
-            },
-        )
-        prepared = client.post(
-            "/api/program/scene-preparations",
-            json={
+    with _served(runtime, tmp_path) as client:
+        second = ProgramRunnerApplication(FakeRuntime(), client.root)
+        with pytest.raises(ProgramRunnerError) as refused:
+            second.start()
+        second.close()
+        assert refused.value.code == "program_runner_socket_unavailable"
+        assert "another Program runner" in str(refused.value)
+        assert client.value("health")["started"] is True
+
+
+def test_private_surface_projects_owner_facts_and_manages_lifecycle(tmp_path) -> None:
+    runtime = FakeRuntime()
+    with _served(runtime, tmp_path) as client:
+        health = client.value("health")
+        index = client.value("runs", {"active_only": True, "limit": 7})
+        started = client.value("start_run", {**_caller(), **_START_BODY})
+        prepared = client.value(
+            "prepare_applied_scene",
+            {
                 **_caller(),
                 "request_key": _key("request.prepare.1"),
                 "expected_applied_record_digest": _DIGEST_B,
                 "expected_admission_generation": 7,
             },
         )
-        read = client.get("/api/program/runs/1")
-        motion_started = client.post(
-            "/api/program/runs/1/motion-start",
-            json={
+        read = client.value("read_run", {"program_run_id": 1})
+        motion_started = client.value(
+            "start_motion",
+            _run(1, {
                 **_caller(),
                 "request_key": _key("request.motion-start.1"),
                 "program_run_id": 1,
                 "expected_hold_revision": 0,
                 "group_ids": ["robot_group"],
                 "reason": "initial operator motion Run",
-            },
+            }),
         )
-        resumed = client.post(
-            "/api/program/runs/1/resume-halt",
-            json={
+        resumed = client.value(
+            "resume_halt",
+            _run(1, {
                 **_caller(),
                 "request_key": _key("request.resume-halt.1"),
                 "program_run_id": 1,
                 "expected_run_revision": 1,
                 "reason": "operator Execute after Halt",
-            },
+            }),
         )
-        # Kernel-first: the runner has no Stop route; every client Stop goes
-        # Headless -> Kernel.
-        removed_stop_routes = [
-            client.post(f"/api/program/runs/1/{route}", json={})
-            for route in (
-                "stop", "motion-stop", "full-stop", "discard-full-stop",
-                "resume-full-stop",
+        # Kernel-first: the runner has no Stop command; every client Stop
+        # goes Headless -> Kernel.
+        removed_stops = [
+            client.error(command, _run(1, {}))
+            for command in (
+                "stop", "motion_stop", "full_stop", "discard_full_stop",
+                "resume_full_stop",
             )
         ]
 
-    assert health.status_code == 200
-    assert prepared.status_code == 200
-    assert prepared.json()["status"] == "prepared"
-    assert health.json()["started"] is True
-    assert index.json()["runs"][0]["capture"]["program_run_id"] == 1
-    assert started.status_code == 200
-    assert read.status_code == 200
-    assert started.json() == _reply("start")
-    assert motion_started.json() == _reply("start_motion", _key("request.motion-start.1"))
-    assert resumed.json() == _reply("resume_halt", _key("request.resume-halt.1"))
-    assert [response.status_code for response in removed_stop_routes] == [404] * 5
+    assert prepared["status"] == "prepared"
+    assert health["started"] is True
+    assert index["runs"][0]["capture"]["program_run_id"] == 1
+    assert read["capture"]["program_run_id"] == 1
+    assert started == _reply("start")
+    assert motion_started == _reply("start_motion", _key("request.motion-start.1"))
+    assert resumed == _reply("resume_halt", _key("request.resume-halt.1"))
+    assert removed_stops == [_MALFORMED] * 5
     assert runtime.calls[0] == ("runs", (True, 7))
     assert runtime.calls[1][0] == "start"
     assert runtime.calls[2][0] == "prepare_scene"
@@ -602,11 +659,13 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
     assert isinstance(runtime.calls[5][1][1], ProgramHaltResumeRequest)
     assert len(runtime.calls) == 6
     assert runtime.closed is True
+    # The sockets go with the application.
+    assert not (client.root / "program-command.sock").exists()
+    assert not (client.root / "program-status.sock").exists()
 
 
-def test_private_surface_rejects_unknown_fields_and_path_body_mismatch() -> None:
+def test_private_surface_rejects_unknown_fields_and_path_body_mismatch(tmp_path) -> None:
     runtime = FakeRuntime()
-    client = TestClient(create_app(runtime))
     body = {
         **_caller(),
         "program_run_id": 2,
@@ -614,35 +673,23 @@ def test_private_surface_rejects_unknown_fields_and_path_body_mismatch() -> None
         "group_ids": ["robot_group"],
         "reason": None,
     }
-    with client:
-        mismatch = client.post(
-            "/api/program/runs/1/motion-start",
-            json=body,
+    with _served(runtime, tmp_path) as client:
+        mismatch = client.error("start_motion", _run(1, body))
+        # Run numbers are integers >= 1 (1.15.3).
+        textual = client.error("read_run", {"program_run_id": "program-run.1"})
+        zero = client.error("read_run", {"program_run_id": 0})
+        unknown = client.error(
+            "start_run", {**_caller(), **_START_BODY, "invented": True}
         )
-        # Run numbers are decimal integers >= 1 (1.15.3).
-        textual = client.get("/api/program/runs/program-run.1")
-        zero = client.get("/api/program/runs/0")
-        unknown = client.post(
-            "/api/program/runs",
-            json={
-                **_caller(),
-                "scenario_id": "cell-pick",
-                "source_document_digest": _DIGEST_A,
-                "expected_applied_record_digest": _DIGEST_B,
-                "draft_program_revision": _DIGEST_B,
-                "invented": True,
-            },
-        )
+        limit = client.error("runs", {"limit": 4_097})
 
-    assert mismatch.status_code == 400
-    assert mismatch.json()["detail"]["code"] == "program_run_path_invalid"
-    assert textual.status_code == 422
-    assert zero.status_code == 422
-    assert unknown.status_code == 422
+    assert mismatch["code"] == "program_run_path_invalid"
+    assert mismatch["message"] == "Program-run path and body must match"
+    assert textual == zero == unknown == limit == _MALFORMED
     assert runtime.calls == []
 
 
-def test_private_surface_preserves_stable_owner_error_codes() -> None:
+def test_private_surface_preserves_stable_owner_error_codes(tmp_path) -> None:
     class FailingRuntime(FakeRuntime):
         def read_run(self, program_run_id: int) -> dict[str, Any]:
             raise ProgramRunnerError(
@@ -651,19 +698,72 @@ def test_private_surface_preserves_stable_owner_error_codes() -> None:
                 producer="kernel",
             )
 
-    client = TestClient(create_app(FailingRuntime()))
-    with client:
-        response = client.get("/api/program/runs/7")
+    with _served(FailingRuntime(), tmp_path) as client:
+        error = client.error("read_run", {"program_run_id": 7})
 
-    assert response.status_code == 404
-    assert response.json() == {
-        "detail": {
-            "code": "program_run_not_found",
-            "details": {},
-            "message": "unknown Program run 7",
-            "producer": "kernel",
-        }
+    assert error == {
+        "code": "program_run_not_found",
+        "details": {},
+        "message": "unknown Program run 7",
+        "producer": "kernel",
     }
+
+
+def test_an_unexpected_runner_failure_is_an_invalid_answer(tmp_path) -> None:
+    class BrokenRuntime(FakeRuntime):
+        def read_run(self, program_run_id: int) -> dict[str, Any]:
+            raise KeyError("bug")
+
+        def read_runtime_controls(self, program_run_id: int) -> dict[str, Any]:
+            return {"not_json": object()}
+
+    with _served(BrokenRuntime(), tmp_path) as client:
+        errors = [
+            client.error("read_run", {"program_run_id": 7}),
+            client.error("read_runtime_controls", {"program_run_id": 7}),
+        ]
+    assert errors == [{
+        "code": "program_runner_response_invalid",
+        "details": {},
+        "message": "Program runner returned an invalid response",
+        "producer": "program_runner",
+    }] * 2
+
+
+def test_a_full_ordinary_lane_refuses_at_once(tmp_path) -> None:
+    release = threading.Event()
+    entered = threading.Semaphore(0)
+
+    class SlowRuntime(FakeRuntime):
+        def reconcile_persistent_values(self) -> dict[str, Any]:
+            entered.release()
+            release.wait()
+            return {"outcome": "duplicate"}
+
+    with _served(SlowRuntime(), tmp_path) as client:
+        replies: list[dict[str, Any]] = []
+        callers = [
+            threading.Thread(
+                target=lambda: replies.append(client.call("reconcile_persistent_values"))
+            )
+            for _ in range(2)
+        ]
+        for caller in callers:
+            caller.start()
+        assert entered.acquire(timeout=5.0) and entered.acquire(timeout=5.0)
+        busy = client.error("reconcile_persistent_values")
+        # Reads keep being served while the lane is full.
+        assert client.value("health")["started"] is True
+        release.set()
+        for caller in callers:
+            caller.join()
+    assert busy == {
+        "code": "execution_control_ingress_busy",
+        "details": {"lane": "ordinary", "maximum_admitted": 2},
+        "message": "execution-control ordinary lane is at its admission limit (2)",
+        "producer": "program_runner",
+    }
+    assert replies == [{"ok": True, "value": {"outcome": "duplicate"}}] * 2
 
 
 @pytest.mark.parametrize(
@@ -676,30 +776,18 @@ def test_private_surface_preserves_stable_owner_error_codes() -> None:
         "stale_generation",
     ],
 )
-def test_program_start_preconditions_map_to_client_conflict(code: str) -> None:
+def test_program_start_preconditions_keep_their_codes(tmp_path, code: str) -> None:
     class RejectingRuntime(FakeRuntime):
         def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
             raise ProgramRunnerError(code, "start precondition rejected")
 
-    client = TestClient(create_app(RejectingRuntime()))
-    with client:
-        response = client.post(
-            "/api/program/runs",
-            json={
-                **_caller(),
-                "scenario_id": "cell-pick",
-                "source_document_digest": _DIGEST_A,
-                "expected_applied_record_digest": _DIGEST_B,
-                "draft_program_revision": _DIGEST_B,
-            },
-        )
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == code
+    with _served(RejectingRuntime(), tmp_path) as client:
+        error = client.error("start_run", {**_caller(), **_START_BODY})
+    assert error["code"] == code
 
 
-def test_persistent_value_routes_are_applied_project_strict_requests() -> None:
+def test_persistent_value_routes_are_applied_project_strict_requests(tmp_path) -> None:
     runtime = FakeRuntime()
-    base = "/api/program/persistent-values"
     project = "/projects/cell-pick.scenario"
     edit = {
         **_caller(),
@@ -707,19 +795,18 @@ def test_persistent_value_routes_are_applied_project_strict_requests() -> None:
         "key": "layer",
         "expected_program_revision": _DIGEST_A,
     }
-    with TestClient(create_app(runtime)) as client:
-        assert client.get(base).json() == {"project_path": project}
-        assert client.post(base, json={**edit, "value": 3}).json() == _reply(
+    with _served(runtime, tmp_path) as client:
+        assert client.value("read_persistent_values") == {"project_path": project}
+        assert client.value("set_persistent_value", {**edit, "value": 3}) == _reply(
             "persistent_value_set"
         )
-        assert client.post(f"{base}/reset", json=edit).json() == _reply(
+        assert client.value("reset_persistent_value", edit) == _reply(
             "persistent_value_reset"
         )
-        cleared = client.post(
-            f"{base}/clear",
-            json={**_caller(), "project_path": project},
+        cleared = client.value(
+            "clear_persistent_values", {**_caller(), "project_path": project}
         )
-        assert cleared.json() == _reply("persistent_values_clear")
+        assert cleared == _reply("persistent_values_clear")
         # The project folder is absolute and lexically normalized.
         for path in (
             "projects/cell-pick.scenario",
@@ -729,37 +816,31 @@ def test_persistent_value_routes_are_applied_project_strict_requests() -> None:
             "/projects/\x00cell-pick",
             "/" + "p" * 4096,
         ):
-            assert client.post(
-                f"{base}/clear", json={**_caller(), "project_path": path}
-            ).status_code == 422
-        assert client.post(f"{base}/clear", json=_caller()).status_code == 422
-        # The former Scenario-id addressed routes are gone.
-        assert client.get(
-            "/api/program/scenarios/cell-pick/persistent-values"
-        ).status_code == 404
+            assert client.error(
+                "clear_persistent_values", {**_caller(), "project_path": path}
+            ) == _MALFORMED
+        assert client.error("clear_persistent_values", _caller()) == _MALFORMED
         # A value is required to set, and nothing else is accepted.
-        assert client.post(base, json=edit).status_code == 422
-        assert client.post(f"{base}/reset", json={**edit, "value": 3}).status_code == 422
+        assert client.error("set_persistent_value", edit) == _MALFORMED
+        assert client.error("reset_persistent_value", {**edit, "value": 3}) == _MALFORMED
         # A live run is named with its revision; the register sequence is no
         # longer a fence (without a run the last admitted edit wins).
-        assert client.post(
-            f"{base}/reset", json={**edit, "program_run_id": 1}
-        ).status_code == 422
-        assert client.post(
-            f"{base}/reset", json={**edit, "expected_sequence": 4}
-        ).status_code == 422
-        assert client.post(
-            f"{base}/reset",
-            json={**edit, "program_run_id": 1, "expected_run_revision": 2},
-        ).json() == _reply("persistent_value_reset")
-        assert client.post(
-            f"{base}/clear",
-            json={**_caller(), "project_path": project, "expected_sequence": 4},
-        ).status_code == 422
+        assert client.error(
+            "reset_persistent_value", {**edit, "program_run_id": 1}
+        ) == _MALFORMED
+        assert client.error(
+            "reset_persistent_value", {**edit, "expected_sequence": 4}
+        ) == _MALFORMED
+        assert client.value(
+            "reset_persistent_value",
+            {**edit, "program_run_id": 1, "expected_run_revision": 2},
+        ) == _reply("persistent_value_reset")
+        assert client.error(
+            "clear_persistent_values",
+            {**_caller(), "project_path": project, "expected_sequence": 4},
+        ) == _MALFORMED
         # Headless's wake after a committed Apply carries nothing to trust.
-        assert client.post("/api/program/persistent-values/reconcile").json() == {
-            "outcome": "duplicate"
-        }
+        assert client.value("reconcile_persistent_values") == {"outcome": "duplicate"}
 
     assert [name for name, _values in runtime.calls] == [
         "read_persistent_values",
@@ -772,28 +853,27 @@ def test_persistent_value_routes_are_applied_project_strict_requests() -> None:
     assert runtime.calls[1][1].value == 3
 
 
-def test_runtime_override_routes_are_removed_and_key_writes_remain() -> None:
-    paths = {
-        getattr(route, "path", None) for route in create_app(FakeRuntime()).routes
-    }
-    assert not any("runtime-overrides" in str(path) for path in paths)
-    assert "/api/program/runs/{program_run_id}/blackboard-values" in paths
-    assert "/api/program/runs/{program_run_id}/runtime-controls" in paths
+def test_runtime_override_commands_are_removed_and_key_writes_remain() -> None:
+    assert not any("override" in command for command in PROGRAM_RUNNER_COMMANDS)
+    assert {
+        "read_runtime_blackboard",
+        "write_runtime_blackboard",
+        "read_runtime_controls",
+    } <= PROGRAM_RUNNER_COMMANDS
 
 
-def test_key_values_read_is_a_plain_runner_query() -> None:
+def test_key_values_read_is_a_plain_runner_query(tmp_path) -> None:
     runtime = FakeRuntime()
-    with TestClient(create_app(runtime)) as client:
-        response = client.get("/api/program/runs/3/blackboard-values")
-        invalid = client.get("/api/program/runs/0/blackboard-values")
+    with _served(runtime, tmp_path) as client:
+        value = client.value("read_runtime_blackboard", {"program_run_id": 3})
+        invalid = client.error("read_runtime_blackboard", {"program_run_id": 0})
 
-    assert response.status_code == 200
-    assert response.json() == {"program_run_id": 3, "keys": []}
-    assert invalid.status_code == 422
+    assert value == {"program_run_id": 3, "keys": []}
+    assert invalid == _MALFORMED
     assert ("read_runtime_blackboard", 3) in runtime.calls
 
 
-def test_node_correction_preview_is_a_plain_runner_query() -> None:
+def test_node_correction_preview_is_a_plain_runner_query(tmp_path) -> None:
     runtime = FakeRuntime()
     body = {
         "schema_version": "manyforge.program_node_correction_preview_request.v2",
@@ -806,45 +886,38 @@ def test_node_correction_preview_is_a_plain_runner_query() -> None:
         "proposed_inputs": [{"path": "goal", "value": []}],
     }
 
-    with TestClient(create_app(runtime)) as client:
-        response = client.post(
-            "/api/program/runs/1/node-correction-previews", json=body
-        )
-        foreign = client.post(
-            "/api/program/runs/1/node-correction-previews",
-            json={**body, "target_role_id": "other"},
+    with _served(runtime, tmp_path) as client:
+        client.value("preview_node_correction", _run(1, body))
+        foreign = client.error(
+            "preview_node_correction", _run(1, {**body, "target_role_id": "other"})
         )
 
-    assert response.status_code == 200, response.text
-    assert foreign.status_code == 422
+    assert foreign == _MALFORMED
     assert [kind for kind, _value in runtime.calls] == ["node_preview"]
     assert runtime.calls[0][1][1].model_dump(mode="json") == body
 
 
-def test_run_contract_removes_client_generation_and_rejects_old_wire_field():
+def test_run_contract_removes_client_generation_and_rejects_old_wire_field(tmp_path):
     runtime = FakeRuntime()
-    body = {**_caller(), "scenario_id": "cell-pick",
-            "source_document_digest": _DIGEST_A,
-            "expected_applied_record_digest": _DIGEST_B,
-            "draft_program_revision": _DIGEST_B}
-    with TestClient(create_app(runtime)) as client:
-        assert client.post("/api/program/runs", json=body).status_code == 200
-        legacy = client.post("/api/program/runs", json={**body, "expected_admission_generation": 36})
-        assert legacy.status_code == 422
-        schema = client.get("/openapi.json").json()["components"]["schemas"]["ProgramRunStartRequest"]
-        assert "expected_admission_generation" not in schema["properties"]
-        assert "expected_admission_generation" not in schema["required"]
+    body = {**_caller(), **_START_BODY}
+    with _served(runtime, tmp_path) as client:
+        client.value("start_run", body)
+        legacy = client.error("start_run", {**body, "expected_admission_generation": 36})
+        assert legacy == _MALFORMED
+    schema = ProgramRunStartRequest.model_json_schema()
+    assert "expected_admission_generation" not in schema["properties"]
+    assert "expected_admission_generation" not in schema["required"]
     assert len([call for call in runtime.calls if call[0] == "start"]) == 1
 
 
-@pytest.mark.parametrize("code,status", [
-    ("program_run_started_then_failed", 422),
-    ("authoring_not_ready", 409),
-    ("program_cycle_reconciliation_required", 503),
-    ("program_runner_internal_error", 500),
+@pytest.mark.parametrize("code", [
+    "program_run_started_then_failed",
+    "authoring_not_ready",
+    "program_cycle_reconciliation_required",
+    "program_runner_internal_error",
 ])
 def test_started_then_failed_response_preserves_actual_identity_and_native_details(
-    code: str, status: int,
+    tmp_path, code: str,
 ) -> None:
     details = {"program_run_id": 2, "claim_generation": 9, "needs_reset": True,
         "cause_code": "component_lifecycle_facts_stale", "admission_changed": "true",
@@ -852,26 +925,16 @@ def test_started_then_failed_response_preserves_actual_identity_and_native_detai
     class FailedStart(FakeRuntime):
         def start_run(self, _request):
             raise ProgramRunnerError(code, "Owner outcome", details=details)
-    with TestClient(create_app(FailedStart())) as client:
-        response = client.post("/api/program/runs", json={**_caller(), "request_key": _key("run.failed.1"),
-            "scenario_id": "cell-pick", "source_document_digest": _DIGEST_A,
-            "expected_applied_record_digest": _DIGEST_B, "draft_program_revision": _DIGEST_A})
-    assert response.status_code == status
-    assert response.json() == {"detail": {"code": code,
-        "message": "Owner outcome", "details": details,
-        "producer": "program_runner"}}
+    with _served(FailedStart(), tmp_path) as client:
+        error = client.error("start_run", {**_caller(), **_START_BODY,
+            "request_key": _key("run.failed.1"), "draft_program_revision": _DIGEST_A})
+    assert error == {"code": code, "message": "Owner outcome", "details": details,
+        "producer": "program_runner"}
 
 
-def test_run_refusals_are_409_not_5xx() -> None:
-    # A readiness or run refusal is known before any effect: never 5xx.
-    for code in RUN_REFUSAL_CODES:
-        assert _status(code) == 409, code
-    assert _status("program_runner_unavailable") == 503
-
-
-def test_a_forwarded_request_without_its_key_is_a_bad_request() -> None:
+def test_a_forwarded_request_without_its_key_keeps_its_code(tmp_path) -> None:
     """1.15.1: the runner refuses a request Headless forwarded without its key
-    with ``request_key_required``, an internal contract violation (400)."""
+    with ``request_key_required``, an internal contract violation."""
 
     class KeylessRuntime(FakeRuntime):
         def start_run(self, request):
@@ -879,30 +942,24 @@ def test_a_forwarded_request_without_its_key_is_a_bad_request() -> None:
                 "request_key_required", "the forwarded request carries no request key"
             )
 
-    client = TestClient(create_app(KeylessRuntime()))
-    with client:
-        response = client.post(
-            "/api/program/runs",
-            json={
-                "source_label": "operator_ui",
-                "scenario_id": "cell-pick",
-                "source_document_digest": _DIGEST_A,
-                "expected_applied_record_digest": _DIGEST_B,
-                "draft_program_revision": _DIGEST_B,
-            },
+    with _served(KeylessRuntime(), tmp_path) as client:
+        error = client.error(
+            "start_run", {"source_label": "operator_ui", **_START_BODY}
         )
-    assert response.status_code == 400
-    assert response.json()["detail"]["code"] == "request_key_required"
+    assert error["code"] == "request_key_required"
 
 
-def test_startup_collects_once_after_start_and_before_serving(monkeypatch) -> None:
+def test_startup_collects_once_after_start_and_before_serving(monkeypatch, tmp_path) -> None:
     runtime = FakeRuntime()
-    settles: list[tuple[str, bool, int]] = []
+    settles: list[tuple[str, bool, int, bool]] = []
     monkeypatch.setattr(
         "manyforge_program_runner.app.settle_heap",
-        lambda point: settles.append((point, runtime.started, len(runtime.calls))),
+        lambda point: settles.append((
+            point, runtime.started, len(runtime.calls),
+            (tmp_path / "sockets" / "program-command.sock").exists(),
+        )),
     )
-    with TestClient(create_app(runtime)) as client:
-        assert settles == [("start", True, 0)]
-        assert client.get("/api/program/health").status_code == 200
-    assert settles == [("start", True, 0)]
+    with _served(runtime, tmp_path) as client:
+        assert settles == [("start", True, 0, False)]
+        assert client.value("health")["started"] is True
+    assert settles == [("start", True, 0, False)]

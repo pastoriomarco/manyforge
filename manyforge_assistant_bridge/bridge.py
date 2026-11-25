@@ -740,7 +740,7 @@ class BridgeService:
         source = node_environment.get("source")
         if (
             node_environment.get("schema_version")
-            != "manyforge.node_environment_projection.v3"
+            != "manyforge.node_environment_projection.v4"
             or type(source) is not dict
             or source.get("available") is not True
             or source.get("freshness") != "fresh"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from dataclasses import dataclass
 from typing import Any
 
@@ -667,19 +668,23 @@ def test_idle_manual_gripper_start_during_cell_stop_forwards_exact_native_decisi
     )
 
 
-@pytest.mark.parametrize("accepted", [(False, False), (True, False), (False, True), (True, True)])
-@pytest.mark.parametrize("requested", [(False, False), (True, False), (False, True), (True, True)])
+_RESET_SELECTORS = list(itertools.product((False, True), repeat=3))
+
+
+@pytest.mark.parametrize("accepted", _RESET_SELECTORS)
+@pytest.mark.parametrize("requested", _RESET_SELECTORS)
 def test_reset_join_requires_exact_accepted_options(accepted, requested):
     clock = _Clock()
     ingress, _stamps = _ingress(clock)
+    names = ("reload_initial_scene", "reset_robot_position", "reset_stored_values")
     try:
         request = _request(ingress, kind="program_reset").model_copy(update={"payload": {
             "program_run_id": None, "expected_cycle_generation": 3,
-            "reload_initial_scene": requested[0], "reset_robot_position": requested[1],
+            **dict(zip(names, requested)),
         }})
         cycle = {"execution_control_revision": 7,
                  "cycle_generation": 3, "program_run_id": None, "state": "resetting",
-                 "reset_options": {"reload_initial_scene": accepted[0], "reset_robot_position": accepted[1]}}
+                 "reset_options": dict(zip(names, accepted))}
         disposition, projection = _dispatch(object())._reduce_unavailable(request, cycle, None)
         assert disposition.disposition == ("joined" if accepted == requested else "rejected")
         assert disposition.code == ("program_reset_already_current" if accepted == requested else "program_run_request_conflict")

@@ -12,10 +12,12 @@ from typing import Any, Sequence
 import uvicorn
 
 from .app import create_app
+from . import history_export
 from .client import HeadlessClientError, HeadlessHttpClient
 from .component_model import COMPONENT_ACTIONS, enable_all_targets, prepare_all_targets
 from .identity import parse_application_start_id
 from .internal_http import INTERNAL_HTTP_SERVER_KEEP_ALIVE_SECONDS
+from .logging_setup import LOG_LEVELS, setup_logging
 from .native import (
     DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     HeadlessApiConfig,
@@ -89,7 +91,7 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     )
-    serve.add_argument("--program-runner-url")
+    serve.add_argument("--program-runner-socket-root", type=Path)
     serve.add_argument("--program-runner-timeout-s", type=float, default=30.0)
     serve.add_argument("--activation-preparer", type=Path)
     serve.add_argument("--activation-preparer-capability-root", type=Path)
@@ -98,6 +100,8 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument(
         "--activation-preparer-timeout-s", type=float, default=120.0
     )
+    # Structured JSON lines on stderr.
+    serve.add_argument("--log-level", default="INFO", choices=LOG_LEVELS)
 
     for name in (
         "health",
@@ -134,6 +138,7 @@ def _parser() -> argparse.ArgumentParser:
     history.add_argument("--event-type", action="append", default=[])
     history.add_argument("--before-sequence", type=int)
     history.add_argument("--limit", type=int, default=32)
+    history_export.add_parser(history.add_subparsers(dest="history_command"))
 
     acknowledge = subcommands.add_parser("acknowledge-alarm")
     acknowledge.add_argument("--url", default="http://127.0.0.1:9010")
@@ -209,6 +214,7 @@ def _caller(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _serve(args: argparse.Namespace) -> int:
+    setup_logging(args.log_level, process="headless_api")
     config = HeadlessApiConfig(
         install_root=args.install_root,
         artifact_root=args.artifact_root,
@@ -224,7 +230,7 @@ def _serve(args: argparse.Namespace) -> int:
         application_start_id=args.application_start_id,
         freshness_milliseconds=args.freshness_ms,
         manager_timeout_seconds=args.manager_timeout_s,
-        program_runner_url=args.program_runner_url,
+        program_runner_socket_root=args.program_runner_socket_root,
         program_runner_timeout_seconds=args.program_runner_timeout_s,
         activation_preparer_path=args.activation_preparer,
         activation_preparer_capability_root=(
@@ -339,6 +345,8 @@ def _request(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if getattr(args, "history_command", None) == "export":
+        return history_export.run(args)
     try:
         return _serve(args) if args.command == "serve" else _request(args)
     except (HeadlessApiError, HeadlessClientError, ValueError) as exc:

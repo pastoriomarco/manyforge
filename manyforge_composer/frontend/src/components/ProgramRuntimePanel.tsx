@@ -1,5 +1,5 @@
 import {
-  useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject,
+  useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type RefObject,
 } from 'react';
 
 import {
@@ -11,7 +11,7 @@ import {
   type ProgramRuntimeController,
 } from '../hooks/useProgramRuntime';
 import { busyLabel, busyReason, type BusyOperation } from '../state/busyOperation';
-import { PERSISTENT_KEYS_RESET_NOTE, RELOAD_INITIAL_SCENE_NOTE } from '../state/initialSceneApplied';
+import { RELOAD_INITIAL_SCENE_NOTE } from '../state/initialSceneApplied';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
   AutomaticRetryAuditEvent,
@@ -43,7 +43,8 @@ import { useAuthoringAdmissionTooltip } from './authoringAdmission';
 import { ActiveTcpHoldHistory, activeTcpSnapshot, type ResumeTcpChange } from '../state/activeTcpResume';
 import { NamespaceGroupOptions, useNamespaceGroups } from './common/NamespaceGroupOptions';
 import { groupByNamespace } from '../utils/blackboardNamespaces';
-import { activeProgramWaits } from '../state/programWaits';
+import { activeProgramWaits, programWaitLine, type ProgramWait } from '../state/programWaits';
+import type { SignalSample } from '../types/components';
 import {
   blockedReasonText,
   haltCauseText,
@@ -56,6 +57,7 @@ import {
 import { PendingApplyNote, SettingsSubheading } from './SettingsScope';
 import { ProgramRunSetup, type AdmittedSpeedsView } from './ProgramRunSetup';
 import { api } from '../api/client';
+import { errorMessage } from '../state/structuralResource';
 import { ERROR_CATALOG } from '../api/errorCatalog.generated';
 import {
   isAutomaticRetryAuditEvent,
@@ -112,6 +114,8 @@ interface ProgramRuntimePanelProps {
   recovery?: ProgramRecoveryCommands | null;
   recoveryRef?: RefObject<HTMLElement | null>;
 }
+
+const subscribeNothing = () => () => undefined;
 
 const RECOVERY_COMMAND_MEANING = {
   retry: 'Re-run the node.',
@@ -549,7 +553,11 @@ function useBriefNewestAuditEvent<E extends RuntimeControlAuditEvent>(
     && (baseline.runId !== programRunId || newest.eventRevision > baseline.revision)
     ? newest
     : null;
-  return useBriefNotice(fresh === null ? null : noticeOf(programRunId, fresh));
+  // Recent's "see History" filters by the run.
+  return useBriefNotice(fresh === null ? null : {
+    ...noticeOf(programRunId, fresh),
+    ...(programRunId === null ? {} : { history: { programRunId } }),
+  });
 }
 
 /** The brief warning for a newly unavailable io wait source (see the retry notice). */
@@ -673,7 +681,7 @@ export function ProgramRunKeyValuesSection({
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) {
-          setError(reason instanceof Error ? reason.message : 'Current values are unavailable.');
+          setError(errorMessage(reason, 'Current values are unavailable.'));
         }
       });
     return () => controller.abort();
@@ -1447,10 +1455,16 @@ export function deriveTransportGuidance({
   onOpenManualRecovery,
   onReviewProgramRecovery,
   onReset,
+  io = null,
+  nowMs = Date.now(),
 }: {
   enabled: boolean;
   program: ProgramRuntimeController;
   robot: RobotControlController;
+  /** The pushed I/O samples (null: not known): an input wait shows its input's current value. */
+  io?: readonly SignalSample[] | null;
+  /** Wall time a wait's elapsed time counts to. */
+  nowMs?: number;
   observationTransport?: ExecutionObservationTransportStatus;
   motionActive: boolean;
   onOpenManualRecovery?: (operation: ManualRecoveryOperation) => void;
@@ -1611,19 +1625,30 @@ export function deriveTransportGuidance({
       })),
     });
   }
-  const waiting = programWaitNotice(program);
+  const waiting = programWaitNotice(program, io, nowMs);
   if (waiting !== null) notices.push(waiting);
   return notices;
 }
 
-/** What the running Program waits for (OD-354); null when nothing waits. */
-function programWaitNotice(program: ProgramRuntimeController): WorkbenchNotice | null {
+/** The running Program's active waits (OD-354); empty when nothing waits. */
+function programWaitsShown(program: ProgramRuntimeController): ProgramWait[] {
   const { run, applied } = program.state;
   // The node statuses name nodes of the captured Program: read its tree only when it is the Applied one.
   if (run === null || applied === null || run.state !== 'running'
-    || run.capture.programRevision !== applied.programRevision) return null;
-  const waits = activeProgramWaits(applied.program.tree, run.nodeStatuses);
+    || run.capture.programRevision !== applied.programRevision) return [];
+  return activeProgramWaits(applied.program.tree, run.nodeStatuses);
+}
+
+/** What the running Program waits for (OD-354); null when nothing waits. */
+function programWaitNotice(
+  program: ProgramRuntimeController,
+  io: readonly SignalSample[] | null,
+  nowMs: number,
+): WorkbenchNotice | null {
+  const waits = programWaitsShown(program);
   if (waits.length === 0) return null;
+  const run = program.state.run!;
+  const observation = { runningSinceUtcNs: run.nodeRunningSinceUtcNs, waitValues: run.nodeWaitValues, nowMs };
   return {
     id: 'program.waiting',
     severity: 'info',
@@ -1631,8 +1656,23 @@ function programWaitNotice(program: ProgramRuntimeController): WorkbenchNotice |
     title: 'Waiting',
     message: '',
     // Every active wait on its own line, always shown while it waits.
-    pinnedLines: waits.map((wait) => `${wait.condition} — ${wait.nodeInstanceIds.join(', ')}`),
+    pinnedLines: waits.map((wait) => programWaitLine(wait, io, observation)),
   };
+}
+
+/** Wall time, ticking each second while a shown wait counts its elapsed time. */
+function useWaitClock(program: ProgramRuntimeController): number {
+  const since = program.state.run?.nodeRunningSinceUtcNs;
+  const counting = since !== undefined && programWaitsShown(program)
+    .some((wait) => wait.nodeInstanceIds.some((id) => since[id] !== undefined));
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!counting) return undefined;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [counting]);
+  return nowMs;
 }
 
 /** Operator explanation for an automatically revealed All column. */
@@ -1827,14 +1867,20 @@ export function MotionControlSettings({ groups }: { groups: DraftGroupVisibility
   );
 }
 
-// Both Reset options start off each time the confirmation opens.
+// Every Reset option starts off each time the confirmation opens.
 const NO_RESET_OPTIONS: Required<ProgramResetOptions> = {
   reloadInitialScene: false,
   resetRobotPosition: false,
+  resetStoredValues: false,
 };
 
+/** The help text of the Reset stored values option (OD-393). */
+export const RESET_STORED_VALUES_NOTE = 'Part dimensions, offsets and other values kept between runs return to the Program\'s initial values.';
+
 /** What a Reset with these options leaves as it is, for the confirmation. */
-export function resetKeptMessage(options: Required<ProgramResetOptions>): string | null {
+export function resetKeptMessage(
+  options: Pick<Required<ProgramResetOptions>, 'reloadInitialScene' | 'resetRobotPosition'>,
+): string | null {
   if (options.reloadInitialScene && options.resetRobotPosition) return null;
   if (options.reloadInitialScene) return 'Robot positions stay as they are.';
   if (options.resetRobotPosition) return 'The Scene, carried objects and gripper state stay as they are.';
@@ -2214,14 +2260,18 @@ export function ProgramTransportControls({
   const reloadUnavailableReason = reloadAvailable
     ? null
     : 'No applied Program is available, so there is no initial scene to reload. Load a Scenario first.';
+  // Stored values exist only for the applied Program's persistent keys.
+  const appliedPersistentKeys = (state.applied?.program.blackboard?.keys ?? [])
+    .some((key) => key.persistence === 'persistent');
+  const storedValuesUnavailableReason = appliedPersistentKeys
+    ? null
+    : 'The applied Program has no persistent keys, so there are no stored values to reset.';
   const resetSelectionApplied = {
     reloadInitialScene: reloadAvailable && resetSelection.reloadInitialScene,
     resetRobotPosition: positionAvailable && resetSelection.resetRobotPosition,
+    resetStoredValues: appliedPersistentKeys && resetSelection.resetStoredValues,
   };
   const resetKept = resetKeptMessage(resetSelectionApplied);
-  // Reload initial scene also resets persistent keys; the confirmation lists them.
-  const appliedPersistentKeys = (state.applied?.program.blackboard?.keys ?? [])
-    .some((key) => key.persistence === 'persistent');
   const confirmReset = preferences.confirmReset;
   const requestProgramReset = async () => {
     if (!canReset) return;
@@ -2371,10 +2421,16 @@ export function ProgramTransportControls({
       recoverySection.current?.focus({ preventScroll: true });
     });
   }, [detailsOpen, focusRecovery]);
+  // The pushed I/O samples, for the current value of an input wait.
+  const pushedIo = () => robot.controlSource?.getCellState().io ?? null;
+  const io = useSyncExternalStore(robot.controlSource?.subscribeCellState ?? subscribeNothing, pushedIo, pushedIo);
+  const waitClockMs = useWaitClock(program);
   usePublishWorkbenchNotices('transport', deriveTransportGuidance({
     enabled,
     program,
     robot,
+    io,
+    nowMs: waitClockMs,
     observationTransport,
     motionActive,
     onOpenManualRecovery: onOpenRobotControls === undefined ? undefined : openManualRecovery,
@@ -2995,7 +3051,6 @@ export function ProgramTransportControls({
             </label>
             <small className="transport-reset-option-note">
               {reloadUnavailableReason ?? RELOAD_INITIAL_SCENE_NOTE}
-              {appliedPersistentKeys && PERSISTENT_KEYS_RESET_NOTE}
             </small>
             <label className="toggle-control" title={positionUnavailableReason ?? undefined}>
               <input
@@ -3014,8 +3069,24 @@ export function ProgramTransportControls({
                 ? 'Simulator only: robots are set to the Deployment\'s initial joint positions.'
                 : positionUnavailableReason}
             </small>
+            <label className="toggle-control" title={storedValuesUnavailableReason ?? undefined}>
+              <input
+                type="checkbox"
+                name="resetStoredValues"
+                checked={resetSelectionApplied.resetStoredValues}
+                disabled={!appliedPersistentKeys}
+                onChange={(event) => {
+                  const resetStoredValues = event.target.checked;
+                  setResetSelection((current) => ({ ...current, resetStoredValues }));
+                }}
+              />
+              <span>Reset stored values to their initial values</span>
+            </label>
+            <small className="transport-reset-option-note">
+              {storedValuesUnavailableReason ?? RESET_STORED_VALUES_NOTE}
+            </small>
           </fieldset>
-          {resetSelectionApplied.reloadInitialScene && appliedPersistentKeys && (
+          {resetSelectionApplied.resetStoredValues && (
             <PersistentKeyResetNotice client={program.persistentValues} />
           )}
           {resetKept !== null && <p>{resetKept}</p>}

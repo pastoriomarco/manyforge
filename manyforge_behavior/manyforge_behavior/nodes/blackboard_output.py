@@ -13,7 +13,7 @@ from typing import Final
 
 
 BLACKBOARD_OUTPUT_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_blackboard_output_binding_unavailable"
+    "blackboard_output_binding_unavailable"
 )
 
 

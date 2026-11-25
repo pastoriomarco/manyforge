@@ -23,7 +23,7 @@ from typing import Final, NamedTuple
 
 
 UNAVAILABLE_EXIT_CODE: Final = 78
-UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
+UNAVAILABLE_REASON_CODE: Final = "runtime_unavailable"
 HISTORICAL_SOURCE: Final = (
     "manyforge@08222188293df8e12f90dc72e204c21f22f92ea1"
 )

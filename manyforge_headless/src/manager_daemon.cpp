@@ -30,6 +30,7 @@
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/retained_execution_host_unit_adapter.hpp>
 #include <manyforge_component_manager/site_settings.hpp>
+#include <manyforge_core/process_diagnostics.hpp>
 #include <manyforge_core/types/application_identity.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/request_key.hpp>
@@ -66,7 +67,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -191,6 +194,58 @@ void HandleStopSignal(int) {
       g_stop_signal_count.load(std::memory_order_relaxed) +
       (g_stop_started_by_command.load(std::memory_order_relaxed) ? 1U : 0U);
   return requests >= 2U;
+}
+
+/// A repeating failure's line, printed once per change: `text` is printed
+/// only when it differs from `last`, the last one printed. The site clears
+/// `last` on its next success, so a new episode prints again.
+void LogOnChange(std::optional<std::string> &last,
+                 const core::LogSeverity severity, std::string text) {
+  if (last == text) return;
+  core::LogLine(severity, text);
+  last = std::move(text);
+}
+
+/// `<manager-run-root>/application-end.json`
+/// (`manyforge.application_end.v1`): how the application ended, written once
+/// by the main thread at the end of the stop sequence; the launcher puts it
+/// into the run's session marker.
+inline constexpr std::string_view kApplicationEndFileName =
+    "application-end.json";
+
+/// The process whose exit ended the application, as observed at its reap.
+struct ApplicationEndProcess final {
+  std::string role;
+  pid_t pid{};
+  bool signaled{};
+  int value{};
+  bool core_dumped{};
+};
+
+/// The first application-ending event, held in memory until it is written.
+struct ApplicationEnd final {
+  /// "process_exit", "stop_signal", "shutdown_runtime" or
+  /// "manager_failure".
+  std::string_view ended_by;
+  std::optional<ApplicationEndProcess> process;
+  /// UTC, ISO-8601 with milliseconds and `Z`.
+  std::string ended_at_wall;
+};
+
+std::string UtcWallText(const std::chrono::system_clock::time_point time) {
+  const auto milliseconds =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          time.time_since_epoch())
+          .count();
+  const std::time_t seconds = static_cast<std::time_t>(milliseconds / 1000);
+  std::tm value{};
+  static_cast<void>(::gmtime_r(&seconds, &value));
+  std::array<char, 32> output{};
+  const auto count = std::snprintf(
+      output.data(), output.size(), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+      value.tm_year + 1900, value.tm_mon + 1, value.tm_mday, value.tm_hour,
+      value.tm_min, value.tm_sec, static_cast<int>(milliseconds % 1000));
+  return std::string(output.data(), static_cast<std::size_t>(count));
 }
 
 class FileDescriptor final {
@@ -1572,8 +1627,14 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     return result;
   }
   if (command == "scene_owner_read") {
-    RequireExactObjectSize(root, 2U, "scene owner read command");
-    return ManagerCommand{.kind = CommandKind::kSceneOwnerRead};
+    // Optional `scene_resource_ids`: only these resources' rows (OD-380).
+    const auto *ids = root.find_object_member("scene_resource_ids");
+    RequireExactObjectSize(root, ids != nullptr ? 3U : 2U,
+                           "scene owner read command");
+    ManagerCommand result{.kind = CommandKind::kSceneOwnerRead};
+    if (ids != nullptr)
+      result.scene_resource_ids = RequiredSceneResourceIds(*ids);
+    return result;
   }
   if (command == "scene_candidate_preview") {
     RequireExactObjectSize(root, 3U, "scene candidate preview command");
@@ -2499,17 +2560,23 @@ CanonicalValue ApplyPreparedActivationValue(
 /// mutable phase label, heartbeat or socket responsiveness is reported as
 /// progress. A failure is reported once, with its first retained failure and
 /// effect certainty, and is never repaired, retried or rolled back.
+/// A journaled success whose admission claim release is still pending
+/// (`success_settlement_pending`) is answered `pending` (OD-387): `succeeded`
+/// means the claim is released and the cell usable.
 CanonicalValue ApplyStatusResponse(
     const component_manager::PersistedManagerApplyStatus &status,
-    const component_manager::FailedApplyAcknowledgementState failure_acknowledgement) {
+    const component_manager::FailedApplyAcknowledgementState failure_acknowledgement,
+    const bool success_settlement_pending) {
   const auto &intent = status.intent.intent;
   const auto progress =
       component_manager::DeriveManagerApplyProgress(status);
   const auto phase =
       CanonicalValue(std::string(component_manager::ToString(progress.phase)));
-  const auto terminal = status.terminal_outcome.has_value()
-                            ? &status.terminal_outcome->terminal_outcome
-                            : nullptr;
+  const auto *terminal = status.terminal_outcome.has_value()
+                             ? &status.terminal_outcome->terminal_outcome
+                             : nullptr;
+  if (terminal != nullptr && terminal->succeeded() && success_settlement_pending)
+    terminal = nullptr;
   const bool succeeded =
       terminal != nullptr && terminal->state ==
                                  component_manager::
@@ -3369,7 +3436,8 @@ public:
         application_processes_(
             ParseApplicationProcessList(ReadStartupDocument(
                 config_.application_processes_path, "application processes")),
-            application_start_id_) {
+            application_start_id_,
+            component_manager::CoreDumpLimitBytesOfDocument(site_settings_document_)) {
     // The constructor posts store records (bootstrap); a failure drains them
     // before the stores close, as the destructor does.
     // OD-187 (1): a second stop request during the stop sequence also ends
@@ -3433,6 +3501,7 @@ public:
     if (!main_wake_fd_) FailErrno("create the Manager main-thread wake");
     const int stop_fd = execution_host_adapter_.AbandonSignalFd();
     auto next_status_tick = std::chrono::steady_clock::now();
+    std::string_view ended_by = "stop_signal";
     try {
       StartNativeManagerLivenessLane();
       StartApplyProgressLane();
@@ -3456,6 +3525,7 @@ public:
           if (shutdown_client_.has_value()) {
             // shutdown_runtime (the first stop request): the stop sequence
             // runs here; its client is answered once it ended.
+            ended_by = "shutdown_runtime";
             break;
           }
         }
@@ -3473,7 +3543,11 @@ public:
           [[maybe_unused]] const auto io_result = ::read(main_wake_fd_.get(), &count, sizeof(count));
         }
       }
+      RecordApplicationEnd(ended_by, std::nullopt);
     } catch (...) {
+      // A Manager-internal failure (memory only; the stop sequence's last
+      // step writes it).
+      RecordApplicationEnd("manager_failure", std::nullopt);
       EndApplication();
       throw;
     }
@@ -3585,15 +3659,28 @@ public:
   /// Returns true when the application must end.
   [[nodiscard]] bool SuperviseApplication() {
     if (const auto exit = execution_host_adapter_.HostExit()) {
-      std::cerr << "execution_host exited with "
-                << (exit->signaled ? "signal " : "status ") << exit->value
-                << '\n';
+      core::LogLine(core::LogSeverity::kError, core::LogText("execution_host exited with ",
+                                      exit->signaled ? "signal " : "status ",
+                                      exit->value));
+      RecordApplicationEnd(
+          "process_exit",
+          ApplicationEndProcess{std::string(core::ApplicationRoleText(
+                                    core::ApplicationRole::kExecutionHost)),
+                                exit->pid, exit->signaled, exit->value,
+                                exit->core_dumped});
       return true;
     }
     if (const auto exit = application_processes_.PollExit()) {
-      std::cerr << core::ApplicationRoleText(exit->role) << " exited with "
-                << (exit->signaled ? "signal " : "status ") << exit->value
-                << '\n';
+      core::LogLine(core::LogSeverity::kError,
+                    core::LogText(core::ApplicationRoleText(exit->role),
+                                  " exited with ",
+                                  exit->signaled ? "signal " : "status ",
+                                  exit->value));
+      RecordApplicationEnd(
+          "process_exit",
+          ApplicationEndProcess{
+              std::string(core::ApplicationRoleText(exit->role)), exit->pid,
+              exit->signaled, exit->value, exit->core_dumped});
       return true;
     }
     LogExecutionHostLateReply();
@@ -3610,8 +3697,9 @@ public:
         try {
           application_processes_.StartAfterBaseline();
         } catch (const std::exception &error) {
-          std::cerr << "application process launch failed: " << error.what()
-                    << '\n';
+          core::LogLine(core::LogSeverity::kError, core::LogText("application process launch failed: ",
+                                          error.what()));
+          RecordApplicationEnd("manager_failure", std::nullopt);
           return true;
         }
       }
@@ -3652,10 +3740,11 @@ public:
       static_cast<void>(active_runtime_.Shutdown());
     } catch (const std::exception &error) {
       stop_incomplete_ = true;
-      std::cerr << "execution host shutdown failed: " << error.what() << '\n';
+      core::LogLine(core::LogSeverity::kError, core::LogText("execution host shutdown failed: ",
+                                      error.what()));
     } catch (...) {
       stop_incomplete_ = true;
-      std::cerr << "execution host shutdown failed\n";
+      core::LogLine(core::LogSeverity::kError, "execution host shutdown failed");
     }
     // The adapter's stop records the kill of the host (a second stop
     // request); the Manager prints its lines here.
@@ -3671,6 +3760,81 @@ public:
       stop_incomplete_ = true;
     StopApplyProgressLane();
     StopNativeManagerLivenessLane();
+    // Every step above is done (the Halt request, the processes, the
+    // execution host, the Manager's lanes), so this write delays none of them
+    // and holds no lock any other thread takes.
+    WriteApplicationEnd();
+  }
+
+  /// Main thread, memory only: keeps the first application-ending event
+  /// (OD-382). A later event, such as an exit during the stop, is not kept.
+  void RecordApplicationEnd(const std::string_view ended_by,
+                            std::optional<ApplicationEndProcess> process) {
+    if (application_end_.has_value()) return;
+    application_end_ = ApplicationEnd{
+        ended_by, std::move(process),
+        UtcWallText(std::chrono::system_clock::now())};
+  }
+
+  /// Main thread, once, at the end of the stop sequence: writes the kept
+  /// application end to `<manager-run-root>/application-end.json`, atomically
+  /// (a temporary file, then rename). Nothing when no end was kept. A failed
+  /// write is logged once and ignored.
+  void WriteApplicationEnd() noexcept {
+    if (!application_end_.has_value()) return;
+    const auto end = std::exchange(application_end_, std::nullopt);
+    try {
+      CanonicalValue process(nullptr);
+      if (end->process.has_value()) {
+        const auto &facts = *end->process;
+        process = CanonicalValue(CanonicalValue::Object{
+            {"core_dumped", CanonicalValue(facts.core_dumped)},
+            {"exit_status",
+             facts.signaled ? CanonicalValue(nullptr)
+                            : CanonicalValue(static_cast<double>(facts.value))},
+            {"pid", CanonicalValue(static_cast<double>(facts.pid))},
+            {"role", CanonicalValue(facts.role)},
+            {"signal",
+             facts.signaled ? CanonicalValue(static_cast<double>(facts.value))
+                            : CanonicalValue(nullptr)},
+        });
+      }
+      const auto text =
+          content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+              {"ended_at_wall", CanonicalValue(end->ended_at_wall)},
+              {"ended_by", CanonicalValue(std::string(end->ended_by))},
+              {"process", std::move(process)},
+              {"schema_version", CanonicalValue("manyforge.application_end.v1")},
+          })) +
+          "\n";
+      const auto path = config_.manager_run_root / kApplicationEndFileName;
+      auto temporary = path;
+      temporary.replace_filename("." + std::string(kApplicationEndFileName) +
+                                 ".next");
+      {
+        const FileDescriptor file(
+            ::open(temporary.c_str(),
+                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
+        if (!file) FailErrno("create " + temporary.string());
+        std::size_t offset = 0U;
+        while (offset < text.size()) {
+          const auto count =
+              ::write(file.get(), text.data() + offset, text.size() - offset);
+          if (count < 0 && errno == EINTR) continue;
+          if (count <= 0) FailErrno("write " + temporary.string());
+          offset += static_cast<std::size_t>(count);
+        }
+      }
+      if (::rename(temporary.c_str(), path.c_str()) != 0)
+        FailErrno("rename " + temporary.string());
+    } catch (const std::exception &error) {
+      core::LogLine(core::LogSeverity::kError,
+                    core::LogText("application end record not written: ",
+                                  error.what()));
+    } catch (...) {
+      core::LogLine(core::LogSeverity::kError,
+                    "application end record not written");
+    }
   }
 
   /// The Manager's status after an orderly stop: 0 when every step
@@ -3696,10 +3860,10 @@ private:
   /// stop request does not cut it. A close failure is ignored, as the
   /// stores' destructors ignore it.
   void DrainAndCloseStores() noexcept {
-    std::cerr << "application stop: waiting at manager_records: the queued "
-                 "store records to be written\n";
+    core::LogLine(core::LogSeverity::kInfo, "application stop: waiting at manager_records: the "
+                      "queued store records to be written");
     record_writer_.DrainAndStop();
-    std::cerr << "application stop: manager_records written\n";
+    core::LogLine(core::LogSeverity::kInfo, "application stop: manager_records written");
     const auto close_store = [](auto &store) noexcept {
       try {
         store.Close();
@@ -4077,8 +4241,10 @@ private:
         const auto warning = reconciled.error().code + ": " +
                              reconciled.error().message.substr(0U, 1024U);
         if (scene_admission_last_warning_ != warning) {
-          std::cerr << "Scene admission reconciliation remains closed: "
-                    << warning << '\n';
+          core::LogLine(core::LogSeverity::kWarning,
+                        "Scene admission reconciliation remains closed: " +
+                            warning,
+                        reconciled.error().code);
           scene_admission_last_warning_ = warning;
         }
       } else {
@@ -4137,13 +4303,14 @@ private:
         0U,
         publication_generation,
     };
+    std::optional<std::string> viewer_pose_failure;
     {
       std::lock_guard source_lock(manager_source_mutex_);
       if (scene_runtime_owner_.Snapshot().initialization_generation == 0U) {
         scene_runtime_owner_.EstablishOpenRuntime(
             desired_scene_runtime, publication_generation,
             "durable_finalized_active_projection");
-        TryPublishViewerPoseSessionsLocked();
+        viewer_pose_failure = TryPublishViewerPoseSessionsLocked();
       } else {
         const auto changed = scene_runtime_owner_.AdoptFinalizedOpenRuntime(
             desired_scene_runtime, publication_generation,
@@ -4151,23 +4318,27 @@ private:
         if (changed) {
           pose_observer_sessions_.clear();
           pose_observation_replays_.clear();
-          TryPublishViewerPoseSessionsLocked();
+          viewer_pose_failure = TryPublishViewerPoseSessionsLocked();
         }
       }
     }
+    LogViewerPoseSessionFailure(viewer_pose_failure);
     const auto manager_generation = [&] {
       // One lock spans the journal read, the build and the board swap, so
       // every Manager source value pairs one active publication with the
       // Apply history read after it, and values are stored in journal order.
       std::lock_guard source_lock(manager_source_mutex_);
+      const auto apply_inventory = stores_.apply_journal().ReadStatusInventory();
       return PublishManagerSectionLocked(
           observed_at,
           BuildManagerSourcePayload(
               *active_bundle, admission_, runtime, stores_.apply_journal(),
-              stores_.apply_journal().ReadStatusInventory(),
+              apply_inventory,
               kernel_apply_available
                   ? ManagerApplyMutationAvailability::kAvailable
-                  : ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
+                  : ManagerApplyMutationAvailability::kKernelOwnerUnavailable,
+              // Lock-free, read after the journal (OD-387).
+              named_apply_.SuccessSettlementPendingApply()));
     }();
 
     const auto scene_generation = PublishLogicalScene(observed_at);
@@ -4647,14 +4818,16 @@ private:
             *manager_liveness_last_warning_ == warning)
           return;
         manager_liveness_last_warning_ = std::move(warning);
-        std::cerr << *manager_liveness_last_warning_ << '\n';
+        core::LogLine(core::LogSeverity::kWarning, *manager_liveness_last_warning_);
       } catch (...) {
         try {
-          std::cerr << "Manager native liveness renewal remains fail-closed: "
-                    << "predicate=" << failure_predicate
-                    << " scope=" << failure_scope
-                    << " runtime_unit=" << runtime_unit
-                    << " cause=" << cause.substr(0U, 512U) << '\n';
+          core::LogLine(
+              core::LogSeverity::kWarning,
+              core::LogText(
+                  "Manager native liveness renewal remains fail-closed: ",
+                  "predicate=", failure_predicate, " scope=", failure_scope,
+                  " runtime_unit=", runtime_unit,
+                  " cause=", cause.substr(0U, 512U)));
         } catch (...) {
           // Logging availability never changes the already recorded failure.
         }
@@ -4928,9 +5101,13 @@ private:
       static_cast<void>(ObserveRuntimeAndPublish());
       return ManagerLivenessRenewedFor(intent, true);
     } catch (const std::exception &error) {
-      std::cerr << "Manager Apply successor observation remains pending: " << error.what() << '\n';
+      core::LogLine(core::LogSeverity::kWarning,
+                    core::LogText("Manager Apply successor observation "
+                                  "remains pending: ",
+                                  error.what()));
     } catch (...) {
-      std::cerr << "Manager Apply successor observation remains pending after an unknown error\n";
+      core::LogLine(core::LogSeverity::kWarning, "Manager Apply successor observation remains "
+                        "pending after an unknown error");
     }
     return false;
   }
@@ -5075,11 +5252,16 @@ private:
             if (const auto pending = named_apply_.PendingSettlementForHeartbeat())
               RequestApplySettlementProgress(*pending);
           }
+          heartbeat_settlement_last_warning_.reset();
         } catch (const std::exception &error) {
-          std::cerr << "Manager Apply heartbeat settlement stopped fail-closed: "
-                    << error.what() << '\n';
+          LogOnChange(heartbeat_settlement_last_warning_, core::LogSeverity::kError,
+                      core::LogText("Manager Apply heartbeat settlement "
+                                    "stopped fail-closed: ",
+                                    error.what()));
         } catch (...) {
-          std::cerr << "Manager Apply heartbeat settlement stopped fail-closed after an unknown error\n";
+          LogOnChange(heartbeat_settlement_last_warning_, core::LogSeverity::kError,
+                      "Manager Apply heartbeat settlement stopped fail-closed "
+                      "after an unknown error");
         }
       }
       lock.lock();
@@ -5171,15 +5353,22 @@ private:
         row("program_runner", "liveness", runner->exchange,
             runner_outstanding_seen_.since_ns);
       std::lock_guard source_lock(manager_source_mutex_);
-      if (rows == outstanding_exchanges_) return;
+      if (rows == outstanding_exchanges_) {
+        outstanding_exchange_last_warning_.reset();
+        return;
+      }
       outstanding_exchanges_ = std::move(rows);
       if (last_manager_payload_.has_value())
         static_cast<void>(PublishManagerValueLocked(now_ns));
+      outstanding_exchange_last_warning_.reset();
     } catch (const std::exception &error) {
-      std::cerr << "Manager outstanding-exchange publication failed: "
-                << error.what() << '\n';
+      LogOnChange(outstanding_exchange_last_warning_, core::LogSeverity::kError,
+                  core::LogText("Manager outstanding-exchange publication "
+                                "failed: ",
+                                error.what()));
     } catch (...) {
-      std::cerr << "Manager outstanding-exchange publication failed\n";
+      LogOnChange(outstanding_exchange_last_warning_, core::LogSeverity::kError,
+                  "Manager outstanding-exchange publication failed");
     }
   }
 
@@ -5204,16 +5393,20 @@ private:
       static_cast<void>(
           PublishLogicalScene(static_cast<std::int64_t>(ElapsedNs())));
     } catch (const std::exception &error) {
-      std::cerr << "Manager daemon scene publication failed after durable "
-                   "commit: "
-                << error.what() << '\n';
+      core::LogLine(core::LogSeverity::kError,
+                    core::LogText("Manager daemon scene publication failed "
+                                  "after durable commit: ",
+                                  error.what()));
     } catch (...) {
-      std::cerr << "Manager daemon scene publication failed after durable "
-                   "commit with an unknown error\n";
+      core::LogLine(core::LogSeverity::kError, "Manager daemon scene publication failed after "
+                        "durable commit with an unknown error");
     }
   }
 
-  void TryPublishViewerPoseSessionsLocked() noexcept {
+  /// Under manager_source_mutex_, memory only. A failure is returned as its
+  /// log line, which the caller prints after it released the lock.
+  [[nodiscard]] std::optional<std::string>
+  TryPublishViewerPoseSessionsLocked() noexcept {
     try {
       const auto state = SceneRuntimeStateValue(scene_runtime_owner_.Snapshot());
       const auto *identity = state.find_object_member("runtime_identity");
@@ -5236,13 +5429,20 @@ private:
               {"runtime_identity", *identity},
               {"sessions", CanonicalValue(std::move(sessions))},
           })));
+      return std::nullopt;
     } catch (const std::exception &error) {
-      std::cerr << "Manager viewer pose session publication failed: "
-                << error.what() << '\n';
+      return core::LogText("Manager viewer pose session publication failed: ",
+                           error.what());
     } catch (...) {
-      std::cerr << "Manager viewer pose session publication failed with an "
-                   "unknown error\n";
+      return "Manager viewer pose session publication failed with an unknown "
+             "error";
     }
+  }
+
+  static void LogViewerPoseSessionFailure(
+      const std::optional<std::string> &failure) noexcept {
+    if (failure.has_value())
+      core::LogLine(core::LogSeverity::kError, *failure);
   }
 
   /// Command strand and Apply lane, with no lock held. Every input of the
@@ -5387,17 +5587,21 @@ private:
                   kernel_apply_available_
                       ? ManagerApplyMutationAvailability::kAvailable
                       : ManagerApplyMutationAvailability::
-                            kKernelOwnerUnavailable)));
+                            kKernelOwnerUnavailable,
+                  // Lock-free, read after the journal (OD-387).
+                  named_apply_.SuccessSettlementPendingApply())));
         }
       }
       static_cast<void>(PublishLogicalScene(observed_at));
       static_cast<void>(PublishSceneRuntime(observed_at));
     } catch (const std::exception &error) {
-      std::cerr << "Manager daemon Apply-transition publication failed: "
-                << error.what() << '\n';
+      core::LogLine(core::LogSeverity::kError,
+                    core::LogText("Manager daemon Apply-transition "
+                                  "publication failed: ",
+                                  error.what()));
     } catch (...) {
-      std::cerr << "Manager daemon Apply-transition publication failed with "
-                   "an unknown error\n";
+      core::LogLine(core::LogSeverity::kError, "Manager daemon Apply-transition publication "
+                        "failed with an unknown error");
     }
   }
 
@@ -5418,19 +5622,24 @@ private:
       // replaced here. Only an explicit admitted maintenance operation may
       // initialize it again.
       static_cast<void>(ObserveRuntimeAndPublish());
+      periodic_reconcile_last_warning_.reset();
     } catch (const ManagerPackageGenerationRestartRequired &error) {
       TrySubmitFailClosedReadiness();
       PublishPackageRestartRequired();
-      std::cerr << "Manager daemon package generation changed: " << error.what()
-                << '\n';
+      LogOnChange(periodic_reconcile_last_warning_, core::LogSeverity::kError,
+                  core::LogText("Manager daemon package generation changed: ",
+                                error.what()));
     } catch (const std::exception &error) {
       TrySubmitFailClosedReadiness();
-      std::cerr << "Manager daemon periodic reconciliation failed: "
-                << error.what() << '\n';
+      LogOnChange(periodic_reconcile_last_warning_, core::LogSeverity::kError,
+                  core::LogText("Manager daemon periodic reconciliation "
+                                "failed: ",
+                                error.what()));
     } catch (...) {
       TrySubmitFailClosedReadiness();
-      std::cerr << "Manager daemon periodic reconciliation failed with an "
-                   "unknown error\n";
+      LogOnChange(periodic_reconcile_last_warning_, core::LogSeverity::kError,
+                  "Manager daemon periodic reconciliation failed with an "
+                  "unknown error");
     }
   }
 
@@ -5527,21 +5736,29 @@ private:
                     !result->settlement_pending;
           note_success(result);
         }
-        if (succeeded)
+        if (succeeded) {
+          // The claim is released: republish so `succeeded` reaches the
+          // source's subscribers now (OD-387). No lane lock is held here.
+          TryPublishApplyTransition();
           CollectUnreferencedActivationContent();
+        }
+        apply_progression_last_warning_.reset();
       } catch (const std::exception &error) {
         // A nonterminal Apply's step failure is already its terminal outcome
         // (`apply_progression_failed`, in the coordinator) and a release after
         // a terminal outcome is a pending settlement, so this lane never parks
         // (OD-188 P1). What still escapes (a journal read or write) is logged;
         // the periodic tick requests the next pass while an Apply is open.
-        std::cerr << "Manager daemon Apply progression pass failed: "
-                  << error.what() << '\n';
+        LogOnChange(apply_progression_last_warning_, core::LogSeverity::kError,
+                    core::LogText("Manager daemon Apply progression pass "
+                                  "failed: ",
+                                  error.what()));
         lock.lock();
         continue;
       } catch (...) {
-        std::cerr << "Manager daemon Apply progression pass failed with an "
-                     "unknown error\n";
+        LogOnChange(apply_progression_last_warning_, core::LogSeverity::kError,
+                    "Manager daemon Apply progression pass failed with an "
+                    "unknown error");
         lock.lock();
         continue;
       }
@@ -5686,17 +5903,21 @@ private:
           config_.activation_root, live, activation_content_references_);
       // One line per run, also when nothing is removed or a preparation
       // deferred it: its duration is time this lane holds the writer lock.
-      std::cerr << "Manager activation content collection: "
-                << (collected.collected ? "collected" : "deferred")
-                << " examined=" << collected.examined_entries
-                << " removed=" << collected.removed_entries
-                << " removed_bytes=" << collected.removed_bytes
-                << " read_bytes=" << collected.read_bytes
-                << " reused_documents=" << collected.reused_documents
-                << " elapsed_ms=" << elapsed_ms() << '\n';
+      core::LogLine(
+          core::LogSeverity::kInfo,
+          core::LogText("Manager activation content collection: ",
+                        collected.collected ? "collected" : "deferred",
+                        " examined=", collected.examined_entries,
+                        " removed=", collected.removed_entries,
+                        " removed_bytes=", collected.removed_bytes,
+                        " read_bytes=", collected.read_bytes,
+                        " reused_documents=", collected.reused_documents,
+                        " elapsed_ms=", elapsed_ms()));
     } catch (const std::exception &error) {
-      std::cerr << "Manager activation content collection skipped after "
-                << elapsed_ms() << " ms: " << error.what() << '\n';
+      core::LogLine(core::LogSeverity::kWarning,
+                    core::LogText("Manager activation content collection "
+                                  "skipped after ",
+                                  elapsed_ms(), " ms: ", error.what()));
     }
   }
 
@@ -5731,14 +5952,16 @@ private:
           BuildManagerSourcePayload(
               *last_active_bundle_, admission_, *last_runtime_, stores_.apply_journal(),
               apply_inventory,
-              ManagerApplyMutationAvailability::kFullStackRestartRequired)));
+              ManagerApplyMutationAvailability::kFullStackRestartRequired,
+              named_apply_.SuccessSettlementPendingApply())));
     } catch (const std::exception &publication_error) {
-      std::cerr << "Manager daemon could not publish package-generation "
-                   "failure: "
-                << publication_error.what() << '\n';
+      core::LogLine(core::LogSeverity::kError,
+                    core::LogText("Manager daemon could not publish "
+                                  "package-generation failure: ",
+                                  publication_error.what()));
     } catch (...) {
-      std::cerr << "Manager daemon could not publish package-generation "
-                   "failure\n";
+      core::LogLine(core::LogSeverity::kError, "Manager daemon could not publish "
+                        "package-generation failure");
     }
   }
 
@@ -5890,7 +6113,8 @@ private:
   /// re-checks the forced stop between short poll slices instead. Returns
   /// true only when the Stop completed.
   [[nodiscard]] bool RequestPlannedStopAndWait() noexcept {
-    std::cerr << "application stop: waiting at halt: the Stop to complete\n";
+    core::LogLine(core::LogSeverity::kInfo, "application stop: waiting at halt: the Stop to "
+                      "complete");
     const auto socket = config_.execution_run_root / "execution-control.sock";
     const auto attribution = CanonicalValue(CanonicalValue::Object{
         {"assurance", CanonicalValue("unverified")},
@@ -5961,7 +6185,7 @@ private:
                 << outcome << "\"}\n";
       return false;
     }
-    std::cerr << "application stop: halt complete\n";
+    core::LogLine(core::LogSeverity::kInfo, "application stop: halt complete");
     return true;
   }
 
@@ -6046,9 +6270,12 @@ private:
       if (const auto refused =
               PublishCarriedObjectLostLevel(component, target, std::nullopt);
           refused && refused->code != "io_signal_service_unavailable")
-        std::cerr << "carried-object-lost signal was not cleared for "
-                  << component.value() << "/" << target.value() << ": "
-                  << refused->code << '\n';
+        core::LogLine(core::LogSeverity::kWarning,
+                      core::LogText("carried-object-lost signal was not "
+                                    "cleared for ",
+                                    component.value(), "/", target.value(),
+                                    ": ", refused->code),
+                      refused->code);
     } catch (...) {
     }
   }
@@ -6981,7 +7208,9 @@ private:
         }
         TrySendResponse(client.get(), ApplyStatusResponse(
             *status, named_apply_.FailedApplyAcknowledgementStatus(
-                         *command.apply_id, *command.apply_generation)));
+                         *command.apply_id, *command.apply_generation),
+            // Lock-free, read after the journal (OD-387).
+            named_apply_.SuccessSettlementPending(*command.apply_id)));
         return false;
       }
       case CommandKind::kSceneCommit: {
@@ -7022,12 +7251,18 @@ private:
         return false;
       }
       case CommandKind::kSceneOwnerRead: {
-        const auto projection = scene_owner_.CurrentProjectionRevision();
-        const auto snapshot = scene_owner_.LogicalSnapshot();
+        const auto [projection, snapshot] =
+            detail::ReadSceneOwnerView(scene_owner_);
         Require(snapshot != nullptr &&
                     snapshot->revision == projection.scene_revision,
                 "logical-scene read crossed a projection revision");
-        TrySendResponse(client.get(), SceneOwnerReadResponse(projection, *snapshot));
+        TrySendResponse(
+            client.get(),
+            command.scene_resource_ids.empty()
+                ? SceneOwnerReadResponse(projection, *snapshot)
+                : SceneOwnerReadResponse(
+                      projection, detail::SelectSceneResources(
+                                      *snapshot, command.scene_resource_ids)));
         return false;
       }
       case CommandKind::kSceneCandidatePreview: {
@@ -7178,8 +7413,9 @@ private:
             PoseObserverSession{*snapshot.runtime_identity,
                                 *command.pose_source_epoch, source_epoch_order,
                                 command.pose_observer_bindings});
-        TryPublishViewerPoseSessionsLocked();
+        const auto viewer_pose_failure = TryPublishViewerPoseSessionsLocked();
         source_lock.unlock();
+        LogViewerPoseSessionFailure(viewer_pose_failure);
         status_board_.NotifyIfChanged();
         TrySendResponse(client.get(),
                         SceneRuntimeObserverOpenResponse(
@@ -7480,6 +7716,12 @@ private:
   bool kernel_apply_available_{};
   std::atomic<bool> scene_admission_reconciled_{false};
   std::optional<std::string> scene_admission_last_warning_;
+  // The last line of a repeating failure, printed once per change or episode
+  // (LogOnChange); each is used by one thread only: the command lane, the
+  // main thread and the Apply progress lane.
+  std::optional<std::string> periodic_reconcile_last_warning_;
+  std::optional<std::string> outstanding_exchange_last_warning_;
+  std::optional<std::string> apply_progression_last_warning_;
   std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
       last_runtime_;
   // The last Manager section value as built (without the outstanding
@@ -7546,6 +7788,7 @@ private:
   // Host-liveness lane only, from here to program_runner_contact_loss_.
   // Log-only.
   std::optional<std::string> manager_liveness_last_warning_;
+  std::optional<std::string> heartbeat_settlement_last_warning_;
   std::optional<core::CellAdmissionReadinessSnapshotDTO>
       last_submitted_readiness_;
   // Alarm evidence only. It does not alter readiness selection.
@@ -7590,6 +7833,9 @@ private:
   // the forced step was logged.
   bool stop_incomplete_{};
   bool stop_forced_logged_{};
+  // Main thread only: the first application-ending event, until
+  // WriteApplicationEnd writes it.
+  std::optional<ApplicationEnd> application_end_;
   std::thread apply_progress_lane_;
   // OD-298 (a): the command lane, and what it hands to the main thread under
   // command_lane_mutex_ (a leaf lock, memory only). main_wake_fd_ wakes the
@@ -7727,6 +7973,8 @@ std::string EncodeManagerStartupError(const manyforge::core::ErrorDTO &error) {
 } // namespace manyforge::headless
 
 int main(int argc, char **argv) {
+  manyforge::core::SetProcessRole("manager");
+  manyforge::core::InstallCrashEvidence();
   try {
     manyforge::headless::InstallSignalHandlers();
     manyforge::headless::ManagerDaemon daemon(
@@ -7741,10 +7989,12 @@ int main(int argc, char **argv) {
               << '\n';
     return 70;
   } catch (const std::exception &error) {
-    std::cerr << error.what() << '\n';
+    manyforge::core::LogLine(manyforge::core::LogSeverity::kError,
+                             error.what());
     return 70;
   } catch (...) {
-    std::cerr << "Manager daemon failed with an unknown error\n";
+    manyforge::core::LogLine(manyforge::core::LogSeverity::kError,
+                             "Manager daemon failed with an unknown error");
     return 71;
   }
 }

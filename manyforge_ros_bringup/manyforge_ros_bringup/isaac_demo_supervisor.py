@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 
 
-UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: the Isaac product is not available through "
     "this entrypoint; no DemoSupervisor fallback exists"

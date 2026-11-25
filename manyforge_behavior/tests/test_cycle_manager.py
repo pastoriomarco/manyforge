@@ -107,6 +107,6 @@ def test_cycle_manager_fails_before_runner_or_kernel_access() -> None:
     poison = PoisonCollaborator()
     with pytest.raises(
         CycleManagerUnavailableError,
-        match="composable_cell_cycle_manager_unavailable",
+        match="cycle_manager_unavailable",
     ):
         CycleManager(poison, poison, event_sink=poison)

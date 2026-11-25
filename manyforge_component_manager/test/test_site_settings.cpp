@@ -69,6 +69,17 @@ TEST(SiteSettings, RejectsMalformedAndNonClosedShapes) {
       Replace(sample, "}}", R"(},"disk_always_free_bytes":9007199254740992})"),
       Replace(sample, "}}", R"(},"disk_machine_minimum_bytes":-1})"),
       Replace(sample, "}}", R"(},"disk_machine_minimum_bytes":true})"),
+      Replace(sample, "}}", R"(},"core_dumps":true})"),
+      Replace(sample, "}}", R"(},"core_dumps":{}})"),
+      Replace(sample, "}}", R"(},"core_dumps":{"enabled":true}})"),
+      Replace(sample, "}}", R"(},"core_dumps":{"max_bytes":1000}})"),
+      Replace(sample, "}}", R"(},"core_dumps":{"enabled":1,"max_bytes":1000}})"),
+      Replace(sample, "}}", R"(},"core_dumps":{"enabled":true,"max_bytes":0}})"),
+      Replace(sample, "}}", R"(},"core_dumps":{"enabled":true,"max_bytes":-1}})"),
+      Replace(sample, "}}", R"(},"core_dumps":{"enabled":true,"max_bytes":10.5}})"),
+      Replace(sample, "}}", R"(},"core_dumps":{"enabled":true,"max_bytes":"1000"}})"),
+      Replace(sample, "}}", R"(},"core_dumps":{"enabled":true,"max_bytes":9007199254740992}})"),
+      Replace(sample, "}}", R"(},"core_dumps":{"enabled":true,"max_bytes":1000,"path":"/tmp"}})"),
       Replace(sample, R"("schema":"manyforge.site.v2",)", ""),
       Replace(sample, R"("schema":"manyforge.site.v2")", R"("schema":1)"),
       Replace(sample, "}}", R"(},"project_folders":"/data/projects"})"),
@@ -116,6 +127,27 @@ TEST(SiteSettings, AcceptsAndIgnoresTheDiskLimits) {
       Replace(sample, "}}", R"(},"disk_max_percent":1})"))));
 }
 
+TEST(SiteSettings, CarriesTheCoreDumpLimitOnlyWhenEnabled) {
+  const std::string sample(kSample);
+  EXPECT_EQ(ParseSiteSettings(sample).core_dump_limit_bytes(), 0U);
+  EXPECT_EQ(ParseSiteSettings(Replace(sample, "}}",
+                                      R"(},"core_dumps":{"enabled":false,"max_bytes":1000}})"))
+                .core_dump_limit_bytes(),
+            0U);
+  EXPECT_EQ(ParseSiteSettings(Replace(sample, "}}",
+                                      R"(},"core_dumps":{"enabled":true,"max_bytes":1073741824}})"))
+                .core_dump_limit_bytes(),
+            1073741824U);
+  EXPECT_EQ(ParseSiteSettings(Replace(sample, "}}",
+                                      R"(},"core_dumps":{"enabled":true,"max_bytes":9007199254740991}})"))
+                .core_dump_limit_bytes(),
+            9007199254740991U);
+  EXPECT_EQ(CoreDumpLimitBytesOfDocument(std::nullopt), 0U);
+  EXPECT_EQ(CoreDumpLimitBytesOfDocument(Replace(
+                sample, "}}", R"(},"core_dumps":{"enabled":true,"max_bytes":4096}})")),
+            4096U);
+}
+
 TEST(SiteSettings, ReadsVersionOneWithoutDiskLimits) {
   const std::string version_one =
       Replace(std::string(kSample), "manyforge.site.v2", "manyforge.site.v1");
@@ -131,6 +163,10 @@ TEST(SiteSettings, ReadsVersionOneWithoutDiskLimits) {
                  "manyforge.site.v2: change the first line's schema to "
                  "manyforge.site.v2; no other change is needed");
   }
+  EXPECT_THROW(static_cast<void>(ParseSiteSettings(Replace(
+                   version_one, "}}",
+                   R"(},"core_dumps":{"enabled":false,"max_bytes":1000}})"))),
+               SiteSettingsError);
 }
 
 TEST(SiteSettings, ResolvesOnlyConfiguredReferences) {

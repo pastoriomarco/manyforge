@@ -8,6 +8,7 @@ motion builder, so the preview can be compared with what execution sent.
 from __future__ import annotations
 
 import hashlib
+import time
 
 from copy import deepcopy
 from pathlib import Path
@@ -76,14 +77,15 @@ _NODE = "move_to_pick"
 
 
 class _KernelTransport:
-    """Native owner fake: identity reads are allowed, every effect is recorded."""
+    """Execution gateway fake: identity reads are allowed, every effect is
+    recorded (one method per wire command, taking its members)."""
 
     def __init__(self) -> None:
         self.submissions: list[dict[str, Any]] = []
         self.effects: list[str] = []
         self.identity_reads = 0
 
-    def identity(self) -> dict[str, Any]:
+    def identity(self, members: Mapping[str, Any] | None = None) -> dict[str, Any]:
         self.identity_reads += 1
         return {
             "ok": True,
@@ -99,8 +101,8 @@ class _KernelTransport:
             },
         }
 
-    def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        self.submissions.append(deepcopy(dict(body)))
+    def submit(self, members: Mapping[str, Any]) -> dict[str, Any]:
+        self.submissions.append(deepcopy(dict(members["operation"])))
         return {
             "ok": True,
             "accepted": {"operation_id": 1, "operation_revision": 1},
@@ -246,6 +248,27 @@ class _ScopePort:
         raise AssertionError("preview must not reset")
 
 
+def _advance_answered(owner: ProgramRunOwner, run_id: int):
+    """OD-380 D2: the node's owner call leaves the tick on the run's sender
+    and its answer is seen one wake later; let the sender answer, then
+    advance again."""
+
+    sender = owner.run_sender(run_id)
+    snapshot = owner.advance_once(run_id)
+    for _ in range(20):
+        if snapshot.state is not ProgramRunState.RUNNING:
+            break
+        deadline = time.monotonic() + 5.0
+        while True:
+            with sender._lock:  # noqa: SLF001
+                if not sender._queue and not sender._draining:  # noqa: SLF001
+                    break
+            assert time.monotonic() < deadline, "the run's sender did not answer"
+            time.sleep(0.001)
+        snapshot = owner.advance_once(run_id)
+    return snapshot
+
+
 def _held_run():
     environment = build_node_environment()
     program = Program(
@@ -357,7 +380,7 @@ def _held_run():
             "frame": {"component_id": "ur5_robot", "frame_id": "tcp"},
         },
     )
-    paused = owner.advance_once(run_id)
+    paused = _advance_answered(owner, run_id)
     assert paused.state is ProgramRunState.INTERVENTION_REQUIRED
     held = interventions.read(run_id)
     assert held is not None and held.identity.node_instance_id == _NODE

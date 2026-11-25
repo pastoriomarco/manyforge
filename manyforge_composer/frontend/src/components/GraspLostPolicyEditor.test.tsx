@@ -49,7 +49,7 @@ const attachCatalog: CatalogEntry = {
   execution: { blocking: true, cancellable: false, ownerApi: 'scene.transaction' },
   runners: { py_trees: 'scene_attach_carried_object_v1' },
   tags: ['scene', 'attachment'],
-  minProgramProfile: 'composable-cell-v1',
+  minProgramProfile: 'manyforge-cell-v1',
   blackboard: { reads: [], writes: [] },
   ownerContext: null,
   outcomes: {},
@@ -65,7 +65,7 @@ const attachNode: ProgramTreeNode = {
 
 const program = {
   api_version: 'manyforge.program.v2',
-  program_profile: 'composable-cell-v1',
+  program_profile: 'manyforge-cell-v1',
   catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.7.0' },
   component_roles: {},
   target_roles: {},

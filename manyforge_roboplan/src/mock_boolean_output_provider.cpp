@@ -14,6 +14,8 @@
 
 #include <manyforge_roboplan/mock_boolean_output_provider.hpp>
 
+#include <manyforge_core/process_diagnostics.hpp>
+
 #include <algorithm>
 #include <iostream>
 #include <mutex>
@@ -191,7 +193,9 @@ SetOutputResult MockBooleanOutputProvider::WriteOutput(const core::IoSignalId &s
     }
   }
   lock.unlock();
-  if (echo_not_scheduled) std::cerr << "Mock I/O echo could not be scheduled\n";
+  if (echo_not_scheduled)
+    core::LogLine(core::LogSeverity::kWarning,
+                  "Mock I/O echo could not be scheduled");
   return {core::ActionOutcome::kSucceeded, std::nullopt};
 }
 

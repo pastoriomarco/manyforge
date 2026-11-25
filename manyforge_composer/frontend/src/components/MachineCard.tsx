@@ -19,7 +19,9 @@ import {
   TONE_BADGE_CLASSES,
 } from '../state/componentPresentation';
 import { ComponentActions, ComponentStatePanel, concernedOwnerFault } from './ComponentStatePanel';
+import { withErrorCode } from '../state/structuralResource';
 import { CHANGE_LABELS } from './ComponentManager';
+import { ProcessOutputTail } from './ProcessOutputTail';
 
 type Row = Record<string, JsonValue>;
 
@@ -271,18 +273,19 @@ function MemberStatus({ state, states, enabled, applicationStartId }: {
     <>
       {concerned !== null && (
         <p className="inline-message severity-error" role="alert">
-          {concerned.ownerId}: {concerned.fault.title}. {concerned.fault.detail}
+          {concerned.ownerId}: {withErrorCode(concerned.fault.title, concerned.fault.code)}. {concerned.fault.detail}
           {concerned.fault.operatorAction !== null
             && ` Operator action: ${concerned.fault.operatorAction} on ${concerned.ownerId}`}
         </p>
       )}
       {fault !== null && (
         <p className="inline-message severity-error" role="alert">
-          {fault.title}. {fault.detail}
+          {withErrorCode(fault.title, fault.code)}{fault.since !== null && ` (${fault.since})`}. {fault.detail}
           {fault.vendor !== null && ` ${fault.vendor}.`}
           {fault.operatorAction !== null && ` Operator action: ${fault.operatorAction}`}
         </p>
       )}
+      {fault?.outputTail != null && <ProcessOutputTail text={fault.outputTail} />}
       {reason !== null && <p className="inline-message severity-warning">{reason}</p>}
       {state.action !== undefined && (
         <p className="inline-message severity-info">{actionLabel(state.action.action)} in progress</p>

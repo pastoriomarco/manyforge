@@ -4,8 +4,8 @@
   "catalogs": {
     "records": []
   },
-  "cell_id": "c1_build_authority_cell",
-  "deployment_revision": "sha256:2b2ddbd2632ac30ce1ef06b528e84815678c36ff83496feb011d99ea54826f41",
+  "cell_id": "canonical_empty_cell",
+  "deployment_revision": "sha256:34740358926192e76474268c2771eedd99f5af2d80e5d57a80cd29f9b1c7e633",
   "desired_control_configurations": [],
   "graph": {
     "component_attachments": [],

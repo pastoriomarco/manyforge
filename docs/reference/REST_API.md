@@ -3,13 +3,13 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-11-23 18:10:22 UTC
+  Last regenerated: 2026-11-25 12:04:59 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
 # Composer REST API
 
-This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, Stops, component actions and the server-run Apply/Load/New requests without owning their state. Generic `/api/control/state` and `/api/control/commands` expose the same state-conditioned ingress used by the versioned `/ws/control` session; callers submit once and observe backend-owned lifecycle state. Complete product launch and remaining provider-specific capabilities remain unavailable. Build-owned skills are discovered and expanded into ordinary Program trees through `/api/skills`; expansion does not edit Draft or execute a command. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
+This is the structural, authoring, and thin runtime-client Composer surface. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, Stops, component actions and the server-run Apply/Load/New requests without owning their state. Generic `/api/control/state` and `/api/control/commands` expose the same state-conditioned ingress used by the versioned `/ws/control` session; callers submit once and observe backend-owned lifecycle state. Complete product launch and remaining provider-specific capabilities remain unavailable. Build-owned skills are discovered and expanded into ordinary Program trees through `/api/skills`; expansion does not edit Draft or execute a command. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
 
 **Real robot.** A real robot's address is a site fact (`device_addresses` in the `manyforge.site.v2` site settings file); a Scenario names only its key (`configuration.device_address_ref` of the machine owner). Component states, faults, the cell latch and readiness are readable here; the site file, robot power, network and e-stop are the operator's. See [Real robot setup](../operations/REAL_ROBOT_SETUP.md).
 
@@ -156,6 +156,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/scenario-documents/discard` | composer-scenario-documents | Discard Scenario |
 | `POST` | `/api/scenario-documents/export` | composer-scenario-documents | Export Document |
 | `POST` | `/api/scenario-documents/save` | composer-scenario-documents | Save Document |
+| `GET` | `/api/scenario-documents/upgrade` | composer-scenario-documents | Check Upgrade |
+| `POST` | `/api/scenario-documents/upgrade` | composer-scenario-documents | Upgrade Document |
 | `POST` | `/api/scenario/load` | composer-scenario-documents | Load Document |
 | `POST` | `/api/scenario/new` | composer-scenario-documents | New Document |
 | `GET` | `/api/scenarios/current` | headless-runtime-client | Current Scenario |
@@ -286,6 +288,7 @@ The Draft column of the next table says which Draft `draftId` and `expectedDraft
 | `POST` | `/api/scenario-documents/discard` | Program and Deployment | `expectedAdmissionGeneration`, `applicationStartId`, `requestKey`, `expectedWorkspaceEpoch`, `expectedWorkspaceRevision`, `draftId`, `expectedDraftRevision`, `deploymentDraftId`, `expectedDeploymentDraftRevision` |
 | `POST` | `/api/scenario-documents/export` | Program and Deployment | `expectedAdmissionGeneration`, `applicationStartId`, `requestKey`, `expectedWorkspaceEpoch`, `expectedWorkspaceRevision`, `draftId`, `expectedDraftRevision`, `deploymentDraftId`, `expectedDeploymentDraftRevision` |
 | `POST` | `/api/scenario-documents/save` | Program and Deployment | `expectedAdmissionGeneration`, `applicationStartId`, `requestKey`, `expectedWorkspaceEpoch`, `expectedWorkspaceRevision`, `draftId`, `expectedDraftRevision`, `deploymentDraftId`, `expectedDeploymentDraftRevision` |
+| `POST` | `/api/scenario-documents/upgrade` | — | `request_key` |
 | `POST` | `/api/scenario/load` | — | `request_key` |
 | `POST` | `/api/scenario/new` | — | `request_key` |
 | `POST` | `/api/scene/transactions` | Program | `application_start_id`, `expected_admission_generation`, `expected_draft_id`, `expected_draft_revision`, `expected_authoring_workspace`, `request_context` |

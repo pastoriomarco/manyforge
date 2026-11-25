@@ -284,12 +284,14 @@
     "details": null,
     "halt": null,
     "message": "No pick candidate is feasible",
+    "node_running_since_utc_ns": {},
     "node_status_revision": 2,
     "node_statuses": {
       "arm_move": "running",
       "parallel": "running",
       "tool_move": "running"
     },
+    "node_wait_values": {},
     "operation_failures": [
       {
         "failure": {
@@ -302,7 +304,7 @@
           "operation_id": 1,
           "operation_revision": 2
         },
-        "operator_facing_run_revision": 4,
+        "operator_facing_run_revision": 5,
         "recovery_class": "failed_validation",
         "resource_ids": [
           "arm.joints"
@@ -325,7 +327,7 @@
           "operation_id": 1,
           "operation_revision": 2
         },
-        "operator_facing_run_revision": 4,
+        "operator_facing_run_revision": 5,
         "recovery_class": "failed_validation",
         "resource_ids": [
           "arm.joints"
@@ -346,13 +348,13 @@
     "owner_id": "program-runner.cell-a",
     "reason_code": "no_feasible_candidate",
     "run_end": null,
-    "run_revision": 5,
-    "schema_version": "manyforge.program_run_status.v5",
+    "run_revision": 6,
+    "schema_version": "manyforge.program_run_status.v6",
     "state": "intervention_required",
     "tree_status": "running"
   },
   "run_end": null,
-  "run_revision": 5,
+  "run_revision": 6,
   "runner_commands": {
     "ended": [
       {
@@ -635,7 +637,7 @@
         }
       }
     ],
-    "run_revision": 5,
+    "run_revision": 6,
     "runtime_controls": {
       "audit": [],
       "program_run_id": 1,

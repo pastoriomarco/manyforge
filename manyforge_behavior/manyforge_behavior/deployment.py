@@ -4,7 +4,7 @@ The former :mod:`manyforge_behavior.deployment` implementation parsed
 ``manyforge.deployment.v0`` and became the semantic owner for one
 ``robot_id/group_id``, adapter and runtime-resource selection, launcher module
 selection, gripper transport, pose-source policy, authority, and Program/Kernel
-cross-validation.  Those meanings cannot be retained beside the composable-cell
+cross-validation.  Those meanings cannot be retained beside the component-based
 contracts: they are replaced atomically with component instances, command-target
 and capability addresses, and the native deployment bindings.
 
@@ -25,7 +25,7 @@ from typing import Final, NoReturn
 
 
 DEPLOYMENT_ARTIFACT_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_deployment_artifact_unavailable"
+    "deployment_artifact_unavailable"
 )
 
 

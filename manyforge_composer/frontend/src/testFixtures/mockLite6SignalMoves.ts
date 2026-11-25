@@ -60,7 +60,7 @@ export function trialEDeployment(
 
 export function trialEProgram(forest: ProgramTreeNode[]): ProgramAuthoringDocument {
   return {
-    api_version: 'manyforge.program.v4', program_profile: 'composable-cell-v1',
+    api_version: 'manyforge.program.v4', program_profile: 'manyforge-cell-v1',
     catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
     parameters: [],
     blackboard: { namespaces: [], keys: [] },

@@ -30,7 +30,7 @@ ROS_TIME_SEC_MIN = -(2**31)
 ROS_TIME_SEC_MAX = 2**31 - 1
 ROS_TIME_NANOSEC_MAX = 999_999_999
 UNAVAILABLE_MESSAGE = (
-    "composable_cell_runtime_unavailable: FoundationPose Detection3D live "
+    "runtime_unavailable: FoundationPose Detection3D live "
     "qualification requires the focused ROS/Isaac adapter, not available yet"
 )
 

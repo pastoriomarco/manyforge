@@ -58,7 +58,7 @@ class ComposerRuntimeUnavailableError(RuntimeError):
         return {
             "reason_code": self.reason_code,
             "message": str(self),
-            "missing": ["composable_cell_runtime_adapter"],
+            "missing": ["runtime_adapter"],
             "expected_lane": None,
             "current_lane": None,
             "suggested_command": None,

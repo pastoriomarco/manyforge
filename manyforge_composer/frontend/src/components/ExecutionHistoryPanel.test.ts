@@ -3,9 +3,14 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 import {
   ExecutionHistoryPanel,
+  HISTORY_FOLLOW_INTERVAL_MS,
   historyFilterQuery,
+  historyIdReferences,
+  historyRawEvent,
   historyStartOptions,
   historyRunEnd,
+  historyTimeline,
+  historyUtcText,
   type ExecutionHistoryEventView,
 } from './ExecutionHistoryPanel';
 import type { HistorianDetail } from '../types/headless';
@@ -292,5 +297,133 @@ describe('execution history filtering', () => {
       open: true, onClose: vi.fn(), events: [], selectedDetail: selected,
     }));
     expect(markup).toContain('<p class="run-end tone-warning" role="status"><strong>Stopped</strong> · Stopped by rule door</p>');
+  });
+
+  const detail = (payload: Record<string, unknown>, sequence = 11): HistorianDetail => ({
+    schemaVersion: 'manyforge.historian_detail.v3',
+    sequence,
+    event: {
+      schemaVersion: 'manyforge.historian_event.v3',
+      eventId: `event-${sequence}`,
+      component: 'manyforge.program_runner',
+      eventType: 'program_node_attempt_finished',
+      severity: 'WARN',
+      occurredAtNs: '123',
+      occurredAtWall: '2026-11-24T10:00:00.123Z',
+      payload,
+    },
+    sections: {
+      incident: { available: false, reason: 'not published', value: null },
+      executionDigest: { available: false, reason: 'not published', value: null },
+      blackboard: { available: false, reason: 'not published', value: null },
+      latency: { available: false, reason: 'not published', value: null },
+    },
+  });
+
+  it('shows a row time with its date, milliseconds and UTC', () => {
+    // 2026-11-24T10:00:00.123Z
+    const utcNs = '1795514400123456789';
+    expect(historyUtcText(utcNs)).toBe('2026-11-24 10:00:00.123 UTC');
+    const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true, onClose: vi.fn(),
+      events: [{ id: 't', timestampNs: '1', timestampUtcNs: utcNs, channel: 'c', message: 'Timed', type: 'x' }],
+    }));
+    expect(markup).toContain('2026-11-24 10:00:00.123 UTC</time>');
+  });
+
+  it('sends a node attempt filter as its number and refuses other text', () => {
+    const attemptQuery = (nodeAttemptId: string) => historyFilterQuery({
+      severity: 'all', alarmView: 'all', timeWindow: 'all', component: '', eventType: '',
+      search: '', programRunId: '', operationId: '', nodeAttemptId, applicationStartId: CURRENT_START,
+    });
+    expect(attemptQuery(' 12 ')).toMatchObject({ nodeAttemptId: 12 });
+    expect(attemptQuery('')?.nodeAttemptId).toBeUndefined();
+    for (const text of ['0', 'a1', '1.5', '-3', '01']) expect(attemptQuery(text)).toBeNull();
+  });
+
+  it('finds every filterable id anywhere in the payload, once each', () => {
+    expect(historyIdReferences({
+      application_start_id: CURRENT_START,
+      attempt: { program_run_id: 3, node_instance_id: 'pick_1', node_attempt_id: 12 },
+      participants: [{ execution_scope: { operation_id: 7, node_instance_id: 'pick_1' } }],
+      stop: { stop_event_id: 4, rule_id: 'wall' },
+      // Not an id of its kind: left out.
+      program_run_id_text: 'x', operation_id: 0, condition_id: '', incident_id: 5,
+    })).toEqual([
+      { key: 'application_start_id', value: CURRENT_START },
+      { key: 'program_run_id', value: '3' },
+      { key: 'node_instance_id', value: 'pick_1' },
+      { key: 'node_attempt_id', value: '12' },
+      { key: 'operation_id', value: '7' },
+      { key: 'stop_event_id', value: '4' },
+      { key: 'rule_id', value: 'wall' },
+    ]);
+  });
+
+  it('shows the recorded event as JSON with Copy and its ids as filter buttons', () => {
+    const payload = { subject: 'motion.move_to_pose', attempt: { program_run_id: 3, node_attempt_id: 12 } };
+    const row: ExecutionHistoryEventView = {
+      id: '11:event-11', sequence: 11, timestampNs: '123', timestampUtcNs: '1795514400123000000',
+      clockOwner: `program_runner:${CURRENT_START}`, channel: 'manyforge.program_runner',
+      message: 'Node pick_1 failed', type: 'program_node_attempt_finished', applicationStartId: CURRENT_START,
+    };
+    expect(historyRawEvent(detail(payload), row)).toEqual({
+      sequence: 11,
+      application_start_id: CURRENT_START,
+      occurred_at_utc_ns: '1795514400123000000',
+      clock_owner: `program_runner:${CURRENT_START}`,
+      event: {
+        schema_version: 'manyforge.historian_event.v3', event_id: 'event-11',
+        component: 'manyforge.program_runner', event_type: 'program_node_attempt_finished',
+        severity: 'WARN', occurred_at_ns: '123', occurred_at_wall: '2026-11-24T10:00:00.123Z', payload,
+      },
+    });
+    const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true, onClose: vi.fn(), events: [row], selectedDetail: detail(payload),
+      applicationStartId: CURRENT_START,
+    }));
+    expect(markup).toContain('>Copy</button>');
+    expect(markup).toContain('<summary>Recorded event</summary>');
+    expect(markup).toContain('&quot;event_id&quot;: &quot;event-11&quot;');
+    expect(markup).toContain('>Program run 3</button>');
+    expect(markup).toContain('>Node attempt 12</button>');
+  });
+
+  it('orders a run page by recorded time with the time since the row before', () => {
+    const row = (id: string, sequence: number, utcNs: string | null, type = 'program_node_attempt_finished'):
+      ExecutionHistoryEventView => ({
+      id, sequence, timestampNs: '1', timestampUtcNs: utcNs, channel: 'manyforge.program_runner',
+      message: id, type, programRunId: 3,
+    });
+    // Newest first, as the page lists them; the runner's batch arrived after the end row.
+    const page = [
+      row('late attempt', 9, '1795514400500000000'),
+      row('run finished', 8, '1795514401000000000', 'program_run_finished'),
+      row('no time', 7, null, 'clock_anchor'),
+      row('run started', 6, '1795514400000000000', 'program_run_started'),
+    ];
+    expect(historyTimeline(page).map(({ event, sincePreviousMs }) => [event.id, sincePreviousMs])).toEqual([
+      ['run started', null], ['late attempt', 500], ['run finished', 500], ['no time', null],
+    ]);
+    const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true, onClose: vi.fn(), events: page, timelineRunId: 3,
+    }));
+    expect(markup).toContain('<summary>Run 3 timeline · this page, oldest first</summary>');
+    expect(markup).toContain('>10:00:00.500</time>');
+    expect(markup).toContain('+0.500 s');
+    expect(markup).toContain('<small>program run started</small>');
+    expect(renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true, onClose: vi.fn(), events: page,
+    }))).not.toContain('timeline');
+  });
+
+  it('offers Follow only with a follow reader', () => {
+    expect(renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true, onClose: vi.fn(), events: [], onFollow: vi.fn(),
+    }))).toContain('Follow</label>');
+    expect(renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true, onClose: vi.fn(), events: [],
+    }))).not.toContain('Follow');
+    expect(HISTORY_FOLLOW_INTERVAL_MS).toBe(2000);
   });
 });

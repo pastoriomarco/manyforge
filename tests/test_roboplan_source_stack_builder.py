@@ -523,7 +523,7 @@ def test_source_verifier_rejects_wrong_content_before_build(tmp_path: Path) -> N
     ledger.write_text(
         json.dumps(
             {
-                "schema": "manyforge.composable_cell.e1.external_delta_ledger.v1",
+                "schema": "manyforge.external_delta_ledger.v1",
                 "frozen_sources": [
                     {
                         "id": "fixture",
@@ -590,7 +590,7 @@ def test_source_verifier_rejects_wrong_license_or_git_identity(tmp_path: Path) -
         capture_output=True,
     ).stdout
     payload = {
-        "schema": "manyforge.composable_cell.e1.external_delta_ledger.v1",
+        "schema": "manyforge.external_delta_ledger.v1",
         "frozen_sources": [
             {
                 "id": "fixture",

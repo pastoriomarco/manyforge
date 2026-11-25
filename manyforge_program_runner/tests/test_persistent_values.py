@@ -61,7 +61,7 @@ def _program(*keys: dict[str, Any]) -> dict[str, Any]:
     document = {
         "api_version": "manyforge.program.v4",
         "program_revision": "sha256:" + "0" * 64,
-        "program_profile": "composable-cell-v1",
+        "program_profile": "manyforge-cell-v1",
         "catalog": {"api_version": "manyforge.node_catalog.v3",
                     "content_version": environment.catalog.content_version},
         "parameters": [],
@@ -286,7 +286,7 @@ def _runtime(
             persistent_key_register_directory=tmp_path,
         ),
         headless_client=headless,  # type: ignore[arg-type]
-        execution_transport=headless,  # type: ignore[arg-type]
+        gateway=headless,  # type: ignore[arg-type]
         admission_client=object(),  # type: ignore[arg-type]
         cycle_journal=ProgramCycleJournal(
             tmp_path / f"cycle-{application_start_id}.sqlite3",

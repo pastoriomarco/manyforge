@@ -171,7 +171,7 @@ describe('stored persistent values', () => {
   });
 });
 
-describe('Reset with Reload initial scene: the stored values it resets', () => {
+describe('Reset with Reset stored values: the stored values it resets', () => {
   it('lists each stored value with its current and new value; unstored keys are not listed', () => {
     const current = values();
     const rows = persistentKeyResetRows({

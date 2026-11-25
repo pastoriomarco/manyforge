@@ -31,7 +31,9 @@ from manyforge_headless_api.cell_admission import (
     MAXIMUM_RESPONSE_BYTES,
     CellAdmissionClient,
 )
-from manyforge_headless_api.execution import ExecutionCommandClient, ExecutionEventPump
+import manyforge_headless_py  # type: ignore[import-not-found]
+
+from manyforge_headless_api.execution import ExecutionEventPump
 from manyforge_headless_api.manager_status_stream import ManagerStatusFollower
 from manyforge_headless_api.native import HeadlessApiConfig, NativeHeadlessCore
 from manyforge_headless_api.process_tests.test_process_stack import (
@@ -279,7 +281,7 @@ def test_attention_publication_stays_within_freshness_on_the_real_core_and_kerne
         )
         pump = ExecutionEventPump(
             core,
-            ExecutionCommandClient(stack.execution_run_root, timeout_seconds=1.0),
+            manyforge_headless_py.ExecutionEvents(str(stack.execution_run_root)),
             application_start_id=stack.application_start_id,
             poll_seconds=0.1,
         )

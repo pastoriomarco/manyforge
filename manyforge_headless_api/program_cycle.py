@@ -280,6 +280,8 @@ class _ProgramResetSelectorsDTO(BaseModel):
 class ProgramResetOptionsDTO(_ProgramResetSelectorsDTO):
     """The accepted Reset's options; a continuation must carry the same."""
 
+    reset_stored_values: bool
+
 
 class AcceptedProgramResetDTO(_ProgramResetSelectorsDTO):
     """Private heartbeat proof of the original accepted Reset occurrence."""

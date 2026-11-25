@@ -31,7 +31,7 @@ from typing import Any, Iterator
 import pytest
 
 from manyforge_headless_api.client import HeadlessHttpClient
-from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.process_tests.host_probe import HostProbe
 from manyforge_headless_api.process_tests.test_process_stack import (
     ProcessStack,
     _apply_command,
@@ -62,7 +62,7 @@ TRIAL_SCENARIO = "mock_lite6_signal_moves"
 BOOTSTRAP_SCENARIO = "mock_lite6_pick_and_place"
 SCENARIO_ID = "mock_lite6_signal_moves_process"
 # The dev workbench's ROS cell identity: the trial's proven bootstrap path.
-CELL_ID = "c1_build_authority_cell"
+CELL_ID = "canonical_empty_cell"
 ADMISSION_FILENAME = f"canonical-empty-admission.{CELL_ID}.json"
 KEPT_NODES = ("start_rest", "search_trip", "trip_outcome", "search_no_trip", "no_trip_outcome")
 REQUIRED_ENVIRONMENT = (
@@ -330,7 +330,7 @@ def _stop_completed(stack: ProcessStack, event_id: int) -> dict[str, Any]:
         time.sleep(0.02)
 
 
-def _stop_chain(native: ExecutionCommandClient, participant: dict[str, Any]) -> list[str]:
+def _stop_chain(native: HostProbe, participant: dict[str, Any]) -> list[str]:
     """The robot's qualified Stop stage order of the exact Targets motion row."""
 
     inventory = native.targets()["targets"]
@@ -384,7 +384,7 @@ def test_move_until_signal_trips_and_completes_over_the_real_wire() -> None:
         assert not any(row["effect_uncertain"] for row in results.values()), results
 
         # The Kernel's typed rule result for the very operations the nodes ran.
-        native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=2.0)
+        native = HostProbe(stack.execution_run_root, timeout_seconds=2.0)
         operations = _node_operations(stack, program_run_id)
         assert len(operations.get("search_trip", ())) == 1, operations  # no automatic retry
         assert len(operations.get("search_no_trip", ())) == 1, operations

@@ -31,7 +31,7 @@ namespace {
 using content_identity::CanonicalValue;
 
 constexpr int kHistorianApplicationId = 0x4D464548;
-constexpr int kHistorianUserVersion = 9;
+constexpr int kHistorianUserVersion = 10;
 /// A maximal record (256-KiB payload plus its bounded envelope) always fits
 /// one capture, so a trigger is never dropped for its size.
 constexpr std::int64_t kMinimumCaptureBytes = 512LL * 1024LL;
@@ -51,6 +51,22 @@ constexpr std::int64_t kMaximumDatabasePageImageBytes = 512LL * 1024LL * 1024LL;
 // Six <=1024-byte identities, a <=1024-code-point message, a <=128-byte
 // wall clock and fixed fields fit below 48 KiB even with 6-byte JSON escapes.
 constexpr std::size_t kMaximumSummaryBytes = 64U * 1024U;
+
+/// Retention classes (format 10). Each class keeps at most the configured
+/// row count and its own record bytes; a Program's node attempts have their
+/// own class, so a long run's node rows never prune the Applies, Enables and
+/// moves before them. All budgets together, with the failure-capture budget
+/// (at most a quarter of the page cap), stay well inside the page cap.
+struct RetentionClass {
+  std::string_view name;
+  std::int64_t record_bytes;
+};
+constexpr std::array<RetentionClass, 3> kRetentionClasses{{
+    {"routine", 16LL * 1024LL * 1024LL},
+    {"important", 16LL * 1024LL * 1024LL},
+    {"node_attempts", 32LL * 1024LL * 1024LL},
+}};
+constexpr std::int64_t kNodeAttemptClass = 2;
 
 // ``historian_events.application_start_id`` is the start a row belongs to
 // (format 7): the start whose Headless wrote it, or, for the previous-session
@@ -103,12 +119,12 @@ CREATE INDEX historian_events_severity_idx ON historian_events(condition_severit
 CREATE INDEX historian_events_retention_idx ON historian_events(retention_class,sequence);
 CREATE INDEX historian_events_coverage_idx ON historian_events(retention_class,occurred_at_utc_ns);
 CREATE TABLE historian_retention (
-  partition INTEGER PRIMARY KEY CHECK(partition IN (0,1)),
+  partition INTEGER PRIMARY KEY CHECK(partition IN (0,1,2)),
   pruned_count INTEGER NOT NULL DEFAULT 0,
   pruned_bytes INTEGER NOT NULL DEFAULT 0,
   last_pruned_sequence INTEGER
 ) STRICT;
-INSERT INTO historian_retention(partition) VALUES(0),(1);
+INSERT INTO historian_retention(partition) VALUES(0),(1),(2);
 CREATE TABLE historian_event_keys (
   sequence INTEGER NOT NULL REFERENCES historian_events(sequence) ON DELETE CASCADE,
   kind TEXT NOT NULL,
@@ -179,7 +195,7 @@ constexpr std::string_view kCorrelationNames =
 // revision 6 adds the incident cause and closure codes); they are not
 // correlation filters or discovery kinds. Revision 9 keys `rule_id` (the
 // collision rule or global rule an event names) in place of the contact
-// policy id.
+// policy id; the filter has the same name.
 constexpr std::string_view kSearchCodeNames = "'code','reason','reason_code','cause_class','closure_reason'";
 const std::string kIndexedKeyNames = std::string(kCorrelationNames) + "," + std::string(kSearchCodeNames);
 // Ids minted inside one application start are integers (contract 1.5). They
@@ -232,7 +248,7 @@ const std::string kProgramDiagnosticSchemaList = [] {
 }();
 const std::set<std::string> kCorrelationKeys{
     "program_run_id", "operation_id", "action_span_id", "node_instance_id", "node_attempt_id",
-    "intervention_session_id", "collision_rule_id", "incident_id", "condition_id", "alarm_condition_id",
+    "intervention_session_id", "rule_id", "incident_id", "condition_id", "alarm_condition_id",
     "activation_id", "stop_event_id", "resource_id", "channel", "phase", "parent_node_attempt_id"};
 
 std::optional<std::string> RecordedClockOwner(const HistorianEvent &event) {
@@ -643,11 +659,15 @@ std::string Placeholders(const std::size_t count) {
   return result;
 }
 
+/// Important rows first (unchanged by format 10), then a Program's node
+/// attempts, else routine.
 std::int64_t RetentionPartition(const HistorianEvent &event) {
   const auto severity = HistorianConditionSeverity(event);
-  return severity == "ERROR" || severity == "CRITICAL" ||
-         event.event_type.find("stop") != std::string::npos ||
-         event.event_type.find("acknowledged") != std::string::npos;
+  if (severity == "ERROR" || severity == "CRITICAL" ||
+      event.event_type.find("stop") != std::string::npos ||
+      event.event_type.find("acknowledged") != std::string::npos)
+    return 1;
+  return event.event_type == "program_node_attempt_finished" ? kNodeAttemptClass : 0;
 }
 
 std::string SummaryDigest(std::int64_t sequence, const std::string& event_digest,
@@ -759,11 +779,11 @@ class QueryBudget final {
 struct PartitionUsage {
   std::int64_t count{}, bytes{}, unknown_time{}, regressed_time{};
 };
-// Routine and important govern unprotected rows; bucket 2 is the failure
-// capture budget. A protected row is charged there exactly once, however
-// many overlapping captures reference it.
-constexpr std::size_t kCaptureBucket = 2U;
-using RetainedUsage = std::array<PartitionUsage, 3>;
+// The retention classes govern unprotected rows; the bucket after them is
+// the failure capture budget. A protected row is charged there exactly once,
+// however many overlapping captures reference it.
+constexpr std::size_t kCaptureBucket = kRetentionClasses.size();
+using RetainedUsage = std::array<PartitionUsage, kRetentionClasses.size() + 1U>;
 
 std::size_t UsageBucket(const std::int64_t retention_class, const std::int64_t capture_refs) {
   return capture_refs > 0 ? kCaptureBucket : static_cast<std::size_t>(retention_class);
@@ -1389,10 +1409,11 @@ private:
   }
 
   void Prune(RetainedUsage &usage) {
-    for (std::int64_t partition : {0, 1}) {
+    for (std::int64_t partition = 0; partition < static_cast<std::int64_t>(kRetentionClasses.size()); ++partition) {
       auto &part = usage.at(static_cast<std::size_t>(partition));
+      const auto byte_limit = kRetentionClasses.at(static_cast<std::size_t>(partition)).record_bytes;
       for (;;) {
-        if (part.count <= static_cast<std::int64_t>(record_retention_) && part.bytes <= 16LL * 1024LL * 1024LL) break;
+        if (part.count <= static_cast<std::int64_t>(record_retention_) && part.bytes <= byte_limit) break;
         // Rows protected by a live failure capture are charged to the
         // capture budget and are never selected by ordinary pruning.
         Statement oldest(statements_, "SELECT " + kIndexedEventColumns + " FROM historian_events WHERE retention_class=?"
@@ -1428,12 +1449,15 @@ private:
     Statement rows(database_, "SELECT partition,pruned_count,pruned_bytes,last_pruned_sequence FROM historian_retention ORDER BY partition");
     CanonicalValue::Array partitions;
     while (rows.Step()) {
-      Require(rows.Integer(0) == static_cast<std::int64_t>(partitions.size()) && rows.Integer(0) < 2 &&
+      Require(rows.Integer(0) == static_cast<std::int64_t>(partitions.size()) &&
+                  rows.Integer(0) < static_cast<std::int64_t>(kRetentionClasses.size()) &&
                   rows.Integer(1) >= 0 && static_cast<std::uint64_t>(rows.Integer(1)) <= kMaximumSafeInteger &&
                   rows.Integer(2) >= 0 && (rows.IsNull(3) || (rows.Integer(3) > 0 &&
                   static_cast<std::uint64_t>(rows.Integer(3)) <= kMaximumSafeInteger)),
               "historian_storage_corrupt", "historian loss metadata is invalid");
-      CanonicalValue::Object part{{"partition", CanonicalValue(rows.Integer(0) == 0 ? "routine" : "important")}};
+      const auto &retention_class = kRetentionClasses.at(static_cast<std::size_t>(rows.Integer(0)));
+      CanonicalValue::Object part{{"partition", CanonicalValue(std::string(retention_class.name))},
+                                  {"record_byte_limit", CanonicalValue(std::to_string(retention_class.record_bytes))}};
       const auto &usage = usage_.at(static_cast<std::size_t>(rows.Integer(0)));
       for (const auto &[name, value] : std::vector<std::pair<std::string_view, std::int64_t>>{
           {"retained_count",usage.count},{"retained_bytes",usage.bytes},
@@ -1456,7 +1480,8 @@ private:
       }
       partitions.emplace_back(std::move(part));
     }
-    Require(partitions.size() == 2, "historian_storage_corrupt", "historian loss metadata is incomplete");
+    Require(partitions.size() == kRetentionClasses.size(), "historian_storage_corrupt",
+            "historian loss metadata is incomplete");
     const auto prior_pruning_known = ScalarInteger(database_, "SELECT prior_pruning_known FROM historian_metadata WHERE singleton=1");
     Require(prior_pruning_known == 0 || prior_pruning_known == 1,
             "historian_storage_corrupt", "historian coverage metadata is invalid");
@@ -1482,11 +1507,10 @@ private:
             ? CanonicalValue(nullptr) : CanonicalValue(std::to_string(capture_totals.Integer(5)))},
     });
     return CanonicalValue(CanonicalValue::Object{
-        {"schema_version", CanonicalValue("manyforge.historian_retention.v3")},
+        {"schema_version", CanonicalValue("manyforge.historian_retention.v4")},
         {"partitions", CanonicalValue(std::move(partitions))},
         {"captures", std::move(captures)},
         {"partition_row_limit", CanonicalValue(std::to_string(record_retention_))},
-        {"partition_record_byte_limit", CanonicalValue("16777216")},
         {"database_page_byte_limit", CanonicalValue("536870912")},
         {"duration_guaranteed", CanonicalValue(false)},
         {"prior_pruning_known", CanonicalValue(prior_pruning_known == 1)},
@@ -1515,7 +1539,8 @@ private:
     moving.Bind(3, from_refs);
     while (moving.Step()) {
       const auto partition = moving.Integer(0);
-      Require(partition == 0 || partition == 1, "historian_storage_corrupt",
+      Require(partition >= 0 && partition < static_cast<std::int64_t>(kRetentionClasses.size()),
+              "historian_storage_corrupt",
               "historian capture range contains an invalid partition");
       const PartitionUsage delta{moving.Integer(1), moving.Integer(2), moving.Integer(3),
                                  moving.Integer(4)};

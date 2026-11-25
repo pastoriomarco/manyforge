@@ -68,9 +68,9 @@ def test_removed_runtime_modes_fail_with_the_stable_unavailable_reason(
     with pytest.raises(composer_main.ComposerRuntimeUnavailableError) as error:
         composer_main.main()
 
-    assert error.value.reason_code == "composable_cell_runtime_unavailable"
+    assert error.value.reason_code == "runtime_unavailable"
     assert error.value.to_detail()["missing"] == [
-        "composable_cell_runtime_adapter"
+        "runtime_adapter"
     ]
 
 

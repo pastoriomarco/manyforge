@@ -1,4 +1,12 @@
-"""Strict private wire client for the Kernel cell-admission owner."""
+"""Client of the Kernel cell-admission owner.
+
+``get``, ``acquire``, ``release`` and ``recovery_receipt`` are one gateway
+core call each (``manyforge_headless_py.Gateway``, GIL released, only the
+connect limited; OD-214). The operator-alarm attention publication keeps its
+own exchange here: its wait for the Kernel's acceptance also ends at the
+publisher's shutdown (the caller's stop pipe, OD-307), which a core call
+cannot.
+"""
 
 from __future__ import annotations
 
@@ -14,15 +22,14 @@ from typing import Any, Final
 
 import rfc8785
 
-from manyforge_behavior.json_scalars import nonnegative_int64
-
 from .private_transport import (
     PinnedRunRoot,
     PrivateTransportCapabilityError,
 )
 
 
-EXECUTION_SOCKET_FILE: Final = "execution-command.sock"
+_LOGGER = logging.getLogger(__name__)
+
 # The operator-alarm attention heartbeat is served on the independent
 # component socket; it never waits behind ordinary traffic.
 EXECUTION_COMPONENT_SOCKET_FILE: Final = "execution-component.sock"
@@ -30,64 +37,10 @@ EXECUTION_COMMAND_VERSION: Final = "manyforge.execution_command.v4"
 EXECUTION_RESPONSE_VERSION: Final = "manyforge.execution_command_response.v5"
 MAXIMUM_PACKET_BYTES: Final = 1024 * 1024
 MAXIMUM_RESPONSE_BYTES: Final = 4 * 1024 * 1024
-_COMMANDS: Final = frozenset(
-    {
-        "cell_admission_get",
-        "cell_admission_acquire",
-        "cell_admission_release",
-        "cell_admission_recovery_receipt",
-        "cell_admission_publish_operator_alarm_attention",
-    }
-)
-_ATTENTION_ACCEPTED_KEYS: Final = frozenset({"generation"})
-_ERROR_RESPONSE_KEYS: Final = frozenset(
-    {"api_version", "command", "error", "ok"}
-)
-_ERROR_KEYS: Final = frozenset({"code", "details", "message"})
-_AUTHORING_KEYS: Final = frozenset(
-    {"admission_generation", "authoring_allowed"}
-)
-_CLAIM_KEYS: Final = frozenset(
-    {
-        "accepted_at_ns",
-        "acquired_admission_generation",
-        "claim_generation",
-        "intent",
-    }
-)
-_INTENT_KEYS: Final = frozenset(
-    {
-        "claim_kind",
-        "expected_admission_generation",
-        "intervention_evidence",
-        "owner_role",
-        "owner_transaction_id",
-        "program_cycle_evidence",
-        "request_key",
-        "scope",
-    }
-)
-_RELEASE_KEYS: Final = frozenset(
-    {
-        "acquired_admission_generation",
-        "claim_generation",
-        "owner_role",
-        "owner_transaction_id",
-        "request_key",
-        "settlement",
-    }
-)
-_RECOVERY_QUERY_KEYS: Final = frozenset(
-    {"expected_claim", "expected_release", "intent"}
-)
-_RECOVERY_RECEIPT_KEYS: Final = frozenset(
-    {
-        "admission_generation",
-        "held_claims",
-        "matched_claim",
-        "matched_release",
-        "status",
-    }
+_ATTENTION_COMMAND: Final = "cell_admission_publish_operator_alarm_attention"
+# Core failures raised before anything was sent: their outcome is known.
+_NOT_SENT_CODES: Final = frozenset(
+    {"execution_command_invalid", "execution_command_oversized"}
 )
 
 
@@ -111,19 +64,107 @@ class CellAdmissionError(RuntimeError):
 
 
 class CellAdmissionClient:
-    """Strict bounded client for owner-specific admission integration."""
+    """Owner-specific admission integration over the gateway core."""
 
     def __init__(self, run_root: Path, *, timeout_seconds: float = 10.0) -> None:
+        # ``timeout_seconds`` limits the connect only.
         if timeout_seconds <= 0 or timeout_seconds > 30:
             raise ValueError("execution timeout must be in (0, 30] seconds")
+        import manyforge_headless_py as core  # type: ignore[import-not-found]
+
+        self._gateway_error: type[Exception] = core.GatewayError
         try:
+            # Cell-admission commands carry no attribution.
+            self._gateway = core.Gateway(
+                str(run_root), None, attribution="internal",
+                connect_limit_s=timeout_seconds,
+            )
             self._run_root = PinnedRunRoot(run_root)
-        except PrivateTransportCapabilityError as error:
+        except (core.GatewayError, PrivateTransportCapabilityError) as error:
             raise CellAdmissionError(
                 "execution_owner_unavailable",
                 f"native execution run capability is invalid: {error}",
             ) from error
         self._timeout_seconds = timeout_seconds
+
+    def _call(
+        self,
+        command: str,
+        members: dict[str, Any],
+    ) -> dict[str, Any]:
+        """One gateway call; the result member of an accepted reply."""
+
+        try:
+            response = self._gateway.host(command, members)
+        except self._gateway_error as error:
+            _LOGGER.warning(
+                "Cell-admission call failed: command=%s code=%s message=%s",
+                command, error.code, error.message,
+            )
+            raise CellAdmissionError(
+                error.code, error.message, error.details,
+                outcome_unknown=error.code not in _NOT_SENT_CODES,
+                producer=error.producer,
+            ) from error
+        return _result(command, response)
+
+    def get(self) -> dict[str, Any]:
+        return self._call("cell_admission_get", {})
+
+    def acquire(
+        self,
+        intent: Mapping[str, Any],
+        *,
+        program_cycle_status: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """A Program Reset claim carries the runner's current cycle status
+        beside its intent, and only it does (OD-139)."""
+        members: dict[str, Any] = {"request": dict(intent)}
+        if program_cycle_status is not None:
+            members["program_cycle_status"] = dict(program_cycle_status)
+        return self._call("cell_admission_acquire", members)
+
+    def release(self, release: Mapping[str, Any]) -> dict[str, Any]:
+        return self._call("cell_admission_release", {"request": dict(release)})
+
+    def recovery_receipt(self, query: Mapping[str, Any]) -> dict[str, Any]:
+        return self._call("cell_admission_recovery_receipt", {"request": dict(query)})
+
+    def publish_operator_alarm_attention(
+        self, projection: Mapping[str, Any], *, stop_fd: int | None = None
+    ) -> dict[str, Any]:
+        """Publish the Alarm Lifecycle Owner's fenced motion-attention view.
+
+        The Kernel retains the newest generation and alone
+        evaluates it at Run/Resume/recovery admission, judging its age by
+        its own freshness bound. The wait for the acceptance has no time
+        limit (OD-307): it ends by the Kernel's answer, by the socket closing
+        when the host exits, or by ``stop_fd`` (the read end of the caller's
+        stop pipe) becoming readable.
+        """
+        packet = {
+            "api_version": EXECUTION_COMMAND_VERSION,
+            "command": _ATTENTION_COMMAND,
+            "request": dict(projection),
+        }
+        response = self._exchange(packet, stop_fd=stop_fd)
+        if (
+            response.get("api_version") != EXECUTION_RESPONSE_VERSION
+            or response.get("command") != _ATTENTION_COMMAND
+            or type(response.get("ok")) is not bool
+        ):
+            raise CellAdmissionError(
+                "execution_command_response_invalid",
+                "native cell-admission response has the wrong envelope",
+                outcome_unknown=True,
+            )
+        result = _result(_ATTENTION_COMMAND, response)
+        if result.get("generation") != projection.get("generation"):
+            raise CellAdmissionError(
+                "execution_command_response_invalid",
+                "native operator-alarm attention acceptance names another generation",
+            )
+        return result
 
     @staticmethod
     def _strict_object(payload: bytes) -> dict[str, Any]:
@@ -164,7 +205,6 @@ class CellAdmissionClient:
         self,
         packet: dict[str, Any],
         *,
-        socket_file: str = EXECUTION_SOCKET_FILE,
         stop_fd: int | None = None,
     ) -> dict[str, Any]:
         try:
@@ -179,6 +219,7 @@ class CellAdmissionClient:
                 "execution_command_oversized",
                 "cell-admission command exceeds its byte bound",
             )
+        socket_file = EXECUTION_COMPONENT_SOCKET_FILE
         operation = "resolve_socket"
         peer_pid: int | None = None
         try:
@@ -238,7 +279,7 @@ class CellAdmissionClient:
             OSError,
             TimeoutError,
         ) as error:
-            logging.getLogger(__name__).warning(
+            _LOGGER.warning(
                 "Native cell-admission transport failed: syscall=%s errno=%s peer_socket=%s peer_pid=%s exception_type=%s",
                 operation, getattr(error, "errno", None), socket_file, peer_pid, type(error).__name__,
             )
@@ -259,209 +300,24 @@ class CellAdmissionClient:
             error.outcome_unknown = True
             raise
 
-    def _call(
-        self,
-        command: str,
-        request: Mapping[str, Any] | None,
-        *,
-        stop_fd: int | None = None,
-        program_cycle_status: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        if command not in _COMMANDS:
-            raise ValueError("unsupported cell-admission command")
-        packet = {
-            "api_version": EXECUTION_COMMAND_VERSION,
-            "command": command,
-        }
-        if command == "cell_admission_get":
-            if request is not None:
-                raise ValueError("cell-admission get has no request")
-        else:
-            if not isinstance(request, Mapping):
-                raise TypeError("cell-admission request must be a mapping")
-            packet["request"] = dict(request)
-        if program_cycle_status is not None:
-            packet["program_cycle_status"] = dict(program_cycle_status)
-        response = self._exchange(
-            packet,
-            stop_fd=stop_fd,
-            socket_file=(
-                EXECUTION_COMPONENT_SOCKET_FILE
-                if command == "cell_admission_publish_operator_alarm_attention"
-                else EXECUTION_SOCKET_FILE
-            ),
+
+_RESULT_MEMBERS: Final = {
+    "cell_admission_acquire": "claim",
+    "cell_admission_recovery_receipt": "recovery_receipt",
+    _ATTENTION_COMMAND: "operator_alarm_attention",
+}
+
+
+def _result(command: str, response: dict[str, Any]) -> dict[str, Any]:
+    """An accepted reply's result member; a refusal as its typed error."""
+
+    if response["ok"] is not True:
+        error = response["error"]
+        raise CellAdmissionError(
+            error["code"], error["message"], error.get("details"),
+            producer=error.get("producer", "kernel"),
         )
-        if (
-            response.get("api_version") != EXECUTION_RESPONSE_VERSION
-            or response.get("command") != command
-            or type(response.get("ok")) is not bool
-        ):
-            raise CellAdmissionError(
-                "execution_command_response_invalid",
-                "native cell-admission response has the wrong envelope",
-                outcome_unknown=True,
-            )
-        if response["ok"] is not True:
-            if set(response) != _ERROR_RESPONSE_KEYS:
-                raise CellAdmissionError(
-                    "execution_command_response_invalid",
-                    "native cell-admission error has the wrong envelope",
-                    outcome_unknown=True,
-                )
-            error = response.get("error")
-            producer = (
-                error.get("producer", "kernel")
-                if isinstance(error, dict)
-                else None
-            )
-            if (
-                not isinstance(error, dict)
-                or frozenset(error)
-                not in {_ERROR_KEYS, _ERROR_KEYS | {"producer"}}
-                or not isinstance(error.get("code"), str)
-                or not error["code"]
-                or not isinstance(error.get("message"), str)
-                or not isinstance(error.get("details"), dict)
-                or not isinstance(producer, str)
-                or not producer
-            ):
-                raise CellAdmissionError(
-                    "execution_command_response_invalid",
-                    "native cell-admission error is malformed",
-                    outcome_unknown=True,
-                )
-            raise CellAdmissionError(
-                error["code"], error["message"], error["details"],
-                producer=producer,
-            )
-        result_key = {
-            "cell_admission_acquire": "claim",
-            "cell_admission_recovery_receipt": "recovery_receipt",
-            "cell_admission_publish_operator_alarm_attention": (
-                "operator_alarm_attention"
-            ),
-        }.get(command, "authoring_admission")
-        expected_keys = frozenset({"api_version", "command", "ok", result_key})
-        if set(response) != expected_keys or not isinstance(
-            response.get(result_key), dict
-        ):
-            raise CellAdmissionError(
-                "execution_command_response_invalid",
-                "native cell-admission result is malformed",
-                outcome_unknown=True,
-            )
-        return response[result_key]
-
-    def get(self) -> dict[str, Any]:
-        return self._authoring(self._call("cell_admission_get", None))
-
-    @staticmethod
-    def _authoring(value: dict[str, Any]) -> dict[str, Any]:
-        if (
-            set(value) != _AUTHORING_KEYS
-            or type(value.get("authoring_allowed")) is not bool
-            or type(value.get("admission_generation")) is not int
-            or not 1 <= value["admission_generation"] <= 9_007_199_254_740_991
-        ):
-            raise CellAdmissionError(
-                "execution_command_response_invalid",
-                "native authoring-admission projection is malformed",
-            )
-        return value
-
-    def acquire(
-        self,
-        intent: Mapping[str, Any],
-        *,
-        program_cycle_status: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """A Program Reset claim carries the runner's current cycle status
-        beside its intent, and only it does (OD-139)."""
-        if set(intent) not in (_INTENT_KEYS, _INTENT_KEYS | {"program_node_evidence"}):
-            raise ValueError("claim intent is not the exact A1 projection")
-        result = self._call(
-            "cell_admission_acquire", intent, program_cycle_status=program_cycle_status
-        )
-        try:
-            nonnegative_int64(result.get("accepted_at_ns"))
-        except ValueError as error:
-            raise CellAdmissionError("execution_command_response_invalid",
-                                     "native claim acceptance time is malformed") from error
-        if (
-            set(result) != _CLAIM_KEYS
-            or result.get("intent") != dict(intent)
-            or any(
-                type(result.get(key)) is not int
-                for key in (
-                    "acquired_admission_generation",
-                    "claim_generation",
-                )
-            )
-            or not 1
-            <= result["acquired_admission_generation"]
-            <= 9_007_199_254_740_991
-            or not 1 <= result["claim_generation"] <= 9_007_199_254_740_991
-        ):
-            raise CellAdmissionError(
-                "execution_command_response_invalid",
-                "native cell-admission claim is malformed",
-                outcome_unknown=True,
-            )
-        return result
-
-    def release(self, release: Mapping[str, Any]) -> dict[str, Any]:
-        if set(release) != _RELEASE_KEYS:
-            raise ValueError("claim release is not the exact A1 projection")
-        return self._authoring(self._call("cell_admission_release", release))
-
-    def recovery_receipt(self, query: Mapping[str, Any]) -> dict[str, Any]:
-        if set(query) != _RECOVERY_QUERY_KEYS:
-            raise ValueError("recovery query is not the exact A1 projection")
-        result = self._call("cell_admission_recovery_receipt", query)
-        if (
-            set(result) != _RECOVERY_RECEIPT_KEYS
-            or result.get("status")
-            not in {
-                "unknown",
-                "conflicting",
-                "held_exact",
-                "released_exact",
-            }
-            or not isinstance(result.get("held_claims"), list)
-        ):
-            raise CellAdmissionError(
-                "execution_command_response_invalid",
-                "native recovery receipt is malformed",
-                outcome_unknown=True,
-            )
-        return result
-
-    def publish_operator_alarm_attention(
-        self, projection: Mapping[str, Any], *, stop_fd: int | None = None
-    ) -> dict[str, Any]:
-        """Publish the Alarm Lifecycle Owner's fenced motion-attention view.
-
-        The Kernel retains the newest generation and alone
-        evaluates it at Run/Resume/recovery admission, judging its age by
-        its own freshness bound. The wait for the acceptance has no time
-        limit (OD-307): it ends by the Kernel's answer, by the socket closing
-        when the host exits, or by ``stop_fd`` (the read end of the caller's
-        stop pipe) becoming readable.
-        """
-        result = self._call(
-            "cell_admission_publish_operator_alarm_attention",
-            projection,
-            stop_fd=stop_fd,
-        )
-        if (
-            set(result) != _ATTENTION_ACCEPTED_KEYS
-            or result.get("generation") != projection.get("generation")
-        ):
-            raise CellAdmissionError(
-                "execution_command_response_invalid",
-                "native operator-alarm attention acceptance is malformed",
-            )
-        return result
+    return response[_RESULT_MEMBERS.get(command, "authoring_admission")]
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

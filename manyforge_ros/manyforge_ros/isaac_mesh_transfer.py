@@ -21,8 +21,7 @@ from typing import Final
 
 
 UNAVAILABLE_EXIT_CODE: Final = 78
-UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
-RESTORATION_GATE: Final = "I9/I"
+UNAVAILABLE_REASON_CODE: Final = "runtime_unavailable"
 HISTORICAL_SOURCE_BLOB: Final = "ed0b7fa46046f9e257baae9f6f07c97049b11718"
 HISTORICAL_TEST_BLOB: Final = "3653dea92b75948e9bd8a47d1b9ce6af4c3bcc66"
 UNAVAILABLE_MESSAGE: Final = (
@@ -34,7 +33,6 @@ def unavailable_payload() -> dict[str, object]:
     return {
         "schema_version": "manyforge.qualification_unavailable.v1",
         "reason_code": UNAVAILABLE_REASON_CODE,
-        "restoration_gate": RESTORATION_GATE,
         "historical_source_blob": HISTORICAL_SOURCE_BLOB,
         "historical_test_blob": HISTORICAL_TEST_BLOB,
         "removed_contracts": [

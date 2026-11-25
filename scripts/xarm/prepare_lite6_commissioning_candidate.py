@@ -28,7 +28,7 @@ from typing import Final, Sequence
 
 
 LITE6_COMMISSIONING_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_lite6_commissioning_unavailable"
+    "lite6_commissioning_unavailable"
 )
 HISTORICAL_SOURCE_COMMIT: Final = (
     "08222188293df8e12f90dc72e204c21f22f92ea1"

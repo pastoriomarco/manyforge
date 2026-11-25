@@ -113,7 +113,7 @@ TEST(NodeEnvironmentProjection,
   const auto bytes = content_identity::canonical_json(available);
   EXPECT_NE(
       bytes.find(
-          "\"schema_version\":\"manyforge.node_environment_projection.v3\""),
+          "\"schema_version\":\"manyforge.node_environment_projection.v4\""),
       std::string::npos);
   EXPECT_NE(bytes.find("\"portable_authoring_available\":true"),
             std::string::npos);
@@ -141,8 +141,6 @@ TEST(NodeEnvironmentProjection,
   EXPECT_EQ(bytes.find("\"semantic_io_node_adapter_unavailable_until_i11\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"manager_runtime_converged\":true"),
-            std::string::npos);
-  EXPECT_NE(bytes.find("\"restoration_gates\":[\"I6\",\"N\"]"),
             std::string::npos);
   EXPECT_NE(bytes.find(admission.retained_bundle_id().value()),
             std::string::npos);
@@ -187,7 +185,6 @@ TEST(NodeEnvironmentProjection,
       EXPECT_FALSE(member(row, "binding_available").as_bool()) << id;
       EXPECT_FALSE(member(row, "execution_available").as_bool()) << id;
       EXPECT_FALSE(member(row, "owner_health_available").as_bool()) << id;
-      EXPECT_TRUE(member(row, "restoration_gates").as_array().empty()) << id;
       EXPECT_EQ(content_identity::canonical_json(member(row, "reason_codes")),
                 "[\"program_binding_unselected\",\"program_runtime_owner_"
                 "unavailable\"]")

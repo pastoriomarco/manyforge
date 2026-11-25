@@ -78,6 +78,8 @@ def native(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 def test_serve_passes_report_root_to_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     observed = []
+    # The serve path configures the root logger; keep the test process's own.
+    monkeypatch.setattr(cli, "setup_logging", lambda level, *, process: None)
     monkeypatch.setattr(cli, "create_app", lambda config: observed.append(config) or object())
     monkeypatch.setattr(cli.uvicorn, "run", lambda *_args, **_kwargs: None)
     args = [

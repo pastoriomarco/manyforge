@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-11-24 16:42:25 UTC
+  Last regenerated: 2026-11-25 07:46:57 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -17,7 +17,7 @@ A Scene request that finds the Scene changed by another request since it was che
 
 A successful Scene commit is answered once Headless's own view of the logical scene shows the committed revision (or a newer one, or another active bundle, graph or scene), so a read after the reply shows the commit; when the Manager stops answering, or Headless shuts down, the success reply is returned at once. This wait has no time limit.
 
-The Program runner latches pose observations into the scene between nodes through `GET /api/scene/runtime-owner` and `POST /api/scene/runtime-latch`. A latch that committed observations is answered under the same rule as a Scene commit; one that committed none is answered at once.
+The Program runner reads and edits the scene, and latches pose observations into it between nodes, at the Manager, not through this API; a Program node's read after such a change shows it. Headless's own view of the logical scene shows these changes once the Manager publishes them, so a read through this API is not ordered with them.
 
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
@@ -62,6 +62,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/execution/history/export` |  | History Export |
 | `GET` | `/api/execution/history/health` |  | Historian Health |
 | `POST` | `/api/execution/history/program-reset-outcomes` |  | History Program Reset Outcome |
+| `POST` | `/api/execution/history/scene-changes` |  | History Scene Change |
 | `GET` | `/api/execution/history/{sequence}` |  | History Detail |
 | `GET` | `/api/execution/identity` |  | Execution Identity |
 | `POST` | `/api/execution/io-signals/mock-input` |  | Execution Set Mock Io Input |
@@ -131,10 +132,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/runtime` |  | Runtime |
 | `GET` | `/api/scene` |  | Scene |
 | `POST` | `/api/scene/resource-poses/query` |  | Scene Resource Poses |
-| `POST` | `/api/scene/runtime-latch` |  | Scene Runtime Latch |
-| `GET` | `/api/scene/runtime-owner` |  | Scene Runtime Owner |
 | `POST` | `/api/scene/transactions` |  | Scene Commit |
-| `POST` | `/api/scene/transactions/status` |  | Scene Transaction Status |
 | `GET` | `/api/skills` |  | Skills |
 | `POST` | `/api/skills/expand` |  | Expand Skill |
 | `GET` | `/api/source-model` |  | Source Model |

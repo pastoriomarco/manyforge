@@ -7,11 +7,11 @@
   "description": "Mock UR5 semantic object pick. A model selects one scene object from a deterministic manifest plus a viewer snapshot, and the pick sequence is then computed deterministically from the scene state. Needs a model endpoint; Load and Execute the Program.",
   "members": {
     "deployment.yaml": "sha256:d20334e1d230acdfc88fa1515755ce5ecf7f059b92caa4563182b44d34e97c35",
-    "program.yaml": "sha256:d0c596f4c935abfd94168f2dde91f541d9ef080cd318b9f7ca96fac1f5ca1ae6"
+    "program.yaml": "sha256:ed8b168c0bc9d197631d56d1674dbd7a579219453266fc898d46a951bbea721f"
   },
   "name": "mock_ur5_semantic_object_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:86c304029d5ce0b3a139060782d864356ef939736a22b34f43cf5130ae1b84ca",
+    "checked_content_digest": "sha256:923d2e207f35a666d9c22ad9d97d4f3dbc00d06881b8641e4926a8b799488885",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

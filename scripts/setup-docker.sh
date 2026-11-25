@@ -119,7 +119,7 @@ python3 "$ROBOPLAN_SOURCE_VERIFIER" \
     || fail "jrl-cmakemodules source identity/license preflight failed."
 python3 "$ROBOPLAN_SOURCE_VERIFIER" \
     --ledger "$ROBOPLAN_SOURCE_LEDGER" \
-    --source-id toppra_0_6_10_ua1_dependency \
+    --source-id toppra_0_6_10_dependency \
     --root "$TOPPRA_DIR" --content-kind source \
     || fail "TOPPRA source identity/license preflight failed."
 python3 "$ROBOPLAN_SOURCE_VERIFIER" \

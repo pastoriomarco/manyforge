@@ -47,7 +47,7 @@ const sequence: CatalogEntry = {
   execution: { blocking: true, cancellable: true, ownerApi: 'program' },
   runners: { py_trees: 'sequence_v1' },
   tags: [],
-  minProgramProfile: 'composable-cell-v1',
+  minProgramProfile: 'manyforge-cell-v1',
   blackboard: { reads: [], writes: [] },
   ownerContext: null,
   outcomes: {},
@@ -86,12 +86,10 @@ const environment: NodeEnvironmentResponse = {
     executionAvailable: false,
     reasons: [],
     reasonCodes: ['native_program_product_unavailable'],
-    restorationGates: ['N7'],
   })),
   portableAuthoringAvailable: true,
   executionAvailable: false,
   reasonCodes: ['native_program_product_unavailable'],
-  restorationGates: ['N7'],
   active: null,
 };
 

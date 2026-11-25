@@ -181,7 +181,7 @@ class _Headless(HeadlessHttpClient):
     def node_environment(self) -> dict[str, Any]:
         mode = self.projection
         return {
-            "schema_version": "manyforge.node_environment_projection.v3",
+            "schema_version": "manyforge.node_environment_projection.v4",
             "retained_bundle_id": mode["retained_bundle_id"],
             "graph_revision": mode["graph_revision"],
             **mode["node_environment"],
@@ -2265,13 +2265,12 @@ def test_deployment_capabilities_read_shows_a_concise_view(tmp_path: Path) -> No
                 "executable_package_id": "manyforge_behavior", "adapter_build_qualified": True,
                 "authoring_available": True, "binding_available": not reasons,
                 "execution_available": not reasons, "implementation_identity_resolved": True,
-                "owner_health_available": True, "reason_codes": codes, "reasons": reasons,
-                "restoration_gates": []}
+                "owner_health_available": True, "reason_codes": codes, "reasons": reasons}
 
     availability = {
         "binding_context": "applied", "execution_available": True,
         "manager_runtime_converged": True, "portable_authoring_available": True,
-        "reason_codes": [], "restoration_gates": [],
+        "reason_codes": [],
         "implementations": [
             implementation("io.set_output", []),
             implementation("simulation.step", [{

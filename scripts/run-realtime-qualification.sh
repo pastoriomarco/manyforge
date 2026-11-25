@@ -13,8 +13,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 python3 manyforge_core/tools/collect_qualification_evidence.py \
   --repo-root "${REPO_ROOT}" \
-  --lane "${MANYFORGE_QUALIFICATION_LANE:-rt6-local}" \
-  --source "rt6-realtime-qualification" \
+  --lane "${MANYFORGE_QUALIFICATION_LANE:-realtime-local}" \
+  --source "realtime-qualification" \
   --require-evidence \
   -- \
   python3 manyforge_core/tools/realtime_qualification_probe.py

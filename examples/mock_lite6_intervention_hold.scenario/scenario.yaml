@@ -7,11 +7,11 @@
   "description": "Mock Lite6 per-group failure hold. An unreachable move (1 automatic retry) holds for intervention in arm_group (intervention_stop_scope own_groups). Retry re-runs it; Continue fails the node so the Fallback takes the reachable alternative.",
   "members": {
     "deployment.yaml": "sha256:929507995843e09254d4ebe4c9bd8b0b131c3b228e32e674e58cafdfdae79f03",
-    "program.yaml": "sha256:f4102be01eb6cbb49f2afdb501038163961ec0f6bf12a923ab9058318f3f1bde"
+    "program.yaml": "sha256:a41121dc499a8c5df235340d7f9b5c2f48eabfa85e3710532af8a41686da1e60"
   },
   "name": "mock_lite6_intervention_hold",
   "saved_status": {
-    "checked_content_digest": "sha256:81f78e6a4df322dedf5a0574637fec3aceb3005f8a3c79a258b8a4d70901dd0a",
+    "checked_content_digest": "sha256:3221ea69cca8267d26f0c0e4461b7607deadc0248fad99f7f44067c03f0d20c7",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

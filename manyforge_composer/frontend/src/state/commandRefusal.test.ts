@@ -7,6 +7,23 @@ import {
 } from './commandRefusal';
 
 describe('command refusal text', () => {
+  it('names a late command\'s age and limit on the REST and WebSocket paths', () => {
+    const [compact, full] = ERROR_CATALOG.control_freshness_expired;
+    const expected = `${compact}: ${full} too late (Age: 2.4 s, limit 1.0 s)`;
+    const rest = parseApiErrorDto({
+      detail: {
+        code: 'control_freshness_expired', message: 'too late',
+        details: { elapsed_ns: 2_400_000_000, valid_for_ns: 1_000_000_000 },
+      },
+    })!;
+    expect(commandRefusalText(rest)).toBe(expected);
+    const receipt = receiptRefusal('control_freshness_expired', {
+      code: 'control_freshness_expired', client_sequence: '4', message: 'too late',
+      details: { elapsed_ns: '2400000000', valid_for_ns: '1000000000' },
+    });
+    expect(commandRefusalText(receipt, { withCode: true })).toBe(`control_freshness_expired: ${expected}`);
+  });
+
   it('names the Kernel admission reason of a refusal', () => {
     // POST /api/control/commands, HTTP 409.
     const error = parseApiErrorDto({

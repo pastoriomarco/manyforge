@@ -28,14 +28,16 @@ import {
   type ComponentTreeNode,
 } from '../state/componentPresentation';
 import type { ComponentState } from '../types/components';
+import { withErrorCode } from '../state/structuralResource';
 import { OverlayPanel } from './OverlayPanel';
 import { RecoverEnableDialog } from './RecoverEnableDialog';
+import { ProcessOutputTail } from './ProcessOutputTail';
 
 /** A refused or failed request, as the operator reads it (catalogue text by code). */
 export function requestErrorText(error: unknown): string {
   const code = apiErrorCode(error);
   const message = error instanceof Error ? error.message : String(error);
-  return code === null ? message : codedErrorText({ code, message });
+  return code === null ? message : withErrorCode(codedErrorText({ code, message }), code);
 }
 
 /**
@@ -215,7 +217,7 @@ export function ComponentStatePanel({ state, enabled, states = [], embedded = fa
       )}
       {concerned !== null && (
         <div className="notice severity-error" role="alert">
-          <strong>{concerned.ownerId}: {concerned.fault.title}</strong>
+          <strong>{concerned.ownerId}: {withErrorCode(concerned.fault.title, concerned.fault.code)}</strong>
           <p>{concerned.fault.detail}</p>
           {concerned.fault.operatorAction !== null && (
             <p>Operator action: {concerned.fault.operatorAction} on {concerned.ownerId}</p>
@@ -244,10 +246,12 @@ export function ComponentStatePanel({ state, enabled, states = [], embedded = fa
       )}
       {fault !== null && (
         <div className="notice severity-error" role="alert">
-          <strong>{fault.title}</strong>
+          <strong>{withErrorCode(fault.title, fault.code)}</strong>
+          {fault.since !== null && <small className="muted"> {fault.since}</small>}
           <p>{fault.detail}</p>
           {fault.vendor !== null && <p className="muted">{fault.vendor}</p>}
           {fault.operatorAction !== null && <p>Operator action: {fault.operatorAction}</p>}
+          {fault.outputTail !== null && <ProcessOutputTail text={fault.outputTail} />}
         </div>
       )}
       {state.streams.length > 0 && (

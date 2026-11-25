@@ -1933,6 +1933,7 @@ def test_interrupt_nodes_are_qualified_and_build_the_interrupt_adapter() -> None
         audit_sink=None, name="probe", node_instance_id="probe", attempt_source=_Attempts(),
         parameters={"target": {"component_id": "robot", "command_target_id": "arm"}},
         value_sources={}, input_resolver=_Resolver(), operator_stop_state=None,
+        run_sender=None,
     )
     assert type(build(context)) is v2_owner.InterruptMotionTaskAdapter
 
@@ -2434,3 +2435,43 @@ def test_a_stopped_newcomer_whose_node_is_not_held_still_fails() -> None:
         adapter = _motion(port, clock, hold=stop_state)
         assert _tick(adapter) is _FAILURE
         assert adapter.failure_reason_code == "operation_stopped"
+
+
+class _PublishedStore(_Store):
+    """The outcome key is published: its write returns the frame's receipt."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        from manyforge_behavior.orchestration_values import PublicationReceipt
+
+        self.receipt = PublicationReceipt()
+
+    def write_node_outcome(self, node_instance_id, outcome, *, metadata=None):
+        super().write_node_outcome(node_instance_id, outcome, metadata=metadata)
+        return self.receipt
+
+
+def test_a_published_outcome_returns_the_result_after_the_host_answer() -> None:
+    # Base published the outcome inside the write, so the node returned its
+    # result only after the host's answer (OD-213 part 3); it still does.
+    store = _PublishedStore()
+    _time, clock = _clocked()
+    adapter = _motion(_MotionPort([_succeeded()]), clock, store=store)
+    assert _tick(adapter) is _RUNNING
+    assert [value for _key, value, _meta in store.writes] == ["completed"]
+    assert _tick(adapter) is _RUNNING
+    store.receipt.answer()
+    assert _tick(adapter) is _SUCCESS
+    assert [value for _key, value, _meta in store.writes] == ["completed"]
+
+
+def test_a_stop_while_the_outcome_is_on_its_way_ends_with_the_real_result() -> None:
+    store = _PublishedStore()
+    _time, clock = _clocked()
+    adapter = _motion(_MotionPort([_succeeded()]), clock, store=store)
+    assert _tick(adapter) is _RUNNING
+    adapter.stop(_INVALID)  # Forced Program End after the write.
+    assert adapter.settle_abandoned_request() is False
+    store.receipt.answer()
+    assert adapter.settle_abandoned_request() is True
+    assert adapter.status is _SUCCESS and adapter.outcome == "success"

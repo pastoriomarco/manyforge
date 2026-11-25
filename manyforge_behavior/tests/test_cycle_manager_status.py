@@ -16,6 +16,6 @@ def test_status_path_fails_before_touching_a_python_tree() -> None:
     poison = PoisonTree()
     with pytest.raises(
         CycleManagerUnavailableError,
-        match="composable_cell_cycle_manager_unavailable",
+        match="cycle_manager_unavailable",
     ):
         CycleManager(poison, poison)

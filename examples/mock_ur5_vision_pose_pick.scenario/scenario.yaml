@@ -7,11 +7,11 @@
   "description": "Mock UR5 vision-guided pose pick. Needs one connected viewer snapshot source so assistant.query_model can attach a live scene snapshot. Load and Execute the Program.",
   "members": {
     "deployment.yaml": "sha256:3d40a789e1f45be76a508db8fb9cdf392f5e9b7ca19050541dbddcda23231f18",
-    "program.yaml": "sha256:76055e910dc89789dbd00d66ecf29cc4631a782118ce9be530eec294412ad37c"
+    "program.yaml": "sha256:017727b7a908513bf2e4b61dcce8870fb5768e5578ae47978f007ae0c98a896d"
   },
   "name": "mock_ur5_vision_pose_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:1a5716b9c5c17ce33da6e55d6847e00954a9dd53761874de70a31fded8533e59",
+    "checked_content_digest": "sha256:a7f52dba3b9b8ca2d0e70300d5a0a77610a2edf0c37a69e4515c69179e0aa9cd",
     "last_known_status": "unknown",
     "manyforge_version": "0.4.0"
   },

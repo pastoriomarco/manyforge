@@ -139,7 +139,7 @@ function workspace(
   const program = {
     api_version: 'manyforge.program.v4' as const,
     program_revision: programRevision,
-    program_profile: 'composable-cell-v1' as const,
+    program_profile: 'manyforge-cell-v1' as const,
     catalog: {
       api_version: 'manyforge.node_catalog.v3' as const,
       content_version: 'fixture',
@@ -785,10 +785,13 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       details,
     } });
     let refusal: string | null = null;
+    const codes: Array<string | null | undefined> = [];
     const load = async (error: ApiError) => {
       apiMock.cellApply.load.mockRejectedValueOnce(error);
       await act(async () => {
-        await latest?.loadScenarioDocument('/workspace/cell', (message) => { refusal = message; });
+        await latest?.loadScenarioDocument('/workspace/cell', (message, _failed, code) => {
+          refusal = message; codes.push(code);
+        });
       });
       return refusal;
     };
@@ -808,6 +811,8 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(await load(incomplete({
       member: 'program.yaml', cause_code: 'unlisted_cause', path: 'forest', diagnostic_count: 1,
     }))).toBe('Scenario Load refused: Scenario document is incomplete (program.yaml, forest: unlisted_cause).');
+    // The dialog also gets the typed code (its guidance, Upgrade and load).
+    expect(new Set(codes)).toEqual(new Set(['scenario_activation_incomplete']));
     expect(scenarioOpened).not.toHaveBeenCalled();
   });
 
@@ -906,17 +911,21 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     // A Load whose preparation refused it ends its row refused (OD-214): it
     // is shown as a refusal, as its HTTP refusal was.
     const refusals: string[] = [];
+    const refusalCodes: Array<string | null | undefined> = [];
     apiMock.cellApply.load.mockResolvedValueOnce({
       kind: 'scenario_load', requestKey: 'e'.repeat(32), step: 'previewing', stepSource: null,
       acceptedAtNs: '1', end: { outcome: 'refused', code: 'activation_preparation_failed',
         details: null, finishedAtNs: '2' },
     } satisfies ApplyCommandRow);
     await act(async () => {
-      await latest?.loadScenarioDocument('/workspace/cell', (message) => { refusals.push(message); });
+      await latest?.loadScenarioDocument('/workspace/cell', (message, _failed, code) => {
+        refusals.push(message); refusalCodes.push(code);
+      });
     });
     expect(refusals).toEqual([
       `Scenario Load refused: ${codedErrorText({ code: 'activation_preparation_failed', message: '' })}`,
     ]);
+    expect(refusalCodes).toEqual(['activation_preparation_failed']);
     expect(scenarioOpened).toHaveBeenCalledTimes(1);
   });
 

@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import signal
 import socket
 from typing import Any, Callable, Mapping, Sequence
@@ -105,18 +106,25 @@ def write_document(path: Path, processes: Sequence[ApplicationProcess]) -> Path:
     return path
 
 
-def parent_death_preexec() -> Callable[[], None]:
+def parent_death_preexec(core_dump_limit_bytes: int = 0) -> Callable[[], None]:
     """Return a ``preexec_fn`` that ends the Manager when its launcher ends.
 
     The child sets ``PR_SET_PDEATHSIG(SIGTERM)`` and then checks that the
     launcher is still its parent (it may have died between fork and prctl).
-    The C library is loaded here, in the launcher, never after fork.
+    It also sets the core-file size limit's soft value to
+    ``core_dump_limit_bytes`` (the site settings' ``core_dumps``; 0, core
+    dumps off, by default), at most the hard limit, which is kept. The C
+    library and the limits are read here, in the launcher, never after fork.
     """
 
     libc = ctypes.CDLL(None, use_errno=True)
     launcher = os.getpid()
+    _core_soft, core_hard = resource.getrlimit(resource.RLIMIT_CORE)
+    core_soft = (core_dump_limit_bytes if core_hard == resource.RLIM_INFINITY
+                 else min(core_dump_limit_bytes, core_hard))
 
     def preexec() -> None:
+        resource.setrlimit(resource.RLIMIT_CORE, (core_soft, core_hard))
         if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0 or os.getppid() != launcher:
             os._exit(70)
 

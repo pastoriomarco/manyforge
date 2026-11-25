@@ -2233,7 +2233,7 @@ def test_the_empty_cell_preparation_has_a_scenario_origin() -> None:
     assert ManagerApplyPreparedActivation.model_validate(value).origin.kind == "scenario"
 
 
-@pytest.mark.parametrize("option", ["reload_initial_scene", "reset_robot_position"])
+@pytest.mark.parametrize("option", ["reload_initial_scene", "reset_robot_position", "reset_stored_values"])
 @pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}])
 def test_program_reset_options_are_strict_default_off(option, value):
     from manyforge_headless_api.models import ProgramCycleResetRequest
@@ -2241,6 +2241,7 @@ def test_program_reset_options_are_strict_default_off(option, value):
             "program_run_id": None, "expected_cycle_generation": 1}
     parsed = ProgramCycleResetRequest.model_validate(body)
     assert parsed.reload_initial_scene is False and parsed.reset_robot_position is False
+    assert parsed.reset_stored_values is False
     with pytest.raises(ValidationError):
         ProgramCycleResetRequest.model_validate({**body, option: value})
 
@@ -2256,7 +2257,8 @@ def test_no_run_selected_reset_requires_retained_options_and_truthful_phase():
                  "kind": "reset", "request_key": _KEY, "step": "restoring_scene",
                  "accepted_at_ns": "1", "end": None}, "ended": []},
              "failure": None, "reset_phase": "restoring_scene",
-             "reset_options": {"reload_initial_scene": True, "reset_robot_position": False},
+             "reset_options": {"reload_initial_scene": True, "reset_robot_position": False,
+                               "reset_stored_values": False},
              "reset_robot_position": {"available": False, "reason": "unsupported"}, "allowed_commands": []}
     ProgramCycleStatusDTO.model_validate(cycle)
     failure = {"code": "scene_failed", "failed_phase": "restoring_scene"}
@@ -2264,7 +2266,10 @@ def test_no_run_selected_reset_requires_retained_options_and_truthful_phase():
     ProgramCycleStatusDTO.model_validate(recovery)
     for change in ({"reset_options": None}, {"reset_phase": "stopping"},
                    {"cycle_claim_generation": 1}, {"current_command_kind": None},
-                   {"reset_options": {"reload_initial_scene": False, "reset_robot_position": False}},
+                   {"reset_options": {"reload_initial_scene": True, "reset_robot_position": False}},
+                   # Stored values alone never enter a no-run Reset phase.
+                   {"reset_options": {"reload_initial_scene": False, "reset_robot_position": False,
+                                      "reset_stored_values": True}},
                    {"reset_robot_position": {"available": True, "reason": "unsupported"}},
                    {"reset_robot_position": {"available": False, "reason": None}}):
         with pytest.raises(ValidationError):
@@ -2608,14 +2613,14 @@ def test_recovery_action_names_an_offered_action_or_an_operator_choice_option():
         CycleRecoveryActionRequest.model_validate(body)
 
 
-def test_history_filters_by_collision_rule_id():
+def test_history_filters_by_rule_id():
     from manyforge_headless_api.history_query import HistorianQueryRequest
 
-    query = HistorianQueryRequest(collision_rule_id="tip_on_part")
+    query = HistorianQueryRequest(rule_id="tip_on_part")
     assert query.native_arguments(now_utc_ns=1)["correlations"] == {
-        "collision_rule_id": "tip_on_part"}
-    # `rule_id` names an interrupt rule in events; it is not a History filter.
-    for stale in ({"rule_id": "tip_on_part"}, {"contact_policy_id": "probe_contact_policy"}):
+        "rule_id": "tip_on_part"}
+    # Earlier filter names are refused like any unknown filter.
+    for stale in ({"collision_rule_id": "tip_on_part"}, {"contact_policy_id": "probe_contact_policy"}):
         with pytest.raises(ValidationError):
             HistorianQueryRequest(**stale)
 

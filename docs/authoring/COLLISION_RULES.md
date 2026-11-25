@@ -347,15 +347,19 @@ again. See also [Troubleshooting](../operations/TROUBLESHOOTING.md).
 
 Older Scenario files used a per-robot `collision_clearance_m`, a `clearance_m`
 on motion nodes, Program contact policies and support contacts on Scene
-objects. They are not loaded any more. Convert them once:
+objects. Load refuses them and offers **Upgrade and load**, which converts the
+Scenario folder in place, keeps the original next to it as a backup and loads
+the result (see
+[the workbench guide](../operations/DEVELOPMENT_WORKBENCH.md)). To convert
+many Scenarios at once, or a single Program file, use the script:
 
 ```bash
 python3 scripts/convert_scenario_od46.py path/to/my.scenario
 ```
 
-The script rewrites `program.yaml` and `deployment.yaml` together and prints
+Both rewrite `program.yaml` and `deployment.yaml` together; the script prints
 what it changed. Support contacts become rules on single moves: a release
 rule on the lift and a contact rule on the last place move. Check these two
 moves in the Composer after the conversion: moves in between now keep the
-normal clearance to the support. When the script cannot convert something it
-names it and writes nothing.
+normal clearance to the support. When something cannot be converted, the
+upgrade or the script names it and writes nothing.

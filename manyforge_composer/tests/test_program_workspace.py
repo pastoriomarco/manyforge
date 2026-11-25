@@ -352,11 +352,10 @@ def _node_environment_projection() -> dict:
                         ),
                     }
                 ),
-                "restoration_gates": list(disposition.restoration_gates),
             }
         )
     return {
-        "schema_version": "manyforge.node_environment_projection.v3",
+        "schema_version": "manyforge.node_environment_projection.v4",
         "retained_bundle_id": "bundle-1",
         "graph_revision": "graph-1",
         "catalog_id": manifest.catalog_id,
@@ -381,7 +380,6 @@ def _node_environment_projection() -> dict:
                 "program_binding_unselected",
                 "program_runtime_owner_unavailable",
             ],
-            "restoration_gates": ["I6", "N"],
         },
         "source": {
             "available": True,
@@ -1254,7 +1252,7 @@ def test_program_settings_mutation_is_validated_and_draft_only(
             **_fence(opened),
             "mutation": "program_draft_update_settings",
             "arguments": {
-                "program_profile": "composable-cell-v1",
+                "program_profile": "manyforge-cell-v1",
                 "compatibility": {
                     "assistant": "optional",
                     "requires": ["scene.mutable"],

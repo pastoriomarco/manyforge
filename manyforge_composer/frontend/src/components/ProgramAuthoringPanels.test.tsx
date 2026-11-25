@@ -54,7 +54,7 @@ const sequence: CatalogEntry = {
   execution: { blocking: true, cancellable: true, ownerApi: 'program' },
   runners: { py_trees: 'sequence_v1' },
   tags: ['flow'],
-  minProgramProfile: 'composable-cell-v1',
+  minProgramProfile: 'manyforge-cell-v1',
   blackboard: { reads: [], writes: [] },
   ownerContext: null,
   outcomes: {},
@@ -112,12 +112,10 @@ const environment: NodeEnvironmentResponse = {
     executionAvailable: false,
     reasons: [],
     reasonCodes: ['native_program_product_unavailable'],
-    restorationGates: ['N7'],
   })),
   portableAuthoringAvailable: true,
   executionAvailable: false,
   reasonCodes: ['native_program_product_unavailable'],
-  restorationGates: ['N7'],
   active: null,
 };
 
@@ -128,7 +126,7 @@ function authoringProgram(
 ): ProgramAuthoringDocument {
   return {
     api_version: 'manyforge.program.v4',
-    program_profile: 'composable-cell-v1',
+    program_profile: 'manyforge-cell-v1',
     catalog: {
       api_version: 'manyforge.node_catalog.v3',
       content_version: '2.4.0',
@@ -328,11 +326,11 @@ describe('Program authoring panels', () => {
       <NodePaletteItem
         entry={sequence}
         executionAvailable={false}
-        executionNote="Authorable · unavailable in this version"
+        executionNote="Authorable · unavailable"
         allowDrag
       />,
     );
-    expect(unavailableItem).not.toContain('Authorable · unavailable in this version');
+    expect(unavailableItem).not.toContain('Authorable · unavailable');
     expect(unavailableItem).toContain('node-info-button execution-unavailable');
     expect(unavailableItem).toContain('execution unavailable');
     expect(unavailableItem).toContain('draggable="true"');
@@ -356,13 +354,11 @@ describe('Program authoring panels', () => {
       ...environment,
       executionAvailable: true,
       reasonCodes: [],
-      restorationGates: [],
       implementations: environment.implementations.map((row) => ({
         ...row,
         executionAvailable: true,
         reasons: [],
         reasonCodes: [],
-        restorationGates: [],
       })),
     };
     const markup = renderToStaticMarkup(
@@ -421,7 +417,6 @@ describe('Program authoring panels', () => {
           executionAvailable: false,
           reasons: [modelReason],
           reasonCodes: ['capability_not_offered'],
-          restorationGates: [],
         },
       ],
     };
@@ -448,15 +443,13 @@ describe('Program authoring panels', () => {
           executionAvailable: false,
           reasons: [missingCapability],
           reasonCodes: ['capability_not_offered'],
-          restorationGates: [],
         },
       ],
     };
 
-    // Restoration gate codes never reach the operator.
     expect(executionAvailability(sequence, environment)).toEqual({
       available: false,
-      note: 'Authorable · unavailable in this version · native program product unavailable',
+      note: 'Authorable · unavailable · native program product unavailable',
     });
     expect(executionAvailability(modelQuery, modelEnvironment)).toEqual({
       available: false,
@@ -471,7 +464,7 @@ describe('Program authoring panels', () => {
       ...modelEnvironment,
       implementations: modelEnvironment.implementations.map((row) => (
         row.nodeId === sequence.id
-          ? { ...row, executionAvailable: true, reasons: [], reasonCodes: [], restorationGates: [] }
+          ? { ...row, executionAvailable: true, reasons: [], reasonCodes: [] }
           : row
       )),
     };
@@ -1686,7 +1679,7 @@ describe('Program authoring panels', () => {
         authoring: {
           schema_version: 'manyforge.composer_authoring_forest.v2',
           api_version: 'manyforge.program.v4',
-          program_profile: 'composable-cell-v1',
+          program_profile: 'manyforge-cell-v1',
           catalog: {
             api_version: 'manyforge.node_catalog.v3',
             content_version: 'fixture',
@@ -1699,7 +1692,7 @@ describe('Program authoring panels', () => {
         program: {
           api_version: 'manyforge.program.v4',
           program_revision: `sha256:${'a'.repeat(64)}`,
-          program_profile: 'composable-cell-v1',
+          program_profile: 'manyforge-cell-v1',
           catalog: {
             api_version: 'manyforge.node_catalog.v3',
             content_version: 'fixture',
@@ -1714,7 +1707,6 @@ describe('Program authoring panels', () => {
         unavailableReason: {
           code: 'composer_authoring_draft_incomplete',
           message: 'Program requires exactly one root; found 0.',
-          restorationGates: [],
         },
       },
       saved: {

@@ -20,7 +20,7 @@ from manyforge_headless_api.alarm_attention import (
 )
 from manyforge_headless_api.cell_admission import CellAdmissionClient
 from manyforge_headless_api.execution import ExecutionEventPump
-from manyforge_headless_api.tests.paged_event_stream import paged_subscription
+from manyforge_headless_api.tests.paged_event_stream import FollowedEventSource
 
 
 class _Core:
@@ -203,15 +203,12 @@ class _PumpCore:
         return {"status": "marked_unknown"}
 
 
-class _BlockedSourceRefresh:
+class _BlockedSourceRefresh(FollowedEventSource):
     """An execution source whose first refresh blocks until released."""
 
     def __init__(self) -> None:
         self.entered = threading.Event()
         self.release = threading.Event()
-
-    def subscribe_events(self, after_cursor: int):
-        return paged_subscription(self, after_cursor)
 
     def identity(self) -> dict[str, Any]:
         self.entered.set()

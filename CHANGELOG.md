@@ -9,13 +9,47 @@ formats; such changes are listed explicitly.
 
 ## 0.4.0 – unreleased
 
-Upgrading: Scenarios saved with 0.3.x are converted by
-`python3 scripts/convert_scenario_od46.py <Scenario folder>` (Program v4,
-Deployment intent v3; see Breaking changes), then by
+Upgrading: Load refuses a Scenario saved with 0.3.x and offers **Upgrade and
+load**: after a confirmation that lists the conversions, it converts the
+Scenario folder in place (Program v4, Deployment intent v3, one name and
+description, the renamed Program profile, no lane labels; see Breaking changes
+and Renamed),
+keeps the original next to it as
+`<name>.scenario.before-0.4.0-<UTC date and time>` and loads the result. A
+part that cannot be converted is named (`scenario_upgrade_conversion_failed`)
+and nothing changes. For batch use the scripts remain:
+`python3 scripts/convert_scenario_od46.py <Scenario folder>`, then
 `python3 scripts/convert_scenarios_od369.py <Scenario folder>`.
 
 ### Breaking changes
 
+- **Observability formats.** The session marker is
+  `manyforge.workbench_session.v3` (with `application_end` and
+  `manager_exit`), the session selection `…selection.v3`, and the
+  previous-run report `manyforge.workbench_previous_session.v4` (adds
+  `application_end`, `archived_older_marker`, `started_at_wall`,
+  `reported_at_wall`); an older marker is reported with an unknown shutdown,
+  its format in `archived_older_marker`, and the previous-session alarm says
+  the session came from an older build and names its archive. After an upgrade the development
+  workbench's `start` archives a stopped session of the older marker format
+  by itself (into `previous-runs/`) and says so; one whose container may still
+  run is refused with `development_workbench_session_marker_outdated`.
+  History retention is `manyforge.historian_retention.v4` (three partitions, each with its own
+  `record_byte_limit`). The Program run status is
+  `manyforge.program_run_status.v6` (`node_running_since_utc_ns`,
+  `node_wait_values`). The History filter `collision_rule_id` is now `rule_id`;
+  the old name is refused.
+- **Launcher formats.** The Program runner no longer has an HTTP port (9011);
+  Headless and the launcher reach it over local sockets, so a launch
+  configuration lists two endpoints (`composer`, `headless`). The formats are
+  `manyforge.operator_launch_contract.v3`,
+  `manyforge.operator_launch_configuration.v2`,
+  `manyforge.launch_instance_status.v3`,
+  `manyforge.operator_command_result.v3` and the launch record
+  `manyforge.native_operator_instance.v3`. A launch record in an earlier
+  format is refused with guidance (`status_record_invalid`), not converted:
+  stop that instance with the version that started it, then use a new
+  instance. *Integrators:* accept the new ids from `--json`.
 - **A Scenario has one name and one description.** A Scenario is named by its
   folder (`<name>.scenario`) and described in its `scenario.yaml`. The Program
   no longer has a `program_id`, `name` or `description`, and the Deployment no
@@ -63,8 +97,8 @@ Deployment intent v3; see Breaking changes), then by
     `contact_penetration_exceeds_policy`, and `contact_rule_violation`
     replaces `contact_policy_violation`. A clearance refusal names its rule
     (`collision_rule_id`). The execution history filters by
-    `collision_rule_id` instead of `contact_policy_id`; its file is now
-    `history.v9.sqlite3`, and an earlier History file stays on disk unopened.
+    `rule_id` instead of `contact_policy_id`; its file is now
+    `history.v10.sqlite3`, and an earlier History file stays on disk unopened.
   - **TCP contact bodies.** A descriptor's `tcps` row and a custom TCP can
     list `contact_bodies`. Without the key a gripper's TCP takes its pads,
     else its fingers, and a passive tool's TCP none.
@@ -108,9 +142,47 @@ Deployment intent v3; see Breaking changes), then by
   stream can publish is refused at commit with `scene_too_large`.
 - **Removed error codes:** `kinematic_receiver_time_skew_exceeded` (see
   Changed) and `native_projection_effective_policy_mismatch`.
+- **Removed Headless routes:** `GET /api/scene/runtime-owner`,
+  `POST /api/scene/runtime-latch` and `POST /api/scene/transactions/status`;
+  the Program runner reads and latches the scene at the Manager directly.
+- The `restorationGates` / `restoration_gates` field is removed from Composer
+  /health, its 503 reply and the node-environment data (it carried only
+  placeholder values). The node-environment projection is
+  `manyforge.node_environment_projection.v4` and the Program runner's node
+  availability `manyforge.node_execution_availability.v2`.
 
 ### Added
 
+- **Observability.**
+  - A crash of the Manager, the execution host or a candidate worker prints
+    the fatal signal and a backtrace before the process ends as before;
+    Python processes print every thread's traceback (`faulthandler`). Core
+    files are off by default; the site setting `core_dumps: {enabled,
+    max_bytes}` (`manyforge.site.v2`) allows them up to `max_bytes` each,
+    where and how long they are kept is the host's `kernel.core_pattern`.
+  - One JSON line format for the Manager, the execution host, Headless, the
+    Program runner and Composer (UTC `timestamp`, `level`, `process`, `pid`);
+    Headless and the runner take `--log-level` (default INFO).
+  - The Manager records how the application ended
+    (`application-end.json`: a process exit with its exit status or signal and
+    core dumped, a stop request, or a Manager failure, and the time); the
+    previous-run report and its alarm name them.
+  - History records operator commands and refusals (`command_finished`),
+    manual output writes (`io_output_written`), Program run start, end and
+    audit events, lost records (`historian_records_lost`), one clock anchor per
+    start, and captured motion traces (`motion_trace_captured`: a failed
+    operation or an escalated Stop writes the trace automatically). Records
+    name their caller (`request_id`, transport `http`/`ws`/`mcp`). Program
+    node attempts have their own retention budget.
+  - Refusals carry their typed details (for example the age and limit of an
+    expired control); a launch fault carries the process's last output lines;
+    a fault and a component stop carry `since_utc_ns`.
+  - `python -m manyforge_headless_api history export` and
+    `./manyforge collect [--list]`; evidence captures have timestamps and are
+    kept to the newest 10.
+  - Composer: History with UTC date and milliseconds, the recorded event with
+    Copy, Set filter, Follow and a run timeline; recent notices; waits show the
+    current value and how long they have waited.
 - **Springs.** A contact rule with `max_compression_step_m` is a spring: the
   pair may press in up to `max_penetration_m` (the stroke), and the overlap
   may grow by at most the step limit between samples, checked at most 1 mm of
@@ -304,6 +376,17 @@ Deployment intent v3; see Breaking changes), then by
 
 ### Changed
 
+- **Reset stored values is its own Reset option.** **Reload initial scene**
+  now reloads only the Scene and keeps stored values. The new option
+  **Reset stored values to their initial values** (off by default,
+  independent of the other options) returns every persistent key to
+  `initial:`; its confirmation lists the values it resets, and the resets are
+  recorded in the stored-value edits as before. *Integrators:* the Reset
+  request (`POST /api/program/cycle/reset`, control command `program_reset`)
+  takes `reset_stored_values` (default `false`), and the cycle status's
+  `reset_options` and History's `program_reset_finished` record carry it. A
+  client that relied on Reload initial scene to reset stored values sends
+  `reset_stored_values: true`.
 - **Scene changes are about three times faster.** A Program scene step
   (add, move, remove, attach, detach) took 140-200 ms on a Jetson Thor and
   now takes 35-60 ms: the static-body class rule above, one validation and
@@ -394,7 +477,9 @@ Deployment intent v3; see Breaking changes), then by
 - **Scenario lane labels removed** (file format change). The Program's
   `compatibility.lanes` and the Deployment's `compatibility.lane` are gone,
   with the **Supported lanes** checkboxes in Program settings; a Program or
-  Deployment that still names them is refused as an unknown field. Each
+  Deployment that still names them is refused (Load of a saved Scenario with
+  `scenario_document_dropped_fields`). Upgrade and load, or
+  `scripts/convert_scenarios_od369.py`, removes them. Each
   component's own lane is the only lane, and one Scenario may mix lanes.
   Component-catalog entries from example Scenarios now carry their row's own
   lane.
@@ -417,6 +502,106 @@ Deployment intent v3; see Breaking changes), then by
   by their Run or Resume); a `stop_program_selection` request from the
   Program runner may name `stopped_by_node_instance_id`. The group rows'
   `stopped_by` comes from there.
+
+### Renamed
+
+Names that carried internal milestone codes are renamed. There are no
+aliases: an old name is unknown, and an old environment variable is ignored.
+
+- **Program profile** `composable-cell-v1` is now `manyforge-cell-v1`
+  (`program_profile`, the node catalog's `min_program_profile`, skills'
+  `compatible_profiles`; `composable-cell-v2` is now `manyforge-cell-v2`). A
+  Scenario saved with the old profile is refused
+  (`scenario_program_profile_renamed`);
+  `python3 scripts/convert_scenarios_od369.py <Scenario folder | Program file>`
+  converts it and recomputes the digests and `program_revision`.
+- **Error codes:**
+  - `i6_command_schema_unsupported` → `gripper_command_schema_unsupported`
+  - `i6_gripper_command_scope_unsupported` → `gripper_command_scope_unsupported`
+  - `i6_motion_model_group_cardinality_invalid` → `motion_model_group_cardinality_invalid`
+  - `i6_preview_capability_command_invalid` → `preview_capability_command_invalid`
+  - `i6_preview_primary_motion_invalid` → `preview_primary_motion_invalid`
+  - `i6_preview_single_participant_only` → `preview_single_participant_only`
+  - `composable_cell_runtime_unavailable` → `runtime_unavailable`
+  - `composable_cell_snapshot_client_unavailable` → `snapshot_client_unavailable`
+  - `composable_cell_<name>` → `<name>` for `action_span_authoring_unavailable`,
+    `blackboard_output_binding_unavailable`, `cycle_manager_unavailable`,
+    `cycle_recovery_owner_unavailable`, `deployment_artifact_unavailable`,
+    `geometry_node_unavailable`, `logic_node_binding_unavailable`,
+    `model_node_unavailable`, `motion_node_unavailable`,
+    `motion_scoped_node_unavailable`, `motion_transaction_owner_unavailable`,
+    `recovery_node_unavailable`, `runtime_pause_owner_unavailable`,
+    `runtime_resource_binding_unavailable`, `simulation_node_unavailable`;
+    and, outside the catalog, `kernel_client_binding_unavailable`,
+    `program_runtime_unavailable`, `runtime_adapter`,
+    `lite6_deployment_authority_unavailable`,
+    `lite6_product_smoke_unavailable`, `lite6_commissioning_unavailable`,
+    `collision_lookup_probe_requires_docker`,
+    `collision_lookup_probe_missing_build`.
+
+  History records written before keep their old codes as text.
+- **Runtime snapshot** `scope.blind_spots`: `program_execution_pending_i6`,
+  `component_lifecycle_pending_i7`, `kernel_stop_pending_i8`,
+  `isaac_pending_i9`, `real_robot_pending_i10` and
+  `tools_and_grippers_pending_i11` are now `program_execution`,
+  `component_lifecycle`, `kernel_stop`, `isaac`, `real_robot` and
+  `tools_and_grippers`.
+- **Environment variables** of `scripts/run-realtime-qualification.sh`:
+  `MANYFORGE_RT6_REQUESTED_CPU_AFFINITY`, `MANYFORGE_RT6_REQUESTED_MLOCK` and
+  `MANYFORGE_RT6_REQUESTED_SCHED_POLICY` are now
+  `MANYFORGE_REALTIME_REQUESTED_CPU_AFFINITY`,
+  `MANYFORGE_REALTIME_REQUESTED_MLOCK` and
+  `MANYFORGE_REALTIME_REQUESTED_SCHED_POLICY`; its evidence format
+  `manyforge.rt6_qualification.v1` is `manyforge.realtime_qualification.v1`,
+  its default lane `rt6-local` is `realtime-local` and its source
+  `rt6-realtime-qualification` is `realtime-qualification`.
+- **Execution host ids:** `manyforge_i6_execution_host` →
+  `manyforge_execution_host`, `manyforge_i6_execution_host_worker` →
+  `manyforge_execution_host_worker`, `manyforge_i6_native_gripper_host` →
+  `manyforge_native_gripper_host`, collision publisher `i6-execution-host` →
+  `execution-host`, active control configurations `active.i6.native.arm` →
+  `active.native.arm`, `active.i6.native.gripper` → `active.native.gripper`,
+  `active.i6.manager_native` → `active.manager_native`.
+- **Session stores and journals** (in a fresh `current/` every start; nothing
+  to convert): `manyforge.internal.active-bundle-publication-store.i4.v4` →
+  `manyforge.internal.active-bundle-publication-store.v4`,
+  `manyforge.internal.component-manager.bootstrap-journal.i4.v2` →
+  `manyforge.internal.component-manager.bootstrap-journal.v2`,
+  `manyforge.internal.component-manager.apply-journal.h1a.v25` →
+  `manyforge.internal.component-manager.apply-journal.v25`,
+  `manyforge.internal.execution.operation-journal.o1.5.v23` →
+  `manyforge.internal.execution.operation-journal.v23`, and the Apply journal
+  digest domains `manyforge.component-manager-private-selected-bundle.ua4.v2`,
+  `manyforge.component-manager-fence-release-intent.ua4.v2` and
+  `manyforge.component-manager-terminal-outcome.ua4.v4` (now without `.ua4`).
+- **Build, ledger and test formats:** `manyforge.composable_cell.e1.external_delta_ledger.v1`
+  → `manyforge.external_delta_ledger.v1`;
+  `manyforge.composable_cell_i2.binding_api_inventory.v1` →
+  `manyforge.binding_api_inventory.v1`;
+  `manyforge.composable_cell_i2.direct_binding_case.v1` →
+  `manyforge.direct_binding_case.v1`;
+  `manyforge.i3.retained-consumer-fixture.v3` →
+  `manyforge.retained-consumer-fixture.v3`;
+  `manyforge.i6.native-execution-fixture.v2` →
+  `manyforge.native-execution-fixture.v2`;
+  `manyforge.i6.retained_model_lookup_perf.v1` →
+  `manyforge.retained_model_lookup_perf.v1`; build manifest key
+  `i3_retention_subset` → `retention_subset`; planner portability mapping
+  `implementation_changes_in_rp5_6` → `implementation_changes` and status
+  `temporarily_unavailable_composable_cell_rebuild` →
+  `temporarily_unavailable_runtime_rebuild`; ledger source ids
+  `roboplan_0_7_0_ua1_foundation` → `roboplan_0_7_0_foundation`,
+  `toppra_0_6_10_ua1_dependency` → `toppra_0_6_10_dependency`,
+  `xarm_composable_cell_current` → `xarm_current`.
+- **Canonical-empty cell:** the cell id `c1_build_authority_cell` (also the
+  development workbench's cell and `canonical-empty-admission.<cell>.json`) is
+  `canonical_empty_cell`, and
+  `manyforge_deployment/resources/canonical_empty/c1_build_authority.deployment.json`
+  is `canonical_empty_cell.deployment.json`.
+- **Scripts:** `scripts/lib/composable-cell-runtime-availability.sh` is
+  `scripts/lib/runtime-availability.sh` (`manyforge_fail_runtime_unavailable`,
+  `MANYFORGE_RUNTIME_UNAVAILABLE_REASON_CODE`,
+  `MANYFORGE_RUNTIME_UNAVAILABLE_MESSAGE`).
 
 ### Fixed
 

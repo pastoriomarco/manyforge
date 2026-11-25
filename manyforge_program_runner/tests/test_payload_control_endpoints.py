@@ -1,13 +1,11 @@
-"""Program Runner HTTP control boundaries preserve release ordering."""
+"""Program Runner control commands preserve release ordering."""
 import hashlib
 
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 
-from manyforge_program_runner.app import create_app
-
+from .test_app import _served
 from .test_failure_release_revision import _RUN, _publish, harness
 from .test_runtime import _join_command_threads
 
@@ -24,16 +22,9 @@ def _key(*parts) -> str:
     return _kb(*parts).hex()
 
 
-@pytest.mark.parametrize(
-    ("route", "method"),
-    [
-        ("motion-start", "start_motion"),
-        ("motion-resume", "resume_motion"),
-        ("resume-halt", "resume_halt"),
-    ],
-)
-def test_motion_endpoint_refreshes_tcp_before_release(
-    harness, monkeypatch, route, method
+@pytest.mark.parametrize("method", ["start_motion", "resume_motion", "resume_halt"])
+def test_motion_command_refreshes_tcp_before_release(
+    harness, monkeypatch, tmp_path, method
 ) -> None:
     run = harness()
     if method == "resume_halt":
@@ -71,11 +62,10 @@ def test_motion_endpoint_refreshes_tcp_before_release(
         request.update(expected_run_revision=run.owner.read(_RUN).run_revision)
     else:
         request.update(expected_hold_revision=0, group_ids=["robot_group"])
-    with TestClient(create_app(run.runtime)) as client:
-        accepted = client.post(f"/api/program/runs/{_RUN}/{route}", json=request)
-        assert accepted.status_code == 200
+    with _served(run.runtime, tmp_path) as client:
+        accepted = client.value(method, {"program_run_id": _RUN, "body": request})
         # OD-214: answered at acceptance; the command runs on to its end.
-        assert accepted.json()["command"]["accepted_at_ns"] is not None
+        assert accepted["command"]["accepted_at_ns"] is not None
         _join_command_threads()
         assert calls == ["tcp", "release"]
         assert run.runtime.cycle_status()["runner_commands"]["ended"][0]["end"][
@@ -83,8 +73,8 @@ def test_motion_endpoint_refreshes_tcp_before_release(
 
 
 @pytest.mark.parametrize("action", ["continue_with_failure", "retry_runtime_step"])
-def test_recovery_endpoint_preserves_release_order(
-    harness, monkeypatch, action
+def test_recovery_command_preserves_release_order(
+    harness, monkeypatch, tmp_path, action
 ) -> None:
     run = harness()
     run.offer["actions"] = [{"action_id": action, "enabled": True}]
@@ -119,11 +109,10 @@ def test_recovery_endpoint_preserves_release_order(
         "offer_revision": run.offer["offer_revision"],
         "action_id": action,
     }
-    with TestClient(create_app(run.runtime)) as client:
-        accepted = client.post("/api/cycle/recovery-actions", json=request)
-        assert accepted.status_code == 200
+    with _served(run.runtime, tmp_path) as client:
+        accepted = client.value("apply_recovery_action", request)
         # OD-214: answered at acceptance; the command runs on to its end.
-        assert accepted.json()["command"]["accepted_at_ns"] is not None
+        assert accepted["command"]["accepted_at_ns"] is not None
         _join_command_threads()
         assert calls == ["release", "tcp", "resume"]
         assert run.effects == [1]

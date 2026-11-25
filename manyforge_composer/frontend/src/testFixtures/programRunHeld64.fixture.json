@@ -1,5 +1,7 @@
 {
-  "schema_version": "manyforge.program_run_status.v5",
+  "schema_version": "manyforge.program_run_status.v6",
+  "node_running_since_utc_ns": {},
+  "node_wait_values": {},
   "owner_id": "program-runner.development-workbench",
   "run_revision": 3,
   "state": "running",

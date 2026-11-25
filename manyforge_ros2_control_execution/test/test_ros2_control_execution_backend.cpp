@@ -2187,10 +2187,14 @@ TEST(JtcExecutionPort,
     ASSERT_TRUE(rig.accepted(key(1)));
     auto result = std::make_shared<Action::Result>();
     result->error_code = code;
+    result->error_string = "joint_2 path tolerance";
     rig.handle()->abort(result);
     ASSERT_TRUE(wait_until(
         [&] { return rig.adapter->ReadGoal(key(1))->result == expected; }));
     EXPECT_FALSE(rig.adapter->ReadGoal(key(1))->preempted_by);
+    // The controller's own text is kept for the typed error's details.
+    EXPECT_EQ(rig.adapter->ReadGoal(key(1))->controller_error_text,
+              std::optional<std::string>("joint_2 path tolerance"));
   }
 }
 

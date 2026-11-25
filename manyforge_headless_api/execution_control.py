@@ -8,6 +8,7 @@ to hand a recognized Stop request to its existing reserved owner path.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import itertools
 import threading
 import time
@@ -150,8 +151,11 @@ class _BoundedLane:
             if on_admitted is not None:
                 on_admitted()
             executor = self._executor_for_submit()
+            # The request's context (request id, transport) travels with the
+            # command, so its outbound calls and History records carry it.
             future = asyncio.get_running_loop().run_in_executor(
                 executor,
+                contextvars.copy_context().run,
                 self._invoke,
                 callback,
             )

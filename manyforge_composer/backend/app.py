@@ -19,6 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from manyforge_headless_api.client import (
+    REQUEST_ID_HEADER,
+    TRANSPORT_HEADER,
+    outbound_headers,
+)
 from manyforge_headless_api.execution_control import ExecutionControlClient
 from manyforge_headless_api.request_validation import request_validation_detail
 
@@ -100,7 +105,6 @@ _UNAVAILABLE_PAYLOAD = UnavailableResponse(
     detail=UnavailableDetail(
         code=RUNTIME_UNAVAILABLE_REASON_CODE,
         message=RUNTIME_UNAVAILABLE_MESSAGE,
-        restoration_gates=["N7", "L0", "P5", "I", "R", "T"],
     )
 ).detail.model_dump(by_alias=True)
 
@@ -394,6 +398,12 @@ def create_app(
         request_id = incoming_id or uuid.uuid4().hex[:16]
         request.state.request_id = request_id
         started_at = time.monotonic()
+        # Headless calls made while serving this request carry its id (and
+        # the MCP adapter's mark), so one command is followed across both.
+        forwarded = {REQUEST_ID_HEADER: request_id}
+        if request.headers.get(TRANSPORT_HEADER) == "mcp":
+            forwarded[TRANSPORT_HEADER] = "mcp"
+        headers_token = outbound_headers.set(forwarded)
         try:
             response: Response = await call_next(request)
         except (HTTPException, StarletteHTTPException) as exc:
@@ -422,6 +432,8 @@ def create_app(
                     "request_id": request_id,
                 },
             )
+        finally:
+            outbound_headers.reset(headers_token)
         duration_ms = (time.monotonic() - started_at) * 1000.0
         error_code = None
         error_details = None
@@ -529,7 +541,6 @@ def create_app(
                     "runtimeAvailability": {
                         "code": error.code,
                         "message": str(error),
-                        "restorationGates": [],
                     },
                     "timestamp": time.time(),
                 }

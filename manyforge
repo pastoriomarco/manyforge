@@ -9,6 +9,8 @@
 #
 #   ./manyforge run [--project <folder>] [<image reference> | sha256:<digest>]
 #   ./manyforge status | stop | logs [<docker logs option>...]
+#   ./manyforge collect [--start <application start id> | --last] [--out <file.tar.gz>] [--max-bytes <bytes>]
+#   ./manyforge collect --list
 set -euo pipefail
 kit="$(cd "$(dirname "$0")" && pwd)"
 launcher="$kit/scripts/compose-dev.sh"
@@ -32,9 +34,9 @@ export MANYFORGE_DEV_CACHE_BASE="${MANYFORGE_DEV_CACHE_BASE:-$kit/.manyforge}"
 export MANYFORGE_DEV_DISPLAY_NAME=ManyForge
 
 case "${1:-}" in
-  run | status | stop | logs) exec "$launcher" "$@" ;;
+  run | status | stop | logs | collect) exec "$launcher" "$@" ;;
   *)
-    echo "Usage: $0 run [--project <scenario-project-folder>] [<image reference> | sha256:<digest>] | status | stop | logs [<docker logs option>...]" >&2
+    echo "Usage: $0 run [--project <scenario-project-folder>] [<image reference> | sha256:<digest>] | status | stop | logs [<docker logs option>...] | collect [--start <application start id> | --last] [--out <file.tar.gz>] [--max-bytes <bytes>] | collect --list" >&2
     exit 64
     ;;
 esac

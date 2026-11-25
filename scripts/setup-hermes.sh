@@ -21,7 +21,7 @@
 set -euo pipefail
 
 _manyforge_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=lib/composable-cell-runtime-availability.sh
-source "${_manyforge_script_dir}/lib/composable-cell-runtime-availability.sh"
-MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_COMPOSABLE_CELL_RUNTIME_UNAVAILABLE_REASON_CODE}: Hermes setup returns with the qualified headless assistant and MCP clients."
-manyforge_fail_composable_cell_runtime_unavailable
+# shellcheck source=lib/runtime-availability.sh
+source "${_manyforge_script_dir}/lib/runtime-availability.sh"
+MANYFORGE_RUNTIME_UNAVAILABLE_MESSAGE="${MANYFORGE_RUNTIME_UNAVAILABLE_REASON_CODE}: Hermes setup returns with the qualified headless assistant and MCP clients."
+manyforge_fail_runtime_unavailable

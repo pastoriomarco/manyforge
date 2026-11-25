@@ -19,12 +19,20 @@ struct ComponentProcessCommand final {
   std::vector<std::string> arguments;
 };
 
-/// One running component process; destroying it stops the process.
+/// One running component process. Its owner stops it with `stop()` on the
+/// thread that replaces or ends it; dropping a copy (e.g. a State() reader's)
+/// then only releases it. Destroying one that was never stopped stops it.
 class IComponentProcess {
  public:
   virtual ~IComponentProcess() = default;
+  /// Stops the process gracefully, with the supervisor's existing grace.
+  /// Idempotent: returns at once when it was already stopped.
+  virtual void stop() = 0;
   /// The exit reason once the process has exited; empty while it runs.
   [[nodiscard]] virtual std::optional<std::string> exited() = 0;
+  /// The last lines of its retained output for a fault's `output_tail`
+  /// (bounded, memory only); empty when none.
+  [[nodiscard]] virtual std::string output_tail() const = 0;
 };
 
 /// Starts the process; throws `std::runtime_error` when it can't start.

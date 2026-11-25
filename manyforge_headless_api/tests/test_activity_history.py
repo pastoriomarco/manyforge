@@ -258,7 +258,7 @@ def test_an_apply_outcome_is_recorded_with_its_rows() -> None:
 def _reset_facts(**changes: Any) -> dict[str, Any]:
     return {
         "reload_initial_scene": True, "reset_robot_position": False,
-        "program_run_id": 7, "program_revision": "sha256:" + "1" * 64,
+        "reset_stored_values": False, "program_run_id": 7, "program_revision": "sha256:" + "1" * 64,
         "applied_record_digest": "sha256:" + "2" * 64,
         "scene_revision_id": 10, "scene_content_hash": "sha256:" + "3" * 64,
         "cause_code": None, **changes,
@@ -275,10 +275,10 @@ def test_a_program_reset_record_names_its_options_and_scene_revision() -> None:
     refused = program_reset_record(
         "refused", {"code": "authoring_not_ready", "message": "not ready"},
         _reset_facts(program_run_id=None, scene_revision_id=None, scene_content_hash=None,
-                     reset_robot_position=True))
+                     reset_robot_position=True, reset_stored_values=True))
     assert refused["message"] == (
         "Program reset refused: authoring_not_ready: not ready"
-        " · reload initial scene · reset robot position")
+        " · reload initial scene · reset robot position · reset stored values")
 
 
 def test_a_program_reset_outcome_is_recorded_through_the_route() -> None:
@@ -299,8 +299,13 @@ def test_a_program_reset_outcome_is_recorded_through_the_route() -> None:
                                          "reset": _reset_facts(scene_revision_id=0)})
         no_facts = client.post("/api/execution/history/program-reset-outcomes",
                                json={"outcome": "succeeded"})
+        facts = _reset_facts()
+        del facts["reset_stored_values"]
+        no_option = client.post("/api/execution/history/program-reset-outcomes",
+                                json={"outcome": "succeeded", "reset": facts})
     assert response.status_code == 200 and response.json() == {"recorded": True}
-    assert {bad_outcome.status_code, bad_revision.status_code, no_facts.status_code} == {422}
+    assert {bad_outcome.status_code, bad_revision.status_code, no_facts.status_code,
+            no_option.status_code} == {422}
     [record] = core.activity
     assert record["kind"] == "program_reset" and record["outcome"] == "failed"
     assert record["error"] == {"code": "program_cycle_recovery_required",
@@ -309,6 +314,69 @@ def test_a_program_reset_outcome_is_recorded_through_the_route() -> None:
     assert record["reset"]["scene_revision_id"] is None
     assert record["message"].startswith(
         "Program reset failed: program_cycle_recovery_required: scene owner lost · run 7")
+
+
+# Program Runner scene changes outside a node (OD-375) ----------------------------
+
+
+def _runner_scene_change(**changes: Any) -> dict[str, Any]:
+    return {
+        "application_start_id": _APPLICATION_START_ID,
+        "operation_kind": "remove_object", "outcome": "succeeded", "error": None,
+        "scene_change": {"scene_resource_id": "part.1",
+                         "source_label": "manyforge.behavior.program_scene",
+                         "duration_ms": 2.5, "scene_revision_id": 4},
+        **changes,
+    }
+
+
+def test_a_runner_scene_change_is_recorded_as_its_scene_route_recorded_it() -> None:
+    core = _ActivityCore()
+    service = _service(core, FakeManager(), _ModelExecution(_reply()),
+                       program_runner=FakeProgramRunner(active=False))
+    refused_error = {"code": "missing_reference", "message": "carrier unavailable",
+                     "details": {"reason": "carrier"}}
+    detach = {"scene_resource_id": None, "source_label": "manyforge.behavior.program_scene",
+              "duration_ms": 1.0, "scene_revision_id": None}
+    invalid = [
+        _runner_scene_change(outcome="accepted"),
+        _runner_scene_change(operation_kind="scene_clear"),
+        _runner_scene_change(scene_change={**detach, "duration_ms": -1.0}),
+        _runner_scene_change(scene_change={**detach, "scene_revision_id": 0}),
+        _runner_scene_change(scene_change={**detach, "principal_id": "operator.7"}),
+        _runner_scene_change(error={"code": ""}),
+        {**_runner_scene_change(), "extra": 1},
+    ]
+    with TestClient(create_app(service=service)) as client:
+        succeeded = client.post("/api/execution/history/scene-changes",
+                                json=_runner_scene_change())
+        refused = client.post("/api/execution/history/scene-changes", json=_runner_scene_change(
+            operation_kind="detach_carried_object", outcome="refused", error=refused_error,
+            scene_change=detach))
+        bad = [client.post("/api/execution/history/scene-changes", json=body) for body in invalid]
+        no_start = client.post("/api/execution/history/scene-changes",
+                               json=_runner_scene_change(application_start_id=None))
+        other_start = client.post("/api/execution/history/scene-changes",
+                                  json=_runner_scene_change(application_start_id="0bad0000000000b2"))
+    assert succeeded.status_code == 200 and succeeded.json() == {"recorded": True}
+    assert refused.status_code == 200
+    assert {response.status_code for response in bad} == {422}
+    assert no_start.json()["detail"]["code"] == "start_identity_required"
+    assert other_start.json()["detail"]["code"] == "stale_application_start_id"
+    # The same records Headless's scene route wrote for these commits, each
+    # naming its caller: the runner's request and its source label.
+    callers = [record.pop("caller") for record in core.activity]
+    assert [{name: value for name, value in named.items() if name != "request_id"}
+            for named in callers] == [
+        {"transport": "http", "source_label": "manyforge.behavior.program_scene"}] * 2
+    assert all(named["request_id"] for named in callers)
+    assert core.activity == [
+        scene_change_record("remove_object", "succeeded", None, {
+            "scene_resource_id": "part.1", "source_label": "manyforge.behavior.program_scene",
+            "principal_id": None, "duration_ms": 2.5, "scene_revision_id": 4}),
+        scene_change_record("detach_carried_object", "refused", refused_error,
+                            {**detach, "principal_id": None}),
+    ]
 
 
 # Program node attempts from the Program Runner (OD-375) ---------------------------
@@ -366,7 +434,7 @@ def test_node_attempts_are_recorded_one_event_each_through_the_route() -> None:
     service = _service(core, FakeManager(), _ModelExecution(_reply()),
                        program_runner=FakeProgramRunner(active=False))
     batch = {
-        "schema_version": "manyforge.program_node_attempt_batch.v1",
+        "schema_version": "manyforge.program_node_attempt_batch.v2",
         "application_start_id": _APPLICATION_START_ID,
         "attempts": [
             _attempt(duration_ms=0),
@@ -422,7 +490,7 @@ def test_a_lost_node_attempt_line_is_not_counted_and_never_fails_the_route() -> 
                        program_runner=FakeProgramRunner(active=False))
     with TestClient(create_app(service=service)) as client:
         response = client.post("/api/program/node-attempts", json={
-            "schema_version": "manyforge.program_node_attempt_batch.v1",
+            "schema_version": "manyforge.program_node_attempt_batch.v2",
             "application_start_id": _APPLICATION_START_ID, "attempts": [_attempt()]})
     assert response.status_code == 200 and response.json()["recorded"] == 0
 

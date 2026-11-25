@@ -122,6 +122,21 @@ def test_removed_exact_occurrence_requires_successful_docker_authority(state, mo
     assert calls[1] == ["docker", "container", "ls", "--all", "--quiet", "--no-trunc"]
 
 
+@pytest.mark.parametrize("captured", [False, True])
+def test_removed_occurrence_warns_once_when_its_console_was_not_captured(state, monkeypatch, capsys, captured):
+    root, descriptor, _ = selected_docker(state)
+    # A partial capture or another container's capture is not this console.
+    for name, identity in (("20261124T000000Z.partial", "a" * 64), ("20261124T000001Z", "b" * 64),
+                           *((("20261124T000002Z", "a" * 64),) if captured else ())):
+        (root / "evidence" / name).mkdir(parents=True)
+        (root / "evidence" / name / "docker-inspect.json").write_text(json.dumps({"container_id": identity}))
+    monkeypatch.setattr(sessions.subprocess, "run", lambda command, **_k:
+        SimpleNamespace(returncode=1 if command[1] == "inspect" else 0, stdout=""))
+    sessions.prepare_docker_session(root, uuid.uuid4().hex, lock_fd=descriptor)
+    warning = f"WARNING ManyForge previous container {'a' * 64} was removed without console evidence\n"
+    assert capsys.readouterr().err == ("" if captured else warning)
+
+
 def test_unbound_docker_crash_is_preserved(state, monkeypatch):
     root, descriptor = state
     marker = sessions.prepare_session(root, uuid.uuid4().hex, lock_fd=descriptor,
@@ -191,3 +206,94 @@ def test_direct_fresh_and_clean_closed_starts_remain_supported(state):
         assert successor.marker["previous_session"]["shutdown"] == "clean"
     finally:
         successor.close()
+
+
+def older_marker(state, *, container_id: str | None = "a" * 64):
+    """A stopped, clean session of the earlier marker format (an older build)."""
+    root, descriptor, marker = selected_docker(state)
+    path = root / "current/session.json"
+    older = json.loads(path.read_text())
+    del older["application_end"], older["manager_exit"]
+    older.update(schema_version="manyforge.workbench_session.v2", disposition="stopped",
+                 shutdown="clean", process_boundary={"kind": "docker", "container_id": container_id})
+    path.write_text(json.dumps(older))
+    return root, descriptor, marker
+
+
+def docker(row: dict | None, running_labelled: str = ""):
+    """inspect answers ``row`` (None: no such container); ls and ps answer."""
+    def run(command, **_kwargs):
+        if command[1] == "inspect":
+            return SimpleNamespace(returncode=1, stdout="") if row is None else SimpleNamespace(
+                returncode=0, stdout=json.dumps(row))
+        if command[1] == "ps":
+            return SimpleNamespace(returncode=0, stdout=running_labelled)
+        return SimpleNamespace(returncode=0, stdout="")
+    return run
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_a_stopped_session_of_an_older_build_is_archived_and_the_start_proceeds(state, monkeypatch, capsys, removed):
+    root, descriptor, marker = older_marker(state)
+    monkeypatch.setattr(sessions.subprocess, "run",
+                        docker(None if removed else stopped_row(root, marker)))
+    identity = uuid.uuid4().hex
+    current = sessions.prepare_docker_session(root, identity, lock_fd=descriptor)
+    assert current["session_id"] == identity
+    assert sessions._marker(root / "current")["session_id"] == identity
+    archive = current["previous_session"]["archive_relative_path"]
+    assert (root / archive / "session.json").is_file()
+    # The report names the same older marker format and archive as the line.
+    assert current["previous_session"]["archived_older_marker"] == "manyforge.workbench_session.v2"
+    assert f"was archived to {archive} at the upgrade." in current["previous_session"]["message"]
+    line = capsys.readouterr().err.splitlines()[-1]
+    assert line == ("ManyForge archived the previous session (marker manyforge.workbench_session.v2, "
+                    f"an older build) to {root / archive}")
+
+
+def test_an_older_session_without_a_bound_container_is_archived_when_none_of_its_containers_runs(state, monkeypatch):
+    root, descriptor, _ = older_marker(state, container_id=None)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return docker(None)(command, **kwargs)
+
+    monkeypatch.setattr(sessions.subprocess, "run", run)
+    sessions.prepare_docker_session(root, uuid.uuid4().hex, lock_fd=descriptor)
+    assert [command[1] for command in calls] == ["ps"]
+
+
+@pytest.mark.parametrize("live", ["running_container", "running_labelled", "docker_unavailable"])
+def test_an_older_session_that_may_still_run_is_refused_with_guidance(state, monkeypatch, capsys, live):
+    root, descriptor, marker = older_marker(state)
+    row = stopped_row(root, marker)
+    if live == "running_container":
+        row["State"].update(Status="running", Running=True)
+        run = docker(row)
+    elif live == "running_labelled":
+        run = docker(row, running_labelled="c" * 64 + "\n")
+    else:
+        run = lambda command, **_k: SimpleNamespace(returncode=1, stdout="")  # noqa: E731
+    monkeypatch.setattr(sessions.subprocess, "run", run)
+    before = (root / "current/session.json").read_bytes()
+    with pytest.raises(sessions.SessionMarkerOutdated) as refused:
+        sessions.prepare_docker_session(root, uuid.uuid4().hex, lock_fd=descriptor)
+    message = str(refused.value)
+    assert "manyforge.workbench_session.v2 (an older build)" in message
+    assert "stop it with the build that started it" in message
+    assert (root / "current/session.json").read_bytes() == before
+    assert not (root / "previous-runs").exists() or not any((root / "previous-runs").iterdir())
+    monkeypatch.setattr("sys.argv", ["workbench_session.py", str(root), "--session-id",
+                                     uuid.uuid4().hex, "--lock-fd", str(descriptor)])
+    assert sessions.main() == 69
+    assert capsys.readouterr().err.startswith("development_workbench_session_marker_outdated: ")
+
+
+def test_an_unreadable_marker_keeps_the_proof_refusal(state, monkeypatch):
+    root, descriptor, _ = selected_docker(state)
+    (root / "current/session.json").write_text("{}")
+    monkeypatch.setattr(sessions.subprocess, "run", lambda *_a, **_k: pytest.fail("no Docker question"))
+    with pytest.raises(ValueError, match="no exact stopped process-set proof") as refused:
+        sessions.prepare_docker_session(root, uuid.uuid4().hex, lock_fd=descriptor)
+    assert not isinstance(refused.value, sessions.SessionMarkerOutdated)

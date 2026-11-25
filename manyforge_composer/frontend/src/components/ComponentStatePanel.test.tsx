@@ -4,7 +4,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { reactPropsHost } from '../test/reactPropsHost';
 import type { ComponentState } from '../types/components';
-import { CellComponentsCard, ComponentStatePanel } from './ComponentStatePanel';
+import { CellComponentsCard, ComponentStatePanel, requestErrorText } from './ComponentStatePanel';
+import { ApiError } from '../api/client';
 
 const api = vi.hoisted(() => ({
   action: vi.fn(),
@@ -61,10 +62,25 @@ describe('ComponentStatePanel', () => {
         vendor_code: 'C31', vendor_text: 'Abnormal current', since_ns: 1 },
     })} />);
     expect(html).toContain('Robot stopped itself');
+    // The typed code beside the catalogue text, so the operator can quote it.
+    expect(html).toContain('<strong>Robot stopped itself (fault_protective_stop)</strong>');
     expect(html).toContain('Check for an obstruction, then Recover.');
     expect(html).toContain('Operator action: Recover');
     expect(html).toContain('Vendor: C31 · Abnormal current');
     expect(html).toContain('status-error');
+  });
+
+  it('shows when a fault began and a launch fault\'s output tail, collapsed with Copy', () => {
+    const html = renderToStaticMarkup(<ComponentStatePanel enabled state={state({
+      lifecycle: 'fault',
+      fault: { code: 'fault_process_exited', message: 'exited', clearable: true, operator_action: 'recover',
+        since_ns: 1, since_utc_ns: '1795514400123000000', output_tail: 'line 1\nValueError: bad <config>' },
+    })} />);
+    expect(html).toContain('since 2026-11-24 10:00:00.123 UTC (');
+    expect(html).toContain('<details class="process-output-tail"><summary>Process output (last lines)</summary>');
+    expect(html).toContain('<pre>line 1\nValueError: bad &lt;config&gt;</pre>');
+    expect(html).toContain('>Copy</button>');
+    expect(html).not.toContain('<details class="process-output-tail" open');
   });
 
   it('shows reason, action in progress and the last result; buttons wait for the action', () => {
@@ -97,6 +113,16 @@ describe('ComponentStatePanel', () => {
       expect(find((props) => props.type === 'button' && props.children === 'Enable').disabled).toBe(false);
     } finally { await act(() => root.unmount()); }
   });
+});
+
+it('names a refused component request by its catalogue text and its typed code', () => {
+  expect(requestErrorText(new ApiError('C31', 409, { detail: { code: 'fault_protective_stop', message: 'C31' } })))
+    .toBe('Robot stopped itself (fault_protective_stop)');
+  // Without a catalogue row the message stands for the text; a code-only text is not repeated.
+  expect(requestErrorText(new ApiError('owner busy', 409, { detail: { code: 'x_busy', message: 'owner busy' } })))
+    .toBe('owner busy (x_busy)');
+  expect(requestErrorText(new ApiError('x_busy', 409, { detail: { code: 'x_busy', message: '' } }))).toBe('x_busy');
+  expect(requestErrorText(new Error('busy'))).toBe('busy');
 });
 
 describe('ComponentStatePanel in a machine', () => {

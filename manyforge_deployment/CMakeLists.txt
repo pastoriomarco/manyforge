@@ -451,7 +451,7 @@ configure_file(
 
 set(
   MANYFORGE_CANONICAL_EMPTY_DEPLOYMENT
-  "${CMAKE_CURRENT_SOURCE_DIR}/resources/canonical_empty/c1_build_authority.deployment.json")
+  "${CMAKE_CURRENT_SOURCE_DIR}/resources/canonical_empty/canonical_empty_cell.deployment.json")
 file(READ
   "${MANYFORGE_CANONICAL_EMPTY_DEPLOYMENT}"
   MANYFORGE_EMBEDDED_CANONICAL_EMPTY_DEPLOYMENT)

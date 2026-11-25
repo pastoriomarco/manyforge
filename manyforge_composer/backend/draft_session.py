@@ -1321,7 +1321,6 @@ class ComposerDraftSession:
                         if self._diagnostics
                         else "Program Draft has no strict candidate"
                     ),
-                    "restorationGates": [],
                 },
             }
         )
@@ -1338,7 +1337,6 @@ class ComposerDraftSession:
             "message": (
                 "authoritative Program Apply requires a configured Headless owner"
             ),
-            "restorationGates": [],
         }
         return {
             "schemaVersion": _WORKSPACE_API_VERSION,

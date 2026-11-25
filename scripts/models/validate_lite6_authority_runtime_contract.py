@@ -48,7 +48,7 @@ HISTORICAL_SOURCE_BLOB: Final = (
     "b228171c782c0b9a81c9d3683ab5edf6fbd5fd92"
 )
 LEGACY_DEPLOYMENT_AUTHORITY_UNAVAILABLE_REASON_CODE: Final = (
-    "composable_cell_lite6_deployment_authority_unavailable"
+    "lite6_deployment_authority_unavailable"
 )
 _MAX_ARTIFACT_BYTES: Final = 4 * 1024 * 1024
 STATIC_ARTIFACT_MODE: Final = "static-artifacts"

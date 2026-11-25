@@ -19,7 +19,7 @@ from itertools import islice
 from typing import Any, Iterable, Sequence
 
 
-UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: live Isaac controlled-stop qualification "
     "is not available yet"

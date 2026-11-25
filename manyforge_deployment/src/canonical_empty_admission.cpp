@@ -28,7 +28,7 @@ namespace {
 
 namespace posix = detail::posix_durability;
 
-constexpr std::string_view kCanonicalCellId = "c1_build_authority_cell";
+constexpr std::string_view kCanonicalCellId = "canonical_empty_cell";
 constexpr std::string_view kAdmissionFilename =
     "canonical-empty-admission.json";
 constexpr std::string_view kZeroDigest =

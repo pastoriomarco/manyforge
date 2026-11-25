@@ -64,6 +64,7 @@ import {
   parseRuntimeScaleControlStatus,
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentExportResponse,
+  parseScenarioUpgradeResponse,
   parseScenarioDocumentSaveResponse,
   parseSceneTransactionResponse,
   parseSceneMeshAssetMetadata,
@@ -126,6 +127,7 @@ import type {
   ScenarioDocumentFenceRequest,
   ScenarioDocumentExportResponse,
   ScenarioDocumentIndexResponse,
+  ScenarioUpgradeResponse,
   ScenarioDocumentSaveResponse,
   SceneTransactionRequest,
   SceneTransactionResponse,
@@ -184,9 +186,13 @@ export interface HistorianListQuery {
   applicationStartId?: ApplicationStartId;
   actionSpanId?: string;
   nodeInstanceId?: string;
+  /** A node attempt number of the named (else the current) start. */
+  nodeAttemptId?: number;
+  /** A Stop: its number, display form (`3f9a/stop4`) or full form. */
+  stopEventId?: string;
   interventionSessionId?: string;
-  /** Id of the collision rule the events name (`collision_rule_id`). */
-  collisionRuleId?: string;
+  /** Id of the collision or global rule the events name (`rule_id`). */
+  ruleId?: string;
   incidentId?: string;
   conditionId?: string;
   channel?: string;
@@ -229,7 +235,8 @@ export function historianListPath(query: HistorianListQuery = {}): string {
     ['recent_seconds', query.recentSeconds], ['clock_owner', query.clockOwner],
     ['program_run_id', query.programRunId], ['operation_id', query.operationId],
     ['action_span_id', query.actionSpanId], ['node_instance_id', query.nodeInstanceId],
-    ['intervention_session_id', query.interventionSessionId], ['collision_rule_id', query.collisionRuleId],
+    ['node_attempt_id', query.nodeAttemptId], ['stop_event_id', query.stopEventId],
+    ['intervention_session_id', query.interventionSessionId], ['rule_id', query.ruleId],
     ['incident_id', query.incidentId], ['condition_id', query.conditionId],
     ['channel', query.channel],
     ['alarm_phase', query.alarmPhase], ['search', query.search],
@@ -1032,6 +1039,16 @@ export const api = {
         body: JSON.stringify({ ...fence, destinationPath }),
       },
     ),
+    /** Which older-format conversions an upgrade would apply (writes nothing). */
+    upgradeCheck: (path: string, signal?: AbortSignal): Promise<ScenarioUpgradeResponse> =>
+      requestJson(
+        `/api/scenario-documents/upgrade?path=${encodeURIComponent(path)}`,
+        parseScenarioUpgradeResponse,
+        signal,
+      ),
+    /** Upgrade the Scenario folder in place, keeping the original as its backup. */
+    upgrade: (path: string): Promise<ScenarioUpgradeResponse> =>
+      sendKeyedCommand('/api/scenario-documents/upgrade', { path }, parseScenarioUpgradeResponse),
   },
   deploymentWorkspace: {
     assistantProfiles: (signal?: AbortSignal): Promise<AssistantProfiles> =>

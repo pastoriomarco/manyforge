@@ -15,6 +15,7 @@ from manyforge_behavior.production_ports import NativeKernelProgramPort
 from .test_executable_node_runtime import _leaf_node, _set_tcp_stop_run
 from .test_production_ports import _context, _Transport
 from .v3_fixtures import frame, target, target_binding
+from .gateway_fakes import transport_gateway
 
 
 def _ur5_context():
@@ -70,7 +71,7 @@ def test_stop_while_a_sent_set_tcp_step_is_blocked_completes_it_then_obeys_polic
 
     transport = BlockingSubmit()
     port = NativeKernelProgramPort(
-        KernelClient(transport),
+        KernelClient(transport_gateway(transport)),
         active_tcp_result=lambda run, robot, value: confirmed.append((run, robot, deepcopy(value))),
     )
     port.bind(_ur5_context())
@@ -125,7 +126,7 @@ def test_forced_end_while_a_set_tcp_step_is_sent_waits_for_its_real_result():
                 "registration_generation": 1, "sequence": 1}]}
 
     transport = BlockingSubmit()
-    port = NativeKernelProgramPort(KernelClient(transport), active_tcp_result=lambda *args: True)
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)), active_tcp_result=lambda *args: True)
     port.bind(_ur5_context())
     run = _set_tcp_stop_run(policy="hold", task=port.operations)
     try:

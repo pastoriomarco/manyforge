@@ -239,6 +239,6 @@ def test_snapshot_route_requires_a_headless_runtime_client() -> None:
 
     with pytest.raises(
         SnapshotClientUnavailableError,
-        match="composable_cell_snapshot_client_unavailable",
+        match="snapshot_client_unavailable",
     ):
         create_snapshot_router(MissingState(), SecurityConfig())  # type: ignore[arg-type]

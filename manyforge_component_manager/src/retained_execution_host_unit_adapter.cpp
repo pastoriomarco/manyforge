@@ -6,6 +6,8 @@
 #include "native_projection_rpc_internal.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
 #include "manyforge_component_manager/execution_host_exit.hpp"
+#include "manyforge_component_manager/site_settings.hpp"
+#include <manyforge_core/process_diagnostics.hpp>
 #include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
@@ -16,6 +18,7 @@
 #include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -67,6 +70,9 @@ extern char **environ;
 namespace manyforge::component_manager {
 namespace {
 
+using manyforge::core::LogLine;
+using manyforge::core::LogSeverity;
+using manyforge::core::LogText;
 using manyforge::core::RuntimeEpoch;
 using manyforge::deployment::RetainedBundle;
 
@@ -605,11 +611,12 @@ void ReportSlowExchange(const std::string_view command, const pid_t pid,
   }
   const auto start_us = std::chrono::duration_cast<std::chrono::microseconds>(start.time_since_epoch()).count();
   const auto end_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
-  std::fprintf(stderr, "kernel rpc timing: command=%.*s pid=%ld id_type=%.*s id=%s start_us=%lld end_us=%lld elapsed_us=%lld\n",
-               static_cast<int>(command.size()), command.data(),
-               static_cast<long>(pid), static_cast<int>(id_type.size()), id_type.data(),
-               length ? id : "none", static_cast<long long>(start_us),
-               static_cast<long long>(end_us), static_cast<long long>(us));
+  LogLine(LogSeverity::kWarning, LogText("kernel rpc timing: command=", command, " pid=",
+                      static_cast<long>(pid), " id_type=", id_type, " id=",
+                      length ? id : "none", " start_us=",
+                      static_cast<long long>(start_us), " end_us=",
+                      static_cast<long long>(end_us), " elapsed_us=",
+                      static_cast<long long>(us)));
 }
 
 [[nodiscard]] const manyforge::core::RuntimeUnitDTO &
@@ -762,12 +769,24 @@ SameChildProduct(const ExecutionHostUnitAdmission &admission,
                              const int executable_fd, const int package_root_fd,
                              const int program_artifact_root_fd,
                              const int scene_content_root_fd,
+                             const std::uint64_t core_dump_limit_bytes,
                              char *const argv[]) noexcept {
   if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
     ChildExit(error_fd, errno);
   }
   if (::getppid() != expected_parent) {
     ChildExit(error_fd, ECHILD);
+  }
+  // The core-file size limit's soft value is the site's (0, core dumps off,
+  // by default), at most the hard limit, which is kept.
+  struct rlimit core_limit {};
+  if (::getrlimit(RLIMIT_CORE, &core_limit) != 0) {
+    ChildExit(error_fd, errno);
+  }
+  core_limit.rlim_cur =
+      std::min(static_cast<rlim_t>(core_dump_limit_bytes), core_limit.rlim_max);
+  if (::setrlimit(RLIMIT_CORE, &core_limit) != 0) {
+    ChildExit(error_fd, errno);
   }
   const int channel_copy =
       ::fcntl(channel_fd, F_DUPFD_CLOEXEC, kChildHighestReservedFd + 1);
@@ -1019,6 +1038,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
         launch_environment_contracts(
             std::move(selected_launch_environment_contracts)),
         site_settings_document(std::move(site_settings_document)),
+        core_dump_limit_bytes(
+            CoreDumpLimitBytesOfDocument(this->site_settings_document)),
         observer_instance_id("native-observer-" + RandomHex()),
         start_epoch([&] {
           const auto text = FormatApplicationStartId(application_start_id);
@@ -1261,6 +1282,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       return true;
     }
     if (result == child.pid) {
+      host_exit_pid.store(child.pid, std::memory_order_relaxed);
       if (WIFEXITED(status)) {
         child.exit_status = WEXITSTATUS(status);
         host_exit_value.store(WEXITSTATUS(status), std::memory_order_relaxed);
@@ -1270,6 +1292,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       } else if (WIFSIGNALED(status)) {
         host_exit_signaled.store(true, std::memory_order_relaxed);
         host_exit_value.store(WTERMSIG(status), std::memory_order_relaxed);
+        host_exit_core_dumped.store(WCOREDUMP(status) != 0,
+                                    std::memory_order_relaxed);
         host_exited.store(true, std::memory_order_release);
         std::cerr << "execution host child terminated: pid=" << child.pid
                   << " signal=" << WTERMSIG(status) << '\n';
@@ -1365,14 +1389,13 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       channel.status_reply = std::move(*packet);
       channel.status_reply_sequence = pending.sequence;
     } else if (pending.kind == kInspectionKind) {
-      std::cerr << "component inspection late response settled: pid="
-                << host.pid << " epoch=" << host.runtime_epoch.value()
-                << '\n';
+      LogLine(LogSeverity::kInfo, LogText("component inspection late response settled: pid=",
+                          host.pid, " epoch=", host.runtime_epoch.value()));
     } else {
-      std::cerr << (&channel == &host.liveness ? "abandoned liveness"
-                                               : "abandoned exchange")
-                << " reply settled: pid=" << host.pid
-                << " exchange=" << kExchangeKinds[pending.kind] << '\n';
+      LogLine(LogSeverity::kInfo, LogText(&channel == &host.liveness ? "abandoned liveness"
+                                                     : "abandoned exchange",
+                          " reply settled: pid=", host.pid,
+                          " exchange=", kExchangeKinds[pending.kind]));
     }
     channel.pending.reset();
     return true;
@@ -2122,8 +2145,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       // No time limit (OD-270): it ends on its reply, the host's exit or the
       // application's stop; its start and duration are logged.
       const std::string binding_text = provider_binding_id.value();
-      std::cerr << "native projection preparation started: pid=" << child.pid
-                << " binding=" << binding_text << '\n';
+      LogLine(LogSeverity::kInfo, LogText("native projection preparation started: pid=",
+                          child.pid, " binding=", binding_text));
       const auto started = std::chrono::steady_clock::now();
       const auto elapsed_ms = [&] {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2135,16 +2158,16 @@ struct RetainedExecutionHostUnitAdapter::Impl final
           std::unique_lock lock(mutex);
           return ExchangeProjection(lock, host, request);
         } catch (...) {
-          std::cerr << "native projection preparation ended without its "
-                       "reply: pid="
-                    << child.pid << " binding=" << binding_text
-                    << " elapsed_ms=" << elapsed_ms() << '\n';
+          LogLine(LogSeverity::kWarning, LogText("native projection preparation ended without "
+                              "its reply: pid=",
+                              child.pid, " binding=", binding_text,
+                              " elapsed_ms=", elapsed_ms()));
           throw;
         }
       }();
-      std::cerr << "native projection preparation answered: pid=" << child.pid
-                << " binding=" << binding_text
-                << " elapsed_ms=" << elapsed_ms() << '\n';
+      LogLine(LogSeverity::kInfo, LogText("native projection preparation answered: pid=",
+                          child.pid, " binding=", binding_text,
+                          " elapsed_ms=", elapsed_ms()));
       if (const auto *failure =
               std::get_if<detail::NativeProjectionRpcFailure>(&response)) {
         Fail("native projection request failed [" + failure->error.code +
@@ -2213,10 +2236,10 @@ struct RetainedExecutionHostUnitAdapter::Impl final
         // Unknown direct-child ownership is not permission to target a reused
         // PID: this waits until the Manager process itself is ended (only a
         // defect reaches here; a stop request does not end this wait).
-        std::cerr << "shutdown stuck at child-exit-observation: "
-                  << error.what() << '\n';
+        LogLine(LogSeverity::kError, LogText("shutdown stuck at child-exit-observation: ",
+                            error.what()));
       } catch (...) {
-        std::cerr << "shutdown stuck at child-exit-observation\n";
+        LogLine(LogSeverity::kError, "shutdown stuck at child-exit-observation");
       }
       std::this_thread::sleep_for(kStuckStopRetryPause);
     }
@@ -2228,8 +2251,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     if (!child.shutdown_requested) {
       child.shutdown_requested =
           true; // one request, even if delivery is unknown
-      std::cerr << "execution host child shutdown requested: pid=" << child.pid
-                << " epoch=" << child.runtime_epoch.value() << '\n';
+      LogLine(LogSeverity::kInfo, LogText("execution host child shutdown requested: pid=",
+                          child.pid, " epoch=", child.runtime_epoch.value()));
     }
     // No time limit (OD-187 (1)): the host's exit (waitpid) ends the wait;
     // each change of its published phase is logged, so the last line names
@@ -2254,14 +2277,14 @@ struct RetainedExecutionHostUnitAdapter::Impl final
           child.shutdown_sent = TrySendPacket(child.management.fd.get(), "shutdown");
         } catch (const std::exception &error) {
           child.shutdown_sent = true;
-          std::cerr << "native shutdown delivery failed: " << error.what()
-                    << "; requesting existing SIGTERM handler once: pid="
-                    << child.pid << '\n';
+          LogLine(LogSeverity::kWarning, LogText("native shutdown delivery failed: ", error.what(),
+                              "; requesting existing SIGTERM handler once: pid=",
+                              child.pid));
           // Existing handler requests the same host teardown. No automatic
           // total wait/escalation and no signal on a merely delayed reply.
           if (::kill(child.pid, SIGTERM) != 0 && errno != ESRCH)
-            std::cerr << "native shutdown SIGTERM request failed: errno="
-                      << errno << '\n';
+            LogLine(LogSeverity::kError, LogText("native shutdown SIGTERM request failed: errno=",
+                                errno));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
@@ -2275,27 +2298,28 @@ struct RetainedExecutionHostUnitAdapter::Impl final
         const auto &progress = *read;
         if (!last_progress || progress != *last_progress) {
           last_progress = progress;
-          std::cerr << "native shutdown entering/waiting at "
-                    << detail::NativeShutdownPhaseName(progress.phase)
-                    << " pid=" << child.pid
-                    << " epoch=" << progress.runtime_epoch
-                    << " workers_joined=" << progress.completed_workers
-                    << " groups_pending=" << progress.pending_groups << '/'
-                    << progress.total_groups
-                    << " signalled=" << progress.signalled_groups
-                    << " escalated=" << progress.escalated_groups
-                    << " reaped=" << progress.reaped_groups
-                    << " drained=" << progress.drained_groups
-                    << " unknown=" << progress.unknown_groups
-                    << " pending_pid=" << progress.pending_pid << '\n';
+          LogLine(LogSeverity::kInfo,
+                  LogText("native shutdown entering/waiting at ",
+                          detail::NativeShutdownPhaseName(progress.phase),
+                          " pid=", child.pid,
+                          " epoch=", progress.runtime_epoch,
+                          " workers_joined=", progress.completed_workers,
+                          " groups_pending=", progress.pending_groups, '/',
+                          progress.total_groups,
+                          " signalled=", progress.signalled_groups,
+                          " escalated=", progress.escalated_groups,
+                          " reaped=", progress.reaped_groups,
+                          " drained=", progress.drained_groups,
+                          " unknown=", progress.unknown_groups,
+                          " pending_pid=", progress.pending_pid));
         }
         last_observation_error.clear();
       } catch (const std::exception &error) {
         // Responsiveness/transport loss never proves EXIT or authorizes force.
         if (last_observation_error != error.what()) {
           last_observation_error = error.what();
-          std::cerr << "native shutdown progress unavailable: " << error.what()
-                    << '\n';
+          LogLine(LogSeverity::kWarning, LogText("native shutdown progress unavailable: ",
+                              error.what()));
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -2379,7 +2403,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       EnterChild(parent, channels[1].get(), liveness_channels[1].get(),
                  exec_pipe[1].get(), target.get(), selected_package_root_fd,
                  selected_program_artifact_root_fd, activation_root_fd.get(),
-                 argv.data());
+                 core_dump_limit_bytes, argv.data());
     }
 
     channels[1].Reset();
@@ -2395,8 +2419,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       // steps.
       ConfirmExecOrThrow(pid, exec_pipe[0].get(), abandon_fd.get());
       exec_pipe[0].Reset();
-      std::cerr << "execution host launched: pid=" << pid
-                << "; waiting for its readiness\n";
+      LogLine(LogSeverity::kInfo, LogText("execution host launched: pid=", pid,
+                          "; waiting for its readiness"));
       exit_fd.Reset(static_cast<int>(::syscall(SYS_pidfd_open, pid, 0U)));
       if (!exit_fd)
         Fail(ErrnoDetail("could not observe execution host exit", errno));
@@ -2415,7 +2439,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       if (ready != admission.expected_ready_packet(runtime_epoch)) {
         Fail("native execution child returned malformed or foreign readiness");
       }
-      std::cerr << "execution host ready: pid=" << pid << '\n';
+      LogLine(LogSeverity::kInfo, LogText("execution host ready: pid=", pid));
     } catch (...) {
       channels[0].Reset();
       liveness_channels[0].Reset();
@@ -2607,8 +2631,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       stopping = found->second;
       busy_units.emplace(runtime_id, "stopping");
     }
-    std::cerr << "stopping execution host child: runtime_unit=" << runtime_id
-              << " epoch=" << stopping->runtime_epoch.value() << '\n';
+    LogLine(LogSeverity::kInfo, LogText("stopping execution host child: runtime_unit=",
+                        runtime_id, " epoch=", stopping->runtime_epoch.value()));
     try {
       StopChild(*stopping);
     } catch (...) {
@@ -2685,8 +2709,8 @@ struct RetainedExecutionHostUnitAdapter::Impl final
       // every call is answered at once until the host is stopped; the
       // channel stays open so the host is not ended by its close. An exited
       // host is reaped here or at the next observation.
-      std::cerr << "execution host child private channel failed: pid="
-                << child.pid << ": " << error.what() << '\n';
+      LogLine(LogSeverity::kError, LogText("execution host child private channel failed: pid=",
+                          child.pid, ": ", error.what()));
       if (!ChildIsLive(child)) {
         EraseChild(found);
         return std::nullopt;
@@ -2758,6 +2782,9 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   std::string operating_system;
   std::vector<std::string> launch_environment_contracts;
   std::optional<std::string> site_settings_document;
+  // The soft core-file size limit of every host child, from the site
+  // document, read once here.
+  std::uint64_t core_dump_limit_bytes{};
   std::optional<std::filesystem::path> site_settings_snapshot;
   std::string observer_instance_id;
   // The 16-hex text of the application-start identity: the one host
@@ -2794,6 +2821,11 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   std::atomic<bool> host_exited{false};
   std::atomic<bool> host_exit_signaled{false};
   std::atomic<int> host_exit_value{0};
+  std::atomic<pid_t> host_exit_pid{0};
+  std::atomic<bool> host_exit_core_dumped{false};
+  // HostReplyOutstanding's last printed failure line (once per episode);
+  // used only by its one caller thread, the Manager's main thread.
+  std::optional<std::string> reply_observation_last_failure;
   // OD-187 (1): the Manager's "a second stop request came" (set once before
   // any stop), and the host PID StopChild killed for it (0: none).
   std::atomic<bool (*)() noexcept> shutdown_force{nullptr};
@@ -3117,7 +3149,9 @@ RetainedExecutionHostUnitAdapter::HostExit() const noexcept {
   if (!impl_->host_exited.load(std::memory_order_acquire)) return std::nullopt;
   return ExecutionHostExitDTO{
       impl_->host_exit_signaled.load(std::memory_order_relaxed),
-      impl_->host_exit_value.load(std::memory_order_relaxed)};
+      impl_->host_exit_value.load(std::memory_order_relaxed),
+      impl_->host_exit_pid.load(std::memory_order_relaxed),
+      impl_->host_exit_core_dumped.load(std::memory_order_relaxed)};
 }
 
 void RetainedExecutionHostUnitAdapter::SetShutdownForce(
@@ -3132,8 +3166,8 @@ void RetainedExecutionHostUnitAdapter::AbandonExchanges() noexcept {
   do {
     written = ::write(impl_->abandon_fd.get(), &one, sizeof(one));
   } while (written < 0 && errno == EINTR);
-  std::cerr << "execution host exchanges abandoned: the application is "
-               "stopping\n";
+  LogLine(LogSeverity::kInfo, "execution host exchanges abandoned: the application is "
+                    "stopping");
 }
 
 int RetainedExecutionHostUnitAdapter::AbandonSignalFd() const noexcept {
@@ -3160,11 +3194,19 @@ RetainedExecutionHostUnitAdapter::HostForceKilledPid() const noexcept {
 
 std::optional<ExecutionHostReplyOutstandingDTO>
 RetainedExecutionHostUnitAdapter::HostReplyOutstanding() const noexcept {
+  // Printed once per episode: a failure is printed only when its line differs
+  // from the last one printed; the next success ends the episode.
   try {
-    return impl_->ReplyOutstanding();
+    auto outstanding = impl_->ReplyOutstanding();
+    impl_->reply_observation_last_failure.reset();
+    return outstanding;
   } catch (const std::exception &error) {
-    std::cerr << "execution host reply observation failed: " << error.what()
-              << '\n';
+    std::string text =
+        LogText("execution host reply observation failed: ", error.what());
+    if (impl_->reply_observation_last_failure != text) {
+      LogLine(LogSeverity::kError, text);
+      impl_->reply_observation_last_failure = std::move(text);
+    }
     return std::nullopt;
   }
 }

@@ -105,6 +105,19 @@ SCENARIO_NAME_MAX = 128
 SCENARIO_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
 SCENARIO_PROJECT_SUFFIX = ".scenario"
 _SCENARIO_NAME = re.compile(SCENARIO_NAME_PATTERN)
+# Folders Upgrade and load leaves next to a project (scenario_upgrade): the
+# backup `<name>.scenario.before-<version>-<UTC time>` and a hidden staging
+# copy `.<name>.scenario.upgrade-<hex>`. The Load list does not show them.
+SCENARIO_BACKUP_INFIX = f"{SCENARIO_PROJECT_SUFFIX}.before-"
+SCENARIO_STAGING_INFIX = f"{SCENARIO_PROJECT_SUFFIX}.upgrade-"
+
+
+def scenario_upgrade_folder(name: str) -> bool:
+    """Whether a folder name is an upgrade backup or staging copy."""
+
+    return SCENARIO_BACKUP_INFIX in name or (
+        name.startswith(".") and SCENARIO_STAGING_INFIX in name
+    )
 # The one built-in empty Scenario that New opens (``UNTITLED_SCENARIO_PATH``,
 # defined with the shared write guard in ``security``) is package data,
 # readable outside the allowed roots and never written: Save As places it
@@ -287,6 +300,7 @@ _DROPPED_DOCUMENT_FIELDS = {
     "program_draft": ("program_id", "name", "description"),
     "deployment_draft": ("deployment_artifact_id", "name", "description"),
 }
+_DROPPED_LANE_LABELS = {"program_draft": "lanes", "deployment_draft": "lane"}
 
 
 def _refuse_dropped_fields(value: dict[str, Any], *, source: str) -> None:
@@ -297,11 +311,32 @@ def _refuse_dropped_fields(value: dict[str, Any], *, source: str) -> None:
         for field in fields
         if field in value[member]
     ]
+    # Scenario lane labels were removed (0.4.0, OD-392): the Program's
+    # compatibility.lanes and the Deployment's compatibility.lane, refused
+    # here with the same code.
+    for member, field in _DROPPED_LANE_LABELS.items():
+        document = value.get(member)
+        compatibility = document.get("compatibility") if isinstance(document, dict) else None
+        if isinstance(compatibility, dict) and field in compatibility:
+            found.append(f"{SCENARIO_PROJECT_MEMBERS[member]}: compatibility.{field}")
     if found:
         _fail(
             "scenario_document_dropped_fields",
             f"{source}: {', '.join(found)} are no longer part of a Scenario; "
             "convert it with scripts/convert_scenarios_od369.py",
+        )
+
+
+_RETIRED_PROGRAM_PROFILE = "composable-cell-v1"
+
+
+def _refuse_retired_profile(value: dict[str, Any], *, source: str) -> None:
+    program = value.get("program_draft")
+    if isinstance(program, dict) and program.get("program_profile") == _RETIRED_PROGRAM_PROFILE:
+        _fail(
+            "scenario_program_profile_renamed",
+            f"{source}: program.yaml: program_profile {_RETIRED_PROGRAM_PROFILE} is now "
+            "manyforge-cell-v1; convert it with scripts/convert_scenarios_od369.py",
         )
 
 
@@ -338,6 +373,7 @@ def validate_scenario_document(
             f"{source}: Scenario fields do not match {SCENARIO_API_VERSION}",
         )
     _refuse_dropped_fields(value, source=source)
+    _refuse_retired_profile(value, source=source)
     scenario_id = value["scenario_id"]
     name = value["name"]
     description = value["description"]
@@ -1376,6 +1412,8 @@ def discover_scenario_artifacts(
     rows: list[dict[str, Any]] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name.casefold()):
         if path.is_symlink() or not path.is_dir() or not (path / SCENARIO_MANIFEST).is_file():
+            continue
+        if scenario_upgrade_folder(path.name):
             continue
         try:
             # Discovery is metadata-only. Load captures and validates the selected

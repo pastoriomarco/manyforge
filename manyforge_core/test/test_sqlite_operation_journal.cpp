@@ -384,7 +384,7 @@ TEST(SqliteOperationJournalTest, CorruptV9CutoverLeavesIdentityAndEvidenceUntouc
             legacy,
             "ALTER TABLE operation_snapshots DROP COLUMN journal_capture_order;"
             "PRAGMA user_version=9; UPDATE journal_metadata SET schema_version=9,"
-            "schema_id='manyforge.internal.execution.operation-journal.o1.5.v9' WHERE singleton=1;",
+            "schema_id='manyforge.internal.execution.operation-journal.v9' WHERE singleton=1;",
             nullptr, nullptr, nullptr),
         SQLITE_OK);
     ASSERT_EQ(sqlite3_exec(legacy, corruption, nullptr, nullptr, nullptr), SQLITE_OK);
@@ -435,7 +435,7 @@ TEST(SqliteOperationJournalTest, CorruptV11CaptureOrderCannotCommitTheSchemaUpgr
     ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
     const auto downgrade =
         "PRAGMA user_version=11; UPDATE journal_metadata SET schema_version=11,"
-        "schema_id='manyforge.internal.execution.operation-journal.o1.5.v11';"
+        "schema_id='manyforge.internal.execution.operation-journal.v11';"
         "UPDATE operation_snapshots SET journal_capture_order=" +
         std::to_string(order);
     ASSERT_EQ(sqlite3_exec(legacy, downgrade.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);

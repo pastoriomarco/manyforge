@@ -124,6 +124,6 @@ def test_recovery_nodes_fail_before_child_or_offer_access(node_type: type) -> No
     poison = PoisonInput()
     with pytest.raises(
         RecoveryNodeUnavailableError,
-        match="composable_cell_recovery_node_unavailable",
+        match="recovery_node_unavailable",
     ):
         node_type(poison, child=poison, offer=poison)

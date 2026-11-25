@@ -1,12 +1,16 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import { api, HISTORIAN_PAGE_LIMIT } from '../api/client';
 import { HistoryDiscovery } from './HistoryDiscovery';
 import type { HistorianListQuery } from '../api/client';
-import { fullId, parseIdFilter, type ApplicationStartId, type DisplayIdKind } from '../api/applicationIdentity';
+import {
+  fullId, isApplicationStartId, parseIdFilter, type ApplicationStartId, type DisplayIdKind,
+} from '../api/applicationIdentity';
 import type { HistorianDetail, HistorianRetention } from '../types/headless';
 import { parseProgramRunEnd } from '../api/parsers/components';
-import { runEndPresentation, type RunEndPresentation } from '../state/componentPresentation';
+import { runEndPresentation, utcText, type RunEndPresentation } from '../state/componentPresentation';
+import { copyToClipboard } from '../utils/clipboard';
+import type { NoticeHistoryRef } from '../state/workbenchNotices';
 
 export type HistorySeverityFilter = 'all' | 'info' | 'warning' | 'error';
 export type HistoryAlarmFilter =
@@ -44,6 +48,155 @@ export interface ExecutionHistoryEventView {
 }
 
 const MAXIMUM_MOUNTED_HISTORY_ROWS = 32;
+/** Follow reads the newest page this long after the previous read ended. */
+export const HISTORY_FOLLOW_INTERVAL_MS = 2_000;
+
+/** A recorded UTC time with date and milliseconds: `2026-11-24 14:02:03.123 UTC`. */
+export function historyUtcText(utcNs: string): string {
+  return utcText(utcNs);
+}
+
+/** Ids an event names, by payload key, that a History filter takes. */
+export type HistoryIdKey =
+  | 'application_start_id' | 'program_run_id' | 'operation_id' | 'node_attempt_id'
+  | 'stop_event_id' | 'node_instance_id' | 'action_span_id' | 'intervention_session_id'
+  | 'rule_id' | 'incident_id' | 'condition_id';
+
+const HISTORY_ID_LABELS: Readonly<Record<HistoryIdKey, string>> = {
+  application_start_id: 'Start',
+  program_run_id: 'Program run',
+  operation_id: 'Operation',
+  node_attempt_id: 'Node attempt',
+  stop_event_id: 'Stop',
+  node_instance_id: 'Node instance',
+  action_span_id: 'Action span',
+  intervention_session_id: 'Intervention',
+  rule_id: 'Rule',
+  incident_id: 'Incident',
+  condition_id: 'Condition',
+};
+
+const NUMBERED_HISTORY_IDS: ReadonlySet<string> = new Set(
+  ['program_run_id', 'operation_id', 'node_attempt_id', 'stop_event_id'],
+);
+
+/** The correlation filter each remaining id sets. */
+const CORRELATION_ID_FILTERS = {
+  stop_event_id: 'stopEventId',
+  node_instance_id: 'nodeInstanceId',
+  action_span_id: 'actionSpanId',
+  intervention_session_id: 'interventionSessionId',
+  rule_id: 'ruleId',
+  incident_id: 'incidentId',
+  condition_id: 'conditionId',
+} as const;
+
+export interface HistoryIdReference {
+  key: HistoryIdKey;
+  value: string;
+}
+
+function historyIdText(key: string, value: unknown): string | null {
+  if (!Object.hasOwn(HISTORY_ID_LABELS, key)) return null;
+  if (NUMBERED_HISTORY_IDS.has(key)) {
+    return Number.isSafeInteger(value) && (value as number) > 0 ? String(value) : null;
+  }
+  if (key === 'application_start_id') return isApplicationStartId(value) ? value : null;
+  return typeof value === 'string' && value !== '' && value.length <= 1024 ? value : null;
+}
+
+/** Every distinct filterable id anywhere in an event payload, in payload order. */
+export function historyIdReferences(payload: unknown): HistoryIdReference[] {
+  const found = new Map<string, HistoryIdReference>();
+  const visit = (value: unknown) => {
+    if (value === null || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    for (const [key, item] of Object.entries(value)) {
+      const text = historyIdText(key, item);
+      if (text === null) visit(item);
+      else found.set(`${key}\n${text}`, { key: key as HistoryIdKey, value: text });
+    }
+  };
+  visit(payload);
+  return [...found.values()];
+}
+
+/**
+ * The selected event as the backend recorded it, for a developer: the detail's
+ * event in its wire field names, with the row's sequence, start and recorded UTC.
+ */
+export function historyRawEvent(
+  detail: HistorianDetail,
+  row: ExecutionHistoryEventView | undefined,
+): Record<string, unknown> {
+  const { event } = detail;
+  return {
+    sequence: detail.sequence,
+    ...(row?.applicationStartId === undefined ? {} : { application_start_id: row.applicationStartId }),
+    ...(row?.timestampUtcNs == null ? {} : { occurred_at_utc_ns: row.timestampUtcNs }),
+    ...(row?.clockOwner == null ? {} : { clock_owner: row.clockOwner }),
+    event: {
+      schema_version: event.schemaVersion,
+      event_id: event.eventId,
+      component: event.component,
+      event_type: event.eventType,
+      severity: event.severity,
+      occurred_at_ns: event.occurredAtNs,
+      occurred_at_wall: event.occurredAtWall,
+      payload: event.payload,
+    },
+  };
+}
+
+/**
+ * Follow: `read` now, then again HISTORY_FOLLOW_INTERVAL_MS after each read
+ * ends (never two at once), while `active` and the browser page is visible.
+ */
+export function useHistoryFollow(active: boolean, read: () => Promise<void> | undefined): void {
+  const latest = useRef(read);
+  useEffect(() => {
+    latest.current = read;
+  });
+  useEffect(() => {
+    if (!active) return undefined;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      if (!document.hidden) await latest.current();
+      if (!stopped) timer = setTimeout(() => { void tick(); }, HISTORY_FOLLOW_INTERVAL_MS);
+    };
+    void tick();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [active]);
+}
+
+/**
+ * A run's rows in recorded-time order (sequence order is ingest order, and a
+ * runner's batched records arrive late), each with the time since the row
+ * before it. Rows without a recorded UTC time keep their place at the end.
+ */
+export function historyTimeline(
+  events: readonly ExecutionHistoryEventView[],
+): { event: ExecutionHistoryEventView; sincePreviousMs: number | null }[] {
+  const timed = events.filter((event) => event.timestampUtcNs != null)
+    .map((event) => ({ event, utcNs: BigInt(event.timestampUtcNs as string) }))
+    .sort((left, right) => (left.utcNs < right.utcNs ? -1 : left.utcNs > right.utcNs ? 1
+      : (left.event.sequence ?? 0) - (right.event.sequence ?? 0)));
+  return [
+    ...timed.map(({ event, utcNs }, index) => ({
+      event,
+      sincePreviousMs: index === 0 ? null : Number((utcNs - timed[index - 1].utcNs) / 1_000n) / 1_000,
+    })),
+    ...events.filter((event) => event.timestampUtcNs == null)
+      .map((event) => ({ event, sincePreviousMs: null })),
+  ];
+}
 
 /** The run end a Program run's end event carries, if this is one. */
 export function historyRunEnd(payload: Record<string, unknown>): RunEndPresentation | null {
@@ -115,6 +268,8 @@ export function historyFilterQuery(options: {
   search: string;
   programRunId: string;
   operationId: string;
+  /** A node attempt number; it names an attempt of the selected (else the current) start. */
+  nodeAttemptId?: string;
   /** The current start, for the display form and the bare number. */
   applicationStartId: ApplicationStartId | null;
   /** The start chosen in the start selector; null is the current start. */
@@ -127,7 +282,10 @@ export function historyFilterQuery(options: {
     ? undefined : historyIdFilter(options.programRunId, 'run', base);
   const operation = options.operationId.trim() === ''
     ? undefined : historyIdFilter(options.operationId, 'op', base);
-  if (run === null || operation === null
+  const attemptText = (options.nodeAttemptId ?? '').trim();
+  const attempt = attemptText === '' ? undefined
+    : /^[1-9]\d{0,15}$/.test(attemptText) && Number.isSafeInteger(Number(attemptText)) ? Number(attemptText) : null;
+  if (run === null || operation === null || attempt === null
     || (run !== undefined && operation !== undefined
       && run.applicationStartId !== operation.applicationStartId)
     || (startFilter !== null && (run ?? operation) !== undefined
@@ -142,15 +300,14 @@ export function historyFilterQuery(options: {
     eventTypes: options.eventType.trim() ? [options.eventType.trim()] : undefined,
     programRunId: run?.value,
     operationId: operation?.value,
+    nodeAttemptId: attempt,
     applicationStartId: (run ?? operation)?.applicationStartId ?? startFilter ?? undefined,
     search: options.search.trim() || undefined,
   };
 }
 
 function eventTime(event: ExecutionHistoryEventView): string {
-  if (event.timestampUtcNs != null) {
-    return new Date(Number(BigInt(event.timestampUtcNs) / 1_000_000n)).toLocaleTimeString();
-  }
+  if (event.timestampUtcNs != null) return historyUtcText(event.timestampUtcNs);
   return event.clockOwner
     ? `UTC unavailable · ${event.clockOwner}: ${event.timestampNs} ns`
     : 'Recorded UTC unavailable';
@@ -169,6 +326,10 @@ interface ExecutionHistoryPanelProps {
   applicationStartId?: ApplicationStartId | null;
   embedded?: boolean;
   onReload?: (query: HistorianListQuery) => void;
+  /** Reads the newest page for Follow without replacing the open detail; settles when the read ends. */
+  onFollow?: (query: HistorianListQuery) => Promise<void>;
+  /** The Program run the shown page is filtered to, if one: the page also shows as its timeline. */
+  timelineRunId?: number | null;
   onLoadOlder?: () => void;
   onLoadNewer?: () => void;
   hasOlder?: boolean;
@@ -177,6 +338,11 @@ interface ExecutionHistoryPanelProps {
   detailLoading?: boolean;
   detailError?: string | null;
   onSelectEvent?: (event: ExecutionHistoryEventView) => void;
+  /**
+   * The run or operation filter the panel starts with (a Recent notice's
+   * "see History"); its page is read once when shown. Remount to apply another.
+   */
+  preset?: NoticeHistoryRef;
 }
 
 /**
@@ -195,6 +361,8 @@ export function ExecutionHistoryPanel({
   applicationStartId = null,
   embedded = false,
   onReload,
+  onFollow,
+  timelineRunId = null,
   onLoadOlder,
   onLoadNewer,
   hasOlder = false,
@@ -203,6 +371,7 @@ export function ExecutionHistoryPanel({
   detailLoading = false,
   detailError = null,
   onSelectEvent,
+  preset,
 }: ExecutionHistoryPanelProps) {
   const [severity, setSeverity] = useState<HistorySeverityFilter>('all');
   const [alarmView, setAlarmView] = useState<HistoryAlarmFilter>('all');
@@ -210,8 +379,11 @@ export function ExecutionHistoryPanel({
   const [timeWindow, setTimeWindow] = useState<'all' | 'minute' | 'five_minutes' | 'hour'>('all');
   const [component, setComponent] = useState('');
   const [eventType, setEventType] = useState('');
-  const [programRunId, setProgramRunId] = useState('');
-  const [operationId, setOperationId] = useState('');
+  const [programRunId, setProgramRunId] = useState(preset?.programRunId === undefined ? '' : String(preset.programRunId));
+  const [operationId, setOperationId] = useState(preset?.operationId === undefined ? '' : String(preset.operationId));
+  const [nodeAttemptId, setNodeAttemptId] = useState('');
+  const [follow, setFollow] = useState(false);
+  const [copied, setCopied] = useState<{ sequence: number; ok: boolean } | null>(null);
   const [currentOnly, setCurrentOnly] = useState(false);
   const [correlations, setCorrelations] = useState<Partial<HistorianListQuery>>({});
   const [startFilter, setStartFilter] = useState<ApplicationStartId | null>(null);
@@ -250,7 +422,7 @@ export function ExecutionHistoryPanel({
     return () => request.abort();
   }, [open, applicationStartId]);
   const query = historyFilterQuery({
-    severity, alarmView, timeWindow, component, eventType, search, operationId,
+    severity, alarmView, timeWindow, component, eventType, search, operationId, nodeAttemptId,
     programRunId: currentOnly && currentProgramRunId ? String(currentProgramRunId) : programRunId,
     applicationStartId,
     startFilter,
@@ -260,7 +432,42 @@ export function ExecutionHistoryPanel({
   // The start a run or operation filter names, else the current start: run
   // numbers, the run list and rows are read against it.
   const selectedStart = query?.applicationStartId ?? applicationStartId;
+  useHistoryFollow(open && follow, () => (
+    !loading && validSearch && query !== null ? onFollow?.(query) : undefined));
+  const presetRead = useRef(preset === undefined);
+  useEffect(() => {
+    if (!open || presetRead.current || query === null) return;
+    presetRead.current = true;
+    onReload?.(query);
+  });
   if (!open) return null;
+  const selectedRow = selectedDetail === null ? undefined
+    : events.find((event) => event.sequence === selectedDetail.sequence);
+  const recordedEvent = selectedDetail === null ? ''
+    : JSON.stringify(historyRawEvent(selectedDetail, selectedRow), null, 2);
+  // An id of the selected row sets its filter, under the row's own start.
+  const applyReference = ({ key, value }: HistoryIdReference) => {
+    const rowStart = selectedRow?.applicationStartId ?? selectedStart;
+    const otherStart = rowStart !== null && rowStart !== applicationStartId ? rowStart : null;
+    const numbered = (kind: DisplayIdKind) => (
+      otherStart === null ? value : fullId(otherStart, kind, Number(value)));
+    if (key === 'application_start_id') {
+      setStartFilter(value === applicationStartId ? null : value);
+      return;
+    }
+    setStartFilter(otherStart);
+    if (key === 'program_run_id') {
+      setCurrentOnly(false);
+      setProgramRunId(numbered('run'));
+    } else if (key === 'operation_id') setOperationId(numbered('op'));
+    else if (key === 'node_attempt_id') setNodeAttemptId(value);
+    else {
+      setCorrelations({
+        ...correlations,
+        [CORRELATION_ID_FILTERS[key]]: key === 'stop_event_id' ? numbered('stop') : value,
+      });
+    }
+  };
 
   return (
     <section
@@ -273,6 +480,12 @@ export function ExecutionHistoryPanel({
           <h2 id="history-title">Runtime history</h2>
         </div>
         <div className="button-row">
+          {onFollow && (
+            <label className="history-follow-toggle" title="Read the newest page every 2 s while this tab is open.">
+              <input type="checkbox" checked={follow} onChange={(event) => setFollow(event.target.checked)} />
+              Follow
+            </label>
+          )}
           {onReload && <button type="button" disabled={loading || !validSearch || query === null} onClick={() => { if (query !== null) onReload(query); }}>Refresh</button>}
           {!embedded && <button type="button" onClick={onClose}>Close</button>}
         </div>
@@ -348,6 +561,14 @@ export function ExecutionHistoryPanel({
           />
         </label>
         <label>
+          <span>Node attempt</span>
+          <input
+            value={nodeAttemptId}
+            onChange={(event) => setNodeAttemptId(event.target.value)}
+            placeholder="Attempt number"
+          />
+        </label>
+        <label>
           <span>Alarm events</span>
           <select
             value={alarmView}
@@ -399,8 +620,8 @@ export function ExecutionHistoryPanel({
         <div className="history-filters">
           {([
             ['channel', 'Exact component / channel'],
-            ['actionSpanId', 'Action span'], ['nodeInstanceId', 'Node instance'],
-            ['interventionSessionId', 'Intervention'], ['collisionRuleId', 'Collision rule'],
+            ['actionSpanId', 'Action span'], ['nodeInstanceId', 'Node instance'], ['stopEventId', 'Stop'],
+            ['interventionSessionId', 'Intervention'], ['ruleId', 'Rule'],
             ['incidentId', 'Incident'], ['conditionId', 'Condition'],
           ] as const).map(([key, label]) => (
             <label key={key}><span>{label}</span>
@@ -412,7 +633,7 @@ export function ExecutionHistoryPanel({
       </details>
       {retention && <details className="history-retention">
         <summary>Retention and recorded-time coverage</summary>
-        <p className="muted">Bounded local history, not a permanent archive. Important events and routine progress have independent limits. Export evidence before it is pruned.</p>
+        <p className="muted">Bounded local history, not a permanent archive. Important events, routine progress and Program node attempts have independent limits. Export evidence before it is pruned.</p>
         {!retention.priorPruningKnown && <p className="muted">Legacy history did not retain pruning counts; coverage before this migration is unknown.</p>}
         {retention.olderHistoryFiles.map((file) => <p key={file.fileName} className="muted">
           Earlier history{file.format === null ? '' : ` (format ${file.format})`} is in <code>{file.fileName}</code> and is not shown here.
@@ -434,6 +655,23 @@ export function ExecutionHistoryPanel({
         {error && <p className="error-state notice severity-error" role="alert">{error}</p>}
         {!loading && !error && events.length === 0 && (
           <p className="muted">No events match these filters.</p>
+        )}
+        {timelineRunId !== null && events.length > 0 && (
+          <details className="history-timeline">
+            <summary>Run {timelineRunId} timeline · this page, oldest first</summary>
+            <ol>
+              {historyTimeline(events.slice(0, MAXIMUM_MOUNTED_HISTORY_ROWS)).map(({ event, sincePreviousMs }) => (
+                <li key={event.id} className={`severity-${historySeverityGroup(event.severity)}`}>
+                  <time title={event.timestampUtcNs == null ? undefined : historyUtcText(event.timestampUtcNs)}>
+                    {event.timestampUtcNs == null ? 'time unknown' : historyUtcText(event.timestampUtcNs).slice(11, 23)}
+                  </time>
+                  <small title="Time since the row before">{sincePreviousMs === null ? '' : `+${(sincePreviousMs / 1000).toFixed(3)} s`}</small>
+                  <small>{event.type.replaceAll('_', ' ')}</small>
+                  <span>{event.message || event.type}</span>
+                </li>
+              ))}
+            </ol>
+          </details>
         )}
         {events.slice(0, MAXIMUM_MOUNTED_HISTORY_ROWS).map((event) => (
           <button
@@ -468,7 +706,11 @@ export function ExecutionHistoryPanel({
             <button
               type="button"
               disabled={loading || !hasOlder}
-              onClick={onLoadOlder}
+              onClick={() => {
+                // An older page is not the newest one: reading it ends Follow.
+                setFollow(false);
+                onLoadOlder?.();
+              }}
             >Older</button>
           </nav>
         )}
@@ -481,10 +723,25 @@ export function ExecutionHistoryPanel({
             <>
               <header>
                 <strong>{selectedDetail.event.eventType.replaceAll('_', ' ')}</strong>
-                <code>sequence {selectedDetail.sequence}</code>
+                <span className="button-row">
+                  <code>sequence {selectedDetail.sequence}</code>
+                  <button
+                    type="button"
+                    title="Copy the whole recorded event, with its ids, as JSON."
+                    onClick={() => setCopied({
+                      sequence: selectedDetail.sequence,
+                      ok: copyToClipboard(recordedEvent),
+                    })}
+                  >{copied?.sequence !== selectedDetail.sequence ? 'Copy' : copied.ok ? 'Copied' : 'Copy failed'}</button>
+                </span>
               </header>
               <HistoryRunEnd payload={selectedDetail.event.payload} />
+              <HistoryReferences payload={selectedDetail.event.payload} onUse={applyReference} />
               <div className="history-detail-sections">
+                <details open>
+                  <summary>Recorded event</summary>
+                  <pre>{recordedEvent}</pre>
+                </details>
                 {Object.entries(selectedDetail.sections).map(([name, section]) => (
                   <details key={name} open={section.available}>
                     <summary>{name.replaceAll(/([A-Z])/g, ' $1')}</summary>
@@ -499,6 +756,31 @@ export function ExecutionHistoryPanel({
         </section>
       )}
     </section>
+  );
+}
+
+function HistoryReferences({ payload, onUse }: {
+  payload: Record<string, unknown>;
+  onUse: (reference: HistoryIdReference) => void;
+}) {
+  const references = historyIdReferences(payload);
+  if (references.length === 0) return null;
+  return (
+    <p className="history-detail-references">
+      <span className="muted">Set filter:</span>
+      {references.map((reference) => {
+        const label = HISTORY_ID_LABELS[reference.key];
+        return (
+          <button
+            type="button"
+            className="text-button"
+            key={`${reference.key}\n${reference.value}`}
+            title={`Set the ${label} filter to ${reference.value}; Apply filters reads it.`}
+            onClick={() => onUse(reference)}
+          >{label} {reference.key === 'application_start_id' ? reference.value.slice(0, 4) : reference.value}</button>
+        );
+      })}
+    </p>
   );
 }
 

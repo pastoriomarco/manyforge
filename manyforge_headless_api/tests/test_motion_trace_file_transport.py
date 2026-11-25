@@ -13,8 +13,23 @@ import socket
 import pytest
 import rfc8785
 
-from manyforge_headless_api.execution import ExecutionCommandClient, EXECUTION_SOCKET_FILE
+import manyforge_headless_py as core  # type: ignore[import-not-found]
+
+from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.tests.fake_gateway import FakeGateway
+
 from manyforge_headless_api.native import HeadlessApiError
+
+
+EXECUTION_SOCKET_FILE = "execution-command.sock"
+
+
+def _real_client(run_root):
+    """The adapter over the real gateway core (internal attribution)."""
+
+    return ExecutionCommandClient(
+        core.Gateway(str(run_root), None, attribution="internal", connect_limit_s=2.0)
+    )
 
 
 _MAX_BYTES = 5 * 1024 * 1024
@@ -70,10 +85,7 @@ def _client(metadata, *, inline=None):
         response["trace_file"] = metadata
     if inline is not None:
         response["trace"] = inline
-    client = object.__new__(ExecutionCommandClient)
-    client._attribution_transport = "internal"
-    client._exchange = lambda _command: response
-    return client
+    return ExecutionCommandClient(FakeGateway(lambda _command: response))
 
 
 @pytest.mark.parametrize("setting", [None, ""])
@@ -132,7 +144,7 @@ def test_inline_trace_above_default_send_buffer_crosses_real_seqpacket(monkeypat
 
         with ThreadPoolExecutor(max_workers=1) as worker:
             answered = worker.submit(answer)
-            client = ExecutionCommandClient(tmp_path, timeout_seconds=2, attribution_transport="internal")
+            client = _real_client(tmp_path)
             assert client.read_volatile_motion_trace(_MAX_BYTES) == trace
             command = answered.result(timeout=3)
     assert command == {"api_version": "manyforge.execution_command.v4",
@@ -172,7 +184,7 @@ def test_large_trace_crosses_real_small_seqpacket_only_as_file_metadata(monkeypa
 
         with ThreadPoolExecutor(max_workers=1) as worker:
             answered = worker.submit(answer)
-            client = ExecutionCommandClient(tmp_path, timeout_seconds=2, attribution_transport="internal")
+            client = _real_client(tmp_path)
             assert client.read_volatile_motion_trace(_MAX_BYTES) == trace
             command = answered.result(timeout=3)
     assert command["command"] == "read_volatile_motion_trace"
@@ -346,3 +358,37 @@ def test_partial_coverage_is_returned_unchanged_without_claiming_installation(mo
     observed = _client(metadata).read_volatile_motion_trace(4096)
     assert observed == trace
     assert all(goal["installation"] == "unknown" for goal in observed["goals"])
+
+
+def test_capture_returns_file_metadata_without_reading_the_file(monkeypatch, tmp_path):
+    """The automatic capture names the file the host wrote; Headless never
+    reads or parses it (no file needs to exist for this answer)."""
+    monkeypatch.delenv("MANYFORGE_MOTION_TRACE_DIR", raising=False)
+    payload = rfc8785.dumps(_normal_trace())
+    digest = hashlib.sha256(payload).hexdigest()
+    metadata = {"schema_version": "manyforge.motion_trace_file.v2",
+                "file": f"trace-{digest}.json", "bytes": len(payload),
+                "sha256": f"sha256:{digest}", "status": "partial"}
+    sent = []
+    response = {"api_version": "manyforge.execution_command_response.v6", "ok": True,
+                "command": "read_volatile_motion_trace", "trace_file": metadata}
+    client = ExecutionCommandClient(
+        FakeGateway(lambda command: sent.append(command) or response)
+    )
+    assert client.capture_motion_trace_file(_MAX_BYTES) == metadata
+    assert sent[0]["command"] == "read_volatile_motion_trace"
+    assert sent[0]["allowance_bytes"] == _MAX_BYTES
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_capture_refuses_an_inline_answer_and_keeps_native_refusals_typed():
+    with pytest.raises(HeadlessApiError) as inline:
+        _client(..., inline=_normal_trace()).capture_motion_trace_file(_MAX_BYTES)
+    assert inline.value.code == "motion_trace_file_invalid"
+    client = ExecutionCommandClient(FakeGateway(lambda _command: {
+        "api_version": "manyforge.execution_command_response.v6", "ok": False,
+        "error": {"code": "motion_trace_store_full", "message": "store is full",
+                  "details": {}}}))
+    with pytest.raises(HeadlessApiError) as refused:
+        client.capture_motion_trace_file(_MAX_BYTES)
+    assert refused.value.code == "motion_trace_store_full"

@@ -1,6 +1,6 @@
 api_version: manyforge.program.v4
-program_revision: sha256:a508281d26c4017882ba48bc1450dd8efec3da401f61510a452b7102cdf317af
-program_profile: composable-cell-v1
+program_revision: sha256:6e56e456f016b181847192e33d7ec8b2009d3d2f347779d43add424b6b7bb2a6
+program_profile: manyforge-cell-v1
 catalog:
   api_version: manyforge.node_catalog.v3
   content_version: 4.0.0

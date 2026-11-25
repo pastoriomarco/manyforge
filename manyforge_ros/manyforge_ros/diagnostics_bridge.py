@@ -1,6 +1,6 @@
 """ROS-neutral diagnostic mapping and thin ROS message translation.
 
-The pure mapping remains usable during the composable-cell cutover.  The
+The pure mapping remains usable.  The
 former effectful bridge polled Composer-owned runtime endpoints and is not
 retained as a hidden fallback; the module entrypoint stays unavailable until
 addressed runtime diagnostics over the headless substrate exist.
@@ -51,7 +51,7 @@ MAX_FAULT_CODE_CHARS: Final = 64
 _MAX_JSON_DEPTH: Final = 8
 _MAX_JSON_NODES: Final = 256
 
-UNAVAILABLE_REASON_CODE = "composable_cell_runtime_unavailable"
+UNAVAILABLE_REASON_CODE = "runtime_unavailable"
 UNAVAILABLE_MESSAGE = (
     f"{UNAVAILABLE_REASON_CODE}: ROS diagnostics publication requires the "
     "addressed runtime diagnostic projection"

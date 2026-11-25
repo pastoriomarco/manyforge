@@ -2,7 +2,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -10,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <sys/resource.h>
 #include <unistd.h>
 
 namespace manyforge::headless {
@@ -106,11 +110,66 @@ TEST(ApplicationProcessSupervisor, HandsTheStartIdentityAndEnvironmentAtLaunch) 
   EXPECT_EQ(exit->role, core::ApplicationRole::kHeadless);
   EXPECT_FALSE(exit->signaled);
   EXPECT_EQ(exit->value, 0);
+  EXPECT_GT(exit->pid, 0);
+  EXPECT_FALSE(exit->core_dumped);
   std::ifstream stream(output);
   std::stringstream content;
   content << stream.rdbuf();
   EXPECT_EQ(content.str(),
             "--application-start-id\n3f9a00000000c0de\nadded\n");
+  std::filesystem::remove_all(root);
+}
+
+TEST(ApplicationProcessSupervisor, StartsEveryProcessWithCoreDumpsOff) {
+  const auto root = TemporaryDirectory();
+  const auto output = root / "core-limit";
+  ApplicationProcessSupervisor supervisor(
+      {{core::ApplicationRole::kHeadless,
+        {"/bin/sh", "-c", "ulimit -c > " + output.string() + "; kill -TERM $$"},
+        {},
+        false}},
+      kStartId);
+  supervisor.StartImmediate();
+  const auto exit = WaitForExit(supervisor);
+  ASSERT_TRUE(exit.has_value());
+  EXPECT_TRUE(exit->signaled);
+  EXPECT_EQ(exit->value, SIGTERM);
+  EXPECT_FALSE(exit->core_dumped);
+  std::ifstream stream(output);
+  std::stringstream content;
+  content << stream.rdbuf();
+  EXPECT_EQ(content.str(), "0\n");
+  std::filesystem::remove_all(root);
+}
+
+TEST(ApplicationProcessSupervisor, StartsEveryProcessWithTheSiteCoreDumpLimit) {
+  const auto root = TemporaryDirectory();
+  const auto output = root / "core-limit";
+  constexpr std::uint64_t kLimit = 1048576U;
+  ApplicationProcessSupervisor supervisor(
+      {{core::ApplicationRole::kHeadless,
+        {"/bin/sh", "-c",
+         "grep '^Max core file size' /proc/self/limits > " + output.string()},
+        {},
+        false}},
+      kStartId, kLimit);
+  supervisor.StartImmediate();
+  const auto exit = WaitForExit(supervisor);
+  ASSERT_TRUE(exit.has_value());
+  EXPECT_FALSE(exit->signaled);
+  EXPECT_EQ(exit->value, 0);
+  struct rlimit own {};
+  ASSERT_EQ(::getrlimit(RLIMIT_CORE, &own), 0);
+  // Only the soft value changes, and never above the hard limit.
+  const auto soft = std::min(static_cast<rlim_t>(kLimit), own.rlim_max);
+  const std::string hard = own.rlim_max == RLIM_INFINITY
+                               ? std::string("unlimited")
+                               : std::to_string(own.rlim_max);
+  std::ifstream stream(output);
+  std::string max, core, file, size, soft_text, hard_text;
+  stream >> max >> core >> file >> size >> soft_text >> hard_text;
+  EXPECT_EQ(soft_text, std::to_string(soft));
+  EXPECT_EQ(hard_text, hard);
   std::filesystem::remove_all(root);
 }
 

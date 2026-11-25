@@ -80,7 +80,7 @@ ProgramBytes(const deployment::RetainedBundle &bundle) {
             deployment::CanonicalValue(
                 bundle.value().catalogs.node_environment.content_version)},
        })},
-      {"program_profile", deployment::CanonicalValue("composable-cell-v1")},
+      {"program_profile", deployment::CanonicalValue("manyforge-cell-v1")},
       {"program_revision",
        deployment::CanonicalValue(std::string(kZeroDigest))},
       {"tree",

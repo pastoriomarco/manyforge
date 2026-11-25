@@ -19,7 +19,7 @@ from manyforge_behavior.canonical_artifact import (
     load_strict_json_yaml,
 )
 from manyforge_behavior.catalog import EXPECTED_CONTENT_VERSION, NodeCatalog
-from manyforge_behavior.kernel_client import KernelClient
+from manyforge_behavior.kernel_client import ExecutionCommandError, KernelClient
 from manyforge_behavior.nodes.v2_owner import IoInputWaitAdapter
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
@@ -39,6 +39,7 @@ from manyforge_behavior.program_clock import ProgramClock
 
 
 from .v3_fixtures import signal, target, target_binding, program_document
+from .gateway_fakes import transport_gateway
 
 _ROOT = Path(__file__).resolve().parents[2]
 _A = "sha256:" + "a" * 64
@@ -226,7 +227,7 @@ class _Transport:
 
 def _bound(context: ProgramRunPortContext | None = None):
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     port.bind(context or _context([_signal_row()]))
     return transport, port
 
@@ -349,7 +350,7 @@ def test_signal_references_refuse_at_run_preparation(rows, coordinate_roles, cod
             "children": [],
         }],
     }
-    port = NativeKernelProgramPort(KernelClient(_Transport()))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(_Transport())))
     with pytest.raises(IoSignalRefusedError) as refused:
         port.bind(_context(rows, coordinate_roles=coordinate_roles, tree=tree))
     assert refused.value.code == code
@@ -366,7 +367,7 @@ def test_duplicate_exact_signal_binding_is_refused_before_use(with_node: bool) -
     tree = {"node_id": "io.check_input", "instance_id": "check", "children": [],
             "parameters": {"signal": signal("io.1", "di_0"), "expected_value": True}}
     transport = _Transport()
-    port = NativeKernelProgramPort(KernelClient(transport))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(transport)))
     with pytest.raises(ProductionPortError, match="signal binding repeats"):
         port.bind(_context([_signal_row(), _signal_row()], tree=tree if with_node else None))
     assert transport.queries == []
@@ -383,7 +384,7 @@ def test_an_edge_wait_is_refused_at_run_preparation() -> None:
         },
         "children": [],
     }
-    port = NativeKernelProgramPort(KernelClient(_Transport()))
+    port = NativeKernelProgramPort(KernelClient(transport_gateway(_Transport())))
     with pytest.raises(IoSignalRefusedError) as refused:
         port.bind(_context([_signal_row()], tree=tree))
     assert refused.value.code == "io_watch_condition_unsupported"
@@ -557,8 +558,11 @@ def test_a_host_refused_registration_sends_no_scope_release() -> None:
     transport.register_error = _OwnerError(
         "stale_generation", {"reason": "io_watch_generation_stale"}
     )
-    with pytest.raises(_OwnerError):
+    # The host's refusal reply raises the client's typed refusal.
+    with pytest.raises(ExecutionCommandError) as refused:
         port.io_watches.start("io.wait_for_input", _identity(), _wait_inputs())
+    assert refused.value.code == "stale_generation"
+    assert refused.value.details == {"reason": "io_watch_generation_stale"}
     assert transport.scope_releases == []
 
 
@@ -808,30 +812,48 @@ def test_a_halt_during_the_call_does_not_count_toward_the_deadline() -> None:
     assert node.status is py_trees.common.Status.SUCCESS
 
 
+class _WireGateway:
+    """The host's replies to the I/O watch commands as the gateway returns
+    them; ``sent`` records each command with the members the core sends."""
+
+    _COMMANDS = ("register_io_watch", "read_io_watch", "release_io_watch")
+
+    def __init__(self, double: Any, replies: dict[str, dict[str, Any]]) -> None:
+        self._other = transport_gateway(double)
+        self.replies = replies
+        self.sent: list[dict[str, Any]] = []
+        self.lost: set[str] = set()
+
+    def __getattr__(self, command: str):
+        if command not in self._COMMANDS:
+            return getattr(self._other, command)
+
+        def call(members: Mapping[str, Any] = {}, principal_id: str | None = None):
+            self.sent.append({"command": command, **deepcopy(dict(members))})
+            if command in self.lost:
+                # The request may have reached the host; its reply never arrived.
+                raise _GatewayLoss("execution_owner_unavailable", "timed out")
+            return deepcopy(self.replies[command])
+
+        return call
+
+
+class _GatewayLoss(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details: dict[str, Any] = {}
+
+
 def _wire_port(monkeypatch, tmp_path, replies: dict[str, dict[str, Any]]):
-    """Actual host envelopes through the Runner transport, client and port."""
+    """Actual host replies through the gateway, client and port."""
 
-    from manyforge_headless_api.execution import ExecutionCommandClient
-    from manyforge_program_runner.execution_transport import (
-        ProgramRunnerExecutionTransport,
-    )
-
-    wire = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
-    sent: list[dict[str, Any]] = []
-
-    def exchange_on(_self, command, _socket_path):
-        sent.append(deepcopy(command))
-        return deepcopy(replies[command["command"]])
-
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange_on)
-    transport = _Transport()
-    transport.register_io_watch = wire.register_io_watch
-    transport.read_io_watch = wire.read_io_watch
-    transport.release_io_watch = wire.release_io_watch
-    transport.release_io_watch_scope = wire.release_io_watch_scope
-    port = NativeKernelProgramPort(KernelClient(transport))
+    del monkeypatch, tmp_path
+    gateway = _WireGateway(_Transport(), replies)
+    port = NativeKernelProgramPort(KernelClient(gateway))
     port.bind(_context([_signal_row()]))
-    return port, sent
+    port.gateway = gateway
+    return port, gateway.sent
 
 
 def _wire_registration(attempt: int) -> dict[str, Any]:
@@ -905,29 +927,18 @@ def test_actual_stale_generation_refusal_fails_the_wait_with_its_reason(
 def test_actual_unknown_registration_fails_and_releases_the_attempt_scope(
     monkeypatch, tmp_path
 ) -> None:
-    from manyforge_headless_api.native import HeadlessApiError
-
     replies = _wire_replies({"ok": True, "command": "read_io_watch"})
     port, sent = _wire_port(monkeypatch, tmp_path, replies)
-    from manyforge_headless_api.execution import ExecutionCommandClient
-
-    def exchange_on(_self, command, _socket_path):
-        sent.append(deepcopy(command))
-        if command["command"] == "register_io_watch":
-            # The request may have reached the host; its reply never arrived.
-            raise HeadlessApiError("execution_owner_unavailable", "timed out")
-        return deepcopy(replies[command["command"]])
-
-    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange_on)
+    port.gateway.lost.add("register_io_watch")
     node, _fake, _clock, _program_clock, _events = _waiter(port=port.io_watches)
     node.tick_once()
     assert node.status is py_trees.common.Status.FAILURE
     assert [command["command"] for command in sent] == [
         "register_io_watch", "release_io_watch"
     ]
+    # The core adds the internal attribution (release_io_watch carries the caller's).
     release = sent[1]
-    assert set(release) == {"api_version", "command", "attribution", "scope_request"}
-    assert release["attribution"]["transport"] == "internal"
+    assert set(release) == {"command", "scope_request"}
     assert release["scope_request"] == {
         **_SCOPE_RELEASE, "node_instance_id": "wait", "node_attempt_id": 1
     }
@@ -943,11 +954,11 @@ def test_changed_outside_requires_a_bound_output_base() -> None:
     derived = signal("io.1", "di_0.changed_outside")
     tree = {"node_id": "io.wait_for_input", "instance_id": "wait", "children": [],
             "parameters": {"signal": derived, "expected_value": True, "edge": "level"}}
-    valid = NativeKernelProgramPort(KernelClient(_Transport()))
+    valid = NativeKernelProgramPort(KernelClient(transport_gateway(_Transport())))
     valid.bind(_context([_signal_row(direction="output")], tree=tree))
     for rows, code in (([_signal_row(direction="input")], "io_signal_direction_mismatch"),
                        ([], "io_signal_unbound")):
-        port = NativeKernelProgramPort(KernelClient(_Transport()))
+        port = NativeKernelProgramPort(KernelClient(transport_gateway(_Transport())))
         with pytest.raises(IoSignalRefusedError) as refused:
             port.bind(_context(rows, tree=tree))
         assert refused.value.code == code

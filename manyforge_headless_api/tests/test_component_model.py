@@ -7,7 +7,6 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -31,7 +30,7 @@ from manyforge_headless_api.control_state import (
     control_shell_fact_key,
 )
 from manyforge_headless_api.native import HeadlessApiError
-from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
+from manyforge_headless_api.program_runner_client import ProgramRunnerClient
 from manyforge_headless_api.tests.test_app import (
     FakeCore,
     FakeExecution,
@@ -130,9 +129,24 @@ def test_stop_change_is_visible_to_component_event_deduplication() -> None:
     assert control_shell_fact_key(before, "component_state") != control_shell_fact_key(after, "component_state")
 
 
+def test_component_stop_and_fault_carry_their_utc_time() -> None:
+    stop = {"code": "estop", "message": "E-stop", "since_ns": 1,
+            "since_utc_ns": "1795122990477663500"}
+    fault = {"code": "fault_process_exited", "message": "exited", "clearable": True,
+             "operator_action": "recover", "since_ns": 3, "since_utc_ns": 7,
+             "details": {"output_tail": "last line"}}
+    model = _model(component_states=[_state("robot", "fault", stop=stop, fault=fault)])
+    assert model.component_states[0]["stop"] == stop
+    assert model.component_states[0]["fault"] == fault
+
+
 @pytest.mark.parametrize("stop", [None, {}, {"code": "estop", "message": "x", "since_ns": True},
                                    {"code": "other", "message": "x", "since_ns": 1},
-                                   {"code": "estop", "message": "x", "since_ns": 1, "extra": 1}])
+                                   {"code": "estop", "message": "x", "since_ns": 1, "extra": 1},
+                                   {"code": "estop", "message": "x", "since_ns": 1,
+                                    "since_utc_ns": "01"},
+                                   {"code": "estop", "message": "x", "since_ns": 1,
+                                    "since_utc_ns": -1}])
 def test_malformed_component_stop_is_refused(stop: object) -> None:
     with pytest.raises(HeadlessApiError):
         _model(component_states=[_state("robot", stop=stop)])
@@ -718,26 +732,32 @@ def test_component_reads_have_the_contract_shapes() -> None:
 
 
 def test_the_runners_readiness_is_answered_without_calling_the_runner() -> None:
-    requests: list[httpx.Request] = []
+    import manyforge_headless_py as core
 
-    def unreachable(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        raise httpx.ConnectError("connection refused", request=request)
+    requests: list[str] = []
 
-    raw = httpx.Client(base_url="http://runner.test", transport=httpx.MockTransport(unreachable))
+    class UnreachableLink:
+        def call(self, command, _request):
+            requests.append(command)
+            raise core.GatewayError(
+                "program_runner_unavailable", "connection refused", {}, "program_runner"
+            )
+
+        def subscribe_status(self):
+            raise core.GatewayError(
+                "program_runner_unavailable", "connection refused", {}, "program_runner"
+            )
+
     service = _service(
         FakeCore(), FakeManager(), _ModelExecution(_reply()),
-        program_runner=ProgramRunnerHttpClient("http://runner.test", client=raw),
+        program_runner=ProgramRunnerClient("/unused", link=UnreachableLink()),
     )
-    try:
-        with TestClient(create_app(service=service)) as client:
-            execute = client.post("/api/program/readiness", json=_RUNNER_READINESS)
-            resume = client.post("/api/program/readiness", json={
-                **_RUNNER_READINESS,
-                "program_cycle": {"state": "running", "resume_halt_allowed": True},
-            })
-    finally:
-        raw.close()
+    with TestClient(create_app(service=service)) as client:
+        execute = client.post("/api/program/readiness", json=_RUNNER_READINESS)
+        resume = client.post("/api/program/readiness", json={
+            **_RUNNER_READINESS,
+            "program_cycle": {"state": "running", "resume_halt_allowed": True},
+        })
     assert execute.status_code == 200 and execute.json()["can_execute"] is True
     assert resume.status_code == 200 and resume.json()["can_resume"] is True
     assert requests == []
@@ -1205,3 +1225,22 @@ def test_latch_cause_carries_the_stop_unconfirmed_reason_unchanged() -> None:
     assert model.component_states[0]["reason"] == reason
     assert model.cell_latch["causes"][0]["reason"] == reason
     assert model.cell_latch["causes"][1]["reason"] is None
+
+
+def test_a_stop_since_beyond_2_53_arrives_as_decimal_text() -> None:
+    from manyforge_headless_api.component_model import _validate_stop
+
+    _validate_stop({"code": "estop", "message": "E-stop", "since_ns": "9007199254740993",
+                    "since_utc_ns": "1795514400000000000"})
+    for since in ("01", "-1", "1.5", -1, 1.5):
+        with pytest.raises(Exception):
+            _validate_stop({"code": "estop", "message": "E-stop", "since_ns": since})
+
+
+def test_recovery_stop_accepts_since_beyond_2_53_as_decimal_text() -> None:
+    from manyforge_headless_api.models import RecoveryStop
+
+    assert RecoveryStop(code="estop", message="E-stop", since_ns="9007199254740993").since_ns == (
+        "9007199254740993")
+    with pytest.raises(Exception):
+        RecoveryStop(code="estop", message="E-stop", since_ns="01")

@@ -1,13 +1,10 @@
-"""Exact private Program-operation scope wire."""
+"""Program-operation query model bounds (the query is the runner's, sent through the gateway core)."""
 
-from copy import deepcopy
 
 import pytest
 from pydantic import ValidationError
 
-from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import ProgramOperationQuery
-from manyforge_headless_api.native import HeadlessApiError
 
 
 QUERY = {
@@ -16,49 +13,6 @@ QUERY = {
     "program_run_id": 1,
     "target": {"component_id": "robot", "command_target_id": "arm"},
 }
-
-
-def _client(response):
-    client = object.__new__(ExecutionCommandClient)
-    requests = []
-
-    def exchange(request):
-        requests.append(deepcopy(request))
-        return deepcopy(response)
-
-    client._exchange = exchange
-    client._request_attribution = lambda _principal: {"transport": "internal"}
-    return client, requests
-
-
-def _response():
-    return {
-        "ok": True,
-        "command": "query_operation",
-        "target": {"component_id": "robot", "command_target_id": "arm"},
-        "operation": {
-            "operation_id": 1,
-            "operation_revision": 2,
-            "program_run_id": 1,
-            "program_binding_id": QUERY["program_binding_id"],
-            "participants": [{"command_target_id": "arm"}],
-        },
-    }
-
-
-def test_operation_query_is_one_read_without_command_or_retry_identity():
-    response = _response()
-    client, requests = _client(response)
-    assert (
-        client.query_operation(ProgramOperationQuery.model_validate(QUERY)) == response
-    )
-    assert requests == [
-        {
-            "api_version": "manyforge.execution_command.v4",
-            "command": "query_operation",
-            "query": QUERY,
-        }
-    ]
 
 
 @pytest.mark.parametrize(
@@ -79,43 +33,3 @@ def test_operation_query_rejects_unbounded_or_caller_invented_scope(change):
         ProgramOperationQuery.model_validate({**QUERY, **change})
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("operation_id", ""),
-        ("operation_id", "1"),
-        ("operation_id", 0),
-        ("operation_revision", True),
-        ("operation_revision", 0),
-        ("operation_revision", 2**53),
-        ("participants", []),
-        ("participants", [{}, {}]),
-        ("participants", ["wrong"]),
-    ],
-)
-def test_crossed_operation_response_is_rejected_not_retried(field, value):
-    response = _response()
-    response["operation"][field] = value
-    client, requests = _client(response)
-    with pytest.raises(HeadlessApiError) as error:
-        client.query_operation(ProgramOperationQuery.model_validate(QUERY))
-    assert error.value.code == "execution_operation_context_invalid"
-    assert len(requests) == 1
-
-
-def test_operation_response_must_have_its_command_kind():
-    client, requests = _client({**_response(), "command": "read"})
-    with pytest.raises(HeadlessApiError) as error:
-        client.query_operation(ProgramOperationQuery.model_validate(QUERY))
-    assert error.value.code == "execution_operation_context_invalid"
-    assert len(requests) == 1
-
-
-def test_operation_response_echo_is_not_compared():
-    # Each exchange is its own connection: the echoed identity is not compared.
-    response = _response()
-    response.update(target={"component_id": "robot", "command_target_id": "gripper"})
-    response["operation"]["program_run_id"] = 99
-    client, requests = _client(response)
-    assert client.query_operation(ProgramOperationQuery.model_validate(QUERY)) == response
-    assert len(requests) == 1

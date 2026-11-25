@@ -51,7 +51,7 @@ function appliedProgram(): AppliedProgramSelection {
     program: {
       api_version: 'manyforge.program.v4',
       program_revision: digest('b'),
-      program_profile: 'composable-cell-v1',
+      program_profile: 'manyforge-cell-v1',
       catalog: { api_version: 'manyforge.node_catalog.v3', content_version: '4.0.0' },
       execution_groups: { robots: { execution_policy: 'independent' } },
       tree: {

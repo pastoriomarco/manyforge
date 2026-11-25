@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing, contextmanager
+from datetime import datetime, timedelta
 import fcntl
 import json
 import os
@@ -100,11 +101,19 @@ def test_fresh_selection_contains_only_marker_and_history_is_stable(tmp_path):
     assert report["history_coverage"] == "not_imported"
     assert "Up to five previous runs (2 GiB in total) are normally kept" in report["message"]
     assert report["journal_families"] == ["program_cycle", "manager", "kernel_operation"]
-    assert report["schema_version"] == "manyforge.workbench_previous_session.v3"
+    assert report["schema_version"] == "manyforge.workbench_previous_session.v4"
     # No Kernel journal in that run: the unfinished operations are unknown.
     assert report["unfinished_operations"] is None
     assert report["unfinished_operation_count"] is None
     assert report["application_start_id"] is None
+    # The Manager wrote no application end in that run.
+    assert report["application_end"] is None
+    assert report["archived_older_marker"] is None
+    assert marker["application_end"] is None and marker["manager_exit"] is None
+    # History files the report at the previous start; the report time is UTC.
+    assert report["started_at_wall"] == marker["started_at_wall"]
+    assert datetime.fromisoformat(report["reported_at_wall"]).utcoffset() == timedelta(0)
+    assert len(report) == 15
 
 
 def test_report_lists_unfinished_operations_from_a_copy_of_the_journal_and_its_wal(tmp_path):
@@ -173,6 +182,7 @@ def test_old_report_text_keeps_an_interrupted_session_selection_recoverable(tmp_
 
     marker = select(root, THIRD)
     assert marker["session_id"] == THIRD
+    # The recorded report, its report time included, is kept.
     assert json.loads(pending.read_text()) == previous
     assert_evidence(root / "previous-runs" / FIRST, original)
     assert not selection_path.exists()
@@ -274,6 +284,126 @@ def test_preselected_launcher_claim_is_single_use_and_wrong_identity_cannot_star
         sessions.Session(root, FIRST)
     marker = json.loads((root / "current/session.json").read_text())
     assert marker["disposition"] == "stopped" and marker["shutdown"] == "clean"
+    assert marker["schema_version"] == "manyforge.workbench_session.v3"
+    assert marker["application_end"] is None
+    assert marker["manager_exit"] == {"exit_status": None, "signal": None}
+
+
+APPLICATION_END = {
+    "schema_version": "manyforge.application_end.v1",
+    "ended_by": "process_exit",
+    "process": {"role": "execution_host", "pid": 4242, "exit_status": None,
+                "signal": 11, "core_dumped": False},
+    "ended_at_wall": "2026-11-24T10:15:30.123Z",
+}
+
+
+def write_application_end(current: Path, value: object) -> None:
+    path = current / "manager-run/application-end.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value))
+
+
+@pytest.mark.parametrize(("returncode", "manager_exit"), [
+    (72, {"exit_status": 72, "signal": None}),
+    (-9, {"exit_status": None, "signal": 9}),
+])
+def test_stopped_marker_carries_the_application_end_and_the_manager_exit(tmp_path, returncode, manager_exit):
+    root = tmp_path / "runtime"
+    select(root, FIRST)
+    running = sessions.Session(root, FIRST)
+    write_application_end(root / "current", APPLICATION_END)
+    running.stopped(verified=False, manager_returncode=returncode)
+    running.close()
+    marker = json.loads((root / "current/session.json").read_text())
+    assert marker["application_end"] == APPLICATION_END
+    assert marker["manager_exit"] == manager_exit
+    # The next selection reads the closed marker and reports the end.
+    successor = select(root, SECOND)
+    assert successor["previous_session"]["application_end"] == APPLICATION_END
+    assert successor["previous_session"]["shutdown"] == "unknown"
+
+
+@pytest.mark.parametrize("value", [
+    dict(APPLICATION_END, schema_version="manyforge.application_end.v2"),
+    dict(APPLICATION_END, ended_by="crash"),
+    dict(APPLICATION_END, ended_by="stop_signal"),
+    dict(APPLICATION_END, ended_at_wall="2026-11-24T10:15:30"),
+    dict(APPLICATION_END, process=dict(APPLICATION_END["process"], exit_status=1)),
+    dict(APPLICATION_END, process=dict(APPLICATION_END["process"], core_dumped=1)),
+    dict(APPLICATION_END, extra=True),
+    [APPLICATION_END],
+])
+def test_an_invalid_application_end_is_reported_as_unknown(tmp_path, value):
+    root = tmp_path / "runtime"
+    select(root, FIRST)
+    write_application_end(root / "current", value)
+    assert sessions.run_session.application_end(root / "current") is None
+    assert select(root, SECOND)["previous_session"]["application_end"] is None
+
+
+def test_a_signal_shutdown_or_manager_failure_end_has_no_process(tmp_path):
+    for ended_by in ("stop_signal", "shutdown_runtime", "manager_failure"):
+        value = dict(APPLICATION_END, ended_by=ended_by, process=None)
+        write_application_end(tmp_path, value)
+        assert sessions.run_session.application_end(tmp_path) == value
+    # A Manager failure names no process.
+    write_application_end(tmp_path, dict(APPLICATION_END, ended_by="manager_failure"))
+    assert sessions.run_session.application_end(tmp_path) is None
+
+
+def test_a_manager_failure_end_reaches_the_next_report(tmp_path):
+    root = tmp_path / "runtime"
+    select(root, FIRST)
+    running = sessions.Session(root, FIRST)
+    value = dict(APPLICATION_END, ended_by="manager_failure", process=None)
+    write_application_end(root / "current", value)
+    running.stopped(verified=False, manager_returncode=70)
+    running.close()
+    marker = json.loads((root / "current/session.json").read_text())
+    assert marker["application_end"] == value
+    assert marker["manager_exit"] == {"exit_status": 70, "signal": None}
+    assert select(root, SECOND)["previous_session"]["application_end"] == value
+
+
+def test_an_application_end_of_an_unclosed_run_is_reported_from_its_archive(tmp_path):
+    # The launcher ended without closing the marker; the Manager's record is
+    # still in the archived run.
+    root = tmp_path / "runtime"
+    select(root, FIRST)
+    write_application_end(root / "current", APPLICATION_END)
+    assert select(root, SECOND)["previous_session"]["application_end"] == APPLICATION_END
+
+
+def test_a_marker_of_the_earlier_version_is_not_trusted(tmp_path):
+    root = tmp_path / "runtime"
+    select(root, FIRST)
+    path = root / "current/session.json"
+    marker = json.loads(path.read_text())
+    del marker["application_end"], marker["manager_exit"]
+    path.write_text(json.dumps(dict(marker, schema_version="manyforge.workbench_session.v2",
+                                    disposition="stopped", shutdown="clean")))
+    report = select(root, SECOND)["previous_session"]
+    assert report["shutdown"] == "unknown" and report["effects"] == "unknown"
+    assert report["started_at_wall"] is None
+    # The report says the session came from an older build and where it went
+    # (its untrusted marker's identity is not used).
+    archive = report["archive_relative_path"]
+    assert (root / archive / "session.json").is_file()
+    assert report["archived_older_marker"] == "manyforge.workbench_session.v2"
+    assert (" It ran an older build (marker manyforge.workbench_session.v2) and was archived to "
+            f"{archive} at the upgrade.") in report["message"]
+
+
+@pytest.mark.parametrize("schema_version", ["manyforge.workbench_session", "foreign.v2", 2])
+def test_an_unreadable_marker_names_no_older_build(tmp_path, schema_version):
+    root = tmp_path / "runtime"
+    select(root, FIRST)
+    path = root / "current/session.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text()), schema_version=schema_version)))
+    report = select(root, SECOND)["previous_session"]
+    assert report["archived_older_marker"] is None
+    assert "older build" not in report["message"]
 
 
 def test_contender_rechecks_claimed_marker_after_acquiring_the_lifetime_lock(tmp_path, monkeypatch):
@@ -628,6 +758,7 @@ def test_the_scene_has_no_journal_family(tmp_path):
 def test_a_pending_report_of_the_earlier_version_is_kept_as_recorded(tmp_path):
     # A v2 report (four families, "scene" among them) that Headless had not
     # filed yet stays pending, byte for byte; Headless files it as recorded.
+    # (A v3 report is kept the same way.)
     root = tmp_path / "runtime"
     select(root, FIRST)
     select(root, SECOND)
@@ -639,7 +770,7 @@ def test_a_pending_report_of_the_earlier_version_is_kept_as_recorded(tmp_path):
     recorded = pending.read_bytes()
     marker = select(root, THIRD)
     assert pending.read_bytes() == recorded
-    assert marker["previous_session"]["schema_version"] == "manyforge.workbench_previous_session.v3"
+    assert marker["previous_session"]["schema_version"] == "manyforge.workbench_previous_session.v4"
     assert json.loads((root / "session-reports/pending" / (SECOND + ".json")).read_text()) == marker["previous_session"]
 
 

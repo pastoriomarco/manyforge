@@ -89,15 +89,20 @@ allowed_until(const std::chrono::steady_clock::time_point now,
                   step_deadline.value_or(std::chrono::steady_clock::time_point::max()));
 }
 
-// One INFO line per sent controller-manager call with its
-// measured duration, so that per-call caps can be set from live data.
+// One line per sent controller-manager call with its measured duration, so
+// that per-call caps can be set from live data: DEBUG for an answered call,
+// INFO for one that got no answer (cancelled, timeout).
 void log_call(const rclcpp::Logger &logger, const char *call, const char *outcome,
               const std::chrono::steady_clock::time_point started) {
-  RCLCPP_INFO(logger, "manyforge_component_call call=%s outcome=%s duration_ms=%.1f", call,
-              outcome,
-              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
-                                                        started)
-                  .count());
+  const double duration_ms =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+          .count();
+  if (std::string_view(outcome) == "answered")
+    RCLCPP_DEBUG(logger, "manyforge_component_call call=%s outcome=%s duration_ms=%.1f", call,
+                 outcome, duration_ms);
+  else
+    RCLCPP_INFO(logger, "manyforge_component_call call=%s outcome=%s duration_ms=%.1f", call,
+                outcome, duration_ms);
 }
 
 // A prepare waits for its own endpoints (the controller manager reporting
@@ -2525,7 +2530,8 @@ RetainedRos2ControlRuntimeHandle::RebindAfterRearm(const std::chrono::nanosecond
 
 void RetainedRos2ControlRuntimeHandle::InstallControllerProcessFaultSource(
     std::function<std::optional<std::string>()> source,
-    std::function<core::Result<std::optional<std::string>>()> health_source) {
+    std::function<core::Result<std::optional<std::string>>()> health_source,
+    std::function<std::string()> output_tail) {
   std::lock_guard lock(mutex_);
   if (start_attempted_ || process_fault_source_ || !source) {
     throw std::logic_error(
@@ -2533,6 +2539,7 @@ void RetainedRos2ControlRuntimeHandle::InstallControllerProcessFaultSource(
   }
   process_fault_source_ = std::move(source);
   process_health_source_ = std::move(health_source);
+  process_output_tail_ = std::move(output_tail);
 }
 
 void RetainedRos2ControlRuntimeHandle::InstallOwnerRecoveryHooks(
@@ -2668,12 +2675,14 @@ bool RetainedRos2ControlRuntimeHandle::ControllerLaunchExited() const {
 
 void RetainedRos2ControlRuntimeHandle::ReplaceControllerProcessFaultSource(
     std::function<std::optional<std::string>()> source,
-    std::function<core::Result<std::optional<std::string>>()> health_source) {
+    std::function<core::Result<std::optional<std::string>>()> health_source,
+    std::function<std::string()> output_tail) {
   std::lock_guard lock(mutex_);
   if (!process_fault_source_ || !source)
     throw std::logic_error("ROS controller process fault source replaces an installed one");
   process_fault_source_ = std::move(source);
   process_health_source_ = std::move(health_source);
+  process_output_tail_ = std::move(output_tail);
   process_diagnostic_incident_id_.clear();
   process_diagnostic_snapshot_.reset();
 }
@@ -4811,6 +4820,7 @@ RetainedRos2ControlRuntimeHandle::ReadObservation(const core::TimePoint now_ns) 
     }
   }
   std::function<core::Result<std::optional<std::string>>()> process_health;
+  std::function<std::string()> process_output_tail;
   std::function<std::optional<std::string>()> guard_fault;
   std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
   ros2_control_execution::Ros2GripperCommandBackend *gripper{};
@@ -4826,6 +4836,7 @@ RetainedRos2ControlRuntimeHandle::ReadObservation(const core::TimePoint now_ns) 
     if (!arm_ && !gripper_only_) return observation;
     clock = clock_;
     process_health = process_health_source_;
+    process_output_tail = process_output_tail_;
     recovery_marker = owner_recovery_marker_;
     recovery_qualified = owner_recovery_qualified_;
     pending_recovery_fault = owner_recovery_pending_fault_;
@@ -4882,6 +4893,9 @@ RetainedRos2ControlRuntimeHandle::ReadObservation(const core::TimePoint now_ns) 
       observation.process_fault = exited.error().message;
     else if (exited.value())
       observation.process_fault = *exited.value();
+    // Memory only, outside this handle's lock: the launch's own output lock.
+    if (observation.process_fault && process_output_tail)
+      observation.process_output_tail = process_output_tail();
   }
   if (guard_fault) observation.guard_fault = guard_fault();
   // A second publisher on the component's controller-manager or

@@ -59,6 +59,7 @@ from .contracts import (
     RuntimeArtifactIdentity,
     SERVICE_BIND_HOSTS,
     SERVICE_PORTS,
+    STATUS_SCHEMA,
     ServiceEndpoint,
     ServiceKind,
     SourceIdentityV1,
@@ -91,7 +92,8 @@ from . import run_session
 _CELL_ROOT_ENTRIES = frozenset({CELL_LAYOUT_MARKER, "data", "history", "operator"})
 
 
-STATUS_ENVELOPE_SCHEMA = "manyforge.native_operator_instance.v2"
+STATUS_ENVELOPE_SCHEMA = "manyforge.native_operator_instance.v3"
+_STATUS_ENVELOPE_FAMILY = "manyforge.native_operator_instance.v"
 STATUS_RECORD_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_STATE_ROOT = Path(".manyforge-var/operator")
 DEFAULT_TIMEOUT_SECONDS = 60.0
@@ -338,10 +340,6 @@ class NativeLauncherConfig:
         return f"http://127.0.0.1:{SERVICE_PORTS['headless']}/"
 
     @property
-    def program_runner_url(self) -> str:
-        return f"http://127.0.0.1:{SERVICE_PORTS['program_runner']}/"
-
-    @property
     def composer_url(self) -> str:
         return f"http://{self.advertised_host}:{SERVICE_PORTS['composer']}/"
 
@@ -443,6 +441,12 @@ def native_commands(
             # assistant's bridge reads Headless and calls back into Composer.
             "MANYFORGE_COMPOSER_URL": f"http://127.0.0.1:{SERVICE_PORTS['composer']}",
             "MANYFORGE_HEADLESS_API_URL": config.headless_url.rstrip("/"),
+            # Motion-trace snapshots for the debug export, in the execution
+            # host's capped store (5 MiB each, 64 MiB in total, oldest first)
+            # below this run's folder, as the development workbench keeps
+            # them; set it empty for traces inline. Headless reads it too.
+            "MANYFORGE_MOTION_TRACE_DIR": os.environ.get(
+                "MANYFORGE_MOTION_TRACE_DIR", str(config.current_root / "motion-traces")),
         },
         config.source_root,
     )
@@ -452,8 +456,12 @@ def native_commands(
     )
     if previous_session_id is not None:
         previous_session_arguments += ("--workbench-previous-session-id", previous_session_id)
+    # -X faulthandler: a fatal signal writes every thread's Python traceback
+    # to the process's output (its journal), then the default termination.
     headless = (
         sys.executable,
+        "-X",
+        "faulthandler",
         "-m",
         "manyforge_headless_api",
         "serve",
@@ -494,17 +502,17 @@ def native_commands(
         "2000",
         "--manager-timeout-s",
         str(config.manager_timeout_seconds),
-        "--program-runner-url",
-        config.program_runner_url,
+        "--program-runner-socket-root",
+        str(config.manager_run_root),
     )
     program_runner = [
         sys.executable,
+        "-X",
+        "faulthandler",
         "-m",
         "manyforge_program_runner",
-        "--host",
-        SERVICE_BIND_HOSTS["program_runner"],
-        "--port",
-        str(SERVICE_PORTS["program_runner"]),
+        "--program-socket-root",
+        str(config.manager_run_root),
         "--headless-url",
         config.headless_url,
         "--snapshot-url",
@@ -528,6 +536,8 @@ def native_commands(
         )
     composer = (
         sys.executable,
+        "-X",
+        "faulthandler",
         "-m",
         "manyforge_composer",
         "--host",
@@ -1024,7 +1034,22 @@ class _StateStore:
                 finally:
                     os.close(descriptor)
             envelope = json.loads(b"".join(chunks).decode("utf-8"))
-            if envelope.get("schema_version") != STATUS_ENVELOPE_SCHEMA:
+            schema_version = envelope.get("schema_version")
+            if (
+                isinstance(schema_version, str)
+                and schema_version.startswith(_STATUS_ENVELOPE_FAMILY)
+                and schema_version != STATUS_ENVELOPE_SCHEMA
+            ):
+                raise LauncherError(
+                    "status_record_invalid",
+                    f"launch record {self.record_path} is in the format "
+                    f"{schema_version} of an earlier ManyForge version; it is "
+                    f"not read or converted. If that instance may still run, "
+                    f"stop it with the version that started it; then start a "
+                    f"new instance (another --instance-id or --state-root).",
+                    exit_code=70,
+                )
+            if schema_version != STATUS_ENVELOPE_SCHEMA:
                 raise ValueError("unexpected status envelope schema")
             status = LaunchInstanceStatus.model_validate_json(
                 json.dumps(envelope["status"], ensure_ascii=False)
@@ -1197,7 +1222,7 @@ def _status(
         readiness, key=lambda item: (item.component_id, item.authority, item.source_schema)
     )
     return LaunchInstanceStatus(
-        schema_version="manyforge.launch_instance_status.v2",
+        schema_version=STATUS_SCHEMA,
         launch_instance_id=instance_id,
         record_generation=generation,
         configuration=configuration,
@@ -1280,7 +1305,6 @@ class NativeLauncher:
             instance_id=instance_id,
             instance_root=root,
             headless_url="http://127.0.0.1:9010/",
-            program_runner_url="http://127.0.0.1:9011/",
             composer_url="http://localhost:9000/",
             manager_state_root=root / "current" / "manager",
             manager_run_root=root / "current" / "manager-run",
@@ -1492,7 +1516,6 @@ class NativeLauncher:
             probes = (
                 (SERVICE_BIND_HOSTS["composer"], 9000),
                 ("127.0.0.1", 9010),
-                ("127.0.0.1", 9011),
             )
         listeners: list[socket.socket] = []
         try:
@@ -1517,6 +1540,24 @@ class NativeLauncher:
             raise ValueError("owner response must be a JSON object")
         return value
 
+    def _program_runner_health(self) -> dict[str, Any]:
+        """The runner's health over its command socket in the Manager run
+        root (through ``manyforge_headless_py``, as Headless reaches it)."""
+
+        try:
+            from manyforge_headless_api.program_runner_client import (
+                ProgramRunnerClient,
+                ProgramRunnerClientError,
+            )
+
+            return ProgramRunnerClient(
+                self.config.manager_run_root, timeout_seconds=2.0
+            ).health()
+        except ImportError as error:
+            raise ValueError(f"Program runner link is unavailable: {error}") from error
+        except ProgramRunnerClientError as error:
+            raise ValueError(f"{error.code}: {error}") from error
+
     def _readiness(
         self, configuration: LaunchConfiguration | None = None
     ) -> tuple[bool, list[ReadinessObservation], str | None]:
@@ -1524,36 +1565,29 @@ class NativeLauncher:
             endpoint_urls = {}
         else:
             # Readiness is queried from the local runtime host.  The
-            # advertised URL may be a LAN address, while Headless and the
-            # Program runner intentionally bind loopback and Composer binds
-            # all interfaces; never use the public address as a local probe.
+            # advertised URL may be a LAN address, while Headless
+            # intentionally binds loopback and Composer binds all
+            # interfaces; never use the public address as a local probe.
             endpoint_urls = {
                 endpoint.service: (
                     f"http://{('127.0.0.1' if endpoint.bind_host in {'0.0.0.0', '::'} else endpoint.bind_host)}:{endpoint.port}/"
                 )
                 for endpoint in configuration.endpoints
             }
-        endpoints = (
-            (
-                "headless",
-                f"{endpoint_urls.get(ServiceKind.HEADLESS, self.config.headless_url)}api/health",
-            ),
-            (
-                "program_runner",
-                f"{endpoint_urls.get(ServiceKind.PROGRAM_RUNNER, self.config.program_runner_url)}api/program/health",
-            ),
-            (
-                "composer",
-                f"{endpoint_urls.get(ServiceKind.COMPOSER, self.config.composer_url)}api/health",
-            ),
+        headless_url = f"{endpoint_urls.get(ServiceKind.HEADLESS, self.config.headless_url)}api/health"
+        composer_url = f"{endpoint_urls.get(ServiceKind.COMPOSER, self.config.composer_url)}api/health"
+        endpoints: tuple[tuple[str, Callable[[], dict[str, Any]]], ...] = (
+            ("headless", lambda: self._response(headless_url)),
+            ("program_runner", self._program_runner_health),
+            ("composer", lambda: self._response(composer_url)),
         )
         rows: list[ReadinessObservation] = []
         all_ready = True
         failure: str | None = None
         now = _safe_unix_timestamp()
-        for component, url in endpoints:
+        for component, read in endpoints:
             try:
-                payload = self._response(url)
+                payload = read()
                 if component == "headless":
                     ready = payload.get("status") == "ready" and payload.get("headless_projection_ready") is True
                     schema = "manyforge.headless_health.v1"
@@ -2064,7 +2098,8 @@ class NativeLauncher:
                 # A failed write leaves the run "started": the next start
                 # treats it as ended uncleanly (OD-229).
                 try:
-                    run_session.record_stopped(root, root_fd, marker, verified=exit_status == MANAGER_STOPPED)
+                    run_session.record_stopped(root, root_fd, marker, verified=exit_status == MANAGER_STOPPED,
+                                               manager_returncode=exit_status)
                 except OSError as error:
                     raise LauncherError(
                         "run_end_not_recorded", f"{root}: {error}"[:1024], exit_code=71,

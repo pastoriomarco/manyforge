@@ -175,6 +175,16 @@ struct ControllerLaunchOutputSnapshot final {
   std::uint64_t dropped_forward_bytes{0};
 };
 
+/// The bounds of a launch fault's `output_tail` detail.
+inline constexpr std::size_t kLaunchOutputTailLines = 40U;
+inline constexpr std::size_t kLaunchOutputTailBytes = 4096U;
+
+/// A launch fault's `output_tail` detail from the launch's retained output:
+/// its last `kLaunchOutputTailLines` lines, at most `kLaunchOutputTailBytes`
+/// bytes, starting on a UTF-8 boundary, without trailing line breaks; empty
+/// when nothing is left or the text is not NFC.
+[[nodiscard]] std::string LaunchOutputTailDetail(std::string_view retained);
+
 /// One started launch process. Its own process group holds the whole
 /// `ros2 launch` tree; stopping signals the group. On parent death the canonical
 /// Mock/Isaac controller launch roles receive SIGINT, other roles SIGTERM
@@ -219,6 +229,12 @@ public:
   /// Cached only: never waits for group cleanup, scans proc, or signals.
   [[nodiscard]] ControllerLaunchCleanupObservation cleanup_observation();
   [[nodiscard]] ControllerLaunchOutputSnapshot output_snapshot() const;
+  /// `LaunchOutputTailDetail` of the retained output, built under the
+  /// output's own lock without copying the whole tail (memory only).
+  [[nodiscard]] std::string output_tail_detail() const;
+  /// Whether the retained output contains `text`, searched under the
+  /// output's own lock without copying it (memory only).
+  [[nodiscard]] bool output_contains(std::string_view text) const;
   /// Occurrence-local scalar query; does not copy the output tail.
   [[nodiscard]] ControllerLaunchForwardingCounters output_counters() const;
   /// Refresh the existing request identity for future diagnostics after Retain.

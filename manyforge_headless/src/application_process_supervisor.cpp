@@ -1,11 +1,13 @@
 #include "application_process_supervisor.hpp"
 
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/process_diagnostics.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -149,8 +151,9 @@ ParseApplicationProcessList(const std::string_view document) {
 
 ApplicationProcessSupervisor::ApplicationProcessSupervisor(
     std::vector<ApplicationProcessSpec> specs,
-    const core::ApplicationStartId application_start_id)
-    : specs_(std::move(specs)) {
+    const core::ApplicationStartId application_start_id,
+    const std::uint64_t core_dump_limit_bytes)
+    : specs_(std::move(specs)), core_dump_limit_bytes_(core_dump_limit_bytes) {
   const auto text = core::FormatApplicationStartId(application_start_id);
   application_start_text_.assign(text.data(), text.size());
   running_.reserve(specs_.size());
@@ -218,9 +221,16 @@ void ApplicationProcessSupervisor::Launch(const std::size_t spec_index) {
     sigemptyset(&default_action.sa_mask);
     sigset_t empty_mask;
     sigemptyset(&empty_mask);
+    // The core-file size limit's soft value is the site's (0, core dumps
+    // off, by default), at most the hard limit, which is kept.
+    struct rlimit core_limit {};
+    const bool core_limit_read = ::getrlimit(RLIMIT_CORE, &core_limit) == 0;
+    core_limit.rlim_cur =
+        std::min(static_cast<rlim_t>(core_dump_limit_bytes_), core_limit.rlim_max);
     if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 ||
         ::sigaction(SIGPIPE, &default_action, nullptr) != 0 ||
-        ::sigprocmask(SIG_SETMASK, &empty_mask, nullptr) != 0) {
+        ::sigprocmask(SIG_SETMASK, &empty_mask, nullptr) != 0 ||
+        !core_limit_read || ::setrlimit(RLIMIT_CORE, &core_limit) != 0) {
       error = errno;
     } else if (::getppid() != parent) {
       error = ESRCH;
@@ -253,7 +263,8 @@ void ApplicationProcessSupervisor::Launch(const std::size_t spec_index) {
                                                                  : EIO);
   }
   running_.push_back({spec_index, pid});
-  std::cerr << "started " << RoleText(spec.role) << " pid=" << pid << '\n';
+  core::LogLine(core::LogSeverity::kInfo, core::LogText("started ", RoleText(spec.role),
+                                   " pid=", pid));
 }
 
 std::optional<ApplicationProcessExit> ApplicationProcessSupervisor::PollExit() {
@@ -265,10 +276,10 @@ std::optional<ApplicationProcessExit> ApplicationProcessSupervisor::PollExit() {
     } while (result < 0 && errno == EINTR);
     if (result == 0) continue;
     if (result < 0) FailErrno("observe " + RoleText(specs_[child->spec_index].role), errno);
-    ApplicationProcessExit exit{specs_[child->spec_index].role,
-                                WIFSIGNALED(status),
-                                WIFSIGNALED(status) ? WTERMSIG(status)
-                                                    : WEXITSTATUS(status)};
+    ApplicationProcessExit exit{
+        specs_[child->spec_index].role, WIFSIGNALED(status),
+        WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status),
+        child->pid, WIFSIGNALED(status) && WCOREDUMP(status) != 0};
     running_.erase(child);
     return exit;
   }
@@ -295,8 +306,8 @@ bool ApplicationProcessSupervisor::StopAll(
       kill_child();
     } else {
       static_cast<void>(::kill(child.pid, SIGTERM));
-      std::cerr << "application stop: waiting at " << role << ": pid="
-                << child.pid << " to exit\n";
+      core::LogLine(core::LogSeverity::kInfo, core::LogText("application stop: waiting at ", role,
+                                      ": pid=", child.pid, " to exit"));
     }
     // No time limit: the exit (waitpid) ends the wait, or a second stop
     // request, which kills the process.
@@ -304,11 +315,12 @@ bool ApplicationProcessSupervisor::StopAll(
       int status = 0;
       const auto result = ::waitpid(child.pid, &status, WNOHANG);
       if (result == child.pid) {
-        std::cerr << "application stop: " << role << " exited pid=" << child.pid
-                  << (WIFSIGNALED(status) ? " signal=" : " status=")
-                  << (WIFSIGNALED(status) ? WTERMSIG(status)
-                                          : WEXITSTATUS(status))
-                  << '\n';
+        core::LogLine(core::LogSeverity::kInfo,
+                      core::LogText("application stop: ", role,
+                                    " exited pid=", child.pid,
+                                    WIFSIGNALED(status) ? " signal=" : " status=",
+                                    WIFSIGNALED(status) ? WTERMSIG(status)
+                                                        : WEXITSTATUS(status)));
         break;
       }
       if (result < 0 && errno != EINTR) break;
