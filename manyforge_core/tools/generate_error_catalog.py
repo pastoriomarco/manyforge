@@ -166,7 +166,9 @@ def http_status(code: str) -> int:
         or code in RUN_REFUSAL_CODES
     ):
         return 409
-    if "unavailable" in code or code in {
+    # A busy refusal is "try again later" (OD-413), unless a rule above makes
+    # it a conflict.
+    if "unavailable" in code or code.endswith("_busy") or code in {
         "assistant_ai_model_absent",
         "headless_api_closed",
         "kernel_owner_unavailable",
@@ -178,8 +180,6 @@ def http_status(code: str) -> int:
         "program_cycle_reconciliation_required",
         "request_ledger_full",
         "scene_projection_commit_uncertain",
-        "execution_control_ingress_busy",
-        "execution_planning_jobs_busy",
         # A runtime unit launching or preparing (contract 1.3).
         "runtime_unit_launch_in_progress",
     }:

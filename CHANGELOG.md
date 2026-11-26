@@ -427,6 +427,10 @@ nothing changes. For batch use the scripts remain:
 
 ### Changed
 
+- **Busy refusals answer HTTP 503.** Headless answers a refusal whose code
+  ends in `_busy` (for example `execution_submission_lane_busy`) with 503,
+  "try again", instead of 500; the two busy codes that mean a conflict with
+  another operation stay 409.
 - **Program steps are faster.** The Program runner no longer calls Headless
   over HTTP: a C++ core in the runner (Headless uses the same one) sends each
   effect over local sockets, scene reads, commits and the between-node latch

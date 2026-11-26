@@ -723,9 +723,9 @@ their defaults until set.
 **Activation.** An inactive rule doesn't watch, trip, Stop or hold; its state
 is `inactive`. The node **Set rule active** (`rules.set_active`, parameters
 `rule_id` and `active`) activates or deactivates one rule of the Deployment
-and succeeds at once; a `rule_id` that isn't in the Deployment fails the node
-with `rule_unknown`. Activating a rule whose condition already holds trips it
-at once. Every rule returns to its `active_at_start` at the end of every run
+and succeeds at once; a `rule_id` that isn't in the Deployment refuses
+Execute with `rule_unknown`. Activating a rule whose condition already holds
+trips it at once. Every rule returns to its `active_at_start` at the end of every run
 (completed, failed or stopped), at Reset, and after every Apply (Load and New
 included). A rule meant to guard the cell at all times needs
 `active_at_start: true`.
@@ -742,8 +742,8 @@ included). A rule meant to guard the cell at all times needs
   longer true the hold clears by itself; there is nothing to acknowledge.
   - `after_stop: hold` (default): the Program run is held like the operator's
     Stop, also when nothing in the rule's scope was moving. It continues only
-    with **Resume**, which waits until the rule no longer holds. If the run
-    ends from there, its end is `stopped` with `stopped_by: rule` and the
+    with **Resume**, which is refused with `rule_holds` while the rule holds.
+    If the run ends from there, its end is `stopped` with `stopped_by: rule` and the
     `rule_id`.
   - `after_stop: fail_node`: the stopped motion node fails with
     `interrupt_fault` and the run continues, so the Program's own failure
