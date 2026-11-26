@@ -8,10 +8,10 @@
     "date": "2026-08-06",
     "selected_source_id": "roboplan_0_6_0_candidate",
     "rejected_source_id": "roboplan_0_5_1_control",
-    "rationale": "Adopt the current upstream release before I6 so one focused adapter is restored and qualified once against the long-lived baseline. Four small upstream-ready dependency-internal fixes preserve correctness and bounds; historical authority and integration patches move to ManyForge boundaries; exact source closure, compatibility, containment, sanitizer, packaging, and performance evidence shows no safety, reliability, or supportability blocker.",
+    "rationale": "Adopt the current upstream release before native restoration so one focused adapter is restored and qualified once against the long-lived baseline. Four small upstream-ready dependency-internal fixes preserve correctness and bounds; historical authority and integration patches move to ManyForge boundaries; exact source closure, compatibility, containment, sanitizer, packaging, and performance evidence shows no safety, reliability, or supportability blocker.",
     "accepted_tradeoffs": [
-      "The exact E1 UR5 joint-RRT fixture is about 12-13% slower, roughly 1.4-1.8 ms, while remaining inside its fixed absolute bounds; Cartesian planning is about 56% faster and other measured workloads, memory, cancellation, replacement, and recovery are comparable or better.",
-      "Retiring patch 0007 accepts 6.6% more allocation calls and 17.6% more allocated bytes on its isolated fixture because the measured runtime benefit is negligible and RoboPlan 0.6 exposes no safe reusable-scratch hook; I6 retains ordinary end-to-end allocation and performance gates."
+      "The exact external dependency convergence UR5 joint-RRT fixture is about 12-13% slower, roughly 1.4-1.8 ms, while remaining inside its fixed absolute bounds; Cartesian planning is about 56% faster and other measured workloads, memory, cancellation, replacement, and recovery are comparable or better.",
+      "Retiring patch 0007 accepts 6.6% more allocation calls and 17.6% more allocated bytes on its isolated fixture because the measured runtime benefit is negligible and RoboPlan 0.6 exposes no safe reusable-scratch hook; native restoration retains ordinary end-to-end allocation and performance gates."
     ]
   },
   "purpose": "Preserve every behavior supplied by a consumed external delta, assign it to its future owner, and carry only externally unavoidable fixes with upstream-ready evidence.",
@@ -116,7 +116,7 @@
         "spdx": "MIT",
         "sha256": "eb1aefeda6ceb10afdf5f0a35fdd9c372d643fc7632a561c32b3226e68ed4d4d"
       },
-      "role": "frozen RoboPlan 0.6.0 operator-directed restoration source retained until UA7 qualification"
+      "role": "frozen RoboPlan 0.6.0 operator-directed restoration source retained until integrated-path qualification"
     },
     {
       "id": "roboplan_0_7_0_foundation",
@@ -134,7 +134,7 @@
         "spdx": "MIT",
         "sha256": "eb1aefeda6ceb10afdf5f0a35fdd9c372d643fc7632a561c32b3226e68ed4d4d"
       },
-      "role": "UI6-I-UA1 exact RoboPlan 0.7.0 foundation source; the frozen 0.6 record remains operator-directed restoration evidence until UA7 qualification"
+      "role": "RoboPlan 0.7 source foundation: exact RoboPlan 0.7.0 foundation source; the frozen 0.6 record remains operator-directed restoration evidence until integrated-path qualification"
     },
     {
       "id": "proxsuite_0_7_3_candidate_dependency",
@@ -172,7 +172,7 @@
           "state": "uninitialized"
         }
       ],
-      "role": "exact ProxSuite solver dependency shared by the frozen RoboPlan 0.6 restoration closure and the UI6-I-UA1 RoboPlan 0.7 foundation"
+      "role": "exact ProxSuite solver dependency shared by the frozen RoboPlan 0.6 restoration closure and the RoboPlan 0.7 source foundation"
     },
     {
       "id": "proxsuite_cmake_module_candidate_dependency",
@@ -225,7 +225,7 @@
         "spdx": "MIT",
         "sha256": "80d9415117d2a3cbee058702e8776bcb1986c7c6fcb69f1b81176f10d88db952"
       },
-      "role": "UI6-I-UA1 exact RoboPlan 0.7 time-parameterization dependency"
+      "role": "RoboPlan 0.7 source foundation: exact RoboPlan 0.7 time-parameterization dependency"
     },
     {
       "id": "xarm_jazzy_functional_base",
@@ -249,7 +249,7 @@
         "commit": "c3172e57c1c1bb2982fc008304ad6bc886357c87",
         "tree": "00056796f565dddfa6098d1b1c2661de102671b6"
       },
-      "role": "current xArm relocation source routed to I10/I12"
+      "role": "current xArm relocation source routed to real-robot restoration/multi-robot qualification"
     },
     {
       "id": "xarm_sdk_control",
@@ -298,7 +298,7 @@
         "spdx": "MIT",
         "sha256": "eb1aefeda6ceb10afdf5f0a35fdd9c372d643fc7632a561c32b3226e68ed4d4d"
       },
-      "role": "M9 exact RoboPlan 0.8.0 source; build content is the tree after the 0.8 patch series"
+      "role": "RoboPlan 0.8 upgrade: exact RoboPlan 0.8.0 source; build content is the tree after the 0.8 patch series"
     },
     {
       "id": "proxsuite_0_8_2_dependency",
@@ -366,7 +366,7 @@
       "qualification_requirement": "adapter implementation milestone",
       "acceptance_evidence": [
         "unchanged portable request reaches reference and selected RoboPlan adapters",
-        "retained I3 product semantics and projection identities remain unchanged"
+        "retained deployment compiler product semantics and projection identities remain unchanged"
       ]
     },
     {
@@ -531,12 +531,12 @@
         "historical manyforge_roboplan scene-generation contract",
         "native and ROS Docker RoboPlan source builds"
       ],
-      "owner_gate": "E1 decision and I6 adapter",
+      "owner_gate": "external dependency convergence decision and native restoration adapter",
       "acceptance_evidence": [
         "fresh immutable native Scene per retained projection",
         "5/5 native source-destruction, reconstruction, wrong-generation, concurrent-isolation, and ASan/UBSan cases",
         "five historical Scene-generation successor cases and common selected-adapter conformance pass against the corrected candidate",
-        "final selected-outcome result, in the RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository), records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip"
+        "final selected-outcome result, in the RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository), records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final external dependency convergence contract cases with one intended optional historical-data skip"
       ],
       "rollback_source": "RoboPlan 0.5.1 plus the exact cfa676dc patch",
       "removal_condition": "Delete when the selected adapter reconstructs one request-private native Scene from the ManyForge logical snapshot and clone/replacement behavior is no longer consumed, or when selected upstream supplies an equivalent proven contract.",
@@ -587,7 +587,7 @@
         "historical ManyForge Cartesian planner adapter",
         "bounded cancellation/progress qualification corpus"
       ],
-      "owner_gate": "E1 containment decision and I6 adapter",
+      "owner_gate": "external dependency convergence containment decision and native restoration adapter",
       "acceptance_evidence": [
         "22-case Docker finite-admission, caller-bound projection, actual-candidate bootstrap, sealed-result, orphan-cleanup, and warmed-worker containment suite",
         "common selected-adapter conformance executable covers 11 supported-or-exact-rejection cases and advertises only joint, pose, Cartesian, first-feasible, and IK",
@@ -627,7 +627,7 @@
         "historical IK, OInK, RRT, TOPPRA, Cartesian, and path utility calls",
         "scene source-lifetime sanitizer corpus"
       ],
-      "owner_gate": "E1 lifetime decision and I6 adapter",
+      "owner_gate": "external dependency convergence lifetime decision and native restoration adapter",
       "acceptance_evidence": [
         "adapter/worker owns Scene longer than all native consumers",
         "5/5 source-destruction, exact-generation mismatch, ASan/UBSan, and concurrent-isolation cases",
@@ -686,7 +686,7 @@
       "consuming_surfaces": [
         "native and ROS Docker source builds"
       ],
-      "owner_gate": "E1",
+      "owner_gate": "external dependency convergence",
       "acceptance_evidence": [
         "tests/test_roboplan_source_stack_builder.py",
         "clean raw 0.6 source-stack build with just-built libraries ahead of ambient same-soname generations",
@@ -739,14 +739,14 @@
         "RoboPlan Scene construction and geometry mutation",
         "strict scene lifetime sanitizer corpus"
       ],
-      "owner_gate": "E1 dependency-internal correctness decision",
+      "owner_gate": "external dependency convergence dependency-internal correctness decision",
       "acceptance_evidence": [
         "raw 0.6 Release upstream suite",
         "raw 0.6 UBSan invalid Eigen ComputationInfo read at scene.cpp:185 through pinocchio::Data assignment",
         "candidate 0.6 complete 47-case roboplan ASan/UBSan suite and 128 repeated Scene mutation cases",
         "corrected exact disconnected full-stack build and 47/47 source-installed Python corpus",
         "5/5 adapter-shaped native lifetime ASan/UBSan cases, five historical Scene-generation behaviors, and comparable Scene/collision performance",
-        "final selected-outcome result, in the RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository), records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
+        "final selected-outcome result, in the RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository), records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final external dependency convergence contract cases with one intended optional historical-data skip",
         "third_party/roboplan/upstream/roboplan-060-scene-scratch-construction-ubsan.md",
         "Pinocchio-version compatibility analysis"
       ],
@@ -815,7 +815,7 @@
         "historical bounded Cartesian planner",
         "extreme-speed and acceleration resource regressions"
       ],
-      "owner_gate": "E1 arithmetic/containment decision and I6 adapter",
+      "owner_gate": "external dependency convergence arithmetic/containment decision and native restoration adapter",
       "acceptance_evidence": [
         "finite and representable adapter input proof",
         "raw 0.6 non-finite dt reaches an unstructured vector::reserve exception with exact candidate libraries selected",
@@ -824,7 +824,7 @@
         "third_party/roboplan/upstream/roboplan-060-toppra-output-sample-bound.md",
         "22-case pre-dispatch finite/sample-budget, caller-bound projection, actual-candidate bootstrap, sealed-result, and worker peak-memory/resource-termination suite",
         "corrected exact disconnected four-patch source stack builds and its source-installed Python corpus passes 47/47",
-        "final selected-outcome result, in the RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository), records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
+        "final selected-outcome result, in the RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository), records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final external dependency convergence contract cases with one intended optional historical-data skip",
         "five fresh interleaved performance cohorts show no material TOPPRA regression and a material Cartesian improvement"
       ],
       "rollback_source": "RoboPlan 0.5.1 plus the exact c0b699d5 patch",
@@ -905,7 +905,7 @@
         "historical performance-qualified RoboPlan adapters",
         "collision allocation/latency and timeout-candidate regressions"
       ],
-      "owner_gate": "E1 measured performance disposition and I6 adapter performance qualification",
+      "owner_gate": "external dependency convergence measured performance disposition and native restoration adapter performance qualification",
       "acceptance_evidence": [
         "five fresh interleaved Release control/candidate offline and actual-worker cohorts with exact binary/source/closure identities",
         "candidate joint RRT has a reproducible material 12-13% median/throughput regression (about 1.4-1.8 ms), while Cartesian is about 56% faster and collision, IK, TOPPRA, memory, kill, replacement, and recovery remain comparable or better",
@@ -916,11 +916,11 @@
         "joint RRT, pose IK, TOPPRA, Cartesian, exact-generation mismatch, sealed trajectory transfer, parity, sanitizer, and recovery cases"
       ],
       "rollback_source": "Historical ec2d17b patch blob 627a9e3; current candidate removes only its integration-only source-prefix hunk.",
-      "removal_condition": "Delete the broad dependency API when raw 0.6 provides request-private generation-safe scratch and the direct A/B shows no practical latency/throughput benefit sufficient to justify a new upstream hook; retain the evidence for ordinary I6 allocation and performance regression checks.",
+      "removal_condition": "Delete the broad dependency API when raw 0.6 provides request-private generation-safe scratch and the direct A/B shows no practical latency/throughput benefit sufficient to justify a new upstream hook; retain the evidence for ordinary native restoration allocation and performance regression checks.",
       "disposition": {
         "state": "frozen",
         "selection": "delete_upstream_equivalent",
-        "rationale": "Raw 0.6 already constructs request-private generation-safe collision scratch, so the correctness and lifetime guarantee has an upstream equivalent. Its only public RRT::plan entrypoint creates a fresh CollisionContext and exposes no safe injection hook. The direct 0.5.1 A/B attributes 6.6% fewer operator-new calls and 17.6% fewer bytes to reuse, but only -0.45% p50 and +0.74% throughput; candidate memory and containment remain inside the frozen bounds. Adding and maintaining a new lifetime-bearing dependency API for that negligible runtime gain is not justified. I6 retains ordinary allocation/performance regression checks, not a promise to reproduce this retired internal optimization. The separate 0.6 joint-RRT regression remains an explicit Adopt/No-go tradeoff."
+        "rationale": "Raw 0.6 already constructs request-private generation-safe collision scratch, so the correctness and lifetime guarantee has an upstream equivalent. Its only public RRT::plan entrypoint creates a fresh CollisionContext and exposes no safe injection hook. The direct 0.5.1 A/B attributes 6.6% fewer operator-new calls and 17.6% fewer bytes to reuse, but only -0.45% p50 and +0.74% throughput; candidate memory and containment remain inside the frozen bounds. Adding and maintaining a new lifetime-bearing dependency API for that negligible runtime gain is not justified. native restoration retains ordinary allocation/performance regression checks, not a promise to reproduce this retired internal optimization. The separate 0.6 joint-RRT regression remains an explicit Adopt/No-go tradeoff."
       }
     },
     {
@@ -958,7 +958,7 @@
         "RoboPlan RRT and constrained-RRT state-space construction",
         "selected RoboPlan Python RRT binding"
       ],
-      "owner_gate": "E1 dependency-internal reliability decision",
+      "owner_gate": "external dependency convergence dependency-internal reliability decision",
       "acceptance_evidence": [
         "raw exact 0.6 emits eight -Wmaybe-uninitialized paths and fails when that warning is promoted to an error",
         "corrected warning-as-error Release build and 15/15 RRT cases",
@@ -1019,12 +1019,12 @@
         "RoboPlan Simple IK",
         "selected RoboPlan Python RRT and Simple IK bindings"
       ],
-      "owner_gate": "E1 dependency-internal correctness decision",
+      "owner_gate": "external dependency convergence dependency-internal correctness decision",
       "acceptance_evidence": [
         "raw exact 0.6 constrained-RRT UBSan invalid Eigen ComputationInfo read at constraints.cpp:56",
         "corrected native lifetime 5/5, RRT 15/15, and Simple IK 4/4 ASan/UBSan cases",
         "corrected Release RRT 15/15 and Simple IK 4/4, ASan/UBSan RRT 17/17 and Simple IK 4/4, and complete Python corpus 47/47",
-        "common selected-adapter conformance and five historical Scene-generation behaviors pass; final selected-outcome result records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
+        "common selected-adapter conformance and five historical Scene-generation behaviors pass; final selected-outcome result records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final external dependency convergence contract cases with one intended optional historical-data skip",
         "fresh performance evidence discloses the release-level joint-RRT regression rather than making a blanket per-patch no-regression claim",
         "third_party/roboplan/upstream/roboplan-060-pinocchio-scratch-direct-initialization.md"
       ],
@@ -1075,10 +1075,10 @@
         "RoboPlan 0.8 roboplan_core Scene construction and refreshCollisionData geometry mutation",
         "manyforge_roboplan_scene_factory retained-model Scene construction"
       ],
-      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "owner_gate": "RoboPlan 0.8 upgrade; dependency-internal correctness decision",
       "acceptance_evidence": [
-        "M9-R1 0.8 source inspection: Scene still default-constructs model_data_ and collision_model_data_ and reassigns GeometryData in refreshCollisionData",
-        "M9-R1 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream roboplan_core 8/8 in Release and ASan+UBSan; ManyForge RoboPlan adapter tests 96/96",
+        "RoboPlan 0.8 source inspection: Scene still default-constructs model_data_ and collision_model_data_ and reassigns GeometryData in refreshCollisionData",
+        "RoboPlan 0.8 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream roboplan_core 8/8 in Release and ASan+UBSan; ManyForge RoboPlan adapter tests 96/96",
         "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation",
         "third_party/roboplan/upstream/roboplan-060-scene-scratch-construction-ubsan.md retains the clean 0.6 UBSan reproduction"
       ],
@@ -1087,7 +1087,7 @@
       "disposition": {
         "state": "frozen",
         "selection": "submit_upstream_and_carry_until_released",
-        "rationale": "Re-ported 0.8 successor of the E1 0.6 correction. RoboPlan 0.8 centralizes the reassignment in refreshCollisionData but still default-constructs and then assigns nontrivial Pinocchio scratch; an adapter cannot make dependency-internal construction defined, so the smallest construction fix is carried until an upstream release supplies it.",
+        "rationale": "Re-ported 0.8 successor of the external dependency convergence 0.6 correction. RoboPlan 0.8 centralizes the reassignment in refreshCollisionData but still default-constructs and then assigns nontrivial Pinocchio scratch; an adapter cannot make dependency-internal construction defined, so the smallest construction fix is carried until an upstream release supplies it.",
         "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-scene-scratch-construction-ubsan.md",
         "dossier_fields": [
           "exact_upstream_source",
@@ -1129,10 +1129,10 @@
         "RoboPlan 0.8 roboplan_toppra time parameterization (joint moves and TimeOptimal Cartesian timing)",
         "RoboPlan 0.8 Python TOPPRA max_output_samples option"
       ],
-      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "owner_gate": "RoboPlan 0.8 upgrade; dependency-internal correctness decision",
       "acceptance_evidence": [
-        "M9-R1 0.8 source inspection: PathParameterizerTOPPRA::generate still converts the solver duration to a sample count without a finiteness or cardinality check",
-        "M9-R1 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream test_toppra 20/20 under ASan+UBSan including the patch's own cases; in Release 19/20, the one failure (LinearBlendIsFastAndRespectsLimitsOnSharpCorner) fails identically on raw 0.8.0",
+        "RoboPlan 0.8 source inspection: PathParameterizerTOPPRA::generate still converts the solver duration to a sample count without a finiteness or cardinality check",
+        "RoboPlan 0.8 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream test_toppra 20/20 under ASan+UBSan including the patch's own cases; in Release 19/20, the one failure (LinearBlendIsFastAndRespectsLimitsOnSharpCorner) fails identically on raw 0.8.0",
         "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation",
         "third_party/roboplan/upstream/roboplan-060-toppra-output-sample-bound.md retains the clean 0.6 reproduction"
       ],
@@ -1141,7 +1141,7 @@
       "disposition": {
         "state": "frozen",
         "selection": "submit_upstream_and_carry_until_released",
-        "rationale": "Re-ported 0.8 successor of the E1 0.6 guard. The solver-derived duration and sample cardinality exist only inside RoboPlan, so the smallest dependency-local guard is carried until an upstream release supplies it. RoboPlan 0.8 Bounded Cartesian timing samples its own trajectory outside TOPP-RA; that loop is deliberately not patched: the planning deadline bounds it (the worker process is killed) and ManyForge rejects any result above maximum_trajectory_samples.",
+        "rationale": "Re-ported 0.8 successor of the external dependency convergence 0.6 guard. The solver-derived duration and sample cardinality exist only inside RoboPlan, so the smallest dependency-local guard is carried until an upstream release supplies it. RoboPlan 0.8 Bounded Cartesian timing samples its own trajectory outside TOPP-RA; that loop is deliberately not patched: the planning deadline bounds it (the worker process is killed) and ManyForge rejects any result above maximum_trajectory_samples.",
         "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-toppra-output-sample-bound.md",
         "dossier_fields": [
           "exact_upstream_source",
@@ -1178,10 +1178,10 @@
         "RoboPlan 0.7 RRT and constrained-RRT state-space construction",
         "RoboPlan 0.7 Python RRT binding"
       ],
-      "owner_gate": "UI6-I-UA1 dependency-internal correctness decision; UA7 selected-closure qualification",
+      "owner_gate": "RoboPlan 0.7 source foundation dependency-internal correctness decision; integrated-path qualification of the selected closure",
       "acceptance_evidence": [
-        "UI6-I-UA1 0.7 source inspection: the upstream RRT state-space fix does not initialize these lower, upper, and weight members",
-        "UI6-I-UA1 focused container qualification: exact patched upstream RRT 16/16 including the warning-as-error construction check, and independent DynoTree initialization 2/2",
+        "RoboPlan 0.7 source inspection: the upstream RRT state-space fix does not initialize these lower, upper, and weight members",
+        "RoboPlan 0.7 source foundation focused container qualification: exact patched upstream RRT 16/16 including the warning-as-error construction check, and independent DynoTree initialization 2/2",
         "third_party/roboplan/upstream/roboplan-060-dynotree-variant-initialization.md retains the clean 0.6 reproduction",
         "RoboPlan 0.8 replaced the embedded DynoTree with nanoflann K-D trees (upstream #376); the patched header no longer exists in roboplan_0_8_0_foundation"
       ],
@@ -1219,10 +1219,10 @@
         "RoboPlan 0.8 roboplan_core PoseConstraint used by constrained RRT",
         "RoboPlan 0.8 Python core and RRT bindings"
       ],
-      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "owner_gate": "RoboPlan 0.8 upgrade; dependency-internal correctness decision",
       "acceptance_evidence": [
-        "M9-R1 0.8 source inspection: PoseConstraint (moved to roboplan_core/src/core/constraints.cpp) still assigns pinocchio::Data after default construction",
-        "M9-R1 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream roboplan_core 8/8 and roboplan_rrt in Release and ASan+UBSan",
+        "RoboPlan 0.8 source inspection: PoseConstraint (moved to roboplan_core/src/core/constraints.cpp) still assigns pinocchio::Data after default construction",
+        "RoboPlan 0.8 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream roboplan_core 8/8 and roboplan_rrt in Release and ASan+UBSan",
         "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation",
         "third_party/roboplan/upstream/roboplan-060-pinocchio-scratch-direct-initialization.md retains the clean 0.6 reproduction"
       ],
@@ -1231,7 +1231,7 @@
       "disposition": {
         "state": "frozen",
         "selection": "submit_upstream_and_carry_until_released",
-        "rationale": "Re-ported 0.8 successor of the PoseConstraint half of the E1 0.6 correction; PoseConstraint moved from roboplan_rrt to roboplan_core in 0.8 and still default-constructs and then assigns this scratch. Direct member initialization remains the smallest fix and changes no public contract.",
+        "rationale": "Re-ported 0.8 successor of the PoseConstraint half of the external dependency convergence 0.6 correction; PoseConstraint moved from roboplan_rrt to roboplan_core in 0.8 and still default-constructs and then assigns this scratch. Direct member initialization remains the smallest fix and changes no public contract.",
         "upstream_dossier": "third_party/roboplan/upstream/roboplan-060-pinocchio-scratch-direct-initialization.md",
         "dossier_fields": [
           "exact_upstream_source",
@@ -1277,7 +1277,7 @@
         "native and ROS image RoboPlan Python distribution installation and pip check",
         "installed RoboPlan dependency-stack verification"
       ],
-      "owner_gate": "M9 RoboPlan 0.8 upgrade; image dependency closure",
+      "owner_gate": "RoboPlan 0.8 upgrade; image dependency closure",
       "acceptance_evidence": [
         "both production Dockerfiles install every RoboPlan 0.8 distribution once from the patched source and then run pip check",
         "scripts/ci/check-roboplan-dependency-stack.py requires libtoppra and libproxsuite to resolve from the exact source-built closure rather than a competing wheel generation",
@@ -1317,11 +1317,11 @@
         "RoboPlan 0.8 Scene and SceneContext collision checks",
         "RoboPlan 0.8 RRT and path collision checks in the ManyForge candidate worker"
       ],
-      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "owner_gate": "RoboPlan 0.8 upgrade; dependency-internal correctness decision",
       "acceptance_evidence": [
         "RoboPlanSceneTest.TestCollisionPairMargins carried in the patch",
         "ManyForge worker-protocol, candidate-client, and kernel clearance tests",
-        "M9-R1 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream roboplan_core (TestCollisionPairMargins) 8/8 in Release and ASan+UBSan; ManyForge RoboPlan adapter tests 96/96",
+        "RoboPlan 0.8 Thor arm64 image manyforge-ros-lyrical-full:m9-rp08: patched upstream roboplan_core (TestCollisionPairMargins) 8/8 in Release and ASan+UBSan; ManyForge RoboPlan adapter tests 96/96",
         "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation"
       ],
       "rollback_source": "Exact raw RoboPlan 0.8.0 Scene and SceneContext; without the patch every pair keeps coal's default margin of zero.",
@@ -1361,9 +1361,9 @@
       "guarantee": "RoboPlan 0.8 TOPP-RA accepts an optional per-grid-point bound on the path speed ds/dt, evaluated from the group positions and path tangent at every grid point of its standard grid and intersected with the joint limits; unset, timing is unchanged.",
       "consuming_surfaces": [
         "RoboPlan 0.8 PathParameterizerTOPPRA::generate",
-        "ManyForge candidate worker joint-move timing (RP-3 TCP speed bound at 0.98 of the limit)"
+        "ManyForge candidate worker joint-move timing (TCP speed bound inside time-scaling, at 0.98 of the limit)"
       ],
-      "owner_gate": "M9 RoboPlan 0.8 upgrade; RP-3 / PLAN-1 item 2 planning speed decision",
+      "owner_gate": "RoboPlan 0.8 upgrade; TCP speed bound inside time-scaling, planning speed decision item 2",
       "acceptance_evidence": [
         "RoboPlanToppraTest.PathVelocityBoundCapsSpeedOnlyWhereItBinds carried in the patch",
         "ManyForge candidate-computer and Cartesian trajectory TCP speed tests",
@@ -1408,7 +1408,7 @@
         "RoboPlan 0.8 Scene and SceneContext collision checks",
         "ManyForge candidate worker per-request contact-policy pairs for planning and IK"
       ],
-      "owner_gate": "M9 RoboPlan 0.8 upgrade; dependency-internal correctness decision",
+      "owner_gate": "RoboPlan 0.8 upgrade; dependency-internal correctness decision",
       "acceptance_evidence": [
         "RoboPlanSceneTest.TestSetCollisionPairsActive carried in the patch",
         "ManyForge worker-protocol and candidate-client contact-pair rows",
@@ -1451,9 +1451,9 @@
       "guarantee": "RoboPlan 0.8 TimeOptimal Cartesian timing accepts an optional per-grid-point path-velocity bound (CartesianPlannerOptions::toppra_max_path_velocity) and passes it to TOPP-RA (patch 0016); unset, timing is unchanged.",
       "consuming_surfaces": [
         "RoboPlan 0.8 CartesianPathPlanner::timeOptimal",
-        "ManyForge candidate worker time_optimal Cartesian timing (CT-1, TCP speed bound)"
+        "ManyForge candidate worker time_optimal Cartesian timing (Cartesian timing modes, TCP speed bound)"
       ],
-      "owner_gate": "M9 RoboPlan 0.8 upgrade; CT-1 / RP-3 planning speed decision",
+      "owner_gate": "RoboPlan 0.8 upgrade; Cartesian timing modes / TCP speed bound inside time-scaling, planning speed decision",
       "acceptance_evidence": [
         "ManyForge candidate-computer time_optimal Cartesian TCP speed rows",
         "third_party/roboplan/patches.sha256 lists this patch in the 0.8 patch series; both production Dockerfiles check that manifest and apply it before verifying the recorded build-content digest of roboplan_0_8_0_foundation"
@@ -1495,9 +1495,9 @@
       "guarantee": "RoboPlan 0.8 Bounded Cartesian timing also holds the tool's lateral acceleration v^2/r on curves within max_linear_acceleration: each sample's path speed is capped from the curvature of the circle through the neighbouring waypoints inside its run (the same half-limit split as the joint q'' term), so only the curved part of a run slows; straight runs and stops are unchanged.",
       "consuming_surfaces": [
         "RoboPlan 0.8 CartesianPathPlanner::timeBounded",
-        "ManyForge candidate worker constant_speed Cartesian timing through RP-2 rounded corners"
+        "ManyForge candidate worker constant_speed Cartesian timing through corner-blend-radius rounded corners"
       ],
-      "owner_gate": "M9 RoboPlan 0.8 upgrade; RP-2 corner blend radius decision",
+      "owner_gate": "RoboPlan 0.8 upgrade; corner blend radius decision",
       "acceptance_evidence": [
         "CartesianPlannerTest.BoundedModeSlowsOnlyOnCurves carried in the patch (fails on unpatched 0.8.0: arc speed 0.098 vs cap 0.066 m/s, tool acceleration up to 0.97 vs 0.44 m/s^2)",
         "ManyForge planning benchmark run_cart.sh constant_speed U path with 10 mm blends",
@@ -1557,7 +1557,7 @@
       "consuming_surfaces": [
         "RoboPlan 0.6 OInK source build"
       ],
-      "owner_gate": "E1 selected RoboPlan 0.6 source closure",
+      "owner_gate": "external dependency convergence selected RoboPlan 0.6 source closure",
       "acceptance_evidence": [
         "offline exact-source four-patch candidate build with exact proxsuite_DIR attestation",
         "pre-configure canonical content/license/commit/tree/submodule/archive identity verification",
@@ -1605,7 +1605,7 @@
       "consuming_surfaces": [
         "RoboPlan 0.6 TOPPRA and Cartesian source builds"
       ],
-      "owner_gate": "E1 selected RoboPlan 0.6 source closure",
+      "owner_gate": "external dependency convergence selected RoboPlan 0.6 source closure",
       "acceptance_evidence": [
         "offline exact-source four-patch candidate build with exact toppra_DIR and ldd attestation",
         "pre-configure canonical content/license/commit/tree identity verification",
@@ -1638,19 +1638,19 @@
       "guarantee": "Use the established Jazzy no-Gazebo reduction while retaining the functional upstream-like source as an exact rollback and comparison base.",
       "consuming_surfaces": [
         "xArm Docker/source lane",
-        "future I10 real-robot adapter"
+        "future real-robot restoration adapter"
       ],
-      "owner_gate": "I10",
+      "owner_gate": "real-robot restoration",
       "acceptance_evidence": [
         "46-path deletion inventory digest b409d50382a23a28d4bb96f6f7b62d8dfef76024a942776095c0b2cedf558c0b",
-        "I10 native and physical xArm qualification"
+        "real-robot restoration: native and physical xArm qualification"
       ],
       "rollback_source": "xArm Jazzy functional base 2589f4304d03aaf9b6b1ff6691ec7deb739f4090.",
-      "removal_condition": "Reconcile only at I10 against the selected maintained xArm source; E1 cannot restore Gazebo or alter physical qualification scope.",
+      "removal_condition": "Reconcile only at real-robot restoration against the selected maintained xArm source; external dependency convergence cannot restore Gazebo or alter physical qualification scope.",
       "disposition": {
         "state": "frozen",
         "selection": "defer_to_owner_gate",
-        "rationale": "This is an xArm product-source reduction whose correctness depends on I10 native and physical evidence, not the E1 planner-dependency decision."
+        "rationale": "This is an xArm product-source reduction whose correctness depends on native and physical evidence from real-robot restoration, not the external dependency convergence planner-dependency decision."
       }
     },
     {
@@ -1672,20 +1672,20 @@
         "xarm_api supervised driver/session",
         "xarm_controller supervised hardware boundary",
         "xarm_msgs lifecycle command/state contracts",
-        "future I10 xArm adapter"
+        "future real-robot restoration xArm adapter"
       ],
-      "owner_gate": "I10",
+      "owner_gate": "real-robot restoration",
       "acceptance_evidence": [
         "12 exact commits from 226b5964 through c3172e57",
         "34-path delta inventory digest 72ddd0f189b5effe1b36ed3759d130f75d9bdbb785890d6a0748aea5639d24fa",
-        "retained XC behavior ledger and I10 fake/native/physical evidence"
+        "retained XC behavior ledger and fake/native/physical evidence from real-robot restoration"
       ],
       "rollback_source": "xArm no-Gazebo base 50064477f39ecd69ab006488630c837cdcb8d83e plus the retained XC evidence history.",
-      "removal_condition": "At I10, upstream or move generic ManyForge policy only when equivalent behavior and physical reliability are proven; retain focused device/transport mechanics in the adapter or fork as required.",
+      "removal_condition": "At real-robot restoration, upstream or move generic ManyForge policy only when equivalent behavior and physical reliability are proven; retain focused device/transport mechanics in the adapter or fork as required.",
       "disposition": {
         "state": "frozen",
         "selection": "defer_to_owner_gate",
-        "rationale": "The behavior is required, but source ownership and upstreamability cannot be decided without I10 adapter integration and attended physical evidence."
+        "rationale": "The behavior is required, but source ownership and upstreamability cannot be decided without real-robot restoration adapter integration and attended physical evidence."
       }
     },
     {
@@ -1706,20 +1706,20 @@
       "guarantee": "SDK transport/thread shutdown hardening, hidden-bug and security fixes, sensor-error correction, and inverse-kinematics parameter support used by the current xArm branch.",
       "consuming_surfaces": [
         "xarm_api transport session",
-        "future I10 xArm adapter"
+        "future real-robot restoration xArm adapter"
       ],
-      "owner_gate": "I10",
+      "owner_gate": "real-robot restoration",
       "acceptance_evidence": [
         "exact ten-commit SDK range",
         "transport-loss/shutdown fake evidence",
         "attended physical reconnect, shutdown, and motion-admission matrix"
       ],
       "rollback_source": "SDK gitlink 2b6b595a956c2558e867c08001fda454212b271a.",
-      "removal_condition": "At I10, compare against the then-current supported upstream SDK and retain only deltas still required by reproducible transport and physical tests.",
+      "removal_condition": "At real-robot restoration, compare against the then-current supported upstream SDK and retain only deltas still required by reproducible transport and physical tests.",
       "disposition": {
         "state": "frozen",
         "selection": "defer_to_owner_gate",
-        "rationale": "SDK convergence is coupled to the exact I10 device/transport qualification matrix and cannot be inferred from source diff alone."
+        "rationale": "SDK convergence is coupled to the exact real-robot restoration device/transport qualification matrix and cannot be inferred from source diff alone."
       }
     },
     {
@@ -1771,17 +1771,17 @@
         ]
       },
       "consumer_inventory_sha256": "76d38efebc0d5df9ab6ebd599aaf96425bf802fb97ca3f7bf4cfb8fe3b3b5ef1",
-      "owner_gate": "I12",
+      "owner_gate": "multi-robot qualification",
       "acceptance_evidence": [
         "exact 23-file consumer inventory digest 76d38efebc0d5df9ab6ebd599aaf96425bf802fb97ca3f7bf4cfb8fe3b3b5ef1",
-        "I12 maintained-consumer migration and two-instance/mixed-composition evidence"
+        "multi-robot qualification maintained-consumer migration and two-instance/mixed-composition evidence"
       ],
       "rollback_source": "xArm c3172e57 uf_ros_lib builder files plus ManyMove 1a73f42 launch consumers.",
-      "removal_condition": "Delete fork-only builder dependence only after every maintained consumer is migrated at I12 and equivalent single/dual composition behavior passes; do not add a ManyForge compatibility facade in E1.",
+      "removal_condition": "Delete fork-only builder dependence only after every maintained consumer is migrated at multi-robot qualification and equivalent single/dual composition behavior passes; do not add a ManyForge compatibility facade in external dependency convergence.",
       "disposition": {
         "state": "frozen",
         "selection": "defer_to_owner_gate",
-        "rationale": "The builder behavior is required acceptance input, while final consumer migration and source deletion belong to I12 after composition is proven."
+        "rationale": "The builder behavior is required acceptance input, while final consumer migration and source deletion belong to multi-robot qualification after composition is proven."
       }
     },
     {
@@ -1801,20 +1801,20 @@
       "guarantee": "Retain the historical Docker/source-overlay fixes, FoundationPose action split, Isaac/tree behavior changes, planner action-server fixes, and their tests as restoration and migration inputs.",
       "consuming_surfaces": [
         "historical ManyMove native, Isaac, and xArm workflows",
-        "future I9-I12 maintained-consumer restoration"
+        "future Isaac-through-multi-robot maintained-consumer restoration"
       ],
-      "owner_gate": "I9-I12",
+      "owner_gate": "Isaac-through-multi-robot restoration",
       "acceptance_evidence": [
         "18-path branch delta inventory digest 1b74e7bf0674087c294c9c4af95891f3949108200af84a0d5ba0fc9a280e0c5b",
         "exact 12-commit historical range",
-        "I9 simulator, I10 robot, and I12 maintained-consumer evidence"
+        "Isaac restoration simulator, real-robot restoration robot, and multi-robot qualification maintained-consumer evidence"
       ],
       "rollback_source": "ManyMove main f3a4c65e plus historical acceptance commit 1a73f42c and its tests.",
-      "removal_condition": "Disposition each behavior in its owning I9-I12 slice; no historical function or test is discarded merely because current main lacks it.",
+      "removal_condition": "Disposition each behavior in its owning Isaac-through-multi-robot restoration slice; no historical function or test is discarded merely because current main lacks it.",
       "disposition": {
         "state": "frozen",
         "selection": "defer_to_owner_gate",
-        "rationale": "E1 preserves and routes these external application behaviors; it does not pull simulator, robot, or final consumer implementation forward."
+        "rationale": "external dependency convergence preserves and routes these external application behaviors; it does not pull simulator, robot, or final consumer implementation forward."
       }
     }
   ]
