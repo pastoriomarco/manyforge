@@ -837,12 +837,12 @@ TEST(CollisionQualificationPrimitivesTest,
   EXPECT_EQ(kRetainedAcceptance.size() + kFactoryCoupledAcceptance.size(), 35U);
   for (const auto& disposition : kRetainedAcceptance) {
     EXPECT_FALSE(disposition.historical_case.empty());
-    EXPECT_FALSE(disposition.restoration_gate.empty());
+    EXPECT_FALSE(disposition.qualification_requirement.empty());
     EXPECT_FALSE(disposition.required_behavior.empty());
   }
   for (const auto& disposition : kFactoryCoupledAcceptance) {
     EXPECT_FALSE(disposition.historical_case.empty());
-    EXPECT_FALSE(disposition.restoration_gate.empty());
+    EXPECT_FALSE(disposition.qualification_requirement.empty());
     EXPECT_FALSE(disposition.required_behavior.empty());
   }
 }

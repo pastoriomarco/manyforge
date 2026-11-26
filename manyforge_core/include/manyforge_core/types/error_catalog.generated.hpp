@@ -901,6 +901,8 @@ inline constexpr std::string_view kExecutionProgressGenerationUnavailable{"execu
 inline constexpr std::string_view kExecutionRejected{"execution_rejected"};
 inline constexpr std::string_view kExecutionRequestAttributionInvalid{"execution_request_attribution_invalid"};
 inline constexpr std::string_view kExecutionRuntimeScaleLaneBusy{"execution_runtime_scale_lane_busy"};
+inline constexpr std::string_view kExecutionSceneReadLaneBusy{"execution_scene_read_lane_busy"};
+inline constexpr std::string_view kExecutionSubmissionLaneBusy{"execution_submission_lane_busy"};
 inline constexpr std::string_view kExecutionTargetBindingUnavailable{"execution_target_binding_unavailable"};
 inline constexpr std::string_view kExecutionTargetFrameStateUnavailable{"execution_target_frame_state_unavailable"};
 inline constexpr std::string_view kExecutionTargetFrameUnavailable{"execution_target_frame_unavailable"};
@@ -4073,7 +4075,7 @@ inline constexpr std::string_view kXarmStatusUnavailable{"xarm_status_unavailabl
 inline constexpr std::string_view kZeroSpeedHoldTimeout{"zero_speed_hold_timeout"};
 
 /// Every catalogued code, sorted by code text (byte order).
-inline constexpr std::array<std::string_view, 4063> kSortedCodes{
+inline constexpr std::array<std::string_view, 4065> kSortedCodes{
     kAbsoluteMotionHasReference,
     kAbsoluteTargetHasReference,
     kAcceptanceException,
@@ -4967,6 +4969,8 @@ inline constexpr std::array<std::string_view, 4063> kSortedCodes{
     kExecutionRejected,
     kExecutionRequestAttributionInvalid,
     kExecutionRuntimeScaleLaneBusy,
+    kExecutionSceneReadLaneBusy,
+    kExecutionSubmissionLaneBusy,
     kExecutionTargetBindingUnavailable,
     kExecutionTargetFrameStateUnavailable,
     kExecutionTargetFrameUnavailable,

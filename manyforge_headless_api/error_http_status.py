@@ -903,6 +903,8 @@ HTTP_STATUS: Final[Mapping[str, int]] = MappingProxyType({
     "execution_rejected": 400,
     "execution_request_attribution_invalid": 400,
     "execution_runtime_scale_lane_busy": 500,
+    "execution_scene_read_lane_busy": 500,
+    "execution_submission_lane_busy": 500,
     "execution_target_binding_unavailable": 503,
     "execution_target_frame_state_unavailable": 503,
     "execution_target_frame_unavailable": 503,

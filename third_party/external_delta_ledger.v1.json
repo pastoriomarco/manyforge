@@ -23,39 +23,39 @@
         "id": "native_amd64",
         "status": "passed",
         "evidence": [
-          "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#native_amd64"
+          "RoboPlan 0.6.0 selected-outcome qualification record, native_amd64 (not carried in this repository)"
         ]
       },
       {
         "id": "native_aarch64",
         "status": "passed",
         "evidence": [
-          "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#native_aarch64"
+          "RoboPlan 0.6.0 selected-outcome qualification record, native_aarch64 (not carried in this repository)"
         ]
       },
       {
         "id": "ros_isaac_amd64",
         "status": "passed",
         "evidence": [
-          "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#ros_isaac_amd64"
+          "RoboPlan 0.6.0 selected-outcome qualification record, ros_isaac_amd64 (not carried in this repository)"
         ]
       },
       {
         "id": "ros_isaac_aarch64",
         "status": "passed",
         "evidence": [
-          "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#ros_isaac_aarch64"
+          "RoboPlan 0.6.0 selected-outcome qualification record, ros_isaac_aarch64 (not carried in this repository)"
         ]
       }
     ],
     "python_install_metadata": {
       "status": "passed",
       "evidence": [
-        "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json#selected_source_checks"
+        "RoboPlan 0.6.0 selected-outcome qualification record, selected_source_checks (not carried in this repository)"
       ]
     },
     "result_record": {
-      "path": "verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json",
+      "record": "RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository)",
       "sha256": "d53b4dad37845d6b972222bde3832fc048af27be36951bc9e7f508ff22a431a3"
     },
     "selection_rule": "After Adopt/No-go, all four exact selected dependency lanes and source-installed Python metadata must pass before the ledger can freeze; the rejected generation remains nonselectable evidence only."
@@ -363,7 +363,7 @@
       "portable_semantic_owner": "ManyForge Program, retained-product, and Kernel contracts",
       "adapter_responsibility": "Translate one validated portable request into planner-native inputs without planner-native types escaping.",
       "planner_prerequisite": "Accept the adapter's finite native problem and return a candidate or attributable failure.",
-      "restoration_gate": "I6",
+      "qualification_requirement": "adapter implementation milestone",
       "acceptance_evidence": [
         "unchanged portable request reaches reference and selected RoboPlan adapters",
         "retained I3 product semantics and projection identities remain unchanged"
@@ -374,7 +374,7 @@
       "portable_semantic_owner": "ManyForge logical-scene owner",
       "adapter_responsibility": "Construct a fresh planner-native scene for one exact retained projection generation and acknowledge that generation.",
       "planner_prerequisite": "Provide native scene and collision structures whose lifetime can remain adapter-private.",
-      "restoration_gate": "I6",
+      "qualification_requirement": "adapter implementation milestone",
       "acceptance_evidence": [
         "source-destruction and generation-mismatch regressions",
         "scene reconstruction and collision parity corpus"
@@ -385,7 +385,7 @@
       "portable_semantic_owner": "ManyForge selected-adapter lifecycle contract",
       "adapter_responsibility": "Own the native Scene, every borrowed context, request scratch, synchronization, and worker generation for their complete use.",
       "planner_prerequisite": "No hidden global mutable state that defeats per-adapter isolation.",
-      "restoration_gate": "E1 feasibility, I6 implementation",
+      "qualification_requirement": "feasibility evidence, then adapter implementation milestone",
       "acceptance_evidence": [
         "ASan/UBSan lifetime matrix",
         "focused TSan/concurrency isolation matrix",
@@ -397,7 +397,7 @@
       "portable_semantic_owner": "Planner backend for algorithmic candidate computation only",
       "adapter_responsibility": "Select only an advertised qualified mode and normalize its result.",
       "planner_prerequisite": "RoboPlan RRT, IK, Cartesian, OInK, and TOPPRA behavior required by the selected capability profile.",
-      "restoration_gate": "I6",
+      "qualification_requirement": "adapter implementation milestone",
       "acceptance_evidence": [
         "upstream package corpus",
         "current ManyForge planner-option and deterministic-seed corpus",
@@ -409,7 +409,7 @@
       "portable_semantic_owner": "ManyForge independent trajectory and collision validators",
       "adapter_responsibility": "Return an attributable candidate plus exact source/projection metadata; never self-certify portable acceptance.",
       "planner_prerequisite": "Expose sufficient candidate samples and metadata for independent validation.",
-      "restoration_gate": "I6",
+      "qualification_requirement": "adapter implementation milestone",
       "acceptance_evidence": [
         "trajectory-invariant corpus",
         "independent collision replay",
@@ -421,7 +421,7 @@
       "portable_semantic_owner": "ManyForge request lifecycle and structured outcome contract",
       "adapter_responsibility": "Use qualified cooperative cancellation when available; otherwise kill a bounded generation-bound worker, distinguish cancel from deadline, reject late results, and replace it before later admission.",
       "planner_prerequisite": "Run inside a killable process when no nonblocking cooperative hook exists.",
-      "restoration_gate": "E1 feasibility, I6 implementation",
+      "qualification_requirement": "feasibility evidence, then adapter implementation milestone",
       "acceptance_evidence": [
         "pre-start and in-flight cancellation",
         "deadline distinction",
@@ -434,7 +434,7 @@
       "portable_semantic_owner": "ManyForge monotonic lifecycle progress contract",
       "adapter_responsibility": "Normalize native progress when trustworthy or expose coarse lifecycle phases without fabricating solver-internal progress.",
       "planner_prerequisite": "None beyond bounded invocation; native detailed progress is optional.",
-      "restoration_gate": "I6",
+      "qualification_requirement": "adapter implementation milestone",
       "acceptance_evidence": [
         "progress is monotonic",
         "opaque solver reports only truthful coarse phases"
@@ -445,7 +445,7 @@
       "portable_semantic_owner": "ManyForge request validation and adapter resource policy",
       "adapter_responsibility": "Reject non-finite or unrepresentable inputs before dispatch and enforce CPU, memory, output, request, and replacement bounds around the native worker.",
       "planner_prerequisite": "No dependency-internal undefined conversion or allocation can occur for admitted inputs; otherwise the smallest internal fix is required.",
-      "restoration_gate": "E1 proof, I6 implementation",
+      "qualification_requirement": "proof evidence, then adapter implementation milestone",
       "acceptance_evidence": [
         "extreme, subnormal, and non-finite input corpus",
         "finite duration-to-cardinality proof",
@@ -458,7 +458,7 @@
       "portable_semantic_owner": "ManyForge deployment-selected capability profile",
       "adapter_responsibility": "Advertise only modes proven by the common conformance suite for that exact source/dependency identity.",
       "planner_prerequisite": "Implement each advertised native mode; optional 0.6 features may remain unadvertised.",
-      "restoration_gate": "I6",
+      "qualification_requirement": "adapter implementation milestone",
       "acceptance_evidence": [
         "profile and implementation identity agree",
         "constrained RRT and other optional features remain unavailable until separately qualified"
@@ -469,7 +469,7 @@
       "portable_semantic_owner": "ManyForge public error taxonomy",
       "adapter_responsibility": "Map dependency outcomes, crashes, resource termination, cancellation, deadline, and invalid results without exposing unstable native strings as semantics.",
       "planner_prerequisite": "Return or throw an observable native outcome; process termination remains classifiable by the adapter.",
-      "restoration_gate": "I6",
+      "qualification_requirement": "adapter implementation milestone",
       "acceptance_evidence": [
         "planner-option and structured-error corpus",
         "worker crash/resource/cancel/deadline classifications"
@@ -480,7 +480,7 @@
       "portable_semantic_owner": "ManyForge Kernel dispatch and adapter health state",
       "adapter_responsibility": "Admit work only to a healthy exact generation and block subsequent work during bounded worker replacement.",
       "planner_prerequisite": "No direct authority over dispatch or recovery admission.",
-      "restoration_gate": "I6",
+      "qualification_requirement": "adapter implementation milestone",
       "acceptance_evidence": [
         "late and mismatched results cannot publish",
         "replacement completes or fails closed within a named bound",
@@ -492,7 +492,7 @@
       "portable_semantic_owner": "ManyForge focused planner ports and common conformance suite",
       "adapter_responsibility": "Implement only focused backend, scene-projection, and applicable kinematics/reference/validation ports; do not recover a combined planner/context authority.",
       "planner_prerequisite": "RoboPlan and future MoveIt2 integrations remain external components selected through explicit adapters.",
-      "restoration_gate": "E1 boundary audit, later adapter milestone",
+      "qualification_requirement": "boundary audit, then a later adapter milestone",
       "acceptance_evidence": [
         "static planner-portability audit",
         "future MoveIt2 mapping requires no Kernel, Program, scene, collision, or execution redesign"
@@ -516,8 +516,8 @@
           "sha256": "cfa676dca94d8a8e9d4f61fb76b4988dc0810a5484b4d3a42416b5d294363344"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/native_lifetime/test_e1_roboplan_native_lifetime.cpp",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.6 native lifetime test",
           "sha256": "c3e9f433f30345af0fc2c996264e5045310210177665970f478aa3380a2ef899"
         },
         {
@@ -536,7 +536,7 @@
         "fresh immutable native Scene per retained projection",
         "5/5 native source-destruction, reconstruction, wrong-generation, concurrent-isolation, and ASan/UBSan cases",
         "five historical Scene-generation successor cases and common selected-adapter conformance pass against the corrected candidate",
-        "final selected-outcome result verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip"
+        "final selected-outcome result, in the RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository), records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip"
       ],
       "rollback_source": "RoboPlan 0.5.1 plus the exact cfa676dc patch",
       "removal_condition": "Delete when the selected adapter reconstructs one request-private native Scene from the ManyForge logical snapshot and clone/replacement behavior is no longer consumed, or when selected upstream supplies an equivalent proven contract.",
@@ -562,23 +562,23 @@
           "sha256": "344123b71a6eb2bcf8217ca7aea77413f68e70c5e96a397f6deb856c0cf8c9bf"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/planner_worker_containment.py",
+          "kind": "retired_repository_path",
+          "path": "planner worker containment check",
           "sha256": "5a516f06e94a4c7bd86ae8de1fc6bff316899fc4f451085054c2505f33a368e2"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/conformance/CMakeLists.txt",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.6 conformance build file",
           "sha256": "2e64ff231ae906efafd8ccb818df8283f25e3a08ba43f17e25b83add0ca682ef"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/conformance/test_e1_roboplan_candidate_conformance.cpp",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.6 candidate conformance test",
           "sha256": "3b37e55e022791e8d597a077424e3b1800a171288106277e1063f5a56835a6ff"
         },
         {
-          "kind": "repository_path",
-          "path": "tests/test_composable_cell_e1_planner_worker_containment.py",
+          "kind": "retired_repository_path",
+          "path": "planner worker containment test",
           "sha256": "28b7a090c9da729418256cefb296bce97ed05ec146783c9c7b7010d5336bbb97"
         }
       ],
@@ -617,8 +617,8 @@
           "sha256": "0e83a7b644bf033e9d00d3ec1f638f8126593602c04416ab9fc70e98d186c81c"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/native_lifetime/test_e1_roboplan_native_lifetime.cpp",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.6 native lifetime test",
           "sha256": "c3e9f433f30345af0fc2c996264e5045310210177665970f478aa3380a2ef899"
         }
       ],
@@ -724,13 +724,13 @@
           "sha256": "00ca95fea84dcf1180d80f8abd2782897a3911fef80ae639131d75f834250184"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/patches/0005-construct-roboplan-060-scene-scratch-without-assignment.patch",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.6 patch 0005, scene scratch construction",
           "sha256": "00ca95fea84dcf1180d80f8abd2782897a3911fef80ae639131d75f834250184"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/sanitizers/CMakeLists.txt",
+          "kind": "retired_repository_path",
+          "path": "sanitizer build file for the RoboPlan 0.6 lane",
           "sha256": "9adac6d5eb5fdfe518e47facceafd9148527ab758cc994e922e938ba5e553734"
         }
       ],
@@ -746,7 +746,7 @@
         "candidate 0.6 complete 47-case roboplan ASan/UBSan suite and 128 repeated Scene mutation cases",
         "corrected exact disconnected full-stack build and 47/47 source-installed Python corpus",
         "5/5 adapter-shaped native lifetime ASan/UBSan cases, five historical Scene-generation behaviors, and comparable Scene/collision performance",
-        "final selected-outcome result verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
+        "final selected-outcome result, in the RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository), records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
         "third_party/roboplan/upstream/roboplan-060-scene-scratch-construction-ubsan.md",
         "Pinocchio-version compatibility analysis"
       ],
@@ -795,18 +795,18 @@
           "sha256": "ba886434bdca4eafb6f59ce630b1b4a4957a2c7ffb0c7e3c140a1bab5c5fac6a"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/patches/0006-bound-roboplan-060-toppra-output-samples.patch",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.6 patch 0006, TOPPRA output-sample bound",
           "sha256": "ba886434bdca4eafb6f59ce630b1b4a4957a2c7ffb0c7e3c140a1bab5c5fac6a"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/planner_worker_containment.py",
+          "kind": "retired_repository_path",
+          "path": "planner worker containment check",
           "sha256": "5a516f06e94a4c7bd86ae8de1fc6bff316899fc4f451085054c2505f33a368e2"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/roboplan_offline_benchmark.py",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan offline benchmark script",
           "sha256": "26ddaec8979d41fb20b369c57d9c012d8993ca0c56e3f0eb29b7d0f779ed84d2"
         }
       ],
@@ -824,7 +824,7 @@
         "third_party/roboplan/upstream/roboplan-060-toppra-output-sample-bound.md",
         "22-case pre-dispatch finite/sample-budget, caller-bound projection, actual-candidate bootstrap, sealed-result, and worker peak-memory/resource-termination suite",
         "corrected exact disconnected four-patch source stack builds and its source-installed Python corpus passes 47/47",
-        "final selected-outcome result verification/composable_cell_e1/evidence/roboplan-060-selected-outcome-qualification.v1.json records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
+        "final selected-outcome result, in the RoboPlan 0.6.0 selected-outcome qualification record (not carried in this repository), records 239/239 corrected C++, 47/47 source-installed Python, 57/57 retained-consumer, and 156 passing final E1 contract cases with one intended optional historical-data skip",
         "five fresh interleaved performance cohorts show no material TOPPRA regression and a material Cartesian improvement"
       ],
       "rollback_source": "RoboPlan 0.5.1 plus the exact c0b699d5 patch",
@@ -865,38 +865,38 @@
           "sha256": "d14a8eb7b2f99dfc37a59475e0add3514fe1d96d78a818ca4c7ce658cbc2e14d"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/roboplan_offline_benchmark.py",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan offline benchmark script",
           "sha256": "26ddaec8979d41fb20b369c57d9c012d8993ca0c56e3f0eb29b7d0f779ed84d2"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/aggregate_performance_evidence.py",
+          "kind": "retired_repository_path",
+          "path": "performance evidence aggregation script",
           "sha256": "1ab2c513766d4363b3903faf7d4b5dc517d964be44d79a10fcc961abc26328a9"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/evidence/roboplan-060-comparable-performance.v1.json",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.6.0 comparable-performance record",
           "sha256": "38b9193731775d8cf66ec537fe6da7a6d8d5f5adae44e35045c5af44613a5539"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/patch0007_ab/CMakeLists.txt",
+          "kind": "retired_repository_path",
+          "path": "patch 0007 A/B build file",
           "sha256": "30f809a66f337b748b0c70d312519050029a6a0cf47d143ea5b405b5f7209088"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/patch0007_ab/patch0007_collision_reuse_ab.cpp",
+          "kind": "retired_repository_path",
+          "path": "patch 0007 collision-reuse A/B program",
           "sha256": "bb2310271a40787f4dfc281d28a85cec186ae98ad90e4a664dd1e8f13dc54d41"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/evidence/roboplan-051-patch0007-collision-reuse-ab.v1.json",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.5.1 patch 0007 collision-reuse A/B record",
           "sha256": "ad086267ba5396c51fc4e6d2a50726ebb87dc8dd62a2e652150a679d4e6c8b30"
         },
         {
-          "kind": "repository_path",
-          "path": "tests/test_composable_cell_e1_performance_evidence.py",
+          "kind": "retired_repository_path",
+          "path": "performance evidence test",
           "sha256": "5bb3f982a8bd706196aa08d58149abf65b4523971892dc4674b1ffb4c0153643"
         }
       ],
@@ -909,9 +909,9 @@
       "acceptance_evidence": [
         "five fresh interleaved Release control/candidate offline and actual-worker cohorts with exact binary/source/closure identities",
         "candidate joint RRT has a reproducible material 12-13% median/throughput regression (about 1.4-1.8 ms), while Cartesian is about 56% faster and collision, IK, TOPPRA, memory, kill, replacement, and recovery remain comparable or better",
-        "verification/composable_cell_e1/evidence/roboplan-060-comparable-performance.v1.json",
+        "RoboPlan 0.6.0 comparable-performance record (not carried in this repository)",
         "direct five-batch 0.5.1 A/B: reusable scratch changes p50 by -0.45% and throughput by +0.74% while reducing operator-new calls by 6.6% and bytes by 17.6%",
-        "verification/composable_cell_e1/evidence/roboplan-051-patch0007-collision-reuse-ab.v1.json",
+        "RoboPlan 0.5.1 patch 0007 collision-reuse A/B record (not carried in this repository)",
         "exact 0.6 RRT::plan constructs a fresh request-private CollisionContext internally and exposes no reuse hook; the candidate remains inside the frozen memory, latency, throughput, containment, and recovery bounds without patch 0007",
         "joint RRT, pose IK, TOPPRA, Cartesian, exact-generation mismatch, sealed trajectory transfer, parity, sanitizer, and recovery cases"
       ],
@@ -938,18 +938,18 @@
           "sha256": "e705472bfa05feecc8cf0b669018968966687a5a911047307be01f421ac2cbdd"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/patches/0008-initialize-roboplan-060-dynotree-variant-state.patch",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.6 patch 0008, DynoTree variant state",
           "sha256": "e705472bfa05feecc8cf0b669018968966687a5a911047307be01f421ac2cbdd"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/sanitizers/CMakeLists.txt",
+          "kind": "retired_repository_path",
+          "path": "sanitizer build file for the RoboPlan 0.6 lane",
           "sha256": "9adac6d5eb5fdfe518e47facceafd9148527ab758cc994e922e938ba5e553734"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/sanitizers/test_e1_dynotree_state_contract.cpp",
+          "kind": "retired_repository_path",
+          "path": "DynoTree state contract sanitizer test",
           "sha256": "8c2d0cb5bd8ec1b77d34935f7a2739935d6f3b07e71b7f8c21effd7a21a8269a"
         }
       ],
@@ -1003,13 +1003,13 @@
           "sha256": "af8526dad047c046c6cd5a33a0513a3c94fca321da22c658d54e0efa33a5f858"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/patches/0009-direct-initialize-roboplan-060-pinocchio-scratch.patch",
+          "kind": "retired_repository_path",
+          "path": "RoboPlan 0.6 patch 0009, Pinocchio scratch initialization",
           "sha256": "af8526dad047c046c6cd5a33a0513a3c94fca321da22c658d54e0efa33a5f858"
         },
         {
-          "kind": "repository_path",
-          "path": "verification/composable_cell_e1/sanitizers/CMakeLists.txt",
+          "kind": "retired_repository_path",
+          "path": "sanitizer build file for the RoboPlan 0.6 lane",
           "sha256": "9adac6d5eb5fdfe518e47facceafd9148527ab758cc994e922e938ba5e553734"
         }
       ],

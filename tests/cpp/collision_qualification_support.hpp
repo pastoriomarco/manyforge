@@ -14,7 +14,7 @@ namespace manyforge::qualification {
 
 struct AcceptanceDisposition {
   std::string_view historical_case;
-  std::string_view restoration_gate;
+  std::string_view qualification_requirement;
   std::string_view required_behavior;
 };
 

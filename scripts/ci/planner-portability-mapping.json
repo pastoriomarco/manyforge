@@ -4,7 +4,7 @@
   "runtime_availability": {
     "status": "temporarily_unavailable_runtime_rebuild",
     "available_surface": "retained_planning_product_consumer_qualification_only",
-    "restoration_gate": "qualify a non-empty retained planner product and its target-scene adapter before restoring runtime launch or conformance claims"
+    "qualification_requirement": "qualify a non-empty retained planner product and its target-scene adapter before restoring runtime launch or conformance claims"
   },
   "portable_capabilities": [
     "planning.motion.joint_goal",
@@ -38,7 +38,7 @@
       "status": "temporarily_unavailable_runtime_rebuild",
       "package": "manyforge_roboplan",
       "available_surface": "retained_planning_product_consumer_qualification_only",
-      "restoration_gate": "non-empty retained planning product plus target-scene adapter qualification",
+      "qualification_requirement": "non-empty retained planning product plus target-scene adapter qualification",
       "source_identity": "RoboPlan 0.8.0 2a6b447e648b1a3337f10cbab995cda0c0a71d55 plus the exact patch manifest",
       "capability_disposition": {
         "planning.motion.joint_goal": "temporarily_unavailable",

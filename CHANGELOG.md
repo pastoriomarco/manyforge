@@ -736,6 +736,9 @@ aliases: an old name is unknown, and an old environment variable is ignored.
   groups no other hold owns), not all motion. The Reset offered with a held
   node is the Program's Reset, which ends the run. `intervention_stop_scope`
   is now documented.
+- **Two busy refusals have catalog entries.** The execution host's refusals
+  `execution_submission_lane_busy` and `execution_scene_read_lane_busy` were
+  sent without catalog wording; both codes now have their catalog entries.
 
 ## 0.3.1 – 2026-11-19
 
