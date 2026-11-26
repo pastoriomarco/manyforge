@@ -958,7 +958,6 @@ inline constexpr std::string_view kFloatLiteralOutOfRange{"float_literal_out_of_
 inline constexpr std::string_view kForwardKinematicsBatchFailed{"forward_kinematics_batch_failed"};
 inline constexpr std::string_view kForwardKinematicsFailed{"forward_kinematics_failed"};
 inline constexpr std::string_view kFrameBindingsInvalid{"frame_bindings_invalid"};
-inline constexpr std::string_view kFrameHeightOutsideRange{"frame_height_outside_range"};
 inline constexpr std::string_view kFrameMissing{"frame_missing"};
 inline constexpr std::string_view kFrameNotMounted{"frame_not_mounted"};
 inline constexpr std::string_view kFrameOrPoseInvalid{"frame_or_pose_invalid"};
@@ -4074,7 +4073,7 @@ inline constexpr std::string_view kXarmStatusUnavailable{"xarm_status_unavailabl
 inline constexpr std::string_view kZeroSpeedHoldTimeout{"zero_speed_hold_timeout"};
 
 /// Every catalogued code, sorted by code text (byte order).
-inline constexpr std::array<std::string_view, 4064> kSortedCodes{
+inline constexpr std::array<std::string_view, 4063> kSortedCodes{
     kAbsoluteMotionHasReference,
     kAbsoluteTargetHasReference,
     kAcceptanceException,
@@ -5025,7 +5024,6 @@ inline constexpr std::array<std::string_view, 4064> kSortedCodes{
     kForwardKinematicsBatchFailed,
     kForwardKinematicsFailed,
     kFrameBindingsInvalid,
-    kFrameHeightOutsideRange,
     kFrameMissing,
     kFrameNotMounted,
     kFrameOrPoseInvalid,

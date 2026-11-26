@@ -71,7 +71,6 @@ RUN set -eu; \
         VERSION LICENSE NOTICE THIRD_PARTY_NOTICES.md \
         manyforge scripts/dev-workbench.py scripts/compose-dev.sh scripts/lib \
         manyforge_behavior/manyforge_behavior manyforge_behavior/resources \
-        manyforge_example_nodes \
         manyforge_headless_api \
         manyforge_headless/resources \
         manyforge_program_runner \

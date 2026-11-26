@@ -19,8 +19,6 @@ from types import MappingProxyType
 from typing import Any, Final
 
 import py_trees
-from manyforge_example_nodes import FrameHeightQuery
-from manyforge_behavior import qualified_node_extensions as extension
 
 from manyforge_behavior.catalog import CatalogEntry
 from manyforge_behavior.node_environment import NodeEnvironment
@@ -449,7 +447,6 @@ def _owner_invocation_builder(
     owner_api: str,
     output_key_parameter: str | None = None,
     blackboard_read_parameters: tuple[str, ...] = (),
-    transform_port: Callable[[OwnerInvocationPort], OwnerInvocationPort] | None = None,
     framed_port: (
         Callable[[OwnerInvocationPort, FrameTransformPort | None], OwnerInvocationPort] | None
     ) = None,
@@ -457,8 +454,6 @@ def _owner_invocation_builder(
 ) -> NodeAdapterBuilder:
     def build(context: NodeAdapterBuildContext) -> py_trees.behaviour.Behaviour:
         port = _required_port(context, port_name)
-        if transform_port is not None:
-            port = transform_port(port)
         if framed_port is not None:
             port = framed_port(port, context.ports.model_queries)
         common = dict(
@@ -662,10 +657,7 @@ def _definition_for(
     row: ExecutableRegistryRow,
     entry: CatalogEntry,
 ) -> _AdapterDefinition:
-    expected_package = (
-        extension.PACKAGE_ID if row.node_id == extension.NODE_ID else BUILTIN_EXECUTABLE_PACKAGE_ID
-    )
-    if row.executable_package_id != expected_package:
+    if row.executable_package_id != BUILTIN_EXECUTABLE_PACKAGE_ID:
         raise ExecutableNodeResolverError(
             "node implementation belongs to another qualified package"
         )
@@ -676,24 +668,6 @@ def _definition_for(
     if entry.runner_implementation_ids.get(row.engine_id) != row.implementation_id:
         raise ExecutableNodeResolverError(
             f"row for {row.node_id!r} disagrees with catalog runner metadata"
-        )
-    if row.executable_package_id == extension.PACKAGE_ID:
-        if (
-            row.node_id != extension.NODE_ID
-            or row.implementation_id != extension.IMPLEMENTATION_ID
-            or entry.execution.owner_api != "model.kinematics"
-        ):
-            raise ExecutableNodeResolverError("extension row has no reviewed adapter")
-        return _AdapterDefinition(
-            row,
-            _owner_invocation_builder(
-                row.node_id,
-                "model_queries",
-                owner_api=entry.execution.owner_api,
-                transform_port=FrameHeightQuery,
-            ),
-            "model_queries",
-            None,
         )
     run_owner_builder = _RUN_OWNER_BUILDERS.get(
         (row.implementation_id, entry.execution.owner_api)

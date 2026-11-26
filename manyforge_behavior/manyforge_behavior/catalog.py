@@ -35,7 +35,7 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v3"
 EXPECTED_CONTENT_VERSION = "4.0.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:2800a9be389ec9297e69e20b4d7c83c7616c99df0696258815f946858663cf74"
+    "sha256:0fee3f75d18fda83a8aa4899158ba04757ef4fd8212d6e9ffcb7fcaf041d5991"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _PROGRAM_PROFILE_RE = re.compile(r"^manyforge-cell-v(\d+)$")

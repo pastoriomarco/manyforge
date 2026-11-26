@@ -366,8 +366,8 @@ def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
 
     # + rules.set_active, io.clear_outside_change, operator.request_choice,
     # motion.stop_groups
-    assert len(dispositions) == len(environment.registry.rows) == 53
-    assert sum(item.adapter_build_qualified for item in dispositions) == 53
+    assert len(dispositions) == len(environment.registry.rows) == 52
+    assert sum(item.adapter_build_qualified for item in dispositions) == 52
     assert sum(not item.adapter_build_qualified for item in dispositions) == 0
     assert all(
         (

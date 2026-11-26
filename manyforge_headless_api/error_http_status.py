@@ -960,7 +960,6 @@ HTTP_STATUS: Final[Mapping[str, int]] = MappingProxyType({
     "forward_kinematics_batch_failed": 500,
     "forward_kinematics_failed": 500,
     "frame_bindings_invalid": 400,
-    "frame_height_outside_range": 500,
     "frame_missing": 409,
     "frame_not_mounted": 500,
     "frame_or_pose_invalid": 400,

@@ -3675,7 +3675,6 @@ execution_port_route_rebind_mismatch	Program routing crosses robot binding	An in
 execution_progress_generation_unavailable	Lookahead has no motion progress	The runtime collision lookahead has no progress of the running motion yet, so the trajectory could not be certified. Try again; if it persists, collect the logs and report it.
 execution_target_unavailable	Program targets unavailable	The robots and tools that can be controlled could not be read, or none is configured. Check that the configuration is Applied and the components are Active.
 failed_validation_ack_rejected	Retry after Scene repair refused	The retry after Scene repair was refused. The details give the reason; check the run state and try again.
-frame_height_outside_range	Frame outside height range	The observed frame is outside the selected height range, so the check failed.
 frame_transform_failed	Frame transform failed	The pose could not be converted between frames. The message gives the cause; check the frames named in the step.
 full_stop_request_attribution_invalid	Stop request origin invalid	An internal check failed: a Stop request has an invalid origin. Collect the logs and report it.
 full_stop_request_context_invalid	Stop request context invalid	An internal check failed: a Stop request has an invalid request context. Collect the logs and report it.

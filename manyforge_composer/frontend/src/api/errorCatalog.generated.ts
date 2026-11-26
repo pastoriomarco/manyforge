@@ -952,7 +952,6 @@ export const ERROR_CATALOG: Readonly<Record<string, readonly [string, string]>> 
   forward_kinematics_batch_failed: ["Forward kinematics failed", "The forward kinematics of several frames could not be computed; the details give the reason. Check the robot model and the joint values."],
   forward_kinematics_failed: ["Forward kinematics failed", "The forward kinematics of a frame could not be computed; the details give the reason. Check the robot model and the joint values."],
   frame_bindings_invalid: ["Frame bindings invalid", "An internal check failed: a prepared operation has an empty or oversized list of frame bindings. Collect the logs and report it."],
-  frame_height_outside_range: ["Frame outside height range", "The observed frame is outside the selected height range, so the check failed."],
   frame_missing: ["Frame reference not found", "The referenced frame is not present in the applied component model."],
   frame_not_mounted: ["Frame not mounted on target component", "The frame named in a Program reference is not mounted on the target component. Choose a frame of that component or another target."],
   frame_or_pose_invalid: ["Pose source pose or frame invalid", "The pose source returned a pose that is invalid or uses a different frame than its reference. Check the pose source frame settings."],

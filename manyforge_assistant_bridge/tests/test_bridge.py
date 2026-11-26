@@ -1501,7 +1501,6 @@ def test_node_tools_are_small_and_the_prompt_lists_node_summaries(tmp_path: Path
         if line.strip().startswith("- gripper.command_position (target, position, ")
     )
     assert gripper.endswith(".")
-    assert "example.check_frame_height" not in prompt
     assert "Rules:" in prompt and "Cell (frame cell_frame" in prompt
     assert "- robot: target arm (frames tcp)" in prompt
     assert len(prompt) < 12_000

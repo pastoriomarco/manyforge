@@ -1,8 +1,8 @@
-# Generated extension composition; edit extension entries in their package descriptor.
+# Built-in node catalog. Edit the entries here, then run manyforge_behavior/scripts/generate_effective_node_catalog.py to refresh catalog_digest.
 api_version: manyforge.node_catalog.v3
 content_version: 4.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:2800a9be389ec9297e69e20b4d7c83c7616c99df0696258815f946858663cf74
+catalog_digest: sha256:0fee3f75d18fda83a8aa4899158ba04757ef4fd8212d6e9ffcb7fcaf041d5991
 schema_types:
   tcp_selector:
     type: object
@@ -5512,8 +5512,10 @@ entries:
     chosen, then succeeds or fails as that option says. Only this branch waits; the
     rest of the tree keeps running. With hold_motion the named motion groups are stopped
     when the node starts, as by the operator's Stop, and stay stopped after the answer
-    until the operator's Run. There is no timeout; a Program Stop or Reset ends the
-    question as interrupted.
+    until the operator's Run. When hold_motion is [all] or names a group that contains
+    the node itself, the Stop holds the node too; it completes only after the operator's
+    Run, unless its operator_stop_policy is continue. There is no timeout; a Program
+    Stop or Reset ends the question as interrupted.
   stability: stable
   tags:
   - operator
@@ -5592,7 +5594,9 @@ entries:
   category: recovery
   description: Stops the named motion groups as the operator's Stop does and succeeds
     once that Stop has completed. The groups stay stopped until the operator's Run.
-    It fails when a stopped node's Stop ended uncontained.
+    When groups is [all] or names a group that contains the node itself, the Stop
+    holds the node too; it succeeds only after the operator's Run, unless its operator_stop_policy
+    is continue. It fails when a stopped node's Stop ended uncontained.
   stability: stable
   tags:
   - motion
@@ -5672,62 +5676,6 @@ entries:
   runners:
     py_trees:
       implementation_id: recovery_apply_offered_action_v1
-  observability:
-    event_family: manyforge.program.node
-- id: example.check_frame_height
-  name: Check frame height
-  category: model
-  description: Build-owned experimental example that checks the cell-frame height
-    of a component frame against an inclusive range. Fails when the height is outside
-    the range or the observed state is unavailable.
-  stability: experimental
-  tags:
-  - example
-  - model
-  profiles:
-    min_program_profile: manyforge-cell-v1
-  kind: leaf
-  children:
-    min: 0
-    max: 0
-  parameters:
-  - id: target
-    required: true
-    description: Component and command target whose frame height is read.
-    schema:
-      schema_ref: '#/schema_types/target_reference'
-  - id: frame
-    required: true
-    description: Component frame whose height in the cell frame is checked.
-    schema:
-      schema_ref: '#/schema_types/frame_reference'
-  - id: minimum_height_m
-    required: true
-    description: Lower bound of the allowed height in meters, inclusive.
-    schema:
-      type: float
-  - id: maximum_height_m
-    required: true
-    description: Upper bound of the allowed height in meters, inclusive.
-    schema:
-      type: float
-  required_capabilities:
-  - capability_id: model.kinematics.fk
-    scope: target_binding
-    target_parameter: target
-  - capability_id: state.observed.current
-    scope: target_binding
-    target_parameter: target
-  execution:
-    blocking: true
-    cancellable: false
-    owner_api: model.kinematics
-  outcomes:
-    success: height_in_range
-    failure: height_outside_range_or_unavailable
-  runners:
-    py_trees:
-      implementation_id: example_check_frame_height_v1
   observability:
     event_family: manyforge.program.node
 skill_cross_references: []

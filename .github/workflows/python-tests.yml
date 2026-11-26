@@ -11,7 +11,6 @@ on:
     paths:
       - "manyforge_behavior/**"
       - "manyforge_operator/**"
-      - "manyforge_example_nodes/**"
       - "manyforge_example_models/**"
       - "manyforge_composer/**"
       - "manyforge_assistant_bridge/**"
@@ -38,7 +37,6 @@ on:
     paths:
       - "manyforge_behavior/**"
       - "manyforge_operator/**"
-      - "manyforge_example_nodes/**"
       - "manyforge_example_models/**"
       - "manyforge_composer/**"
       - "manyforge_assistant_bridge/**"

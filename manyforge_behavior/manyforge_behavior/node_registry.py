@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior import qualified_node_extensions as extension
 
 BUILTIN_EXECUTABLE_PACKAGE_ID = "manyforge_behavior"
 _BUILD_TOKEN = object()
@@ -90,21 +89,13 @@ class NodeRegistry:
 def build_node_registry(catalog: NodeCatalog) -> NodeRegistry:
     """Derive the total canonical built-in registry from catalog runner rows."""
 
-    try:
-        extension.verify_composition(catalog)
-    except (OSError, ValueError) as exc:
-        raise NodeRegistryError(str(exc)) from exc
     rows = tuple(
         sorted(
             ExecutableRegistryRow(
                 node_id=entry.id,
                 engine_id=engine_id,
                 implementation_id=implementation_id,
-                executable_package_id=(
-                    extension.PACKAGE_ID
-                    if entry.id == extension.NODE_ID
-                    else BUILTIN_EXECUTABLE_PACKAGE_ID
-                ),
+                executable_package_id=BUILTIN_EXECUTABLE_PACKAGE_ID,
             )
             for entry in catalog.entries
             for engine_id, implementation_id in entry.runner_implementation_ids.items()

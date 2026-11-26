@@ -54,8 +54,6 @@ NATIVE_BINDING_FIXTURE = "manyforge_deployment/resources/program_binding_lite6_n
 PROJECT_SNAPSHOTS = (
     (f"{BEHAVIOR}/pyproject.toml",
      f"{BEHAVIOR}/manyforge_behavior/_retained_source/manyforge_behavior.pyproject.toml"),
-    ("manyforge_example_nodes/pyproject.toml",
-     "manyforge_example_nodes/_retained_source/pyproject.toml"),
 )
 
 HEX = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")

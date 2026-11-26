@@ -292,12 +292,7 @@ void require_exact_fields(const CanonicalValue::Object &object,
                  byte == '_' || byte == '.';
         });
   }
-  constexpr std::string_view kExtensionPrefix = "node-extension-descriptor:";
-  if (value.starts_with(kExtensionPrefix)) {
-    return is_portable_identifier(value.substr(kExtensionPrefix.size()));
-  }
-  return value == "python-project:manyforge_behavior" ||
-         value == "python-project:manyforge_example_nodes";
+  return value == "python-project:manyforge_behavior";
 }
 
 [[nodiscard]] CanonicalValue with_replaced_member(const CanonicalValue &value,

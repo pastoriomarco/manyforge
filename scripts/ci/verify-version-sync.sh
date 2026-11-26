@@ -83,8 +83,7 @@ for pkg in \
     manyforge_headless_api \
     manyforge_program_runner \
     manyforge_operator \
-    manyforge_medkit_adapter \
-    manyforge_example_nodes; do
+    manyforge_medkit_adapter; do
     file="${REPO_ROOT}/${pkg}/pyproject.toml"
     if [[ ! -f "${file}" ]]; then
         printf '  ✗ %-50s pyproject.toml missing\n' "${pkg}"

@@ -51,9 +51,6 @@ def test_node_set_is_stable_entries_whose_capabilities_the_deployment_offers() -
     assert {"io.set_output", "io.get_input", "io.check_input", "io.wait_for_input"} <= set(
         _node_ids(with_io)
     )
-    # Experimental entries are never authorable by the assistant.
-    everything = [entry.id for entry in _assistant_instruments().entries()]
-    assert "example.check_frame_height" not in everything
     assert with_io["tools"][0]["argument_types"] == {"node": "node"}
     node_type = with_io["types"]["node"]
     node_id = node_type["properties"]["node_id"]

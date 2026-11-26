@@ -917,7 +917,7 @@ def _write_mixed_variants(
 ) -> dict[str, Path]:
     """Writes GROUPED variants: `single` keeps only lite6 and its Program
     branch (a Program may not reference a removed component), `solo` also adds
-    a target-scoped FK check, `replace`
+    a target-scoped FK pose read and a bounds check on it, `replace`
     changes only ur5e's controller input so lite6 is retained by the
     component delta, and `move` changes only ur5e's root pose, which is
     shared cell planning model rather than controller identity, so both
@@ -975,15 +975,33 @@ def _write_mixed_variants(
                 ]
         if kind in ("solo", "solo_cartesian"):
             program = candidate["program_draft"]
-            # This maintained node has a real target-scoped FK requirement;
-            # its direct references also retain the exact base used below.
+            # The FK read has a real target-scoped requirement. It writes a
+            # declared pose key that the bounds check reads next, so both sit in
+            # a sequence: a parallel root would tick them together.
+            program["blackboard"] = {
+                "namespaces": [{"namespace_id": "check", "owner": "program"}],
+                "keys": [{"key": "check.lite6_base", "type": "stored_pose",
+                          "access": "read_write", "persistence": "run"}],
+            }
             program["forest"][0]["children"].append({
-                "instance_id": "lite6_fk_check", "node_id": "example.check_frame_height",
-                "parameters": {
-                    "target": {"component_id": "lite6_robot", "command_target_id": "arm"},
-                    "frame": {"component_id": "lite6_robot", "frame_id": "base"},
-                    "minimum_height_m": -1000.0, "maximum_height_m": 1000.0,
-                }, "children": [],
+                "instance_id": "lite6_fk_check", "node_id": "sequence", "parameters": {},
+                "children": [
+                    {"instance_id": "lite6_fk_pose", "node_id": "model.get_frame_pose",
+                     "parameters": {
+                         "target": {"component_id": "lite6_robot", "command_target_id": "arm"},
+                         "frame": {"component_id": "lite6_robot", "frame_id": "base"},
+                         "output_key": "check.lite6_base",
+                     }, "children": []},
+                    {"instance_id": "lite6_fk_bounds", "node_id": "geometry.check_pose_bounds",
+                     "value_sources": {
+                         "pose": {"kind": "blackboard_key", "reference": "check.lite6_base"},
+                     },
+                     "parameters": {
+                         "frame_ref": {"kind": "cell_frame"},
+                         "min_position_m": [-1000.0, -1000.0, -1000.0],
+                         "max_position_m": [1000.0, 1000.0, 1000.0],
+                     }, "children": []},
+                ],
             })
             if kind == "solo_cartesian":
                 motion = next(child for root in program["forest"] for child in root["children"]

@@ -38,7 +38,6 @@ from manyforge_behavior.node_registry import (
     NodeRegistryError,
     build_node_registry,
 )
-from manyforge_behavior import qualified_node_extensions as extension
 
 
 NODE_ENVIRONMENT_MANIFEST_API = "manyforge.node_environment_manifest.v1"
@@ -53,10 +52,9 @@ MAX_MANIFEST_TEXT_CHARACTERS = 1024
 _IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _SOURCE_ID_RE = re.compile(
     r"^(?:python-module:[a-z][a-z0-9_.]*|"
-    r"python-project:[a-z][a-z0-9_.]*|skill-artifact:[a-z][a-z0-9_.-]*|"
-    r"node-extension-descriptor:[a-z][a-z0-9_.-]*)$"
+    r"python-project:[a-z][a-z0-9_.]*|skill-artifact:[a-z][a-z0-9_.-]*)$"
 )
-_QUALIFIED_PACKAGES = frozenset({BUILTIN_EXECUTABLE_PACKAGE_ID, extension.PACKAGE_ID})
+_QUALIFIED_PACKAGES = frozenset({BUILTIN_EXECUTABLE_PACKAGE_ID})
 _ZERO_DIGEST = "sha256:" + ("0" * 64)
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 _BEHAVIOR_ROOT = _PACKAGE_ROOT.parent
@@ -245,14 +243,6 @@ def _current_source_coverage() -> tuple[SourceCoverageRecord, ...]:
                             PACKAGED_PROJECT_SNAPSHOT_PATH.read_bytes()
                         ),
                     ),
-                    *(
-                        SourceCoverageRecord(
-                            extension.PACKAGE_ID,
-                            source_id,
-                            raw_sha256_digest(path.read_bytes()),
-                        )
-                        for source_id, path in extension.source_files()
-                    ),
                 )
             )
         )
@@ -268,11 +258,7 @@ def _current_source_coverage() -> tuple[SourceCoverageRecord, ...]:
 
 
 def _package_version(package_id: str = BUILTIN_EXECUTABLE_PACKAGE_ID) -> str:
-    project_path = (
-        PACKAGED_PROJECT_SNAPSHOT_PATH
-        if package_id == BUILTIN_EXECUTABLE_PACKAGE_ID
-        else extension.PROJECT_SNAPSHOT_PATH
-    )
+    project_path = PACKAGED_PROJECT_SNAPSHOT_PATH
     try:
         project_data = tomllib.loads(project_path.read_text(encoding="utf-8"))
         project = project_data["project"]

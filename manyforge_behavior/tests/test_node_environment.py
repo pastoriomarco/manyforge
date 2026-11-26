@@ -34,8 +34,8 @@ def test_retained_environment_manifest_is_fresh_and_build_owned() -> None:
     assert retained.catalog_digest == environment.catalog.catalog_digest
     assert retained.executable_registry == environment.registry.rows
     # + rules.set_active, io.clear_outside_change, operator.request_choice, motion.stop_groups
-    assert len(retained.executable_registry) == 53
-    assert len(retained.executable_packages) == 2
+    assert len(retained.executable_registry) == 52
+    assert len(retained.executable_packages) == 1
     assert retained.source_coverage
     assert any(
         row.source_id == "python-project:manyforge_behavior" for row in retained.source_coverage

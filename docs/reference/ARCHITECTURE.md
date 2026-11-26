@@ -927,12 +927,10 @@ ______________________________________________________________________
   **New execution transport** — implement `IExecutionBackend` and its observed
   state/progression contract. The two extension seams are independent, and the
   kernel/program artifacts remain backend-neutral.
-- **Trusted external behavior node** — use the statically selected
-  [`manyforge_example_nodes`](../../manyforge_example_nodes/README.md) package
-  as the build/owner-adapter example. Its descriptor, actual source and
-  executable binding join the same content-addressed NodeEnvironment as
-  built-in nodes. There is no runtime path loader, plugin discovery or
-  arbitrary Composer/assistant import.
+- **Trusted external behavior node** — none is built in; every catalog node
+  is built-in. There is no runtime path loader, plugin discovery or arbitrary
+  Composer/assistant import, and a trusted node returns only through the
+  content-addressed v2 package/compiler boundary.
 - **Reusable subtree** — build-owned skill artifacts expand during authoring
   into ordinary Program nodes, with typed arguments, role mapping and retained
   provenance. Expansion does not mutate the Draft or execute the subtree;

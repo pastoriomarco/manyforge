@@ -2569,15 +2569,24 @@ CanonicalValue ApplyStatusResponse(
     const component_manager::FailedApplyAcknowledgementState failure_acknowledgement,
     const bool success_settlement_pending) {
   const auto &intent = status.intent.intent;
-  const auto progress =
-      component_manager::DeriveManagerApplyProgress(status);
-  const auto phase =
-      CanonicalValue(std::string(component_manager::ToString(progress.phase)));
   const auto *terminal = status.terminal_outcome.has_value()
                              ? &status.terminal_outcome->terminal_outcome
                              : nullptr;
-  if (terminal != nullptr && terminal->succeeded() && success_settlement_pending)
+  const bool settling =
+      terminal != nullptr && terminal->succeeded() && success_settlement_pending;
+  if (settling)
     terminal = nullptr;
+  // While the success settles, progress ignores the terminal record, as the
+  // owner publication's ApplyPhase(..., settling) does.
+  const auto progress = [&] {
+    if (!settling)
+      return component_manager::DeriveManagerApplyProgress(status);
+    auto before_terminal = status;
+    before_terminal.terminal_outcome.reset();
+    return component_manager::DeriveManagerApplyProgress(before_terminal);
+  }();
+  const auto phase =
+      CanonicalValue(std::string(component_manager::ToString(progress.phase)));
   const bool succeeded =
       terminal != nullptr && terminal->state ==
                                  component_manager::

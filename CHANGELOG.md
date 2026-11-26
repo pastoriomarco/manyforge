@@ -665,8 +665,20 @@ aliases: an old name is unknown, and an old environment variable is ignored.
   `MANYFORGE_RUNTIME_UNAVAILABLE_REASON_CODE`,
   `MANYFORGE_RUNTIME_UNAVAILABLE_MESSAGE`).
 
+### Removed
+
+- **The build-time node example is removed (`example.check_frame_height`,
+  OD-402).** Its package `manyforge_example_nodes`, the extension selection
+  and qualification code only it used, and its error code
+  `frame_height_outside_range` are gone. Program nodes are built in only.
+  The non-operative example folder `examples/external_nodes/` (OD-406) is
+  removed too.
+
 ### Fixed
 
+- **Apply status while a successful Apply is still settling.** Apply status
+  already answered `pending` then, but still showed the finished Apply's phase
+  and last progress; both now describe the Apply that is still settling.
 - **A scene request too large for the execution host is refused,**
   `native_projection_rpc_bound_exceeded`, instead of ending the execution
   host and the application.

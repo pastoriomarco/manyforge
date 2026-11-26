@@ -12,10 +12,6 @@ from manyforge_behavior.node_environment import (
     PACKAGED_PROJECT_SNAPSHOT_PATH,
     generate_builtin_node_environment_manifest,
 )
-from manyforge_behavior.qualified_node_extensions import (
-    PACKAGE_ROOT,
-    PROJECT_SNAPSHOT_PATH,
-)
 
 
 def _render() -> str:
@@ -50,8 +46,6 @@ def main() -> int:
             f"{PACKAGED_PROJECT_SNAPSHOT_PATH} is stale; it must be an exact "
             f"byte snapshot of {AUTHORITATIVE_PROJECT_PATH}"
         )
-    if (PACKAGE_ROOT / "pyproject.toml").read_bytes() != PROJECT_SNAPSHOT_PATH.read_bytes():
-        parser.error("selected extension project snapshot is stale")
     rendered = _render()
     if args.check:
         try:

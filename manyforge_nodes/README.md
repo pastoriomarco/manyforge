@@ -9,5 +9,4 @@ content-addressed v2 package/compiler boundary: implementation availability and
 addressed execution. No path loader or Python factory table
 will be restored.
 
-Program nodes are built in. For a build-time node example, see
-[`../manyforge_example_nodes/README.md`](../manyforge_example_nodes/README.md).
+Program nodes are built in.
